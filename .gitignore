@@ -1,0 +1,6 @@
+/target
+*.sqlite
+# rs-harbor materialises this on dev-shell entry
+/.cargo/config.toml
+*.sqlite-journal
+.DS_Store

@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sorrel-io",
+    "crates/sorrel-compute",
+    "crates/sorrel-data",
+    "crates/sorrel-render",
+    "crates/sorrel-ui",
+    "crates/sorrel",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://codeberg.org/caniko/sorrel"
+rust-version = "1.78"
+
+[workspace.dependencies]
+sorrel-io = { path = "crates/sorrel-io" }
+sorrel-compute = { path = "crates/sorrel-compute" }
+sorrel-data = { path = "crates/sorrel-data" }
+sorrel-render = { path = "crates/sorrel-render" }
+sorrel-ui = { path = "crates/sorrel-ui" }
+
+anyhow = "1"
+thiserror = "1"
+bytemuck = { version = "1", features = ["derive"] }
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+log = "0.4"
+env_logger = "0.11"
+wgpu = "0.20"
+egui = "0.28"
+eframe = { version = "0.28", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+egui_extras = "0.28"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+debug = false
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,12 @@
+[package]
+name = "sorrel-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sorrel-io.workspace = true
+sorrel-data.workspace = true
+sorrel-compute.workspace = true
+bytemuck.workspace = true

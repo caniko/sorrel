@@ -1,0 +1,17 @@
+[package]
+name = "sorrel-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sorrel-io.workspace = true
+sorrel-data.workspace = true
+sorrel-compute.workspace = true
+sorrel-render.workspace = true
+egui.workspace = true
+eframe.workspace = true
+egui_extras.workspace = true
+log.workspace = true
+anyhow.workspace = true

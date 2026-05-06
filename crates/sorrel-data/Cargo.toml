@@ -1,0 +1,15 @@
+[package]
+name = "sorrel-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sorrel-io.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+bincode.workspace = true
+rusqlite.workspace = true
+log.workspace = true
