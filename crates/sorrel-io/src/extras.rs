@@ -84,17 +84,104 @@ pub trait HasTemplateWaveforms: DataProvider {
     fn similar_templates(&self) -> &[f32];
 }
 
+/// Owning table of per-cluster scalar metrics. Names and per-metric value
+/// columns are kept in lockstep — there's no way to add one without the
+/// other, which is the bug the previous parallel `Vec<String>` +
+/// `HashMap<String, Vec<f32>>` shape made easy to introduce.
+///
+/// Iteration order matches insertion order, so callers (e.g. the cluster
+/// table) get a deterministic column layout. Look-up is linear in the number
+/// of metrics; in practice this is <20 columns and lives off the hot path.
+#[derive(Debug, Default, Clone)]
+pub struct QualityMetrics {
+    names: Vec<String>,
+    columns: Vec<Vec<f32>>,
+}
+
+impl QualityMetrics {
+    pub const fn new() -> Self {
+        Self {
+            names: Vec::new(),
+            columns: Vec::new(),
+        }
+    }
+
+    /// Insert a metric column. Replaces any existing column with the same
+    /// name. The caller is responsible for the column length matching
+    /// `n_clusters` — typically `vec![NAN; n_clusters]` initialised once and
+    /// filled in as rows arrive.
+    pub fn insert(&mut self, name: String, values: Vec<f32>) {
+        if let Some(i) = self.names.iter().position(|n| *n == name) {
+            self.columns[i] = values;
+        } else {
+            self.names.push(name);
+            self.columns.push(values);
+        }
+    }
+
+    /// `true` if a metric named `name` is present.
+    pub fn contains(&self, name: &str) -> bool {
+        self.names.iter().any(|n| n == name)
+    }
+
+    /// Look up the per-cluster column for `name`. `None` when absent.
+    pub fn get(&self, name: &str) -> Option<&[f32]> {
+        self.names
+            .iter()
+            .position(|n| n == name)
+            .map(|i| self.columns[i].as_slice())
+    }
+
+    /// Mutable access for in-place fills during CSV / TSV ingest.
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut [f32]> {
+        self.names
+            .iter()
+            .position(|n| n == name)
+            .map(|i| self.columns[i].as_mut_slice())
+    }
+
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    /// Sort columns alphabetically by name. The cluster-table UI relies on
+    /// this for stable column ordering across loads.
+    pub fn sort_by_name(&mut self) {
+        let mut idx: Vec<usize> = (0..self.names.len()).collect();
+        idx.sort_by(|&a, &b| self.names[a].cmp(&self.names[b]));
+        let names = idx.iter().map(|&i| self.names[i].clone()).collect();
+        let columns = idx.iter().map(|&i| std::mem::take(&mut self.columns[i])).collect();
+        self.names = names;
+        self.columns = columns;
+    }
+}
+
 /// Per-cluster scalar metrics provided by an upstream tool (SpikeInterface's
 /// `quality_metrics.csv`, phy's `cluster_*.tsv`, etc.). Each metric is a
 /// named column; values are aligned by `ClusterId`.
 ///
-/// Backends opt in by reading sidecar files at load time and storing one
-/// flat `Vec<f32>` per metric (NaN where the upstream tool reports nothing).
+/// Backends opt in by reading sidecar files at load time and storing them in
+/// a [`QualityMetrics`] table (NaN where the upstream tool reports nothing).
 pub trait HasQualityMetrics: DataProvider {
+    /// Borrow the full metric table.
+    fn quality_metrics(&self) -> &QualityMetrics;
+
     /// Sorted list of metric names exposed by this provider.
-    fn metric_names(&self) -> &[String];
+    fn metric_names(&self) -> &[String] {
+        self.quality_metrics().names()
+    }
 
     /// Per-cluster values for `name`, length = `n_clusters()`. `None` when
     /// the metric isn't present. NaN means "missing for this cluster".
-    fn metric_values(&self, name: &str) -> Option<&[f32]>;
+    fn metric_values(&self, name: &str) -> Option<&[f32]> {
+        self.quality_metrics().get(name)
+    }
 }

@@ -107,7 +107,7 @@ impl ProbeGeometry {
                     })?;
                     // -1 means "disabled"; map onto u32::MAX as a sentinel.
                     all_device_idx
-                        .push(if i < 0 { u32::MAX } else { i as ChannelId });
+                        .push(if i < 0 { ChannelId(u32::MAX) } else { ChannelId(i as u32) });
                 }
             }
         }
@@ -146,7 +146,7 @@ mod tests {
         assert_eq!(p.channel_positions.len(), 3);
         assert_eq!(p.channel_positions[1], [10.0, 20.0]);
         assert_eq!(p.channel_shanks, vec![0, 0, 0]);
-        assert_eq!(p.channel_map, vec![2, 0, 1]);
+        assert_eq!(p.channel_map, vec![ChannelId(2), ChannelId(0), ChannelId(1)]);
     }
 
     #[test]
@@ -178,6 +178,6 @@ mod tests {
             }]
         }"#;
         let p = ProbeGeometry::from_json(json).unwrap();
-        assert_eq!(p.channel_map, vec![0, u32::MAX]);
+        assert_eq!(p.channel_map, vec![ChannelId(0), ChannelId(u32::MAX)]);
     }
 }

@@ -28,7 +28,7 @@ pub fn isi_histogram(spikes: &[SampleIndex], max_samples: u64, bins: usize) -> V
     let mut h = vec![0u32; bins];
     let inv = bins as f64 / max_samples as f64;
     for w in spikes.windows(2) {
-        let dt = w[1].saturating_sub(w[0]);
+        let dt = w[1].0.saturating_sub(w[0].0);
         if dt >= max_samples {
             continue;
         }
@@ -74,12 +74,12 @@ mod tests {
     #[test]
     fn isi_handles_too_few_spikes() {
         assert_eq!(isi_histogram(&[], 100, 4), vec![0, 0, 0, 0]);
-        assert_eq!(isi_histogram(&[10], 100, 4), vec![0, 0, 0, 0]);
+        assert_eq!(isi_histogram(&[SampleIndex(10)], 100, 4), vec![0, 0, 0, 0]);
     }
 
     #[test]
     fn isi_skips_intervals_at_or_above_max() {
-        let spikes = vec![0u64, 10, 200, 210];
+        let spikes: Vec<SampleIndex> = [0u64, 10, 200, 210].iter().copied().map(SampleIndex).collect();
         let h = isi_histogram(&spikes, 100, 4);
         // Intervals: 10 -> bin 0, 190 -> skipped (>= 100), 10 -> bin 0
         assert_eq!(h.iter().sum::<u32>(), 2);
@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn isi_distributes_across_bins() {
-        let spikes = vec![0u64, 25, 75];
+        let spikes: Vec<SampleIndex> = [0u64, 25, 75].iter().copied().map(SampleIndex).collect();
         // intervals 25 (bin 1 of 4 over [0,100)) and 50 (bin 2)
         let h = isi_histogram(&spikes, 100, 4);
         assert_eq!(h, vec![0, 1, 1, 0]);
@@ -96,7 +96,8 @@ mod tests {
 
     #[test]
     fn isi_degenerate_returns_zeros() {
-        assert_eq!(isi_histogram(&[0, 1, 2], 0, 4), vec![0, 0, 0, 0]);
-        assert_eq!(isi_histogram(&[0, 1, 2], 100, 0), Vec::<u32>::new());
+        let s: Vec<SampleIndex> = [0u64, 1, 2].iter().copied().map(SampleIndex).collect();
+        assert_eq!(isi_histogram(&s, 0, 4), vec![0, 0, 0, 0]);
+        assert_eq!(isi_histogram(&s, 100, 0), Vec::<u32>::new());
     }
 }

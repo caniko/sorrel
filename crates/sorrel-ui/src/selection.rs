@@ -15,17 +15,18 @@ use sorrel_io::ClusterId;
 ///
 /// ```
 /// use sorrel_ui::SelectionSet;
+/// use sorrel_io::ClusterId;
 ///
-/// let mut s = SelectionSet::single(3);
-/// s.toggle(7);                         // ctrl-click
-/// assert_eq!(s.as_slice(), &[3, 7]);
+/// let mut s = SelectionSet::single(ClusterId(3));
+/// s.toggle(ClusterId(7));                         // ctrl-click
+/// assert_eq!(s.as_slice(), &[ClusterId(3), ClusterId(7)]);
 ///
-/// s.extend_to(5);                      // shift-click — range from anchor (7)
-/// assert_eq!(s.as_slice(), &[5, 6, 7]);
+/// s.extend_to(ClusterId(5));                      // shift-click — range from anchor (7)
+/// assert_eq!(s.as_slice(), &[ClusterId(5), ClusterId(6), ClusterId(7)]);
 ///
-/// s.replace(99);                       // plain click
-/// assert_eq!(s.as_slice(), &[99]);
-/// assert_eq!(s.anchor(), Some(99));
+/// s.replace(ClusterId(99));                       // plain click
+/// assert_eq!(s.as_slice(), &[ClusterId(99)]);
+/// assert_eq!(s.anchor(), Some(ClusterId(99)));
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct SelectionSet {
@@ -114,8 +115,8 @@ impl SelectionSet {
         };
         let (lo, hi) = if anchor <= c { (anchor, c) } else { (c, anchor) };
         self.items.clear();
-        for id in lo..=hi {
-            self.items.push(id);
+        for id in lo.0..=hi.0 {
+            self.items.push(ClusterId(id));
         }
         // Anchor is preserved so consecutive extend_to operations all pivot
         // around the original click — same as phy.
@@ -129,9 +130,9 @@ impl SelectionSet {
             self.clear();
             return;
         }
-        let cur = self.anchor.unwrap_or(0) as i64;
+        let cur = self.anchor.unwrap_or(ClusterId(0)).as_i64();
         let max = (n_clusters - 1) as i64;
-        let next = (cur + delta as i64).clamp(0, max) as ClusterId;
+        let next = ClusterId((cur + delta as i64).clamp(0, max) as u32);
         self.replace(next);
     }
 }
@@ -149,118 +150,118 @@ mod tests {
 
     #[test]
     fn single_seeds_one_id_and_sets_anchor() {
-        let s = SelectionSet::single(7);
-        assert_eq!(s.as_slice(), &[7]);
-        assert_eq!(s.anchor(), Some(7));
+        let s = SelectionSet::single(ClusterId(7));
+        assert_eq!(s.as_slice(), &[ClusterId(7)]);
+        assert_eq!(s.anchor(), Some(ClusterId(7)));
     }
 
     #[test]
     fn replace_resets_to_one_id() {
-        let mut s = SelectionSet::single(1);
-        s.toggle(2);
-        s.toggle(3);
-        s.replace(99);
-        assert_eq!(s.as_slice(), &[99]);
-        assert_eq!(s.anchor(), Some(99));
+        let mut s = SelectionSet::single(ClusterId(1));
+        s.toggle(ClusterId(2));
+        s.toggle(ClusterId(3));
+        s.replace(ClusterId(99));
+        assert_eq!(s.as_slice(), &[ClusterId(99)]);
+        assert_eq!(s.anchor(), Some(ClusterId(99)));
     }
 
     #[test]
     fn toggle_adds_then_removes() {
         let mut s = SelectionSet::new();
-        s.toggle(5);
-        assert_eq!(s.as_slice(), &[5]);
-        assert_eq!(s.anchor(), Some(5));
-        s.toggle(7);
-        assert_eq!(s.as_slice(), &[5, 7]);
-        s.toggle(5);
-        assert_eq!(s.as_slice(), &[7]);
-        assert_eq!(s.anchor(), Some(7), "anchor moved to the surviving id");
+        s.toggle(ClusterId(5));
+        assert_eq!(s.as_slice(), &[ClusterId(5)]);
+        assert_eq!(s.anchor(), Some(ClusterId(5)));
+        s.toggle(ClusterId(7));
+        assert_eq!(s.as_slice(), &[ClusterId(5), ClusterId(7)]);
+        s.toggle(ClusterId(5));
+        assert_eq!(s.as_slice(), &[ClusterId(7)]);
+        assert_eq!(s.anchor(), Some(ClusterId(7)), "anchor moved to the surviving id");
     }
 
     #[test]
     fn toggle_removing_anchor_falls_back_to_last() {
-        let mut s = SelectionSet::single(1);
-        s.toggle(2);
-        s.toggle(3);
+        let mut s = SelectionSet::single(ClusterId(1));
+        s.toggle(ClusterId(2));
+        s.toggle(ClusterId(3));
         // anchor is 3 (last added). Toggle off 3:
-        s.toggle(3);
-        assert_eq!(s.as_slice(), &[1, 2]);
-        assert_eq!(s.anchor(), Some(2));
+        s.toggle(ClusterId(3));
+        assert_eq!(s.as_slice(), &[ClusterId(1), ClusterId(2)]);
+        assert_eq!(s.anchor(), Some(ClusterId(2)));
     }
 
     #[test]
     fn toggle_off_last_id_clears_anchor() {
-        let mut s = SelectionSet::single(4);
-        s.toggle(4);
+        let mut s = SelectionSet::single(ClusterId(4));
+        s.toggle(ClusterId(4));
         assert!(s.is_empty());
         assert_eq!(s.anchor(), None);
     }
 
     #[test]
     fn extend_to_builds_inclusive_range_in_either_direction() {
-        let mut s = SelectionSet::single(3);
-        s.extend_to(6);
-        assert_eq!(s.as_slice(), &[3, 4, 5, 6]);
-        assert_eq!(s.anchor(), Some(3), "anchor is preserved across extend");
+        let mut s = SelectionSet::single(ClusterId(3));
+        s.extend_to(ClusterId(6));
+        assert_eq!(s.as_slice(), &[ClusterId(3), ClusterId(4), ClusterId(5), ClusterId(6)]);
+        assert_eq!(s.anchor(), Some(ClusterId(3)), "anchor is preserved across extend");
 
         // Extend the other way from the same anchor — phy semantics.
-        s.extend_to(1);
-        assert_eq!(s.as_slice(), &[1, 2, 3]);
-        assert_eq!(s.anchor(), Some(3));
+        s.extend_to(ClusterId(1));
+        assert_eq!(s.as_slice(), &[ClusterId(1), ClusterId(2), ClusterId(3)]);
+        assert_eq!(s.anchor(), Some(ClusterId(3)));
     }
 
     #[test]
     fn extend_to_with_no_anchor_acts_like_replace() {
         let mut s = SelectionSet::new();
-        s.extend_to(9);
-        assert_eq!(s.as_slice(), &[9]);
-        assert_eq!(s.anchor(), Some(9));
+        s.extend_to(ClusterId(9));
+        assert_eq!(s.as_slice(), &[ClusterId(9)]);
+        assert_eq!(s.anchor(), Some(ClusterId(9)));
     }
 
     #[test]
     fn bump_moves_anchor_within_bounds_and_replaces_selection() {
-        let mut s = SelectionSet::single(5);
-        s.toggle(7);
+        let mut s = SelectionSet::single(ClusterId(5));
+        s.toggle(ClusterId(7));
         s.bump(1, 10);
-        assert_eq!(s.as_slice(), &[8]); // anchor was 7, +1 -> 8
+        assert_eq!(s.as_slice(), &[ClusterId(8)]); // anchor was 7, +1 -> 8
         s.bump(-100, 10);
-        assert_eq!(s.as_slice(), &[0]);
+        assert_eq!(s.as_slice(), &[ClusterId(0)]);
         s.bump(100, 10);
-        assert_eq!(s.as_slice(), &[9]);
+        assert_eq!(s.as_slice(), &[ClusterId(9)]);
     }
 
     #[test]
     fn bump_with_zero_clusters_clears_selection() {
-        let mut s = SelectionSet::single(3);
+        let mut s = SelectionSet::single(ClusterId(3));
         s.bump(1, 0);
         assert!(s.is_empty());
     }
 
     #[test]
     fn extend_to_self_yields_single_id() {
-        let mut s = SelectionSet::single(7);
-        s.extend_to(7);
-        assert_eq!(s.as_slice(), &[7]);
-        assert_eq!(s.anchor(), Some(7));
+        let mut s = SelectionSet::single(ClusterId(7));
+        s.extend_to(ClusterId(7));
+        assert_eq!(s.as_slice(), &[ClusterId(7)]);
+        assert_eq!(s.anchor(), Some(ClusterId(7)));
     }
 
     #[test]
     fn extend_to_adjacent_id_yields_two_id_range() {
-        let mut s = SelectionSet::single(4);
-        s.extend_to(5);
-        assert_eq!(s.as_slice(), &[4, 5]);
-        s.extend_to(3);
-        assert_eq!(s.as_slice(), &[3, 4]);
+        let mut s = SelectionSet::single(ClusterId(4));
+        s.extend_to(ClusterId(5));
+        assert_eq!(s.as_slice(), &[ClusterId(4), ClusterId(5)]);
+        s.extend_to(ClusterId(3));
+        assert_eq!(s.as_slice(), &[ClusterId(3), ClusterId(4)]);
     }
 
     #[test]
     fn toggle_idempotency_pair() {
         // toggle(x); toggle(x) == initial state.
-        let mut s = SelectionSet::single(1);
+        let mut s = SelectionSet::single(ClusterId(1));
         let before = s.as_slice().to_vec();
         let before_anchor = s.anchor();
-        s.toggle(99);
-        s.toggle(99);
+        s.toggle(ClusterId(99));
+        s.toggle(ClusterId(99));
         assert_eq!(s.as_slice(), &before[..]);
         assert_eq!(s.anchor(), before_anchor);
     }
@@ -268,18 +269,18 @@ mod tests {
     #[test]
     fn replace_clears_then_anchors_in_one_step() {
         let mut s = SelectionSet::new();
-        s.toggle(1);
-        s.toggle(2);
-        s.toggle(3);
-        s.replace(7);
+        s.toggle(ClusterId(1));
+        s.toggle(ClusterId(2));
+        s.toggle(ClusterId(3));
+        s.replace(ClusterId(7));
         assert_eq!(s.len(), 1);
-        assert_eq!(s.anchor(), Some(7));
+        assert_eq!(s.anchor(), Some(ClusterId(7)));
     }
 
     #[test]
     fn clear_resets_everything() {
-        let mut s = SelectionSet::single(5);
-        s.toggle(7);
+        let mut s = SelectionSet::single(ClusterId(5));
+        s.toggle(ClusterId(7));
         s.clear();
         assert!(s.is_empty());
         assert_eq!(s.anchor(), None);
@@ -287,49 +288,49 @@ mod tests {
 
     #[test]
     fn bump_at_boundaries_clamps_correctly() {
-        let mut s = SelectionSet::single(0);
+        let mut s = SelectionSet::single(ClusterId(0));
         s.bump(-1, 5);
-        assert_eq!(s.as_slice(), &[0]);
-        let mut s = SelectionSet::single(4);
+        assert_eq!(s.as_slice(), &[ClusterId(0)]);
+        let mut s = SelectionSet::single(ClusterId(4));
         s.bump(1, 5);
-        assert_eq!(s.as_slice(), &[4]);
+        assert_eq!(s.as_slice(), &[ClusterId(4)]);
     }
 
     #[test]
     fn bump_starts_at_zero_when_no_anchor() {
         let mut s = SelectionSet::new();
         s.bump(1, 10);
-        assert_eq!(s.as_slice(), &[1]);
-        assert_eq!(s.anchor(), Some(1));
+        assert_eq!(s.as_slice(), &[ClusterId(1)]);
+        assert_eq!(s.anchor(), Some(ClusterId(1)));
     }
 
     #[test]
     fn extend_to_with_descending_then_ascending_pivots_around_anchor() {
-        let mut s = SelectionSet::single(5);
-        s.extend_to(1);
-        assert_eq!(s.as_slice(), &[1, 2, 3, 4, 5]);
+        let mut s = SelectionSet::single(ClusterId(5));
+        s.extend_to(ClusterId(1));
+        assert_eq!(s.as_slice(), &[ClusterId(1), ClusterId(2), ClusterId(3), ClusterId(4), ClusterId(5)]);
         // Anchor stayed at 5; extending up should walk back the other way.
-        s.extend_to(8);
-        assert_eq!(s.as_slice(), &[5, 6, 7, 8]);
+        s.extend_to(ClusterId(8));
+        assert_eq!(s.as_slice(), &[ClusterId(5), ClusterId(6), ClusterId(7), ClusterId(8)]);
     }
 
     #[test]
     fn iter_yields_items_in_insertion_order() {
         let mut s = SelectionSet::new();
-        s.toggle(7);
-        s.toggle(3);
-        s.toggle(11);
+        s.toggle(ClusterId(7));
+        s.toggle(ClusterId(3));
+        s.toggle(ClusterId(11));
         let collected: Vec<_> = s.iter().copied().collect();
-        assert_eq!(collected, vec![7, 3, 11]);
+        assert_eq!(collected, vec![ClusterId(7), ClusterId(3), ClusterId(11)]);
     }
 
     #[test]
     fn contains_returns_membership_correctly() {
-        let mut s = SelectionSet::single(3);
-        s.toggle(7);
-        assert!(s.contains(3));
-        assert!(s.contains(7));
-        assert!(!s.contains(0));
-        assert!(!s.contains(99));
+        let mut s = SelectionSet::single(ClusterId(3));
+        s.toggle(ClusterId(7));
+        assert!(s.contains(ClusterId(3)));
+        assert!(s.contains(ClusterId(7)));
+        assert!(!s.contains(ClusterId(0)));
+        assert!(!s.contains(ClusterId(99)));
     }
 }

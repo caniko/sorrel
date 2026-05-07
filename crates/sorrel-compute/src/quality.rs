@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn breakdown_clean_train_scores_high() {
         // Evenly-spaced spike train, constant amplitude, no contamination.
-        let times: Vec<u64> = (0..100).map(|i| i as u64 * 1000).collect();
+        let times: Vec<SampleIndex> = (0..100).map(|i| i as u64 * 1000).map(SampleIndex).collect();
         let amps: Vec<f32> = (0..100).map(|_| 3.0).collect();
         let q = quality_breakdown(&times, &amps, 100, 100_000, 1000.0, 50);
         assert!(q.contamination_score > 0.95);
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn breakdown_drifting_train_scores_lower_stability() {
-        let times: Vec<u64> = (0..100).map(|i| i as u64 * 1000).collect();
+        let times: Vec<SampleIndex> = (0..100).map(|i| i as u64 * 1000).map(SampleIndex).collect();
         // Amplitude grows linearly with time → drift_corr ≈ 1.
         let amps: Vec<f32> = (0..100).map(|i| i as f32 * 0.1).collect();
         let q = quality_breakdown(&times, &amps, 100, 100_000, 1000.0, 50);
@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn breakdown_records_n_spikes() {
-        let times: Vec<u64> = (0..42).map(|i| i as u64 * 100).collect();
+        let times: Vec<SampleIndex> = (0..42).map(|i| i as u64 * 100).map(SampleIndex).collect();
         let amps: Vec<f32> = (0..42).map(|i| i as f32).collect();
         let q = quality_breakdown(&times, &amps, 50, 4200, 1000.0, 10);
         assert_eq!(q.n_spikes, 42);
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn breakdown_drift_corr_negative_still_penalises_stability() {
-        let times: Vec<u64> = (0..100).map(|i| i as u64 * 1000).collect();
+        let times: Vec<SampleIndex> = (0..100).map(|i| i as u64 * 1000).map(SampleIndex).collect();
         // Amplitude falling with time → drift_corr ≈ -1.
         let amps: Vec<f32> = (0..100).map(|i| -(i as f32) * 0.1).collect();
         let q = quality_breakdown(&times, &amps, 100, 100_000, 1000.0, 50);
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn contamination_score_clamped_when_input_exceeds_one() {
         // Bursty input — heavy ISI violations.
-        let times: Vec<u64> = (0..50).map(|i| i as u64).collect();
+        let times: Vec<SampleIndex> = (0..50).map(|i| i as u64).map(SampleIndex).collect();
         let amps = vec![1.0; 50];
         let q = quality_breakdown(&times, &amps, 100, 50, 1000.0, 5);
         assert!((0.0..=1.0).contains(&q.contamination_score));

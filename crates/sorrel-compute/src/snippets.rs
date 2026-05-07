@@ -29,9 +29,9 @@ pub fn extract_snippets_single_channel(
     let pre = pre as i64;
     let post = post as i64;
     let len_i = channel_samples.len() as i64;
-    let start_i = start_sample as i64;
+    let start_i = start_sample.as_i64();
     for &t in spike_times {
-        let idx = t as i64 - start_i;
+        let idx = t.as_i64() - start_i;
         let lo = idx - pre;
         let hi = idx + post + 1;
         if lo < 0 || hi > len_i {
@@ -71,12 +71,16 @@ pub fn mean_snippet(snippets: &[Vec<f32>]) -> Vec<f32> {
 mod tests {
     use super::*;
 
+    fn si(xs: impl IntoIterator<Item = u64>) -> Vec<SampleIndex> {
+        xs.into_iter().map(SampleIndex).collect()
+    }
+
     #[test]
     fn extracts_centred_window_for_each_in_range_spike() {
         // Trace samples at global times [0..10], values = time * 10.
         let trace: Vec<f32> = (0..10).map(|t| (t as f32) * 10.0).collect();
-        let spikes = [3u64, 5, 7];
-        let snips = extract_snippets_single_channel(&trace, 0, &spikes, 1, 1);
+        let spikes = si([3u64, 5, 7]);
+        let snips = extract_snippets_single_channel(&trace, SampleIndex(0), &spikes, 1, 1);
         assert_eq!(snips.len(), 3);
         assert_eq!(snips[0], vec![20.0, 30.0, 40.0]);
         assert_eq!(snips[1], vec![40.0, 50.0, 60.0]);
@@ -87,8 +91,8 @@ mod tests {
     fn skips_spikes_whose_window_falls_off_the_edges() {
         let trace: Vec<f32> = (0..10).map(|t| t as f32).collect();
         // Spikes at 0 (lo would be -2) and at 9 (hi would be 12).
-        let spikes = [0u64, 9];
-        let snips = extract_snippets_single_channel(&trace, 0, &spikes, 2, 2);
+        let spikes = si([0u64, 9]);
+        let snips = extract_snippets_single_channel(&trace, SampleIndex(0), &spikes, 2, 2);
         assert!(snips.is_empty(), "both edges should be rejected");
     }
 
@@ -96,14 +100,14 @@ mod tests {
     fn honours_start_sample_offset() {
         // `start_sample = 100` means the slice represents samples 100..110.
         let trace: Vec<f32> = (0..10).map(|t| t as f32).collect();
-        let spikes = [102u64];
-        let snips = extract_snippets_single_channel(&trace, 100, &spikes, 1, 1);
+        let spikes = si([102u64]);
+        let snips = extract_snippets_single_channel(&trace, SampleIndex(100), &spikes, 1, 1);
         assert_eq!(snips, vec![vec![1.0, 2.0, 3.0]]);
     }
 
     #[test]
     fn empty_trace_returns_empty() {
-        let snips = extract_snippets_single_channel(&[], 0, &[5u64], 1, 1);
+        let snips = extract_snippets_single_channel(&[], SampleIndex(0), &si([5u64]), 1, 1);
         assert!(snips.is_empty());
     }
 
@@ -136,10 +140,10 @@ mod tests {
     #[test]
     fn extracted_snippet_length_is_pre_plus_post_plus_one() {
         let trace: Vec<f32> = (0..1000).map(|t| t as f32).collect();
-        let spikes: Vec<u64> = (50..950).step_by(50).map(|t| t as u64).collect();
+        let spikes = si((50..950).step_by(50).map(|t| t as u64));
         for &(pre, post) in &[(0u32, 0u32), (5, 5), (10, 30), (30, 10)] {
             let snips =
-                extract_snippets_single_channel(&trace, 0, &spikes, pre, post);
+                extract_snippets_single_channel(&trace, SampleIndex(0), &spikes, pre, post);
             for s in &snips {
                 assert_eq!(
                     s.len(),
@@ -155,13 +159,13 @@ mod tests {
     #[test]
     fn centre_sample_equals_trace_at_spike_time() {
         let trace: Vec<f32> = (0..100).map(|t| (t as f32) * 7.0).collect();
-        let spikes = [20u64, 50, 80];
+        let spikes = si([20u64, 50, 80]);
         let pre = 5u32;
         let post = 5u32;
-        let snips = extract_snippets_single_channel(&trace, 0, &spikes, pre, post);
+        let snips = extract_snippets_single_channel(&trace, SampleIndex(0), &spikes, pre, post);
         for (i, snip) in snips.iter().enumerate() {
             let centre = snip[pre as usize];
-            let expected = trace[spikes[i] as usize];
+            let expected = trace[spikes[i].idx()];
             assert_eq!(centre, expected);
         }
     }

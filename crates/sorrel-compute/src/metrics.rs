@@ -31,17 +31,17 @@ pub fn cross_correlogram(
     for &ta in a {
         // Advance the window's lower edge past spikes that are more than
         // `max_lag` *before* `ta`. We rephrase to avoid u64 underflow.
-        while lo < b.len() && b[lo] + max_lag < ta {
+        while lo < b.len() && b[lo].0 + max_lag < ta.0 {
             lo += 1;
         }
         if hi < lo {
             hi = lo;
         }
-        while hi < b.len() && b[hi] <= ta.saturating_add(max_lag) {
+        while hi < b.len() && b[hi].0 <= ta.0.saturating_add(max_lag) {
             hi += 1;
         }
         for &tb in &b[lo..hi] {
-            let dt = tb as i64 - ta as i64;
+            let dt = tb.as_i64() - ta.as_i64();
             let centred = dt as f64 + max_lag as f64;
             let mut idx = (centred * inv_bin) as usize;
             if idx >= bins {
@@ -67,20 +67,20 @@ pub fn auto_correlogram(times: &[SampleIndex], max_lag_samples: u64, bins: usize
     let mut lo = 0usize;
     let mut hi = 0usize;
     for (i, &ta) in times.iter().enumerate() {
-        while lo < times.len() && times[lo] + max_lag < ta {
+        while lo < times.len() && times[lo].0 + max_lag < ta.0 {
             lo += 1;
         }
         if hi < lo {
             hi = lo;
         }
-        while hi < times.len() && times[hi] <= ta.saturating_add(max_lag) {
+        while hi < times.len() && times[hi].0 <= ta.0.saturating_add(max_lag) {
             hi += 1;
         }
         for (j, &tb) in times[lo..hi].iter().enumerate() {
             if lo + j == i {
                 continue; // exclude self
             }
-            let dt = tb as i64 - ta as i64;
+            let dt = tb.as_i64() - ta.as_i64();
             let centred = dt as f64 + max_lag as f64;
             let mut idx = (centred * inv_bin) as usize;
             if idx >= bins {
@@ -101,10 +101,12 @@ pub fn auto_correlogram(times: &[SampleIndex], max_lag_samples: u64, bins: usize
 ///
 /// ```
 /// use sorrel_compute::isi_violations;
+/// use sorrel_io::SampleIndex;
 ///
 /// // Spikes at samples 0, 5, 30, 35, 100 with refractory window 10:
 /// //   intervals 5, 25, 5, 65 → two intervals are < 10.
-/// assert_eq!(isi_violations(&[0, 5, 30, 35, 100], 10), 2);
+/// let times = [0, 5, 30, 35, 100].map(SampleIndex);
+/// assert_eq!(isi_violations(&times, 10), 2);
 /// ```
 pub fn isi_violations(spike_times: &[SampleIndex], refractory_samples: u64) -> usize {
     if spike_times.len() < 2 || refractory_samples == 0 {
@@ -112,7 +114,7 @@ pub fn isi_violations(spike_times: &[SampleIndex], refractory_samples: u64) -> u
     }
     spike_times
         .windows(2)
-        .filter(|w| w[1].saturating_sub(w[0]) < refractory_samples)
+        .filter(|w| w[1].0.saturating_sub(w[0].0) < refractory_samples)
         .count()
 }
 
@@ -127,7 +129,7 @@ pub fn isi_violation_rate(
         return 0.0;
     }
     let n = isi_violations(spike_times, refractory_samples);
-    let duration_s = (spike_times[spike_times.len() - 1].saturating_sub(spike_times[0]))
+    let duration_s = (spike_times[spike_times.len() - 1].0.saturating_sub(spike_times[0].0))
         as f32
         / sample_rate;
     if duration_s <= 0.0 {
@@ -182,7 +184,7 @@ pub fn presence_ratio(
     let bin_width = (total_duration_samples as f64 / n_bins as f64).max(1.0);
     let mut filled = vec![false; n_bins];
     for &t in spike_times {
-        let idx = ((t as f64) / bin_width) as usize;
+        let idx = ((t.as_f64()) / bin_width) as usize;
         if idx < n_bins {
             filled[idx] = true;
         }
@@ -241,30 +243,38 @@ pub fn fraction_below(amps: &[f32], threshold: f32) -> f32 {
 mod tests {
     use super::*;
 
+    fn si<const N: usize>(xs: [u64; N]) -> [SampleIndex; N] {
+        xs.map(SampleIndex)
+    }
+
+    fn siv(xs: impl IntoIterator<Item = u64>) -> Vec<SampleIndex> {
+        xs.into_iter().map(SampleIndex).collect()
+    }
+
     #[test]
     fn isi_violations_counts_short_intervals_only() {
         // Spikes at t = 0, 5, 30, 35, 100. Refractory = 10.
         // Intervals: 5 (viol), 25 (ok), 5 (viol), 65 (ok). -> 2.
-        let times = [0, 5, 30, 35, 100];
+        let times = si([0, 5, 30, 35, 100]);
         assert_eq!(isi_violations(&times, 10), 2);
     }
 
     #[test]
     fn isi_violations_handles_short_inputs() {
         assert_eq!(isi_violations(&[], 10), 0);
-        assert_eq!(isi_violations(&[5], 10), 0);
+        assert_eq!(isi_violations(&si([5]), 10), 0);
     }
 
     #[test]
     fn isi_violations_zero_window_is_zero() {
-        assert_eq!(isi_violations(&[0, 5, 10], 0), 0);
+        assert_eq!(isi_violations(&si([0, 5, 10]), 0), 0);
     }
 
     #[test]
     fn isi_violation_rate_returns_zero_for_pathological_input() {
         assert_eq!(isi_violation_rate(&[], 10, 1000.0), 0.0);
-        assert_eq!(isi_violation_rate(&[5], 10, 1000.0), 0.0);
-        assert_eq!(isi_violation_rate(&[0, 5], 10, 0.0), 0.0);
+        assert_eq!(isi_violation_rate(&si([5]), 10, 1000.0), 0.0);
+        assert_eq!(isi_violation_rate(&si([0, 5]), 10, 0.0), 0.0);
     }
 
     #[test]
@@ -272,28 +282,28 @@ mod tests {
         // Spike train spanning 1 second at 1000 Hz, with 1 violation.
         // Times in samples: [0, 50, 1000]. RP = 100 samples.
         // viol = 1 (the 0→50 gap). duration = 1 s. rate = 1.0 /s.
-        let times = [0u64, 50, 1000];
+        let times = si([0u64, 50, 1000]);
         assert!((isi_violation_rate(&times, 100, 1000.0) - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn presence_ratio_empty_returns_zero() {
         assert_eq!(presence_ratio(&[], 1000, 10), 0.0);
-        assert_eq!(presence_ratio(&[1, 2, 3], 0, 10), 0.0);
-        assert_eq!(presence_ratio(&[1, 2, 3], 100, 0), 0.0);
+        assert_eq!(presence_ratio(&si([1, 2, 3]), 0, 10), 0.0);
+        assert_eq!(presence_ratio(&si([1, 2, 3]), 100, 0), 0.0);
     }
 
     #[test]
     fn presence_ratio_full_coverage_is_one() {
         // 10 bins of width 100. Place a spike in each bin.
-        let times: Vec<u64> = (0..10).map(|i| i as u64 * 100 + 50).collect();
+        let times = siv((0..10).map(|i| i as u64 * 100 + 50));
         assert_eq!(presence_ratio(&times, 1000, 10), 1.0);
     }
 
     #[test]
     fn presence_ratio_half_coverage_is_half() {
         // 4 bins of width 100. Put spikes only in the first 2.
-        let times = [10u64, 50, 110, 150];
+        let times = si([10u64, 50, 110, 150]);
         assert!((presence_ratio(&times, 400, 4) - 0.5).abs() < 1e-6);
     }
 
@@ -333,7 +343,7 @@ mod tests {
     #[test]
     fn refractory_contamination_zero_for_clean_train() {
         // Spikes spread out beyond the refractory window — contamination = 0.
-        let times = [0u64, 10_000, 20_000, 30_000];
+        let times = si([0u64, 10_000, 20_000, 30_000]);
         let rp = 100;
         let total = 30_000;
         assert_eq!(refractory_contamination(&times, rp, total, 1000.0), 0.0);
@@ -342,7 +352,7 @@ mod tests {
     #[test]
     fn refractory_contamination_positive_when_violations_present() {
         // Two close-together spikes inside RP window.
-        let times = [0u64, 5, 1_000, 5_000];
+        let times = si([0u64, 5, 1_000, 5_000]);
         let rp = 100;
         let total = 5_000;
         let c = refractory_contamination(&times, rp, total, 1000.0);
@@ -352,16 +362,16 @@ mod tests {
     #[test]
     fn cross_correlogram_total_count_matches_pair_count_within_window() {
         // Two trains with all pairs within ±max_lag: expect total = |a|*|b|.
-        let a = [0u64, 5, 10];
-        let b = [1u64, 4, 9];
+        let a = si([0u64, 5, 10]);
+        let b = si([1u64, 4, 9]);
         let h = cross_correlogram(&a, &b, 100, 20);
         assert_eq!(h.iter().copied().sum::<u32>(), 9);
     }
 
     #[test]
     fn cross_correlogram_outside_window_is_dropped() {
-        let a = [0u64];
-        let b = [50u64, 200];
+        let a = si([0u64]);
+        let b = si([50u64, 200]);
         let h = cross_correlogram(&a, &b, 60, 12);
         // Only the first b is within ±60.
         assert_eq!(h.iter().copied().sum::<u32>(), 1);
@@ -370,7 +380,7 @@ mod tests {
     #[test]
     fn auto_correlogram_excludes_zero_lag_diagonal() {
         // Single spike — nothing to correlate with itself.
-        let times = [42u64];
+        let times = si([42u64]);
         let h = auto_correlogram(&times, 50, 10);
         assert_eq!(h.iter().copied().sum::<u32>(), 0);
     }
@@ -378,14 +388,14 @@ mod tests {
     #[test]
     fn auto_correlogram_counts_each_off_diagonal_pair_twice() {
         // Two spikes 5 samples apart -> contributes a (+5) and a (-5).
-        let times = [10u64, 15];
+        let times = si([10u64, 15]);
         let h = auto_correlogram(&times, 50, 10);
         assert_eq!(h.iter().copied().sum::<u32>(), 2);
     }
 
     #[test]
     fn empty_inputs_return_zero_histograms() {
-        let h = cross_correlogram(&[], &[1, 2], 10, 5);
+        let h = cross_correlogram(&[], &si([1, 2]), 10, 5);
         assert_eq!(h, vec![0; 5]);
         let h = auto_correlogram(&[], 10, 5);
         assert_eq!(h, vec![0; 5]);
@@ -397,8 +407,8 @@ mod tests {
     /// two have equal totals.
     #[test]
     fn cross_correlogram_total_count_is_symmetric_under_swap() {
-        let a: Vec<u64> = vec![10, 50, 90, 130];
-        let b: Vec<u64> = vec![20, 60, 100];
+        let a = siv([10, 50, 90, 130]);
+        let b = siv([20, 60, 100]);
         let bins = 20usize;
         let max_lag = 100u64;
 
@@ -413,7 +423,7 @@ mod tests {
     /// counted twice — once for each direction).
     #[test]
     fn auto_correlogram_is_symmetric_around_centre() {
-        let times: Vec<u64> = (0..20).map(|i| (i * 37) as u64 + 5).collect();
+        let times = siv((0..20).map(|i| (i * 37) as u64 + 5));
         let bins = 30usize;
         let h = auto_correlogram(&times, 1000, bins);
         for i in 0..bins / 2 {
@@ -433,7 +443,7 @@ mod tests {
     /// and full presence.
     #[test]
     fn well_distributed_clean_train_has_perfect_metrics() {
-        let times: Vec<u64> = (0..100).map(|i| (i as u64 + 1) * 1000).collect();
+        let times = siv((0..100).map(|i| (i as u64 + 1) * 1000));
         // Total = max spike time, so every bin has at least one spike.
         let total = 100_000u64;
         assert_eq!(isi_violations(&times, 100), 0);

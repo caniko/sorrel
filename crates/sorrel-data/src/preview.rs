@@ -57,7 +57,7 @@ pub fn preview_merge<P: DataProvider>(
         &times,
         &amps,
         refractory_samples,
-        total_duration,
+        total_duration.0,
         sr,
         PRESENCE_BINS,
     );
@@ -265,16 +265,16 @@ mod tests {
         fn n_samples(&self) -> SampleIndex { self.n_samples }
         fn n_clusters(&self) -> u32 { self.spikes.len() as u32 }
         fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
-            self.spikes.get(c as usize).map(Vec::as_slice).unwrap_or(&[])
+            self.spikes.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
         }
         fn trace(&self, _: SampleIndex, _: u32) -> TraceSlice<'_> {
-            TraceSlice { start: 0, n_channels: 1, samples: TraceSamples::I16(&[]) }
+            TraceSlice { start: SampleIndex(0), n_channels: 1, samples: TraceSamples::I16(&[]) }
         }
         fn initial_labels(&self) -> Vec<u8> { vec![0; self.spikes.len()] }
     }
     impl HasAmplitudes for MockProvider {
         fn spike_amplitudes(&self, c: ClusterId) -> &[f32] {
-            self.amps.get(c as usize).map(Vec::as_slice).unwrap_or(&[])
+            self.amps.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
         }
     }
 
@@ -289,27 +289,27 @@ mod tests {
     #[test]
     fn preview_does_not_mutate_session() {
         let prov = MockProvider {
-            spikes: vec![vec![10, 30, 150], vec![20, 200], vec![100]],
+            spikes: vec![vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)], vec![SampleIndex(20), SampleIndex(200)], vec![SampleIndex(100)]],
             amps: vec![vec![1.0, 2.0, 3.0], vec![1.0, 1.0], vec![5.0]],
-            n_samples: 500,
+            n_samples: SampleIndex(500),
         };
         let (s, _d) = make_session(prov);
-        let pre_target = s.spike_times(2).to_vec();
+        let pre_target = s.spike_times(ClusterId(2)).to_vec();
         let pre_n = s.n_clusters();
-        let _ = preview_merge(&s, &[0, 1], 2);
-        assert_eq!(s.spike_times(2), &pre_target[..]);
+        let _ = preview_merge(&s, &[ClusterId(0), ClusterId(1)], ClusterId(2));
+        assert_eq!(s.spike_times(ClusterId(2)), &pre_target[..]);
         assert_eq!(s.n_clusters(), pre_n);
     }
 
     #[test]
     fn preview_merge_produces_union_spike_count() {
         let prov = MockProvider {
-            spikes: vec![vec![10, 30, 150], vec![20, 200], vec![100]],
+            spikes: vec![vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)], vec![SampleIndex(20), SampleIndex(200)], vec![SampleIndex(100)]],
             amps: vec![vec![1.0, 2.0, 3.0], vec![1.0, 1.0], vec![5.0]],
-            n_samples: 500,
+            n_samples: SampleIndex(500),
         };
         let (s, _d) = make_session(prov);
-        let p = preview_merge(&s, &[0, 1], 2);
+        let p = preview_merge(&s, &[ClusterId(0), ClusterId(1)], ClusterId(2));
         // Union has 6 spikes — post.n_spikes should reflect that.
         assert_eq!(p.post.n_spikes, 6);
     }
@@ -320,18 +320,18 @@ mod tests {
         let prov = MockProvider {
             // Target = 0: well-spaced (clean).
             spikes: vec![
-                vec![0u64, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000],
+                vec![0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000].into_iter().map(SampleIndex).collect(),
                 // Source = 1: spikes packed close to target's → many violations.
-                vec![1u64, 1001, 2001, 3001, 4001, 5001, 6001, 7001, 8001, 9001],
+                vec![1, 1001, 2001, 3001, 4001, 5001, 6001, 7001, 8001, 9001].into_iter().map(SampleIndex).collect(),
             ],
             amps: vec![
                 vec![5.0; 10],
                 vec![5.0; 10],
             ],
-            n_samples: 10_000,
+            n_samples: SampleIndex(10_000),
         };
         let (s, _d) = make_session(prov);
-        let p = preview_merge(&s, &[1], 0);
+        let p = preview_merge(&s, &[ClusterId(1)], ClusterId(0));
         assert!(p.contamination_delta() > 0.0, "expected merge to worsen contamination");
         assert!(p.warns());
     }
@@ -339,12 +339,12 @@ mod tests {
     #[test]
     fn preview_isolation_none_without_pc_features() {
         let prov = MockProvider {
-            spikes: vec![vec![10, 30], vec![20, 40]],
+            spikes: vec![vec![SampleIndex(10), SampleIndex(30)], vec![SampleIndex(20), SampleIndex(40)]],
             amps: vec![vec![1.0, 2.0], vec![1.0, 1.0]],
-            n_samples: 500,
+            n_samples: SampleIndex(500),
         };
         let (s, _d) = make_session(prov);
-        let p = preview_merge(&s, &[1], 0);
+        let p = preview_merge(&s, &[ClusterId(1)], ClusterId(0));
         assert!(p.post.isolation.is_none());
     }
 }

@@ -22,6 +22,68 @@ impl NpyHeader {
     }
 }
 
+/// Numpy dtype tags we accept for the arrays Kilosort and SpikeInterface
+/// emit. Backends typically downcast to a single in-memory type (e.g. spike
+/// times always land as `u64`), so the decoder takes both `<f4`/`<f8`
+/// equivalents and lets the caller resolve the conversion.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NpyDtype {
+    F32,
+    F64,
+    I32,
+    U32,
+    I64,
+    U64,
+}
+
+impl NpyDtype {
+    /// Parse a numpy `descr` string. Accepts both numpy-canonical forms
+    /// (`'<f4'`, `'<i8'`) and the bare aliases that occasionally appear in
+    /// Kilosort outputs (`'i4'`, `'<i32'`).
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim() {
+            "<f4" | "f4" | "<float32" | "float32" => Self::F32,
+            "<f8" | "f8" | "<float64" | "float64" => Self::F64,
+            "<i4" | "i4" | "<i32" | "i32" => Self::I32,
+            "<u4" | "u4" | "<u32" | "u32" => Self::U32,
+            "<i8" | "i8" | "<i64" | "i64" => Self::I64,
+            "<u8" | "u8" | "<u64" | "u64" => Self::U64,
+            other => bail!("unsupported numpy dtype {other}"),
+        })
+    }
+
+    pub const fn size_bytes(self) -> usize {
+        match self {
+            Self::F32 | Self::I32 | Self::U32 => 4,
+            Self::F64 | Self::I64 | Self::U64 => 8,
+        }
+    }
+
+    pub const fn is_float(self) -> bool {
+        matches!(self, Self::F32 | Self::F64)
+    }
+
+    pub const fn is_integer(self) -> bool {
+        !self.is_float()
+    }
+}
+
+/// Decode `n` elements of `dtype` from `bytes`, applying `f` to each chunk.
+/// Returns `Err` if the buffer is short.
+fn decode_chunks<T>(
+    bytes: &[u8],
+    n: usize,
+    dtype: NpyDtype,
+    f: impl FnMut(&[u8]) -> T,
+) -> Result<Vec<T>> {
+    let elem = dtype.size_bytes();
+    let need = n * elem;
+    if bytes.len() < need {
+        bail!("array truncated: have {} bytes, need {need}", bytes.len());
+    }
+    Ok(bytes[..need].chunks_exact(elem).map(f).collect())
+}
+
 pub fn read_header(path: &Path) -> Result<NpyHeader> {
     let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut magic = [0u8; 6];
@@ -169,30 +231,15 @@ pub fn read_1d_u32(path: &Path) -> Result<Vec<u32>> {
 }
 
 fn decode_f32(h: &NpyHeader, bytes: &[u8], n: usize) -> Result<Vec<f32>> {
-    match h.dtype.as_str() {
-        "<f4" | "f4" | "<float32" | "float32" => {
-            let need = n * 4;
-            if bytes.len() < need {
-                bail!("array truncated: have {} bytes, need {need}", bytes.len());
-            }
-            let mut out = Vec::with_capacity(n);
-            for c in bytes[..need].chunks_exact(4) {
-                out.push(f32::from_le_bytes(c.try_into().unwrap()));
-            }
-            Ok(out)
-        }
-        "<f8" | "f8" | "<float64" | "float64" => {
-            let need = n * 8;
-            if bytes.len() < need {
-                bail!("array truncated");
-            }
-            let mut out = Vec::with_capacity(n);
-            for c in bytes[..need].chunks_exact(8) {
-                out.push(f64::from_le_bytes(c.try_into().unwrap()) as f32);
-            }
-            Ok(out)
-        }
-        d => bail!("unsupported float dtype {d}"),
+    let dtype = NpyDtype::parse(&h.dtype)?;
+    match dtype {
+        NpyDtype::F32 => decode_chunks(bytes, n, dtype, |c| {
+            f32::from_le_bytes(c.try_into().unwrap())
+        }),
+        NpyDtype::F64 => decode_chunks(bytes, n, dtype, |c| {
+            f64::from_le_bytes(c.try_into().unwrap()) as f32
+        }),
+        d => bail!("unsupported float dtype {d:?}"),
     }
 }
 
@@ -266,30 +313,15 @@ fn write_npy_1d<F: FnOnce(&mut File) -> std::io::Result<()>>(
 }
 
 fn decode_u32(h: &NpyHeader, bytes: &[u8], n: usize) -> Result<Vec<u32>> {
-    match h.dtype.as_str() {
-        "<i4" | "<u4" => {
-            let need = n * 4;
-            if bytes.len() < need {
-                bail!("array truncated");
-            }
-            let mut out = Vec::with_capacity(n);
-            for c in bytes[..need].chunks_exact(4) {
-                out.push(u32::from_le_bytes(c.try_into().unwrap()));
-            }
-            Ok(out)
-        }
-        "<i8" | "<u8" => {
-            let need = n * 8;
-            if bytes.len() < need {
-                bail!("array truncated");
-            }
-            let mut out = Vec::with_capacity(n);
-            for c in bytes[..need].chunks_exact(8) {
-                out.push(u64::from_le_bytes(c.try_into().unwrap()) as u32);
-            }
-            Ok(out)
-        }
-        d => bail!("unsupported integer dtype {d}"),
+    let dtype = NpyDtype::parse(&h.dtype)?;
+    match dtype {
+        NpyDtype::I32 | NpyDtype::U32 => decode_chunks(bytes, n, dtype, |c| {
+            u32::from_le_bytes(c.try_into().unwrap())
+        }),
+        NpyDtype::I64 | NpyDtype::U64 => decode_chunks(bytes, n, dtype, |c| {
+            u64::from_le_bytes(c.try_into().unwrap()) as u32
+        }),
+        d => bail!("unsupported integer dtype {d:?}"),
     }
 }
 

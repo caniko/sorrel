@@ -156,11 +156,48 @@ h1 {
 }
 
 .features,
+.backends,
 .quick-install {
   padding: 72px 0;
 }
 
+.backends {
+  border-top: 1px solid $border;
+  background: #0b0f14;
+}
+
+.backend-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+}
+
+.backend {
+  border: 1px solid $border;
+  border-radius: 8px;
+  padding: 22px;
+  background: $bg-card;
+}
+
+.backend h3 {
+  margin: 0 0 10px;
+  font-size: 1.05rem;
+  color: $accent-hover;
+}
+
+.backend p {
+  margin: 0;
+  color: $text-muted;
+  font-size: 0.95rem;
+}
+
+.backend code {
+  color: $success;
+  font-size: 0.85rem;
+}
+
 .features h2,
+.backends h2,
 .quick-install h2 {
   margin: 0 0 24px;
   font-size: 2rem;
@@ -266,7 +303,12 @@ code {
   }
 
   .features,
+  .backends,
   .quick-install {
     padding: 48px 0;
+  }
+
+  .backend-grid {
+    grid-template-columns: 1fr;
   }
 }

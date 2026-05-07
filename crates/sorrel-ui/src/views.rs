@@ -13,7 +13,7 @@ use sorrel_data::{
     cluster_quality, preview_merge, rank_merge_candidates, rank_split_candidates, MergeCandidate,
     Session, SplitCandidate, SuggestConfig,
 };
-use sorrel_io::{ClusterId, DataProvider};
+use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 
 /// Categorical palette used to colour clusters across views. Index modulo
 /// length so we never run out — phy uses essentially the same trick.
@@ -30,7 +30,7 @@ const PALETTE: [Color32; 8] = [
 
 #[inline]
 fn cluster_colour(c: ClusterId) -> Color32 {
-    PALETTE[(c as usize) % PALETTE.len()]
+    PALETTE[c.idx() % PALETTE.len()]
 }
 
 /// Amplitude-vs-time scatter for every cluster in the selection. Only
@@ -75,8 +75,8 @@ pub fn amplitude_view<P: DataProvider>(
         }
         total_points += times.len();
         if let (Some(&first), Some(&last)) = (times.first(), times.last()) {
-            t_min = t_min.min(first as f32 * inv_sr);
-            t_max = t_max.max(last as f32 * inv_sr);
+            t_min = t_min.min(first.as_f32() * inv_sr);
+            t_max = t_max.max(last.as_f32() * inv_sr);
         }
         for &a in amps {
             if a < a_min {
@@ -114,7 +114,7 @@ pub fn amplitude_view<P: DataProvider>(
         }
         let n = times.len().min(amps.len());
         for i in (0..n).step_by(stride) {
-            let t = times[i] as f32 * inv_sr;
+            let t = times[i].as_f32() * inv_sr;
             let a = amps[i];
             let x = rect.left() + (t - t_min) / t_span * rect.width();
             let y = rect.bottom() - (a - a_min) / a_span * rect.height();
@@ -318,8 +318,8 @@ impl WaveformCache {
             let stride = (times.len() / MAX_SPIKES_PER_CLUSTER).max(1);
             let mut bucket = Vec::new();
             for &t in times.iter().step_by(stride).take(MAX_SPIKES_PER_CLUSTER) {
-                let lo = t.saturating_sub(pre as u64);
-                let slice = session.provider.trace(lo, snippet_len as u32);
+                let lo = t.0.saturating_sub(pre as u64);
+                let slice = session.provider.trace(SampleIndex(lo), snippet_len as u32);
                 if slice.samples.len() != snippet_len * nc {
                     continue;
                 }
@@ -1089,29 +1089,30 @@ impl RasterCache {
         // dominated by holes left behind after merges.
         let mut rows = vec![-1i32; n_clusters as usize];
         let mut n_rows = 0u32;
-        for c in 0..n_clusters {
+        for c in (0..n_clusters).map(ClusterId) {
             if !session.spike_times(c).is_empty() {
-                rows[c as usize] = n_rows as i32;
+                rows[c.idx()] = n_rows as i32;
                 n_rows += 1;
             }
         }
 
         let total: usize = (0..n_clusters)
+            .map(ClusterId)
             .map(|c| session.spike_times(c).len())
             .sum();
 
         let mut vertices = Vec::with_capacity(total);
         let mut t_min = f32::INFINITY;
         let mut t_max = f32::NEG_INFINITY;
-        for c in 0..n_clusters {
-            let row = rows[c as usize];
+        for c in (0..n_clusters).map(ClusterId) {
+            let row = rows[c.idx()];
             if row < 0 {
                 continue;
             }
             let colour = cluster_colour(c);
             let packed = pack_rgba(colour.r(), colour.g(), colour.b(), 220);
             for &t in session.spike_times(c) {
-                let ts = t as f32 * inv_sr;
+                let ts = t.as_f32() * inv_sr;
                 if ts < t_min {
                     t_min = ts;
                 }
@@ -1222,7 +1223,7 @@ pub fn firing_rate_view<P: DataProvider>(
         return;
     }
     let sr = session.provider.sample_rate().max(1.0);
-    let total_samples = session.provider.n_samples();
+    let total_samples = session.provider.n_samples().0;
     if total_samples == 0 {
         ui.label("recording has zero length");
         return;
@@ -1251,7 +1252,7 @@ pub fn firing_rate_view<P: DataProvider>(
         let times = session.spike_times(c);
         let mut h = vec![0u32; bins];
         for &t in times {
-            let idx = (t / bin_samples) as usize;
+            let idx = (t.0 / bin_samples) as usize;
             if idx < bins {
                 h[idx] += 1;
             }
@@ -1628,7 +1629,7 @@ pub fn similarity_view<P: DataProvider>(
     let n_clusters = session.n_clusters();
     let mut tpl_to_cluster: std::collections::HashMap<u32, ClusterId> =
         std::collections::HashMap::new();
-    for c in 0..n_clusters {
+    for c in (0..n_clusters).map(ClusterId) {
         if let Some(t) = primary_template_id(session, c) {
             tpl_to_cluster.entry(t).or_insert(c);
         }
@@ -1707,7 +1708,7 @@ pub fn cluster_statistics_view<P: DataProvider>(ui: &mut Ui, session: &Session<P
     let mut spike_counts: Vec<f32> = Vec::with_capacity(n);
     let mut mean_amps: Vec<f32> = Vec::new();
     let mut isi_viols: Vec<f32> = Vec::with_capacity(n);
-    for c in 0..n as u32 {
+    for c in (0..n as u32).map(ClusterId) {
         spike_counts.push(session.spike_times(c).len() as f32);
         let amps = session.spike_amplitudes(c);
         if !amps.is_empty() {
@@ -2360,8 +2361,8 @@ pub fn drift_map_view<P: DataProvider>(
         }
         total_spikes += times.len();
         if let (Some(&first), Some(&last)) = (times.first(), times.last()) {
-            t_min = t_min.min(first as f32 * inv_sr);
-            t_max = t_max.max(last as f32 * inv_sr);
+            t_min = t_min.min(first.as_f32() * inv_sr);
+            t_max = t_max.max(last.as_f32() * inv_sr);
         }
         for &a in amps {
             if a < a_min { a_min = a; }
@@ -2399,7 +2400,7 @@ pub fn drift_map_view<P: DataProvider>(
         let faint = Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), 60);
         let n = times.len().min(amps.len());
         for i in (0..n).step_by(stride) {
-            let t = times[i] as f32 * inv_sr;
+            let t = times[i].as_f32() * inv_sr;
             let a = amps[i];
             let x = rect.left() + (t - t_min) / t_span * rect.width();
             let y = rect.bottom() - (a - a_min) / a_span * rect.height();
@@ -2407,12 +2408,12 @@ pub fn drift_map_view<P: DataProvider>(
         }
         // OLS regression line on (t, a). cheap.
         let nf = n as f64;
-        let mean_t: f64 = times[..n].iter().map(|&t| t as f64 * inv_sr as f64).sum::<f64>() / nf;
+        let mean_t: f64 = times[..n].iter().map(|&t| t.as_f64() * inv_sr as f64).sum::<f64>() / nf;
         let mean_a: f64 = amps[..n].iter().map(|&a| a as f64).sum::<f64>() / nf;
         let mut num = 0.0_f64;
         let mut denom = 0.0_f64;
         for i in 0..n {
-            let dt = times[i] as f64 * inv_sr as f64 - mean_t;
+            let dt = times[i].as_f64() * inv_sr as f64 - mean_t;
             let da = amps[i] as f64 - mean_a;
             num += dt * da;
             denom += dt * dt;
@@ -2463,7 +2464,7 @@ pub fn contamination_over_time_view<P: DataProvider>(
         return;
     }
     let sr = session.provider.sample_rate().max(1.0);
-    let total_samples = session.provider.n_samples();
+    let total_samples = session.provider.n_samples().0;
     if total_samples == 0 {
         ui.label("recording has zero length");
         return;

@@ -8,7 +8,7 @@ pub mod vertex;
 
 pub use buffers::{
     build_scatter_vertices, build_trace_vertices, build_trace_vertices_cfg,
-    build_trace_vertices_gpu, GpuTracePreproc, TraceConfig,
+    build_trace_vertices_gpu, GpuTracePreproc, TracePreproc,
 };
 pub use pipelines::{ScatterPipeline, TracePipeline};
 pub use vertex::{ScatterVertex, TraceVertex};

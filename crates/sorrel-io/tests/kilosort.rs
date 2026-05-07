@@ -3,7 +3,8 @@
 
 use sorrel_io::kilosort::{KilosortOpenParams, KilosortProvider, PhyLabel};
 use sorrel_io::{
-    DataProvider, HasAmplitudes, HasGeometry, HasSpikeTemplates, TraceDtype, TraceSamples,
+    ChannelId, ClusterId, DataProvider, HasAmplitudes, HasGeometry, HasSpikeTemplates,
+    SampleIndex, TraceDtype, TraceSamples,
 };
 use std::io::Write;
 use std::path::Path;
@@ -88,23 +89,26 @@ fn opens_minimal_kilosort_fixture() {
 
     assert_eq!(p.sample_rate(), 30_000.0);
     assert_eq!(p.n_channels(), n_channels);
-    assert_eq!(p.n_samples(), n_samples as u64);
+    assert_eq!(p.n_samples(), SampleIndex(n_samples as u64));
     assert_eq!(p.n_clusters(), 3);
     assert_eq!(p.dtype(), TraceDtype::I16);
 
     // spike_times per cluster, sorted ascending.
-    assert_eq!(p.spike_times(0), &[10, 30, 150]);
-    assert_eq!(p.spike_times(1), &[50, 200]);
-    assert_eq!(p.spike_times(2), &[100]);
-    assert!(p.spike_times(99).is_empty());
+    assert_eq!(
+        p.spike_times(ClusterId(0)),
+        &[SampleIndex(10), SampleIndex(30), SampleIndex(150)]
+    );
+    assert_eq!(p.spike_times(ClusterId(1)), &[SampleIndex(50), SampleIndex(200)]);
+    assert_eq!(p.spike_times(ClusterId(2)), &[SampleIndex(100)]);
+    assert!(p.spike_times(ClusterId(99)).is_empty());
 
     // initial labels from the TSV.
     let labels = p.initial_labels();
     assert_eq!(labels, vec![PhyLabel::Good, PhyLabel::Unsorted, PhyLabel::Noise]);
 
     // trace slice contents and clamping.
-    let slice = p.trace(0, 2);
-    assert_eq!(slice.start, 0);
+    let slice = p.trace(SampleIndex(0), 2);
+    assert_eq!(slice.start, SampleIndex(0));
     assert_eq!(slice.n_channels, n_channels);
     let TraceSamples::I16(s) = slice.samples else {
         panic!("expected i16 samples, got {:?}", slice.samples.dtype());
@@ -115,7 +119,7 @@ fn opens_minimal_kilosort_fixture() {
     assert_eq!(s[4], 10);
 
     // out-of-range request clamps to end without panic.
-    let clamped = p.trace((n_samples as u64) - 1, 100);
+    let clamped = p.trace(SampleIndex(n_samples as u64 - 1), 100);
     assert_eq!(clamped.samples.len(), n_channels as usize);
 }
 
@@ -177,7 +181,7 @@ fn reads_params_py_when_present() {
     let p = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
     assert_eq!(p.sample_rate(), 25_000.0);
     assert_eq!(p.n_channels(), 4);
-    assert_eq!(p.n_samples(), 4);
+    assert_eq!(p.n_samples(), SampleIndex(4));
     assert_eq!(p.dtype(), TraceDtype::I16);
 }
 
@@ -216,7 +220,7 @@ fn float32_dtype_round_trips_through_provider() {
 
     let p = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
     assert_eq!(p.dtype(), TraceDtype::F32);
-    let slice = p.trace(0, 3);
+    let slice = p.trace(SampleIndex(0), 3);
     let TraceSamples::F32(s) = slice.samples else {
         panic!("expected f32 samples");
     };
@@ -257,8 +261,8 @@ fn dat_offset_is_skipped() {
     .unwrap();
 
     let p = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
-    assert_eq!(p.n_samples(), n_samples as u64);
-    let slice = p.trace(0, 1);
+    assert_eq!(p.n_samples(), SampleIndex(n_samples as u64));
+    let slice = p.trace(SampleIndex(0), 1);
     let TraceSamples::I16(s) = slice.samples else {
         panic!("expected i16 samples");
     };
@@ -329,24 +333,27 @@ fn amplitudes_and_templates_align_with_time_sorted_spikes() {
 
     // Cluster 0 has spikes at global indices [0,2,5] with times [10,30,150]
     // and amps [1.0,3.0,6.0]. After time-sort the order is [10,30,150].
-    assert_eq!(p.spike_times(0), &[10, 30, 150]);
-    assert_eq!(p.spike_amplitudes(0), &[1.0, 3.0, 6.0]);
-    assert_eq!(p.spike_templates(0), &[10, 10, 10]);
+    assert_eq!(
+        p.spike_times(ClusterId(0)),
+        &[SampleIndex(10), SampleIndex(30), SampleIndex(150)]
+    );
+    assert_eq!(p.spike_amplitudes(ClusterId(0)), &[1.0, 3.0, 6.0]);
+    assert_eq!(p.spike_templates(ClusterId(0)), &[10, 10, 10]);
 
     // Cluster 1 has [1,4] -> times [50,200], amps [2.0,5.0], templates
     // [11,11] (already in time order).
-    assert_eq!(p.spike_times(1), &[50, 200]);
-    assert_eq!(p.spike_amplitudes(1), &[2.0, 5.0]);
-    assert_eq!(p.spike_templates(1), &[11, 11]);
+    assert_eq!(p.spike_times(ClusterId(1)), &[SampleIndex(50), SampleIndex(200)]);
+    assert_eq!(p.spike_amplitudes(ClusterId(1)), &[2.0, 5.0]);
+    assert_eq!(p.spike_templates(ClusterId(1)), &[11, 11]);
 
     // Cluster 2: single spike.
-    assert_eq!(p.spike_times(2), &[100]);
-    assert_eq!(p.spike_amplitudes(2), &[4.0]);
-    assert_eq!(p.spike_templates(2), &[12]);
+    assert_eq!(p.spike_times(ClusterId(2)), &[SampleIndex(100)]);
+    assert_eq!(p.spike_amplitudes(ClusterId(2)), &[4.0]);
+    assert_eq!(p.spike_templates(ClusterId(2)), &[12]);
 
     // Out-of-range clusters return empty slices, never panic.
-    assert!(p.spike_amplitudes(99).is_empty());
-    assert!(p.spike_templates(99).is_empty());
+    assert!(p.spike_amplitudes(ClusterId(99)).is_empty());
+    assert!(p.spike_templates(ClusterId(99)).is_empty());
 }
 
 #[test]
@@ -360,7 +367,10 @@ fn channel_geometry_loads_when_files_present() {
     assert_eq!(p.channel_positions()[0], [0.0, 0.0]);
     assert_eq!(p.channel_positions()[3], [0.0, 60.0]);
     assert_eq!(p.channel_shanks(), &[0, 0, 0, 0]);
-    assert_eq!(p.channel_map(), &[0, 1, 2, 3]);
+    assert_eq!(
+        p.channel_map(),
+        &[ChannelId(0), ChannelId(1), ChannelId(2), ChannelId(3)]
+    );
 }
 
 #[test]
@@ -383,8 +393,8 @@ fn missing_optional_files_yield_empty_slices() {
     .unwrap();
 
     let p = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
-    assert!(p.spike_amplitudes(0).is_empty());
-    assert!(p.spike_templates(0).is_empty());
+    assert!(p.spike_amplitudes(ClusterId(0)).is_empty());
+    assert!(p.spike_templates(ClusterId(0)).is_empty());
     assert!(p.channel_positions().is_empty());
     assert!(p.channel_shanks().is_empty());
     assert!(p.channel_map().is_empty());

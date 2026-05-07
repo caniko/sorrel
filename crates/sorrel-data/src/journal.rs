@@ -253,7 +253,7 @@ mod tests {
     use crate::command::PhyLabelOp;
 
     fn cmd(c: u32, op: PhyLabelOp) -> CurationCommand {
-        CurationCommand::Relabel { cluster: c, op }
+        CurationCommand::Relabel { cluster: sorrel_io::ClusterId(c), op }
     }
 
     #[test]
@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(ops.len(), 3);
         match &ops[0] {
             CurationCommand::Relabel { cluster, op } => {
-                assert_eq!(*cluster, 0);
+                assert_eq!(*cluster, sorrel_io::ClusterId(0));
                 assert_eq!(*op, PhyLabelOp::SetGood);
             }
             _ => panic!(),
@@ -371,16 +371,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("j.sorrel");
         let mut j = Journal::open_or_create(&p, 0, 0).unwrap();
-        j.append(&CurationCommand::Relabel { cluster: 0, op: PhyLabelOp::SetGood })
+        use sorrel_io::ClusterId;
+        j.append(&CurationCommand::Relabel { cluster: ClusterId(0), op: PhyLabelOp::SetGood })
             .unwrap();
-        j.append(&CurationCommand::Merge { sources: vec![1, 2], target: 3 }).unwrap();
+        j.append(&CurationCommand::Merge { sources: vec![ClusterId(1), ClusterId(2)], target: ClusterId(3) }).unwrap();
         j.append(&CurationCommand::Split {
-            cluster: 4,
+            cluster: ClusterId(4),
             spike_idx: vec![0, 1, 5, 8],
-            new_cluster: 99,
+            new_cluster: ClusterId(99),
         })
         .unwrap();
-        j.append(&CurationCommand::Note { cluster: 7, text: "needs review".into() })
+        j.append(&CurationCommand::Note { cluster: ClusterId(7), text: "needs review".into() })
             .unwrap();
         j.append(&CurationCommand::Undo).unwrap();
         j.append(&CurationCommand::Redo).unwrap();
@@ -407,7 +408,7 @@ mod tests {
         assert_eq!(ops.len(), 50);
         for (i, op) in ops.iter().enumerate() {
             match op {
-                CurationCommand::Relabel { cluster, .. } => assert_eq!(*cluster as usize, i),
+                CurationCommand::Relabel { cluster, .. } => assert_eq!(cluster.idx(), i),
                 _ => panic!(),
             }
         }

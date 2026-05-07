@@ -29,14 +29,39 @@
   </div>
 </section>
 
+<section class="backends" aria-labelledby="backends-heading">
+  <div class="section-inner">
+    <h2 id="backends-heading">Reads What You Already Have</h2>
+    <div class="backend-grid">
+      <article class="backend">
+        <h3>phy / Kilosort</h3>
+        <p>Directory of <code>spike_times.npy</code>, <code>spike_clusters.npy</code>, <code>params.py</code>, plus optional templates, PC features, amplitudes, channel positions, similarity, and quality-metric sidecars.</p>
+      </article>
+      <article class="backend">
+        <h3>SpikeInterface</h3>
+        <p>SortingAnalyzer saved as <code>binary_folder</code> — <code>recording.json</code>, the flat sorting under <code>sorting/</code>, optional <code>probe.json</code>, and <code>quality_metrics</code> extension.</p>
+      </article>
+      <article class="backend">
+        <h3>NWB &amp; KS4 rez</h3>
+        <p><code>*.nwb</code> via <code>/units/spike_times</code> and the electrodes table; <code>rez.mat</code> via <code>rez/st3</code> and <code>rez/ops</code>. Both gated behind <code>--features hdf5</code>.</p>
+      </article>
+      <article class="backend">
+        <h3>Recording sources</h3>
+        <p>SpikeGLX <code>.bin</code>+<code>.meta</code>, Open Ephys <code>continuous.dat</code>+<code>structure.oebin</code>, and Mountainsort MDA plug in via <code>--dat</code>, <code>--spikeglx-meta</code>, <code>--oebin</code>.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
 {% if section.extra.install %}
 <section class="quick-install" aria-labelledby="install-heading">
   <div class="section-inner install-inner">
     <div>
-      <h2 id="install-heading">Build Sorrel</h2>
-      <p>Compile the release binary from the Rust workspace.</p>
+      <h2 id="install-heading">Build &amp; Run</h2>
+      <p>Compile the release binary, then point it at a sorting directory — Sorrel auto-detects the backend.</p>
     </div>
-    <pre><code>{{ section.extra.install }}</code></pre>
+    <pre><code>{{ section.extra.install }}
+sorrel my_run/phy</code></pre>
   </div>
 </section>
 {% endif %}

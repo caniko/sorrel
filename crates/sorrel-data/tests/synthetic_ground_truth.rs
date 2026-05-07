@@ -36,17 +36,17 @@ impl DataProvider for GroundTruth {
     fn n_samples(&self) -> SampleIndex { self.n_samples }
     fn n_clusters(&self) -> u32 { self.spikes.len() as u32 }
     fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
-        self.spikes.get(c as usize).map(Vec::as_slice).unwrap_or(&[])
+        self.spikes.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
     }
     fn trace(&self, _: SampleIndex, _: u32) -> TraceSlice<'_> {
-        TraceSlice { start: 0, n_channels: 1, samples: TraceSamples::I16(&[]) }
+        TraceSlice { start: SampleIndex(0), n_channels: 1, samples: TraceSamples::I16(&[]) }
     }
     fn initial_labels(&self) -> Vec<u8> { vec![0; self.spikes.len()] }
 }
 
 impl HasAmplitudes for GroundTruth {
     fn spike_amplitudes(&self, c: ClusterId) -> &[f32] {
-        self.amps.get(c as usize).map(Vec::as_slice).unwrap_or(&[])
+        self.amps.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
     }
 }
 
@@ -106,10 +106,10 @@ fn build_ground_truth() -> GroundTruth {
             last = t;
             let amp = 5.0 + 0.3 * gaussian(&mut seed);
             if emitted % 2 == 0 {
-                times_a.push(t);
+                times_a.push(SampleIndex(t));
                 amps_a.push(amp);
             } else {
-                times_b.push(t);
+                times_b.push(SampleIndex(t));
                 amps_b.push(amp);
             }
             emitted += 1;
@@ -126,7 +126,7 @@ fn build_ground_truth() -> GroundTruth {
     let mut which = 0;
     let isi_c = 300_u64; // 10 ms at 30 kHz
     while t < n_samples {
-        times_c.push(t);
+        times_c.push(SampleIndex(t));
         let amp = if which % 2 == 0 {
             3.0 + 0.4 * gaussian(&mut seed)
         } else {
@@ -143,7 +143,7 @@ fn build_ground_truth() -> GroundTruth {
     let mut amps_d = Vec::new();
     t = 200;
     while t < n_samples {
-        times_d.push(t);
+        times_d.push(SampleIndex(t));
         amps_d.push(6.0 + 0.3 * gaussian(&mut seed));
         t += isi_d;
     }
@@ -151,7 +151,7 @@ fn build_ground_truth() -> GroundTruth {
     GroundTruth {
         spikes: vec![times_a, times_b, times_c, times_d],
         amps: vec![amps_a, amps_b, amps_c, amps_d],
-        n_samples,
+        n_samples: SampleIndex(n_samples),
     }
 }
 
@@ -171,7 +171,7 @@ fn merge_suggester_picks_secretly_same_neuron_pair() {
     assert!(!merges.is_empty(), "expected at least one merge candidate");
     let top = &merges[0];
     let pair = (top.a.min(top.b), top.a.max(top.b));
-    assert_eq!(pair, (0, 1), "expected (0,1) to be the top pair, got {pair:?}");
+    assert_eq!(pair, (ClusterId(0), ClusterId(1)), "expected (0,1) to be the top pair, got {pair:?}");
     assert!(top.score > 0.5, "top merge score {} is too low", top.score);
     // The CCG dip z-score should be unambiguously positive.
     assert!(top.ccg_dip_z > 2.0, "weak dip z = {}", top.ccg_dip_z);
@@ -185,7 +185,7 @@ fn merge_suggester_does_not_propose_isolated_cluster() {
     // Cluster 3 is well-isolated; if it appears it must be at the bottom
     // and below 0.5.
     for m in &merges {
-        if m.a == 3 || m.b == 3 {
+        if m.a == ClusterId(3) || m.b == ClusterId(3) {
             assert!(
                 m.score < 0.5,
                 "cluster 3 (isolated) shouldn't rank with score {}",
@@ -203,7 +203,7 @@ fn split_suggester_flags_bimodal_overmerge() {
     assert!(!splits.is_empty(), "expected the bimodal cluster to be flagged");
     // Cluster 2 must rank first.
     assert_eq!(
-        splits[0].cluster, 2,
+        splits[0].cluster, ClusterId(2),
         "expected c2 to top, got c{}",
         splits[0].cluster
     );
@@ -231,7 +231,7 @@ fn split_suggester_does_not_flag_isolated_cluster() {
     let splits = rank_split_candidates(&sess, &cfg);
     for s in &splits {
         assert_ne!(
-            s.cluster, 3,
+            s.cluster, ClusterId(3),
             "cluster 3 (isolated) should not be in split candidates"
         );
     }

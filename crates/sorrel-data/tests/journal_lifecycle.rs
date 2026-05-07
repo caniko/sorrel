@@ -43,20 +43,20 @@ impl DataProvider for Stub {
         1
     }
     fn n_samples(&self) -> SampleIndex {
-        0
+        SampleIndex(0)
     }
     fn n_clusters(&self) -> u32 {
         self.spikes.len() as u32
     }
     fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
         self.spikes
-            .get(c as usize)
+            .get(c.idx())
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
     fn trace(&self, _: SampleIndex, _: u32) -> TraceSlice<'_> {
         TraceSlice {
-            start: 0,
+            start: SampleIndex(0),
             n_channels: 0,
             samples: TraceSamples::I16(&[]),
         }
@@ -79,7 +79,7 @@ impl ApplyPhyLabel for Stub {
 
 fn fixture_provider() -> Stub {
     Stub {
-        spikes: vec![vec![10, 30, 150], vec![20, 200], vec![100]],
+        spikes: vec![vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)], vec![SampleIndex(20), SampleIndex(200)], vec![SampleIndex(100)]],
     }
 }
 
@@ -104,10 +104,10 @@ fn journal_round_trips_across_session_reopen() {
         pre_assignment = session.cluster_index().spike_clusters().to_vec();
 
         session
-            .dispatch(CurationCommand::Merge { sources: vec![0], target: 2 })
+            .dispatch(CurationCommand::Merge { sources: vec![ClusterId(0)], target: ClusterId(2) })
             .unwrap();
         session
-            .dispatch(CurationCommand::Relabel { cluster: 1, op: PhyLabelOp::SetMua })
+            .dispatch(CurationCommand::Relabel { cluster: ClusterId(1), op: PhyLabelOp::SetMua })
             .unwrap();
 
         merged_assignment = session.cluster_index().spike_clusters().to_vec();
@@ -125,7 +125,7 @@ fn journal_round_trips_across_session_reopen() {
         &merged_assignment[..],
         "cross-session replay didn't reach the same state"
     );
-    assert_eq!(session.label(1), Some(2u8)); // Mua
+    assert_eq!(session.label(ClusterId(1)), Some(2u8)); // Mua
 }
 
 /// Same invariant under a longer history: 10 alternating merge/relabel
@@ -140,19 +140,19 @@ fn journal_round_trips_a_long_history() {
     {
         let provider = Stub {
             spikes: (0..10)
-                .map(|c| (0..20).map(|i| (c * 100 + i) as SampleIndex).collect())
+                .map(|c| (0..20).map(|i| SampleIndex((c * 100 + i) as u64)).collect())
                 .collect(),
         };
         let journal = Journal::open_or_create(&journal_path, 0xCAFE, 10).unwrap();
         let mut session = Session::new(provider, journal);
         original = session.cluster_index().spike_clusters().to_vec();
 
-        for c in 0..9u32 {
+        for c in (0..9u32).map(ClusterId) {
             session
                 .dispatch(CurationCommand::Relabel { cluster: c, op: PhyLabelOp::SetGood })
                 .unwrap();
             session
-                .dispatch(CurationCommand::Merge { sources: vec![c], target: c + 1 })
+                .dispatch(CurationCommand::Merge { sources: vec![c], target: ClusterId(c.0 + 1) })
                 .unwrap();
         }
         final_state = session.cluster_index().spike_clusters().to_vec();
@@ -161,7 +161,7 @@ fn journal_round_trips_a_long_history() {
 
     let provider = Stub {
         spikes: (0..10)
-            .map(|c| (0..20).map(|i| (c * 100 + i) as SampleIndex).collect())
+            .map(|c| (0..20).map(|i| SampleIndex((c * 100 + i) as u64)).collect())
             .collect(),
     };
     let journal = Journal::open_or_create(&journal_path, 0xCAFE, 10).unwrap();
@@ -186,7 +186,7 @@ fn journal_history_exposes_merge_descendants_pairs() {
     let mut session = Session::new(provider, journal);
 
     session
-        .dispatch(CurationCommand::Merge { sources: vec![0, 1], target: 2 })
+        .dispatch(CurationCommand::Merge { sources: vec![ClusterId(0), ClusterId(1)], target: ClusterId(2) })
         .unwrap();
 
     // Walk history, derive descendants pairs the same way phy's
@@ -199,7 +199,7 @@ fn journal_history_exposes_merge_descendants_pairs() {
             }
         }
     }
-    assert_eq!(descendants, vec![(0u32, 2u32), (1, 2)]);
+    assert_eq!(descendants, vec![(ClusterId(0), ClusterId(2)), (ClusterId(1), ClusterId(2))]);
 }
 
 /// Multi-step lineage walk: trace cluster 2's history through
@@ -209,24 +209,24 @@ fn journal_history_supports_lineage_chain_walk() {
     let dir = tempfile::tempdir().unwrap();
     let journal_path = dir.path().join("sorrel.journal");
     let provider = Stub {
-        spikes: (0..5).map(|c| vec![c as u64 * 100]).collect(),
+        spikes: (0..5).map(|c| vec![SampleIndex(c as u64 * 100)]).collect(),
     };
     let journal = Journal::open_or_create(&journal_path, 0, 5).unwrap();
     let mut session = Session::new(provider, journal);
 
     // 0 → 1 → 2 → 3: chained merges.
     session
-        .dispatch(CurationCommand::Merge { sources: vec![0], target: 1 })
+        .dispatch(CurationCommand::Merge { sources: vec![ClusterId(0)], target: ClusterId(1) })
         .unwrap();
     session
-        .dispatch(CurationCommand::Merge { sources: vec![1], target: 2 })
+        .dispatch(CurationCommand::Merge { sources: vec![ClusterId(1)], target: ClusterId(2) })
         .unwrap();
     session
-        .dispatch(CurationCommand::Merge { sources: vec![2], target: 3 })
+        .dispatch(CurationCommand::Merge { sources: vec![ClusterId(2)], target: ClusterId(3) })
         .unwrap();
 
     // Trace what 0 became by walking forward through merges.
-    let mut current = 0u32;
+    let mut current = ClusterId(0);
     for cmd in session.history_commands() {
         if let CurationCommand::Merge { sources, target } = cmd {
             if sources.contains(&current) {
@@ -234,7 +234,7 @@ fn journal_history_supports_lineage_chain_walk() {
             }
         }
     }
-    assert_eq!(current, 3, "cluster 0 was eventually merged into 3");
+    assert_eq!(current, ClusterId(3), "cluster 0 was eventually merged into 3");
 }
 
 /// Split lineage: a split records `(source → new_cluster)`. The new id
@@ -249,10 +249,7 @@ fn journal_history_records_split_descendants() {
 
     let n_pre = session.n_clusters();
     session
-        .dispatch(CurationCommand::Split {
-            cluster: 0,
-            spike_idx: vec![1],
-            new_cluster: 0, // ignored — auto-allocated
+        .dispatch(CurationCommand::Split { cluster: ClusterId(0), spike_idx: vec![1], new_cluster: ClusterId(0), // ignored — auto-allocated
         })
         .unwrap();
     let n_post = session.n_clusters();
@@ -276,17 +273,17 @@ fn journal_history_records_split_descendants() {
 fn waveform_extractor_processes_every_in_range_spike() {
     use sorrel_compute::extract_snippets_single_channel;
     let trace: Vec<f32> = (0..10_000).map(|t| t as f32).collect();
-    let spikes: Vec<u64> = (50..9950).step_by(100).map(|t| t as u64).collect();
+    let spikes: Vec<SampleIndex> = (50..9950).step_by(100).map(|t| SampleIndex(t as u64)).collect();
     let pre = 10u32;
     let post = 10u32;
-    let snips = extract_snippets_single_channel(&trace, 0, &spikes, pre, post);
+    let snips = extract_snippets_single_channel(&trace, SampleIndex(0), &spikes, pre, post);
     // Every spike falls inside [pre, len - post - 1] = [10, 9989], so all
     // should produce a snippet.
     assert_eq!(snips.len(), spikes.len());
     for (i, snip) in snips.iter().enumerate() {
         assert_eq!(snip.len(), (pre + post + 1) as usize);
         // Centre sample should equal trace[spike_time].
-        assert_eq!(snip[pre as usize], spikes[i] as f32);
+        assert_eq!(snip[pre as usize], spikes[i].as_f32());
     }
 }
 
@@ -296,10 +293,10 @@ fn waveform_extractor_processes_every_in_range_spike() {
 fn waveform_extractor_handles_non_uniform_spacing() {
     use sorrel_compute::extract_snippets_single_channel;
     let trace: Vec<f32> = (0..1000).map(|t| t as f32).collect();
-    let spikes = [12u64, 47, 63, 250, 251, 252, 999];
+    let spikes: [SampleIndex; 7] = [12, 47, 63, 250, 251, 252, 999].map(SampleIndex);
     let pre = 10u32;
     let post = 10u32;
-    let snips = extract_snippets_single_channel(&trace, 0, &spikes, pre, post);
+    let snips = extract_snippets_single_channel(&trace, SampleIndex(0), &spikes, pre, post);
     // 999 is dropped (window would extend past trace end).
     assert_eq!(snips.len(), spikes.len() - 1);
     for snip in &snips {
@@ -324,10 +321,10 @@ fn save_and_reseal_writes_artifacts_and_clears_journal_history() {
         let journal = Journal::open_or_create(&journal_path, 0, 3).unwrap();
         let mut session = Session::new(provider, journal);
         session
-            .dispatch(CurationCommand::Merge { sources: vec![0], target: 2 })
+            .dispatch(CurationCommand::Merge { sources: vec![ClusterId(0)], target: ClusterId(2) })
             .unwrap();
         session
-            .dispatch(CurationCommand::Relabel { cluster: 1, op: PhyLabelOp::SetMua })
+            .dispatch(CurationCommand::Relabel { cluster: ClusterId(1), op: PhyLabelOp::SetMua })
             .unwrap();
 
         let new_journal =
@@ -354,7 +351,7 @@ fn save_and_reseal_invalidates_old_baseline() {
         let journal = Journal::open_or_create(&journal_path, old_baseline, 3).unwrap();
         let mut session = Session::new(provider, journal);
         session
-            .dispatch(CurationCommand::Merge { sources: vec![0], target: 2 })
+            .dispatch(CurationCommand::Merge { sources: vec![ClusterId(0)], target: ClusterId(2) })
             .unwrap();
 
         save_and_reseal_journal(&session, &root, &journal_path, label_str_u8).unwrap();
@@ -394,7 +391,7 @@ fn external_edit_to_spike_clusters_invalidates_journal() {
         let journal = Journal::open_or_create(&journal_path, initial, 3).unwrap();
         let mut session = Session::new(provider, journal);
         session
-            .dispatch(CurationCommand::Relabel { cluster: 0, op: PhyLabelOp::SetGood })
+            .dispatch(CurationCommand::Relabel { cluster: ClusterId(0), op: PhyLabelOp::SetGood })
             .unwrap();
     }
 
@@ -429,7 +426,7 @@ fn save_to_phy_alone_does_not_touch_journal() {
     let journal = Journal::open_or_create(&journal_path, 0, 3).unwrap();
     let mut session = Session::new(provider, journal);
     session
-        .dispatch(CurationCommand::Merge { sources: vec![0], target: 2 })
+        .dispatch(CurationCommand::Merge { sources: vec![ClusterId(0)], target: ClusterId(2) })
         .unwrap();
     save_to_phy(&session, &root, label_str_u8).unwrap();
 
@@ -452,7 +449,7 @@ fn cluster_index_n_spikes_invariant_under_long_session() {
     let journal_path = dir.path().join("sorrel.journal");
     let provider = Stub {
         spikes: (0..5)
-            .map(|c| (0..10).map(|i| (c * 100 + i) as SampleIndex).collect())
+            .map(|c| (0..10).map(|i| SampleIndex((c * 100 + i) as u64)).collect())
             .collect(),
     };
     let total_spikes = 5 * 10;
@@ -461,9 +458,9 @@ fn cluster_index_n_spikes_invariant_under_long_session() {
     assert_eq!(session.cluster_index().n_spikes(), total_spikes);
 
     for round in 0..3 {
-        for c in 0..4u32 {
+        for c in (0..4u32).map(ClusterId) {
             session
-                .dispatch(CurationCommand::Merge { sources: vec![c], target: c + 1 })
+                .dispatch(CurationCommand::Merge { sources: vec![c], target: ClusterId(c.0 + 1) })
                 .unwrap();
         }
         let n = session.cluster_index().n_spikes();

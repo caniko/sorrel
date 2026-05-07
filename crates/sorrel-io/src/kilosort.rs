@@ -101,8 +101,7 @@ pub struct KilosortProvider {
     // `cluster_*.tsv` (phy convention) or `quality_metrics.csv`
     // (SpikeInterface). One column per metric, length == n_clusters,
     // NaN where the upstream tool reports nothing.
-    metric_names: Vec<String>,
-    metrics: HashMap<String, Vec<f32>>,
+    metrics: crate::extras::QualityMetrics,
 
     // Raw byte view of the trace mmap *after* `offset` has been applied.
     // We cast at access time based on `dtype`.
@@ -228,8 +227,11 @@ impl KilosortProvider {
         let channel_positions = read_optional_positions(&root.join("channel_positions.npy"))?;
         let channel_shanks =
             read_optional_u32_1d(&root.join("channel_shanks.npy"), 0)?.unwrap_or_default();
-        let channel_map =
-            read_optional_u32_1d(&root.join("channel_map.npy"), 0)?.unwrap_or_default();
+        let channel_map: Vec<ChannelId> = read_optional_u32_1d(&root.join("channel_map.npy"), 0)?
+            .unwrap_or_default()
+            .into_iter()
+            .map(ChannelId)
+            .collect();
 
         // 2.6. PC features. Both files are optional but we need both or
         // neither — having pc_features without pc_feature_ind makes the
@@ -248,8 +250,7 @@ impl KilosortProvider {
         //   - phy:  one `cluster_<metric>.tsv` per metric.
         //   - SI:   a single `quality_metrics.csv` with one row per cluster.
         // We accept both; SI's CSV wins when both are present.
-        let (metric_names, metrics) =
-            load_quality_metrics(&root, n_clusters);
+        let metrics = load_quality_metrics(&root, n_clusters);
 
         // 3. Raw recording.
         let dat_rel = overrides
@@ -282,7 +283,7 @@ impl KilosortProvider {
                 dtype.size_bytes()
             );
         }
-        let n_samples = (payload_bytes / bytes_per_sample) as u64;
+        let n_samples = SampleIndex((payload_bytes / bytes_per_sample) as u64);
         // SAFETY: pointer arithmetic stays inside the mmap; we just verified
         // `offset <= total_bytes`.
         let trace_ptr = unsafe { trace_mmap.as_ptr().add(offset as usize) };
@@ -311,7 +312,6 @@ impl KilosortProvider {
             template_waveforms,
             template_shape,
             similar_templates,
-            metric_names,
             metrics,
             trace_ptr,
             trace_byte_len,
@@ -320,7 +320,7 @@ impl KilosortProvider {
 
     fn samples_window(&self, start: SampleIndex, len: u32) -> TraceSamples<'_> {
         let nc = self.n_channels as usize;
-        let s = (start as usize).saturating_mul(nc);
+        let s = start.idx().saturating_mul(nc);
         let e = s + (len as usize) * nc;
         let bytes = unsafe { std::slice::from_raw_parts(self.trace_ptr, self.trace_byte_len) };
         TraceSamples::from_bytes_clamped(bytes, self.dtype, s, e)
@@ -354,7 +354,7 @@ impl DataProvider for KilosortProvider {
     #[inline]
     fn spike_times(&self, cluster: ClusterId) -> &[SampleIndex] {
         self.spikes_per_cluster
-            .get(cluster as usize)
+            .get(cluster.idx())
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
@@ -396,7 +396,7 @@ impl HasAmplitudes for KilosortProvider {
     #[inline]
     fn spike_amplitudes(&self, cluster: ClusterId) -> &[f32] {
         self.amps_per_cluster
-            .get(cluster as usize)
+            .get(cluster.idx())
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
@@ -406,7 +406,7 @@ impl HasSpikeTemplates for KilosortProvider {
     #[inline]
     fn spike_templates(&self, cluster: ClusterId) -> &[u32] {
         self.templates_per_cluster
-            .get(cluster as usize)
+            .get(cluster.idx())
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
@@ -428,7 +428,7 @@ impl HasPcFeatures for KilosortProvider {
     #[inline]
     fn spike_pc_indices(&self, cluster: ClusterId) -> &[u32] {
         self.pc_indices_per_cluster
-            .get(cluster as usize)
+            .get(cluster.idx())
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
@@ -451,12 +451,8 @@ impl crate::extras::HasTemplateWaveforms for KilosortProvider {
 
 impl HasQualityMetrics for KilosortProvider {
     #[inline]
-    fn metric_names(&self) -> &[String] {
-        &self.metric_names
-    }
-    #[inline]
-    fn metric_values(&self, name: &str) -> Option<&[f32]> {
-        self.metrics.get(name).map(Vec::as_slice)
+    fn quality_metrics(&self) -> &crate::extras::QualityMetrics {
+        &self.metrics
     }
 }
 
@@ -464,11 +460,8 @@ impl HasQualityMetrics for KilosortProvider {
 /// `quality_metrics.csv` first, then falls back to phy's per-metric
 /// `cluster_<metric>.tsv` files. Always returns the metric list sorted by
 /// name so the cluster-table column order is deterministic.
-fn load_quality_metrics(
-    root: &Path,
-    n_clusters: usize,
-) -> (Vec<String>, HashMap<String, Vec<f32>>) {
-    let mut metrics: HashMap<String, Vec<f32>> = HashMap::new();
+fn load_quality_metrics(root: &Path, n_clusters: usize) -> crate::extras::QualityMetrics {
+    let mut metrics = crate::extras::QualityMetrics::new();
 
     // SI: single CSV with header row, first column is unit id.
     let si_path = root.join("quality_metrics.csv");
@@ -495,7 +488,7 @@ fn load_quality_metrics(
             {
                 continue;
             }
-            if metrics.contains_key(stripped) {
+            if metrics.contains(stripped) {
                 continue; // SI CSV took precedence.
             }
             if let Ok(text) = std::fs::read_to_string(entry.path()) {
@@ -506,16 +499,11 @@ fn load_quality_metrics(
         }
     }
 
-    let mut names: Vec<String> = metrics.keys().cloned().collect();
-    names.sort();
-    (names, metrics)
+    metrics.sort_by_name();
+    metrics
 }
 
-fn ingest_si_metrics_csv(
-    text: &str,
-    n_clusters: usize,
-    out: &mut HashMap<String, Vec<f32>>,
-) {
+fn ingest_si_metrics_csv(text: &str, n_clusters: usize, out: &mut crate::extras::QualityMetrics) {
     let mut lines = text.lines();
     let Some(header) = lines.next() else {
         return;
@@ -526,8 +514,9 @@ fn ingest_si_metrics_csv(
     }
     let metric_cols: Vec<String> = cols[1..].iter().map(|s| s.trim().to_string()).collect();
     for name in &metric_cols {
-        out.entry(name.clone())
-            .or_insert_with(|| vec![f32::NAN; n_clusters]);
+        if !out.contains(name) {
+            out.insert(name.clone(), vec![f32::NAN; n_clusters]);
+        }
     }
     for line in lines {
         let cells: Vec<&str> = line.split(',').collect();
@@ -737,33 +726,28 @@ fn read_int_array<T>(
 ) -> Result<Vec<T>> {
     let off = hdr.data_offset as usize;
     let bytes = &mmap[off..];
-    match hdr.dtype.as_str() {
-        "<i4" | "<u4" | "<i32" | "<u32" => {
-            let need = n * 4;
-            if bytes.len() < need {
-                bail!("{label} truncated");
-            }
-            Ok(bytes[..need]
-                .chunks_exact(4)
-                .map(|c| from32(u32::from_le_bytes(c.try_into().unwrap())))
-                .collect())
-        }
-        "<i8" | "<u8" | "<i64" | "<u64" => {
-            let need = n * 8;
-            if bytes.len() < need {
-                bail!("{label} truncated");
-            }
-            Ok(bytes[..need]
-                .chunks_exact(8)
-                .map(|c| from64(u64::from_le_bytes(c.try_into().unwrap())))
-                .collect())
-        }
-        d => bail!("unsupported {label} dtype {d}"),
+    let dtype = crate::npy::NpyDtype::parse(&hdr.dtype)
+        .with_context(|| format!("{label} dtype"))?;
+    let elem = dtype.size_bytes();
+    let need = n * elem;
+    if bytes.len() < need {
+        bail!("{label} truncated");
+    }
+    let chunks = bytes[..need].chunks_exact(elem);
+    use crate::npy::NpyDtype as D;
+    match dtype {
+        D::I32 | D::U32 => Ok(chunks
+            .map(|c| from32(u32::from_le_bytes(c.try_into().unwrap())))
+            .collect()),
+        D::I64 | D::U64 => Ok(chunks
+            .map(|c| from64(u64::from_le_bytes(c.try_into().unwrap())))
+            .collect()),
+        d => bail!("unsupported {label} dtype {d:?}"),
     }
 }
 
 fn read_u64_array(mmap: &Mmap, hdr: &NpyHeader, n: usize) -> Result<Vec<SampleIndex>> {
-    read_int_array(mmap, hdr, n, "spike_times", u64::from, |v| v)
+    read_int_array(mmap, hdr, n, "spike_times", |v| SampleIndex(v as u64), SampleIndex)
 }
 
 fn read_u32_array(mmap: &Mmap, hdr: &NpyHeader, n: usize) -> Result<Vec<u32>> {
@@ -797,6 +781,7 @@ fn load_cluster_groups(path: &Path, n_clusters: usize) -> Vec<PhyLabel> {
 /// Convenience: count spikes per cluster (mostly for tests / status bars).
 pub fn spike_counts<P: DataProvider>(p: &P) -> HashMap<ClusterId, usize> {
     (0..p.n_clusters())
+        .map(ClusterId)
         .map(|c| (c, p.spike_times(c).len()))
         .collect()
 }

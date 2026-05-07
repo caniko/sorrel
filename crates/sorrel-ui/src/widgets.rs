@@ -5,7 +5,7 @@ use sorrel_compute::quality_breakdown;
 use sorrel_data::Session;
 use sorrel_io::{ClusterId, DataProvider};
 use sorrel_render::{
-    build_trace_vertices_cfg, build_trace_vertices_gpu, GpuTracePreproc, TraceConfig,
+    build_trace_vertices_cfg, build_trace_vertices_gpu, GpuTracePreproc, TracePreproc,
     TraceVertex,
 };
 
@@ -72,12 +72,13 @@ impl ClusterTableState {
         use rayon::prelude::*;
         let out: Vec<f32> = (0..session.n_clusters())
             .into_par_iter()
+            .map(ClusterId)
             .map(|c| {
                 let q = quality_breakdown(
                     session.spike_times(c),
                     session.spike_amplitudes(c),
                     refractory_samples,
-                    total_duration,
+                    total_duration.0,
                     sr,
                     50,
                 );
@@ -90,7 +91,7 @@ impl ClusterTableState {
 
     fn quality_for(&self, c: ClusterId) -> f32 {
         self.quality_cache
-            .get(c as usize)
+            .get(c.idx())
             .copied()
             .unwrap_or(f32::NAN)
     }
@@ -154,6 +155,7 @@ pub fn cluster_table<P, F>(
     let n = session.n_clusters();
     let filter = state.filter_text.trim();
     let mut visible: Vec<ClusterId> = (0..n)
+        .map(ClusterId)
         .filter(|&i| {
             if state.hide_empty && session.spike_times(i).is_empty() {
                 return false;
@@ -179,7 +181,7 @@ pub fn cluster_table<P, F>(
             mean_amplitude(amps) as f64
         };
         let primary = match state.sort_by {
-            ClusterColumn::Id => c as f64,
+            ClusterColumn::Id => c.as_f64(),
             ClusterColumn::SpikeCount => session.spike_times(c).len() as f64,
             ClusterColumn::Amplitude => amp_mean,
             ClusterColumn::IsiViolations => {
@@ -194,7 +196,7 @@ pub fn cluster_table<P, F>(
         // Encode as (i64, f64) so we can sort with stable secondary on id.
         // We pack the primary into f64 and use id as the tie-breaker
         // (only matters when primary is equal across rows).
-        (c as i64, primary)
+        (c.as_i64(), primary)
     };
 
     visible.sort_by(|&a, &b| {
@@ -348,7 +350,7 @@ pub fn trace_view<P: DataProvider>(
     window_start: u64,
     window_len: u32,
     target_points: usize,
-    cfg: TraceConfig,
+    cfg: TracePreproc,
     gpu: Option<&GpuTracePreproc>,
 ) {
     let avail = ui.available_size();
@@ -361,6 +363,7 @@ pub fn trace_view<P: DataProvider>(
         return;
     }
 
+    let window_start = sorrel_io::SampleIndex(window_start);
     let verts: Vec<TraceVertex> = match gpu {
         Some(g) => build_trace_vertices_gpu(session, window_start, window_len, target_points, cfg, g),
         None => build_trace_vertices_cfg(session, window_start, window_len, target_points, cfg),

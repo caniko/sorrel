@@ -42,7 +42,7 @@ fn time_amp_covariance(
 ///
 /// Returns 0 for fewer than 3 spikes.
 pub fn amplitude_drift_correlation(times: &[SampleIndex], amps: &[f32]) -> f32 {
-    let Some((num, denom_t, denom_a)) = time_amp_covariance(times, amps, |t| t as f64) else {
+    let Some((num, denom_t, denom_a)) = time_amp_covariance(times, amps, |t| t.as_f64()) else {
         return 0.0;
     };
     if denom_t <= 0.0 || denom_a <= 0.0 {
@@ -64,7 +64,7 @@ pub fn amplitude_drift_slope(
         return 0.0;
     }
     let inv_sr = 1.0_f64 / sample_rate as f64;
-    let Some((num, denom_t, _)) = time_amp_covariance(times, amps, |t| t as f64 * inv_sr) else {
+    let Some((num, denom_t, _)) = time_amp_covariance(times, amps, |t| t.as_f64() * inv_sr) else {
         return 0.0;
     };
     if denom_t <= 0.0 {
@@ -83,7 +83,7 @@ pub fn presence_cv(times: &[SampleIndex], total_duration_samples: u64, n_bins: u
     let bin_width = (total_duration_samples as f64 / n_bins as f64).max(1.0);
     let mut counts = vec![0u32; n_bins];
     for &t in times {
-        let idx = ((t as f64) / bin_width) as usize;
+        let idx = ((t.as_f64()) / bin_width) as usize;
         if idx < n_bins {
             counts[idx] += 1;
         }
@@ -123,12 +123,12 @@ pub fn sliding_refractory_contamination(
         let lo = w as u64 * win_samples;
         let hi = lo + win_samples;
         // Advance to the first spike inside this window.
-        while idx < times.len() && times[idx] < lo {
+        while idx < times.len() && times[idx].0 < lo {
             idx += 1;
         }
         let start = idx;
         let mut end = idx;
-        while end < times.len() && times[end] < hi {
+        while end < times.len() && times[end].0 < hi {
             end += 1;
         }
         let centre_s = (lo as f32 + win_samples as f32 * 0.5) * inv_sr;
@@ -158,11 +158,11 @@ pub fn longest_silent_gap_frac(
         return 1.0;
     }
     let total = total_duration_samples;
-    let first = times[0];
-    let last = *times.last().unwrap();
+    let first = times[0].0;
+    let last = times.last().unwrap().0;
     let mut max_gap = first.max(total.saturating_sub(last));
     for w in times.windows(2) {
-        let g = w[1].saturating_sub(w[0]);
+        let g = w[1].0.saturating_sub(w[0].0);
         if g > max_gap {
             max_gap = g;
         }
@@ -174,16 +174,20 @@ pub fn longest_silent_gap_frac(
 mod tests {
     use super::*;
 
+    fn si(xs: impl IntoIterator<Item = u64>) -> Vec<SampleIndex> {
+        xs.into_iter().map(SampleIndex).collect()
+    }
+
     #[test]
     fn drift_correlation_zero_for_constant_amplitude() {
-        let times: Vec<u64> = (0..100).map(|i| i as u64 * 10).collect();
+        let times = si((0..100).map(|i| i as u64 * 10));
         let amps = vec![5.0_f32; 100];
         assert_eq!(amplitude_drift_correlation(&times, &amps), 0.0);
     }
 
     #[test]
     fn drift_correlation_positive_for_rising_amplitude() {
-        let times: Vec<u64> = (0..100).map(|i| i as u64 * 10).collect();
+        let times = si((0..100).map(|i| i as u64 * 10));
         let amps: Vec<f32> = (0..100).map(|i| i as f32 * 0.1).collect();
         assert!(amplitude_drift_correlation(&times, &amps) > 0.99);
     }
@@ -191,12 +195,12 @@ mod tests {
     #[test]
     fn drift_correlation_handles_short_inputs() {
         assert_eq!(amplitude_drift_correlation(&[], &[]), 0.0);
-        assert_eq!(amplitude_drift_correlation(&[1, 2], &[3.0, 4.0]), 0.0);
+        assert_eq!(amplitude_drift_correlation(&si([1, 2]), &[3.0, 4.0]), 0.0);
     }
 
     #[test]
     fn drift_slope_zero_for_flat_amplitude() {
-        let times: Vec<u64> = (0..50).map(|i| i as u64 * 1000).collect();
+        let times = si((0..50).map(|i| i as u64 * 1000));
         let amps = vec![2.0_f32; 50];
         assert_eq!(amplitude_drift_slope(&times, &amps, 1000.0), 0.0);
     }
@@ -204,7 +208,7 @@ mod tests {
     #[test]
     fn drift_slope_positive_for_rising_amplitude() {
         // 1 spike per second, amplitude = 0.5 * t.
-        let times: Vec<u64> = (0..50).map(|i| i as u64 * 1000).collect();
+        let times = si((0..50).map(|i| i as u64 * 1000));
         let amps: Vec<f32> = (0..50).map(|i| i as f32 * 0.5).collect();
         let slope = amplitude_drift_slope(&times, &amps, 1000.0);
         assert!((slope - 0.5).abs() < 1e-3);
@@ -214,10 +218,10 @@ mod tests {
     fn presence_cv_zero_for_uniform_spike_train() {
         // 10 bins of width 100; place exactly 5 spikes inside each bin so all
         // counts are identical regardless of binning rounding.
-        let mut times = Vec::new();
+        let mut times: Vec<SampleIndex> = Vec::new();
         for bin in 0..10 {
             for k in 0..5 {
-                times.push((bin * 100 + 10 + k * 15) as u64);
+                times.push(SampleIndex((bin * 100 + 10 + k * 15) as u64));
             }
         }
         assert!(presence_cv(&times, 1000, 10) < 1e-6);
@@ -226,7 +230,7 @@ mod tests {
     #[test]
     fn presence_cv_high_for_bursty_train() {
         // All spikes packed into 1 bin out of 10.
-        let times: Vec<u64> = (0..100).map(|i| i as u64).collect();
+        let times = si(0..100);
         assert!(presence_cv(&times, 1000, 10) > 1.0);
     }
 
@@ -237,7 +241,7 @@ mod tests {
 
     #[test]
     fn longest_silent_gap_picks_largest_inter_spike_gap() {
-        let times = [0u64, 100, 900];
+        let times = si([0u64, 100, 900]);
         // Gaps: 0 (lead), 100, 800, 100 (trail). max=800/1000=0.8
         let g = longest_silent_gap_frac(&times, 1000);
         assert!((g - 0.8).abs() < 1e-6);
@@ -247,7 +251,7 @@ mod tests {
     fn sliding_contamination_returns_one_row_per_window() {
         // 100 spikes evenly spaced, no contamination — every window should
         // be finite and zero.
-        let times: Vec<u64> = (0..100).map(|i| i as u64 * 100).collect();
+        let times = si((0..100).map(|i| i as u64 * 100));
         let s = sliding_refractory_contamination(&times, 10, 10_000, 1000.0, 5, 5);
         assert_eq!(s.len(), 5);
         for (_, c) in &s {
@@ -259,7 +263,7 @@ mod tests {
     #[test]
     fn sliding_contamination_marks_low_count_windows_nan() {
         // Single spike. Most windows have 0 spikes — they should report NaN.
-        let times = [500_u64];
+        let times = si([500_u64]);
         let s = sliding_refractory_contamination(&times, 10, 10_000, 1000.0, 5, 2);
         assert_eq!(s.len(), 5);
         let nan_count = s.iter().filter(|(_, c)| c.is_nan()).count();
@@ -274,7 +278,7 @@ mod tests {
 
     #[test]
     fn longest_silent_gap_includes_pre_first_and_post_last() {
-        let times = [400u64, 500];
+        let times = si([400u64, 500]);
         // Pre-first = 400, post-last = 500, internal = 100. max = 500.
         let g = longest_silent_gap_frac(&times, 1000);
         assert!((g - 0.5).abs() < 1e-6);
@@ -282,7 +286,7 @@ mod tests {
 
     #[test]
     fn drift_correlation_handles_constant_times() {
-        let times = vec![100u64; 10];
+        let times = vec![SampleIndex(100); 10];
         let amps = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0];
         let r = amplitude_drift_correlation(&times, &amps);
         assert!(r.is_finite() && r.abs() < 1e-3);
@@ -290,7 +294,7 @@ mod tests {
 
     #[test]
     fn drift_correlation_negative_for_falling_amplitude() {
-        let times: Vec<u64> = (0..50).map(|i| i as u64 * 1000).collect();
+        let times = si((0..50).map(|i| i as u64 * 1000));
         let amps: Vec<f32> = (0..50).map(|i| 100.0 - i as f32 * 0.5).collect();
         let r = amplitude_drift_correlation(&times, &amps);
         assert!(r < -0.9, "expected strong negative correlation, got {r}");
@@ -299,7 +303,7 @@ mod tests {
     #[test]
     fn drift_correlation_in_unit_range() {
         // Random-looking input — r must remain in [-1, 1].
-        let times: Vec<u64> = (0..100).map(|i| i as u64 * 1000).collect();
+        let times = si((0..100).map(|i| i as u64 * 1000));
         let amps: Vec<f32> = (0..100).map(|i| ((i * 17) % 50) as f32).collect();
         let r = amplitude_drift_correlation(&times, &amps);
         assert!((-1.0..=1.0).contains(&r), "r={r} out of [-1, 1]");
@@ -308,12 +312,12 @@ mod tests {
     #[test]
     fn drift_slope_handles_short_inputs() {
         assert_eq!(amplitude_drift_slope(&[], &[], 1000.0), 0.0);
-        assert_eq!(amplitude_drift_slope(&[100], &[1.0], 1000.0), 0.0);
+        assert_eq!(amplitude_drift_slope(&si([100]), &[1.0], 1000.0), 0.0);
     }
 
     #[test]
     fn drift_slope_handles_zero_or_negative_sample_rate() {
-        let times: Vec<u64> = (0..10).map(|i| i as u64).collect();
+        let times = si(0..10);
         let amps: Vec<f32> = (0..10).map(|i| i as f32).collect();
         assert_eq!(amplitude_drift_slope(&times, &amps, 0.0), 0.0);
         assert_eq!(amplitude_drift_slope(&times, &amps, -1.0), 0.0);
@@ -321,7 +325,7 @@ mod tests {
 
     #[test]
     fn drift_slope_negative_for_falling_amplitude() {
-        let times: Vec<u64> = (0..50).map(|i| i as u64 * 1000).collect();
+        let times = si((0..50).map(|i| i as u64 * 1000));
         let amps: Vec<f32> = (0..50).map(|i| -0.5 * i as f32).collect();
         let slope = amplitude_drift_slope(&times, &amps, 1000.0);
         assert!((slope + 0.5).abs() < 1e-3);
@@ -330,13 +334,13 @@ mod tests {
     #[test]
     fn presence_cv_zero_inputs_return_finite() {
         assert!(presence_cv(&[], 1000, 10).is_finite());
-        assert!(presence_cv(&[1, 2, 3], 0, 10).is_finite());
-        assert!(presence_cv(&[1, 2, 3], 1000, 0).is_finite());
+        assert!(presence_cv(&si([1, 2, 3]), 0, 10).is_finite());
+        assert!(presence_cv(&si([1, 2, 3]), 1000, 0).is_finite());
     }
 
     #[test]
     fn longest_silent_gap_zero_total_returns_finite() {
-        let g = longest_silent_gap_frac(&[100], 0);
+        let g = longest_silent_gap_frac(&si([100]), 0);
         assert!(g.is_finite());
     }
 
@@ -344,10 +348,10 @@ mod tests {
     #[test]
     fn longest_silent_gap_in_unit_range() {
         for (times, total) in [
-            (vec![0u64, 100, 200], 1000u64),
-            (vec![500u64], 1000u64),
-            (vec![0u64], 1000u64),
-            (vec![999u64], 1000u64),
+            (si([0u64, 100, 200]), 1000u64),
+            (si([500u64]), 1000u64),
+            (si([0u64]), 1000u64),
+            (si([999u64]), 1000u64),
         ] {
             let g = longest_silent_gap_frac(&times, total);
             assert!(
@@ -361,7 +365,7 @@ mod tests {
     #[test]
     fn presence_cv_is_non_negative() {
         for n_bins in [1usize, 5, 10, 50] {
-            let times: Vec<u64> = (0..50).map(|i| i as u64 * 20).collect();
+            let times = si((0..50).map(|i| i as u64 * 20));
             let cv = presence_cv(&times, 1000, n_bins);
             assert!(cv >= 0.0, "cv={cv} is negative");
         }

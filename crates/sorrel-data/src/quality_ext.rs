@@ -30,7 +30,7 @@ pub fn cluster_quality<P: DataProvider>(
         session.spike_times(cluster),
         session.spike_amplitudes(cluster),
         refractory_samples,
-        total_duration,
+        total_duration.0,
         sr,
         50,
     );

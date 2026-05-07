@@ -37,12 +37,12 @@ fn phy_clustering_provider() -> StubProvider {
         spikes: vec![
             vec![],            // 0
             vec![],            // 1
-            vec![0, 3, 6],     // 2
-            vec![2],           // 3
+            vec![SampleIndex(0), SampleIndex(3), SampleIndex(6)],     // 2
+            vec![SampleIndex(2)],           // 3
             vec![],            // 4
-            vec![1, 5],        // 5
+            vec![SampleIndex(1), SampleIndex(5)],        // 5
             vec![],            // 6
-            vec![4],           // 7
+            vec![SampleIndex(4)],           // 7
         ],
     }
 }
@@ -60,20 +60,20 @@ impl DataProvider for StubProvider {
         1
     }
     fn n_samples(&self) -> SampleIndex {
-        0
+        SampleIndex(0)
     }
     fn n_clusters(&self) -> u32 {
         self.spikes.len() as u32
     }
     fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
         self.spikes
-            .get(c as usize)
+            .get(c.idx())
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
     fn trace(&self, _: SampleIndex, _: u32) -> TraceSlice<'_> {
         TraceSlice {
-            start: 0,
+            start: SampleIndex(0),
             n_channels: 0,
             samples: TraceSamples::I16(&[]),
         }
@@ -114,13 +114,13 @@ fn phy_clustering_merge_consolidates_spike_set() {
     let pre_5 = provider.spikes[5].len();
     let (mut s, _d) = fresh_session_with(provider);
 
-    s.dispatch(CurationCommand::Merge { sources: vec![2], target: 5 })
+    s.dispatch(CurationCommand::Merge { sources: vec![ClusterId(2)], target: ClusterId(5) })
         .unwrap();
 
     // phy: ae(clustering.spikes_per_cluster[11], np.sort(np.r_[spk0, spk1]))
     // sorrel: target's bucket grows by exactly the source's count.
-    assert!(s.spike_times(2).is_empty(), "source emptied");
-    assert_eq!(s.spike_times(5).len(), pre_2 + pre_5);
+    assert!(s.spike_times(ClusterId(2)).is_empty(), "source emptied");
+    assert_eq!(s.spike_times(ClusterId(5)).len(), pre_2 + pre_5);
 }
 
 /// phy: every merge/split must preserve total spike count.
@@ -130,20 +130,19 @@ fn phy_clustering_total_spike_count_is_preserved() {
     let total_pre: usize = provider.spikes.iter().map(Vec::len).sum();
     let (mut s, _d) = fresh_session_with(provider);
 
-    s.dispatch(CurationCommand::Merge { sources: vec![2, 3], target: 5 })
+    s.dispatch(CurationCommand::Merge { sources: vec![ClusterId(2), ClusterId(3)], target: ClusterId(5) })
         .unwrap();
     let total_post: usize = (0..s.n_clusters())
+        .map(ClusterId)
         .map(|c| s.spike_times(c).len())
         .sum();
     assert_eq!(total_pre, total_post);
 
-    s.dispatch(CurationCommand::Split {
-        cluster: 5,
-        spike_idx: vec![0, 1],
-        new_cluster: 0,
+    s.dispatch(CurationCommand::Split { cluster: ClusterId(5), spike_idx: vec![0, 1], new_cluster: ClusterId(0),
     })
     .unwrap();
     let total_post2: usize = (0..s.n_clusters())
+        .map(ClusterId)
         .map(|c| s.spike_times(c).len())
         .sum();
     assert_eq!(total_pre, total_post2);
@@ -160,13 +159,11 @@ fn phy_clustering_undo_redo_round_trips_split() {
     let (mut s, _d) = fresh_session_with(provider);
 
     // First split — capture state.
-    s.dispatch(CurationCommand::Split {
-        cluster: 2,
-        spike_idx: vec![0],
-        new_cluster: 0, // ignored
+    s.dispatch(CurationCommand::Split { cluster: ClusterId(2), spike_idx: vec![0], new_cluster: ClusterId(0), // ignored
     })
     .unwrap();
     let after_split: Vec<Vec<SampleIndex>> = (0..s.n_clusters())
+        .map(ClusterId)
         .map(|c| s.spike_times(c).to_vec())
         .collect();
 
@@ -174,6 +171,7 @@ fn phy_clustering_undo_redo_round_trips_split() {
     s.dispatch(CurationCommand::Redo).unwrap();
 
     let after_redo: Vec<Vec<SampleIndex>> = (0..s.n_clusters())
+        .map(ClusterId)
         .map(|c| s.spike_times(c).to_vec())
         .collect();
     assert_eq!(after_split, after_redo);
@@ -186,7 +184,7 @@ fn phy_clustering_redo_with_empty_stack_is_noop() {
     let provider = phy_clustering_provider();
     let (mut s, _d) = fresh_session_with(provider);
 
-    s.dispatch(CurationCommand::Merge { sources: vec![3], target: 2 })
+    s.dispatch(CurationCommand::Merge { sources: vec![ClusterId(3)], target: ClusterId(2) })
         .unwrap();
     s.dispatch(CurationCommand::Undo).unwrap();
     s.dispatch(CurationCommand::Redo).unwrap();
@@ -203,29 +201,34 @@ fn phy_clustering_multi_step_undo_unwinds_in_reverse() {
     let provider = phy_clustering_provider();
     let (mut s, _d) = fresh_session_with(provider);
     let snapshot0: Vec<Vec<SampleIndex>> = (0..s.n_clusters())
+        .map(ClusterId)
         .map(|c| s.spike_times(c).to_vec())
         .collect();
 
-    s.dispatch(CurationCommand::Merge { sources: vec![3], target: 2 })
+    s.dispatch(CurationCommand::Merge { sources: vec![ClusterId(3)], target: ClusterId(2) })
         .unwrap();
     let snapshot1: Vec<Vec<SampleIndex>> = (0..s.n_clusters())
+        .map(ClusterId)
         .map(|c| s.spike_times(c).to_vec())
         .collect();
 
-    s.dispatch(CurationCommand::Merge { sources: vec![7], target: 5 })
+    s.dispatch(CurationCommand::Merge { sources: vec![ClusterId(7)], target: ClusterId(5) })
         .unwrap();
     let snapshot2: Vec<Vec<SampleIndex>> = (0..s.n_clusters())
+        .map(ClusterId)
         .map(|c| s.spike_times(c).to_vec())
         .collect();
 
     s.dispatch(CurationCommand::Undo).unwrap();
     let after_undo_1: Vec<Vec<SampleIndex>> = (0..s.n_clusters())
+        .map(ClusterId)
         .map(|c| s.spike_times(c).to_vec())
         .collect();
     assert_eq!(after_undo_1, snapshot1);
 
     s.dispatch(CurationCommand::Undo).unwrap();
     let after_undo_2: Vec<Vec<SampleIndex>> = (0..s.n_clusters())
+        .map(ClusterId)
         .map(|c| s.spike_times(c).to_vec())
         .collect();
     assert_eq!(after_undo_2, snapshot0);
@@ -253,8 +256,8 @@ fn phy_waveform_extractor_drops_pre_recording_boundary_spike() {
     // phy uses spikes [5, 25, 100, 1000, 1995]; with 2000-sample window 5
     // and 1995 are at the boundaries. We cap to 1000 here so spikes 5 and
     // 999 are at the boundaries.
-    let spikes = [5u64, 25, 100, 999];
-    let snips = extract_snippets_single_channel(&trace, 0, &spikes, pre, post);
+    let spikes: [SampleIndex; 4] = [5, 25, 100, 999].map(SampleIndex);
+    let snips = extract_snippets_single_channel(&trace, SampleIndex(0), &spikes, pre, post);
 
     // Spikes 5 and 999 fall outside the window [pre, len - post - 1],
     // so they get dropped. 25 and 100 stay.
@@ -274,7 +277,7 @@ fn phy_waveform_extractor_centres_window_on_spike_sample() {
     let trace: Vec<f32> = (0..1000).map(|t| t as f32).collect();
     let pre = 15u32;
     let post = 4u32;
-    let snips = extract_snippets_single_channel(&trace, 0, &[25u64], pre, post);
+    let snips = extract_snippets_single_channel(&trace, SampleIndex(0), &[SampleIndex(25)], pre, post);
     assert_eq!(snips.len(), 1);
     let s = &snips[0];
     assert_eq!(s.len(), 20);
@@ -301,9 +304,9 @@ fn phy_chunk_bounds_invariants_via_presence_binning() {
     // spike at the boundary of each bin and verify presence is full coverage.
     let total = 1000u64;
     let n_bins = 10usize;
-    let times: Vec<u64> = (0..n_bins as u64)
+    let times: Vec<SampleIndex> = (0..n_bins as u64)
         .map(|b| b * (total / n_bins as u64) + 1)
-        .collect();
+        .map(SampleIndex).collect();
     let p = presence_ratio(&times, total, n_bins);
     assert!((p - 1.0).abs() < 1e-6, "expected full presence, got {p}");
 }
@@ -379,7 +382,7 @@ fn phy_from_sparse_pc_feature_lookup_round_trip() {
         }
         fn spike_pc_indices(&self, c: ClusterId) -> &[u32] {
             self.per_cluster
-                .get(c as usize)
+                .get(c.idx())
                 .map(Vec::as_slice)
                 .unwrap_or(&[])
         }
@@ -389,7 +392,7 @@ fn phy_from_sparse_pc_feature_lookup_round_trip() {
     let pc: Vec<f32> = (0..12).map(|i| i as f32).collect();
     let stub = Stub {
         inner: StubProvider {
-            spikes: vec![vec![10], vec![20]],
+            spikes: vec![vec![SampleIndex(10)], vec![SampleIndex(20)]],
         },
         pc,
         ind: vec![0, 1],
@@ -490,9 +493,9 @@ fn phy_per_cluster_spike_times_are_sorted() {
     let (mut s, _d) = fresh_session_with(provider);
 
     // After an arbitrary merge, every bucket should still be sorted.
-    s.dispatch(CurationCommand::Merge { sources: vec![3, 7], target: 5 })
+    s.dispatch(CurationCommand::Merge { sources: vec![ClusterId(3), ClusterId(7)], target: ClusterId(5) })
         .unwrap();
-    for c in 0..s.n_clusters() {
+    for c in (0..s.n_clusters()).map(ClusterId) {
         let bucket = s.spike_times(c);
         for w in bucket.windows(2) {
             assert!(
@@ -513,15 +516,14 @@ fn phy_relabel_on_out_of_range_cluster_is_a_noop() {
     let (mut s, _d) = fresh_session_with(provider);
     let pre = s.history_len();
 
-    s.dispatch(CurationCommand::Relabel {
-        cluster: 999,
+    s.dispatch(CurationCommand::Relabel { cluster: ClusterId(999),
         op: PhyLabelOp::SetGood,
     })
     .unwrap();
 
     // History grew (the journal still has the record) but no label changed.
     assert_eq!(s.history_len(), pre + 1);
-    for i in 0..s.n_clusters() {
+    for i in (0..s.n_clusters()).map(ClusterId) {
         // All defaulted to 0 (Unsorted) initially.
         assert_eq!(s.label(i), Some(0u8));
     }

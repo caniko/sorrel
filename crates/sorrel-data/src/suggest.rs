@@ -138,7 +138,7 @@ pub fn rank_merge_candidates<P: DataProvider>(
 
     // Pre-compute per-cluster summaries so the inner loop is cheap.
     let mut summaries: Vec<Option<ClusterSummary>> = Vec::with_capacity(n as usize);
-    for c in 0..n {
+    for c in (0..n).map(ClusterId) {
         let times = session.spike_times(c);
         let amps = session.spike_amplitudes(c);
         if times.len() < cfg.min_spikes {
@@ -171,6 +171,8 @@ pub fn rank_merge_candidates<P: DataProvider>(
             let Some(sb) = summaries[b as usize] else {
                 continue;
             };
+            let a = ClusterId(a);
+            let b = ClusterId(b);
             let amp_mean_delta = if sa.mean_amp.is_finite() && sb.mean_amp.is_finite() {
                 let lo = sa.mean_amp.abs().min(sb.mean_amp.abs()).max(1e-6);
                 ((sa.mean_amp - sb.mean_amp).abs() / lo).min(1.0)
@@ -245,6 +247,7 @@ pub fn rank_split_candidates<P: DataProvider>(
     use rayon::prelude::*;
     let mut out: Vec<SplitCandidate> = (0..n)
         .into_par_iter()
+        .map(ClusterId)
         .filter_map(|c| {
             let times = session.spike_times(c);
             let amps = session.spike_amplitudes(c);
@@ -258,7 +261,7 @@ pub fn rank_split_candidates<P: DataProvider>(
             };
             let bc_score = ((bc - 0.4) / 0.4).clamp(0.0, 1.0);
             let contamination =
-                refractory_contamination(times, refractory_samples, total_duration, sr);
+                refractory_contamination(times, refractory_samples, total_duration.0, sr);
             let cont_score = (contamination * 2.0).clamp(0.0, 1.0);
             let drift = amplitude_drift_correlation(times, amps).abs();
             let drift_score = ((drift - 0.3) / 0.5).clamp(0.0, 1.0);
@@ -364,13 +367,13 @@ mod tests {
         }
         fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
             self.spikes
-                .get(c as usize)
+                .get(c.idx())
                 .map(Vec::as_slice)
                 .unwrap_or(&[])
         }
         fn trace(&self, _: SampleIndex, _: u32) -> TraceSlice<'_> {
             TraceSlice {
-                start: 0,
+                start: SampleIndex(0),
                 n_channels: 1,
                 samples: TraceSamples::I16(&[]),
             }
@@ -383,7 +386,7 @@ mod tests {
     impl HasAmplitudes for MockProvider {
         fn spike_amplitudes(&self, c: ClusterId) -> &[f32] {
             self.amps
-                .get(c as usize)
+                .get(c.idx())
                 .map(Vec::as_slice)
                 .unwrap_or(&[])
         }
@@ -406,19 +409,19 @@ mod tests {
         let mut b_times = Vec::new();
         for i in 0..500 {
             // alternate clusters at 5 ms intervals; never within 1.5 ms.
-            a_times.push((i as u64) * 10);
-            b_times.push((i as u64) * 10 + 5);
+            a_times.push(SampleIndex((i as u64) * 10));
+            b_times.push(SampleIndex((i as u64) * 10 + 5));
         }
         let a_amps: Vec<f32> = (0..500).map(|_| 5.0).collect();
         let b_amps: Vec<f32> = (0..500).map(|_| 5.0).collect();
         // A control cluster that has nothing to do with the others.
-        let c_times: Vec<u64> = (0..500).map(|i| (i as u64) * 7 + 3).collect();
+        let c_times: Vec<SampleIndex> = (0..500).map(|i| SampleIndex((i as u64) * 7 + 3)).collect();
         let c_amps: Vec<f32> = (0..500).map(|_| 5.0).collect();
 
         let prov = MockProvider {
             spikes: vec![a_times, b_times, c_times],
             amps: vec![a_amps, b_amps, c_amps],
-            n_samples: 10_000,
+            n_samples: SampleIndex(10_000),
         };
         let (sess, _d) = fresh_session(prov);
         let cfg = SuggestConfig::default();
@@ -427,7 +430,7 @@ mod tests {
         // The 0-1 pair should rank first.
         assert_eq!(
             (merges[0].a, merges[0].b),
-            (0, 1),
+            (ClusterId(0), ClusterId(1)),
             "expected (0,1) at top, got {:?}",
             (merges[0].a, merges[0].b),
         );
@@ -443,24 +446,24 @@ mod tests {
         for _ in 0..500 {
             amps_bi.push(8.0);
         }
-        let times_bi: Vec<u64> = (0..1000).map(|i| (i as u64) * 10).collect();
+        let times_bi: Vec<SampleIndex> = (0..1000).map(|i| SampleIndex((i as u64) * 10)).collect();
 
         // Cluster 1: unimodal amplitudes (Gaussian-ish around 5).
         let amps_uni: Vec<f32> = (0..1000)
             .map(|i| 5.0 + ((i as f32 * 0.7).sin()) * 0.5)
             .collect();
-        let times_uni: Vec<u64> = (0..1000).map(|i| (i as u64) * 10).collect();
+        let times_uni: Vec<SampleIndex> = (0..1000).map(|i| SampleIndex((i as u64) * 10)).collect();
 
         let prov = MockProvider {
             spikes: vec![times_bi, times_uni],
             amps: vec![amps_bi, amps_uni],
-            n_samples: 10_000,
+            n_samples: SampleIndex(10_000),
         };
         let (sess, _d) = fresh_session(prov);
         let cfg = SuggestConfig::default();
         let splits = rank_split_candidates(&sess, &cfg);
         assert!(!splits.is_empty());
-        assert_eq!(splits[0].cluster, 0, "expected bimodal cluster 0 to top");
+        assert_eq!(splits[0].cluster, ClusterId(0), "expected bimodal cluster 0 to top");
     }
 
     #[test]

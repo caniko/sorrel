@@ -31,7 +31,6 @@ use crate::provider::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use memmap2::Mmap;
-use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -47,8 +46,7 @@ pub struct SortingAnalyzerProvider {
     channel_positions: Vec<[f32; 2]>,
     channel_map: Vec<ChannelId>,
 
-    metric_names: Vec<String>,
-    metrics: HashMap<String, Vec<f32>>,
+    metrics: crate::extras::QualityMetrics,
 
     _trace_mmap: Option<Mmap>,
     trace_ptr: *const u8,
@@ -108,7 +106,7 @@ impl SortingAnalyzerProvider {
             }
         }
 
-        let (metric_names, metrics) = load_quality_metrics_csv(
+        let metrics = load_quality_metrics_csv(
             &root.join("extensions").join("quality_metrics").join("metrics.csv"),
             n_clusters,
         )
@@ -128,7 +126,6 @@ impl SortingAnalyzerProvider {
             initial_labels,
             channel_positions,
             channel_map,
-            metric_names,
             metrics,
             _trace_mmap: trace_mmap,
             trace_ptr,
@@ -141,7 +138,7 @@ impl SortingAnalyzerProvider {
             return TraceSamples::I16(&[]);
         }
         let nc = self.n_channels as usize;
-        let s = (start as usize).saturating_mul(nc);
+        let s = start.idx().saturating_mul(nc);
         let e = s + (len as usize) * nc;
         let bytes = unsafe { std::slice::from_raw_parts(self.trace_ptr, self.trace_byte_len) };
         TraceSamples::from_bytes_clamped(bytes, self.dtype, s, e)
@@ -225,11 +222,11 @@ fn map_recording(
     rec: &RecordingMeta,
 ) -> Result<(Option<Mmap>, *const u8, usize, SampleIndex)> {
     let Some(p) = rec.file_paths.first() else {
-        return Ok((None, std::ptr::null(), 0, 0));
+        return Ok((None, std::ptr::null(), 0, SampleIndex(0)));
     };
     let p = if p.is_absolute() { p.clone() } else { root.join(p) };
     if !p.exists() {
-        return Ok((None, std::ptr::null(), 0, 0));
+        return Ok((None, std::ptr::null(), 0, SampleIndex(0)));
     }
     let f = File::open(&p).with_context(|| format!("open {}", p.display()))?;
     let mmap = unsafe { Mmap::map(&f)? };
@@ -244,7 +241,7 @@ fn map_recording(
     }
     let n_samples = (payload / bps) as u64;
     let trace_ptr = unsafe { mmap.as_ptr().add(rec.offset as usize) };
-    Ok((Some(mmap), trace_ptr, payload, n_samples))
+    Ok((Some(mmap), trace_ptr, payload, SampleIndex(n_samples)))
 }
 
 /// Loads either:
@@ -306,7 +303,7 @@ fn load_structured_spikes(path: &Path) -> Result<(Vec<SampleIndex>, Vec<u32>)> {
         let u = unit_field.offset;
         let sample = read_int_le(&rec[s..s + sample_field.width], sample_field.width)?;
         let unit = read_int_le(&rec[u..u + unit_field.width], unit_field.width)?;
-        times.push(sample as SampleIndex);
+        times.push(SampleIndex(sample as u64));
         units.push(unit as u32);
     }
     Ok((times, units))
@@ -400,37 +397,37 @@ fn read_u64_any(path: &Path) -> Result<Vec<SampleIndex>> {
         }
         let mut out = Vec::with_capacity(n);
         for c in payload[..n * 8].chunks_exact(8) {
-            out.push(u64::from_le_bytes(c.try_into().unwrap()));
+            out.push(SampleIndex(u64::from_le_bytes(c.try_into().unwrap())));
         }
         Ok(out)
     } else {
         let (v, _shape) = read_npy_u32_flat(path)?;
-        Ok(v.into_iter().map(|x| x as u64).collect())
+        Ok(v.into_iter().map(|x| SampleIndex(x as u64)).collect())
     }
 }
 
 fn load_quality_metrics_csv(
     path: &Path,
     n_clusters: usize,
-) -> Result<(Vec<String>, HashMap<String, Vec<f32>>)> {
+) -> Result<crate::extras::QualityMetrics> {
+    let mut out = crate::extras::QualityMetrics::new();
     if !path.exists() {
-        return Ok((Vec::new(), HashMap::new()));
+        return Ok(out);
     }
     let text = std::fs::read_to_string(path)?;
     let mut lines = text.lines();
     let Some(header) = lines.next() else {
-        return Ok((Vec::new(), HashMap::new()));
+        return Ok(out);
     };
     let cols: Vec<&str> = header.split(',').collect();
     if cols.is_empty() {
-        return Ok((Vec::new(), HashMap::new()));
+        return Ok(out);
     }
     // SI writes the unit-id column (often unnamed) first.
     let metric_names: Vec<String> = cols[1..].iter().map(|s| s.trim().to_string()).collect();
-    let mut metrics: HashMap<String, Vec<f32>> = metric_names
-        .iter()
-        .map(|n| (n.clone(), vec![f32::NAN; n_clusters]))
-        .collect();
+    for name in &metric_names {
+        out.insert(name.clone(), vec![f32::NAN; n_clusters]);
+    }
 
     for line in lines {
         let cells: Vec<&str> = line.split(',').collect();
@@ -446,13 +443,13 @@ fn load_quality_metrics_csv(
         for (i, name) in metric_names.iter().enumerate() {
             let cell = cells.get(i + 1).copied().unwrap_or("");
             if let Ok(v) = cell.trim().parse::<f32>() {
-                if let Some(col) = metrics.get_mut(name) {
+                if let Some(col) = out.get_mut(name) {
                     col[unit] = v;
                 }
             }
         }
     }
-    Ok((metric_names, metrics))
+    Ok(out)
 }
 
 impl DataProvider for SortingAnalyzerProvider {
@@ -478,7 +475,7 @@ impl DataProvider for SortingAnalyzerProvider {
     #[inline]
     fn spike_times(&self, cluster: ClusterId) -> &[SampleIndex] {
         self.spikes_per_cluster
-            .get(cluster as usize)
+            .get(cluster.idx())
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
@@ -513,11 +510,8 @@ impl HasGeometry for SortingAnalyzerProvider {
 }
 
 impl HasQualityMetrics for SortingAnalyzerProvider {
-    fn metric_names(&self) -> &[String] {
-        &self.metric_names
-    }
-    fn metric_values(&self, name: &str) -> Option<&[f32]> {
-        self.metrics.get(name).map(Vec::as_slice)
+    fn quality_metrics(&self) -> &crate::extras::QualityMetrics {
+        &self.metrics
     }
 }
 
@@ -610,7 +604,7 @@ mod tests {
         );
 
         let (times, units) = load_structured_spikes(&p).unwrap();
-        assert_eq!(times, vec![100, 250, 999]);
+        assert_eq!(times, vec![SampleIndex(100), SampleIndex(250), SampleIndex(999)]);
         assert_eq!(units, vec![0, 2, 1]);
     }
 
@@ -632,7 +626,7 @@ mod tests {
             &payload,
         );
         let (times, units) = load_structured_spikes(&p).unwrap();
-        assert_eq!(times, vec![42, 10_000_000, 1]);
+        assert_eq!(times, vec![SampleIndex(42), SampleIndex(10_000_000), SampleIndex(1)]);
         assert_eq!(units, vec![7, 3, 0]);
     }
 
@@ -695,18 +689,18 @@ mod tests {
         assert_eq!(p.sample_rate(), 30000.0);
         assert_eq!(p.n_channels(), 4);
         assert_eq!(p.n_clusters(), 3);
-        assert_eq!(p.n_samples(), n_samples_target as u64);
+        assert_eq!(p.n_samples(), SampleIndex(n_samples_target as u64));
 
         // Per-cluster spike times: cluster 0 → [10, 30], 1 → [20, 50], 2 → [40].
-        assert_eq!(p.spike_times(0), &[10, 30]);
-        assert_eq!(p.spike_times(1), &[20, 50]);
-        assert_eq!(p.spike_times(2), &[40]);
+        assert_eq!(p.spike_times(ClusterId(0)), &[SampleIndex(10), SampleIndex(30)]);
+        assert_eq!(p.spike_times(ClusterId(1)), &[SampleIndex(20), SampleIndex(50)]);
+        assert_eq!(p.spike_times(ClusterId(2)), &[SampleIndex(40)]);
         // Out-of-range cluster id returns empty rather than panicking.
-        assert!(p.spike_times(99).is_empty());
+        assert!(p.spike_times(ClusterId(99)).is_empty());
 
         // Trace samples are mmapped — read a 2-sample window starting at
         // sample 5 and verify it matches the synthetic generator.
-        let slice = p.trace(5, 2);
+        let slice = p.trace(SampleIndex(5), 2);
         match slice.samples {
             TraceSamples::I16(buf) => {
                 assert_eq!(buf.len(), 2 * n_channels);
@@ -742,9 +736,9 @@ mod tests {
         write_u32_npy(&sorting_dir.join("unit_ids.npy"), &[0]);
 
         let p = SortingAnalyzerProvider::open(root).unwrap();
-        assert_eq!(p.n_samples(), 0);
+        assert_eq!(p.n_samples(), SampleIndex(0));
         assert_eq!(p.n_clusters(), 1);
-        let slice = p.trace(0, 4);
+        let slice = p.trace(SampleIndex(0), 4);
         match slice.samples {
             TraceSamples::I16(buf) => assert!(buf.is_empty()),
             other => panic!("expected empty I16 trace, got {other:?}"),

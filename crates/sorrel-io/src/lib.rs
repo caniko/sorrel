@@ -19,7 +19,7 @@ pub mod spikeglx;
 
 pub use extras::{
     HasAmplitudes, HasGeometry, HasPcFeatures, HasQualityMetrics, HasSpikeTemplates,
-    HasTemplateWaveforms,
+    HasTemplateWaveforms, QualityMetrics,
 };
 pub use kilosort::KilosortProvider;
 pub use mda::MdaHeader;
@@ -27,7 +27,8 @@ pub use open_ephys::{OebinMeta, OebinStream};
 pub use params::PhyParams;
 pub use probeinterface::ProbeGeometry;
 pub use provider::{
-    ChannelId, ClusterId, DataProvider, SampleIndex, TraceDtype, TraceSamples, TraceSlice,
+    ChannelId, ClusterId, DataProvider, OptionalRow, SampleIndex, TraceDtype, TraceSamples,
+    TraceSlice,
 };
 pub use sorting_analyzer::SortingAnalyzerProvider;
 pub use spikeglx::SpikeGlxMeta;

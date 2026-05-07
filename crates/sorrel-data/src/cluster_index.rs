@@ -11,7 +11,7 @@
 
 use sorrel_io::{
     ClusterId, DataProvider, HasAmplitudes, HasPcFeatures, HasSpikeTemplates,
-    HasTemplateWaveforms, SampleIndex,
+    HasTemplateWaveforms, OptionalRow, SampleIndex,
 };
 
 /// Mutable index over the spike→cluster assignment.
@@ -34,28 +34,31 @@ use sorrel_io::{
 ///     type Label = u8;
 ///     fn sample_rate(&self) -> f32 { 1000.0 }
 ///     fn n_channels(&self) -> u32 { 1 }
-///     fn n_samples(&self) -> SampleIndex { 0 }
+///     fn n_samples(&self) -> SampleIndex { SampleIndex(0) }
 ///     fn n_clusters(&self) -> u32 { self.spikes.len() as u32 }
 ///     fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
-///         self.spikes.get(c as usize).map(Vec::as_slice).unwrap_or(&[])
+///         self.spikes.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
 ///     }
 ///     fn trace(&self, _: SampleIndex, _: u32) -> TraceSlice<'_> {
-///         TraceSlice { start: 0, n_channels: 0, samples: TraceSamples::I16(&[]) }
+///         TraceSlice { start: SampleIndex(0), n_channels: 0, samples: TraceSamples::I16(&[]) }
 ///     }
 ///     fn initial_labels(&self) -> Vec<u8> { vec![0; self.spikes.len()] }
 /// }
 ///
 /// let mut ci = ClusterIndex::from_provider(&Stub {
-///     spikes: vec![vec![10, 30], vec![20], vec![100]],
+///     spikes: vec![vec![SampleIndex(10), SampleIndex(30)], vec![SampleIndex(20)], vec![SampleIndex(100)]],
 /// });
-/// let pre = ci.spike_times(0).to_vec();
+/// let pre = ci.spike_times(ClusterId(0)).to_vec();
 ///
-/// let rec = ci.merge(&[0, 1], 2);
-/// assert!(ci.spike_times(0).is_empty());
-/// assert_eq!(ci.spike_times(2), &[10, 20, 30, 100]);
+/// let rec = ci.merge(&[ClusterId(0), ClusterId(1)], ClusterId(2));
+/// assert!(ci.spike_times(ClusterId(0)).is_empty());
+/// assert_eq!(
+///     ci.spike_times(ClusterId(2)),
+///     &[SampleIndex(10), SampleIndex(20), SampleIndex(30), SampleIndex(100)]
+/// );
 ///
 /// ci.unmerge(rec);
-/// assert_eq!(ci.spike_times(0), &pre[..]);
+/// assert_eq!(ci.spike_times(ClusterId(0)), &pre[..]);
 /// ```
 #[derive(Debug)]
 pub struct ClusterIndex {
@@ -70,7 +73,9 @@ pub struct ClusterIndex {
     /// Per-spike index into the *original* `pc_features.npy` row
     /// (`spike_times.npy` order). Length equals n_spikes when seeded; empty
     /// otherwise. Indexed by global time-sorted spike index, NOT original.
-    spike_pc_indices: Vec<u32>,
+    /// Each entry is an [`OptionalRow`] — `OptionalRow::NONE` means the
+    /// provider didn't supply a row for that spike.
+    spike_pc_indices: Vec<OptionalRow>,
     /// Flat `(n_spikes_orig, n_pcs, n_channels_per_template)` row-major
     /// PC feature buffer. Empty when not seeded. Indexed via
     /// `spike_pc_indices[g] * stride`.
@@ -99,7 +104,7 @@ impl ClusterIndex {
         let n_clusters = provider.n_clusters() as usize;
         let mut times_per_cluster: Vec<Vec<SampleIndex>> = Vec::with_capacity(n_clusters);
         let mut total_spikes = 0usize;
-        for c in 0..n_clusters as u32 {
+        for c in (0..n_clusters as u32).map(ClusterId) {
             let bucket: Vec<SampleIndex> = provider.spike_times(c).to_vec();
             total_spikes += bucket.len();
             times_per_cluster.push(bucket);
@@ -118,14 +123,14 @@ impl ClusterIndex {
                 if cursors[c] < times_per_cluster[c].len() {
                     let t = times_per_cluster[c][cursors[c]];
                     if best.is_none_or(|(_, bt)| t < bt) {
-                        best = Some((c as ClusterId, t));
+                        best = Some((ClusterId(c as u32), t));
                     }
                 }
             }
             let (c, t) = best.expect("total_spikes counts the loop iterations exactly");
             spike_times.push(t);
             spike_clusters.push(c);
-            cursors[c as usize] += 1;
+            cursors[c.idx()] += 1;
         }
 
         Self {
@@ -149,28 +154,19 @@ impl ClusterIndex {
     /// previously seeded amplitudes.
     pub fn seed_amplitudes<P: HasAmplitudes>(&mut self, provider: &P) {
         let n_clusters = provider.n_clusters() as usize;
-        // Per-cluster amplitudes from the provider, in the order it returns
-        // them (which matches its `spike_times(c)` order).
-        let mut amps_per_cluster: Vec<Vec<f32>> = Vec::with_capacity(n_clusters);
-        for c in 0..n_clusters as u32 {
-            amps_per_cluster.push(provider.spike_amplitudes(c).to_vec());
-        }
-        // Rebuild the global flat array in the same time-sorted order we
-        // produced in `from_provider`. We reuse the same merge: walk the
-        // global `spike_clusters` and pop per-cluster cursors.
-        let mut cursors = vec![0usize; n_clusters];
-        let mut spike_amplitudes = Vec::with_capacity(self.spike_clusters.len());
-        for &c in &self.spike_clusters {
-            let bucket = &amps_per_cluster[c as usize];
-            let i = cursors[c as usize];
-            // If the provider gave a different number of amplitudes than
-            // spikes for a cluster, fall back to NaN so the consumer can
-            // notice without a panic.
-            let v = bucket.get(i).copied().unwrap_or(f32::NAN);
-            spike_amplitudes.push(v);
-            cursors[c as usize] += 1;
-        }
-        self.spike_amplitudes = spike_amplitudes;
+        let amps_per_cluster: Vec<Vec<f32>> = (0..n_clusters as u32)
+            .map(ClusterId)
+            .map(|c| provider.spike_amplitudes(c).to_vec())
+            .collect();
+        // If the provider gave a different number of amplitudes than spikes
+        // for a cluster, fall back to NaN so the consumer can notice without
+        // a panic.
+        self.spike_amplitudes = rebucket_to_global(
+            &self.spike_clusters,
+            &amps_per_cluster,
+            |v| v,
+            f32::NAN,
+        );
         self.amps_per_cluster = amps_per_cluster;
     }
 
@@ -180,19 +176,16 @@ impl ClusterIndex {
     /// global time-sorted spike layout we use everywhere else.
     pub fn seed_pc_features<P: HasPcFeatures>(&mut self, provider: &P) {
         let n_clusters = provider.n_clusters() as usize;
-        let mut pc_indices_per_cluster: Vec<Vec<u32>> = Vec::with_capacity(n_clusters);
-        for c in 0..n_clusters as u32 {
-            pc_indices_per_cluster.push(provider.spike_pc_indices(c).to_vec());
-        }
-        let mut cursors = vec![0usize; n_clusters];
-        let mut spike_pc_indices = Vec::with_capacity(self.spike_clusters.len());
-        for &c in &self.spike_clusters {
-            let bucket = &pc_indices_per_cluster[c as usize];
-            let i = cursors[c as usize];
-            spike_pc_indices.push(bucket.get(i).copied().unwrap_or(u32::MAX));
-            cursors[c as usize] += 1;
-        }
-        self.spike_pc_indices = spike_pc_indices;
+        let pc_indices_per_cluster: Vec<Vec<u32>> = (0..n_clusters as u32)
+            .map(ClusterId)
+            .map(|c| provider.spike_pc_indices(c).to_vec())
+            .collect();
+        self.spike_pc_indices = rebucket_to_global(
+            &self.spike_clusters,
+            &pc_indices_per_cluster,
+            OptionalRow::new,
+            OptionalRow::NONE,
+        );
         self.pc_features_flat = provider.pc_features().to_vec();
         self.pc_shape = provider.pc_shape();
     }
@@ -201,20 +194,16 @@ impl ClusterIndex {
     /// as [`Self::seed_amplitudes`].
     pub fn seed_templates<P: HasSpikeTemplates>(&mut self, provider: &P) {
         let n_clusters = provider.n_clusters() as usize;
-        let mut templates_per_cluster: Vec<Vec<u32>> = Vec::with_capacity(n_clusters);
-        for c in 0..n_clusters as u32 {
-            templates_per_cluster.push(provider.spike_templates(c).to_vec());
-        }
-        let mut cursors = vec![0usize; n_clusters];
-        let mut spike_templates = Vec::with_capacity(self.spike_clusters.len());
-        for &c in &self.spike_clusters {
-            let bucket = &templates_per_cluster[c as usize];
-            let i = cursors[c as usize];
-            let v = bucket.get(i).copied().unwrap_or(u32::MAX);
-            spike_templates.push(v);
-            cursors[c as usize] += 1;
-        }
-        self.spike_templates = spike_templates;
+        let templates_per_cluster: Vec<Vec<u32>> = (0..n_clusters as u32)
+            .map(ClusterId)
+            .map(|c| provider.spike_templates(c).to_vec())
+            .collect();
+        self.spike_templates = rebucket_to_global(
+            &self.spike_clusters,
+            &templates_per_cluster,
+            |v| v,
+            u32::MAX,
+        );
         self.templates_per_cluster = templates_per_cluster;
     }
 
@@ -241,7 +230,7 @@ impl ClusterIndex {
     #[inline]
     pub fn spike_times(&self, cluster: ClusterId) -> &[SampleIndex] {
         self.times_per_cluster
-            .get(cluster as usize)
+            .get(cluster.idx())
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
@@ -249,7 +238,7 @@ impl ClusterIndex {
     #[inline]
     pub fn spike_amplitudes(&self, cluster: ClusterId) -> &[f32] {
         self.amps_per_cluster
-            .get(cluster as usize)
+            .get(cluster.idx())
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
@@ -257,7 +246,7 @@ impl ClusterIndex {
     #[inline]
     pub fn spike_templates(&self, cluster: ClusterId) -> &[u32] {
         self.templates_per_cluster
-            .get(cluster as usize)
+            .get(cluster.idx())
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
@@ -277,9 +266,10 @@ impl ClusterIndex {
     }
 
     /// For each global (time-sorted) spike index, the row in `pc_features_flat`
-    /// that holds its features. Length 0 when features aren't seeded.
+    /// that holds its features. Length 0 when features aren't seeded. Use
+    /// [`OptionalRow::get`] on entries to handle the "missing" sentinel.
     #[inline]
-    pub fn spike_pc_indices(&self) -> &[u32] {
+    pub fn spike_pc_indices(&self) -> &[OptionalRow] {
         &self.spike_pc_indices
     }
 
@@ -292,11 +282,8 @@ impl ClusterIndex {
         if stride == 0 {
             return None;
         }
-        let orig = *self.spike_pc_indices.get(global_idx as usize)?;
-        if orig == u32::MAX {
-            return None;
-        }
-        let start = (orig as usize) * stride;
+        let orig = self.spike_pc_indices.get(global_idx as usize)?.get()? as usize;
+        let start = orig * stride;
         let end = start + stride;
         self.pc_features_flat.get(start..end)
     }
@@ -344,7 +331,7 @@ impl ClusterIndex {
     /// Allocate a fresh `ClusterId` (used by split). Grows the internal
     /// bucket vectors by one.
     pub fn allocate_cluster(&mut self) -> ClusterId {
-        let id = self.times_per_cluster.len() as ClusterId;
+        let id = ClusterId(self.times_per_cluster.len() as u32);
         self.times_per_cluster.push(Vec::new());
         self.amps_per_cluster.push(Vec::new());
         self.templates_per_cluster.push(Vec::new());
@@ -360,14 +347,14 @@ impl ClusterIndex {
         // Capture pre-merge state for the touched clusters.
         let mut snapshots = Vec::with_capacity(sources.len() + 1);
         let mut affected = Vec::with_capacity(sources.len());
-        if (target as usize) < self.times_per_cluster.len() {
+        if target.idx() < self.times_per_cluster.len() {
             snapshots.push(self.snapshot(target));
         }
         for &s in sources {
             if s == target {
                 continue;
             }
-            if (s as usize) >= self.times_per_cluster.len() {
+            if s.idx() >= self.times_per_cluster.len() {
                 continue;
             }
             snapshots.push(self.snapshot(s));
@@ -446,8 +433,8 @@ impl ClusterIndex {
         // If `new_cluster` is the last id and is now empty, free the slot
         // so n_clusters returns to its pre-split value.
         let last = self.times_per_cluster.len() as u32;
-        if record.new_cluster + 1 == last
-            && self.times_per_cluster[record.new_cluster as usize].is_empty()
+        if record.new_cluster.0 + 1 == last
+            && self.times_per_cluster[record.new_cluster.idx()].is_empty()
         {
             self.times_per_cluster.pop();
             self.amps_per_cluster.pop();
@@ -459,15 +446,15 @@ impl ClusterIndex {
         ClusterSnapshot {
             cluster: c,
             global_indices: self.global_indices_for(c),
-            times: self.times_per_cluster[c as usize].clone(),
+            times: self.times_per_cluster[c.idx()].clone(),
             amps: self
                 .amps_per_cluster
-                .get(c as usize)
+                .get(c.idx())
                 .cloned()
                 .unwrap_or_default(),
             templates: self
                 .templates_per_cluster
-                .get(c as usize)
+                .get(c.idx())
                 .cloned()
                 .unwrap_or_default(),
         }
@@ -480,7 +467,7 @@ impl ClusterIndex {
         for &gi in &snap.global_indices {
             self.spike_clusters[gi as usize] = snap.cluster;
         }
-        let c = snap.cluster as usize;
+        let c = snap.cluster.idx();
         if c >= self.times_per_cluster.len() {
             // Snapshot referenced an id beyond current bounds — grow.
             self.times_per_cluster.resize_with(c + 1, Vec::new);
@@ -505,7 +492,7 @@ impl ClusterIndex {
     /// arrays. The result is sorted by time (the global arrays are already
     /// in time order).
     fn rebuild_bucket(&mut self, cluster: ClusterId) {
-        let c = cluster as usize;
+        let c = cluster.idx();
         if c >= self.times_per_cluster.len() {
             return;
         }
@@ -530,6 +517,39 @@ impl ClusterIndex {
         self.amps_per_cluster[c] = amps;
         self.templates_per_cluster[c] = templates;
     }
+}
+
+/// Walk the global time-sorted `spike_clusters` array and emit one item per
+/// spike, drawn from the per-cluster bucket via a per-cluster cursor. This
+/// is the merge step that turns provider-side per-cluster vectors into the
+/// flat global array.
+///
+/// `wrap` runs on each successfully-popped value (typically `identity` or
+/// `OptionalRow::new`); `missing` is used when a cluster's bucket is shorter
+/// than its spike count (a robustness path against malformed providers).
+fn rebucket_to_global<S, T, W>(
+    spike_clusters: &[ClusterId],
+    per_cluster: &[Vec<S>],
+    mut wrap: W,
+    missing: T,
+) -> Vec<T>
+where
+    S: Copy,
+    T: Copy,
+    W: FnMut(S) -> T,
+{
+    let mut cursors = vec![0usize; per_cluster.len()];
+    let mut out = Vec::with_capacity(spike_clusters.len());
+    for &c in spike_clusters {
+        let i = cursors[c.idx()];
+        let v = per_cluster[c.idx()]
+            .get(i)
+            .copied()
+            .map_or(missing, &mut wrap);
+        out.push(v);
+        cursors[c.idx()] += 1;
+    }
+    out
 }
 
 /// Snapshot of a single cluster's complete state, used by both merge and
@@ -579,20 +599,20 @@ mod tests {
             1
         }
         fn n_samples(&self) -> SampleIndex {
-            0
+            SampleIndex(0)
         }
         fn n_clusters(&self) -> u32 {
             self.spikes.len() as u32
         }
         fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
             self.spikes
-                .get(c as usize)
+                .get(c.idx())
                 .map(Vec::as_slice)
                 .unwrap_or(&[])
         }
         fn trace(&self, _: SampleIndex, _: u32) -> TraceSlice<'_> {
             TraceSlice {
-                start: 0,
+                start: SampleIndex(0),
                 n_channels: 0,
                 samples: TraceSamples::I16(&[]),
             }
@@ -606,7 +626,7 @@ mod tests {
         // 3 clusters, deliberately interleaved in time so the merge cursor
         // gets exercised.
         ClusterIndex::from_provider(&StubProvider {
-            spikes: vec![vec![10, 30, 150], vec![20, 200], vec![100]],
+            spikes: vec![vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)], vec![SampleIndex(20), SampleIndex(200)], vec![SampleIndex(100)]],
         })
     }
 
@@ -615,36 +635,37 @@ mod tests {
         let ci = cidx();
         assert_eq!(ci.n_clusters(), 3);
         assert_eq!(ci.n_spikes(), 6);
-        assert_eq!(ci.spike_times(0), &[10, 30, 150]);
-        assert_eq!(ci.spike_times(1), &[20, 200]);
-        assert_eq!(ci.spike_times(2), &[100]);
+        assert_eq!(ci.spike_times(ClusterId(0)), &[SampleIndex(10), SampleIndex(30), SampleIndex(150)]);
+        assert_eq!(ci.spike_times(ClusterId(1)), &[SampleIndex(20), SampleIndex(200)]);
+        assert_eq!(ci.spike_times(ClusterId(2)), &[SampleIndex(100)]);
         // Global cluster ids in time order:
         // t=10 c=0, t=20 c=1, t=30 c=0, t=100 c=2, t=150 c=0, t=200 c=1.
-        assert_eq!(ci.spike_clusters(), &[0, 1, 0, 2, 0, 1]);
+        assert_eq!(ci.spike_clusters(), &[ClusterId(0), ClusterId(1), ClusterId(0), ClusterId(2), ClusterId(0), ClusterId(1)]);
     }
 
     #[test]
     fn merge_reassigns_spikes_to_target_and_keeps_buckets_time_sorted() {
         let mut ci = cidx();
-        let _rec = ci.merge(&[0, 1], 2);
-        assert!(ci.spike_times(0).is_empty());
-        assert!(ci.spike_times(1).is_empty());
+        let _rec = ci.merge(&[ClusterId(0), ClusterId(1)], ClusterId(2));
+        assert!(ci.spike_times(ClusterId(0)).is_empty());
+        assert!(ci.spike_times(ClusterId(1)).is_empty());
         // Target now contains every spike, in ascending time order.
-        assert_eq!(ci.spike_times(2), &[10, 20, 30, 100, 150, 200]);
-        assert_eq!(ci.spike_clusters(), &[2, 2, 2, 2, 2, 2]);
+        assert_eq!(ci.spike_times(ClusterId(2)), &[SampleIndex(10), SampleIndex(20), SampleIndex(30), SampleIndex(100), SampleIndex(150), SampleIndex(200)]);
+        assert_eq!(ci.spike_clusters(), &[ClusterId(2), ClusterId(2), ClusterId(2), ClusterId(2), ClusterId(2), ClusterId(2)]);
     }
 
     #[test]
     fn unmerge_restores_buckets_exactly() {
         let mut ci = cidx();
         let pre_buckets: Vec<Vec<SampleIndex>> = (0..ci.n_clusters())
+            .map(ClusterId)
             .map(|c| ci.spike_times(c).to_vec())
             .collect();
         let pre_assign = ci.spike_clusters().to_vec();
-        let rec = ci.merge(&[0, 1], 2);
+        let rec = ci.merge(&[ClusterId(0), ClusterId(1)], ClusterId(2));
         ci.unmerge(rec);
-        for c in 0..ci.n_clusters() {
-            assert_eq!(ci.spike_times(c), &pre_buckets[c as usize][..]);
+        for c in (0..ci.n_clusters()).map(ClusterId) {
+            assert_eq!(ci.spike_times(c), &pre_buckets[c.idx()][..]);
         }
         assert_eq!(ci.spike_clusters(), &pre_assign[..]);
     }
@@ -653,26 +674,26 @@ mod tests {
     fn split_moves_chosen_spikes_to_a_fresh_cluster() {
         let mut ci = cidx();
         // Cluster 0 has [10,30,150]; move the middle one.
-        let rec = ci.split(0, &[1]);
-        assert_eq!(rec.source, 0);
-        assert_eq!(rec.new_cluster, 3);
+        let rec = ci.split(ClusterId(0), &[1]);
+        assert_eq!(rec.source, ClusterId(0));
+        assert_eq!(rec.new_cluster, ClusterId(3));
         assert_eq!(ci.n_clusters(), 4);
-        assert_eq!(ci.spike_times(0), &[10, 150]);
-        assert_eq!(ci.spike_times(3), &[30]);
+        assert_eq!(ci.spike_times(ClusterId(0)), &[SampleIndex(10), SampleIndex(150)]);
+        assert_eq!(ci.spike_times(ClusterId(3)), &[SampleIndex(30)]);
     }
 
     #[test]
     fn unsplit_restores_state_and_frees_trailing_cluster_id() {
         let mut ci = cidx();
         let n_before = ci.n_clusters();
-        let pre_source = ci.spike_times(0).to_vec();
+        let pre_source = ci.spike_times(ClusterId(0)).to_vec();
         let pre_assign = ci.spike_clusters().to_vec();
 
-        let rec = ci.split(0, &[0, 2]);
+        let rec = ci.split(ClusterId(0), &[0, 2]);
         ci.unsplit(rec);
 
         assert_eq!(ci.n_clusters(), n_before);
-        assert_eq!(ci.spike_times(0), &pre_source[..]);
+        assert_eq!(ci.spike_times(ClusterId(0)), &pre_source[..]);
         assert_eq!(ci.spike_clusters(), &pre_assign[..]);
     }
 
@@ -680,8 +701,8 @@ mod tests {
     fn split_with_out_of_range_local_idx_is_a_noop_for_those_indices() {
         let mut ci = cidx();
         // Cluster 2 has 1 spike; idx 99 is bogus.
-        let rec = ci.split(2, &[99]);
-        assert_eq!(ci.spike_times(2), &[100]);
+        let rec = ci.split(ClusterId(2), &[99]);
+        assert_eq!(ci.spike_times(ClusterId(2)), &[SampleIndex(100)]);
         assert!(ci.spike_times(rec.new_cluster).is_empty());
     }
 
@@ -689,8 +710,8 @@ mod tests {
     fn merge_with_target_in_sources_is_a_noop_for_target() {
         let mut ci = cidx();
         // sources include target=2; only 0 and 1 should be merged in.
-        let _rec = ci.merge(&[0, 1, 2], 2);
-        assert_eq!(ci.spike_times(2), &[10, 20, 30, 100, 150, 200]);
+        let _rec = ci.merge(&[ClusterId(0), ClusterId(1), ClusterId(2)], ClusterId(2));
+        assert_eq!(ci.spike_times(ClusterId(2)), &[SampleIndex(10), SampleIndex(20), SampleIndex(30), SampleIndex(100), SampleIndex(150), SampleIndex(200)]);
     }
 
     #[test]
@@ -726,28 +747,28 @@ mod tests {
         impl HasAmplitudes for WithAmps {
             fn spike_amplitudes(&self, c: ClusterId) -> &[f32] {
                 self.amps
-                    .get(c as usize)
+                    .get(c.idx())
                     .map(Vec::as_slice)
                     .unwrap_or(&[])
             }
         }
         let prov = WithAmps {
             inner: StubProvider {
-                spikes: vec![vec![10, 30, 150], vec![20, 200], vec![100]],
+                spikes: vec![vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)], vec![SampleIndex(20), SampleIndex(200)], vec![SampleIndex(100)]],
             },
             amps: vec![vec![1.0, 3.0, 6.0], vec![2.0, 5.0], vec![4.0]],
         };
         let mut ci = ClusterIndex::from_provider(&prov);
         ci.seed_amplitudes(&prov);
-        assert_eq!(ci.spike_amplitudes(0), &[1.0, 3.0, 6.0]);
-        assert_eq!(ci.spike_amplitudes(1), &[2.0, 5.0]);
-        assert_eq!(ci.spike_amplitudes(2), &[4.0]);
+        assert_eq!(ci.spike_amplitudes(ClusterId(0)), &[1.0, 3.0, 6.0]);
+        assert_eq!(ci.spike_amplitudes(ClusterId(1)), &[2.0, 5.0]);
+        assert_eq!(ci.spike_amplitudes(ClusterId(2)), &[4.0]);
 
         // After merging cluster 0 into 2, cluster 2's amplitudes should
         // contain {4.0, 1.0, 3.0, 6.0} in time order: t=10 a=1, t=30 a=3,
         // t=100 a=4, t=150 a=6.
-        let _ = ci.merge(&[0], 2);
-        assert_eq!(ci.spike_amplitudes(2), &[1.0, 3.0, 4.0, 6.0]);
+        let _ = ci.merge(&[ClusterId(0)], ClusterId(2));
+        assert_eq!(ci.spike_amplitudes(ClusterId(2)), &[1.0, 3.0, 4.0, 6.0]);
     }
 
     /// Sequence: split → merge → undo merge → undo split. The state must
@@ -756,22 +777,23 @@ mod tests {
     fn split_then_merge_then_undo_both_returns_to_initial() {
         let mut ci = cidx();
         let pre_buckets: Vec<Vec<SampleIndex>> = (0..ci.n_clusters())
+            .map(ClusterId)
             .map(|c| ci.spike_times(c).to_vec())
             .collect();
         let pre_assign = ci.spike_clusters().to_vec();
 
-        let split_rec = ci.split(0, &[1]); // splits one spike off cluster 0
+        let split_rec = ci.split(ClusterId(0), &[1]); // splits one spike off cluster 0
         let new_id = split_rec.new_cluster;
-        let merge_rec = ci.merge(&[new_id], 2); // merge that new cluster into 2
+        let merge_rec = ci.merge(&[new_id], ClusterId(2)); // merge that new cluster into 2
 
         // Undo in reverse order.
         ci.unmerge(merge_rec);
         ci.unsplit(split_rec);
 
-        for c in 0..ci.n_clusters() {
+        for c in (0..ci.n_clusters()).map(ClusterId) {
             assert_eq!(
                 ci.spike_times(c),
-                &pre_buckets[c as usize][..],
+                &pre_buckets[c.idx()][..],
                 "bucket {c} not restored",
             );
         }
@@ -784,8 +806,8 @@ mod tests {
     fn two_splits_allocate_distinct_ids_and_free_in_reverse() {
         let mut ci = cidx();
         let n0 = ci.n_clusters();
-        let r1 = ci.split(0, &[0]);
-        let r2 = ci.split(0, &[0]);
+        let r1 = ci.split(ClusterId(0), &[0]);
+        let r2 = ci.split(ClusterId(0), &[0]);
         assert_ne!(r1.new_cluster, r2.new_cluster);
         assert_eq!(ci.n_clusters(), n0 + 2);
         ci.unsplit(r2);
@@ -798,22 +820,22 @@ mod tests {
     #[test]
     fn merge_preserves_pre_target_spikes_through_undo() {
         let mut ci = cidx();
-        let pre_target = ci.spike_times(2).to_vec();
-        let rec = ci.merge(&[0, 1], 2);
+        let pre_target = ci.spike_times(ClusterId(2)).to_vec();
+        let rec = ci.merge(&[ClusterId(0), ClusterId(1)], ClusterId(2));
         // Target should now have everything; not equal to pre.
-        assert_ne!(ci.spike_times(2), &pre_target[..]);
+        assert_ne!(ci.spike_times(ClusterId(2)), &pre_target[..]);
         ci.unmerge(rec);
-        assert_eq!(ci.spike_times(2), &pre_target[..]);
+        assert_eq!(ci.spike_times(ClusterId(2)), &pre_target[..]);
     }
 
     /// Splitting *all* of a cluster's spikes leaves the source bucket empty.
     #[test]
     fn split_all_leaves_source_empty() {
         let mut ci = cidx();
-        let n0 = ci.spike_times(0).len();
+        let n0 = ci.spike_times(ClusterId(0)).len();
         let local_idx: Vec<u32> = (0..n0 as u32).collect();
-        let rec = ci.split(0, &local_idx);
-        assert!(ci.spike_times(0).is_empty());
+        let rec = ci.split(ClusterId(0), &local_idx);
+        assert!(ci.spike_times(ClusterId(0)).is_empty());
         assert_eq!(ci.spike_times(rec.new_cluster).len(), n0);
     }
 
@@ -822,9 +844,9 @@ mod tests {
     #[test]
     fn split_empty_idx_only_allocates_a_cluster() {
         let mut ci = cidx();
-        let pre = ci.spike_times(0).to_vec();
-        let rec = ci.split(0, &[]);
-        assert_eq!(ci.spike_times(0), &pre[..]);
+        let pre = ci.spike_times(ClusterId(0)).to_vec();
+        let rec = ci.split(ClusterId(0), &[]);
+        assert_eq!(ci.spike_times(ClusterId(0)), &pre[..]);
         assert!(ci.spike_times(rec.new_cluster).is_empty());
     }
 
@@ -833,11 +855,11 @@ mod tests {
     fn total_spike_count_is_preserved_under_curation() {
         let mut ci = cidx();
         let total = ci.n_spikes();
-        let _ = ci.merge(&[0], 1);
+        let _ = ci.merge(&[ClusterId(0)], ClusterId(1));
         assert_eq!(ci.n_spikes(), total);
-        let _ = ci.split(1, &[0, 2]);
+        let _ = ci.split(ClusterId(1), &[0, 2]);
         assert_eq!(ci.n_spikes(), total);
-        let _ = ci.merge(&[1, 2], 0);
+        let _ = ci.merge(&[ClusterId(1), ClusterId(2)], ClusterId(0));
         assert_eq!(ci.n_spikes(), total);
     }
 
@@ -846,6 +868,7 @@ mod tests {
     fn bucket_sum_equals_n_spikes() {
         let ci = cidx();
         let sum: usize = (0..ci.n_clusters())
+            .map(ClusterId)
             .map(|c| ci.spike_times(c).len())
             .sum();
         assert_eq!(sum, ci.n_spikes());
@@ -855,14 +878,14 @@ mod tests {
     #[test]
     fn buckets_are_always_sorted_ascending() {
         let mut ci = cidx();
-        for c in 0..ci.n_clusters() {
+        for c in (0..ci.n_clusters()).map(ClusterId) {
             let bucket = ci.spike_times(c);
             for w in bucket.windows(2) {
                 assert!(w[0] <= w[1], "bucket {c} not sorted");
             }
         }
-        let _ = ci.merge(&[0, 1], 2);
-        let bucket = ci.spike_times(2);
+        let _ = ci.merge(&[ClusterId(0), ClusterId(1)], ClusterId(2));
+        let bucket = ci.spike_times(ClusterId(2));
         for w in bucket.windows(2) {
             assert!(w[0] <= w[1], "merged bucket not sorted");
         }
@@ -872,7 +895,7 @@ mod tests {
     fn merge_with_self_only_is_a_noop() {
         let mut ci = cidx();
         let pre = ci.spike_clusters().to_vec();
-        let _ = ci.merge(&[2], 2);
+        let _ = ci.merge(&[ClusterId(2)], ClusterId(2));
         assert_eq!(ci.spike_clusters(), &pre[..]);
     }
 
@@ -880,27 +903,27 @@ mod tests {
     fn merge_into_empty_target_takes_all_spikes() {
         let mut ci = cidx();
         // Free up cluster 2 to use as a target after pulling its single spike.
-        let _ = ci.merge(&[2], 0);
+        let _ = ci.merge(&[ClusterId(2)], ClusterId(0));
         // Now 2 is empty. Merge 0 into 2.
-        let _ = ci.merge(&[0], 2);
-        assert_eq!(ci.spike_times(2), &[10, 30, 100, 150]);
-        assert!(ci.spike_times(0).is_empty());
+        let _ = ci.merge(&[ClusterId(0)], ClusterId(2));
+        assert_eq!(ci.spike_times(ClusterId(2)), &[SampleIndex(10), SampleIndex(30), SampleIndex(100), SampleIndex(150)]);
+        assert!(ci.spike_times(ClusterId(0)).is_empty());
     }
 
     #[test]
     fn merge_with_out_of_range_source_is_ignored() {
         let mut ci = cidx();
-        let pre_target = ci.spike_times(2).to_vec();
-        let _ = ci.merge(&[99], 2);
-        assert_eq!(ci.spike_times(2), &pre_target[..]);
+        let pre_target = ci.spike_times(ClusterId(2)).to_vec();
+        let _ = ci.merge(&[ClusterId(99)], ClusterId(2));
+        assert_eq!(ci.spike_times(ClusterId(2)), &pre_target[..]);
     }
 
     #[test]
     fn split_with_duplicate_indices_moves_each_only_once() {
         let mut ci = cidx();
         // Cluster 0 has 3 spikes; ask to move local index 1 twice.
-        let rec = ci.split(0, &[1, 1]);
-        assert_eq!(ci.spike_times(0).len(), 2);
+        let rec = ci.split(ClusterId(0), &[1, 1]);
+        assert_eq!(ci.spike_times(ClusterId(0)).len(), 2);
         assert_eq!(ci.spike_times(rec.new_cluster).len(), 1);
     }
 
@@ -911,9 +934,9 @@ mod tests {
         let pre_n = ci.n_clusters();
 
         // merge → split → merge → unsplit → unmerge → unmerge
-        let r1 = ci.merge(&[0], 2);
-        let r2 = ci.split(2, &[0, 2]);
-        let r3 = ci.merge(&[1], r2.new_cluster);
+        let r1 = ci.merge(&[ClusterId(0)], ClusterId(2));
+        let r2 = ci.split(ClusterId(2), &[0, 2]);
+        let r3 = ci.merge(&[ClusterId(1)], r2.new_cluster);
 
         // Reverse all in LIFO order.
         // Need pristine snapshots before each subsequent inverse since the
@@ -929,17 +952,17 @@ mod tests {
     #[test]
     fn merge_total_count_in_target_equals_sum_of_sources() {
         let mut ci = cidx();
-        let s0 = ci.spike_times(0).len();
-        let s1 = ci.spike_times(1).len();
-        let s2 = ci.spike_times(2).len();
-        let _ = ci.merge(&[0, 1], 2);
-        assert_eq!(ci.spike_times(2).len(), s0 + s1 + s2);
+        let s0 = ci.spike_times(ClusterId(0)).len();
+        let s1 = ci.spike_times(ClusterId(1)).len();
+        let s2 = ci.spike_times(ClusterId(2)).len();
+        let _ = ci.merge(&[ClusterId(0), ClusterId(1)], ClusterId(2));
+        assert_eq!(ci.spike_times(ClusterId(2)).len(), s0 + s1 + s2);
     }
 
     #[test]
     fn split_then_split_again_on_new_cluster() {
         let mut ci = cidx();
-        let r1 = ci.split(0, &[0, 1]); // moves first two spikes off cluster 0
+        let r1 = ci.split(ClusterId(0), &[0, 1]); // moves first two spikes off cluster 0
         let n_in_new = ci.spike_times(r1.new_cluster).len();
         assert_eq!(n_in_new, 2);
         let r2 = ci.split(r1.new_cluster, &[0]);
@@ -953,8 +976,8 @@ mod tests {
         let n = ci.n_clusters();
         let a = ci.allocate_cluster();
         let b = ci.allocate_cluster();
-        assert_eq!(a, n);
-        assert_eq!(b, n + 1);
+        assert_eq!(a, ClusterId(n));
+        assert_eq!(b, ClusterId(n + 1));
         assert_eq!(ci.n_clusters(), n + 2);
         assert!(ci.spike_times(a).is_empty());
         assert!(ci.spike_times(b).is_empty());
@@ -965,7 +988,7 @@ mod tests {
         let mut ci = cidx();
         let pre = ci.spike_clusters().to_vec();
         for _ in 0..5 {
-            let rec = ci.merge(&[0, 1], 2);
+            let rec = ci.merge(&[ClusterId(0), ClusterId(1)], ClusterId(2));
             ci.unmerge(rec);
             assert_eq!(ci.spike_clusters(), &pre[..]);
         }
@@ -1020,7 +1043,7 @@ mod tests {
             }
             fn spike_pc_indices(&self, c: ClusterId) -> &[u32] {
                 self.indices_per_cluster
-                    .get(c as usize)
+                    .get(c.idx())
                     .map(Vec::as_slice)
                     .unwrap_or(&[])
             }
@@ -1030,7 +1053,7 @@ mod tests {
         // (Original NPY row indices.)
         let prov = WithPc {
             inner: StubProvider {
-                spikes: vec![vec![10, 30, 150], vec![20, 200], vec![100]],
+                spikes: vec![vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)], vec![SampleIndex(20), SampleIndex(200)], vec![SampleIndex(100)]],
             },
             pc: (0..6 * 3 * 2).map(|i| i as f32).collect(), // 6 spikes × 3 PCs × 2 chans
             n_pcs: 3,
@@ -1104,7 +1127,7 @@ mod tests {
 
         let prov = WithTpl {
             inner: StubProvider {
-                spikes: vec![vec![10], vec![20]],
+                spikes: vec![vec![SampleIndex(10)], vec![SampleIndex(20)]],
             },
             // 2 templates × 3 samples × 2 channels = 12 floats.
             templates: (0..12).map(|i| i as f32).collect(),
@@ -1138,7 +1161,7 @@ mod tests {
         let spikes: Vec<Vec<SampleIndex>> = (0..n_clusters)
             .map(|c| {
                 (0..n_per)
-                    .map(|i| (c * n_per + i) as SampleIndex)
+                    .map(|i| SampleIndex((c * n_per + i) as u64))
                     .collect()
             })
             .collect();
@@ -1146,9 +1169,9 @@ mod tests {
         let mut ci = ClusterIndex::from_provider(&prov);
         assert_eq!(ci.n_spikes(), n_clusters * n_per);
 
-        let half: Vec<u32> = (0..n_clusters as u32 / 2).collect();
-        let rec = ci.merge(&half, n_clusters as u32 - 1);
-        let target_count = ci.spike_times(n_clusters as u32 - 1).len();
+        let half: Vec<ClusterId> = (0..n_clusters as u32 / 2).map(ClusterId).collect();
+        let rec = ci.merge(&half, ClusterId(n_clusters as u32 - 1));
+        let target_count = ci.spike_times(ClusterId(n_clusters as u32 - 1)).len();
         assert_eq!(target_count, (half.len() + 1) * n_per);
 
         ci.unmerge(rec);

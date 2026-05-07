@@ -1,8 +1,235 @@
 use std::fmt::Debug;
 
-pub type SampleIndex = u64;
-pub type ChannelId = u32;
-pub type ClusterId = u32;
+#[repr(transparent)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    bytemuck::Pod,
+    bytemuck::Zeroable,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct SampleIndex(pub u64);
+
+impl SampleIndex {
+    #[inline]
+    pub const fn new(v: u64) -> Self {
+        Self(v)
+    }
+    #[inline]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+    #[inline]
+    pub const fn idx(self) -> usize {
+        self.0 as usize
+    }
+    #[inline]
+    pub const fn as_i64(self) -> i64 {
+        self.0 as i64
+    }
+    #[inline]
+    pub fn as_f32(self) -> f32 {
+        self.0 as f32
+    }
+    #[inline]
+    pub fn as_f64(self) -> f64 {
+        self.0 as f64
+    }
+}
+impl From<u64> for SampleIndex {
+    fn from(v: u64) -> Self {
+        Self(v)
+    }
+}
+impl From<SampleIndex> for u64 {
+    fn from(s: SampleIndex) -> Self {
+        s.0
+    }
+}
+impl std::fmt::Display for SampleIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+#[repr(transparent)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    bytemuck::Pod,
+    bytemuck::Zeroable,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct ChannelId(pub u32);
+
+impl ChannelId {
+    #[inline]
+    pub const fn new(v: u32) -> Self {
+        Self(v)
+    }
+    #[inline]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+    #[inline]
+    pub const fn idx(self) -> usize {
+        self.0 as usize
+    }
+    #[inline]
+    pub const fn as_i64(self) -> i64 {
+        self.0 as i64
+    }
+    #[inline]
+    pub fn as_f32(self) -> f32 {
+        self.0 as f32
+    }
+    #[inline]
+    pub fn as_f64(self) -> f64 {
+        self.0 as f64
+    }
+}
+impl From<u32> for ChannelId {
+    fn from(v: u32) -> Self {
+        Self(v)
+    }
+}
+impl From<ChannelId> for u32 {
+    fn from(c: ChannelId) -> Self {
+        c.0
+    }
+}
+impl std::fmt::Display for ChannelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+#[repr(transparent)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    bytemuck::Pod,
+    bytemuck::Zeroable,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct ClusterId(pub u32);
+
+impl ClusterId {
+    #[inline]
+    pub const fn new(v: u32) -> Self {
+        Self(v)
+    }
+    #[inline]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+    #[inline]
+    pub const fn idx(self) -> usize {
+        self.0 as usize
+    }
+    #[inline]
+    pub const fn as_i64(self) -> i64 {
+        self.0 as i64
+    }
+    #[inline]
+    pub fn as_f32(self) -> f32 {
+        self.0 as f32
+    }
+    #[inline]
+    pub fn as_f64(self) -> f64 {
+        self.0 as f64
+    }
+}
+impl From<u32> for ClusterId {
+    fn from(v: u32) -> Self {
+        Self(v)
+    }
+}
+impl From<ClusterId> for u32 {
+    fn from(c: ClusterId) -> Self {
+        c.0
+    }
+}
+impl std::fmt::Display for ClusterId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+/// Optional row index packed into a `u32`. `u32::MAX` encodes "absent" so a
+/// flat `Vec<OptionalRow>` is the same size as a `Vec<u32>`; `Option<u32>`
+/// would double the footprint, which matters for >10M-spike recordings.
+///
+/// Use [`OptionalRow::get`] to convert to a real `Option<u32>` at the use
+/// site so callers can't accidentally treat the sentinel as a valid row.
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct OptionalRow(u32);
+
+impl OptionalRow {
+    /// The "absent" sentinel.
+    pub const NONE: Self = Self(u32::MAX);
+
+    /// Wrap a raw row index. `u32::MAX` becomes `NONE`.
+    pub const fn new(row: u32) -> Self {
+        Self(row)
+    }
+
+    /// Construct from `Option<u32>`. `Some(u32::MAX)` collapses to `NONE`.
+    pub const fn from_option(row: Option<u32>) -> Self {
+        match row {
+            Some(r) => Self(r),
+            None => Self::NONE,
+        }
+    }
+
+    /// Resolve to an `Option<u32>` for use at the call site.
+    #[inline]
+    pub const fn get(self) -> Option<u32> {
+        if self.0 == u32::MAX {
+            None
+        } else {
+            Some(self.0)
+        }
+    }
+
+    pub const fn is_some(self) -> bool {
+        self.0 != u32::MAX
+    }
+}
+
+impl Default for OptionalRow {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
 
 /// On-disk dtype for the raw trace file. phy supports int16/uint16/int32/float32;
 /// Kilosort's default is int16 but other recording rigs (e.g. SpikeGLX float

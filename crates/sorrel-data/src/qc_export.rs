@@ -15,7 +15,7 @@
 use crate::quality_ext::cluster_quality;
 use crate::session::Session;
 use anyhow::{Context, Result};
-use sorrel_io::DataProvider;
+use sorrel_io::{ClusterId, DataProvider};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -120,12 +120,12 @@ pub fn collect_qc_rows<P: DataProvider>(session: &Session<P>) -> Vec<QcRow> {
     };
     let sr = session.provider.sample_rate().max(1.0);
     let total_samples = session.provider.n_samples();
-    let total_seconds = total_samples as f32 / sr;
+    let total_seconds = total_samples.as_f32() / sr;
     let refractory_samples = (sr * 0.0015).round() as u64;
 
     let n = session.n_clusters();
     let mut rows = Vec::with_capacity(n as usize);
-    for c in 0..n {
+    for c in (0..n).map(ClusterId) {
         let times = session.spike_times(c);
         let amps = session.spike_amplitudes(c);
         let q = cluster_quality(session, c);
@@ -145,7 +145,7 @@ pub fn collect_qc_rows<P: DataProvider>(session: &Session<P>) -> Vec<QcRow> {
         } else {
             0.0
         };
-        let _contam = refractory_contamination(times, refractory_samples, total_samples, sr);
+        let _contam = refractory_contamination(times, refractory_samples, total_samples.0, sr);
         let _ = (amplitude_snr, amplitude_drift_correlation, presence_ratio,
                  longest_silent_gap_frac);
         let (iso2, l_ratio, nn) = match q.isolation {
@@ -153,7 +153,7 @@ pub fn collect_qc_rows<P: DataProvider>(session: &Session<P>) -> Vec<QcRow> {
             None => (f32::NAN, f32::NAN, f32::NAN),
         };
         rows.push(QcRow {
-            cluster_id: c,
+            cluster_id: c.0,
             n_spikes: times.len() as u32,
             mean_amplitude: mean_amp,
             firing_rate_hz: firing_rate,
@@ -231,25 +231,25 @@ mod tests {
         fn n_samples(&self) -> SampleIndex { self.n_samples }
         fn n_clusters(&self) -> u32 { self.spikes.len() as u32 }
         fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
-            self.spikes.get(c as usize).map(Vec::as_slice).unwrap_or(&[])
+            self.spikes.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
         }
         fn trace(&self, _: SampleIndex, _: u32) -> TraceSlice<'_> {
-            TraceSlice { start: 0, n_channels: 1, samples: TraceSamples::I16(&[]) }
+            TraceSlice { start: SampleIndex(0), n_channels: 1, samples: TraceSamples::I16(&[]) }
         }
         fn initial_labels(&self) -> Vec<u8> { vec![0; self.spikes.len()] }
     }
     impl HasAmplitudes for MockProvider {
         fn spike_amplitudes(&self, c: ClusterId) -> &[f32] {
-            self.amps.get(c as usize).map(Vec::as_slice).unwrap_or(&[])
+            self.amps.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
         }
     }
 
     #[test]
     fn export_writes_both_formats_with_one_row_per_cluster() {
         let prov = MockProvider {
-            spikes: vec![vec![10, 30, 150], vec![20, 200], vec![100]],
+            spikes: vec![vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)], vec![SampleIndex(20), SampleIndex(200)], vec![SampleIndex(100)]],
             amps: vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0], vec![6.0]],
-            n_samples: 1000,
+            n_samples: SampleIndex(1000),
         };
         let dir = tempfile::tempdir().unwrap();
         let journal = SqliteJournal::open(&dir.path().join("j.sqlite")).unwrap();
@@ -278,9 +278,9 @@ mod tests {
     #[test]
     fn isolation_columns_are_blank_in_tsv_when_no_pc_features() {
         let prov = MockProvider {
-            spikes: vec![vec![10, 20]],
+            spikes: vec![vec![SampleIndex(10), SampleIndex(20)]],
             amps: vec![vec![1.0, 2.0]],
-            n_samples: 100,
+            n_samples: SampleIndex(100),
         };
         let dir = tempfile::tempdir().unwrap();
         let journal = SqliteJournal::open(&dir.path().join("j.sqlite")).unwrap();

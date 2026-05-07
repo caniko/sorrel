@@ -3,30 +3,38 @@ title = "Sorrel"
 
 [extra]
 tagline = "Native spike-sorting curation"
-subtitle = "A high-performance GUI for manual curation of spike-sorted electrophysiology data, built around monomorphised Rust data paths and durable SQLite journaling."
+subtitle = "A high-performance GUI for manual curation of spike-sorted electrophysiology data — phy / Kilosort, SpikeInterface, NWB, and KS4 rez out of the box, with a monomorphised Rust core, wgpu compute, and a durable SQLite journal."
 install = "cargo build --release -p sorrel"
 
 [[extra.features]]
-title = "Kilosort / phy2 V1"
-description = "Loads Kilosort arrays, phy2 labels, and raw recording traces for cluster-oriented curation."
+title = "Phy & Kilosort, natively"
+description = "Reads spike_times, spike_clusters, params.py, templates, PC features, amplitudes, similar_templates, channel_positions, and quality-metric sidecars exactly as phy does."
 
 [[extra.features]]
-title = "Static Dispatch Core"
-description = "The session, UI, render, and compute paths are generic over DataProvider instead of runtime trait objects."
+title = "Multiple backends"
+description = "phy / Kilosort, SpikeInterface SortingAnalyzer (binary folder), Kilosort 4 rez.mat, and NWB. SpikeGLX, Open Ephys, and MDA work as raw trace sources."
 
 [[extra.features]]
-title = "Memory-Mapped Inputs"
-description = "Spike arrays and raw trace data are memory-mapped so large recordings stay practical to inspect."
+title = "Static-dispatch core"
+description = "Session, UI, render, and compute paths are generic over the DataProvider trait — every hot path is monomorphised per backend, no Box<dyn Trait>."
 
 [[extra.features]]
-title = "Durable Curation"
-description = "Label operations are written to SQLite before in-memory state is updated."
+title = "GPU trace pipeline"
+description = "Optional wgpu kernels for common-median referencing, high-pass filtering, and mean-snippet extraction — sharing the renderer's device and queue, with a transparent CPU fallback."
 
 [[extra.features]]
-title = "Native GUI"
-description = "egui and wgpu provide a responsive desktop interface for cluster navigation and trace inspection."
+title = "Durable curation journal"
+description = "Every relabel, merge, split, and undo/redo lands in SQLite before the in-memory session moves. Replay on open is idempotent; resealed at save."
 
 [[extra.features]]
-title = "Focused Workspace"
-description = "IO, data state, compute kernels, rendering buffers, UI, and the binary entry point live in separate crates."
+title = "Built-in views"
+description = "Trace, raster, ISI, CCG, waveform, template, feature, drift, probe, similarity, quality, and merge/split suggestions, all in one window."
+
+[[extra.features]]
+title = "Headless QC export"
+description = "sorrel --export-qc DIR runs every metric on the loaded session and writes cluster_qc.tsv + cluster_qc.json without spawning a window."
+
+[[extra.features]]
+title = "Python bridge"
+description = "sorrel.open(recording, sorting) opens a SpikeInterface analyzer in the native GUI via the sorrel-py bridge."
 +++

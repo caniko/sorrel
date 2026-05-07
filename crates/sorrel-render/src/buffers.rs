@@ -6,22 +6,51 @@ use sorrel_io::{ClusterId, DataProvider, SampleIndex, TraceSamples};
 
 /// Optional pre-processing applied to the trace window before LTTB.
 ///
-/// Both fields default to "off" — when `params.py:hp_filtered = True` and the
-/// recording is already CMR'd, the trace mmap is the truth and these stages
-/// would be redundant.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct TraceConfig {
-    /// HP cutoff in Hz; `None` means no filtering. ~300 Hz is phy's default
-    /// for spike-band display.
-    pub hp_cutoff_hz: Option<f32>,
-    /// Subtract the per-time-step channel median (across all channels in the
-    /// window) before filtering / LTTB.
-    pub cmr: bool,
+/// `Off` means the on-disk mmap is the truth — this is correct when
+/// `params.py:hp_filtered = True` and the recording is already CMR'd, where
+/// the extra stages would be redundant.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub enum TracePreproc {
+    #[default]
+    Off,
+    /// HP filter only at the given cutoff in Hz.
+    Hp(f32),
+    /// Per-time-step channel median subtraction only.
+    Cmr,
+    /// CMR followed by HP filter at the given cutoff in Hz.
+    HpAndCmr(f32),
 }
 
-impl TraceConfig {
-    pub fn off() -> Self {
-        Self::default()
+impl TracePreproc {
+    /// phy's default HP cutoff for the spike band.
+    pub const HP_DEFAULT_HZ: f32 = 300.0;
+
+    /// HP cutoff in Hz, if HP is enabled.
+    pub const fn hp(self) -> Option<f32> {
+        match self {
+            Self::Hp(hz) | Self::HpAndCmr(hz) => Some(hz),
+            Self::Off | Self::Cmr => None,
+        }
+    }
+
+    pub const fn has_cmr(self) -> bool {
+        matches!(self, Self::Cmr | Self::HpAndCmr(_))
+    }
+
+    /// True when no preprocessing applies — render code can take the
+    /// dtype-native fast path.
+    pub const fn is_off(self) -> bool {
+        matches!(self, Self::Off)
+    }
+
+    /// Build from independent HP / CMR controls (e.g. two UI checkboxes).
+    pub const fn from_flags(hp: Option<f32>, cmr: bool) -> Self {
+        match (hp, cmr) {
+            (None, false) => Self::Off,
+            (Some(hz), false) => Self::Hp(hz),
+            (None, true) => Self::Cmr,
+            (Some(hz), true) => Self::HpAndCmr(hz),
+        }
     }
 }
 
@@ -38,18 +67,18 @@ pub fn build_trace_vertices<P: DataProvider>(
         start,
         len,
         target_points_per_channel,
-        TraceConfig::off(),
+        TracePreproc::Off,
     )
 }
 
 /// Like [`build_trace_vertices`] but applies optional HP filter / CMR
-/// pre-processing per [`TraceConfig`] before running LTTB.
+/// pre-processing per [`TracePreproc`] before running LTTB.
 pub fn build_trace_vertices_cfg<P: DataProvider>(
     session: &Session<P>,
     start: SampleIndex,
     len: u32,
     target_points_per_channel: usize,
-    cfg: TraceConfig,
+    cfg: TracePreproc,
 ) -> Vec<TraceVertex> {
     let provider = &session.provider;
     let slice = provider.trace(start, len);
@@ -59,11 +88,10 @@ pub fn build_trace_vertices_cfg<P: DataProvider>(
     }
 
     let x_step = 1.0f32 / provider.sample_rate();
-    let x_origin = start as f32 * x_step;
+    let x_origin = start.as_f32() * x_step;
     let cap = target_points_per_channel * nc;
-    let needs_f32 = cfg.hp_cutoff_hz.is_some() || cfg.cmr;
 
-    if !needs_f32 {
+    if cfg.is_off() {
         // Fast path: dispatch on the native dtype, do no preprocessing.
         return match slice.samples {
             TraceSamples::I16(s) => {
@@ -102,7 +130,7 @@ pub fn build_trace_vertices_gpu<P: DataProvider>(
     start: SampleIndex,
     len: u32,
     target_points_per_channel: usize,
-    cfg: TraceConfig,
+    cfg: TracePreproc,
     gpu: &GpuTracePreproc,
 ) -> Vec<TraceVertex> {
     let provider = &session.provider;
@@ -113,11 +141,10 @@ pub fn build_trace_vertices_gpu<P: DataProvider>(
     }
 
     let x_step = 1.0f32 / provider.sample_rate();
-    let x_origin = start as f32 * x_step;
+    let x_origin = start.as_f32() * x_step;
     let cap = target_points_per_channel * nc;
-    let needs_f32 = cfg.hp_cutoff_hz.is_some() || cfg.cmr;
 
-    if !needs_f32 {
+    if cfg.is_off() {
         // Same fast path as CPU: skip preprocessing entirely.
         return build_trace_vertices_cfg(
             session,
@@ -159,16 +186,16 @@ impl GpuTracePreproc {
         &self,
         buf: &mut [f32],
         n_channels: u32,
-        cfg: TraceConfig,
+        cfg: TracePreproc,
         sample_rate: f32,
     ) -> bool {
-        if cfg.cmr {
+        if cfg.has_cmr() {
             if let Err(e) = self.cmr.run(buf, n_channels) {
                 log::warn!("GPU CMR failed, falling back to CPU: {e}");
                 return false;
             }
         }
-        if let Some(hz) = cfg.hp_cutoff_hz {
+        if let Some(hz) = cfg.hp() {
             let b = Biquad::butterworth_hp(hz, sample_rate);
             if let Err(e) = self.biquad.run(buf, n_channels, b) {
                 log::warn!("GPU Biquad failed, falling back to CPU: {e}");
@@ -179,11 +206,11 @@ impl GpuTracePreproc {
     }
 }
 
-fn apply_preproc_cpu(buf: &mut [f32], nc: usize, cfg: TraceConfig, sample_rate: f32) {
-    if cfg.cmr {
+fn apply_preproc_cpu(buf: &mut [f32], nc: usize, cfg: TracePreproc, sample_rate: f32) {
+    if cfg.has_cmr() {
         subtract_channel_median(buf, nc);
     }
-    if let Some(hz) = cfg.hp_cutoff_hz {
+    if let Some(hz) = cfg.hp() {
         let f = Biquad::butterworth_hp(hz, sample_rate);
         let mut states = vec![BiquadState::default(); nc];
         let n_samples = buf.len() / nc;
@@ -241,8 +268,8 @@ pub fn build_scatter_vertices<P: DataProvider>(
         let y = row as f32;
         for &t in session.spike_times(c) {
             out.push(ScatterVertex {
-                pos: [t as f32 * inv_sr, y],
-                cluster: c,
+                pos: [t.as_f32() * inv_sr, y],
+                cluster: c.0,
             });
         }
     }
@@ -267,15 +294,15 @@ mod tests {
         fn sample_rate(&self) -> f32 { self.sr }
         fn n_channels(&self) -> u32 { self.n_channels }
         fn n_samples(&self) -> SampleIndex {
-            (self.trace.len() / self.n_channels.max(1) as usize) as u64
+            SampleIndex((self.trace.len() / self.n_channels.max(1) as usize) as u64)
         }
         fn n_clusters(&self) -> u32 { self.spikes.len() as u32 }
         fn spike_times(&self, cluster: ClusterId) -> &[SampleIndex] {
-            self.spikes.get(cluster as usize).map(Vec::as_slice).unwrap_or(&[])
+            self.spikes.get(cluster.idx()).map(Vec::as_slice).unwrap_or(&[])
         }
         fn trace(&self, start: SampleIndex, len: u32) -> TraceSlice<'_> {
             let nc = self.n_channels as usize;
-            let s = (start as usize * nc).min(self.trace.len());
+            let s = (start.idx() * nc).min(self.trace.len());
             let e = (s + len as usize * nc).min(self.trace.len());
             TraceSlice {
                 start,
@@ -295,13 +322,13 @@ mod tests {
     #[test]
     fn scatter_vertices_one_per_spike_with_correct_row_and_time() {
         let provider = MockProvider {
-            spikes: vec![vec![0, 100, 200], vec![50]],
+            spikes: vec![vec![SampleIndex(0), SampleIndex(100), SampleIndex(200)], vec![SampleIndex(50)]],
             trace: vec![],
             n_channels: 1,
             sr: 1000.0,
         };
         let (session, _d) = session_with(provider);
-        let v = build_scatter_vertices(&session, &[0, 1]);
+        let v = build_scatter_vertices(&session, &[ClusterId(0), ClusterId(1)]);
         assert_eq!(v.len(), 4);
 
         // Cluster 0 (row 0): 3 spikes.
@@ -317,13 +344,13 @@ mod tests {
     #[test]
     fn scatter_vertices_skips_unknown_cluster_ids() {
         let provider = MockProvider {
-            spikes: vec![vec![1, 2]],
+            spikes: vec![vec![SampleIndex(1), SampleIndex(2)]],
             trace: vec![],
             n_channels: 1,
             sr: 100.0,
         };
         let (session, _d) = session_with(provider);
-        let v = build_scatter_vertices(&session, &[0, 99]);
+        let v = build_scatter_vertices(&session, &[ClusterId(0), ClusterId(99)]);
         assert_eq!(v.len(), 2);
         assert!(v.iter().all(|x| x.cluster == 0));
     }
@@ -346,7 +373,7 @@ mod tests {
         };
         let (session, _d) = session_with(provider);
         let target = 32usize;
-        let v = build_trace_vertices(&session, 0, n_samples as u32, target);
+        let v = build_trace_vertices(&session, SampleIndex(0), n_samples as u32, target);
         assert_eq!(v.len(), target * n_channels as usize);
         // Channels are emitted in outer-loop order: first `target` verts are channel 0, etc.
         assert_eq!(v[0].channel, 0);
@@ -362,7 +389,7 @@ mod tests {
             n_channels: 0,
             sr: 1000.0,
         });
-        assert!(build_trace_vertices(&session, 0, 100, 32).is_empty());
+        assert!(build_trace_vertices(&session, SampleIndex(0), 100, 32).is_empty());
     }
 
     #[test]
@@ -383,8 +410,8 @@ mod tests {
         };
         let (session, _d) = session_with(provider);
 
-        let a = build_trace_vertices(&session, 0, n_samples as u32, 32);
-        let b = build_trace_vertices_cfg(&session, 0, n_samples as u32, 32, TraceConfig::off());
+        let a = build_trace_vertices(&session, SampleIndex(0), n_samples as u32, 32);
+        let b = build_trace_vertices_cfg(&session, SampleIndex(0), n_samples as u32, 32, TracePreproc::Off);
         assert_eq!(a.len(), b.len());
         for (av, bv) in a.iter().zip(b.iter()) {
             assert_eq!(av.channel, bv.channel);
@@ -411,11 +438,8 @@ mod tests {
             sr: 1000.0,
         });
 
-        let cfg = TraceConfig {
-            cmr: true,
-            ..TraceConfig::off()
-        };
-        let v = build_trace_vertices_cfg(&session, 0, n_samples as u32, 32, cfg);
+        let cfg = TracePreproc::Cmr;
+        let v = build_trace_vertices_cfg(&session, SampleIndex(0), n_samples as u32, 32, cfg);
         for vert in &v {
             assert!(
                 vert.pos[1].abs() < 1e-3,
@@ -438,13 +462,10 @@ mod tests {
             sr: 30_000.0,
         });
 
-        let cfg_off = TraceConfig::off();
-        let cfg_hp = TraceConfig {
-            hp_cutoff_hz: Some(300.0),
-            ..TraceConfig::off()
-        };
-        let v_off = build_trace_vertices_cfg(&session, 0, n_samples as u32, 64, cfg_off);
-        let v_hp = build_trace_vertices_cfg(&session, 0, n_samples as u32, 64, cfg_hp);
+        let cfg_off = TracePreproc::Off;
+        let cfg_hp = TracePreproc::Hp(300.0);
+        let v_off = build_trace_vertices_cfg(&session, SampleIndex(0), n_samples as u32, 64, cfg_off);
+        let v_hp = build_trace_vertices_cfg(&session, SampleIndex(0), n_samples as u32, 64, cfg_hp);
 
         // Last vertex is sampled near the end of the window — settled.
         let off_tail = v_off.last().unwrap().pos[1].abs();
@@ -456,7 +477,7 @@ mod tests {
     #[test]
     fn scatter_vertices_empty_when_no_clusters_passed() {
         let provider = MockProvider {
-            spikes: vec![vec![1, 2, 3]],
+            spikes: vec![vec![SampleIndex(1), SampleIndex(2), SampleIndex(3)]],
             trace: vec![],
             n_channels: 1,
             sr: 1000.0,
@@ -468,13 +489,13 @@ mod tests {
     #[test]
     fn scatter_vertices_y_equals_row_index() {
         let provider = MockProvider {
-            spikes: vec![vec![10], vec![20], vec![30]],
+            spikes: vec![vec![SampleIndex(10)], vec![SampleIndex(20)], vec![SampleIndex(30)]],
             trace: vec![],
             n_channels: 1,
             sr: 1000.0,
         };
         let (session, _d) = session_with(provider);
-        let v = build_scatter_vertices(&session, &[0, 1, 2]);
+        let v = build_scatter_vertices(&session, &[ClusterId(0), ClusterId(1), ClusterId(2)]);
         assert_eq!(v[0].pos[1], 0.0);
         assert_eq!(v[1].pos[1], 1.0);
         assert_eq!(v[2].pos[1], 2.0);
@@ -483,13 +504,13 @@ mod tests {
     #[test]
     fn scatter_vertices_time_in_seconds_via_sample_rate() {
         let provider = MockProvider {
-            spikes: vec![vec![3000]], // = 0.1 s at 30 kHz
+            spikes: vec![vec![SampleIndex(3000)]], // = 0.1 s at 30 kHz
             trace: vec![],
             n_channels: 1,
             sr: 30_000.0,
         };
         let (session, _d) = session_with(provider);
-        let v = build_scatter_vertices(&session, &[0]);
+        let v = build_scatter_vertices(&session, &[ClusterId(0)]);
         assert_eq!(v.len(), 1);
         assert!((v[0].pos[0] - 0.1).abs() < 1e-6);
     }
@@ -513,11 +534,8 @@ mod tests {
             n_channels,
             sr: 30_000.0,
         });
-        let cfg = TraceConfig {
-            hp_cutoff_hz: Some(300.0),
-            cmr: true,
-        };
-        let v = build_trace_vertices_cfg(&session, 0, n_samples as u32, 64, cfg);
+        let cfg = TracePreproc::HpAndCmr(300.0);
+        let v = build_trace_vertices_cfg(&session, SampleIndex(0), n_samples as u32, 64, cfg);
         for vert in v.iter().skip(40) {
             assert!(
                 vert.pos[1].abs() < 0.5,

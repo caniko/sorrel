@@ -12,7 +12,7 @@ use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::{export_qc, save_to_phy, CurationCommand, Session};
 use sorrel_io::{ClusterId, DataProvider};
 use sorrel_gpu::GpuContext;
-use sorrel_render::{GpuTracePreproc, TraceConfig};
+use sorrel_render::{GpuTracePreproc, TracePreproc};
 use std::path::PathBuf;
 
 /// Which cluster-summary view fills the central panel. Persisted in the app
@@ -52,7 +52,7 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     /// Last "save successful" status message.
     status: Option<String>,
     /// Optional pre-processing applied to the trace window before LTTB.
-    trace_cfg: TraceConfig,
+    trace_cfg: TracePreproc,
     central_tab: CentralTab,
     /// Probe geometry — set by the binary when the backend exposes it.
     /// Empty means the WaveformView falls back to single-channel layout.
@@ -71,7 +71,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     pub fn new(session: Session<P>, label_str: fn(&P::Label) -> &'static str) -> Self {
         let window_len = (session.provider.sample_rate() as u32).max(1) / 10; // 100 ms
         let selection = if session.n_clusters() > 0 {
-            SelectionSet::single(0)
+            SelectionSet::single(ClusterId(0))
         } else {
             SelectionSet::new()
         };
@@ -85,7 +85,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             error: None,
             save_dir: None,
             status: None,
-            trace_cfg: TraceConfig::default(),
+            trace_cfg: TracePreproc::Off,
             central_tab: CentralTab::Summary,
             channel_positions: Vec::new(),
             waveform_cache: WaveformCache::new(),
@@ -127,17 +127,17 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         let n = self.session.n_clusters();
         match intent {
             Intent::SelectCluster(c) => {
-                if c < n {
+                if c.0 < n {
                     self.selection.replace(c);
                 }
             }
             Intent::ToggleCluster(c) => {
-                if c < n {
+                if c.0 < n {
                     self.selection.toggle(c);
                 }
             }
             Intent::ExtendCluster(c) => {
-                if c < n {
+                if c.0 < n {
                     self.selection.extend_to(c);
                 }
             }
@@ -194,6 +194,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     .session
                     .provider
                     .n_samples()
+                    .0
                     .saturating_sub(self.window_len as u64);
                 self.window_start = (self.window_start + self.window_len as u64).min(max);
             }
@@ -296,11 +297,14 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                         self.window_start, self.window_len
                     ));
                     ui.separator();
-                    let mut hp_on = self.trace_cfg.hp_cutoff_hz.is_some();
-                    if ui.checkbox(&mut hp_on, "HP 300 Hz").changed() {
-                        self.trace_cfg.hp_cutoff_hz = if hp_on { Some(300.0) } else { None };
+                    let mut hp_on = self.trace_cfg.hp().is_some();
+                    let mut cmr_on = self.trace_cfg.has_cmr();
+                    let hp_changed = ui.checkbox(&mut hp_on, "HP 300 Hz").changed();
+                    let cmr_changed = ui.checkbox(&mut cmr_on, "CMR").changed();
+                    if hp_changed || cmr_changed {
+                        let hp = hp_on.then_some(TracePreproc::HP_DEFAULT_HZ);
+                        self.trace_cfg = TracePreproc::from_flags(hp, cmr_on);
                     }
-                    ui.checkbox(&mut self.trace_cfg.cmr, "CMR");
                 });
                 trace_view(
                     ui,
@@ -373,6 +377,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                             .session
                             .provider
                             .n_samples()
+                            .0
                             .saturating_sub(self.window_len as u64);
                         self.window_start = sample.min(max);
                     }
@@ -392,7 +397,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                             let cmd = CurationCommand::Split {
                                 cluster,
                                 spike_idx,
-                                new_cluster: 0, // honoured to keep schema; ClusterIndex auto-allocates
+                                new_cluster: ClusterId(0), // honoured to keep schema; ClusterIndex auto-allocates
                             };
                             if let Err(e) = self.session.dispatch(cmd) {
                                 self.error = Some(format!("split failed: {e}"));
@@ -473,7 +478,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                                 let cmd = CurationCommand::Split {
                                     cluster,
                                     spike_idx,
-                                    new_cluster: 0,
+                                    new_cluster: ClusterId(0),
                                 };
                                 if let Err(e) = self.session.dispatch(cmd) {
                                     self.error = Some(format!("split failed: {e}"));
