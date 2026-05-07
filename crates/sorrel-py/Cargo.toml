@@ -1,0 +1,27 @@
+[package]
+name = "sorrel-py"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Python bindings for the sorrel curation GUI"
+
+# Excluded from the workspace on purpose: PyO3 requires a Python interpreter
+# at build time (or maturin), which is not part of the default sorrel build
+# graph. Build this crate via `maturin develop` from inside this directory.
+
+[lib]
+name = "sorrel"
+crate-type = ["cdylib"]
+
+[dependencies]
+sorrel-io = { path = "../sorrel-io" }
+sorrel-data = { path = "../sorrel-data" }
+anyhow = "1"
+
+[dependencies.pyo3]
+version = "0.22"
+features = ["extension-module", "abi3-py38"]
+
+[workspace]
+# Empty section makes this its own (single-member) workspace, keeping
+# `cargo check` from descending into it from the parent workspace.

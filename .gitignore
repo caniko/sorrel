@@ -4,3 +4,5 @@
 /.cargo/config.toml
 *.sqlite-journal
 .DS_Store
+docs/book/
+website/public/

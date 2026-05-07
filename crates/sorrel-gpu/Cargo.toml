@@ -1,0 +1,13 @@
+[package]
+name = "sorrel-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sorrel-compute.workspace = true
+bytemuck.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+log.workspace = true

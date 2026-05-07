@@ -11,4 +11,18 @@ thiserror.workspace = true
 memmap2.workspace = true
 bytemuck.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 log.workspace = true
+
+# Optional HDF5 backend for NWB and Kilosort 4 `rez.mat` (MATLAB v7.3 = HDF5).
+# Off by default: pulls libhdf5 in as a system dependency. Enable with
+# `--features hdf5`. We use the actively-maintained `hdf5-metno` fork
+# (vs. the upstream-stale `hdf5` crate), which supports libhdf5 ≥ 1.14.
+hdf5-metno = { version = "0.10", optional = true }
+
+[features]
+default = []
+hdf5 = ["dep:hdf5-metno"]
+
+[dev-dependencies]
+tempfile.workspace = true

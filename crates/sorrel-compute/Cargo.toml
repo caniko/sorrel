@@ -7,3 +7,4 @@ repository.workspace = true
 
 [dependencies]
 sorrel-io.workspace = true
+rayon.workspace = true

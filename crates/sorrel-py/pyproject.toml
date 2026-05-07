@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "sorrel"
+version = "0.1.0"
+description = "Native curation GUI for SpikeInterface sortings"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.optional-dependencies]
+spikeinterface = ["spikeinterface>=0.100"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "sorrel._native"

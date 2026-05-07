@@ -19,3 +19,7 @@ egui.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
+
+[features]
+default = []
+hdf5 = ["sorrel-io/hdf5", "sorrel-data/hdf5"]

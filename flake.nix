@@ -90,6 +90,28 @@
 
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
+      # Optional libhdf5 for the NWB / Kilosort 4 rez.mat backends.
+      # `hdf5-metno-sys`'s build script wants headers and lib under one
+      # prefix, but nixpkgs splits libhdf5 into separate outputs (`out`
+      # has lib/, `dev` has include/). Symlink-join both into a single tree
+      # so the build script's HDF5_DIR detection works.
+      hdf5C = pkgs.symlinkJoin {
+        name = "hdf5-merged-${pkgs.hdf5.version}";
+        paths = [pkgs.hdf5 pkgs.hdf5.dev];
+      };
+      hdf5BuildInputs = [hdf5C];
+
+      sorrelHdf5 = craneLib.buildPackage (commonArgs
+        // {
+          inherit cargoArtifacts;
+          buildInputs = buildInputs ++ hdf5BuildInputs;
+          cargoExtraArgs = "-p sorrel --locked --features hdf5";
+          postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+            patchelf --add-rpath "${pkgs.lib.makeLibraryPath runtimeLibs}" \
+              "$out/bin/sorrel"
+          '';
+        });
+
       sorrel = craneLib.buildPackage (commonArgs
         // {
           inherit cargoArtifacts;
@@ -109,10 +131,52 @@
             platforms = platforms.unix;
           };
         });
+
+      website = pkgs.stdenv.mkDerivation {
+        pname = "sorrel-website";
+        version = "0.1.0";
+        src = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.maybeMissing ./website;
+        };
+        nativeBuildInputs = [pkgs.zola];
+        phases = ["buildPhase" "installPhase"];
+        buildPhase = ''
+          cp -r --no-preserve=mode $src/website site
+          cd site && zola build
+        '';
+        installPhase = ''
+          cp -r public $out
+        '';
+      };
+
+      docs = pkgs.stdenv.mkDerivation {
+        pname = "sorrel-docs";
+        version = "0.1.0";
+        src = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.maybeMissing ./docs;
+        };
+        nativeBuildInputs = [pkgs.mdbook];
+        buildPhase = ''
+          mdbook build docs
+        '';
+        installPhase = ''
+          cp -r docs/book $out
+        '';
+      };
+
+      site = pkgs.runCommand "sorrel-site" {} ''
+        mkdir -p $out
+        cp -r ${website}/* $out/
+        mkdir -p $out/docs
+        cp -r ${docs}/* $out/docs/
+      '';
     in {
       packages = {
         default = sorrel;
-        inherit sorrel;
+        inherit sorrel sorrelHdf5 website docs site;
+        sorrel-hdf5 = sorrelHdf5;
         cargo-config = cargoConfig.configPath;
       };
 
@@ -137,14 +201,29 @@
         packages = with pkgs;
           [
             cargo-nextest
+            mdbook
             rust-analyzer
+            zola
+            # libhdf5 is pulled in unconditionally so `cargo check
+            # --features hdf5` Just Works inside the dev shell. The default
+            # `cargo build` doesn't reference it.
+            hdf5
           ]
           ++ buildInputs
           ++ nativeBuildInputs;
 
         extraEnv = {
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
+          # Point hdf5-metno-sys at the symlink-joined hdf5 tree (headers
+          # *and* libs under one prefix) so its build script's auto-detect
+          # finds both `H5pubconf.h` and `libhdf5.so`.
+          HDF5_DIR = "${hdf5C}";
         };
+
+        extraShellHook = ''
+          echo "Website: cd website && zola serve"
+          echo "Documentation: cd docs && mdbook serve"
+        '';
       };
 
       apps.default = {

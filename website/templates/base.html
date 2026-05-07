@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="{{ lang | default(value=config.default_language) }}">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="{{ config.description }}">
+    <title>{% block title %}{{ config.title }}{% endblock title %}</title>
+    <link rel="stylesheet" href="{{ get_url(path='style.css') }}">
+  </head>
+  <body>
+    <header class="site-header">
+      <nav class="nav" aria-label="Primary navigation">
+        <a class="brand" href="{{ config.base_url }}/">{{ config.title }}</a>
+        <div class="nav-links">
+          <a href="{{ config.base_url }}/docs/">Documentation</a>
+          <a href="https://codeberg.org/caniko/sorrel">Source</a>
+        </div>
+      </nav>
+    </header>
+
+    <main>
+      {% block content %}{% endblock content %}
+    </main>
+
+    <footer class="site-footer">
+      <p>MIT OR Apache-2.0 · <a href="https://codeberg.org/caniko/sorrel">codeberg.org/caniko/sorrel</a></p>
+    </footer>
+  </body>
+</html>

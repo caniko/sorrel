@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+
+{% block title %}{{ section.title }}{% endblock title %}
+
+{% block content %}
+<section class="hero">
+  <div class="hero-inner">
+    <p class="eyebrow">{{ section.extra.tagline }}</p>
+    <h1>{{ section.title }}</h1>
+    <p class="subtitle">{{ section.extra.subtitle }}</p>
+    <div class="actions">
+      <a class="button primary" href="{{ config.base_url }}/docs/">Get started</a>
+      <a class="button secondary" href="https://codeberg.org/caniko/sorrel">View source</a>
+    </div>
+  </div>
+</section>
+
+<section class="features" aria-labelledby="features-heading">
+  <div class="section-inner">
+    <h2 id="features-heading">Built For Curation Work</h2>
+    <div class="feature-grid">
+      {% for feature in section.extra.features %}
+      <article class="feature">
+        <h3>{{ feature.title }}</h3>
+        <p>{{ feature.description }}</p>
+      </article>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+
+{% if section.extra.install %}
+<section class="quick-install" aria-labelledby="install-heading">
+  <div class="section-inner install-inner">
+    <div>
+      <h2 id="install-heading">Build Sorrel</h2>
+      <p>Compile the release binary from the Rust workspace.</p>
+    </div>
+    <pre><code>{{ section.extra.install }}</code></pre>
+  </div>
+</section>
+{% endif %}
+{% endblock content %}

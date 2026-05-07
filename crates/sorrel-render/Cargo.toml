@@ -9,4 +9,9 @@ repository.workspace = true
 sorrel-io.workspace = true
 sorrel-data.workspace = true
 sorrel-compute.workspace = true
+sorrel-gpu.workspace = true
 bytemuck.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
