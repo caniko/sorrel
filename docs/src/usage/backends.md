@@ -6,15 +6,15 @@ Sorrel reads several sorting and recording formats. The general rule:
 - **Recording-only formats** plug into a sorting via `--dat` /
   `--spikeglx-meta` / `--oebin`.
 
-| Kind | Format | Notes |
-|------|--------|-------|
-| Sorting | phy / Kilosort directory | First-class. Reads phy artefacts as-is. |
-| Sorting | SpikeInterface `SortingAnalyzer` (binary folder) | Reads `recording.json`, the flat sorting under `sorting/`, optional `probe.json`, and `extensions/quality_metrics/metrics.csv`. |
-| Sorting | NWB | Requires `--features hdf5`. Reads `/units/spike_times` + `/general/extracellular_ephys/electrodes`. |
-| Sorting | Kilosort 4 `rez.mat` | Requires `--features hdf5`. Reads `rez/st3`, `rez/ops/*`, `rez/xc`, `rez/yc`. |
-| Recording | SpikeGLX (`*.bin` + `*.meta`) | Use as `--dat`; pass `--spikeglx-meta` for sample rate / channels / dtype. |
-| Recording | Open Ephys binary (`continuous.dat` + `structure.oebin`) | Use as `--dat`; pass `--oebin` to inherit metadata. |
-| Recording | Mountainsort MDA (`*.mda`) | Use as `--dat`. Reads the MDA header. |
+| Kind      | Format                                                   | Notes                                                                                                                           |
+| --------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Sorting   | phy / Kilosort directory                                 | First-class. Reads phy artefacts as-is.                                                                                         |
+| Sorting   | SpikeInterface `SortingAnalyzer` (binary folder)         | Reads `recording.json`, the flat sorting under `sorting/`, optional `probe.json`, and `extensions/quality_metrics/metrics.csv`. |
+| Sorting   | NWB                                                      | Requires `--features hdf5`. Reads `/units/spike_times` + `/general/extracellular_ephys/electrodes`.                             |
+| Sorting   | Kilosort 4 `rez.mat`                                     | Requires `--features hdf5`. Reads `rez/st3`, `rez/ops/*`, `rez/xc`, `rez/yc`.                                                   |
+| Recording | SpikeGLX (`*.bin` + `*.meta`)                            | Use as `--dat`; pass `--spikeglx-meta` for sample rate / channels / dtype.                                                      |
+| Recording | Open Ephys binary (`continuous.dat` + `structure.oebin`) | Use as `--dat`; pass `--oebin` to inherit metadata.                                                                             |
+| Recording | Mountainsort MDA (`*.mda`)                               | Use as `--dat`. Reads the MDA header.                                                                                           |
 
 ## Backend detection
 

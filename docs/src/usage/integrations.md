@@ -80,14 +80,14 @@ authoritative for the row order in the raw bin).
 
 ## Recording-only formats
 
-These are *recording* formats — they don't carry a sorting on their own,
+These are _recording_ formats — they don't carry a sorting on their own,
 but Sorrel can use them as the raw `.dat` for an existing phy directory:
 
-| Format          | What we read                               | Use as `--dat` |
-|-----------------|--------------------------------------------|----------------|
-| **SpikeGLX**    | `<run>.<stream>.bin` + `<run>.<stream>.meta` | yes |
-| **Open Ephys binary** | `continuous.dat` + `structure.oebin` | yes |
-| **Mountainsort MDA**  | `*.mda` (header-prefixed flat array) | yes |
+| Format                | What we read                                 | Use as `--dat` |
+| --------------------- | -------------------------------------------- | -------------- |
+| **SpikeGLX**          | `<run>.<stream>.bin` + `<run>.<stream>.meta` | yes            |
+| **Open Ephys binary** | `continuous.dat` + `structure.oebin`         | yes            |
+| **Mountainsort MDA**  | `*.mda` (header-prefixed flat array)         | yes            |
 
 For SpikeGLX or Open Ephys, point `--dat` at the bin file and pass
 `--sample-rate`/`--channels` from the `.meta`/`.oebin` (or let Sorrel

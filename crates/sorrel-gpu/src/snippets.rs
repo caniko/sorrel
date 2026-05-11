@@ -72,15 +72,16 @@ impl GpuMeanSnippet {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sorrel-gpu.snippets.layout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("sorrel-gpu.snippets.pipeline"),
             layout: Some(&layout),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
+            cache: None,
         });
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sorrel-gpu.snippets.params"),
@@ -103,14 +104,14 @@ impl GpuMeanSnippet {
         if snippet_len == 0 || snippets.is_empty() {
             return Ok(Vec::new());
         }
-        if (snippets.len() as u64) % (snippet_len as u64) != 0 {
+        if (snippets.len() as u64).checked_rem(snippet_len as u64) != Some(0) {
             return Err(GpuMeanSnippetError::ShapeMismatch);
         }
         let n_spikes = (snippets.len() / snippet_len as usize) as u32;
         let device = &self.ctx.device;
         let queue = &self.ctx.queue;
 
-        let in_bytes = (snippets.len() * std::mem::size_of::<f32>()) as u64;
+        let in_bytes = std::mem::size_of_val(snippets) as u64;
         let out_bytes = (snippet_len as usize * std::mem::size_of::<f32>()) as u64;
 
         let in_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -160,7 +161,7 @@ impl GpuMeanSnippet {
             mapped_at_creation: false,
         });
 
-        let workgroups = (snippet_len + 63) / 64;
+        let workgroups = snippet_len.div_ceil(64);
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("sorrel-gpu.snippets.enc"),
         });
@@ -208,14 +209,8 @@ mod tests {
     use super::*;
     use sorrel_compute::mean_snippet;
 
-    fn ctx() -> Option<GpuContext> {
-        match GpuContext::headless() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                eprintln!("skipping GPU test: {e}");
-                None
-            }
-        }
+    fn ctx() -> Option<crate::test_support::TestGpuContext> {
+        crate::test_support::ctx()
     }
 
     #[test]

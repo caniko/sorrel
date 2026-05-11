@@ -6,9 +6,9 @@ unlock additional views.
 
 ## Required
 
-| File | Purpose |
-|------|---------|
-| `spike_times.npy` | Spike sample indices. |
+| File                 | Purpose                    |
+| -------------------- | -------------------------- |
+| `spike_times.npy`    | Spike sample indices.      |
 | `spike_clusters.npy` | Cluster ID for each spike. |
 
 Plus a raw trace — typically `recording.dat`. The path can come from
@@ -17,19 +17,19 @@ inside the directory.
 
 ## Optional, used when present
 
-| File | Powers |
-|------|--------|
-| `params.py` | Sample rate, n channels, dtype, offset, dat path. |
-| `cluster_group.tsv` | Initial good / mua / noise / unsorted labels. |
-| `channel_positions.npy` | Probe geometry — authoritative row order. |
-| `templates.npy` | Template view, similarity matrix. |
-| `template_features.npy`, `template_feature_ind.npy` | Template-feature scatter. |
-| `pc_features.npy`, `pc_feature_ind.npy` | Feature view (PC space). |
-| `amplitudes.npy` | Amplitude-vs-time scatter, drift map. |
-| `similar_templates.npy` | Similarity view shortcut. |
-| `cluster_<metric>.tsv` | Quality-metric columns in the cluster table. |
-| `quality_metrics.csv` | SI-style quality metrics. |
-| `probe.json` / `probegroup.json` | Probe geometry fallback (probeinterface). |
+| File                                                | Powers                                            |
+| --------------------------------------------------- | ------------------------------------------------- |
+| `params.py`                                         | Sample rate, n channels, dtype, offset, dat path. |
+| `cluster_group.tsv`                                 | Initial good / mua / noise / unsorted labels.     |
+| `channel_positions.npy`                             | Probe geometry — authoritative row order.         |
+| `templates.npy`                                     | Template view, similarity matrix.                 |
+| `template_features.npy`, `template_feature_ind.npy` | Template-feature scatter.                         |
+| `pc_features.npy`, `pc_feature_ind.npy`             | Feature view (PC space).                          |
+| `amplitudes.npy`                                    | Amplitude-vs-time scatter, drift map.             |
+| `similar_templates.npy`                             | Similarity view shortcut.                         |
+| `cluster_<metric>.tsv`                              | Quality-metric columns in the cluster table.      |
+| `quality_metrics.csv`                               | SI-style quality metrics.                         |
+| `probe.json` / `probegroup.json`                    | Probe geometry fallback (probeinterface).         |
 
 ## Loading model
 

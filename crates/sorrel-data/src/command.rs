@@ -90,20 +90,36 @@ mod tests {
     #[test]
     fn primary_cluster_matches_variant_field() {
         assert_eq!(
-            CurationCommand::Relabel { cluster: ClusterId(7), op: PhyLabelOp::SetGood }.primary_cluster(),
+            CurationCommand::Relabel {
+                cluster: ClusterId(7),
+                op: PhyLabelOp::SetGood
+            }
+            .primary_cluster(),
             Some(ClusterId(7))
         );
         assert_eq!(
-            CurationCommand::Merge { sources: vec![ClusterId(1), ClusterId(2)], target: ClusterId(9) }.primary_cluster(),
+            CurationCommand::Merge {
+                sources: vec![ClusterId(1), ClusterId(2)],
+                target: ClusterId(9)
+            }
+            .primary_cluster(),
             Some(ClusterId(9))
         );
         assert_eq!(
-            CurationCommand::Split { cluster: ClusterId(4), spike_idx: vec![], new_cluster: ClusterId(5) }
-                .primary_cluster(),
+            CurationCommand::Split {
+                cluster: ClusterId(4),
+                spike_idx: vec![],
+                new_cluster: ClusterId(5)
+            }
+            .primary_cluster(),
             Some(ClusterId(4))
         );
         assert_eq!(
-            CurationCommand::Note { cluster: ClusterId(3), text: "hi".into() }.primary_cluster(),
+            CurationCommand::Note {
+                cluster: ClusterId(3),
+                text: "hi".into()
+            }
+            .primary_cluster(),
             Some(ClusterId(3))
         );
         assert_eq!(CurationCommand::Undo.primary_cluster(), None);
@@ -112,17 +128,28 @@ mod tests {
 
     #[test]
     fn is_forward_distinguishes_curation_from_revert_variants() {
-        assert!(CurationCommand::Relabel { cluster: ClusterId(0), op: PhyLabelOp::SetGood }.is_forward());
-        assert!(CurationCommand::Merge { sources: vec![], target: ClusterId(0) }.is_forward());
+        assert!(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetGood
+        }
+        .is_forward());
+        assert!(CurationCommand::Merge {
+            sources: vec![],
+            target: ClusterId(0)
+        }
+        .is_forward());
         assert!(!CurationCommand::Undo.is_forward());
         assert!(!CurationCommand::Redo.is_forward());
     }
 
     #[test]
-    fn round_trips_through_bincode() {
-        let original = CurationCommand::Relabel { cluster: ClusterId(42), op: PhyLabelOp::SetMua };
-        let bytes = bincode::serialize(&original).unwrap();
-        let decoded: CurationCommand = bincode::deserialize(&bytes).unwrap();
+    fn round_trips_through_messagepack() {
+        let original = CurationCommand::Relabel {
+            cluster: ClusterId(42),
+            op: PhyLabelOp::SetMua,
+        };
+        let bytes = rmp_serde::to_vec(&original).unwrap();
+        let decoded: CurationCommand = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
             CurationCommand::Relabel { cluster, op } => {
                 assert_eq!(cluster, ClusterId(42));
@@ -136,24 +163,38 @@ mod tests {
     fn batch_constructor_rejects_nested_or_revert_children() {
         assert!(CurationCommand::batch(vec![CurationCommand::Undo]).is_none());
         assert!(CurationCommand::batch(vec![CurationCommand::Redo]).is_none());
-        assert!(CurationCommand::batch(vec![CurationCommand::Batch { children: vec![] }]).is_none());
+        assert!(
+            CurationCommand::batch(vec![CurationCommand::Batch { children: vec![] }]).is_none()
+        );
 
         let ok = CurationCommand::batch(vec![
-            CurationCommand::Relabel { cluster: ClusterId(1), op: PhyLabelOp::SetGood },
-            CurationCommand::Merge { sources: vec![ClusterId(2)], target: ClusterId(3) },
+            CurationCommand::Relabel {
+                cluster: ClusterId(1),
+                op: PhyLabelOp::SetGood,
+            },
+            CurationCommand::Merge {
+                sources: vec![ClusterId(2)],
+                target: ClusterId(3),
+            },
         ]);
         assert!(ok.is_some());
     }
 
     #[test]
-    fn batch_round_trips_through_bincode() {
+    fn batch_round_trips_through_messagepack() {
         let original = CurationCommand::batch(vec![
-            CurationCommand::Relabel { cluster: ClusterId(1), op: PhyLabelOp::SetGood },
-            CurationCommand::Merge { sources: vec![ClusterId(2), ClusterId(3)], target: ClusterId(4) },
+            CurationCommand::Relabel {
+                cluster: ClusterId(1),
+                op: PhyLabelOp::SetGood,
+            },
+            CurationCommand::Merge {
+                sources: vec![ClusterId(2), ClusterId(3)],
+                target: ClusterId(4),
+            },
         ])
         .unwrap();
-        let bytes = bincode::serialize(&original).unwrap();
-        let decoded: CurationCommand = bincode::deserialize(&bytes).unwrap();
+        let bytes = rmp_serde::to_vec(&original).unwrap();
+        let decoded: CurationCommand = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
             CurationCommand::Batch { children } => {
                 assert_eq!(children.len(), 2);

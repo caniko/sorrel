@@ -69,8 +69,7 @@ mod imp {
     impl NwbProvider {
         pub fn open(path: impl AsRef<Path>) -> Result<Self> {
             let path = path.as_ref();
-            let f = H5File::open(path)
-                .with_context(|| format!("open NWB {}", path.display()))?;
+            let f = H5File::open(path).with_context(|| format!("open NWB {}", path.display()))?;
 
             // 1. ElectricalSeries: first dataset under /acquisition that has
             // both `data` and a sampling rate (either explicit field or
@@ -104,7 +103,7 @@ mod imp {
                 return TraceSamples::I16(&[]);
             }
             let nc = self.n_channels as usize;
-            let s = (start as usize).saturating_mul(nc);
+            let s = start.idx().saturating_mul(nc);
             let e = s + (len as usize) * nc;
             TraceSamples::from_bytes_clamped(&self.trace_buf, self.dtype, s, e)
         }
@@ -128,7 +127,7 @@ mod imp {
 
         fn spike_times(&self, cluster: ClusterId) -> &[SampleIndex] {
             self.spikes_per_cluster
-                .get(cluster as usize)
+                .get(cluster.idx())
                 .map(Vec::as_slice)
                 .unwrap_or(&[])
         }
@@ -159,12 +158,10 @@ mod imp {
         }
     }
 
-/// Walk `/acquisition/*` looking for the first dataset that smells like
+    /// Walk `/acquisition/*` looking for the first dataset that smells like
     /// an `ElectricalSeries` (has `data` + a rate). Returns
     /// `(sample_rate, n_channels, n_samples, dtype, raw_bytes)`.
-    fn load_electrical_series(
-        f: &H5File,
-    ) -> Result<(f32, u32, SampleIndex, TraceDtype, Vec<u8>)> {
+    fn load_electrical_series(f: &H5File) -> Result<(f32, u32, SampleIndex, TraceDtype, Vec<u8>)> {
         let acq = f
             .group("/acquisition")
             .context("missing /acquisition group")?;
@@ -187,8 +184,8 @@ mod imp {
 
             // Sample rate: prefer `starting_time/rate` attribute, fall back
             // to a sibling `sampling_rate` dataset / attribute.
-            let sample_rate = read_rate(&g)
-                .ok_or_else(|| anyhow!("ElectricalSeries {name} has no rate"))?;
+            let sample_rate =
+                read_rate(&g).ok_or_else(|| anyhow!("ElectricalSeries {name} has no rate"))?;
 
             // Read the dataset into a typed Vec then cast to bytes. This
             // lets the `hdf5` crate do dtype coercion without us juggling
@@ -211,7 +208,13 @@ mod imp {
                     dt.size()
                 );
             };
-            return Ok((sample_rate, n_channels, n_samples, dtype, bytes));
+            return Ok((
+                sample_rate,
+                n_channels,
+                SampleIndex::new(n_samples),
+                dtype,
+                bytes,
+            ));
         }
         bail!("no ElectricalSeries (with shape (n_samples, n_channels)) under /acquisition")
     }
@@ -246,7 +249,9 @@ mod imp {
     /// ragged offsets in `/units/spike_times_index`.
     fn load_units(f: &H5File, sample_rate: f32) -> Result<(Vec<Vec<SampleIndex>>, usize)> {
         let units = f.group("/units").context("missing /units")?;
-        let times = units.dataset("spike_times").context("missing /units/spike_times")?;
+        let times = units
+            .dataset("spike_times")
+            .context("missing /units/spike_times")?;
         let index = units
             .dataset("spike_times_index")
             .context("missing /units/spike_times_index")?;
@@ -268,7 +273,7 @@ mod imp {
             let slice = &all[start as usize..end as usize];
             let mut bucket: Vec<SampleIndex> = slice
                 .iter()
-                .map(|&t| (t * sample_rate as f64).round() as u64)
+                .map(|&t| SampleIndex::new((t * sample_rate as f64).round() as u64))
                 .collect();
             bucket.sort_unstable();
             out.push(bucket);

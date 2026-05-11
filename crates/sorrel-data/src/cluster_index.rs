@@ -10,8 +10,8 @@
 //! Only the cluster id of each spike changes.
 
 use sorrel_io::{
-    ClusterId, DataProvider, HasAmplitudes, HasPcFeatures, HasSpikeTemplates,
-    HasTemplateWaveforms, OptionalRow, SampleIndex,
+    ClusterId, DataProvider, HasAmplitudes, HasPcFeatures, HasSpikeTemplates, HasTemplateWaveforms,
+    OptionalRow, SampleIndex,
 };
 
 /// Mutable index over the spike→cluster assignment.
@@ -122,7 +122,10 @@ impl ClusterIndex {
             for c in 0..n_clusters {
                 if cursors[c] < times_per_cluster[c].len() {
                     let t = times_per_cluster[c][cursors[c]];
-                    if best.is_none_or(|(_, bt)| t < bt) {
+                    if match best {
+                        Some((_, bt)) => t < bt,
+                        None => true,
+                    } {
                         best = Some((ClusterId(c as u32), t));
                     }
                 }
@@ -161,12 +164,8 @@ impl ClusterIndex {
         // If the provider gave a different number of amplitudes than spikes
         // for a cluster, fall back to NaN so the consumer can notice without
         // a panic.
-        self.spike_amplitudes = rebucket_to_global(
-            &self.spike_clusters,
-            &amps_per_cluster,
-            |v| v,
-            f32::NAN,
-        );
+        self.spike_amplitudes =
+            rebucket_to_global(&self.spike_clusters, &amps_per_cluster, |v| v, f32::NAN);
         self.amps_per_cluster = amps_per_cluster;
     }
 
@@ -605,10 +604,7 @@ mod tests {
             self.spikes.len() as u32
         }
         fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
-            self.spikes
-                .get(c.idx())
-                .map(Vec::as_slice)
-                .unwrap_or(&[])
+            self.spikes.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
         }
         fn trace(&self, _: SampleIndex, _: u32) -> TraceSlice<'_> {
             TraceSlice {
@@ -626,7 +622,11 @@ mod tests {
         // 3 clusters, deliberately interleaved in time so the merge cursor
         // gets exercised.
         ClusterIndex::from_provider(&StubProvider {
-            spikes: vec![vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)], vec![SampleIndex(20), SampleIndex(200)], vec![SampleIndex(100)]],
+            spikes: vec![
+                vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
+                vec![SampleIndex(20), SampleIndex(200)],
+                vec![SampleIndex(100)],
+            ],
         })
     }
 
@@ -635,12 +635,28 @@ mod tests {
         let ci = cidx();
         assert_eq!(ci.n_clusters(), 3);
         assert_eq!(ci.n_spikes(), 6);
-        assert_eq!(ci.spike_times(ClusterId(0)), &[SampleIndex(10), SampleIndex(30), SampleIndex(150)]);
-        assert_eq!(ci.spike_times(ClusterId(1)), &[SampleIndex(20), SampleIndex(200)]);
+        assert_eq!(
+            ci.spike_times(ClusterId(0)),
+            &[SampleIndex(10), SampleIndex(30), SampleIndex(150)]
+        );
+        assert_eq!(
+            ci.spike_times(ClusterId(1)),
+            &[SampleIndex(20), SampleIndex(200)]
+        );
         assert_eq!(ci.spike_times(ClusterId(2)), &[SampleIndex(100)]);
         // Global cluster ids in time order:
         // t=10 c=0, t=20 c=1, t=30 c=0, t=100 c=2, t=150 c=0, t=200 c=1.
-        assert_eq!(ci.spike_clusters(), &[ClusterId(0), ClusterId(1), ClusterId(0), ClusterId(2), ClusterId(0), ClusterId(1)]);
+        assert_eq!(
+            ci.spike_clusters(),
+            &[
+                ClusterId(0),
+                ClusterId(1),
+                ClusterId(0),
+                ClusterId(2),
+                ClusterId(0),
+                ClusterId(1)
+            ]
+        );
     }
 
     #[test]
@@ -650,8 +666,28 @@ mod tests {
         assert!(ci.spike_times(ClusterId(0)).is_empty());
         assert!(ci.spike_times(ClusterId(1)).is_empty());
         // Target now contains every spike, in ascending time order.
-        assert_eq!(ci.spike_times(ClusterId(2)), &[SampleIndex(10), SampleIndex(20), SampleIndex(30), SampleIndex(100), SampleIndex(150), SampleIndex(200)]);
-        assert_eq!(ci.spike_clusters(), &[ClusterId(2), ClusterId(2), ClusterId(2), ClusterId(2), ClusterId(2), ClusterId(2)]);
+        assert_eq!(
+            ci.spike_times(ClusterId(2)),
+            &[
+                SampleIndex(10),
+                SampleIndex(20),
+                SampleIndex(30),
+                SampleIndex(100),
+                SampleIndex(150),
+                SampleIndex(200)
+            ]
+        );
+        assert_eq!(
+            ci.spike_clusters(),
+            &[
+                ClusterId(2),
+                ClusterId(2),
+                ClusterId(2),
+                ClusterId(2),
+                ClusterId(2),
+                ClusterId(2)
+            ]
+        );
     }
 
     #[test]
@@ -678,7 +714,10 @@ mod tests {
         assert_eq!(rec.source, ClusterId(0));
         assert_eq!(rec.new_cluster, ClusterId(3));
         assert_eq!(ci.n_clusters(), 4);
-        assert_eq!(ci.spike_times(ClusterId(0)), &[SampleIndex(10), SampleIndex(150)]);
+        assert_eq!(
+            ci.spike_times(ClusterId(0)),
+            &[SampleIndex(10), SampleIndex(150)]
+        );
         assert_eq!(ci.spike_times(ClusterId(3)), &[SampleIndex(30)]);
     }
 
@@ -711,7 +750,17 @@ mod tests {
         let mut ci = cidx();
         // sources include target=2; only 0 and 1 should be merged in.
         let _rec = ci.merge(&[ClusterId(0), ClusterId(1), ClusterId(2)], ClusterId(2));
-        assert_eq!(ci.spike_times(ClusterId(2)), &[SampleIndex(10), SampleIndex(20), SampleIndex(30), SampleIndex(100), SampleIndex(150), SampleIndex(200)]);
+        assert_eq!(
+            ci.spike_times(ClusterId(2)),
+            &[
+                SampleIndex(10),
+                SampleIndex(20),
+                SampleIndex(30),
+                SampleIndex(100),
+                SampleIndex(150),
+                SampleIndex(200)
+            ]
+        );
     }
 
     #[test]
@@ -746,15 +795,16 @@ mod tests {
         }
         impl HasAmplitudes for WithAmps {
             fn spike_amplitudes(&self, c: ClusterId) -> &[f32] {
-                self.amps
-                    .get(c.idx())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[])
+                self.amps.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
             }
         }
         let prov = WithAmps {
             inner: StubProvider {
-                spikes: vec![vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)], vec![SampleIndex(20), SampleIndex(200)], vec![SampleIndex(100)]],
+                spikes: vec![
+                    vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
+                    vec![SampleIndex(20), SampleIndex(200)],
+                    vec![SampleIndex(100)],
+                ],
             },
             amps: vec![vec![1.0, 3.0, 6.0], vec![2.0, 5.0], vec![4.0]],
         };
@@ -906,7 +956,15 @@ mod tests {
         let _ = ci.merge(&[ClusterId(2)], ClusterId(0));
         // Now 2 is empty. Merge 0 into 2.
         let _ = ci.merge(&[ClusterId(0)], ClusterId(2));
-        assert_eq!(ci.spike_times(ClusterId(2)), &[SampleIndex(10), SampleIndex(30), SampleIndex(100), SampleIndex(150)]);
+        assert_eq!(
+            ci.spike_times(ClusterId(2)),
+            &[
+                SampleIndex(10),
+                SampleIndex(30),
+                SampleIndex(100),
+                SampleIndex(150)
+            ]
+        );
         assert!(ci.spike_times(ClusterId(0)).is_empty());
     }
 
@@ -1053,7 +1111,11 @@ mod tests {
         // (Original NPY row indices.)
         let prov = WithPc {
             inner: StubProvider {
-                spikes: vec![vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)], vec![SampleIndex(20), SampleIndex(200)], vec![SampleIndex(100)]],
+                spikes: vec![
+                    vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
+                    vec![SampleIndex(20), SampleIndex(200)],
+                    vec![SampleIndex(100)],
+                ],
             },
             pc: (0..6 * 3 * 2).map(|i| i as f32).collect(), // 6 spikes × 3 PCs × 2 chans
             n_pcs: 3,

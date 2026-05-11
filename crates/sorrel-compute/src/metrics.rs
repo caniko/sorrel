@@ -129,8 +129,9 @@ pub fn isi_violation_rate(
         return 0.0;
     }
     let n = isi_violations(spike_times, refractory_samples);
-    let duration_s = (spike_times[spike_times.len() - 1].0.saturating_sub(spike_times[0].0))
-        as f32
+    let duration_s = (spike_times[spike_times.len() - 1]
+        .0
+        .saturating_sub(spike_times[0].0)) as f32
         / sample_rate;
     if duration_s <= 0.0 {
         return 0.0;
@@ -433,7 +434,8 @@ mod tests {
             assert!(
                 diff <= 1,
                 "ACG asymmetry at bin {i}↔{mirror}: {} vs {} (diff {diff})",
-                h[i], h[mirror],
+                h[i],
+                h[mirror],
             );
         }
     }

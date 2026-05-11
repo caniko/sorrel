@@ -113,7 +113,11 @@ impl SelectionSet {
         let Some(anchor) = self.anchor else {
             return self.replace(c);
         };
-        let (lo, hi) = if anchor <= c { (anchor, c) } else { (c, anchor) };
+        let (lo, hi) = if anchor <= c {
+            (anchor, c)
+        } else {
+            (c, anchor)
+        };
         self.items.clear();
         for id in lo.0..=hi.0 {
             self.items.push(ClusterId(id));
@@ -175,7 +179,11 @@ mod tests {
         assert_eq!(s.as_slice(), &[ClusterId(5), ClusterId(7)]);
         s.toggle(ClusterId(5));
         assert_eq!(s.as_slice(), &[ClusterId(7)]);
-        assert_eq!(s.anchor(), Some(ClusterId(7)), "anchor moved to the surviving id");
+        assert_eq!(
+            s.anchor(),
+            Some(ClusterId(7)),
+            "anchor moved to the surviving id"
+        );
     }
 
     #[test]
@@ -201,8 +209,15 @@ mod tests {
     fn extend_to_builds_inclusive_range_in_either_direction() {
         let mut s = SelectionSet::single(ClusterId(3));
         s.extend_to(ClusterId(6));
-        assert_eq!(s.as_slice(), &[ClusterId(3), ClusterId(4), ClusterId(5), ClusterId(6)]);
-        assert_eq!(s.anchor(), Some(ClusterId(3)), "anchor is preserved across extend");
+        assert_eq!(
+            s.as_slice(),
+            &[ClusterId(3), ClusterId(4), ClusterId(5), ClusterId(6)]
+        );
+        assert_eq!(
+            s.anchor(),
+            Some(ClusterId(3)),
+            "anchor is preserved across extend"
+        );
 
         // Extend the other way from the same anchor — phy semantics.
         s.extend_to(ClusterId(1));
@@ -308,10 +323,22 @@ mod tests {
     fn extend_to_with_descending_then_ascending_pivots_around_anchor() {
         let mut s = SelectionSet::single(ClusterId(5));
         s.extend_to(ClusterId(1));
-        assert_eq!(s.as_slice(), &[ClusterId(1), ClusterId(2), ClusterId(3), ClusterId(4), ClusterId(5)]);
+        assert_eq!(
+            s.as_slice(),
+            &[
+                ClusterId(1),
+                ClusterId(2),
+                ClusterId(3),
+                ClusterId(4),
+                ClusterId(5)
+            ]
+        );
         // Anchor stayed at 5; extending up should walk back the other way.
         s.extend_to(ClusterId(8));
-        assert_eq!(s.as_slice(), &[ClusterId(5), ClusterId(6), ClusterId(7), ClusterId(8)]);
+        assert_eq!(
+            s.as_slice(),
+            &[ClusterId(5), ClusterId(6), ClusterId(7), ClusterId(8)]
+        );
     }
 
     #[test]

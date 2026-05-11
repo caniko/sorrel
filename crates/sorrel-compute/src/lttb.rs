@@ -17,7 +17,12 @@
 /// assert_eq!(pts[0], [0.0, samples[0] as f32]);
 /// assert_eq!(pts.last().unwrap()[0], 999.0);
 /// ```
-pub fn lttb_downsample<S>(samples: &[S], threshold: usize, x_origin: f32, x_step: f32) -> Vec<[f32; 2]>
+pub fn lttb_downsample<S>(
+    samples: &[S],
+    threshold: usize,
+    x_origin: f32,
+    x_step: f32,
+) -> Vec<[f32; 2]>
 where
     S: Copy + Into<f32>,
 {
@@ -130,7 +135,12 @@ mod tests {
         let samples: Vec<i16> = (0..500).map(|i| (i as i16).wrapping_mul(7)).collect();
         for threshold in [3, 5, 50, 100, 250, 499] {
             let out = lttb_downsample::<i16>(&samples, threshold, 0.0, 1.0);
-            assert_eq!(out.len(), threshold, "threshold {threshold} produced {} points", out.len());
+            assert_eq!(
+                out.len(),
+                threshold,
+                "threshold {threshold} produced {} points",
+                out.len()
+            );
         }
     }
 
@@ -141,7 +151,12 @@ mod tests {
         let samples: Vec<i16> = (0..1000).map(|i| ((i * 17) % 256 - 128) as i16).collect();
         let out = lttb_downsample::<i16>(&samples, 73, 0.0, 1.0);
         for w in out.windows(2) {
-            assert!(w[1][0] >= w[0][0], "x went backward: {} < {}", w[1][0], w[0][0]);
+            assert!(
+                w[1][0] >= w[0][0],
+                "x went backward: {} < {}",
+                w[1][0],
+                w[0][0]
+            );
         }
     }
 
@@ -150,14 +165,10 @@ mod tests {
     #[test]
     fn output_y_values_come_from_input() {
         let samples: Vec<i16> = (0..400).map(|i| ((i * 31) % 1000) as i16).collect();
-        let input_set: std::collections::HashSet<i32> =
-            samples.iter().map(|&v| v as i32).collect();
+        let input_set: std::collections::HashSet<i32> = samples.iter().map(|&v| v as i32).collect();
         let out = lttb_downsample::<i16>(&samples, 40, 0.0, 1.0);
         for [_, y] in &out {
-            assert!(
-                input_set.contains(&(*y as i32)),
-                "y={y} not in input set",
-            );
+            assert!(input_set.contains(&(*y as i32)), "y={y} not in input set",);
         }
     }
 
@@ -180,7 +191,12 @@ mod tests {
         let samples: Vec<i16> = (0..256).map(|i| i as i16).collect();
         let out = lttb_downsample::<i16>(&samples, 32, 0.0, 1.0);
         for w in out.windows(2) {
-            assert!(w[1][1] >= w[0][1], "non-monotone: {} -> {}", w[0][1], w[1][1]);
+            assert!(
+                w[1][1] >= w[0][1],
+                "non-monotone: {} -> {}",
+                w[0][1],
+                w[1][1]
+            );
         }
     }
 
@@ -192,7 +208,7 @@ mod tests {
     #[ignore]
     fn stress_one_million_samples_to_one_thousand_points() {
         let samples: Vec<i16> = (0..1_000_000)
-            .map(|i| ((i as i32 * 31) % 30_000 - 15_000) as i16)
+            .map(|i| ((i * 31) % 30_000 - 15_000) as i16)
             .collect();
         let out = lttb_downsample::<i16>(&samples, 1024, 0.0, 1.0);
         assert_eq!(out.len(), 1024);

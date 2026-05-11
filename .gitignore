@@ -1,3 +1,4 @@
+result*
 /target
 *.sqlite
 # rs-harbor materialises this on dev-shell entry

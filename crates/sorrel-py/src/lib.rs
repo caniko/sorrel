@@ -42,11 +42,7 @@ fn inspect_phy(path: &str) -> PyResult<(u32, u64, f32)> {
 /// running from a development checkout.
 #[pyfunction]
 #[pyo3(signature = (path, binary=None, extra_args=None))]
-fn launch(
-    path: &str,
-    binary: Option<&str>,
-    extra_args: Option<Vec<String>>,
-) -> PyResult<i32> {
+fn launch(path: &str, binary: Option<&str>, extra_args: Option<Vec<String>>) -> PyResult<i32> {
     let exe: PathBuf = binary.map(PathBuf::from).unwrap_or_else(|| "sorrel".into());
     let mut cmd = Command::new(&exe);
     cmd.arg(path);

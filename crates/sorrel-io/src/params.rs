@@ -23,8 +23,8 @@ pub struct PhyParams {
 
 impl PhyParams {
     pub fn read(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         Self::parse(&text)
     }
 
@@ -67,9 +67,11 @@ impl PhyParams {
                     );
                 }
                 "sample_rate" => {
-                    out.sample_rate = Some(parse_float(value).with_context(|| {
-                        format!("params.py:{}: sample_rate", lineno + 1)
-                    })? as f32);
+                    out.sample_rate = Some(
+                        parse_float(value)
+                            .with_context(|| format!("params.py:{}: sample_rate", lineno + 1))?
+                            as f32,
+                    );
                 }
                 "hp_filtered" => {
                     out.hp_filtered = match value {

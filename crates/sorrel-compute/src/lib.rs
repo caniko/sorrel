@@ -21,15 +21,15 @@ pub use binning::{histogram_u64, isi_histogram};
 pub use ccg_analysis::{analyse_refractory_dip, refractory_dip_score, CcgRefractoryAnalysis};
 pub use cmr::subtract_channel_median;
 pub use distribution::{
-    amplitude_cutoff, bimodality_coefficient, excess_kurtosis, ks_pvalue, ks_two_sample,
-    mean_f64, mean_std, percentile, skewness, Moments,
+    amplitude_cutoff, bimodality_coefficient, excess_kurtosis, ks_pvalue, ks_two_sample, mean_f64,
+    mean_std, percentile, skewness, Moments,
 };
 pub use drift::{
     amplitude_drift_correlation, amplitude_drift_slope, longest_silent_gap_frac, presence_cv,
     sliding_refractory_contamination,
 };
-pub use gmm::{gmm_split_proposal, GmmSplitProposal};
 pub use filter::{Biquad, BiquadState};
+pub use gmm::{gmm_split_proposal, GmmSplitProposal};
 pub use lttb::lttb_downsample;
 pub use metrics::{
     amplitude_snr, auto_correlogram, cross_correlogram, fraction_below, isi_violation_rate,

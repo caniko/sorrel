@@ -150,10 +150,7 @@ impl KilosortProvider {
             .n_channels
             .or(params.n_channels_dat)
             .context("n_channels_dat not in params.py and no override given")?;
-        let dtype = overrides
-            .dtype
-            .or(params.dtype)
-            .unwrap_or(TraceDtype::I16);
+        let dtype = overrides.dtype.or(params.dtype).unwrap_or(TraceDtype::I16);
         let offset = overrides.offset.or(params.offset).unwrap_or(0);
 
         // 2. Spike index files.
@@ -199,10 +196,8 @@ impl KilosortProvider {
             // Sort the indices into the global spike arrays by time, so
             // downstream slices share the same per-spike order.
             idx_bucket.sort_unstable_by_key(|&i| times[i as usize]);
-            let bucket_times: Vec<SampleIndex> = idx_bucket
-                .iter()
-                .map(|&i| times[i as usize])
-                .collect();
+            let bucket_times: Vec<SampleIndex> =
+                idx_bucket.iter().map(|&i| times[i as usize]).collect();
             let bucket_amps: Vec<f32> = match amps_full.as_ref() {
                 Some(a) => idx_bucket.iter().map(|&i| a[i as usize]).collect(),
                 None => Vec::new(),
@@ -236,8 +231,7 @@ impl KilosortProvider {
         // 2.6. PC features. Both files are optional but we need both or
         // neither — having pc_features without pc_feature_ind makes the
         // shape unusable.
-        let (pc_features, pc_shape, pc_feature_ind) =
-            read_optional_pc_features(&root, n_spikes)?;
+        let (pc_features, pc_shape, pc_feature_ind) = read_optional_pc_features(&root, n_spikes)?;
 
         // 2.7. Template waveforms + similarity matrix. Both optional; the
         // TemplateView and SimilarityView gracefully degrade when absent.
@@ -262,8 +256,8 @@ impl KilosortProvider {
         } else {
             root.join(&dat_rel)
         };
-        let trace_file = File::open(&dat_path)
-            .with_context(|| format!("open {}", dat_path.display()))?;
+        let trace_file =
+            File::open(&dat_path).with_context(|| format!("open {}", dat_path.display()))?;
         let trace_mmap = unsafe { Mmap::map(&trace_file)? };
         let total_bytes = trace_mmap.len();
         if (offset as usize) > total_bytes {
@@ -275,7 +269,7 @@ impl KilosortProvider {
         }
         let payload_bytes = total_bytes - offset as usize;
         let bytes_per_sample = (n_channels as usize) * dtype.size_bytes();
-        if bytes_per_sample == 0 || payload_bytes % bytes_per_sample != 0 {
+        if bytes_per_sample == 0 || payload_bytes.checked_rem(bytes_per_sample) != Some(0) {
             bail!(
                 "dat payload size ({}) not divisible by n_channels({}) * dtype_bytes({})",
                 payload_bytes,
@@ -481,10 +475,8 @@ fn load_quality_metrics(root: &Path, n_clusters: usize) -> crate::extras::Qualit
             else {
                 continue;
             };
-            if matches!(
-                stripped,
-                "group" | "groups" | "KSLabel" | "purity" | "info"
-            ) && stripped == "group"
+            if matches!(stripped, "group" | "groups" | "KSLabel" | "purity" | "info")
+                && stripped == "group"
             {
                 continue;
             }
@@ -586,7 +578,12 @@ fn load_optional<T>(path: &Path, default: T, loader: impl FnOnce(&Path) -> Resul
 
 fn check_len(path: &Path, got: usize, expected: usize) -> Result<()> {
     if got != expected {
-        bail!("{}: expected {} elements, got {}", path.display(), expected, got);
+        bail!(
+            "{}: expected {} elements, got {}",
+            path.display(),
+            expected,
+            got
+        );
     }
     Ok(())
 }
@@ -617,10 +614,9 @@ fn read_optional_u32_1d(path: &Path, expected_len: usize) -> Result<Option<Vec<u
 /// Read `pc_features.npy` and `pc_feature_ind.npy` together when both are
 /// present. Returns `(flat, (n_pcs, n_chans_per_template), feature_ind_flat)`
 /// with empty defaults when either file is absent.
-fn read_optional_pc_features(
-    root: &Path,
-    n_spikes: usize,
-) -> Result<(Vec<f32>, (usize, usize), Vec<u32>)> {
+type PcFeatures = (Vec<f32>, (usize, usize), Vec<u32>);
+
+fn read_optional_pc_features(root: &Path, n_spikes: usize) -> Result<PcFeatures> {
     let feat_path = root.join("pc_features.npy");
     let ind_path = root.join("pc_feature_ind.npy");
     if !feat_path.exists() || !ind_path.exists() {
@@ -647,10 +643,7 @@ fn read_optional_pc_features(
     let ind_chans = match ind_shape.as_slice() {
         [_, c] => *c,
         [c] => *c,
-        other => bail!(
-            "pc_feature_ind.npy: unexpected shape {:?}",
-            other
-        ),
+        other => bail!("pc_feature_ind.npy: unexpected shape {:?}", other),
     };
     if ind_chans != n_chans_per_template {
         bail!(
@@ -682,15 +675,15 @@ fn read_optional_positions(path: &Path) -> Result<Vec<[f32; 2]>> {
 /// n_channels))`. Empty buffer + `(0, 0, 0)` shape when absent.
 fn read_optional_templates(path: &Path) -> Result<(Vec<f32>, (usize, usize, usize))> {
     load_optional(path, (Vec::new(), (0, 0, 0)), |path| {
-    let (flat, shape) = read_npy_f32_flat(path)?;
-    if shape.len() != 3 {
-        bail!(
-            "{}: expected 3-D (n_templates, n_samples, n_channels), got shape {:?}",
-            path.display(),
-            shape
-        );
-    }
-    Ok((flat, (shape[0], shape[1], shape[2])))
+        let (flat, shape) = read_npy_f32_flat(path)?;
+        if shape.len() != 3 {
+            bail!(
+                "{}: expected 3-D (n_templates, n_samples, n_channels), got shape {:?}",
+                path.display(),
+                shape
+            );
+        }
+        Ok((flat, (shape[0], shape[1], shape[2])))
     })
 }
 
@@ -700,7 +693,10 @@ fn read_optional_similar_templates(path: &Path, n_templates: usize) -> Result<Ve
     load_optional(path, Vec::new(), |path| {
         let (flat, (rows, cols)) = read_2d_f32(path)?;
         if rows != cols {
-            bail!("{}: expected square matrix, got {rows}×{cols}", path.display());
+            bail!(
+                "{}: expected square matrix, got {rows}×{cols}",
+                path.display()
+            );
         }
         if n_templates != 0 && rows != n_templates {
             bail!(
@@ -726,8 +722,8 @@ fn read_int_array<T>(
 ) -> Result<Vec<T>> {
     let off = hdr.data_offset as usize;
     let bytes = &mmap[off..];
-    let dtype = crate::npy::NpyDtype::parse(&hdr.dtype)
-        .with_context(|| format!("{label} dtype"))?;
+    let dtype =
+        crate::npy::NpyDtype::parse(&hdr.dtype).with_context(|| format!("{label} dtype"))?;
     let elem = dtype.size_bytes();
     let need = n * elem;
     if bytes.len() < need {
@@ -747,7 +743,14 @@ fn read_int_array<T>(
 }
 
 fn read_u64_array(mmap: &Mmap, hdr: &NpyHeader, n: usize) -> Result<Vec<SampleIndex>> {
-    read_int_array(mmap, hdr, n, "spike_times", |v| SampleIndex(v as u64), SampleIndex)
+    read_int_array(
+        mmap,
+        hdr,
+        n,
+        "spike_times",
+        |v| SampleIndex(v as u64),
+        SampleIndex,
+    )
 }
 
 fn read_u32_array(mmap: &Mmap, hdr: &NpyHeader, n: usize) -> Result<Vec<u32>> {
@@ -801,7 +804,12 @@ mod tests {
 
     #[test]
     fn as_str_round_trips() {
-        for lbl in [PhyLabel::Unsorted, PhyLabel::Good, PhyLabel::Mua, PhyLabel::Noise] {
+        for lbl in [
+            PhyLabel::Unsorted,
+            PhyLabel::Good,
+            PhyLabel::Mua,
+            PhyLabel::Noise,
+        ] {
             assert_eq!(PhyLabel::parse_tsv_value(lbl.as_str()), lbl);
         }
     }

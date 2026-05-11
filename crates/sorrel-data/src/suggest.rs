@@ -13,7 +13,7 @@
 
 use crate::session::Session;
 use sorrel_compute::{
-    analyse_refractory_dip, amplitude_drift_correlation, amplitude_snr, bimodality_coefficient,
+    amplitude_drift_correlation, amplitude_snr, analyse_refractory_dip, bimodality_coefficient,
     cross_correlogram, gmm_split_proposal, ks_two_sample, mean_amplitude, percentile,
     refractory_contamination, refractory_dip_score,
 };
@@ -224,7 +224,11 @@ pub fn rank_merge_candidates<P: DataProvider>(
         })
         .collect();
 
-    out.sort_by(|x, y| y.score.partial_cmp(&x.score).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|x, y| {
+        y.score
+            .partial_cmp(&x.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     out.truncate(cfg.top_merges);
     out
 }
@@ -302,7 +306,11 @@ pub fn rank_split_candidates<P: DataProvider>(
         })
         .collect();
 
-    out.sort_by(|x, y| y.score.partial_cmp(&x.score).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|x, y| {
+        y.score
+            .partial_cmp(&x.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     out.truncate(cfg.top_splits);
     out
 }
@@ -366,10 +374,7 @@ mod tests {
             self.spikes.len() as u32
         }
         fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
-            self.spikes
-                .get(c.idx())
-                .map(Vec::as_slice)
-                .unwrap_or(&[])
+            self.spikes.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
         }
         fn trace(&self, _: SampleIndex, _: u32) -> TraceSlice<'_> {
             TraceSlice {
@@ -385,10 +390,7 @@ mod tests {
 
     impl HasAmplitudes for MockProvider {
         fn spike_amplitudes(&self, c: ClusterId) -> &[f32] {
-            self.amps
-                .get(c.idx())
-                .map(Vec::as_slice)
-                .unwrap_or(&[])
+            self.amps.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
         }
     }
 
@@ -440,12 +442,8 @@ mod tests {
     fn split_suggester_flags_bimodal_amplitudes() {
         // Cluster 0: bimodal amplitudes (clearly two populations).
         let mut amps_bi: Vec<f32> = Vec::new();
-        for _ in 0..500 {
-            amps_bi.push(2.0);
-        }
-        for _ in 0..500 {
-            amps_bi.push(8.0);
-        }
+        amps_bi.resize(500, 2.0);
+        amps_bi.resize(1000, 8.0);
         let times_bi: Vec<SampleIndex> = (0..1000).map(|i| SampleIndex((i as u64) * 10)).collect();
 
         // Cluster 1: unimodal amplitudes (Gaussian-ish around 5).
@@ -463,7 +461,11 @@ mod tests {
         let cfg = SuggestConfig::default();
         let splits = rank_split_candidates(&sess, &cfg);
         assert!(!splits.is_empty());
-        assert_eq!(splits[0].cluster, ClusterId(0), "expected bimodal cluster 0 to top");
+        assert_eq!(
+            splits[0].cluster,
+            ClusterId(0),
+            "expected bimodal cluster 0 to top"
+        );
     }
 
     #[test]

@@ -8,15 +8,15 @@
 //! # File format (`<root>/sorrel.journal`)
 //!
 //! ```text
-//! magic        | 8 bytes  | b"SORREL\x00\x01"
+//! magic        | 8 bytes  | b"SORREL\x00\x02"
 //! version      | u32 LE   | 1
 //! flags        | u32 LE   | reserved (0)
 //! baseline     | u64 LE   | xxh3-64 hash of spike_clusters.npy at last seal
 //! n_clusters_0 | u32 LE   | n_clusters at baseline (sanity)
 //! reserved     | u32 LE   | 0
 //! ----- records (repeating) -----
-//! payload_len  | u32 LE   | bincode payload length in bytes
-//! payload      | [u8; len]| bincoded `CurationCommand`
+//! payload_len  | u32 LE   | MessagePack payload length in bytes
+//! payload      | [u8; len]| MessagePack-encoded `CurationCommand`
 //! ```
 //!
 //! Crash-safety contract: every `append` flushes + fsync's the file before
@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 pub type SqliteJournal = Journal;
 
 /// Magic header. Bumping the trailing byte invalidates older files.
-pub const MAGIC: &[u8; 8] = b"SORREL\x00\x01";
+pub const MAGIC: &[u8; 8] = b"SORREL\x00\x02";
 /// On-disk format version.
 pub const FORMAT_VERSION: u32 = 1;
 /// Header byte size: magic (8) + version (4) + flags (4) + baseline (8)
@@ -75,16 +75,12 @@ impl Journal {
     /// is checked against `expected_baseline`; mismatch returns an error
     /// so the caller can decide whether to discard, fail loudly, or
     /// reset.
-    pub fn open_or_create(
-        path: &Path,
-        expected_baseline: u64,
-        n_clusters: u32,
-    ) -> Result<Self> {
+    pub fn open_or_create(path: &Path, expected_baseline: u64, n_clusters: u32) -> Result<Self> {
         if path.exists() {
             return Self::open_existing(path, expected_baseline);
         }
-        let mut f = File::create(path)
-            .with_context(|| format!("create journal {}", path.display()))?;
+        let mut f =
+            File::create(path).with_context(|| format!("create journal {}", path.display()))?;
         f.write_all(MAGIC)?;
         f.write_all(&FORMAT_VERSION.to_le_bytes())?;
         f.write_all(&0u32.to_le_bytes())?; // flags
@@ -107,8 +103,7 @@ impl Journal {
     }
 
     fn open_existing(path: &Path, expected_baseline: u64) -> Result<Self> {
-        let mut f = File::open(path)
-            .with_context(|| format!("open journal {}", path.display()))?;
+        let mut f = File::open(path).with_context(|| format!("open journal {}", path.display()))?;
         let mut header = [0u8; HEADER_SIZE as usize];
         f.read_exact(&mut header)
             .with_context(|| format!("read journal header {}", path.display()))?;
@@ -174,9 +169,8 @@ impl Journal {
     /// Append one record. Buffers, flushes, and fsync's so the call only
     /// returns after the bytes are durable.
     pub fn append(&mut self, cmd: &CurationCommand) -> Result<()> {
-        let payload = bincode::serialize(cmd)?;
-        let len = u32::try_from(payload.len())
-            .context("journal record exceeds u32::MAX bytes")?;
+        let payload = rmp_serde::to_vec(cmd)?;
+        let len = u32::try_from(payload.len()).context("journal record exceeds u32::MAX bytes")?;
         self.writer.write_all(&len.to_le_bytes())?;
         self.writer.write_all(&payload)?;
         self.writer.flush()?;
@@ -219,7 +213,7 @@ impl Journal {
             }
             let mut payload = vec![0u8; len as usize];
             f.read_exact(&mut payload)?;
-            match bincode::deserialize::<CurationCommand>(&payload) {
+            match rmp_serde::from_slice::<CurationCommand>(&payload) {
                 Ok(cmd) => {
                     out.push(cmd);
                     last_good_pos = f.stream_position()?;
@@ -253,7 +247,10 @@ mod tests {
     use crate::command::PhyLabelOp;
 
     fn cmd(c: u32, op: PhyLabelOp) -> CurationCommand {
-        CurationCommand::Relabel { cluster: sorrel_io::ClusterId(c), op }
+        CurationCommand::Relabel {
+            cluster: sorrel_io::ClusterId(c),
+            op,
+        }
     }
 
     #[test]
@@ -324,7 +321,10 @@ mod tests {
         let j = Journal::truncate(&p, 0x2, 7).unwrap();
         assert_eq!(j.baseline(), 0x2);
         assert_eq!(j.n_clusters_at_baseline(), 7);
-        assert!(j.replay().unwrap().is_empty(), "fresh journal has no records");
+        assert!(
+            j.replay().unwrap().is_empty(),
+            "fresh journal has no records"
+        );
     }
 
     #[test]
@@ -358,10 +358,14 @@ mod tests {
         }
         let j = Journal::open_or_create(&p, 0xF00D, 1).unwrap();
         let ops = j.replay().unwrap();
-        assert_eq!(ops.len(), 2, "partial record discarded, full ones recovered");
+        assert_eq!(
+            ops.len(),
+            2,
+            "partial record discarded, full ones recovered"
+        );
         // After replay, file should be truncated back to 2 fully-committed records.
         let size = std::fs::metadata(&p).unwrap().len();
-        // Exact size is hard to predict (bincode-dependent) but it must be
+        // Exact size is hard to predict (codec-dependent) but it must be
         // smaller than what we wrote (header + 2 records + 4 + 3 = …).
         assert!(size > HEADER_SIZE);
     }
@@ -372,17 +376,27 @@ mod tests {
         let p = dir.path().join("j.sorrel");
         let mut j = Journal::open_or_create(&p, 0, 0).unwrap();
         use sorrel_io::ClusterId;
-        j.append(&CurationCommand::Relabel { cluster: ClusterId(0), op: PhyLabelOp::SetGood })
-            .unwrap();
-        j.append(&CurationCommand::Merge { sources: vec![ClusterId(1), ClusterId(2)], target: ClusterId(3) }).unwrap();
+        j.append(&CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetGood,
+        })
+        .unwrap();
+        j.append(&CurationCommand::Merge {
+            sources: vec![ClusterId(1), ClusterId(2)],
+            target: ClusterId(3),
+        })
+        .unwrap();
         j.append(&CurationCommand::Split {
             cluster: ClusterId(4),
             spike_idx: vec![0, 1, 5, 8],
             new_cluster: ClusterId(99),
         })
         .unwrap();
-        j.append(&CurationCommand::Note { cluster: ClusterId(7), text: "needs review".into() })
-            .unwrap();
+        j.append(&CurationCommand::Note {
+            cluster: ClusterId(7),
+            text: "needs review".into(),
+        })
+        .unwrap();
         j.append(&CurationCommand::Undo).unwrap();
         j.append(&CurationCommand::Redo).unwrap();
 

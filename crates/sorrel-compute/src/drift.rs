@@ -55,11 +55,7 @@ pub fn amplitude_drift_correlation(times: &[SampleIndex], amps: &[f32]) -> f32 {
 /// fit through the (time, amplitude) cloud. Useful as an absolute drift
 /// magnitude rather than the unitless correlation. Sample rate is needed to
 /// convert from sample-indexed times to seconds.
-pub fn amplitude_drift_slope(
-    times: &[SampleIndex],
-    amps: &[f32],
-    sample_rate: f32,
-) -> f32 {
+pub fn amplitude_drift_slope(times: &[SampleIndex], amps: &[f32], sample_rate: f32) -> f32 {
     if sample_rate <= 0.0 {
         return 0.0;
     }
@@ -150,10 +146,7 @@ pub fn sliding_refractory_contamination(
 /// Largest "gap" in the recording where this cluster is silent, expressed as
 /// a fraction of the total recording length. Useful to flag electrode drop:
 /// 0.05 = a 5%-of-recording silent stretch.
-pub fn longest_silent_gap_frac(
-    times: &[SampleIndex],
-    total_duration_samples: u64,
-) -> f32 {
+pub fn longest_silent_gap_frac(times: &[SampleIndex], total_duration_samples: u64) -> f32 {
     if times.is_empty() || total_duration_samples == 0 {
         return 1.0;
     }

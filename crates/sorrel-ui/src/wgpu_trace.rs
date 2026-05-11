@@ -89,8 +89,8 @@ impl TracePipeline {
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sorrel.trace.layout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -98,7 +98,7 @@ impl TracePipeline {
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: VERTEX_SIZE,
@@ -130,7 +130,7 @@ impl TracePipeline {
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
@@ -138,7 +138,8 @@ impl TracePipeline {
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
 
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -188,7 +189,7 @@ impl TracePipeline {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
 
-    fn draw<'rp>(&'rp self, pass: &mut wgpu::RenderPass<'rp>, n_channels: u32, points_per_channel: u32) {
+    fn draw(&self, pass: &mut wgpu::RenderPass<'static>, n_channels: u32, points_per_channel: u32) {
         if n_channels == 0 || points_per_channel < 2 {
             return;
         }
@@ -249,11 +250,11 @@ impl egui_wgpu::CallbackTrait for TraceCallback {
         Vec::new()
     }
 
-    fn paint<'a>(
-        &'a self,
+    fn paint(
+        &self,
         _info: egui::PaintCallbackInfo,
-        render_pass: &mut wgpu::RenderPass<'a>,
-        callback_resources: &'a egui_wgpu::CallbackResources,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        callback_resources: &egui_wgpu::CallbackResources,
     ) {
         let Some(pipeline) = callback_resources.get::<TracePipeline>() else {
             return;

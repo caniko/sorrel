@@ -36,13 +36,9 @@ fn cluster_colour(c: ClusterId) -> Color32 {
 /// Amplitude-vs-time scatter for every cluster in the selection. Only
 /// renders something when the session has seeded amplitudes; otherwise
 /// shows a hint that the backend / open path didn't expose them.
-pub fn amplitude_view<P: DataProvider>(
-    ui: &mut Ui,
-    session: &Session<P>,
-    selection: &[ClusterId],
-) {
+pub fn amplitude_view<P: DataProvider>(ui: &mut Ui, session: &Session<P>, selection: &[ClusterId]) {
     let avail = ui.available_size_before_wrap();
-    let height = avail.y.max(120.0).min(360.0);
+    let height = avail.y.clamp(120.0, 360.0);
     let (rect, _resp) =
         ui.allocate_exact_size(egui::vec2(avail.x.max(120.0), height), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -141,11 +137,7 @@ pub fn amplitude_view<P: DataProvider>(
 
 /// Inter-spike-interval histogram for every cluster in the selection,
 /// stacked vertically so individual cluster shapes stay legible.
-pub fn isi_view<P: DataProvider>(
-    ui: &mut Ui,
-    session: &Session<P>,
-    selection: &[ClusterId],
-) {
+pub fn isi_view<P: DataProvider>(ui: &mut Ui, session: &Session<P>, selection: &[ClusterId]) {
     if selection.is_empty() {
         ui.label("no selection");
         return;
@@ -339,10 +331,9 @@ impl WaveformCache {
             let mut sum = vec![vec![0.0f64; snippet_len]; nc];
             let count = cluster_snips.len() as f64;
             for snip in cluster_snips {
-                for t in 0..snippet_len {
-                    let base = t * nc;
-                    for ch in 0..nc {
-                        sum[ch][t] += snip[base + ch] as f64;
+                for (t, channel_values) in snip.chunks_exact(nc).enumerate().take(snippet_len) {
+                    for (ch, channel_sum) in sum.iter_mut().enumerate().take(nc) {
+                        channel_sum[t] += channel_values[ch] as f64;
                     }
                 }
             }
@@ -418,6 +409,7 @@ pub fn waveform_view<P: DataProvider>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_single_channel(
     ui: &mut Ui,
     selection: &[ClusterId],
@@ -429,16 +421,16 @@ fn draw_single_channel(
     pre: u32,
 ) {
     // Pick the global peak channel.
-    let (peak_ch, peak_val) = peaks
-        .iter()
-        .enumerate()
-        .fold((0usize, 0.0f32), |(bi, bv), (i, &v)| {
+    let (peak_ch, peak_val) = peaks.iter().enumerate().fold(
+        (0usize, 0.0f32),
+        |(bi, bv), (i, &v)| {
             if v > bv {
                 (i, v)
             } else {
                 (bi, bv)
             }
-        });
+        },
+    );
     if peak_val <= 0.0 {
         ui.label("no waveforms in range — try expanding the selection");
         return;
@@ -452,8 +444,8 @@ fn draw_single_channel(
     }
     for cluster_snips in &cache.snippets {
         for snip in cluster_snips {
-            for t in 0..snippet_len {
-                let v = snip[t * nc + peak_ch].abs();
+            for channel_values in snip.chunks_exact(nc).take(snippet_len) {
+                let v = channel_values[peak_ch].abs();
                 if v > y_max {
                     y_max = v;
                 }
@@ -462,7 +454,7 @@ fn draw_single_channel(
     }
 
     let avail = ui.available_size_before_wrap();
-    let height = avail.y.max(160.0).min(420.0);
+    let height = avail.y.clamp(160.0, 420.0);
     let (rect, _resp) =
         ui.allocate_exact_size(egui::vec2(avail.x.max(120.0), height), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -517,6 +509,7 @@ fn draw_single_channel(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_probe_layout(
     ui: &mut Ui,
     selection: &[ClusterId],
@@ -530,7 +523,11 @@ fn draw_probe_layout(
     // Pick top N channels by peak amplitude.
     const N_BEST: usize = 16;
     let mut idx: Vec<usize> = (0..nc).collect();
-    idx.sort_unstable_by(|&a, &b| peaks[b].partial_cmp(&peaks[a]).unwrap_or(std::cmp::Ordering::Equal));
+    idx.sort_unstable_by(|&a, &b| {
+        peaks[b]
+            .partial_cmp(&peaks[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let best: Vec<usize> = idx.into_iter().take(N_BEST).collect();
     if best.is_empty() || peaks[best[0]] <= 0.0 {
         ui.label("no waveforms in range — try expanding the selection");
@@ -563,7 +560,7 @@ fn draw_probe_layout(
     }
 
     let avail = ui.available_size_before_wrap();
-    let height = avail.y.max(220.0).min(640.0);
+    let height = avail.y.clamp(220.0, 640.0);
     let (rect, _resp) =
         ui.allocate_exact_size(egui::vec2(avail.x.max(120.0), height), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -612,8 +609,7 @@ fn draw_probe_layout(
 
         for (ci, &c) in selection.iter().enumerate() {
             let colour = cluster_colour(c);
-            let faint =
-                Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), 30);
+            let faint = Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), 30);
             let stroke_individual = Stroke::new(0.4_f32, faint);
             let stroke_mean = Stroke::new(1.5_f32, colour);
 
@@ -685,7 +681,8 @@ pub fn correlogram_grid_view<P: DataProvider>(
         ui.label("sample rate not set — can't compute correlogram");
         return;
     }
-    let refractory_bin = ((sr * 0.001) / max_lag_samples as f32 * bins as f32 * 0.5).round()
+    let refractory_bin = ((sr * 0.001) / max_lag_samples as f32 * bins as f32 * 0.5)
+        .round()
         .max(0.0) as usize;
 
     let n = selection.len();
@@ -696,10 +693,8 @@ pub fn correlogram_grid_view<P: DataProvider>(
     let cell_h = ((panel_h - 4.0) / n as f32).clamp(40.0, 96.0);
 
     let total_h = cell_h * n as f32 + 8.0 + header_h;
-    let (rect, _resp) = ui.allocate_exact_size(
-        egui::vec2(avail.x.max(120.0), total_h),
-        Sense::hover(),
-    );
+    let (rect, _resp) =
+        ui.allocate_exact_size(egui::vec2(avail.x.max(120.0), total_h), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, Color32::from_gray(18));
 
@@ -721,7 +716,10 @@ pub fn correlogram_grid_view<P: DataProvider>(
         for (ci, &c_col) in selection.iter().enumerate() {
             let tb = session.spike_times(c_col);
             let cell = egui::Rect::from_min_size(
-                egui::pos2(rect.left() + 2.0 + ci as f32 * cell_w, grid_top + ri as f32 * cell_h),
+                egui::pos2(
+                    rect.left() + 2.0 + ci as f32 * cell_w,
+                    grid_top + ri as f32 * cell_h,
+                ),
                 egui::vec2(cell_w - 2.0, cell_h - 2.0),
             );
             painter.rect_filled(cell, 0.0, Color32::from_gray(24));
@@ -775,10 +773,7 @@ pub fn correlogram_grid_view<P: DataProvider>(
                 let bx1 = bx0 + bw * 0.95;
                 let by0 = cell.bottom() - h_norm * (cell.height() - 4.0);
                 painter.rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::pos2(bx0, by0),
-                        egui::pos2(bx1, cell.bottom()),
-                    ),
+                    egui::Rect::from_min_max(egui::pos2(bx0, by0), egui::pos2(bx1, cell.bottom())),
                     0.0,
                     colour,
                 );
@@ -870,7 +865,7 @@ pub fn feature_view<P: DataProvider>(
     });
 
     let avail = ui.available_size_before_wrap();
-    let height = avail.y.max(220.0).min(540.0);
+    let height = avail.y.clamp(220.0, 540.0);
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(avail.x.max(160.0), height),
         Sense::click_and_drag(),
@@ -934,8 +929,7 @@ pub fn feature_view<P: DataProvider>(
     let to_screen = |x: f32, y: f32| {
         let sx = rect.left() + ((x - x_lo) / x_span).clamp(0.0, 1.0) * rect.width();
         // Flip y so larger PC values go up.
-        let sy =
-            rect.bottom() - ((y - y_lo) / y_span).clamp(0.0, 1.0) * rect.height();
+        let sy = rect.bottom() - ((y - y_lo) / y_span).clamp(0.0, 1.0) * rect.height();
         Pos2::new(sx, sy)
     };
 
@@ -964,6 +958,7 @@ pub fn feature_view<P: DataProvider>(
                 lasso,
                 0.0,
                 Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                egui::StrokeKind::Inside,
             );
         }
     }
@@ -992,7 +987,10 @@ pub fn feature_view<P: DataProvider>(
         egui::Align2::LEFT_TOP,
         format!(
             "PC{}×PC{} on ch-idx {} · drag to lasso → split · {} spikes",
-            pc_x, pc_y, ch, points.len()
+            pc_x,
+            pc_y,
+            ch,
+            points.len()
         ),
         egui::FontId::proportional(11.0),
         Color32::GRAY,
@@ -1162,11 +1160,9 @@ pub fn raster_view<P: DataProvider>(
     }
 
     let avail = ui.available_size_before_wrap();
-    let height = avail.y.max(160.0).min(640.0);
-    let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(avail.x.max(120.0), height),
-        Sense::click(),
-    );
+    let height = avail.y.clamp(160.0, 640.0);
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(avail.x.max(120.0), height), Sense::click());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, Color32::from_gray(16));
 
@@ -1181,7 +1177,9 @@ pub fn raster_view<P: DataProvider>(
         n_rows: cache.n_rows,
     };
     ui.painter()
-        .add(eframe::egui_wgpu::Callback::new_paint_callback(rect, callback));
+        .add(eframe::egui_wgpu::Callback::new_paint_callback(
+            rect, callback,
+        ));
 
     // Caption.
     painter.text(
@@ -1266,7 +1264,7 @@ pub fn firing_rate_view<P: DataProvider>(
     }
 
     let avail = ui.available_size_before_wrap();
-    let height = avail.y.max(160.0).min(360.0);
+    let height = avail.y.clamp(160.0, 360.0);
     let (rect, _resp) =
         ui.allocate_exact_size(egui::vec2(avail.x.max(160.0), height), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -1279,10 +1277,7 @@ pub fn firing_rate_view<P: DataProvider>(
     for k in 1..4 {
         let x = rect.left() + rect.width() * k as f32 / 4.0;
         painter.line_segment(
-            [
-                egui::pos2(x, rect.top()),
-                egui::pos2(x, rect.bottom()),
-            ],
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
             Stroke::new(0.3_f32, Color32::from_gray(34)),
         );
     }
@@ -1458,10 +1453,7 @@ pub fn probe_view<P: DataProvider>(
 
 /// Primary (most common) template id for a cluster. Returns `None` for
 /// empty / never-seeded clusters.
-fn primary_template_id<P: DataProvider>(
-    session: &Session<P>,
-    cluster: ClusterId,
-) -> Option<u32> {
+fn primary_template_id<P: DataProvider>(session: &Session<P>, cluster: ClusterId) -> Option<u32> {
     let templates = session.spike_templates(cluster);
     if templates.is_empty() {
         return None;
@@ -1479,11 +1471,7 @@ fn primary_template_id<P: DataProvider>(
 /// Render the per-cluster template waveform on its own peak channel,
 /// colour-coded by cluster. Falls back to a hint when templates aren't
 /// seeded.
-pub fn template_view<P: DataProvider>(
-    ui: &mut Ui,
-    session: &Session<P>,
-    selection: &[ClusterId],
-) {
+pub fn template_view<P: DataProvider>(ui: &mut Ui, session: &Session<P>, selection: &[ClusterId]) {
     if !session.has_template_waveforms() {
         ui.label("templates.npy not loaded — TemplateView unavailable");
         return;
@@ -1534,7 +1522,7 @@ pub fn template_view<P: DataProvider>(
     }
 
     let avail = ui.available_size_before_wrap();
-    let height = avail.y.max(160.0).min(420.0);
+    let height = avail.y.clamp(160.0, 420.0);
     let (rect, _resp) =
         ui.allocate_exact_size(egui::vec2(avail.x.max(120.0), height), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -1717,7 +1705,13 @@ pub fn cluster_statistics_view<P: DataProvider>(ui: &mut Ui, session: &Session<P
         isi_viols.push(isi_violations(session.spike_times(c), refractory_samples) as f32);
     }
 
-    histogram_panel(ui, "spike count", &spike_counts, 30, Color32::from_rgb(78, 121, 167));
+    histogram_panel(
+        ui,
+        "spike count",
+        &spike_counts,
+        30,
+        Color32::from_rgb(78, 121, 167),
+    );
     if !mean_amps.is_empty() {
         histogram_panel(
             ui,
@@ -1951,10 +1945,7 @@ where
             .filter(|(m, p)| m.score >= 0.7 && !p.warns)
             .count();
         let label = format!("apply {n_safe} high-conf merges");
-        let response = ui.add_enabled(
-            n_safe > 0,
-            egui::Button::new(label).small(),
-        );
+        let response = ui.add_enabled(n_safe > 0, egui::Button::new(label).small());
         if response
             .on_hover_text(
                 "Applies every score≥0.70 merge whose predicted Δquality is not negative. \
@@ -1976,8 +1967,7 @@ where
                      or seed amplitudes for stronger evidence.",
                 );
             } else {
-                let merge_action =
-                    render_merge_table(ui, &cache.merges, &cache.merge_previews);
+                let merge_action = render_merge_table(ui, &cache.merges, &cache.merge_previews);
                 if action.is_none() {
                     action = merge_action;
                 }
@@ -2021,15 +2011,35 @@ fn render_merge_table(
         .column(Column::auto().at_least(64.0))
         .column(Column::auto().at_least(140.0))
         .header(22.0, |mut h| {
-            h.col(|ui| { ui.strong("a"); });
-            h.col(|ui| { ui.strong("b"); });
-            h.col(|ui| { ui.strong("score"); });
-            h.col(|ui| { ui.strong("dip z"); });
-            h.col(|ui| { ui.strong("amp KS"); });
-            h.col(|ui| { ui.strong("Δamp"); });
-            h.col(|ui| { ui.strong("Δqual").on_hover_text("predicted change in composite quality after merge"); });
-            h.col(|ui| { ui.strong("Δcontam").on_hover_text("predicted change in refractory contamination"); });
-            h.col(|ui| { ui.strong("action"); });
+            h.col(|ui| {
+                ui.strong("a");
+            });
+            h.col(|ui| {
+                ui.strong("b");
+            });
+            h.col(|ui| {
+                ui.strong("score");
+            });
+            h.col(|ui| {
+                ui.strong("dip z");
+            });
+            h.col(|ui| {
+                ui.strong("amp KS");
+            });
+            h.col(|ui| {
+                ui.strong("Δamp");
+            });
+            h.col(|ui| {
+                ui.strong("Δqual")
+                    .on_hover_text("predicted change in composite quality after merge");
+            });
+            h.col(|ui| {
+                ui.strong("Δcontam")
+                    .on_hover_text("predicted change in refractory contamination");
+            });
+            h.col(|ui| {
+                ui.strong("action");
+            });
         })
         .body(|mut body| {
             for (idx, m) in merges.iter().enumerate() {
@@ -2077,7 +2087,11 @@ fn render_merge_table(
                         if ui.small_button("review").clicked() {
                             action = Some(SuggestAction::Select(vec![m.a, m.b]));
                         }
-                        let merge_label = if preview.warns { "merge ⚠" } else { "merge →" };
+                        let merge_label = if preview.warns {
+                            "merge ⚠"
+                        } else {
+                            "merge →"
+                        };
                         let tt = if preview.warns {
                             format!(
                                 "Predicted Δquality {:+.2}, Δcontam {:+.3}. \
@@ -2124,14 +2138,32 @@ where
         .column(Column::auto().at_least(56.0))
         .column(Column::auto().at_least(140.0))
         .header(22.0, |mut h| {
-            h.col(|ui| { ui.strong("cluster"); });
-            h.col(|ui| { ui.strong("score"); });
-            h.col(|ui| { ui.strong("BC"); });
-            h.col(|ui| { ui.strong("contam"); });
-            h.col(|ui| { ui.strong("|drift|"); });
-            h.col(|ui| { ui.strong("ΔBIC").on_hover_text("BIC(k=1) − BIC(k=2) on amplitudes; >6 = strong evidence for splitting"); });
-            h.col(|ui| { ui.strong("label"); });
-            h.col(|ui| { ui.strong("action"); });
+            h.col(|ui| {
+                ui.strong("cluster");
+            });
+            h.col(|ui| {
+                ui.strong("score");
+            });
+            h.col(|ui| {
+                ui.strong("BC");
+            });
+            h.col(|ui| {
+                ui.strong("contam");
+            });
+            h.col(|ui| {
+                ui.strong("|drift|");
+            });
+            h.col(|ui| {
+                ui.strong("ΔBIC").on_hover_text(
+                    "BIC(k=1) − BIC(k=2) on amplitudes; >6 = strong evidence for splitting",
+                );
+            });
+            h.col(|ui| {
+                ui.strong("label");
+            });
+            h.col(|ui| {
+                ui.strong("action");
+            });
         })
         .body(|mut body| {
             for s in splits {
@@ -2204,11 +2236,7 @@ where
 /// Render a quality-score panel for the selected clusters: the composite
 /// score plus a breakdown into the six contributing factors. Hovering each
 /// score reveals the underlying raw metric.
-pub fn quality_view<P: DataProvider>(
-    ui: &mut Ui,
-    session: &Session<P>,
-    selection: &[ClusterId],
-) {
+pub fn quality_view<P: DataProvider>(ui: &mut Ui, session: &Session<P>, selection: &[ClusterId]) {
     if selection.is_empty() {
         ui.label("no selection");
         return;
@@ -2329,17 +2357,13 @@ pub fn quality_view<P: DataProvider>(
 /// Renders in pure egui — fast enough for tens of thousands of points
 /// because we sub-sample at a fixed point budget. Selected clusters are
 /// overlaid with the standard palette.
-pub fn drift_map_view<P: DataProvider>(
-    ui: &mut Ui,
-    session: &Session<P>,
-    selection: &[ClusterId],
-) {
+pub fn drift_map_view<P: DataProvider>(ui: &mut Ui, session: &Session<P>, selection: &[ClusterId]) {
     if selection.is_empty() {
         ui.label("no selection");
         return;
     }
     let avail = ui.available_size_before_wrap();
-    let height = avail.y.max(220.0).min(560.0);
+    let height = avail.y.clamp(220.0, 560.0);
     let (rect, _resp) =
         ui.allocate_exact_size(egui::vec2(avail.x.max(160.0), height), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -2365,8 +2389,12 @@ pub fn drift_map_view<P: DataProvider>(
             t_max = t_max.max(last.as_f32() * inv_sr);
         }
         for &a in amps {
-            if a < a_min { a_min = a; }
-            if a > a_max { a_max = a; }
+            if a < a_min {
+                a_min = a;
+            }
+            if a > a_max {
+                a_max = a;
+            }
         }
     }
     if total_spikes == 0 || !t_min.is_finite() || !a_min.is_finite() {
@@ -2408,7 +2436,11 @@ pub fn drift_map_view<P: DataProvider>(
         }
         // OLS regression line on (t, a). cheap.
         let nf = n as f64;
-        let mean_t: f64 = times[..n].iter().map(|&t| t.as_f64() * inv_sr as f64).sum::<f64>() / nf;
+        let mean_t: f64 = times[..n]
+            .iter()
+            .map(|&t| t.as_f64() * inv_sr as f64)
+            .sum::<f64>()
+            / nf;
         let mean_a: f64 = amps[..n].iter().map(|&a| a as f64).sum::<f64>() / nf;
         let mut num = 0.0_f64;
         let mut denom = 0.0_f64;
@@ -2499,10 +2531,10 @@ pub fn contamination_over_time_view<P: DataProvider>(
             }
         }
     }
-    y_max = y_max.max(0.05).min(2.0);
+    y_max = y_max.clamp(0.05, 2.0);
 
     let avail = ui.available_size_before_wrap();
-    let height = avail.y.max(180.0).min(420.0);
+    let height = avail.y.clamp(180.0, 420.0);
     let (rect, _resp) =
         ui.allocate_exact_size(egui::vec2(avail.x.max(160.0), height), Sense::hover());
     let painter = ui.painter_at(rect);

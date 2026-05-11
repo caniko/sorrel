@@ -3,8 +3,8 @@
 
 use sorrel_io::kilosort::{KilosortOpenParams, KilosortProvider, PhyLabel};
 use sorrel_io::{
-    ChannelId, ClusterId, DataProvider, HasAmplitudes, HasGeometry, HasSpikeTemplates,
-    SampleIndex, TraceDtype, TraceSamples,
+    ChannelId, ClusterId, DataProvider, HasAmplitudes, HasGeometry, HasSpikeTemplates, SampleIndex,
+    TraceDtype, TraceSamples,
 };
 use std::io::Write;
 use std::path::Path;
@@ -20,13 +20,11 @@ fn write_npy_v1_2d(path: &Path, descr: &str, rows: usize, cols: usize, data: &[u
 }
 
 fn write_npy_with_shape(path: &Path, descr: &str, shape_str: &str, data: &[u8]) {
-    let dict = format!(
-        "{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape_str}, }}"
-    );
+    let dict = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape_str}, }}");
     let prelude_len = 6 + 2 + 2 + dict.len() + 1;
     let pad = (64 - (prelude_len % 64)) % 64;
     let mut header = dict.into_bytes();
-    header.extend(std::iter::repeat(b' ').take(pad));
+    header.resize(header.len() + pad, b' ');
     header.push(b'\n');
     let header_len = header.len() as u16;
 
@@ -49,7 +47,12 @@ fn opens_minimal_kilosort_fixture() {
 
     let times_bytes: Vec<u8> = times.iter().flat_map(|t| t.to_le_bytes()).collect();
     let clusters_bytes: Vec<u8> = clusters.iter().flat_map(|c| c.to_le_bytes()).collect();
-    write_npy_v1(&root.join("spike_times.npy"), "<i64", times.len(), &times_bytes);
+    write_npy_v1(
+        &root.join("spike_times.npy"),
+        "<i64",
+        times.len(),
+        &times_bytes,
+    );
     write_npy_v1(
         &root.join("spike_clusters.npy"),
         "<u32",
@@ -98,13 +101,19 @@ fn opens_minimal_kilosort_fixture() {
         p.spike_times(ClusterId(0)),
         &[SampleIndex(10), SampleIndex(30), SampleIndex(150)]
     );
-    assert_eq!(p.spike_times(ClusterId(1)), &[SampleIndex(50), SampleIndex(200)]);
+    assert_eq!(
+        p.spike_times(ClusterId(1)),
+        &[SampleIndex(50), SampleIndex(200)]
+    );
     assert_eq!(p.spike_times(ClusterId(2)), &[SampleIndex(100)]);
     assert!(p.spike_times(ClusterId(99)).is_empty());
 
     // initial labels from the TSV.
     let labels = p.initial_labels();
-    assert_eq!(labels, vec![PhyLabel::Good, PhyLabel::Unsorted, PhyLabel::Noise]);
+    assert_eq!(
+        labels,
+        vec![PhyLabel::Good, PhyLabel::Unsorted, PhyLabel::Noise]
+    );
 
     // trace slice contents and clamping.
     let slice = p.trace(SampleIndex(0), 2);
@@ -133,7 +142,12 @@ fn rejects_dat_with_wrong_size_for_channel_count() {
     let tb: Vec<u8> = times.iter().flat_map(|t| t.to_le_bytes()).collect();
     let cb: Vec<u8> = clusters.iter().flat_map(|c| c.to_le_bytes()).collect();
     write_npy_v1(&root.join("spike_times.npy"), "<i64", times.len(), &tb);
-    write_npy_v1(&root.join("spike_clusters.npy"), "<u32", clusters.len(), &cb);
+    write_npy_v1(
+        &root.join("spike_clusters.npy"),
+        "<u32",
+        clusters.len(),
+        &cb,
+    );
 
     let dat_path = root.join("recording.dat");
     // 7 bytes — not divisible by 4 channels * 2 bytes = 8.
@@ -161,7 +175,12 @@ fn reads_params_py_when_present() {
     let tb: Vec<u8> = times.iter().flat_map(|t| t.to_le_bytes()).collect();
     let cb: Vec<u8> = clusters.iter().flat_map(|c| c.to_le_bytes()).collect();
     write_npy_v1(&root.join("spike_times.npy"), "<i64", times.len(), &tb);
-    write_npy_v1(&root.join("spike_clusters.npy"), "<u32", clusters.len(), &cb);
+    write_npy_v1(
+        &root.join("spike_clusters.npy"),
+        "<u32",
+        clusters.len(),
+        &cb,
+    );
 
     // 4 ch × 4 samples × 2 bytes = 32 bytes
     std::fs::write(root.join("recording.dat"), [0u8; 32]).unwrap();
@@ -195,7 +214,12 @@ fn float32_dtype_round_trips_through_provider() {
     let tb: Vec<u8> = times.iter().flat_map(|t| t.to_le_bytes()).collect();
     let cb: Vec<u8> = clusters.iter().flat_map(|c| c.to_le_bytes()).collect();
     write_npy_v1(&root.join("spike_times.npy"), "<i64", times.len(), &tb);
-    write_npy_v1(&root.join("spike_clusters.npy"), "<u32", clusters.len(), &cb);
+    write_npy_v1(
+        &root.join("spike_clusters.npy"),
+        "<u32",
+        clusters.len(),
+        &cb,
+    );
 
     // 2 ch × 3 samples × 4 bytes = 24 bytes; values increase per-sample.
     let nc = 2u32;
@@ -240,7 +264,12 @@ fn dat_offset_is_skipped() {
     let tb: Vec<u8> = times.iter().flat_map(|t| t.to_le_bytes()).collect();
     let cb: Vec<u8> = clusters.iter().flat_map(|c| c.to_le_bytes()).collect();
     write_npy_v1(&root.join("spike_times.npy"), "<i64", times.len(), &tb);
-    write_npy_v1(&root.join("spike_clusters.npy"), "<u32", clusters.len(), &cb);
+    write_npy_v1(
+        &root.join("spike_clusters.npy"),
+        "<u32",
+        clusters.len(),
+        &cb,
+    );
 
     // 16 bytes header + 2 ch × 4 samples × 2 bytes = 32 bytes payload.
     let mut bytes = vec![0xFFu8; 16]; // pretend header
@@ -287,9 +316,19 @@ fn write_full_phy_fixture(root: &Path) {
     let ab: Vec<u8> = amps.iter().flat_map(|a| a.to_le_bytes()).collect();
     let pb: Vec<u8> = templates.iter().flat_map(|p| p.to_le_bytes()).collect();
     write_npy_v1(&root.join("spike_times.npy"), "<i64", times.len(), &tb);
-    write_npy_v1(&root.join("spike_clusters.npy"), "<u32", clusters.len(), &cb);
+    write_npy_v1(
+        &root.join("spike_clusters.npy"),
+        "<u32",
+        clusters.len(),
+        &cb,
+    );
     write_npy_v1(&root.join("amplitudes.npy"), "<f4", amps.len(), &ab);
-    write_npy_v1(&root.join("spike_templates.npy"), "<i4", templates.len(), &pb);
+    write_npy_v1(
+        &root.join("spike_templates.npy"),
+        "<i4",
+        templates.len(),
+        &pb,
+    );
 
     // 4 channels, monotonic dat, params.py drives shape.
     let nc = 4u32;
@@ -342,7 +381,10 @@ fn amplitudes_and_templates_align_with_time_sorted_spikes() {
 
     // Cluster 1 has [1,4] -> times [50,200], amps [2.0,5.0], templates
     // [11,11] (already in time order).
-    assert_eq!(p.spike_times(ClusterId(1)), &[SampleIndex(50), SampleIndex(200)]);
+    assert_eq!(
+        p.spike_times(ClusterId(1)),
+        &[SampleIndex(50), SampleIndex(200)]
+    );
     assert_eq!(p.spike_amplitudes(ClusterId(1)), &[2.0, 5.0]);
     assert_eq!(p.spike_templates(ClusterId(1)), &[11, 11]);
 
@@ -384,7 +426,12 @@ fn missing_optional_files_yield_empty_slices() {
     let tb: Vec<u8> = times.iter().flat_map(|t| t.to_le_bytes()).collect();
     let cb: Vec<u8> = clusters.iter().flat_map(|c| c.to_le_bytes()).collect();
     write_npy_v1(&root.join("spike_times.npy"), "<i64", times.len(), &tb);
-    write_npy_v1(&root.join("spike_clusters.npy"), "<u32", clusters.len(), &cb);
+    write_npy_v1(
+        &root.join("spike_clusters.npy"),
+        "<u32",
+        clusters.len(),
+        &cb,
+    );
     std::fs::write(root.join("recording.dat"), [0u8; 4]).unwrap(); // 1 ch × 2 samples
     std::fs::write(
         root.join("params.py"),
@@ -413,7 +460,12 @@ fn rejects_amplitudes_with_wrong_length() {
     let cb: Vec<u8> = clusters.iter().flat_map(|c| c.to_le_bytes()).collect();
     let ab: Vec<u8> = amps.iter().flat_map(|a| a.to_le_bytes()).collect();
     write_npy_v1(&root.join("spike_times.npy"), "<i64", times.len(), &tb);
-    write_npy_v1(&root.join("spike_clusters.npy"), "<u32", clusters.len(), &cb);
+    write_npy_v1(
+        &root.join("spike_clusters.npy"),
+        "<u32",
+        clusters.len(),
+        &cb,
+    );
     write_npy_v1(&root.join("amplitudes.npy"), "<f4", amps.len(), &ab);
 
     std::fs::write(root.join("recording.dat"), [0u8; 4]).unwrap();
@@ -438,7 +490,12 @@ fn templates_npy_round_trips_through_provider() {
     let tb: Vec<u8> = times.iter().flat_map(|t| t.to_le_bytes()).collect();
     let cb: Vec<u8> = clusters.iter().flat_map(|c| c.to_le_bytes()).collect();
     write_npy_v1(&root.join("spike_times.npy"), "<i64", times.len(), &tb);
-    write_npy_v1(&root.join("spike_clusters.npy"), "<u32", clusters.len(), &cb);
+    write_npy_v1(
+        &root.join("spike_clusters.npy"),
+        "<u32",
+        clusters.len(),
+        &cb,
+    );
     std::fs::write(root.join("recording.dat"), [0u8; 8]).unwrap();
     std::fs::write(
         root.join("params.py"),
@@ -474,7 +531,13 @@ fn templates_npy_round_trips_through_provider() {
         sim[i * n_t + i] = 1.0;
     }
     let sim_bytes: Vec<u8> = sim.iter().flat_map(|v| v.to_le_bytes()).collect();
-    write_npy_v1_2d(&root.join("similar_templates.npy"), "<f4", n_t, n_t, &sim_bytes);
+    write_npy_v1_2d(
+        &root.join("similar_templates.npy"),
+        "<f4",
+        n_t,
+        n_t,
+        &sim_bytes,
+    );
 
     let p = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
 
@@ -515,14 +578,7 @@ fn templates_with_mismatched_similar_count_is_an_error() {
     assert!(res.is_err(), "should reject mismatched template/sim shapes");
 }
 
-fn write_npy_v1_3d(
-    path: &Path,
-    descr: &str,
-    d0: usize,
-    d1: usize,
-    d2: usize,
-    data: &[u8],
-) {
+fn write_npy_v1_3d(path: &Path, descr: &str, d0: usize, d1: usize, d2: usize, data: &[u8]) {
     let shape = format!("({d0}, {d1}, {d2})");
     write_npy_with_shape(path, descr, &shape, data);
 }
@@ -534,7 +590,12 @@ fn write_minimal_fixture(root: &Path, n_clusters: u32, n_channels: u32) {
     let tb: Vec<u8> = times.iter().flat_map(|t| t.to_le_bytes()).collect();
     let cb: Vec<u8> = clusters.iter().flat_map(|c| c.to_le_bytes()).collect();
     write_npy_v1(&root.join("spike_times.npy"), "<i64", times.len(), &tb);
-    write_npy_v1(&root.join("spike_clusters.npy"), "<u32", clusters.len(), &cb);
+    write_npy_v1(
+        &root.join("spike_clusters.npy"),
+        "<u32",
+        clusters.len(),
+        &cb,
+    );
 
     let dat_bytes = vec![0u8; n_channels as usize * 4 * 2];
     std::fs::write(root.join("recording.dat"), &dat_bytes).unwrap();
@@ -589,7 +650,11 @@ fn quality_metrics_phy_per_metric_tsv_loads() {
     let amp = p.metric_values("amp").unwrap();
     assert_eq!(amp.len(), 4);
     assert!((amp[0] - 10.5).abs() < 1e-6);
-    assert!(amp[1].is_nan(), "missing cluster should be NaN, got {}", amp[1]);
+    assert!(
+        amp[1].is_nan(),
+        "missing cluster should be NaN, got {}",
+        amp[1]
+    );
     assert!((amp[2] - 7.0).abs() < 1e-6);
     assert!(amp[3].is_nan());
 }

@@ -18,7 +18,7 @@ log.workspace = true
 # Off by default: pulls libhdf5 in as a system dependency. Enable with
 # `--features hdf5`. We use the actively-maintained `hdf5-metno` fork
 # (vs. the upstream-stale `hdf5` crate), which supports libhdf5 ≥ 1.14.
-hdf5-metno = { version = "0.10", optional = true }
+hdf5-metno = { version = "0.12.4", optional = true }
 
 [features]
 default = []

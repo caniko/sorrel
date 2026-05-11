@@ -142,8 +142,7 @@ mod tests {
         let trace: Vec<f32> = (0..1000).map(|t| t as f32).collect();
         let spikes = si((50..950).step_by(50).map(|t| t as u64));
         for &(pre, post) in &[(0u32, 0u32), (5, 5), (10, 30), (30, 10)] {
-            let snips =
-                extract_snippets_single_channel(&trace, SampleIndex(0), &spikes, pre, post);
+            let snips = extract_snippets_single_channel(&trace, SampleIndex(0), &spikes, pre, post);
             for s in &snips {
                 assert_eq!(
                     s.len(),
@@ -184,7 +183,7 @@ mod tests {
     /// Property: mean linearity — mean(snip + offset) == mean(snip) + offset.
     #[test]
     fn mean_snippet_is_linear_under_constant_offset() {
-        let base = vec![1.0_f32, 2.0, 3.0];
+        let base = [1.0_f32, 2.0, 3.0];
         let mut shifted = Vec::new();
         for k in 0..5 {
             shifted.push(base.iter().map(|v| v + k as f32 * 10.0).collect());

@@ -133,7 +133,8 @@ mod tests {
         f.apply(&input, &mut out);
         // Skip the unsettled head.
         let tail = &out[1024..];
-        let rms_in: f32 = (input[1024..].iter().map(|v| v * v).sum::<f32>() / tail.len() as f32).sqrt();
+        let rms_in: f32 =
+            (input[1024..].iter().map(|v| v * v).sum::<f32>() / tail.len() as f32).sqrt();
         let rms_out: f32 = (tail.iter().map(|v| v * v).sum::<f32>() / tail.len() as f32).sqrt();
         // 50 Hz is ~1.5 octaves below the cutoff for a 2nd-order HP — expect
         // strong attenuation, well below 10% of input RMS.
@@ -156,7 +157,8 @@ mod tests {
         let mut out = Vec::new();
         f.apply(&input, &mut out);
         let tail = &out[1024..];
-        let rms_in: f32 = (input[1024..].iter().map(|v| v * v).sum::<f32>() / tail.len() as f32).sqrt();
+        let rms_in: f32 =
+            (input[1024..].iter().map(|v| v * v).sum::<f32>() / tail.len() as f32).sqrt();
         let rms_out: f32 = (tail.iter().map(|v| v * v).sum::<f32>() / tail.len() as f32).sqrt();
         assert!(
             rms_out > 0.85 * rms_in,
@@ -224,9 +226,7 @@ mod tests {
         let f = Biquad::butterworth_hp(300.0, 30_000.0);
         let n = 2048;
         let pad = 64;
-        let x: Vec<f32> = (0..n)
-            .map(|i| (i as f32 * 0.07).sin() * 1000.0)
-            .collect();
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).sin() * 1000.0).collect();
         let mut x_shifted = vec![0.0_f32; n + pad];
         x_shifted[pad..].copy_from_slice(&x);
 

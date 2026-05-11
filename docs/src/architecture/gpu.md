@@ -8,11 +8,11 @@ kernels in `sorrel-compute`.
 
 ## Pipelines
 
-| Shader | Pipeline |
-|--------|----------|
-| `cmr_median.wgsl` | Per-sample channel median for common-median referencing on the trace window. |
-| `biquad_hp.wgsl` | Causal biquad high-pass filter applied per-channel after CMR. |
-| `mean_snippet.wgsl` | Mean-snippet extraction along a window for waveform / template overlays. |
+| Shader              | Pipeline                                                                     |
+| ------------------- | ---------------------------------------------------------------------------- |
+| `cmr_median.wgsl`   | Per-sample channel median for common-median referencing on the trace window. |
+| `biquad_hp.wgsl`    | Causal biquad high-pass filter applied per-channel after CMR.                |
+| `mean_snippet.wgsl` | Mean-snippet extraction along a window for waveform / template overlays.     |
 
 ## Why GPU here
 

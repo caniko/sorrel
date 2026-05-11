@@ -9,9 +9,7 @@
 
 use crate::distribution::amplitude_cutoff;
 use crate::drift::{amplitude_drift_correlation, longest_silent_gap_frac, presence_cv};
-use crate::metrics::{
-    amplitude_snr, isi_violations, presence_ratio, refractory_contamination,
-};
+use crate::metrics::{amplitude_snr, isi_violations, presence_ratio, refractory_contamination};
 use crate::metrics_iso::IsolationMetrics;
 use sorrel_io::SampleIndex;
 
@@ -74,8 +72,7 @@ impl QualityBreakdown {
                 parts.push(s.max(1e-3));
             }
         }
-        let log_mean: f32 =
-            parts.iter().map(|p| p.ln()).sum::<f32>() / parts.len() as f32;
+        let log_mean: f32 = parts.iter().map(|p| p.ln()).sum::<f32>() / parts.len() as f32;
         log_mean.exp().clamp(0.0, 1.0)
     }
 
@@ -96,8 +93,12 @@ pub fn quality_breakdown(
     presence_bins: usize,
 ) -> QualityBreakdown {
     let n = spike_times.len();
-    let raw_contamination =
-        refractory_contamination(spike_times, refractory_samples, total_duration_samples, sample_rate);
+    let raw_contamination = refractory_contamination(
+        spike_times,
+        refractory_samples,
+        total_duration_samples,
+        sample_rate,
+    );
     let raw_presence = presence_ratio(spike_times, total_duration_samples, presence_bins);
     let raw_gap = longest_silent_gap_frac(spike_times, total_duration_samples);
     let raw_snr = amplitude_snr(spike_amplitudes);
@@ -193,10 +194,7 @@ mod tests {
             ..QualityBreakdown::default()
         };
         let c = q.composite();
-        assert!(
-            (0.0..=1.0).contains(&c),
-            "composite {c} out of [0, 1]"
-        );
+        assert!((0.0..=1.0).contains(&c), "composite {c} out of [0, 1]");
     }
 
     #[test]

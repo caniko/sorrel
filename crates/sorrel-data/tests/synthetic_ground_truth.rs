@@ -14,12 +14,9 @@
 //! These are the failure modes that keep curators awake at night.
 
 use sorrel_data::{
-    journal::SqliteJournal,
-    rank_merge_candidates, rank_split_candidates, Session, SuggestConfig,
+    journal::SqliteJournal, rank_merge_candidates, rank_split_candidates, Session, SuggestConfig,
 };
-use sorrel_io::{
-    ClusterId, DataProvider, HasAmplitudes, SampleIndex, TraceSamples, TraceSlice,
-};
+use sorrel_io::{ClusterId, DataProvider, HasAmplitudes, SampleIndex, TraceSamples, TraceSlice};
 
 struct GroundTruth {
     /// Per-cluster spike times, time-sorted.
@@ -31,17 +28,31 @@ struct GroundTruth {
 
 impl DataProvider for GroundTruth {
     type Label = u8;
-    fn sample_rate(&self) -> f32 { 30_000.0 }
-    fn n_channels(&self) -> u32 { 1 }
-    fn n_samples(&self) -> SampleIndex { self.n_samples }
-    fn n_clusters(&self) -> u32 { self.spikes.len() as u32 }
+    fn sample_rate(&self) -> f32 {
+        30_000.0
+    }
+    fn n_channels(&self) -> u32 {
+        1
+    }
+    fn n_samples(&self) -> SampleIndex {
+        self.n_samples
+    }
+    fn n_clusters(&self) -> u32 {
+        self.spikes.len() as u32
+    }
     fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
         self.spikes.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
     }
     fn trace(&self, _: SampleIndex, _: u32) -> TraceSlice<'_> {
-        TraceSlice { start: SampleIndex(0), n_channels: 1, samples: TraceSamples::I16(&[]) }
+        TraceSlice {
+            start: SampleIndex(0),
+            n_channels: 1,
+            samples: TraceSamples::I16(&[]),
+        }
     }
-    fn initial_labels(&self) -> Vec<u8> { vec![0; self.spikes.len()] }
+    fn initial_labels(&self) -> Vec<u8> {
+        vec![0; self.spikes.len()]
+    }
 }
 
 impl HasAmplitudes for GroundTruth {
@@ -105,7 +116,7 @@ fn build_ground_truth() -> GroundTruth {
             }
             last = t;
             let amp = 5.0 + 0.3 * gaussian(&mut seed);
-            if emitted % 2 == 0 {
+            if emitted & 1 == 0 {
                 times_a.push(SampleIndex(t));
                 amps_a.push(amp);
             } else {
@@ -127,7 +138,7 @@ fn build_ground_truth() -> GroundTruth {
     let isi_c = 300_u64; // 10 ms at 30 kHz
     while t < n_samples {
         times_c.push(SampleIndex(t));
-        let amp = if which % 2 == 0 {
+        let amp = if which & 1 == 0 {
             3.0 + 0.4 * gaussian(&mut seed)
         } else {
             8.0 + 0.4 * gaussian(&mut seed)
@@ -171,7 +182,11 @@ fn merge_suggester_picks_secretly_same_neuron_pair() {
     assert!(!merges.is_empty(), "expected at least one merge candidate");
     let top = &merges[0];
     let pair = (top.a.min(top.b), top.a.max(top.b));
-    assert_eq!(pair, (ClusterId(0), ClusterId(1)), "expected (0,1) to be the top pair, got {pair:?}");
+    assert_eq!(
+        pair,
+        (ClusterId(0), ClusterId(1)),
+        "expected (0,1) to be the top pair, got {pair:?}"
+    );
     assert!(top.score > 0.5, "top merge score {} is too low", top.score);
     // The CCG dip z-score should be unambiguously positive.
     assert!(top.ccg_dip_z > 2.0, "weak dip z = {}", top.ccg_dip_z);
@@ -200,10 +215,14 @@ fn split_suggester_flags_bimodal_overmerge() {
     let (sess, _d) = fresh_session(build_ground_truth());
     let cfg = SuggestConfig::default();
     let splits = rank_split_candidates(&sess, &cfg);
-    assert!(!splits.is_empty(), "expected the bimodal cluster to be flagged");
+    assert!(
+        !splits.is_empty(),
+        "expected the bimodal cluster to be flagged"
+    );
     // Cluster 2 must rank first.
     assert_eq!(
-        splits[0].cluster, ClusterId(2),
+        splits[0].cluster,
+        ClusterId(2),
         "expected c2 to top, got c{}",
         splits[0].cluster
     );
@@ -231,7 +250,8 @@ fn split_suggester_does_not_flag_isolated_cluster() {
     let splits = rank_split_candidates(&sess, &cfg);
     for s in &splits {
         assert_ne!(
-            s.cluster, ClusterId(3),
+            s.cluster,
+            ClusterId(3),
             "cluster 3 (isolated) should not be in split candidates"
         );
     }

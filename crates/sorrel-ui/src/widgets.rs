@@ -5,8 +5,7 @@ use sorrel_compute::quality_breakdown;
 use sorrel_data::Session;
 use sorrel_io::{ClusterId, DataProvider};
 use sorrel_render::{
-    build_trace_vertices_cfg, build_trace_vertices_gpu, GpuTracePreproc, TracePreproc,
-    TraceVertex,
+    build_trace_vertices_cfg, build_trace_vertices_gpu, GpuTracePreproc, TracePreproc, TraceVertex,
 };
 
 /// Sortable column on the cluster table. The widget mutates the table state
@@ -90,10 +89,7 @@ impl ClusterTableState {
     }
 
     fn quality_for(&self, c: ClusterId) -> f32 {
-        self.quality_cache
-            .get(c.idx())
-            .copied()
-            .unwrap_or(f32::NAN)
+        self.quality_cache.get(c.idx()).copied().unwrap_or(f32::NAN)
     }
 }
 
@@ -189,9 +185,15 @@ pub fn cluster_table<P, F>(
             }
             ClusterColumn::Quality => {
                 let q = state.quality_for(c);
-                if q.is_finite() { q as f64 } else { f64::NEG_INFINITY }
+                if q.is_finite() {
+                    q as f64
+                } else {
+                    f64::NEG_INFINITY
+                }
             }
-            ClusterColumn::Label => label_rank::<P, F>(&label_str, session.label(c).unwrap_or_default()) as f64,
+            ClusterColumn::Label => {
+                label_rank::<P, F>(&label_str, session.label(c).unwrap_or_default()) as f64
+            }
         };
         // Encode as (i64, f64) so we can sort with stable secondary on id.
         // We pack the primary into f64 and use id as the tie-breaker
@@ -216,7 +218,7 @@ pub fn cluster_table<P, F>(
     let header_label = |ui: &mut Ui, label: &str, col: ClusterColumn, state: &ClusterTableState| {
         let mut text = label.to_string();
         if state.sort_by == col {
-            text.push(if state.sort_descending { ' ' } else { ' ' });
+            text.push(' ');
             text.push(if state.sort_descending { '▼' } else { '▲' });
         }
         ui.add(egui::Label::new(egui::RichText::new(text).strong()).sense(Sense::click()))
@@ -365,7 +367,9 @@ pub fn trace_view<P: DataProvider>(
 
     let window_start = sorrel_io::SampleIndex(window_start);
     let verts: Vec<TraceVertex> = match gpu {
-        Some(g) => build_trace_vertices_gpu(session, window_start, window_len, target_points, cfg, g),
+        Some(g) => {
+            build_trace_vertices_gpu(session, window_start, window_len, target_points, cfg, g)
+        }
         None => build_trace_vertices_cfg(session, window_start, window_len, target_points, cfg),
     };
     if verts.is_empty() {
@@ -388,7 +392,11 @@ pub fn trace_view<P: DataProvider>(
     // Channel separators painted on the egui side so they pick up theming.
     for ch in 1..n_channels {
         let y = rect.top() + rect.height() * ch as f32 / n_channels as f32;
-        painter.hline(rect.x_range(), y, Stroke::new(0.5_f32, Color32::from_gray(40)));
+        painter.hline(
+            rect.x_range(),
+            y,
+            Stroke::new(0.5_f32, Color32::from_gray(40)),
+        );
     }
 
     // Amplitude scale: take 80% of a channel's row, normalised by full-scale.
@@ -407,7 +415,9 @@ pub fn trace_view<P: DataProvider>(
         color: [0.71, 0.86, 1.0, 1.0], // matches the previous Color32::from_rgb(180, 220, 255)
     };
     ui.painter()
-        .add(eframe::egui_wgpu::Callback::new_paint_callback(rect, callback));
+        .add(eframe::egui_wgpu::Callback::new_paint_callback(
+            rect, callback,
+        ));
 
     let _ = Vec2::ZERO;
     let _ = Rect::NOTHING;

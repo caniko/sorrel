@@ -40,14 +40,13 @@ pub struct OebinMeta {
 impl OebinMeta {
     pub fn read(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         Self::from_json(&text)
     }
 
     pub fn from_json(text: &str) -> Result<Self> {
-        let v: serde_json::Value =
-            serde_json::from_str(text).context("parse structure.oebin")?;
+        let v: serde_json::Value = serde_json::from_str(text).context("parse structure.oebin")?;
         let arr = v
             .get("continuous")
             .and_then(|c| c.as_array())

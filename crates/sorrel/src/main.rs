@@ -11,9 +11,7 @@ use sorrel_data::{export_qc, Session, SqliteJournal};
 use sorrel_io::kilosort::{KilosortOpenParams, PhyLabel};
 use sorrel_io::open_ephys::OebinMeta;
 use sorrel_io::spikeglx::SpikeGlxMeta;
-use sorrel_io::{
-    DataProvider, HasGeometry, KilosortProvider, SortingAnalyzerProvider, TraceDtype,
-};
+use sorrel_io::{DataProvider, HasGeometry, KilosortProvider, SortingAnalyzerProvider, TraceDtype};
 use sorrel_ui::{RasterPipeline, SorrelApp, TracePipeline};
 use std::path::{Path, PathBuf};
 
@@ -57,8 +55,7 @@ fn parse_args() -> Result<Args> {
         match a.as_str() {
             "--dat" => args.dat = Some(it.next().context("--dat needs a path")?.into()),
             "--sample-rate" => {
-                args.sample_rate =
-                    Some(it.next().context("--sample-rate needs a value")?.parse()?)
+                args.sample_rate = Some(it.next().context("--sample-rate needs a value")?.parse()?)
             }
             "--channels" => {
                 args.n_channels = Some(it.next().context("--channels needs a value")?.parse()?)
@@ -70,9 +67,7 @@ fn parse_args() -> Result<Args> {
                         .with_context(|| format!("unsupported --dtype {v:?}"))?,
                 );
             }
-            "--offset" => {
-                args.offset = Some(it.next().context("--offset needs a value")?.parse()?)
-            }
+            "--offset" => args.offset = Some(it.next().context("--offset needs a value")?.parse()?),
             "--journal" => args.journal = Some(it.next().context("--journal needs a path")?.into()),
             "--backend" => {
                 let v = it.next().context("--backend needs a value")?;
@@ -84,20 +79,18 @@ fn parse_args() -> Result<Args> {
                     #[cfg(feature = "hdf5")]
                     "ks4-rez" | "rez" => Backend::Ks4Rez,
                     #[cfg(not(feature = "hdf5"))]
-                    "nwb" | "ks4-rez" | "rez" => bail!(
-                        "backend {v} requires building with --features hdf5"
-                    ),
+                    "nwb" | "ks4-rez" | "rez" => {
+                        bail!("backend {v} requires building with --features hdf5")
+                    }
                     other => bail!("unknown backend {other}"),
                 });
             }
             "--spikeglx-meta" => {
-                args.spikeglx_meta =
-                    Some(it.next().context("--spikeglx-meta needs a path")?.into())
+                args.spikeglx_meta = Some(it.next().context("--spikeglx-meta needs a path")?.into())
             }
             "--oebin" => args.oebin = Some(it.next().context("--oebin needs a path")?.into()),
             "--export-qc" => {
-                args.export_qc =
-                    Some(it.next().context("--export-qc needs a path")?.into())
+                args.export_qc = Some(it.next().context("--export-qc needs a path")?.into())
             }
             "-h" | "--help" => {
                 print_help();
@@ -158,10 +151,7 @@ fn detect_backend(root: &Path) -> Result<Backend> {
         #[cfg(not(feature = "hdf5"))]
         {
             if ext == "nwb" || name == "rez.mat" || name == "rez2.mat" {
-                bail!(
-                    "{} requires building with --features hdf5",
-                    root.display()
-                );
+                bail!("{} requires building with --features hdf5", root.display());
             }
         }
         bail!("unrecognised file {}; expected a directory", root.display());
@@ -273,10 +263,7 @@ where
         out_dir.display(),
         out_dir.display(),
     );
-    println!(
-        "exported QC for {n} clusters into {}",
-        out_dir.display()
-    );
+    println!("exported QC for {n} clusters into {}", out_dir.display());
     Ok(())
 }
 
@@ -307,11 +294,9 @@ where
             if let Some(rs) = cc.wgpu_render_state.as_ref() {
                 TracePipeline::install(rs);
                 RasterPipeline::install(rs);
-                app.install_gpu_compute(rs.device.clone(), rs.queue.clone());
+                app.install_gpu_compute(rs.device.clone().into(), rs.queue.clone().into());
             } else {
-                log::warn!(
-                    "no wgpu render state available; trace view will not render"
-                );
+                log::warn!("no wgpu render state available; trace view will not render");
             }
             Ok(Box::new(app))
         }),

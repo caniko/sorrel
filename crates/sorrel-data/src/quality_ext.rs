@@ -7,9 +7,7 @@ use crate::feature_subspace::{
     collect_pc_subspace, DEFAULT_CHANNEL_IDX, DEFAULT_D, DEFAULT_MAX_BACKGROUND,
 };
 use crate::session::Session;
-use sorrel_compute::{
-    isolation_metrics, quality_breakdown, IsolationMetrics, QualityBreakdown,
-};
+use sorrel_compute::{isolation_metrics, quality_breakdown, IsolationMetrics, QualityBreakdown};
 use sorrel_io::{ClusterId, DataProvider};
 
 /// Refractory window used by the quality computation: 1.5 ms. Matches the

@@ -64,15 +64,16 @@ impl GpuCmr {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sorrel-gpu.cmr.layout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("sorrel-gpu.cmr.pipeline"),
             layout: Some(&layout),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
+            cache: None,
         });
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sorrel-gpu.cmr.params"),
@@ -98,14 +99,14 @@ impl GpuCmr {
         if n_channels > MAX_CHANNELS {
             return Err(GpuCmrError::TooManyChannels(n_channels));
         }
-        if (samples.len() as u64) % (n_channels as u64) != 0 {
+        if (samples.len() as u64).checked_rem(n_channels as u64) != Some(0) {
             return Err(GpuCmrError::ShapeMismatch);
         }
         let n_time = (samples.len() / n_channels as usize) as u32;
         let device = &self.ctx.device;
         let queue = &self.ctx.queue;
 
-        let byte_len = (samples.len() * std::mem::size_of::<f32>()) as u64;
+        let byte_len = std::mem::size_of_val(samples) as u64;
         let storage = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sorrel-gpu.cmr.data"),
             size: byte_len,
@@ -182,7 +183,9 @@ pub enum GpuCmrError {
 impl std::fmt::Display for GpuCmrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TooManyChannels(n) => write!(f, "GPU CMR limit is {MAX_CHANNELS} channels, got {n}"),
+            Self::TooManyChannels(n) => {
+                write!(f, "GPU CMR limit is {MAX_CHANNELS} channels, got {n}")
+            }
             Self::ShapeMismatch => write!(f, "samples length not a multiple of n_channels"),
             Self::Readback(e) => write!(f, "readback failed: {e}"),
         }
@@ -195,14 +198,8 @@ mod tests {
     use super::*;
     use sorrel_compute::subtract_channel_median;
 
-    fn ctx() -> Option<GpuContext> {
-        match GpuContext::headless() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                eprintln!("skipping GPU test: {e}");
-                None
-            }
-        }
+    fn ctx() -> Option<crate::test_support::TestGpuContext> {
+        crate::test_support::ctx()
     }
 
     fn approx_eq(a: &[f32], b: &[f32], tol: f32) {

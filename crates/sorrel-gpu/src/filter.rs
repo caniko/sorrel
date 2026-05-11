@@ -68,15 +68,16 @@ impl GpuBiquad {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sorrel-gpu.biquad.layout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("sorrel-gpu.biquad.pipeline"),
             layout: Some(&layout),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
+            cache: None,
         });
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sorrel-gpu.biquad.params"),
@@ -103,14 +104,14 @@ impl GpuBiquad {
         if n_channels == 0 || samples.is_empty() {
             return Ok(());
         }
-        if (samples.len() as u64) % (n_channels as u64) != 0 {
+        if (samples.len() as u64).checked_rem(n_channels as u64) != Some(0) {
             return Err(GpuBiquadError::ShapeMismatch);
         }
         let n_samples = (samples.len() / n_channels as usize) as u32;
         let device = &self.ctx.device;
         let queue = &self.ctx.queue;
 
-        let byte_len = (samples.len() * std::mem::size_of::<f32>()) as u64;
+        let byte_len = std::mem::size_of_val(samples) as u64;
         let storage = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sorrel-gpu.biquad.data"),
             size: byte_len,
@@ -155,7 +156,7 @@ impl GpuBiquad {
             mapped_at_creation: false,
         });
 
-        let workgroups = (n_channels + 63) / 64;
+        let workgroups = n_channels.div_ceil(64);
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("sorrel-gpu.biquad.enc"),
         });
@@ -203,14 +204,8 @@ mod tests {
     use super::*;
     use sorrel_compute::{Biquad, BiquadState};
 
-    fn ctx() -> Option<GpuContext> {
-        match GpuContext::headless() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                eprintln!("skipping GPU test: {e}");
-                None
-            }
-        }
+    fn ctx() -> Option<crate::test_support::TestGpuContext> {
+        crate::test_support::ctx()
     }
 
     /// Streaming CPU reference: same recursion as `Biquad::step`, kept here
@@ -223,9 +218,9 @@ mod tests {
         let mut states = vec![BiquadState::default(); n_channels];
         for t in 0..n_samples {
             let row = t * n_channels;
-            for ch in 0..n_channels {
+            for (ch, state) in states.iter_mut().enumerate().take(n_channels) {
                 let i = row + ch;
-                let y = b.step(samples[i], &mut states[ch]);
+                let y = b.step(samples[i], state);
                 samples[i] = y;
             }
         }
@@ -249,10 +244,7 @@ mod tests {
         // enough. Compare relative.
         for (i, (g, c)) in gpu_in.iter().zip(cpu_in.iter()).enumerate() {
             let scale = g.abs().max(c.abs()).max(1.0);
-            assert!(
-                (g - c).abs() / scale < 1e-3,
-                "i={i}: gpu={g} cpu={c}",
-            );
+            assert!((g - c).abs() / scale < 1e-3, "i={i}: gpu={g} cpu={c}",);
         }
     }
 
@@ -279,9 +271,7 @@ mod tests {
         let b = Biquad::butterworth_hp(300.0, 30_000.0);
         let nc = 384usize;
         let n = 256usize;
-        let mut gpu_in: Vec<f32> = (0..(nc * n))
-            .map(|i| ((i % 71) as f32) - 35.0)
-            .collect();
+        let mut gpu_in: Vec<f32> = (0..(nc * n)).map(|i| ((i % 71) as f32) - 35.0).collect();
         let mut cpu_in = gpu_in.clone();
         gpu.run(&mut gpu_in, nc as u32, b).unwrap();
         cpu_apply_per_channel(&mut cpu_in, nc, b);

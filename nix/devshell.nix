@@ -6,6 +6,8 @@
   cargoConfig,
   checks,
   deps,
+  preCommitEnabledPackages ? [],
+  shellHook ? "",
 }: let
   inherit (deps) buildInputs nativeBuildInputs runtimeLibs hdf5C;
 in
@@ -17,6 +19,7 @@ in
       [
         cargo-nextest
         mdbook
+        pre-commit
         rust-analyzer
         zola
         # libhdf5 is pulled in unconditionally so `cargo check
@@ -24,6 +27,7 @@ in
         # `cargo build` doesn't reference it.
         hdf5
       ]
+      ++ preCommitEnabledPackages
       ++ buildInputs
       ++ nativeBuildInputs;
 
@@ -36,6 +40,7 @@ in
     };
 
     extraShellHook = ''
+      ${shellHook}
       echo "Website: cd website && zola serve"
       echo "Documentation: cd docs && mdbook serve"
     '';

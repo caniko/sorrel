@@ -26,7 +26,7 @@ These are exactly the files `spikeinterface.extractors.read_phy()` reads
 back, so a round trip into SpikeInterface or phy works without
 intermediate steps.
 
-The journal is *resealed* at save time so a fresh open replays cleanly
+The journal is _resealed_ at save time so a fresh open replays cleanly
 from the new baseline rather than from the original sort.
 
 ## Headless QC export

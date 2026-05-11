@@ -16,7 +16,10 @@ pub struct Sym {
 
 impl Sym {
     pub fn zeros(d: usize) -> Self {
-        Self { d, data: vec![0.0; d * d] }
+        Self {
+            d,
+            data: vec![0.0; d * d],
+        }
     }
 
     #[inline]
@@ -122,9 +125,7 @@ pub fn invert(m: &mut Sym, tol: f64) -> Option<()> {
         if pivot != c {
             // Swap rows c and pivot.
             for k in 0..2 * d {
-                let tmp = a[c * 2 * d + k];
-                a[c * 2 * d + k] = a[pivot * 2 * d + k];
-                a[pivot * 2 * d + k] = tmp;
+                a.swap(c * 2 * d + k, pivot * 2 * d + k);
             }
         }
         // Normalise pivot row.
@@ -169,15 +170,15 @@ pub fn invert(m: &mut Sym, tol: f64) -> Option<()> {
 pub fn mahalanobis_sq(x: &[f64], mu: &[f64], inv: &Sym) -> f64 {
     let d = inv.d;
     let mut diff = vec![0.0_f64; d];
-    for i in 0..d {
-        diff[i] = x[i] - mu[i];
+    for (i, slot) in diff.iter_mut().enumerate().take(d) {
+        *slot = x[i] - mu[i];
     }
     // diff^T inv diff
     let mut acc = 0.0_f64;
     for r in 0..d {
         let mut row = 0.0_f64;
-        for c in 0..d {
-            row += inv.get(r, c) * diff[c];
+        for (c, value) in diff.iter().enumerate().take(d) {
+            row += inv.get(r, c) * value;
         }
         acc += diff[r] * row;
     }
@@ -262,14 +263,14 @@ fn gamma_q_cf(a: f64, x: f64) -> f64 {
 fn ln_gamma(z: f64) -> f64 {
     let g = 7.0;
     const COEFF: [f64; 9] = [
-        0.999_999_999_999_809_93,
+        0.999_999_999_999_809_9,
         676.520_368_121_885_1,
         -1_259.139_216_722_402_8,
-        771.323_428_777_653_13,
-        -176.615_029_162_140_59,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
         12.507_343_278_686_905,
         -0.138_571_095_265_720_12,
-        9.984_369_578_019_571_6e-6,
+        9.984_369_578_019_572e-6,
         1.505_632_735_149_311_6e-7,
     ];
     if z < 0.5 {
@@ -322,8 +323,10 @@ mod tests {
     fn invert_singular_matrix_returns_none() {
         let mut m = Sym::zeros(2);
         // Rank-1: rows are linearly dependent.
-        m.set(0, 0, 1.0); m.set(0, 1, 2.0);
-        m.set(1, 0, 2.0); m.set(1, 1, 4.0);
+        m.set(0, 0, 1.0);
+        m.set(0, 1, 2.0);
+        m.set(1, 0, 2.0);
+        m.set(1, 1, 4.0);
         assert!(invert(&mut m, 1e-9).is_none());
     }
 
@@ -380,8 +383,10 @@ mod tests {
     #[test]
     fn ridge_makes_singular_matrix_invertible() {
         let mut m = Sym::zeros(2);
-        m.set(0, 0, 1.0); m.set(0, 1, 2.0);
-        m.set(1, 0, 2.0); m.set(1, 1, 4.0);
+        m.set(0, 0, 1.0);
+        m.set(0, 1, 2.0);
+        m.set(1, 0, 2.0);
+        m.set(1, 1, 4.0);
         m.ridge(0.01);
         assert!(invert(&mut m, 1e-12).is_some());
     }

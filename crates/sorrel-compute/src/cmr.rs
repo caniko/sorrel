@@ -120,10 +120,7 @@ mod tests {
             row.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let m = row[row.len() / 2];
             // Odd n_channels -> exact zero. Use small epsilon for rounding.
-            assert!(
-                m.abs() < 1e-5,
-                "row median = {m} after CMR, expected ~0",
-            );
+            assert!(m.abs() < 1e-5, "row median = {m} after CMR, expected ~0",);
         }
     }
 
@@ -131,23 +128,20 @@ mod tests {
     #[test]
     fn matches_oracle_via_full_sort() {
         let n_channels = 5;
-        let n_samples = 4;
-        let mut s = vec![3.0_f32, 1.0, 4.0, 1.0, 5.0,  // row 0; sorted: 1,1,3,4,5; median 3
-                          9.0, 2.0, 6.0, 5.0, 3.0,    // row 1; sorted: 2,3,5,6,9; median 5
-                          5.0, 8.0, 9.0, 7.0, 9.0,    // row 2; sorted: 5,7,8,9,9; median 8
-                          3.0, 2.0, 3.0, 8.0, 4.0]; // row 3; sorted: 2,3,3,4,8; median 3
+        let _n_samples = 4;
+        let mut s = vec![
+            3.0_f32, 1.0, 4.0, 1.0, 5.0, // row 0; sorted: 1,1,3,4,5; median 3
+            9.0, 2.0, 6.0, 5.0, 3.0, // row 1; sorted: 2,3,5,6,9; median 5
+            5.0, 8.0, 9.0, 7.0, 9.0, // row 2; sorted: 5,7,8,9,9; median 8
+            3.0, 2.0, 3.0, 8.0, 4.0,
+        ]; // row 3; sorted: 2,3,3,4,8; median 3
         let expected = [
-            0.0, -2.0, 1.0, -2.0, 2.0,
-            4.0, -3.0, 1.0, 0.0, -2.0,
-            -3.0, 0.0, 1.0, -1.0, 1.0,
-            0.0, -1.0, 0.0, 5.0, 1.0,
+            0.0, -2.0, 1.0, -2.0, 2.0, 4.0, -3.0, 1.0, 0.0, -2.0, -3.0, 0.0, 1.0, -1.0, 1.0, 0.0,
+            -1.0, 0.0, 5.0, 1.0,
         ];
         subtract_channel_median(&mut s, n_channels);
         for (i, (got, want)) in s.iter().zip(expected.iter()).enumerate() {
-            assert!(
-                (got - want).abs() < 1e-6,
-                "i={i}: got {got}, want {want}",
-            );
+            assert!((got - want).abs() < 1e-6, "i={i}: got {got}, want {want}",);
         }
     }
 

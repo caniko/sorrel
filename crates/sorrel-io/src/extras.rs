@@ -158,7 +158,10 @@ impl QualityMetrics {
         let mut idx: Vec<usize> = (0..self.names.len()).collect();
         idx.sort_by(|&a, &b| self.names[a].cmp(&self.names[b]));
         let names = idx.iter().map(|&i| self.names[i].clone()).collect();
-        let columns = idx.iter().map(|&i| std::mem::take(&mut self.columns[i])).collect();
+        let columns = idx
+            .iter()
+            .map(|&i| std::mem::take(&mut self.columns[i]))
+            .collect();
         self.names = names;
         self.columns = columns;
     }

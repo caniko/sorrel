@@ -191,12 +191,7 @@ pub fn isolation_metrics(
 /// Nearest-neighbour isolation only. Cheap and works even when the
 /// covariance is singular; useful as a fallback signal when the
 /// Mahalanobis-based metrics return NaN.
-pub fn nn_isolation_metric(
-    features: &[f32],
-    is_in_cluster: &[bool],
-    d: usize,
-    k: usize,
-) -> f32 {
+pub fn nn_isolation_metric(features: &[f32], is_in_cluster: &[bool], d: usize, k: usize) -> f32 {
     let n = is_in_cluster.len();
     if n == 0 || d == 0 || k == 0 || features.len() != n * d {
         return f32::NAN;
@@ -240,14 +235,10 @@ pub fn nn_isolation_metric(
                 }
                 if topk.len() < k_eff {
                     topk.push((d2, is_in_cluster[j]));
-                    topk.sort_by(|a, b| {
-                        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    topk.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
                 } else if d2 < topk[k_eff - 1].0 {
                     topk[k_eff - 1] = (d2, is_in_cluster[j]);
-                    topk.sort_by(|a, b| {
-                        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    topk.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
                 }
             }
             let mut own = 0u32;
@@ -276,9 +267,13 @@ mod tests {
         let mut s = seed | 1;
         for _ in 0..n {
             // Box–Muller from xorshift32.
-            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
             let u1 = (s as f64 / u32::MAX as f64).clamp(1e-9, 1.0);
-            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
             let u2 = (s as f64 / u32::MAX as f64).clamp(1e-9, 1.0);
             let r = (-2.0 * u1.ln()).sqrt();
             let g1 = (r * (2.0 * std::f64::consts::PI * u2).cos()) as f32;
@@ -304,7 +299,11 @@ mod tests {
             m.isolation_distance_sq
         );
         assert!(m.l_ratio < 0.01, "expected tiny L-ratio, got {}", m.l_ratio);
-        assert!(m.nn_isolation > 0.95, "expected high NN, got {}", m.nn_isolation);
+        assert!(
+            m.nn_isolation > 0.95,
+            "expected high NN, got {}",
+            m.nn_isolation
+        );
         assert!(m.score() > 0.7);
     }
 
@@ -328,7 +327,11 @@ mod tests {
             m.isolation_distance_sq
         );
         assert!(m.l_ratio > 0.1, "expected high L-ratio, got {}", m.l_ratio);
-        assert!(m.nn_isolation < 0.7, "expected low NN, got {}", m.nn_isolation);
+        assert!(
+            m.nn_isolation < 0.7,
+            "expected low NN, got {}",
+            m.nn_isolation
+        );
     }
 
     #[test]

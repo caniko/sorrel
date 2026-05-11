@@ -49,10 +49,7 @@ impl DataProvider for Stub {
         self.spikes.len() as u32
     }
     fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
-        self.spikes
-            .get(c.idx())
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.spikes.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
     }
     fn trace(&self, _: SampleIndex, _: u32) -> TraceSlice<'_> {
         TraceSlice {
@@ -79,7 +76,11 @@ impl ApplyPhyLabel for Stub {
 
 fn fixture_provider() -> Stub {
     Stub {
-        spikes: vec![vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)], vec![SampleIndex(20), SampleIndex(200)], vec![SampleIndex(100)]],
+        spikes: vec![
+            vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
+            vec![SampleIndex(20), SampleIndex(200)],
+            vec![SampleIndex(100)],
+        ],
     }
 }
 
@@ -104,10 +105,16 @@ fn journal_round_trips_across_session_reopen() {
         pre_assignment = session.cluster_index().spike_clusters().to_vec();
 
         session
-            .dispatch(CurationCommand::Merge { sources: vec![ClusterId(0)], target: ClusterId(2) })
+            .dispatch(CurationCommand::Merge {
+                sources: vec![ClusterId(0)],
+                target: ClusterId(2),
+            })
             .unwrap();
         session
-            .dispatch(CurationCommand::Relabel { cluster: ClusterId(1), op: PhyLabelOp::SetMua })
+            .dispatch(CurationCommand::Relabel {
+                cluster: ClusterId(1),
+                op: PhyLabelOp::SetMua,
+            })
             .unwrap();
 
         merged_assignment = session.cluster_index().spike_clusters().to_vec();
@@ -149,10 +156,16 @@ fn journal_round_trips_a_long_history() {
 
         for c in (0..9u32).map(ClusterId) {
             session
-                .dispatch(CurationCommand::Relabel { cluster: c, op: PhyLabelOp::SetGood })
+                .dispatch(CurationCommand::Relabel {
+                    cluster: c,
+                    op: PhyLabelOp::SetGood,
+                })
                 .unwrap();
             session
-                .dispatch(CurationCommand::Merge { sources: vec![c], target: ClusterId(c.0 + 1) })
+                .dispatch(CurationCommand::Merge {
+                    sources: vec![c],
+                    target: ClusterId(c.0 + 1),
+                })
                 .unwrap();
         }
         final_state = session.cluster_index().spike_clusters().to_vec();
@@ -186,7 +199,10 @@ fn journal_history_exposes_merge_descendants_pairs() {
     let mut session = Session::new(provider, journal);
 
     session
-        .dispatch(CurationCommand::Merge { sources: vec![ClusterId(0), ClusterId(1)], target: ClusterId(2) })
+        .dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(0), ClusterId(1)],
+            target: ClusterId(2),
+        })
         .unwrap();
 
     // Walk history, derive descendants pairs the same way phy's
@@ -199,7 +215,10 @@ fn journal_history_exposes_merge_descendants_pairs() {
             }
         }
     }
-    assert_eq!(descendants, vec![(ClusterId(0), ClusterId(2)), (ClusterId(1), ClusterId(2))]);
+    assert_eq!(
+        descendants,
+        vec![(ClusterId(0), ClusterId(2)), (ClusterId(1), ClusterId(2))]
+    );
 }
 
 /// Multi-step lineage walk: trace cluster 2's history through
@@ -216,13 +235,22 @@ fn journal_history_supports_lineage_chain_walk() {
 
     // 0 → 1 → 2 → 3: chained merges.
     session
-        .dispatch(CurationCommand::Merge { sources: vec![ClusterId(0)], target: ClusterId(1) })
+        .dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(0)],
+            target: ClusterId(1),
+        })
         .unwrap();
     session
-        .dispatch(CurationCommand::Merge { sources: vec![ClusterId(1)], target: ClusterId(2) })
+        .dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(1)],
+            target: ClusterId(2),
+        })
         .unwrap();
     session
-        .dispatch(CurationCommand::Merge { sources: vec![ClusterId(2)], target: ClusterId(3) })
+        .dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(2)],
+            target: ClusterId(3),
+        })
         .unwrap();
 
     // Trace what 0 became by walking forward through merges.
@@ -234,7 +262,11 @@ fn journal_history_supports_lineage_chain_walk() {
             }
         }
     }
-    assert_eq!(current, ClusterId(3), "cluster 0 was eventually merged into 3");
+    assert_eq!(
+        current,
+        ClusterId(3),
+        "cluster 0 was eventually merged into 3"
+    );
 }
 
 /// Split lineage: a split records `(source → new_cluster)`. The new id
@@ -249,7 +281,10 @@ fn journal_history_records_split_descendants() {
 
     let n_pre = session.n_clusters();
     session
-        .dispatch(CurationCommand::Split { cluster: ClusterId(0), spike_idx: vec![1], new_cluster: ClusterId(0), // ignored — auto-allocated
+        .dispatch(CurationCommand::Split {
+            cluster: ClusterId(0),
+            spike_idx: vec![1],
+            new_cluster: ClusterId(0), // ignored — auto-allocated
         })
         .unwrap();
     let n_post = session.n_clusters();
@@ -273,7 +308,10 @@ fn journal_history_records_split_descendants() {
 fn waveform_extractor_processes_every_in_range_spike() {
     use sorrel_compute::extract_snippets_single_channel;
     let trace: Vec<f32> = (0..10_000).map(|t| t as f32).collect();
-    let spikes: Vec<SampleIndex> = (50..9950).step_by(100).map(|t| SampleIndex(t as u64)).collect();
+    let spikes: Vec<SampleIndex> = (50..9950)
+        .step_by(100)
+        .map(|t| SampleIndex(t as u64))
+        .collect();
     let pre = 10u32;
     let post = 10u32;
     let snips = extract_snippets_single_channel(&trace, SampleIndex(0), &spikes, pre, post);
@@ -321,10 +359,16 @@ fn save_and_reseal_writes_artifacts_and_clears_journal_history() {
         let journal = Journal::open_or_create(&journal_path, 0, 3).unwrap();
         let mut session = Session::new(provider, journal);
         session
-            .dispatch(CurationCommand::Merge { sources: vec![ClusterId(0)], target: ClusterId(2) })
+            .dispatch(CurationCommand::Merge {
+                sources: vec![ClusterId(0)],
+                target: ClusterId(2),
+            })
             .unwrap();
         session
-            .dispatch(CurationCommand::Relabel { cluster: ClusterId(1), op: PhyLabelOp::SetMua })
+            .dispatch(CurationCommand::Relabel {
+                cluster: ClusterId(1),
+                op: PhyLabelOp::SetMua,
+            })
             .unwrap();
 
         let new_journal =
@@ -334,7 +378,10 @@ fn save_and_reseal_writes_artifacts_and_clears_journal_history() {
 
     // Reopen with the same baseline.
     let journal = Journal::open_or_create(&journal_path, new_journal_baseline, 3).unwrap();
-    assert!(journal.replay().unwrap().is_empty(), "reseal cleared history");
+    assert!(
+        journal.replay().unwrap().is_empty(),
+        "reseal cleared history"
+    );
 }
 
 /// Once the journal is resealed, attempting to reopen with the OLD
@@ -351,7 +398,10 @@ fn save_and_reseal_invalidates_old_baseline() {
         let journal = Journal::open_or_create(&journal_path, old_baseline, 3).unwrap();
         let mut session = Session::new(provider, journal);
         session
-            .dispatch(CurationCommand::Merge { sources: vec![ClusterId(0)], target: ClusterId(2) })
+            .dispatch(CurationCommand::Merge {
+                sources: vec![ClusterId(0)],
+                target: ClusterId(2),
+            })
             .unwrap();
 
         save_and_reseal_journal(&session, &root, &journal_path, label_str_u8).unwrap();
@@ -377,12 +427,10 @@ fn external_edit_to_spike_clusters_invalidates_journal() {
     let dummy_path = dir.path().join("spike_clusters.npy");
 
     // Initial baseline = hash of fake "[0, 0, 1, 2, 0, 1]".
-    let initial_bytes: Vec<u8> = vec![
-        0u32, 0, 1, 2, 0, 1,
-    ]
-    .iter()
-    .flat_map(|v: &u32| v.to_le_bytes())
-    .collect();
+    let initial_bytes: Vec<u8> = [0u32, 0, 1, 2, 0, 1]
+        .iter()
+        .flat_map(|v: &u32| v.to_le_bytes())
+        .collect();
     std::fs::write(&dummy_path, &initial_bytes).unwrap();
     let initial = baseline_hash(&initial_bytes);
 
@@ -391,12 +439,15 @@ fn external_edit_to_spike_clusters_invalidates_journal() {
         let journal = Journal::open_or_create(&journal_path, initial, 3).unwrap();
         let mut session = Session::new(provider, journal);
         session
-            .dispatch(CurationCommand::Relabel { cluster: ClusterId(0), op: PhyLabelOp::SetGood })
+            .dispatch(CurationCommand::Relabel {
+                cluster: ClusterId(0),
+                op: PhyLabelOp::SetGood,
+            })
             .unwrap();
     }
 
     // External edit: rewrite spike_clusters.npy bytes.
-    let altered_bytes: Vec<u8> = vec![1u32, 1, 1, 2, 1, 1]
+    let altered_bytes: Vec<u8> = [1u32, 1, 1, 2, 1, 1]
         .iter()
         .flat_map(|v: &u32| v.to_le_bytes())
         .collect();
@@ -426,7 +477,10 @@ fn save_to_phy_alone_does_not_touch_journal() {
     let journal = Journal::open_or_create(&journal_path, 0, 3).unwrap();
     let mut session = Session::new(provider, journal);
     session
-        .dispatch(CurationCommand::Merge { sources: vec![ClusterId(0)], target: ClusterId(2) })
+        .dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(0)],
+            target: ClusterId(2),
+        })
         .unwrap();
     save_to_phy(&session, &root, label_str_u8).unwrap();
 
@@ -460,7 +514,10 @@ fn cluster_index_n_spikes_invariant_under_long_session() {
     for round in 0..3 {
         for c in (0..4u32).map(ClusterId) {
             session
-                .dispatch(CurationCommand::Merge { sources: vec![c], target: ClusterId(c.0 + 1) })
+                .dispatch(CurationCommand::Merge {
+                    sources: vec![c],
+                    target: ClusterId(c.0 + 1),
+                })
                 .unwrap();
         }
         let n = session.cluster_index().n_spikes();
@@ -470,7 +527,10 @@ fn cluster_index_n_spikes_invariant_under_long_session() {
             session.dispatch(CurationCommand::Undo).unwrap();
         }
         let n = session.cluster_index().n_spikes();
-        assert_eq!(n, total_spikes, "n_spikes drift after undo on round {round}: {n}");
+        assert_eq!(
+            n, total_spikes,
+            "n_spikes drift after undo on round {round}: {n}"
+        );
     }
 }
 

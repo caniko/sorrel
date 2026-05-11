@@ -6,14 +6,14 @@ Sorrel is built around **zero-cost abstractions**: the entire core is generic ov
 
 ## Workspace
 
-| Crate            | Role                                                   |
-|------------------|--------------------------------------------------------|
-| `sorrel-io`      | Concrete data backends; `DataProvider` trait bound.    |
-| `sorrel-compute` | Generic kernels (LTTB, histograms).                    |
-| `sorrel-data`    | Generic `Session<P>`, `CurationCommand`, SQLite journal.|
-| `sorrel-render`  | Concrete vertex types + monomorphised buffer builders. |
-| `sorrel-ui`      | egui widgets, generic over `P: DataProvider`.          |
-| `sorrel`         | Binary; detects backend and instantiates `SorrelApp<P>`.|
+| Crate            | Role                                                     |
+| ---------------- | -------------------------------------------------------- |
+| `sorrel-io`      | Concrete data backends; `DataProvider` trait bound.      |
+| `sorrel-compute` | Generic kernels (LTTB, histograms).                      |
+| `sorrel-data`    | Generic `Session<P>`, `CurationCommand`, SQLite journal. |
+| `sorrel-render`  | Concrete vertex types + monomorphised buffer builders.   |
+| `sorrel-ui`      | egui widgets, generic over `P: DataProvider`.            |
+| `sorrel`         | Binary; detects backend and instantiates `SorrelApp<P>`. |
 
 ## V1 (Kilosort / phy2)
 
@@ -27,12 +27,12 @@ sorrel <KILOSORT_DIR> --dat recording.dat --sample-rate 30000 --channels 32
 
 ### Keyboard
 
-| Key            | Action                          |
-|----------------|---------------------------------|
+| Key                   | Action                                             |
+| --------------------- | -------------------------------------------------- |
 | `G` / `M` / `N` / `U` | Set selected cluster Good / MUA / Noise / Unsorted |
-| `J` / `K` / arrows    | Next / previous cluster        |
-| `H` / `L`             | Pan trace window               |
-| `Cmd/Ctrl-Z`          | Undo (V1: stub)                |
+| `J` / `K` / arrows    | Next / previous cluster                            |
+| `H` / `L`             | Pan trace window                                   |
+| `Cmd/Ctrl-Z`          | Undo (V1: stub)                                    |
 
 ## Build
 

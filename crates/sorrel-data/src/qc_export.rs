@@ -146,8 +146,12 @@ pub fn collect_qc_rows<P: DataProvider>(session: &Session<P>) -> Vec<QcRow> {
             0.0
         };
         let _contam = refractory_contamination(times, refractory_samples, total_samples.0, sr);
-        let _ = (amplitude_snr, amplitude_drift_correlation, presence_ratio,
-                 longest_silent_gap_frac);
+        let _ = (
+            amplitude_snr,
+            amplitude_drift_correlation,
+            presence_ratio,
+            longest_silent_gap_frac,
+        );
         let (iso2, l_ratio, nn) = match q.isolation {
             Some(iso) => (iso.isolation_distance_sq, iso.l_ratio, iso.nn_isolation),
             None => (f32::NAN, f32::NAN, f32::NAN),
@@ -217,7 +221,9 @@ pub fn export_qc<P: DataProvider>(
 mod tests {
     use super::*;
     use crate::journal::SqliteJournal;
-    use sorrel_io::{ClusterId, DataProvider, HasAmplitudes, SampleIndex, TraceSamples, TraceSlice};
+    use sorrel_io::{
+        ClusterId, DataProvider, HasAmplitudes, SampleIndex, TraceSamples, TraceSlice,
+    };
 
     struct MockProvider {
         spikes: Vec<Vec<SampleIndex>>,
@@ -226,17 +232,31 @@ mod tests {
     }
     impl DataProvider for MockProvider {
         type Label = u8;
-        fn sample_rate(&self) -> f32 { 1000.0 }
-        fn n_channels(&self) -> u32 { 1 }
-        fn n_samples(&self) -> SampleIndex { self.n_samples }
-        fn n_clusters(&self) -> u32 { self.spikes.len() as u32 }
+        fn sample_rate(&self) -> f32 {
+            1000.0
+        }
+        fn n_channels(&self) -> u32 {
+            1
+        }
+        fn n_samples(&self) -> SampleIndex {
+            self.n_samples
+        }
+        fn n_clusters(&self) -> u32 {
+            self.spikes.len() as u32
+        }
         fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
             self.spikes.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
         }
         fn trace(&self, _: SampleIndex, _: u32) -> TraceSlice<'_> {
-            TraceSlice { start: SampleIndex(0), n_channels: 1, samples: TraceSamples::I16(&[]) }
+            TraceSlice {
+                start: SampleIndex(0),
+                n_channels: 1,
+                samples: TraceSamples::I16(&[]),
+            }
         }
-        fn initial_labels(&self) -> Vec<u8> { vec![0; self.spikes.len()] }
+        fn initial_labels(&self) -> Vec<u8> {
+            vec![0; self.spikes.len()]
+        }
     }
     impl HasAmplitudes for MockProvider {
         fn spike_amplitudes(&self, c: ClusterId) -> &[f32] {
@@ -247,7 +267,11 @@ mod tests {
     #[test]
     fn export_writes_both_formats_with_one_row_per_cluster() {
         let prov = MockProvider {
-            spikes: vec![vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)], vec![SampleIndex(20), SampleIndex(200)], vec![SampleIndex(100)]],
+            spikes: vec![
+                vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
+                vec![SampleIndex(20), SampleIndex(200)],
+                vec![SampleIndex(100)],
+            ],
             amps: vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0], vec![6.0]],
             n_samples: SampleIndex(1000),
         };

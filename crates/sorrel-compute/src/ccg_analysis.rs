@@ -135,8 +135,8 @@ mod tests {
     fn deep_central_dip_yields_high_score() {
         let mut h = flat(40, 50);
         // Carve out a 4-bin refractory zone at the centre (bins 18..22).
-        for b in 18..22 {
-            h[b] = 0;
+        for bin in h.iter_mut().take(22).skip(18) {
+            *bin = 0;
         }
         let a = analyse_refractory_dip(&h, 2, 6);
         assert!(a.z > 3.0, "expected large z, got {}", a.z);
@@ -146,8 +146,8 @@ mod tests {
     #[test]
     fn central_excess_yields_zero_score() {
         let mut h = flat(40, 10);
-        for b in 18..22 {
-            h[b] = 200; // synchronous firing
+        for bin in h.iter_mut().take(22).skip(18) {
+            *bin = 200; // synchronous firing
         }
         let a = analyse_refractory_dip(&h, 2, 6);
         assert!(a.z < 0.0);
@@ -166,8 +166,16 @@ mod tests {
     fn refractory_dip_score_in_unit_range() {
         for shape in [
             flat(20, 10),
-            { let mut h = flat(20, 10); h[10] = 0; h },
-            { let mut h = flat(20, 10); h[10] = 50; h },
+            {
+                let mut h = flat(20, 10);
+                h[10] = 0;
+                h
+            },
+            {
+                let mut h = flat(20, 10);
+                h[10] = 50;
+                h
+            },
         ] {
             let a = analyse_refractory_dip(&shape, 1, 5);
             let s = refractory_dip_score(&a);
@@ -212,27 +220,26 @@ mod tests {
         let make_shoulder = |base: u32| {
             let mut h = flat(40, base);
             // Add a small alternation in the shoulders (bins 4..18, 22..36).
-            for i in 0..40 {
+            for (i, bin) in h.iter_mut().enumerate().take(40) {
                 if (4..18).contains(&i) || (22..36).contains(&i) {
                     if i % 2 == 0 {
-                        h[i] = base + 3;
+                        *bin = base + 3;
                     } else {
-                        h[i] = base.saturating_sub(3);
+                        *bin = base.saturating_sub(3);
                     }
                 }
             }
             h
         };
         let mut shallow = make_shoulder(50);
-        for b in 18..22 {
-            shallow[b] = 35; // mild reduction
+        for bin in shallow.iter_mut().take(22).skip(18) {
+            *bin = 35; // mild reduction
         }
         let mut deep = make_shoulder(50);
-        for b in 18..22 {
-            deep[b] = 1;
+        for bin in deep.iter_mut().take(22).skip(18) {
+            *bin = 1;
         }
-        let s_shallow =
-            refractory_dip_score(&analyse_refractory_dip(&shallow, 2, 6));
+        let s_shallow = refractory_dip_score(&analyse_refractory_dip(&shallow, 2, 6));
         let s_deep = refractory_dip_score(&analyse_refractory_dip(&deep, 2, 6));
         assert!(
             s_deep >= s_shallow,

@@ -101,7 +101,7 @@ pub fn collect_pc_subspace<P: DataProvider>(
         if c == cluster {
             continue;
         }
-        let take = bg_seen % bg_stride == 0;
+        let take = bg_seen.checked_rem(bg_stride) == Some(0);
         bg_seen += 1;
         if !take {
             continue;

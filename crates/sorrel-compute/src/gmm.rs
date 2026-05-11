@@ -1,8 +1,10 @@
 //! 1-D Gaussian-mixture-model split test for amplitude distributions.
 //!
 //! Given a cluster's amplitude vector this module fits two competing models:
-//!   * `k=1`: a single Gaussian on the whole sample.
-//!   * `k=2`: a two-component mixture via Expectation-Maximisation.
+//!
+//! * `k=1`: a single Gaussian on the whole sample.
+//! * `k=2`: a two-component mixture via Expectation-Maximisation.
+//!
 //! It then compares them by Bayesian Information Criterion (BIC). When the
 //! 2-component model wins by a margin, the cluster's amplitude distribution
 //! has detectable structure and the curator probably wants to split. We
@@ -158,8 +160,16 @@ pub fn gmm_split_proposal(amps: &[f32]) -> Option<GmmSplitProposal> {
     // Hard-assign each spike to its highest-posterior component. The lower-mean
     // component is "0", higher-mean is "1" — order independent of init.
     let lower_first = mu_a <= mu_b;
-    let (lo_mu, lo_var, lo_w) = if lower_first { (mu_a, var_a, w_a) } else { (mu_b, var_b, w_b) };
-    let (hi_mu, hi_var, hi_w) = if lower_first { (mu_b, var_b, w_b) } else { (mu_a, var_a, w_a) };
+    let (lo_mu, lo_var, lo_w) = if lower_first {
+        (mu_a, var_a, w_a)
+    } else {
+        (mu_b, var_b, w_b)
+    };
+    let (hi_mu, hi_var, hi_w) = if lower_first {
+        (mu_b, var_b, w_b)
+    } else {
+        (mu_a, var_a, w_a)
+    };
 
     // Walk the *original* `amps` (which may include NaN); for each
     // finite-valued spike compute its assignment. NaN spikes go into the
@@ -237,9 +247,13 @@ mod tests {
         let mut s = seed | 1;
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
-            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
             let u1 = (s as f64 / u32::MAX as f64).clamp(1e-9, 1.0);
-            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
             let u2 = (s as f64 / u32::MAX as f64).clamp(1e-9, 1.0);
             let g = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
             out.push(mu + sigma * g as f32);
@@ -252,7 +266,11 @@ mod tests {
         let mut a = cloud(400, 1.0, 0.3, 0xCAFE);
         a.extend(cloud(400, 5.0, 0.3, 0xBABE));
         let p = gmm_split_proposal(&a).expect("proposal");
-        assert!(p.bic_delta > 6.0, "expected strong evidence, got {}", p.bic_delta);
+        assert!(
+            p.bic_delta > 6.0,
+            "expected strong evidence, got {}",
+            p.bic_delta
+        );
         assert!((p.means.0 - 1.0).abs() < 0.2, "means.0 = {}", p.means.0);
         assert!((p.means.1 - 5.0).abs() < 0.2, "means.1 = {}", p.means.1);
         assert_eq!(p.assignment.len(), 800);
@@ -270,7 +288,11 @@ mod tests {
         let a = cloud(800, 0.0, 1.0, 0xDEAD);
         let p = gmm_split_proposal(&a);
         if let Some(p) = p {
-            assert!(p.bic_delta < 6.0, "single Gaussian got bic_delta = {}", p.bic_delta);
+            assert!(
+                p.bic_delta < 6.0,
+                "single Gaussian got bic_delta = {}",
+                p.bic_delta
+            );
         }
     }
 

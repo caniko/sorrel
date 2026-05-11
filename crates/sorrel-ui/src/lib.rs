@@ -4,9 +4,9 @@ pub mod app;
 pub mod intent;
 pub mod selection;
 pub mod views;
-pub mod widgets;
 pub mod wgpu_raster;
 pub mod wgpu_trace;
+pub mod widgets;
 
 pub use app::SorrelApp;
 pub use intent::Intent;

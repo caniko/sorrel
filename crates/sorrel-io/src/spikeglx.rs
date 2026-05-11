@@ -31,8 +31,8 @@ pub struct SpikeGlxMeta {
 impl SpikeGlxMeta {
     pub fn read(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         Self::parse(&text)
     }
 
@@ -53,9 +53,7 @@ impl SpikeGlxMeta {
             .or_else(|| raw.get("niSampRate"))
             .and_then(|s| s.parse::<f32>().ok())
             .or_else(|| raw.get("sRateHz").and_then(|s| s.parse().ok()))
-            .ok_or_else(|| {
-                anyhow::anyhow!("spikeglx meta: no imSampRate/niSampRate field")
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("spikeglx meta: no imSampRate/niSampRate field"))?;
 
         let n_channels = raw
             .get("nSavedChans")

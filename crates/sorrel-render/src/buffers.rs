@@ -98,9 +98,15 @@ pub fn build_trace_vertices_cfg<P: DataProvider>(
                 lttb_per_channel(s, nc, target_points_per_channel, x_origin, x_step, cap)
             }
             TraceSamples::U16(s) => {
-                let centred: Vec<f32> =
-                    s.iter().map(|&v| v as f32 - i16::MAX as f32).collect();
-                lttb_per_channel(&centred, nc, target_points_per_channel, x_origin, x_step, cap)
+                let centred: Vec<f32> = s.iter().map(|&v| v as f32 - i16::MAX as f32).collect();
+                lttb_per_channel(
+                    &centred,
+                    nc,
+                    target_points_per_channel,
+                    x_origin,
+                    x_step,
+                    cap,
+                )
             }
             TraceSamples::I32(s) => {
                 let f: Vec<f32> = s.iter().map(|&v| v as f32).collect();
@@ -146,13 +152,7 @@ pub fn build_trace_vertices_gpu<P: DataProvider>(
 
     if cfg.is_off() {
         // Same fast path as CPU: skip preprocessing entirely.
-        return build_trace_vertices_cfg(
-            session,
-            start,
-            len,
-            target_points_per_channel,
-            cfg,
-        );
+        return build_trace_vertices_cfg(session, start, len, target_points_per_channel, cfg);
     }
 
     let mut buf = slice.samples.to_f32_centred();
@@ -216,9 +216,9 @@ fn apply_preproc_cpu(buf: &mut [f32], nc: usize, cfg: TracePreproc, sample_rate:
         let n_samples = buf.len() / nc;
         for t in 0..n_samples {
             let base = t * nc;
-            for ch in 0..nc {
+            for (ch, state) in states.iter_mut().enumerate().take(nc) {
                 let i = base + ch;
-                let y = f.step(buf[i], &mut states[ch]);
+                let y = f.step(buf[i], state);
                 buf[i] = y;
             }
         }
@@ -291,14 +291,23 @@ mod tests {
 
     impl DataProvider for MockProvider {
         type Label = u8;
-        fn sample_rate(&self) -> f32 { self.sr }
-        fn n_channels(&self) -> u32 { self.n_channels }
+        fn sample_rate(&self) -> f32 {
+            self.sr
+        }
+        fn n_channels(&self) -> u32 {
+            self.n_channels
+        }
         fn n_samples(&self) -> SampleIndex {
             SampleIndex((self.trace.len() / self.n_channels.max(1) as usize) as u64)
         }
-        fn n_clusters(&self) -> u32 { self.spikes.len() as u32 }
+        fn n_clusters(&self) -> u32 {
+            self.spikes.len() as u32
+        }
         fn spike_times(&self, cluster: ClusterId) -> &[SampleIndex] {
-            self.spikes.get(cluster.idx()).map(Vec::as_slice).unwrap_or(&[])
+            self.spikes
+                .get(cluster.idx())
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
         }
         fn trace(&self, start: SampleIndex, len: u32) -> TraceSlice<'_> {
             let nc = self.n_channels as usize;
@@ -310,7 +319,9 @@ mod tests {
                 samples: TraceSamples::I16(&self.trace[s..e]),
             }
         }
-        fn initial_labels(&self) -> Vec<u8> { vec![0u8; self.spikes.len()] }
+        fn initial_labels(&self) -> Vec<u8> {
+            vec![0u8; self.spikes.len()]
+        }
     }
 
     fn session_with(provider: MockProvider) -> (Session<MockProvider>, tempfile::TempDir) {
@@ -322,7 +333,10 @@ mod tests {
     #[test]
     fn scatter_vertices_one_per_spike_with_correct_row_and_time() {
         let provider = MockProvider {
-            spikes: vec![vec![SampleIndex(0), SampleIndex(100), SampleIndex(200)], vec![SampleIndex(50)]],
+            spikes: vec![
+                vec![SampleIndex(0), SampleIndex(100), SampleIndex(200)],
+                vec![SampleIndex(50)],
+            ],
             trace: vec![],
             n_channels: 1,
             sr: 1000.0,
@@ -411,7 +425,13 @@ mod tests {
         let (session, _d) = session_with(provider);
 
         let a = build_trace_vertices(&session, SampleIndex(0), n_samples as u32, 32);
-        let b = build_trace_vertices_cfg(&session, SampleIndex(0), n_samples as u32, 32, TracePreproc::Off);
+        let b = build_trace_vertices_cfg(
+            &session,
+            SampleIndex(0),
+            n_samples as u32,
+            32,
+            TracePreproc::Off,
+        );
         assert_eq!(a.len(), b.len());
         for (av, bv) in a.iter().zip(b.iter()) {
             assert_eq!(av.channel, bv.channel);
@@ -464,7 +484,8 @@ mod tests {
 
         let cfg_off = TracePreproc::Off;
         let cfg_hp = TracePreproc::Hp(300.0);
-        let v_off = build_trace_vertices_cfg(&session, SampleIndex(0), n_samples as u32, 64, cfg_off);
+        let v_off =
+            build_trace_vertices_cfg(&session, SampleIndex(0), n_samples as u32, 64, cfg_off);
         let v_hp = build_trace_vertices_cfg(&session, SampleIndex(0), n_samples as u32, 64, cfg_hp);
 
         // Last vertex is sampled near the end of the window — settled.
@@ -489,7 +510,11 @@ mod tests {
     #[test]
     fn scatter_vertices_y_equals_row_index() {
         let provider = MockProvider {
-            spikes: vec![vec![SampleIndex(10)], vec![SampleIndex(20)], vec![SampleIndex(30)]],
+            spikes: vec![
+                vec![SampleIndex(10)],
+                vec![SampleIndex(20)],
+                vec![SampleIndex(30)],
+            ],
             trace: vec![],
             n_channels: 1,
             sr: 1000.0,

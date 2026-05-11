@@ -25,7 +25,7 @@
 
 use crate::extras::{HasGeometry, HasQualityMetrics};
 use crate::kilosort::PhyLabel;
-use crate::npy::{read_header, read_1d_u32, NpyHeader};
+use crate::npy::{read_1d_u32, read_header};
 use crate::provider::{
     ChannelId, ClusterId, DataProvider, SampleIndex, TraceDtype, TraceSamples, TraceSlice,
 };
@@ -91,11 +91,7 @@ impl SortingAnalyzerProvider {
         // Probe geometry via probeinterface JSON if SI exported one.
         let mut channel_positions = Vec::new();
         let mut channel_map = Vec::new();
-        for candidate in [
-            "probegroup.json",
-            "probe.json",
-            "extensions/probe.json",
-        ] {
+        for candidate in ["probegroup.json", "probe.json", "extensions/probe.json"] {
             let p = root.join(candidate);
             if p.exists() {
                 if let Ok(geom) = crate::probeinterface::ProbeGeometry::read(&p) {
@@ -107,7 +103,10 @@ impl SortingAnalyzerProvider {
         }
 
         let metrics = load_quality_metrics_csv(
-            &root.join("extensions").join("quality_metrics").join("metrics.csv"),
+            &root
+                .join("extensions")
+                .join("quality_metrics")
+                .join("metrics.csv"),
             n_clusters,
         )
         .unwrap_or_default();
@@ -156,24 +155,23 @@ struct RecordingMeta {
 }
 
 fn load_recording_json(root: &Path) -> Result<RecordingMeta> {
-    for name in [
-        "recording.json",
-        "binary.json",
-        "recording/recording.json",
-    ] {
+    for name in ["recording.json", "binary.json", "recording/recording.json"] {
         let p = root.join(name);
         if p.exists() {
-            let text = std::fs::read_to_string(&p)
-                .with_context(|| format!("read {}", p.display()))?;
+            let text =
+                std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
             return parse_recording_json(&text, &p);
         }
     }
-    bail!("SortingAnalyzer: no recording.json/binary.json found in {}", root.display());
+    bail!(
+        "SortingAnalyzer: no recording.json/binary.json found in {}",
+        root.display()
+    );
 }
 
 fn parse_recording_json(text: &str, json_path: &Path) -> Result<RecordingMeta> {
-    let v: serde_json::Value = serde_json::from_str(text)
-        .with_context(|| format!("parse {}", json_path.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(text).with_context(|| format!("parse {}", json_path.display()))?;
     let kwargs = v.get("kwargs").unwrap_or(&v);
     let sample_rate = kwargs
         .get("sampling_frequency")
@@ -224,7 +222,11 @@ fn map_recording(
     let Some(p) = rec.file_paths.first() else {
         return Ok((None, std::ptr::null(), 0, SampleIndex(0)));
     };
-    let p = if p.is_absolute() { p.clone() } else { root.join(p) };
+    let p = if p.is_absolute() {
+        p.clone()
+    } else {
+        root.join(p)
+    };
     if !p.exists() {
         return Ok((None, std::ptr::null(), 0, SampleIndex(0)));
     }
@@ -236,7 +238,7 @@ fn map_recording(
     }
     let payload = total - rec.offset as usize;
     let bps = rec.n_channels as usize * rec.dtype.size_bytes();
-    if bps == 0 || payload % bps != 0 {
+    if bps == 0 || payload.checked_rem(bps) != Some(0) {
         bail!("recording payload not divisible by frame size");
     }
     let n_samples = (payload / bps) as u64;
@@ -264,7 +266,10 @@ fn load_sorting(root: &Path) -> Result<(Vec<SampleIndex>, Vec<u32>)> {
         return load_structured_spikes(&structured);
     }
 
-    bail!("SortingAnalyzer: no sorting arrays found under {}/sorting/", root.display())
+    bail!(
+        "SortingAnalyzer: no sorting arrays found under {}/sorting/",
+        root.display()
+    )
 }
 
 /// Parse SI's `sorting/spikes.npy` structured array. The dtype looks like
@@ -274,7 +279,11 @@ fn load_sorting(root: &Path) -> Result<(Vec<SampleIndex>, Vec<u32>)> {
 fn load_structured_spikes(path: &Path) -> Result<(Vec<SampleIndex>, Vec<u32>)> {
     let h = read_header(path)?;
     if h.shape.len() != 1 {
-        bail!("{}: expected 1-D structured array, got {:?}", path.display(), h.shape);
+        bail!(
+            "{}: expected 1-D structured array, got {:?}",
+            path.display(),
+            h.shape
+        );
     }
     let fields = parse_record_dtype(&h.dtype)
         .with_context(|| format!("parse record dtype {} in {}", h.dtype, path.display()))?;
@@ -283,7 +292,12 @@ fn load_structured_spikes(path: &Path) -> Result<(Vec<SampleIndex>, Vec<u32>)> {
     let sample_field = fields
         .iter()
         .find(|f| f.name == "sample_index")
-        .ok_or_else(|| anyhow!("spikes.npy missing 'sample_index' field (dtype {})", h.dtype))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "spikes.npy missing 'sample_index' field (dtype {})",
+                h.dtype
+            )
+        })?;
     let unit_field = fields
         .iter()
         .find(|f| f.name == "unit_index")
@@ -346,11 +360,19 @@ fn parse_record_dtype(s: &str) -> Result<Vec<RecordField>> {
                     if parts.len() != 2 {
                         bail!("malformed field tuple {tup:?}");
                     }
-                    let name = parts[0].trim().trim_matches('\'').trim_matches('"').to_string();
+                    let name = parts[0]
+                        .trim()
+                        .trim_matches('\'')
+                        .trim_matches('"')
+                        .to_string();
                     let dtype = parts[1].trim().trim_matches('\'').trim_matches('"');
                     let width = int_dtype_width(dtype)
                         .ok_or_else(|| anyhow!("unsupported field dtype {dtype}"))?;
-                    fields.push(RecordField { name, offset, width });
+                    fields.push(RecordField {
+                        name,
+                        offset,
+                        width,
+                    });
                     offset += width;
                 }
             }
@@ -604,7 +626,10 @@ mod tests {
         );
 
         let (times, units) = load_structured_spikes(&p).unwrap();
-        assert_eq!(times, vec![SampleIndex(100), SampleIndex(250), SampleIndex(999)]);
+        assert_eq!(
+            times,
+            vec![SampleIndex(100), SampleIndex(250), SampleIndex(999)]
+        );
         assert_eq!(units, vec![0, 2, 1]);
     }
 
@@ -626,7 +651,10 @@ mod tests {
             &payload,
         );
         let (times, units) = load_structured_spikes(&p).unwrap();
-        assert_eq!(times, vec![SampleIndex(42), SampleIndex(10_000_000), SampleIndex(1)]);
+        assert_eq!(
+            times,
+            vec![SampleIndex(42), SampleIndex(10_000_000), SampleIndex(1)]
+        );
         assert_eq!(units, vec![7, 3, 0]);
     }
 
@@ -663,13 +691,8 @@ mod tests {
         // 3) sorting/spikes.npy + unit_ids.npy.
         let sorting_dir = root.join("sorting");
         std::fs::create_dir_all(&sorting_dir).unwrap();
-        let records: &[(u64, u64, u64)] = &[
-            (10, 0, 0),
-            (20, 1, 0),
-            (30, 0, 0),
-            (40, 2, 0),
-            (50, 1, 0),
-        ];
+        let records: &[(u64, u64, u64)] =
+            &[(10, 0, 0), (20, 1, 0), (30, 0, 0), (40, 2, 0), (50, 1, 0)];
         let mut payload = Vec::new();
         for (s, u, seg) in records {
             payload.extend_from_slice(&s.to_le_bytes());
@@ -692,8 +715,14 @@ mod tests {
         assert_eq!(p.n_samples(), SampleIndex(n_samples_target as u64));
 
         // Per-cluster spike times: cluster 0 → [10, 30], 1 → [20, 50], 2 → [40].
-        assert_eq!(p.spike_times(ClusterId(0)), &[SampleIndex(10), SampleIndex(30)]);
-        assert_eq!(p.spike_times(ClusterId(1)), &[SampleIndex(20), SampleIndex(50)]);
+        assert_eq!(
+            p.spike_times(ClusterId(0)),
+            &[SampleIndex(10), SampleIndex(30)]
+        );
+        assert_eq!(
+            p.spike_times(ClusterId(1)),
+            &[SampleIndex(20), SampleIndex(50)]
+        );
         assert_eq!(p.spike_times(ClusterId(2)), &[SampleIndex(40)]);
         // Out-of-range cluster id returns empty rather than panicking.
         assert!(p.spike_times(ClusterId(99)).is_empty());
@@ -749,13 +778,11 @@ mod tests {
     /// (record-dtype OK), shape `(n,)`, and raw payload bytes.
     fn write_record_npy(path: &Path, descr: &str, n: usize, payload: &[u8]) {
         use std::io::Write;
-        let dict = format!(
-            "{{'descr': {descr}, 'fortran_order': False, 'shape': ({n},), }}"
-        );
+        let dict = format!("{{'descr': {descr}, 'fortran_order': False, 'shape': ({n},), }}");
         let prelude_len = 6 + 2 + 2 + dict.len() + 1;
         let pad = (64 - (prelude_len % 64)) % 64;
         let mut header = dict.into_bytes();
-        header.extend(std::iter::repeat(b' ').take(pad));
+        header.resize(header.len() + pad, b' ');
         header.push(b'\n');
         let header_len = header.len() as u16;
         let mut f = std::fs::File::create(path).unwrap();
@@ -771,8 +798,3 @@ mod tests {
         write_record_npy(path, "'<u4'", data.len(), &bytes);
     }
 }
-
-// Shared with kilosort/quality-metrics ingestion: silence dead-code lint when
-// unused by a particular downstream consumer.
-#[allow(dead_code)]
-fn _suppress_npy_header(_h: NpyHeader) {}

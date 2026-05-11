@@ -43,7 +43,13 @@ impl Moments {
             m4 += d2 * d2;
         }
         let nf = n.max(1) as f64;
-        Self { n, mean, m2: m2 / nf, m3: m3 / nf, m4: m4 / nf }
+        Self {
+            n,
+            mean,
+            m2: m2 / nf,
+            m3: m3 / nf,
+            m4: m4 / nf,
+        }
     }
 
     /// Bessel-corrected sample standard deviation. 0 for n < 2.
@@ -130,8 +136,7 @@ pub fn bimodality_coefficient(values: &[f32]) -> f32 {
 /// (A full Hartigan dip implementation is non-trivial and would require its
 /// own crate-level dependency; intentionally omitted in favour of BC + KS,
 /// which together cover the same diagnostic ground for this curation tool.)
-
-/// Two-sample Kolmogorov–Smirnov statistic — the maximum absolute difference
+/// Two-sample Kolmogorov-Smirnov statistic - the maximum absolute difference
 /// between the empirical CDFs of `a` and `b`. Range `[0, 1]`; large values
 /// indicate the two distributions don't come from the same population. The
 /// asymptotic two-sided p-value at level α is `D > c(α) sqrt((n+m)/(n m))`.
@@ -242,16 +247,16 @@ pub fn amplitude_cutoff(amps: &[f32], n_bins: usize) -> f32 {
     }
     // 3-bin smoothing so single-sample peaks don't pick a misleading mode.
     let mut s = vec![0.0_f32; n_bins];
-    for i in 0..n_bins {
+    for (i, smoothed) in s.iter_mut().enumerate().take(n_bins) {
         let lo_i = i.saturating_sub(1);
         let hi_i = (i + 1).min(n_bins - 1);
         let mut sum = 0.0_f32;
         let mut k = 0.0_f32;
-        for b in lo_i..=hi_i {
-            sum += h[b] as f32;
+        for count in h.iter().take(hi_i + 1).skip(lo_i) {
+            sum += *count as f32;
             k += 1.0;
         }
-        s[i] = sum / k;
+        *smoothed = sum / k;
     }
     let (mode_bin, _) = s
         .iter()
@@ -356,15 +361,10 @@ mod tests {
     #[test]
     fn bimodality_coefficient_high_for_two_clouds() {
         let mut v = Vec::new();
-        v.extend((0..500).map(|i| 0.0 + (i as f32) * 0.0))
-            ;
+        v.extend((0..500).map(|i| 0.0 + (i as f32) * 0.0));
         // Two means, equal mass.
-        for _ in 0..500 {
-            v.push(-1.0);
-        }
-        for _ in 0..500 {
-            v.push(1.0);
-        }
+        v.resize(v.len() + 500, -1.0);
+        v.resize(v.len() + 500, 1.0);
         assert!(bimodality_coefficient(&v) > 0.555);
     }
 
@@ -376,7 +376,7 @@ mod tests {
                 let x = i as f32 / 30.0;
                 let w = (-0.5 * x * x).exp();
                 let n = (w * 100.0) as usize;
-                std::iter::repeat(x).take(n)
+                (0..n).map(move |_| x)
             })
             .collect();
         assert!(bimodality_coefficient(&v) < 0.555);
@@ -463,9 +463,10 @@ mod tests {
 
     #[test]
     fn mean_std_zero_for_constant_input() {
-        let v = vec![3.14_f32; 100];
+        let value = 3.125_f32;
+        let v = vec![value; 100];
         let (mean, std) = mean_std(&v);
-        assert!((mean - 3.14).abs() < 1e-5);
+        assert!((mean - value).abs() < 1e-5);
         assert!(std.abs() < 1e-5);
     }
 
@@ -481,7 +482,10 @@ mod tests {
         // Symmetric around 0.
         let v: Vec<f32> = (-50..=50).map(|i| i as f32).collect();
         let s = skewness(&v);
-        assert!(s.abs() < 1e-3, "skewness {s} should be ~0 for symmetric input");
+        assert!(
+            s.abs() < 1e-3,
+            "skewness {s} should be ~0 for symmetric input"
+        );
     }
 
     #[test]
@@ -531,8 +535,8 @@ mod tests {
     fn excess_kurtosis_positive_for_heavy_tailed_distribution() {
         // Bimodal mixture with concentrated mass at extremes — high kurtosis.
         let mut v: Vec<f32> = vec![0.0; 1000];
-        v.extend(std::iter::repeat(10.0).take(20));
-        v.extend(std::iter::repeat(-10.0).take(20));
+        v.resize(v.len() + 20, 10.0);
+        v.resize(v.len() + 20, -10.0);
         assert!(
             excess_kurtosis(&v) > 1.0,
             "expected positive excess kurtosis"

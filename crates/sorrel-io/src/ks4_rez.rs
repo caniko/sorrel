@@ -79,8 +79,7 @@ mod imp {
     impl Ks4RezProvider {
         pub fn open(path: impl AsRef<Path>, overrides: Ks4RezOpenParams) -> Result<Self> {
             let path = path.as_ref();
-            let f = H5File::open(path)
-                .with_context(|| format!("open {}", path.display()))?;
+            let f = H5File::open(path).with_context(|| format!("open {}", path.display()))?;
 
             let rez = f.group("rez").context("missing /rez group")?;
             let ops = rez.group("ops").context("missing /rez/ops")?;
@@ -127,7 +126,7 @@ mod imp {
                     continue;
                 }
                 // Convert to 0-based.
-                let sample = (sample - 1) as SampleIndex;
+                let sample = SampleIndex::new((sample - 1) as u64);
                 let tmpl = (tmpl - 1) as u32;
                 max_template = max_template.max(tmpl);
                 tuples.push((sample, tmpl));
@@ -156,9 +155,8 @@ mod imp {
                 .and_then(|d| d.read_raw().ok())
                 .unwrap_or_default();
             let np = xs.len().min(ys.len());
-            let channel_positions: Vec<[f32; 2]> = (0..np)
-                .map(|i| [xs[i] as f32, ys[i] as f32])
-                .collect();
+            let channel_positions: Vec<[f32; 2]> =
+                (0..np).map(|i| [xs[i] as f32, ys[i] as f32]).collect();
 
             // Locate the dat file. KS4 writes it as a string dataset under
             // ops; HDF5-rs returns those as `VarLenAscii` / `FixedAscii`.
@@ -168,7 +166,7 @@ mod imp {
                 .or_else(|| read_string_dataset(&ops, "fproc").map(PathBuf::from));
             let (trace_mmap, trace_ptr, trace_byte_len, n_samples) = match dat_path {
                 Some(p) => map_dat(&p, n_channels)?,
-                None => (None, std::ptr::null(), 0usize, 0u64),
+                None => (None, std::ptr::null(), 0usize, SampleIndex::new(0)),
             };
 
             Ok(Self {
@@ -195,7 +193,7 @@ mod imp {
                 return TraceSamples::I16(&[]);
             }
             let nc = self.n_channels as usize;
-            let s = (start as usize).saturating_mul(nc);
+            let s = start.idx().saturating_mul(nc);
             let e = s + (len as usize) * nc;
             // KS4 fbinary is always int16.
             let buf = unsafe { self.typed_slice::<i16>() };
@@ -222,7 +220,7 @@ mod imp {
 
         fn spike_times(&self, cluster: ClusterId) -> &[SampleIndex] {
             self.spikes_per_cluster
-                .get(cluster as usize)
+                .get(cluster.idx())
                 .map(Vec::as_slice)
                 .unwrap_or(&[])
         }
@@ -256,14 +254,15 @@ mod imp {
     impl HasSpikeTemplates for Ks4RezProvider {
         fn spike_templates(&self, cluster: ClusterId) -> &[u32] {
             self.templates_per_cluster
-                .get(cluster as usize)
+                .get(cluster.idx())
                 .map(Vec::as_slice)
                 .unwrap_or(&[])
         }
     }
 
     fn read_scalar_f32(g: &hdf5::Group, name: &str) -> Result<f32> {
-        let ds = g.dataset(name)
+        let ds = g
+            .dataset(name)
             .with_context(|| format!("missing /rez/ops/{name}"))?;
         if let Ok(v) = ds.read_scalar::<f32>() {
             return Ok(v);
@@ -304,24 +303,24 @@ mod imp {
         None
     }
 
-    fn map_dat(
-        p: &Path,
-        n_channels: u32,
-    ) -> Result<(Option<Mmap>, *const u8, usize, SampleIndex)> {
+    fn map_dat(p: &Path, n_channels: u32) -> Result<(Option<Mmap>, *const u8, usize, SampleIndex)> {
         if !p.exists() {
-            log::warn!("KS4 dat path {} does not exist; trace view disabled", p.display());
-            return Ok((None, std::ptr::null(), 0, 0));
+            log::warn!(
+                "KS4 dat path {} does not exist; trace view disabled",
+                p.display()
+            );
+            return Ok((None, std::ptr::null(), 0, SampleIndex::new(0)));
         }
         let f = File::open(p).with_context(|| format!("open {}", p.display()))?;
         let mmap = unsafe { Mmap::map(&f)? };
         let total = mmap.len();
         let bps = n_channels as usize * 2; // i16
-        if bps == 0 || total % bps != 0 {
+        if bps == 0 || total.checked_rem(bps) != Some(0) {
             bail!("KS4 dat size {total} not divisible by frame size {bps}");
         }
         let n_samples = (total / bps) as u64;
         let ptr = mmap.as_ptr();
-        Ok((Some(mmap), ptr, total, n_samples))
+        Ok((Some(mmap), ptr, total, SampleIndex::new(n_samples)))
     }
 }
 

@@ -15,13 +15,9 @@
 //! That's O(sum_of_spike_counts) and stays inside this crate — no extra
 //! allocations on the session, no journal interaction.
 
-use crate::feature_subspace::{
-    DEFAULT_CHANNEL_IDX, DEFAULT_D, DEFAULT_MAX_BACKGROUND,
-};
+use crate::feature_subspace::{DEFAULT_CHANNEL_IDX, DEFAULT_D, DEFAULT_MAX_BACKGROUND};
 use crate::session::Session;
-use sorrel_compute::{
-    isolation_metrics, quality_breakdown, IsolationMetrics, QualityBreakdown,
-};
+use sorrel_compute::{isolation_metrics, quality_breakdown, IsolationMetrics, QualityBreakdown};
 use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 
 const REFRACTORY_SECONDS: f32 = 0.0015;
@@ -108,10 +104,7 @@ fn merge_spike_data<P: DataProvider>(
     session: &Session<P>,
     clusters: &[ClusterId],
 ) -> (Vec<SampleIndex>, Vec<f32>) {
-    let total: usize = clusters
-        .iter()
-        .map(|&c| session.spike_times(c).len())
-        .sum();
+    let total: usize = clusters.iter().map(|&c| session.spike_times(c).len()).sum();
     let mut times = Vec::with_capacity(total);
     let mut amps = Vec::with_capacity(total);
     let mut cursors = vec![0usize; clusters.len()];
@@ -121,7 +114,10 @@ fn merge_spike_data<P: DataProvider>(
             let bucket = session.spike_times(c);
             if cursors[i] < bucket.len() {
                 let t = bucket[cursors[i]];
-                if best.is_none_or(|(_, bt)| t < bt) {
+                if match best {
+                    Some((_, bt)) => t < bt,
+                    None => true,
+                } {
                     best = Some((i, t));
                 }
             }
@@ -155,7 +151,7 @@ fn preview_isolation<P: DataProvider>(
         return None;
     }
     let d = DEFAULT_D.min(n_pcs);
-    let channel_idx = DEFAULT_CHANNEL_IDX.min(n_chans - 1);
+    let channel_idx = DEFAULT_CHANNEL_IDX;
     let stride = n_pcs * n_chans;
 
     let spike_clusters = session.spike_clusters_global();
@@ -200,7 +196,7 @@ fn preview_isolation<P: DataProvider>(
         if merged.contains(&c) {
             continue;
         }
-        let take = bg_seen % bg_stride == 0;
+        let take = bg_seen.checked_rem(bg_stride) == Some(0);
         bg_seen += 1;
         if !take {
             continue;
@@ -260,17 +256,31 @@ mod tests {
 
     impl DataProvider for MockProvider {
         type Label = u8;
-        fn sample_rate(&self) -> f32 { 1000.0 }
-        fn n_channels(&self) -> u32 { 1 }
-        fn n_samples(&self) -> SampleIndex { self.n_samples }
-        fn n_clusters(&self) -> u32 { self.spikes.len() as u32 }
+        fn sample_rate(&self) -> f32 {
+            1000.0
+        }
+        fn n_channels(&self) -> u32 {
+            1
+        }
+        fn n_samples(&self) -> SampleIndex {
+            self.n_samples
+        }
+        fn n_clusters(&self) -> u32 {
+            self.spikes.len() as u32
+        }
         fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
             self.spikes.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
         }
         fn trace(&self, _: SampleIndex, _: u32) -> TraceSlice<'_> {
-            TraceSlice { start: SampleIndex(0), n_channels: 1, samples: TraceSamples::I16(&[]) }
+            TraceSlice {
+                start: SampleIndex(0),
+                n_channels: 1,
+                samples: TraceSamples::I16(&[]),
+            }
         }
-        fn initial_labels(&self) -> Vec<u8> { vec![0; self.spikes.len()] }
+        fn initial_labels(&self) -> Vec<u8> {
+            vec![0; self.spikes.len()]
+        }
     }
     impl HasAmplitudes for MockProvider {
         fn spike_amplitudes(&self, c: ClusterId) -> &[f32] {
@@ -289,7 +299,11 @@ mod tests {
     #[test]
     fn preview_does_not_mutate_session() {
         let prov = MockProvider {
-            spikes: vec![vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)], vec![SampleIndex(20), SampleIndex(200)], vec![SampleIndex(100)]],
+            spikes: vec![
+                vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
+                vec![SampleIndex(20), SampleIndex(200)],
+                vec![SampleIndex(100)],
+            ],
             amps: vec![vec![1.0, 2.0, 3.0], vec![1.0, 1.0], vec![5.0]],
             n_samples: SampleIndex(500),
         };
@@ -304,7 +318,11 @@ mod tests {
     #[test]
     fn preview_merge_produces_union_spike_count() {
         let prov = MockProvider {
-            spikes: vec![vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)], vec![SampleIndex(20), SampleIndex(200)], vec![SampleIndex(100)]],
+            spikes: vec![
+                vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
+                vec![SampleIndex(20), SampleIndex(200)],
+                vec![SampleIndex(100)],
+            ],
             amps: vec![vec![1.0, 2.0, 3.0], vec![1.0, 1.0], vec![5.0]],
             n_samples: SampleIndex(500),
         };
@@ -320,26 +338,35 @@ mod tests {
         let prov = MockProvider {
             // Target = 0: well-spaced (clean).
             spikes: vec![
-                vec![0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000].into_iter().map(SampleIndex).collect(),
+                vec![0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000]
+                    .into_iter()
+                    .map(SampleIndex)
+                    .collect(),
                 // Source = 1: spikes packed close to target's → many violations.
-                vec![1, 1001, 2001, 3001, 4001, 5001, 6001, 7001, 8001, 9001].into_iter().map(SampleIndex).collect(),
+                vec![1, 1001, 2001, 3001, 4001, 5001, 6001, 7001, 8001, 9001]
+                    .into_iter()
+                    .map(SampleIndex)
+                    .collect(),
             ],
-            amps: vec![
-                vec![5.0; 10],
-                vec![5.0; 10],
-            ],
+            amps: vec![vec![5.0; 10], vec![5.0; 10]],
             n_samples: SampleIndex(10_000),
         };
         let (s, _d) = make_session(prov);
         let p = preview_merge(&s, &[ClusterId(1)], ClusterId(0));
-        assert!(p.contamination_delta() > 0.0, "expected merge to worsen contamination");
+        assert!(
+            p.contamination_delta() > 0.0,
+            "expected merge to worsen contamination"
+        );
         assert!(p.warns());
     }
 
     #[test]
     fn preview_isolation_none_without_pc_features() {
         let prov = MockProvider {
-            spikes: vec![vec![SampleIndex(10), SampleIndex(30)], vec![SampleIndex(20), SampleIndex(40)]],
+            spikes: vec![
+                vec![SampleIndex(10), SampleIndex(30)],
+                vec![SampleIndex(20), SampleIndex(40)],
+            ],
             amps: vec![vec![1.0, 2.0], vec![1.0, 1.0]],
             n_samples: SampleIndex(500),
         };

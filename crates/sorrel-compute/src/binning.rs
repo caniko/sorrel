@@ -79,7 +79,11 @@ mod tests {
 
     #[test]
     fn isi_skips_intervals_at_or_above_max() {
-        let spikes: Vec<SampleIndex> = [0u64, 10, 200, 210].iter().copied().map(SampleIndex).collect();
+        let spikes: Vec<SampleIndex> = [0u64, 10, 200, 210]
+            .iter()
+            .copied()
+            .map(SampleIndex)
+            .collect();
         let h = isi_histogram(&spikes, 100, 4);
         // Intervals: 10 -> bin 0, 190 -> skipped (>= 100), 10 -> bin 0
         assert_eq!(h.iter().sum::<u32>(), 2);

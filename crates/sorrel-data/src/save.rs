@@ -57,8 +57,7 @@ where
         }
     }
     let tmp = with_tmp_suffix(&tsv_path);
-    std::fs::write(&tmp, &text)
-        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::write(&tmp, &text).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &tsv_path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), tsv_path.display()))?;
     Ok(())
@@ -135,10 +134,7 @@ mod tests {
             self.spikes.len() as u32
         }
         fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
-            self.spikes
-                .get(c.idx())
-                .map(Vec::as_slice)
-                .unwrap_or(&[])
+            self.spikes.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
         }
         fn trace(&self, _: SampleIndex, _: u32) -> TraceSlice<'_> {
             TraceSlice {
@@ -174,7 +170,11 @@ mod tests {
 
     fn fresh_session() -> (Session<MockProvider>, tempfile::TempDir) {
         let provider = MockProvider {
-            spikes: vec![vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)], vec![SampleIndex(20), SampleIndex(200)], vec![SampleIndex(100)]],
+            spikes: vec![
+                vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
+                vec![SampleIndex(20), SampleIndex(200)],
+                vec![SampleIndex(100)],
+            ],
             labels: vec![MockLabel::Unsorted; 3],
         };
         let dir = tempfile::tempdir().unwrap();
@@ -187,8 +187,11 @@ mod tests {
         let (mut s, dir) = fresh_session();
         // Merge cluster 0 into 2: every spike in the global arrays that was
         // in 0 should now read as 2 in the file we write.
-        s.dispatch(CurationCommand::Merge { sources: vec![ClusterId(0)], target: ClusterId(2) })
-            .unwrap();
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(0)],
+            target: ClusterId(2),
+        })
+        .unwrap();
 
         save_to_phy(&s, dir.path(), label_str).unwrap();
 
@@ -201,17 +204,22 @@ mod tests {
     #[test]
     fn save_writes_cluster_group_tsv_excluding_unsorted_rows() {
         let (mut s, dir) = fresh_session();
-        s.dispatch(CurationCommand::Relabel { cluster: ClusterId(0), op: PhyLabelOp::SetGood })
-            .unwrap();
-        s.dispatch(CurationCommand::Relabel { cluster: ClusterId(2), op: PhyLabelOp::SetNoise })
-            .unwrap();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetGood,
+        })
+        .unwrap();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(2),
+            op: PhyLabelOp::SetNoise,
+        })
+        .unwrap();
 
         save_to_phy(&s, dir.path(), label_str).unwrap();
 
         let tsv = std::fs::read_to_string(dir.path().join("cluster_group.tsv")).unwrap();
         assert_eq!(
-            tsv,
-            "cluster_id\tgroup\n0\tgood\n2\tnoise\n",
+            tsv, "cluster_id\tgroup\n0\tgood\n2\tnoise\n",
             "unsorted cluster 1 should be elided"
         );
     }
@@ -238,7 +246,10 @@ mod tests {
     fn save_after_split_writes_new_cluster_assignments() {
         let (mut s, dir) = fresh_session();
         // Split spike at local index 1 of cluster 0 -> new cluster id.
-        s.dispatch(CurationCommand::Split { cluster: ClusterId(0), spike_idx: vec![1], new_cluster: ClusterId(0), // ignored: auto-allocated
+        s.dispatch(CurationCommand::Split {
+            cluster: ClusterId(0),
+            spike_idx: vec![1],
+            new_cluster: ClusterId(0), // ignored: auto-allocated
         })
         .unwrap();
 
@@ -255,8 +266,11 @@ mod tests {
     #[test]
     fn save_after_undo_writes_pre_change_state() {
         let (mut s, dir) = fresh_session();
-        s.dispatch(CurationCommand::Merge { sources: vec![ClusterId(0), ClusterId(1)], target: ClusterId(2) })
-            .unwrap();
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(0), ClusterId(1)],
+            target: ClusterId(2),
+        })
+        .unwrap();
         s.dispatch(CurationCommand::Undo).unwrap();
 
         save_to_phy(&s, dir.path(), label_str).unwrap();
@@ -268,12 +282,21 @@ mod tests {
     #[test]
     fn save_round_trip_after_many_relabels() {
         let (mut s, dir) = fresh_session();
-        s.dispatch(CurationCommand::Relabel { cluster: ClusterId(0), op: PhyLabelOp::SetGood })
-            .unwrap();
-        s.dispatch(CurationCommand::Relabel { cluster: ClusterId(1), op: PhyLabelOp::SetMua })
-            .unwrap();
-        s.dispatch(CurationCommand::Relabel { cluster: ClusterId(2), op: PhyLabelOp::SetNoise })
-            .unwrap();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetGood,
+        })
+        .unwrap();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(1),
+            op: PhyLabelOp::SetMua,
+        })
+        .unwrap();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(2),
+            op: PhyLabelOp::SetNoise,
+        })
+        .unwrap();
 
         save_to_phy(&s, dir.path(), label_str).unwrap();
         let tsv = std::fs::read_to_string(dir.path().join("cluster_group.tsv")).unwrap();
@@ -298,8 +321,11 @@ mod tests {
     #[test]
     fn double_save_is_idempotent() {
         let (mut s, dir) = fresh_session();
-        s.dispatch(CurationCommand::Relabel { cluster: ClusterId(1), op: PhyLabelOp::SetGood })
-            .unwrap();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(1),
+            op: PhyLabelOp::SetGood,
+        })
+        .unwrap();
         save_to_phy(&s, dir.path(), label_str).unwrap();
         let first = std::fs::read(dir.path().join("spike_clusters.npy")).unwrap();
         save_to_phy(&s, dir.path(), label_str).unwrap();
@@ -307,4 +333,3 @@ mod tests {
         assert_eq!(first, second);
     }
 }
-

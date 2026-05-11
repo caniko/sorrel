@@ -39,10 +39,9 @@ impl GpuContext {
     }
 
     async fn headless_async() -> Result<Self, GpuInitError> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
-        });
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::PRIMARY;
+        let instance = wgpu::Instance::new(descriptor);
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -50,16 +49,16 @@ impl GpuContext {
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or(GpuInitError::NoAdapter)?;
+            .map_err(|_| GpuInitError::NoAdapter)?;
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("sorrel-gpu.headless"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults(),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("sorrel-gpu.headless"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_defaults(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
+            })
             .await
             .map_err(|e| GpuInitError::DeviceRequest(e.to_string()))?;
         Ok(Self {
@@ -102,8 +101,48 @@ pub(crate) fn block_on_map(
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
     });
-    // `Maintain::Wait` polls until all submitted work is done, including the
+    // `PollType::wait_indefinitely` polls until all submitted work is done, including the
     // map operation. After that the channel must have a value.
-    device.poll(wgpu::Maintain::Wait);
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("device polling failed while waiting for map_async");
     rx.recv().expect("map_async never returned")
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{GpuContext, GpuInitError};
+    use std::ops::Deref;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static GPU_TEST_CONTEXT: OnceLock<Result<GpuContext, String>> = OnceLock::new();
+
+    pub(crate) struct TestGpuContext {
+        _guard: MutexGuard<'static, ()>,
+        ctx: &'static GpuContext,
+    }
+
+    impl Deref for TestGpuContext {
+        type Target = GpuContext;
+
+        fn deref(&self) -> &Self::Target {
+            self.ctx
+        }
+    }
+
+    pub(crate) fn ctx() -> Option<TestGpuContext> {
+        let guard = GPU_TEST_LOCK.lock().expect("GPU test lock poisoned");
+        match GPU_TEST_CONTEXT.get_or_init(|| GpuContext::headless().map_err(format_gpu_error)) {
+            Ok(ctx) => Some(TestGpuContext { _guard: guard, ctx }),
+            Err(e) => {
+                eprintln!("skipping GPU test: {e}");
+                None
+            }
+        }
+    }
+
+    fn format_gpu_error(error: GpuInitError) -> String {
+        error.to_string()
+    }
 }

@@ -46,7 +46,8 @@ new baseline rather than from the original sort.
 ## Render
 
 The trace view assembles a window of the raw trace, optionally runs CMR
-+ HP filter (CPU or GPU), then LTTB-downsamples per channel into
-`TraceVertex` buffers consumed by the wgpu pipeline. Other views
-(raster, ISI, CCG, features, drift map…) build their geometry directly
-in egui from the per-cluster slice borrows the session exposes.
+
+- HP filter (CPU or GPU), then LTTB-downsamples per channel into
+  `TraceVertex` buffers consumed by the wgpu pipeline. Other views
+  (raster, ISI, CCG, features, drift map…) build their geometry directly
+  in egui from the per-cluster slice borrows the session exposes.

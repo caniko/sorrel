@@ -9,13 +9,11 @@ use std::io::Write;
 use std::path::Path;
 
 fn write_npy_v1(path: &Path, descr: &str, shape_dim: usize, data: &[u8]) {
-    let dict = format!(
-        "{{'descr': '{descr}', 'fortran_order': False, 'shape': ({shape_dim},), }}"
-    );
+    let dict = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': ({shape_dim},), }}");
     let prelude_len = 6 + 2 + 2 + dict.len() + 1;
     let pad = (64 - (prelude_len % 64)) % 64;
     let mut header = dict.into_bytes();
-    header.extend(std::iter::repeat(b' ').take(pad));
+    header.resize(header.len() + pad, b' ');
     header.push(b'\n');
     let header_len = header.len() as u16;
 
@@ -43,9 +41,13 @@ fn write_fixture(root: &Path) {
     let times: [u64; 6] = [10, 30, 50, 100, 150, 200];
     let clusters: [u32; 6] = [0, 0, 1, 2, 0, 1];
     let times_bytes: Vec<u8> = times.iter().flat_map(|t| t.to_le_bytes()).collect();
-    let clusters_bytes: Vec<u8> =
-        clusters.iter().flat_map(|c| c.to_le_bytes()).collect();
-    write_npy_v1(&root.join("spike_times.npy"), "<i64", times.len(), &times_bytes);
+    let clusters_bytes: Vec<u8> = clusters.iter().flat_map(|c| c.to_le_bytes()).collect();
+    write_npy_v1(
+        &root.join("spike_times.npy"),
+        "<i64",
+        times.len(),
+        &times_bytes,
+    );
     write_npy_v1(
         &root.join("spike_clusters.npy"),
         "<u32",
@@ -70,17 +72,19 @@ fn merge_save_reopen_round_trips_cluster_assignments() {
 
     {
         let provider = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
-        let journal =
-            SqliteJournal::open(&root.join("sorrel.sqlite")).unwrap();
+        let journal = SqliteJournal::open(&root.join("sorrel.sqlite")).unwrap();
         let mut session = Session::new(provider, journal);
 
         // Merge cluster 0 into 2 and label 1 as 'noise'.
         session
-            .dispatch(CurationCommand::Merge { sources: vec![ClusterId(0)], target: ClusterId(2),
+            .dispatch(CurationCommand::Merge {
+                sources: vec![ClusterId(0)],
+                target: ClusterId(2),
             })
             .unwrap();
         session
-            .dispatch(CurationCommand::Relabel { cluster: ClusterId(1),
+            .dispatch(CurationCommand::Relabel {
+                cluster: ClusterId(1),
                 op: PhyLabelOp::SetNoise,
             })
             .unwrap();
@@ -96,13 +100,29 @@ fn merge_save_reopen_round_trips_cluster_assignments() {
 
     // Spike-clusters.npy was rewritten — cluster 2 should now hold the
     // pre-merge cluster 0 spikes too.
-    let provider_clusters: Vec<&[sorrel_io::SampleIndex]> = (0..provider.n_clusters()).map(sorrel_io::ClusterId).map(|c| provider.spike_times(c))
+    let provider_clusters: Vec<&[sorrel_io::SampleIndex]> = (0..provider.n_clusters())
+        .map(sorrel_io::ClusterId)
+        .map(|c| provider.spike_times(c))
         .collect();
-    assert!(provider_clusters[0].is_empty(), "cluster 0 should be empty after merge");
-    assert_eq!(provider_clusters[1], &[sorrel_io::SampleIndex(50), sorrel_io::SampleIndex(200)]);
+    assert!(
+        provider_clusters[0].is_empty(),
+        "cluster 0 should be empty after merge"
+    );
+    assert_eq!(
+        provider_clusters[1],
+        &[sorrel_io::SampleIndex(50), sorrel_io::SampleIndex(200)]
+    );
     let mut c2 = provider_clusters[2].to_vec();
     c2.sort_unstable();
-    assert_eq!(c2, vec![sorrel_io::SampleIndex(10), sorrel_io::SampleIndex(30), sorrel_io::SampleIndex(100), sorrel_io::SampleIndex(150)]);
+    assert_eq!(
+        c2,
+        vec![
+            sorrel_io::SampleIndex(10),
+            sorrel_io::SampleIndex(30),
+            sorrel_io::SampleIndex(100),
+            sorrel_io::SampleIndex(150)
+        ]
+    );
 }
 
 #[test]
@@ -119,7 +139,10 @@ fn split_save_reopen_introduces_new_cluster_id() {
         // Split spike at local idx 1 of cluster 0 (time = 30) off into a
         // freshly allocated cluster.
         session
-            .dispatch(CurationCommand::Split { cluster: ClusterId(0), spike_idx: vec![1], new_cluster: ClusterId(0), // ignored
+            .dispatch(CurationCommand::Split {
+                cluster: ClusterId(0),
+                spike_idx: vec![1],
+                new_cluster: ClusterId(0), // ignored
             })
             .unwrap();
         new_n_clusters = session.n_clusters();
@@ -129,7 +152,10 @@ fn split_save_reopen_introduces_new_cluster_id() {
     let provider = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
     assert_eq!(provider.n_clusters(), new_n_clusters);
     // Cluster 0 lost one spike (t=30).
-    assert_eq!(provider.spike_times(ClusterId(0)), &[SampleIndex(10), SampleIndex(150)]);
+    assert_eq!(
+        provider.spike_times(ClusterId(0)),
+        &[SampleIndex(10), SampleIndex(150)]
+    );
     // Cluster `new_n_clusters - 1` (the newly allocated id) has the moved spike.
     let new_id = ClusterId(new_n_clusters - 1);
     assert_eq!(provider.spike_times(new_id), &[SampleIndex(30)]);
@@ -148,12 +174,15 @@ fn replay_after_save_yields_identical_state() {
         let mut session = Session::new(provider, journal);
 
         session
-            .dispatch(CurationCommand::Relabel { cluster: ClusterId(0),
+            .dispatch(CurationCommand::Relabel {
+                cluster: ClusterId(0),
                 op: PhyLabelOp::SetGood,
             })
             .unwrap();
         session
-            .dispatch(CurationCommand::Merge { sources: vec![ClusterId(1)], target: ClusterId(2),
+            .dispatch(CurationCommand::Merge {
+                sources: vec![ClusterId(1)],
+                target: ClusterId(2),
             })
             .unwrap();
         // Save spike_clusters.npy / cluster_group.tsv — but the journal also
@@ -188,7 +217,10 @@ fn replay_after_save_yields_identical_state() {
     assert_eq!(session.label(ClusterId(0)), Some(PhyLabel::Good));
     // Cluster 1 was merged into 2 — so cluster 1 is empty, cluster 2 has both.
     assert!(session.spike_times(ClusterId(1)).is_empty());
-    assert_eq!(session.spike_times(ClusterId(2)), &[SampleIndex(50), SampleIndex(100), SampleIndex(200)]);
+    assert_eq!(
+        session.spike_times(ClusterId(2)),
+        &[SampleIndex(50), SampleIndex(100), SampleIndex(200)]
+    );
 }
 
 #[test]
@@ -204,7 +236,10 @@ fn undo_then_save_emits_pre_merge_state() {
         let mut session = Session::new(provider, journal);
 
         session
-            .dispatch(CurationCommand::Merge { sources: vec![ClusterId(0), ClusterId(1)], target: ClusterId(2) })
+            .dispatch(CurationCommand::Merge {
+                sources: vec![ClusterId(0), ClusterId(1)],
+                target: ClusterId(2),
+            })
             .unwrap();
         session.dispatch(CurationCommand::Undo).unwrap();
         save_to_phy(&session, root, label_str).unwrap();

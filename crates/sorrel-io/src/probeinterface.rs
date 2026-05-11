@@ -39,8 +39,8 @@ pub struct ProbeGeometry {
 impl ProbeGeometry {
     pub fn read(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         Self::from_json(&text)
     }
 
@@ -64,9 +64,7 @@ impl ProbeGeometry {
             let positions = probe
                 .get("contact_positions")
                 .and_then(|p| p.as_array())
-                .ok_or_else(|| {
-                    anyhow!("probe {probe_idx}: missing 'contact_positions'")
-                })?;
+                .ok_or_else(|| anyhow!("probe {probe_idx}: missing 'contact_positions'"))?;
             for (i, row) in positions.iter().enumerate() {
                 let pair = row.as_array().ok_or_else(|| {
                     anyhow!("probe {probe_idx} contact {i}: position is not an array")
@@ -93,7 +91,7 @@ impl ProbeGeometry {
                 all_shanks.extend(shanks_local.iter().map(|s| s + shank_offset));
                 shank_offset += max_id + 1;
             } else {
-                all_shanks.extend(std::iter::repeat(shank_offset).take(n_contacts));
+                all_shanks.resize(all_shanks.len() + n_contacts, shank_offset);
                 shank_offset += 1;
             }
 
@@ -106,8 +104,11 @@ impl ProbeGeometry {
                         anyhow!("probe {probe_idx}: device_channel_indices not integer")
                     })?;
                     // -1 means "disabled"; map onto u32::MAX as a sentinel.
-                    all_device_idx
-                        .push(if i < 0 { ChannelId(u32::MAX) } else { ChannelId(i as u32) });
+                    all_device_idx.push(if i < 0 {
+                        ChannelId(u32::MAX)
+                    } else {
+                        ChannelId(i as u32)
+                    });
                 }
             }
         }
@@ -146,7 +147,10 @@ mod tests {
         assert_eq!(p.channel_positions.len(), 3);
         assert_eq!(p.channel_positions[1], [10.0, 20.0]);
         assert_eq!(p.channel_shanks, vec![0, 0, 0]);
-        assert_eq!(p.channel_map, vec![ChannelId(2), ChannelId(0), ChannelId(1)]);
+        assert_eq!(
+            p.channel_map,
+            vec![ChannelId(2), ChannelId(0), ChannelId(1)]
+        );
     }
 
     #[test]

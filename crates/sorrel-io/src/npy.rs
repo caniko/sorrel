@@ -110,7 +110,10 @@ pub fn read_header(path: &Path) -> Result<NpyHeader> {
 
     let mut header = vec![0u8; header_len as usize];
     f.read_exact(&mut header)?;
-    let header = std::str::from_utf8(&header)?.trim().trim_end_matches('\0').trim();
+    let header = std::str::from_utf8(&header)?
+        .trim()
+        .trim_end_matches('\0')
+        .trim();
 
     let dtype = extract(header, "'descr':")?;
     let fortran_order = extract(header, "'fortran_order':")?;
@@ -287,19 +290,17 @@ fn write_npy_1d<F: FnOnce(&mut File) -> std::io::Result<()>>(
     n: usize,
     write_payload: F,
 ) -> Result<()> {
-    let dict = format!(
-        "{{'descr': '{descr}', 'fortran_order': False, 'shape': ({n},), }}"
-    );
+    let dict = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': ({n},), }}");
     // NPY 1.0 prelude: \x93NUMPY (6) + version (2) + header_len (2) + dict + \n.
     // Pad the dict so the prelude is a multiple of 64 bytes, matching the
     // numpy convention (and what our reader's tests expect for parity).
     let prelude_len = 6 + 2 + 2 + dict.len() + 1;
     let pad = (64 - (prelude_len % 64)) % 64;
     let mut header = dict.into_bytes();
-    header.extend(std::iter::repeat(b' ').take(pad));
+    header.resize(header.len() + pad, b' ');
     header.push(b'\n');
-    let header_len = u16::try_from(header.len())
-        .context("npy v1 header longer than u16::MAX — switch to v2")?;
+    let header_len =
+        u16::try_from(header.len()).context("npy v1 header longer than u16::MAX — switch to v2")?;
 
     let mut f = File::create(path).with_context(|| format!("create {}", path.display()))?;
     f.write_all(b"\x93NUMPY")?;
@@ -338,15 +339,14 @@ mod tests {
             let inner: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
             format!("({})", inner.join(", "))
         };
-        let dict = format!(
-            "{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape_str}, }}"
-        );
+        let dict =
+            format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape_str}, }}");
         // Pad header so total prelude is a multiple of 64 (NPY convention,
         // not strictly required by our parser but matches real files).
         let prelude_len = 6 + 2 + 2 + dict.len() + 1;
         let pad = (64 - (prelude_len % 64)) % 64;
         let mut header = dict.into_bytes();
-        header.extend(std::iter::repeat(b' ').take(pad));
+        header.resize(header.len() + pad, b' ');
         header.push(b'\n');
         let header_len = header.len() as u16;
 
@@ -543,12 +543,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("ws.npy");
         // Hand-craft a dict with extra spaces.
-        let dict =
-            "{   'descr':   '<f4'  ,  'fortran_order':  False  ,  'shape':  (3,)  ,  }";
+        let dict = "{   'descr':   '<f4'  ,  'fortran_order':  False  ,  'shape':  (3,)  ,  }";
         let prelude_len = 6 + 2 + 2 + dict.len() + 1;
         let pad = (64 - (prelude_len % 64)) % 64;
         let mut header = dict.as_bytes().to_vec();
-        header.extend(std::iter::repeat(b' ').take(pad));
+        header.resize(header.len() + pad, b' ');
         header.push(b'\n');
         let header_len = header.len() as u16;
         let mut f = std::fs::File::create(&p).unwrap();
@@ -556,7 +555,7 @@ mod tests {
         f.write_all(&[1u8, 0u8]).unwrap();
         f.write_all(&header_len.to_le_bytes()).unwrap();
         f.write_all(&header).unwrap();
-        let data: Vec<u8> = vec![1.0_f32, 2.0, 3.0]
+        let data: Vec<u8> = [1.0_f32, 2.0, 3.0]
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
@@ -576,7 +575,7 @@ mod tests {
         let prelude_len = 6 + 2 + 2 + dict.len() + 1;
         let pad = (64 - (prelude_len % 64)) % 64;
         let mut header = dict.as_bytes().to_vec();
-        header.extend(std::iter::repeat(b' ').take(pad));
+        header.resize(header.len() + pad, b' ');
         header.push(b'\n');
         let header_len = header.len() as u16;
         let mut f = std::fs::File::create(&p).unwrap();

@@ -3,8 +3,8 @@ use crate::command::{CurationCommand, PhyLabelOp};
 use crate::journal::SqliteJournal;
 use anyhow::{bail, Result};
 use sorrel_io::{
-    ClusterId, DataProvider, HasAmplitudes, HasPcFeatures, HasSpikeTemplates,
-    HasTemplateWaveforms, SampleIndex,
+    ClusterId, DataProvider, HasAmplitudes, HasPcFeatures, HasSpikeTemplates, HasTemplateWaveforms,
+    SampleIndex,
 };
 
 /// Internal inverse-operation record. Lives only in memory, never journaled —
@@ -474,14 +474,23 @@ mod tests {
     impl DataProvider for MockProvider {
         type Label = MockLabel;
 
-        fn sample_rate(&self) -> f32 { 1000.0 }
-        fn n_channels(&self) -> u32 { self.n_channels }
+        fn sample_rate(&self) -> f32 {
+            1000.0
+        }
+        fn n_channels(&self) -> u32 {
+            self.n_channels
+        }
         fn n_samples(&self) -> SampleIndex {
             SampleIndex((self.trace.len() / self.n_channels.max(1) as usize) as u64)
         }
-        fn n_clusters(&self) -> u32 { self.spikes.len() as u32 }
+        fn n_clusters(&self) -> u32 {
+            self.spikes.len() as u32
+        }
         fn spike_times(&self, cluster: ClusterId) -> &[SampleIndex] {
-            self.spikes.get(cluster.idx()).map(Vec::as_slice).unwrap_or(&[])
+            self.spikes
+                .get(cluster.idx())
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
         }
         fn trace(&self, start: SampleIndex, len: u32) -> TraceSlice<'_> {
             let nc = self.n_channels as usize;
@@ -493,7 +502,9 @@ mod tests {
                 samples: TraceSamples::I16(&self.trace[s..e]),
             }
         }
-        fn initial_labels(&self) -> Vec<Self::Label> { self.labels.clone() }
+        fn initial_labels(&self) -> Vec<Self::Label> {
+            self.labels.clone()
+        }
     }
 
     impl ApplyPhyLabel for MockProvider {
@@ -509,7 +520,11 @@ mod tests {
 
     fn fresh_session() -> (Session<MockProvider>, tempfile::TempDir) {
         let provider = MockProvider {
-            spikes: vec![vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)], vec![SampleIndex(20), SampleIndex(200)], vec![SampleIndex(100)]],
+            spikes: vec![
+                vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
+                vec![SampleIndex(20), SampleIndex(200)],
+                vec![SampleIndex(100)],
+            ],
             labels: vec![MockLabel::Unsorted; 3],
             trace: vec![0i16; 4 * 16],
             n_channels: 4,
@@ -529,14 +544,21 @@ mod tests {
         assert_eq!(s.history_len(), 0);
         assert_eq!(s.redo_len(), 0);
         // Bucketed access flows through the ClusterIndex now.
-        assert_eq!(s.spike_times(ClusterId(0)), &[SampleIndex(10), SampleIndex(30), SampleIndex(150)]);
+        assert_eq!(
+            s.spike_times(ClusterId(0)),
+            &[SampleIndex(10), SampleIndex(30), SampleIndex(150)]
+        );
         assert_eq!(s.spike_times(ClusterId(2)), &[SampleIndex(100)]);
     }
 
     #[test]
     fn dispatch_relabel_updates_label_and_history() {
         let (mut s, _d) = fresh_session();
-        s.dispatch(CurationCommand::Relabel { cluster: ClusterId(1), op: PhyLabelOp::SetGood }).unwrap();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(1),
+            op: PhyLabelOp::SetGood,
+        })
+        .unwrap();
         assert_eq!(s.label(ClusterId(1)), Some(MockLabel::Good));
         assert_eq!(s.history_len(), 1);
     }
@@ -544,10 +566,24 @@ mod tests {
     #[test]
     fn dispatch_merge_reassigns_spikes_to_target() {
         let (mut s, _d) = fresh_session();
-        s.dispatch(CurationCommand::Merge { sources: vec![ClusterId(0), ClusterId(1)], target: ClusterId(2) }).unwrap();
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(0), ClusterId(1)],
+            target: ClusterId(2),
+        })
+        .unwrap();
         assert!(s.spike_times(ClusterId(0)).is_empty());
         assert!(s.spike_times(ClusterId(1)).is_empty());
-        assert_eq!(s.spike_times(ClusterId(2)), &[SampleIndex(10), SampleIndex(20), SampleIndex(30), SampleIndex(100), SampleIndex(150), SampleIndex(200)]);
+        assert_eq!(
+            s.spike_times(ClusterId(2)),
+            &[
+                SampleIndex(10),
+                SampleIndex(20),
+                SampleIndex(30),
+                SampleIndex(100),
+                SampleIndex(150),
+                SampleIndex(200)
+            ]
+        );
         // Labels are NOT changed by merge anymore — phy keeps source labels
         // alongside the empty bucket and lets the user filter "no spikes".
         assert_eq!(s.label(ClusterId(0)), Some(MockLabel::Unsorted));
@@ -556,12 +592,23 @@ mod tests {
     #[test]
     fn undo_merge_restores_buckets_and_source_labels() {
         let (mut s, _d) = fresh_session();
-        s.dispatch(CurationCommand::Relabel { cluster: ClusterId(0), op: PhyLabelOp::SetGood }).unwrap();
-        s.dispatch(CurationCommand::Merge { sources: vec![ClusterId(0)], target: ClusterId(2) }).unwrap();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetGood,
+        })
+        .unwrap();
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(0)],
+            target: ClusterId(2),
+        })
+        .unwrap();
         assert!(s.spike_times(ClusterId(0)).is_empty());
 
         s.dispatch(CurationCommand::Undo).unwrap();
-        assert_eq!(s.spike_times(ClusterId(0)), &[SampleIndex(10), SampleIndex(30), SampleIndex(150)]);
+        assert_eq!(
+            s.spike_times(ClusterId(0)),
+            &[SampleIndex(10), SampleIndex(30), SampleIndex(150)]
+        );
         assert_eq!(s.label(ClusterId(0)), Some(MockLabel::Good));
     }
 
@@ -569,9 +616,18 @@ mod tests {
     fn batch_applies_children_in_order_and_undoes_atomically() {
         let (mut s, _d) = fresh_session();
         let batch = CurationCommand::batch(vec![
-            CurationCommand::Relabel { cluster: ClusterId(0), op: PhyLabelOp::SetGood },
-            CurationCommand::Relabel { cluster: ClusterId(1), op: PhyLabelOp::SetMua },
-            CurationCommand::Merge { sources: vec![ClusterId(0)], target: ClusterId(1) },
+            CurationCommand::Relabel {
+                cluster: ClusterId(0),
+                op: PhyLabelOp::SetGood,
+            },
+            CurationCommand::Relabel {
+                cluster: ClusterId(1),
+                op: PhyLabelOp::SetMua,
+            },
+            CurationCommand::Merge {
+                sources: vec![ClusterId(0)],
+                target: ClusterId(1),
+            },
         ])
         .unwrap();
         s.dispatch(batch).unwrap();
@@ -585,7 +641,10 @@ mod tests {
         s.dispatch(CurationCommand::Undo).unwrap();
         assert_eq!(s.label(ClusterId(0)), Some(MockLabel::Unsorted));
         assert_eq!(s.label(ClusterId(1)), Some(MockLabel::Unsorted));
-        assert_eq!(s.spike_times(ClusterId(0)), &[SampleIndex(10), SampleIndex(30), SampleIndex(150)]);
+        assert_eq!(
+            s.spike_times(ClusterId(0)),
+            &[SampleIndex(10), SampleIndex(30), SampleIndex(150)]
+        );
         assert_eq!(s.history_len(), 0);
         assert_eq!(s.redo_len(), 1);
 
@@ -617,7 +676,10 @@ mod tests {
         })
         .unwrap();
         assert_eq!(s.n_clusters(), n_before + 1);
-        assert_eq!(s.spike_times(ClusterId(0)), &[SampleIndex(10), SampleIndex(150)]);
+        assert_eq!(
+            s.spike_times(ClusterId(0)),
+            &[SampleIndex(10), SampleIndex(150)]
+        );
         assert_eq!(s.spike_times(ClusterId(n_before)), &[SampleIndex(30)]);
     }
 
@@ -626,7 +688,11 @@ mod tests {
         let (mut s, _d) = fresh_session();
         let n_before = s.n_clusters();
         let pre = s.spike_times(ClusterId(0)).to_vec();
-        s.dispatch(CurationCommand::Split { cluster: ClusterId(0), spike_idx: vec![0, 2], new_cluster: ClusterId(0) })
+        s.dispatch(CurationCommand::Split {
+            cluster: ClusterId(0),
+            spike_idx: vec![0, 2],
+            new_cluster: ClusterId(0),
+        })
         .unwrap();
         s.dispatch(CurationCommand::Undo).unwrap();
         assert_eq!(s.n_clusters(), n_before);
@@ -636,7 +702,11 @@ mod tests {
     #[test]
     fn dispatch_note_is_a_noop() {
         let (mut s, _d) = fresh_session();
-        s.dispatch(CurationCommand::Note { cluster: ClusterId(0), text: "x".into() }).unwrap();
+        s.dispatch(CurationCommand::Note {
+            cluster: ClusterId(0),
+            text: "x".into(),
+        })
+        .unwrap();
         assert_eq!(s.label(ClusterId(0)), Some(MockLabel::Unsorted));
         assert_eq!(s.history_len(), 1);
     }
@@ -644,7 +714,11 @@ mod tests {
     #[test]
     fn undo_restores_previous_label() {
         let (mut s, _d) = fresh_session();
-        s.dispatch(CurationCommand::Relabel { cluster: ClusterId(1), op: PhyLabelOp::SetGood }).unwrap();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(1),
+            op: PhyLabelOp::SetGood,
+        })
+        .unwrap();
         assert_eq!(s.label(ClusterId(1)), Some(MockLabel::Good));
 
         s.dispatch(CurationCommand::Undo).unwrap();
@@ -656,7 +730,11 @@ mod tests {
     #[test]
     fn redo_reapplies_after_undo() {
         let (mut s, _d) = fresh_session();
-        s.dispatch(CurationCommand::Relabel { cluster: ClusterId(1), op: PhyLabelOp::SetMua }).unwrap();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(1),
+            op: PhyLabelOp::SetMua,
+        })
+        .unwrap();
         s.dispatch(CurationCommand::Undo).unwrap();
         assert_eq!(s.label(ClusterId(1)), Some(MockLabel::Unsorted));
         s.dispatch(CurationCommand::Redo).unwrap();
@@ -668,23 +746,48 @@ mod tests {
     #[test]
     fn redo_merge_reapplies_spike_reassignment() {
         let (mut s, _d) = fresh_session();
-        s.dispatch(CurationCommand::Merge { sources: vec![ClusterId(0), ClusterId(1)], target: ClusterId(2) }).unwrap();
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(0), ClusterId(1)],
+            target: ClusterId(2),
+        })
+        .unwrap();
         s.dispatch(CurationCommand::Undo).unwrap();
-        assert_eq!(s.spike_times(ClusterId(0)), &[SampleIndex(10), SampleIndex(30), SampleIndex(150)]);
+        assert_eq!(
+            s.spike_times(ClusterId(0)),
+            &[SampleIndex(10), SampleIndex(30), SampleIndex(150)]
+        );
 
         s.dispatch(CurationCommand::Redo).unwrap();
         assert!(s.spike_times(ClusterId(0)).is_empty());
-        assert_eq!(s.spike_times(ClusterId(2)), &[SampleIndex(10), SampleIndex(20), SampleIndex(30), SampleIndex(100), SampleIndex(150), SampleIndex(200)]);
+        assert_eq!(
+            s.spike_times(ClusterId(2)),
+            &[
+                SampleIndex(10),
+                SampleIndex(20),
+                SampleIndex(30),
+                SampleIndex(100),
+                SampleIndex(150),
+                SampleIndex(200)
+            ]
+        );
     }
 
     #[test]
     fn forward_op_after_undo_clears_redo() {
         let (mut s, _d) = fresh_session();
-        s.dispatch(CurationCommand::Relabel { cluster: ClusterId(0), op: PhyLabelOp::SetGood }).unwrap();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetGood,
+        })
+        .unwrap();
         s.dispatch(CurationCommand::Undo).unwrap();
         assert_eq!(s.redo_len(), 1);
 
-        s.dispatch(CurationCommand::Relabel { cluster: ClusterId(0), op: PhyLabelOp::SetMua }).unwrap();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetMua,
+        })
+        .unwrap();
         assert_eq!(s.redo_len(), 0);
         assert_eq!(s.label(ClusterId(0)), Some(MockLabel::Mua));
     }
@@ -700,7 +803,11 @@ mod tests {
     #[test]
     fn redo_with_empty_redo_stack_is_a_noop() {
         let (mut s, _d) = fresh_session();
-        s.dispatch(CurationCommand::Relabel { cluster: ClusterId(0), op: PhyLabelOp::SetGood }).unwrap();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetGood,
+        })
+        .unwrap();
         s.dispatch(CurationCommand::Redo).unwrap();
         assert_eq!(s.label(ClusterId(0)), Some(MockLabel::Good));
         assert_eq!(s.redo_len(), 0);
@@ -709,9 +816,21 @@ mod tests {
     #[test]
     fn multi_step_undo_walks_the_stack_in_reverse() {
         let (mut s, _d) = fresh_session();
-        s.dispatch(CurationCommand::Relabel { cluster: ClusterId(0), op: PhyLabelOp::SetGood }).unwrap();
-        s.dispatch(CurationCommand::Relabel { cluster: ClusterId(0), op: PhyLabelOp::SetMua }).unwrap();
-        s.dispatch(CurationCommand::Relabel { cluster: ClusterId(0), op: PhyLabelOp::SetNoise }).unwrap();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetGood,
+        })
+        .unwrap();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetMua,
+        })
+        .unwrap();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetNoise,
+        })
+        .unwrap();
         assert_eq!(s.label(ClusterId(0)), Some(MockLabel::Noise));
 
         s.dispatch(CurationCommand::Undo).unwrap();
@@ -729,13 +848,25 @@ mod tests {
         let path = dir.path().join("j.sqlite");
         {
             let mut j = SqliteJournal::open(&path).unwrap();
-            j.append(&CurationCommand::Relabel { cluster: ClusterId(0), op: PhyLabelOp::SetMua }).unwrap();
-            j.append(&CurationCommand::Relabel { cluster: ClusterId(1), op: PhyLabelOp::SetNoise }).unwrap();
+            j.append(&CurationCommand::Relabel {
+                cluster: ClusterId(0),
+                op: PhyLabelOp::SetMua,
+            })
+            .unwrap();
+            j.append(&CurationCommand::Relabel {
+                cluster: ClusterId(1),
+                op: PhyLabelOp::SetNoise,
+            })
+            .unwrap();
             j.append(&CurationCommand::Undo).unwrap();
         }
 
         let provider = MockProvider {
-            spikes: vec![vec![SampleIndex(1)], vec![SampleIndex(2)], vec![SampleIndex(3)]],
+            spikes: vec![
+                vec![SampleIndex(1)],
+                vec![SampleIndex(2)],
+                vec![SampleIndex(3)],
+            ],
             labels: vec![MockLabel::Unsorted; 3],
             trace: vec![],
             n_channels: 1,
@@ -777,11 +908,19 @@ mod tests {
         let path = dir.path().join("j.sqlite");
         {
             let mut j = SqliteJournal::open(&path).unwrap();
-            j.append(&CurationCommand::Merge { sources: vec![ClusterId(0), ClusterId(1)], target: ClusterId(2) }).unwrap();
+            j.append(&CurationCommand::Merge {
+                sources: vec![ClusterId(0), ClusterId(1)],
+                target: ClusterId(2),
+            })
+            .unwrap();
         }
 
         let provider = MockProvider {
-            spikes: vec![vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)], vec![SampleIndex(20), SampleIndex(200)], vec![SampleIndex(100)]],
+            spikes: vec![
+                vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
+                vec![SampleIndex(20), SampleIndex(200)],
+                vec![SampleIndex(100)],
+            ],
             labels: vec![MockLabel::Unsorted; 3],
             trace: vec![],
             n_channels: 1,
@@ -790,7 +929,17 @@ mod tests {
         let mut session = Session::new(provider, journal);
         session.replay_journal().unwrap();
 
-        assert_eq!(session.spike_times(ClusterId(2)), &[SampleIndex(10), SampleIndex(20), SampleIndex(30), SampleIndex(100), SampleIndex(150), SampleIndex(200)]);
+        assert_eq!(
+            session.spike_times(ClusterId(2)),
+            &[
+                SampleIndex(10),
+                SampleIndex(20),
+                SampleIndex(30),
+                SampleIndex(100),
+                SampleIndex(150),
+                SampleIndex(200)
+            ]
+        );
         assert!(session.spike_times(ClusterId(0)).is_empty());
     }
 }
