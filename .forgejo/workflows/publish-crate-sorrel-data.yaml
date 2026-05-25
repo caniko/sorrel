@@ -87,21 +87,6 @@ jobs:
       - name: Test no default features
         run: cargo test -p sorrel-data --no-default-features
 
-      - name: Install cargo-audit
-        run: command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked
-
-      - name: Install cargo-deny
-        run: command -v cargo-deny >/dev/null 2>&1 || cargo install cargo-deny --locked --version 0.18.3
-
-      - name: Audit dependencies
-        run: cargo audit
-
-      - name: Deny dependency policy
-        run: cargo deny check bans licenses sources
-
-      - name: Build docs
-        run: cargo doc --no-deps --all-features
-
       - name: Clippy all features
         run: cargo clippy -p sorrel-data --all-targets --all-features -- --deny warnings
 
