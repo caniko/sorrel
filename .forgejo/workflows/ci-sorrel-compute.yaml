@@ -40,7 +40,7 @@ jobs:
         run: cargo audit
 
       - name: Deny dependency policy
-        run: cargo deny check
+        run: cargo deny check bans licenses sources
 
       - name: Build docs
         run: cargo doc -p sorrel-compute --no-deps --all-features
