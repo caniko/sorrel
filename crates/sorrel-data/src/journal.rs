@@ -20,8 +20,8 @@ impl SqliteJournal {
 
         // Synchronous=FULL: the call returns only after fsync, satisfying
         // the "durably recorded before UI updates" requirement.
-        conn.pragma_update(None, "journal_mode", &"WAL")?;
-        conn.pragma_update(None, "synchronous", &"FULL")?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
 
         conn.execute_batch(
             r#"
