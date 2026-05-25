@@ -49,4 +49,4 @@ jobs:
         run: cargo clippy -p sorrel-render --all-targets --all-features -- --deny warnings
 
       - name: Package crate
-        run: cargo package -p sorrel-render --allow-dirty
+        run: cargo package -p sorrel-render --allow-dirty --list
