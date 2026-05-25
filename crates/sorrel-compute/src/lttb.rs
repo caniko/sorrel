@@ -28,9 +28,9 @@ where
         let avg_count = (avg_end - avg_start).max(1);
         let mut avg_x = 0.0f32;
         let mut avg_y = 0.0f32;
-        for j in avg_start..avg_end {
+        for (j, sample) in samples.iter().enumerate().take(avg_end).skip(avg_start) {
             avg_x += x_origin + x_step * j as f32;
-            avg_y += samples[j].into();
+            avg_y += (*sample).into();
         }
         avg_x /= avg_count as f32;
         avg_y /= avg_count as f32;
@@ -44,9 +44,9 @@ where
 
         let mut max_area = -1.0f32;
         let mut max_idx = range_start;
-        for j in range_start..range_end {
+        for (j, sample) in samples.iter().enumerate().take(range_end).skip(range_start) {
             let x = x_origin + x_step * j as f32;
-            let y: f32 = samples[j].into();
+            let y: f32 = (*sample).into();
             let area = ((pa_x - avg_x) * (y - pa_y) - (pa_x - x) * (avg_y - pa_y)).abs() * 0.5;
             if area > max_area {
                 max_area = area;
