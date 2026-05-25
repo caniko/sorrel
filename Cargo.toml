@@ -17,11 +17,11 @@ repository = "https://codeberg.org/caniko/sorrel"
 rust-version = "1.78"
 
 [workspace.dependencies]
-sorrel-io = { path = "crates/sorrel-io" }
-sorrel-compute = { path = "crates/sorrel-compute" }
-sorrel-data = { path = "crates/sorrel-data" }
-sorrel-render = { path = "crates/sorrel-render" }
-sorrel-ui = { path = "crates/sorrel-ui" }
+sorrel-io = { version = "0.1.0", path = "crates/sorrel-io" }
+sorrel-compute = { version = "0.1.0", path = "crates/sorrel-compute" }
+sorrel-data = { version = "0.1.0", path = "crates/sorrel-data" }
+sorrel-render = { version = "0.1.0", path = "crates/sorrel-render" }
+sorrel-ui = { version = "0.1.0", path = "crates/sorrel-ui" }
 
 anyhow = "1"
 thiserror = "1"
