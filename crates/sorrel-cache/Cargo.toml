@@ -1,0 +1,17 @@
+[package]
+name = "sorrel-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+blake3.workspace = true
+bytemuck.workspace = true
+memmap2.workspace = true
+rkyv.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

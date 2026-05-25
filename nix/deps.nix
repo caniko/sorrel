@@ -5,6 +5,8 @@
   # the `bundled` feature, so libsqlite is compiled by cc — no system
   # sqlite needed in buildInputs.
   nativeBuildInputs = with pkgs; [
+    clang
+    mold
     pkg-config
   ];
 
