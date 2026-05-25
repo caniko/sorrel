@@ -1,6 +1,7 @@
 //! sorrel-data: the monomorphised core. `Session<P>` is generic over a
 //! `DataProvider`, so the entire state machine specialises per backend.
 
+pub mod cache;
 pub mod cluster_index;
 pub mod command;
 pub mod feature_subspace;
@@ -12,6 +13,7 @@ pub mod save;
 pub mod session;
 pub mod suggest;
 
+pub use cache::correlograms::{acg_or_compute, ccg_or_compute};
 pub use cluster_index::{ClusterIndex, MergeRecord, SplitRecord};
 pub use command::{CurationCommand, PhyLabelOp};
 pub use feature_subspace::{

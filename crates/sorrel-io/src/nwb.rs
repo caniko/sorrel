@@ -60,6 +60,7 @@ mod imp {
         spikes_per_cluster: Vec<Vec<SampleIndex>>,
         initial_labels: Vec<PhyLabel>,
         channel_positions: Vec<[f32; 2]>,
+        identity_bytes: Vec<u8>,
         // Eagerly-loaded trace buffer; HDF5 datasets are typically chunked
         // and compressed so we can't mmap. Stored as raw bytes and reinterpreted
         // at access time, just like the other providers.
@@ -70,6 +71,7 @@ mod imp {
         pub fn open(path: impl AsRef<Path>) -> Result<Self> {
             let path = path.as_ref();
             let f = H5File::open(path).with_context(|| format!("open NWB {}", path.display()))?;
+            let identity_bytes = provider_identity_bytes(path);
 
             // 1. ElectricalSeries: first dataset under /acquisition that has
             // both `data` and a sampling rate (either explicit field or
@@ -94,6 +96,7 @@ mod imp {
                 spikes_per_cluster,
                 initial_labels,
                 channel_positions,
+                identity_bytes,
                 trace_buf,
             })
         }
@@ -144,9 +147,34 @@ mod imp {
             self.initial_labels.clone()
         }
 
+        fn identity_bytes(&self) -> Vec<u8> {
+            self.identity_bytes.clone()
+        }
+
         fn amplitude_full_scale(&self) -> f32 {
             self.dtype.nominal_full_scale()
         }
+    }
+
+    fn provider_identity_bytes(path: &Path) -> Vec<u8> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"sorrel-provider-identity-v1/nwb");
+        hasher.update(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .as_bytes(),
+        );
+        if let Ok(meta) = std::fs::metadata(path) {
+            hasher.update(&meta.len().to_le_bytes());
+            if let Ok(modified) = meta.modified() {
+                if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                    hasher.update(&duration.as_secs().to_le_bytes());
+                    hasher.update(&duration.subsec_nanos().to_le_bytes());
+                }
+            }
+        }
+        hasher.finalize().as_bytes().to_vec()
     }
 
     impl HasGeometry for NwbProvider {

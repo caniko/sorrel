@@ -1,11 +1,22 @@
+use crate::cache::amplitudes::{
+    CachedAmplitudes, ALGO_VERSION as AMPLITUDES_ALGO_VERSION, KIND as AMPLITUDES_KIND,
+};
+use crate::cache::{isolation, pc_subspace};
 use crate::cluster_index::{ClusterIndex, MergeRecord, SplitRecord};
 use crate::command::{CurationCommand, PhyLabelOp};
+use crate::feature_subspace::{DEFAULT_CHANNEL_IDX, DEFAULT_D, DEFAULT_MAX_BACKGROUND};
 use crate::journal::SqliteJournal;
+use crate::quality_ext::DEFAULT_K_NN;
 use anyhow::{bail, Result};
+use sorrel_cache::{CacheKey, CacheStore, Fingerprint};
 use sorrel_io::{
     ClusterId, DataProvider, HasAmplitudes, HasPcFeatures, HasSpikeTemplates, HasTemplateWaveforms,
     SampleIndex,
 };
+use std::collections::VecDeque;
+use std::path::Path;
+
+const MAX_CACHE_INVALIDATIONS: usize = 1024;
 
 /// Internal inverse-operation record. Lives only in memory, never journaled —
 /// the journal stores only the user-visible `CurationCommand`. The inverse
@@ -42,6 +53,20 @@ struct HistoryEntry<L: Copy> {
     inverse: InverseOp<L>,
 }
 
+#[derive(Clone, Debug)]
+struct CacheClusterIdentity {
+    cluster: ClusterId,
+    spike_count: usize,
+    cluster_spike_fingerprint: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+struct CacheInvalidation {
+    prev_head: u64,
+    new_head: u64,
+    clusters: Vec<CacheClusterIdentity>,
+}
+
 /// The core, generic curation session. `Session<P>` is monomorphised once per
 /// backend type so calls into `provider` are inlined and devirtualised.
 ///
@@ -58,6 +83,7 @@ pub struct Session<P: DataProvider> {
     journal: SqliteJournal,
     history: Vec<HistoryEntry<P::Label>>,
     redo: Vec<HistoryEntry<P::Label>>,
+    cache_invalidations: VecDeque<CacheInvalidation>,
 }
 
 impl<P: DataProvider> Session<P> {
@@ -71,6 +97,7 @@ impl<P: DataProvider> Session<P> {
             journal,
             history: Vec::new(),
             redo: Vec::new(),
+            cache_invalidations: VecDeque::new(),
         }
     }
 
@@ -80,7 +107,133 @@ impl<P: DataProvider> Session<P> {
     where
         P: HasAmplitudes,
     {
-        self.cluster_index.seed_amplitudes(&self.provider);
+        let key = self.amplitudes_cache_key();
+        let Some(dataset_dir) = self.journal.path().parent() else {
+            self.cluster_index.seed_amplitudes(&self.provider);
+            return;
+        };
+
+        match CacheStore::open(dataset_dir) {
+            Ok(store) => {
+                match store.get::<CachedAmplitudes>(&key) {
+                    Ok(Some(cached)) => {
+                        log::debug!("cache hit {}/{}", AMPLITUDES_KIND, key.fingerprint.hex());
+                        let buckets = cached
+                            .per_cluster
+                            .iter()
+                            .map(|bucket| {
+                                bucket
+                                    .as_slice()
+                                    .iter()
+                                    .map(|amp| amp.to_native())
+                                    .collect()
+                            })
+                            .collect();
+                        self.cluster_index.seed_amplitudes_from_buckets(buckets);
+                        return;
+                    }
+                    Ok(None) => {
+                        log::debug!("cache miss {}/{}", AMPLITUDES_KIND, key.fingerprint.hex());
+                    }
+                    Err(err) => {
+                        log::debug!(
+                            "cache miss {}/{} after read error: {err}",
+                            AMPLITUDES_KIND,
+                            key.fingerprint.hex()
+                        );
+                    }
+                }
+
+                self.cluster_index.seed_amplitudes(&self.provider);
+                let value = CachedAmplitudes {
+                    per_cluster: (0..self.cluster_index.n_clusters())
+                        .map(ClusterId)
+                        .map(|cluster| self.cluster_index.spike_amplitudes(cluster).to_vec())
+                        .collect(),
+                    algo_version: AMPLITUDES_ALGO_VERSION,
+                };
+                if let Err(err) = store.put(&key, &value) {
+                    log::debug!(
+                        "failed to write cache {}/{}: {err}",
+                        AMPLITUDES_KIND,
+                        key.fingerprint.hex()
+                    );
+                }
+            }
+            Err(err) => {
+                log::debug!(
+                    "cache miss {}/{} after open error: {err}",
+                    AMPLITUDES_KIND,
+                    key.fingerprint.hex()
+                );
+                self.cluster_index.seed_amplitudes(&self.provider);
+            }
+        }
+    }
+
+    fn amplitudes_cache_key(&self) -> CacheKey {
+        let fingerprint = Fingerprint::builder()
+            .add_provider_identity(&self.provider.identity_bytes())
+            .add_journal_head(self.journal.head())
+            .add_algo_version(AMPLITUDES_ALGO_VERSION)
+            .finish();
+        CacheKey::new(AMPLITUDES_KIND, AMPLITUDES_ALGO_VERSION, fingerprint)
+    }
+
+    pub(crate) fn cache_dataset_dir(&self) -> Option<&Path> {
+        self.journal.path().parent()
+    }
+
+    pub(crate) fn journal_head(&self) -> u64 {
+        self.journal.head()
+    }
+
+    /// Evict cache entries known to have been derived from pre-edit journal
+    /// heads. This is intentionally called at save/quit boundaries, not after
+    /// each command, so a running session keeps its warm in-memory state.
+    pub fn invalidate_caches(
+        &self,
+        store: &CacheStore,
+    ) -> std::result::Result<(), sorrel_cache::CacheError> {
+        let provider_identity = self.provider.identity_bytes();
+        for entry in &self.cache_invalidations {
+            if entry.prev_head == entry.new_head {
+                continue;
+            }
+            store.evict(&amplitudes_cache_key_for(
+                &provider_identity,
+                entry.prev_head,
+            ))?;
+
+            for cluster in &entry.clusters {
+                if cluster.spike_count == 0 {
+                    continue;
+                }
+                let subspace_key = pc_subspace::key(
+                    &provider_identity,
+                    entry.prev_head,
+                    cluster.cluster,
+                    cluster.spike_count,
+                    cluster.cluster_spike_fingerprint,
+                    DEFAULT_D,
+                    DEFAULT_CHANNEL_IDX,
+                    DEFAULT_MAX_BACKGROUND,
+                );
+                store.evict(&subspace_key)?;
+                store.evict(&isolation::key(&subspace_key, DEFAULT_K_NN))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Open the dataset-local cache and apply pending invalidations. Missing
+    /// cache directories are not errors: the cache is derivable.
+    pub fn invalidate_dataset_caches(&self) -> std::result::Result<(), sorrel_cache::CacheError> {
+        let Some(dataset_dir) = self.cache_dataset_dir() else {
+            return Ok(());
+        };
+        let store = CacheStore::open(dataset_dir)?;
+        self.invalidate_caches(&store)
     }
 
     /// Pull per-spike template ids from the provider.
@@ -240,8 +393,13 @@ impl<P: DataProvider> Session<P> {
             CurationCommand::Redo if self.redo.is_empty() => return Ok(()),
             _ => {}
         }
+        let prev_head = self.journal.head();
+        let affected = self.cache_identities_for_command(&cmd);
         self.journal.append(&cmd)?;
-        self.apply_record(cmd)
+        let new_head = self.journal.head();
+        self.apply_record(cmd)?;
+        self.record_cache_invalidation(prev_head, new_head, affected);
+        Ok(())
     }
 
     /// Apply a single journal record (used both by `dispatch` after the
@@ -377,6 +535,92 @@ impl<P: DataProvider> Session<P> {
             }
         }
     }
+
+    fn record_cache_invalidation(
+        &mut self,
+        prev_head: u64,
+        new_head: u64,
+        clusters: Vec<CacheClusterIdentity>,
+    ) {
+        if prev_head == new_head {
+            return;
+        }
+        if self.cache_invalidations.len() == MAX_CACHE_INVALIDATIONS {
+            self.cache_invalidations.pop_front();
+        }
+        self.cache_invalidations.push_back(CacheInvalidation {
+            prev_head,
+            new_head,
+            clusters,
+        });
+    }
+
+    fn cache_identities_for_command(&self, cmd: &CurationCommand) -> Vec<CacheClusterIdentity> {
+        let clusters = match cmd {
+            CurationCommand::Undo | CurationCommand::Redo => {
+                (0..self.n_clusters()).map(ClusterId).collect()
+            }
+            forward => affected_clusters(forward),
+        };
+        clusters
+            .into_iter()
+            .filter(|cluster| cluster.0 < self.n_clusters())
+            .map(|cluster| self.cache_identity(cluster))
+            .collect()
+    }
+
+    fn cache_identity(&self, cluster: ClusterId) -> CacheClusterIdentity {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"sorrel-pc-subspace-cluster-spikes-v1");
+        let mut count = 0usize;
+        for (global_idx, &assigned) in self.spike_clusters_global().iter().enumerate() {
+            if assigned == cluster {
+                count += 1;
+                hasher.update(&(global_idx as u64).to_le_bytes());
+            }
+        }
+        CacheClusterIdentity {
+            cluster,
+            spike_count: count,
+            cluster_spike_fingerprint: *hasher.finalize().as_bytes(),
+        }
+    }
+}
+
+fn affected_clusters(cmd: &CurationCommand) -> Vec<ClusterId> {
+    let mut out = Vec::new();
+    collect_affected_clusters(cmd, &mut out);
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn collect_affected_clusters(cmd: &CurationCommand, out: &mut Vec<ClusterId>) {
+    match cmd {
+        CurationCommand::Relabel { cluster, .. } | CurationCommand::Note { cluster, .. } => {
+            out.push(*cluster);
+        }
+        CurationCommand::Merge { sources, target } => {
+            out.push(*target);
+            out.extend(sources.iter().copied());
+        }
+        CurationCommand::Split { cluster, .. } => out.push(*cluster),
+        CurationCommand::Batch { children } => {
+            for child in children {
+                collect_affected_clusters(child, out);
+            }
+        }
+        CurationCommand::Undo | CurationCommand::Redo => {}
+    }
+}
+
+fn amplitudes_cache_key_for(provider_identity: &[u8], journal_head: u64) -> CacheKey {
+    let fingerprint = Fingerprint::builder()
+        .add_provider_identity(provider_identity)
+        .add_journal_head(journal_head)
+        .add_algo_version(AMPLITUDES_ALGO_VERSION)
+        .finish();
+    CacheKey::new(AMPLITUDES_KIND, AMPLITUDES_ALGO_VERSION, fingerprint)
 }
 
 /// Compile-time assertion: `Session<P>` is `Send + Sync` whenever the
@@ -941,5 +1185,57 @@ mod tests {
             ]
         );
         assert!(session.spike_times(ClusterId(0)).is_empty());
+    }
+
+    #[test]
+    fn merge_then_cache_invalidation_evicts_pre_merge_cluster_archive() {
+        let (mut s, dir) = fresh_session();
+        let store = CacheStore::open(dir.path()).unwrap();
+        let old_head = s.journal_head();
+        let old_identity = s.cache_identity(ClusterId(0));
+        let old_key = pc_subspace::key(
+            &s.provider.identity_bytes(),
+            old_head,
+            old_identity.cluster,
+            old_identity.spike_count,
+            old_identity.cluster_spike_fingerprint,
+            DEFAULT_D,
+            DEFAULT_CHANNEL_IDX,
+            DEFAULT_MAX_BACKGROUND,
+        );
+        store
+            .put(
+                &old_key,
+                &pc_subspace::CachedPcSubspace {
+                    features: vec![1.0, 2.0, 3.0],
+                    is_in_cluster: vec![true],
+                    d: DEFAULT_D as u32,
+                    algo_version: pc_subspace::ALGO_VERSION,
+                },
+            )
+            .unwrap();
+        let old_path = store
+            .root()
+            .join(old_key.kind)
+            .join(format!("{}.rkyv", old_key.fingerprint.hex()));
+        assert!(old_path.exists());
+
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(0)],
+            target: ClusterId(2),
+        })
+        .unwrap();
+        s.invalidate_caches(&store).unwrap();
+        drop(store);
+
+        let reopened = CacheStore::open(dir.path()).unwrap();
+        assert!(
+            reopened
+                .get::<pc_subspace::CachedPcSubspace>(&old_key)
+                .unwrap()
+                .is_none(),
+            "pre-merge archive should not survive save/next-open invalidation"
+        );
+        assert!(!old_path.exists());
     }
 }

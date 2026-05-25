@@ -7,7 +7,11 @@
 //! in `sorrel-data` lets `sorrel-compute` stay metrics-only and
 //! Session-agnostic.
 
+use crate::cache::pc_subspace::{
+    self, CachedPcSubspace, ALGO_VERSION as PC_SUBSPACE_ALGO_VERSION, KIND as PC_SUBSPACE_KIND,
+};
 use crate::session::Session;
+use sorrel_cache::CacheStore;
 use sorrel_io::{ClusterId, DataProvider};
 
 /// Default channel index used for the isolation subspace. PC features are
@@ -58,6 +62,61 @@ pub fn collect_pc_subspace<P: DataProvider>(
     let spike_clusters = session.spike_clusters_global();
     if spike_clusters.is_empty() {
         return None;
+    }
+    let (cluster_spike_count, cluster_spike_fingerprint) =
+        cluster_spike_fingerprint(session, cluster);
+    let cache_key = pc_subspace::key(
+        &session.provider.identity_bytes(),
+        session.journal_head(),
+        cluster,
+        cluster_spike_count,
+        cluster_spike_fingerprint,
+        d_pcs,
+        channel_idx,
+        max_background,
+    );
+    if let Some(dataset_dir) = session.cache_dataset_dir() {
+        if let Ok(store) = CacheStore::open(dataset_dir) {
+            match store.get::<CachedPcSubspace>(&cache_key) {
+                Ok(Some(cached)) if cached.algo_version.to_native() == PC_SUBSPACE_ALGO_VERSION => {
+                    log::debug!(
+                        "cache hit {}/{}",
+                        PC_SUBSPACE_KIND,
+                        cache_key.fingerprint.hex()
+                    );
+                    return Some(PcSubspace {
+                        features: cached
+                            .features
+                            .as_slice()
+                            .iter()
+                            .map(|value| value.to_native())
+                            .collect(),
+                        is_in_cluster: cached.is_in_cluster.as_slice().to_vec(),
+                        d: cached.d.to_native() as usize,
+                    });
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    log::debug!(
+                        "cache miss {}/{}",
+                        PC_SUBSPACE_KIND,
+                        cache_key.fingerprint.hex()
+                    );
+                }
+                Err(err) => {
+                    log::debug!(
+                        "cache miss {}/{} after read error: {err}",
+                        PC_SUBSPACE_KIND,
+                        cache_key.fingerprint.hex()
+                    );
+                }
+            }
+        } else {
+            log::debug!(
+                "cache miss {}/{} after open error",
+                PC_SUBSPACE_KIND,
+                cache_key.fingerprint.hex()
+            );
+        }
     }
 
     // First pass: count cluster + non-cluster sizes so we can allocate once.
@@ -120,9 +179,52 @@ pub fn collect_pc_subspace<P: DataProvider>(
     if features.is_empty() {
         return None;
     }
-    Some(PcSubspace {
+    let subspace = PcSubspace {
         features,
         is_in_cluster: is_in,
         d: d_pcs,
-    })
+    };
+    if let Some(dataset_dir) = session.cache_dataset_dir() {
+        match CacheStore::open(dataset_dir) {
+            Ok(store) => {
+                let value = CachedPcSubspace {
+                    features: subspace.features.clone(),
+                    is_in_cluster: subspace.is_in_cluster.clone(),
+                    d: subspace.d as u32,
+                    algo_version: PC_SUBSPACE_ALGO_VERSION,
+                };
+                if let Err(err) = store.put(&cache_key, &value) {
+                    log::debug!(
+                        "failed to write cache {}/{}: {err}",
+                        PC_SUBSPACE_KIND,
+                        cache_key.fingerprint.hex()
+                    );
+                }
+            }
+            Err(err) => {
+                log::debug!(
+                    "failed to open cache {}/{} for write: {err}",
+                    PC_SUBSPACE_KIND,
+                    cache_key.fingerprint.hex()
+                );
+            }
+        }
+    }
+    Some(subspace)
+}
+
+fn cluster_spike_fingerprint<P: DataProvider>(
+    session: &Session<P>,
+    cluster: ClusterId,
+) -> (usize, [u8; 32]) {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sorrel-pc-subspace-cluster-spikes-v1");
+    let mut count = 0usize;
+    for (global_idx, &assigned) in session.spike_clusters_global().iter().enumerate() {
+        if assigned == cluster {
+            count += 1;
+            hasher.update(&(global_idx as u64).to_le_bytes());
+        }
+    }
+    (count, *hasher.finalize().as_bytes())
 }

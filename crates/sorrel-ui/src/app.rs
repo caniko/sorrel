@@ -312,6 +312,9 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             Intent::Save => match self.save_dir.as_deref() {
                 Some(dir) => match save_to_phy(&self.session, dir, self.label_str) {
                     Ok(()) => {
+                        if let Err(err) = self.session.invalidate_dataset_caches() {
+                            log::warn!("cache invalidation after save failed: {err}");
+                        }
                         self.status = Some((
                             format!("saved → {}", dir.display()),
                             std::time::Instant::now(),
@@ -750,6 +753,12 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                 }
             }
         });
+    }
+
+    fn on_exit(&mut self) {
+        if let Err(err) = self.session.invalidate_dataset_caches() {
+            log::warn!("cache invalidation on exit failed: {err}");
+        }
     }
 }
 

@@ -47,6 +47,7 @@ pub struct SortingAnalyzerProvider {
     channel_map: Vec<ChannelId>,
 
     metrics: crate::extras::QualityMetrics,
+    identity_bytes: Vec<u8>,
 
     _trace_mmap: Option<Mmap>,
     trace_ptr: *const u8,
@@ -115,6 +116,7 @@ impl SortingAnalyzerProvider {
         // path inside recording.json's `kwargs.file_paths`.
         let (trace_mmap, trace_ptr, trace_byte_len, n_samples) =
             map_recording(root, &recording_meta)?;
+        let identity_bytes = provider_identity_bytes(root, &recording_meta);
 
         Ok(Self {
             sample_rate: recording_meta.sample_rate,
@@ -126,6 +128,7 @@ impl SortingAnalyzerProvider {
             channel_positions,
             channel_map,
             metrics,
+            identity_bytes,
             _trace_mmap: trace_mmap,
             trace_ptr,
             trace_byte_len,
@@ -244,6 +247,63 @@ fn map_recording(
     let n_samples = (payload / bps) as u64;
     let trace_ptr = unsafe { mmap.as_ptr().add(rec.offset as usize) };
     Ok((Some(mmap), trace_ptr, payload, SampleIndex(n_samples)))
+}
+
+fn provider_identity_bytes(root: &Path, rec: &RecordingMeta) -> Vec<u8> {
+    let mut paths = vec![
+        root.join("recording.json"),
+        root.join("binary.json"),
+        root.join("sorting").join("spikes.npy"),
+        root.join("sorting").join("spike_times.npy"),
+        root.join("sorting").join("unit_indices.npy"),
+        root.join("sorting").join("unit_ids.npy"),
+    ];
+    if let Some(p) = rec.file_paths.first() {
+        paths.push(if p.is_absolute() {
+            p.clone()
+        } else {
+            root.join(p)
+        });
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sorrel-provider-identity-v1/sorting-analyzer");
+    hasher.update(&rec.sample_rate.to_le_bytes());
+    hasher.update(&rec.n_channels.to_le_bytes());
+    hasher.update(&rec.offset.to_le_bytes());
+    for path in paths {
+        hasher.update(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .as_bytes(),
+        );
+        match std::fs::metadata(&path) {
+            Ok(meta) => {
+                hasher.update(&meta.len().to_le_bytes());
+                if let Ok(modified) = meta.modified() {
+                    if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                        hasher.update(&duration.as_secs().to_le_bytes());
+                        hasher.update(&duration.subsec_nanos().to_le_bytes());
+                    }
+                }
+                if path.extension().and_then(|ext| ext.to_str()) == Some("npy") {
+                    if let Ok(header) = read_header(&path) {
+                        hasher.update(header.dtype.as_bytes());
+                        hasher.update(&[header.fortran_order as u8]);
+                        hasher.update(&header.data_offset.to_le_bytes());
+                        for dim in header.shape {
+                            hasher.update(&(dim as u64).to_le_bytes());
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                hasher.update(b"missing");
+            }
+        }
+    }
+    hasher.finalize().as_bytes().to_vec()
 }
 
 /// Loads either:
@@ -513,6 +573,10 @@ impl DataProvider for SortingAnalyzerProvider {
 
     fn initial_labels(&self) -> Vec<Self::Label> {
         self.initial_labels.clone()
+    }
+
+    fn identity_bytes(&self) -> Vec<u8> {
+        self.identity_bytes.clone()
     }
 
     fn amplitude_full_scale(&self) -> f32 {

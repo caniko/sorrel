@@ -60,6 +60,7 @@ mod imp {
         templates_per_cluster: Vec<Vec<u32>>,
         initial_labels: Vec<PhyLabel>,
         channel_positions: Vec<[f32; 2]>,
+        identity_bytes: Vec<u8>,
         _trace_mmap: Option<Mmap>,
         trace_ptr: *const u8,
         trace_byte_len: usize,
@@ -164,6 +165,7 @@ mod imp {
                 .dat_path
                 .or_else(|| read_string_dataset(&ops, "fbinary").map(PathBuf::from))
                 .or_else(|| read_string_dataset(&ops, "fproc").map(PathBuf::from));
+            let identity_bytes = provider_identity_bytes(path, dat_path.as_deref());
             let (trace_mmap, trace_ptr, trace_byte_len, n_samples) = match dat_path {
                 Some(p) => map_dat(&p, n_channels)?,
                 None => (None, std::ptr::null(), 0usize, SampleIndex::new(0)),
@@ -177,6 +179,7 @@ mod imp {
                 templates_per_cluster,
                 initial_labels,
                 channel_positions,
+                identity_bytes,
                 _trace_mmap: trace_mmap,
                 trace_ptr,
                 trace_byte_len,
@@ -235,6 +238,10 @@ mod imp {
 
         fn initial_labels(&self) -> Vec<Self::Label> {
             self.initial_labels.clone()
+        }
+
+        fn identity_bytes(&self) -> Vec<u8> {
+            self.identity_bytes.clone()
         }
 
         fn amplitude_full_scale(&self) -> f32 {
@@ -321,6 +328,34 @@ mod imp {
         let n_samples = (total / bps) as u64;
         let ptr = mmap.as_ptr();
         Ok((Some(mmap), ptr, total, SampleIndex::new(n_samples)))
+    }
+
+    fn provider_identity_bytes(rez_path: &Path, dat_path: Option<&Path>) -> Vec<u8> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"sorrel-provider-identity-v1/ks4-rez");
+        for path in [Some(rez_path), dat_path].into_iter().flatten() {
+            hasher.update(
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("")
+                    .as_bytes(),
+            );
+            match std::fs::metadata(path) {
+                Ok(meta) => {
+                    hasher.update(&meta.len().to_le_bytes());
+                    if let Ok(modified) = meta.modified() {
+                        if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                            hasher.update(&duration.as_secs().to_le_bytes());
+                            hasher.update(&duration.subsec_nanos().to_le_bytes());
+                        }
+                    }
+                }
+                Err(_) => {
+                    hasher.update(b"missing");
+                }
+            }
+        }
+        hasher.finalize().as_bytes().to_vec()
     }
 }
 

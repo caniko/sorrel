@@ -8,10 +8,13 @@ repository.workspace = true
 [dependencies]
 sorrel-io.workspace = true
 sorrel-compute.workspace = true
+sorrel-cache.workspace = true
 rayon.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+blake3.workspace = true
 serde.workspace = true
+rkyv.workspace = true
 rmp-serde.workspace = true
 xxhash-rust.workspace = true
 log.workspace = true
@@ -20,6 +23,10 @@ log.workspace = true
 default = []
 # Forwarded to sorrel-io: enables HDF5-backed NWB and KS4 rez.mat readers.
 hdf5 = ["sorrel-io/hdf5"]
+
+[[bench]]
+name = "seed_amplitudes_cache"
+harness = false
 
 [dev-dependencies]
 tempfile.workspace = true

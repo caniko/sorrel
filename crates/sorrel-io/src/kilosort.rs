@@ -102,6 +102,7 @@ pub struct KilosortProvider {
     // (SpikeInterface). One column per metric, length == n_clusters,
     // NaN where the upstream tool reports nothing.
     metrics: crate::extras::QualityMetrics,
+    identity_bytes: Vec<u8>,
 
     // Raw byte view of the trace mmap *after* `offset` has been applied.
     // We cast at access time based on `dtype`.
@@ -282,6 +283,12 @@ impl KilosortProvider {
         // `offset <= total_bytes`.
         let trace_ptr = unsafe { trace_mmap.as_ptr().add(offset as usize) };
         let trace_byte_len = payload_bytes;
+        let identity_bytes = provider_identity_bytes(&[
+            &spike_times_path,
+            &spike_clusters_path,
+            &root.join("amplitudes.npy"),
+            &dat_path,
+        ]);
 
         Ok(Self {
             root,
@@ -307,6 +314,7 @@ impl KilosortProvider {
             template_shape,
             similar_templates,
             metrics,
+            identity_bytes,
             trace_ptr,
             trace_byte_len,
         })
@@ -364,6 +372,10 @@ impl DataProvider for KilosortProvider {
 
     fn initial_labels(&self) -> Vec<Self::Label> {
         self.initial_labels.clone()
+    }
+
+    fn identity_bytes(&self) -> Vec<u8> {
+        self.identity_bytes.clone()
     }
 
     fn amplitude_full_scale(&self) -> f32 {
@@ -706,6 +718,44 @@ fn read_optional_similar_templates(path: &Path, n_templates: usize) -> Result<Ve
         }
         Ok(flat)
     })
+}
+
+fn provider_identity_bytes(paths: &[&Path]) -> Vec<u8> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sorrel-provider-identity-v1/kilosort");
+    for path in paths {
+        hasher.update(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .as_bytes(),
+        );
+        match std::fs::metadata(path) {
+            Ok(meta) => {
+                hasher.update(&meta.len().to_le_bytes());
+                if let Ok(modified) = meta.modified() {
+                    if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                        hasher.update(&duration.as_secs().to_le_bytes());
+                        hasher.update(&duration.subsec_nanos().to_le_bytes());
+                    }
+                }
+                if path.extension().and_then(|ext| ext.to_str()) == Some("npy") {
+                    if let Ok(header) = read_header(path) {
+                        hasher.update(header.dtype.as_bytes());
+                        hasher.update(&[header.fortran_order as u8]);
+                        hasher.update(&header.data_offset.to_le_bytes());
+                        for dim in header.shape {
+                            hasher.update(&(dim as u64).to_le_bytes());
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                hasher.update(b"missing");
+            }
+        }
+    }
+    hasher.finalize().as_bytes().to_vec()
 }
 
 /// Read `n` little-endian integers from a `.npy` mmap. Accepts both the numpy

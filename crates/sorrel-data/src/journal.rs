@@ -166,6 +166,19 @@ impl Journal {
         &self.path
     }
 
+    /// Stable journal-head marker for derived-cache invalidation.
+    ///
+    /// The high 64-bit baseline seal is folded together with the number of
+    /// fully committed records. This is cheap, deterministic, and changes
+    /// whenever replay-visible curation state changes.
+    pub fn head(&self) -> u64 {
+        let applied_count = self.replay().map(|cmds| cmds.len() as u64).unwrap_or(0);
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&self.baseline.to_le_bytes());
+        bytes[8..].copy_from_slice(&applied_count.to_le_bytes());
+        xxhash_rust::xxh3::xxh3_64(&bytes)
+    }
+
     /// Append one record. Buffers, flushes, and fsync's so the call only
     /// returns after the bytes are durable.
     pub fn append(&mut self, cmd: &CurationCommand) -> Result<()> {

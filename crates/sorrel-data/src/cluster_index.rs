@@ -161,6 +161,12 @@ impl ClusterIndex {
             .map(ClusterId)
             .map(|c| provider.spike_amplitudes(c).to_vec())
             .collect();
+        self.seed_amplitudes_from_buckets(amps_per_cluster);
+    }
+
+    /// Install already-bucketed per-cluster amplitudes. Used by cache reads
+    /// and by provider seeding after it has gathered the buckets.
+    pub fn seed_amplitudes_from_buckets(&mut self, amps_per_cluster: Vec<Vec<f32>>) {
         // If the provider gave a different number of amplitudes than spikes
         // for a cluster, fall back to NaN so the consumer can notice without
         // a panic.

@@ -45,6 +45,8 @@ struct Args {
     /// write `cluster_qc.tsv` + `cluster_qc.json` into the given dir,
     /// then exit. No GUI is spawned.
     export_qc: Option<PathBuf>,
+    /// Remove `<root>/.sorrel/cache/` and exit before opening the backend.
+    clear_cache: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -92,6 +94,7 @@ fn parse_args() -> Result<Args> {
             "--export-qc" => {
                 args.export_qc = Some(it.next().context("--export-qc needs a path")?.into())
             }
+            "--clear-cache" => args.clear_cache = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -122,6 +125,7 @@ fn print_help() {
          \x20 --spikeglx-meta P    populate sample-rate/channels/dtype from a SpikeGLX .meta\n\
          \x20 --oebin PATH         populate sample-rate/channels from an Open Ephys structure.oebin\n\
          \x20 --export-qc DIR      headless: write cluster_qc.tsv + cluster_qc.json into DIR and exit\n\
+         \x20 --clear-cache        remove <DATA_DIR>/.sorrel/cache/ and exit\n\
          \n\
          When params.py is present, sample-rate / channels / dtype / offset / dat-path\n\
          all default from it; CLI flags override on a per-field basis."
@@ -308,6 +312,20 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = parse_args()?;
     let root = args.root.as_deref().expect("validated in parse_args");
+    if args.clear_cache {
+        let dataset_dir = if root.is_file() {
+            root.parent().unwrap_or_else(|| Path::new("."))
+        } else {
+            root
+        };
+        sorrel_cache::CacheStore::clear_dataset_cache(dataset_dir)
+            .with_context(|| format!("clear cache under {}", dataset_dir.display()))?;
+        println!(
+            "cleared cache at {}",
+            sorrel_cache::CacheStore::cache_root_for(dataset_dir).display()
+        );
+        return Ok(());
+    }
     let backend = match args.backend {
         Some(b) => b,
         None => detect_backend(root)?,

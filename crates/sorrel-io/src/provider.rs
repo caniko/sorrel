@@ -374,6 +374,28 @@ pub trait DataProvider: Send + Sync + 'static {
     /// Initial label vector loaded from the backend's on-disk schema.
     fn initial_labels(&self) -> Vec<Self::Label>;
 
+    /// Stable bytes identifying this provider's input data, not its path.
+    ///
+    /// Concrete file-backed providers should prefer content headers for
+    /// spike arrays and file metadata for huge raw traces. The default is
+    /// intentionally path-free and covers in-memory/test providers.
+    fn identity_bytes(&self) -> Vec<u8> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"sorrel-provider-identity-v1/default");
+        hasher.update(&self.sample_rate().to_le_bytes());
+        hasher.update(&self.n_channels().to_le_bytes());
+        hasher.update(&self.n_samples().0.to_le_bytes());
+        hasher.update(&self.n_clusters().to_le_bytes());
+        for cluster in 0..self.n_clusters() {
+            let spikes = self.spike_times(ClusterId(cluster));
+            hasher.update(&(spikes.len() as u64).to_le_bytes());
+            for spike in spikes {
+                hasher.update(&spike.0.to_le_bytes());
+            }
+        }
+        hasher.finalize().as_bytes().to_vec()
+    }
+
     /// Hint for amplitude scaling; defaults to the nominal full-scale of the
     /// dtype but backends with calibration data should override.
     fn amplitude_full_scale(&self) -> f32 {

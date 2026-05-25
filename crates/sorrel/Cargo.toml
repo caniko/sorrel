@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 sorrel-io.workspace = true
+sorrel-cache.workspace = true
 sorrel-data.workspace = true
 sorrel-render.workspace = true
 sorrel-ui.workspace = true
@@ -23,3 +24,6 @@ env_logger.workspace = true
 [features]
 default = []
 hdf5 = ["sorrel-io/hdf5", "sorrel-data/hdf5"]
+
+[dev-dependencies]
+tempfile.workspace = true
