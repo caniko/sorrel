@@ -69,16 +69,16 @@ mod tests {
     use sorrel_io::ClusterId;
 
     fn subspace_key() -> CacheKey {
-        pc_subspace::key(
-            b"provider-identity",
-            17,
-            ClusterId(3),
-            2,
-            [0x5a; 32],
-            3,
-            0,
-            5_000,
-        )
+        pc_subspace::key(pc_subspace::KeyParts {
+            session_identity: b"provider-identity",
+            journal_head: 17,
+            cluster: ClusterId(3),
+            cluster_spike_count: 2,
+            cluster_spike_fingerprint: [0x5a; 32],
+            d_pcs: 3,
+            channel_idx: 0,
+            max_background: 5_000,
+        })
     }
 
     #[test]

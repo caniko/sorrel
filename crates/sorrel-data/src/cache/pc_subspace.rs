@@ -13,53 +13,41 @@ pub struct CachedPcSubspace {
     pub algo_version: u32,
 }
 
-pub fn key(
-    session_identity: &[u8],
-    journal_head: u64,
-    cluster: ClusterId,
-    cluster_spike_count: usize,
-    cluster_spike_fingerprint: [u8; 32],
-    d_pcs: usize,
-    channel_idx: usize,
-    max_background: usize,
-) -> CacheKey {
-    key_with_algo_version(
-        ALGO_VERSION,
-        session_identity,
-        journal_head,
-        cluster,
-        cluster_spike_count,
-        cluster_spike_fingerprint,
-        d_pcs,
-        channel_idx,
-        max_background,
-    )
+pub struct KeyParts<'a> {
+    pub session_identity: &'a [u8],
+    pub journal_head: u64,
+    pub cluster: ClusterId,
+    pub cluster_spike_count: usize,
+    pub cluster_spike_fingerprint: [u8; 32],
+    pub d_pcs: usize,
+    pub channel_idx: usize,
+    pub max_background: usize,
 }
 
-fn key_with_algo_version(
-    algo_version: u32,
-    session_identity: &[u8],
-    journal_head: u64,
-    cluster: ClusterId,
-    cluster_spike_count: usize,
-    cluster_spike_fingerprint: [u8; 32],
-    d_pcs: usize,
-    channel_idx: usize,
-    max_background: usize,
-) -> CacheKey {
+pub fn key(parts: KeyParts<'_>) -> CacheKey {
+    key_with_algo_version(ALGO_VERSION, parts)
+}
+
+fn key_with_algo_version(algo_version: u32, parts: KeyParts<'_>) -> CacheKey {
     let fingerprint = Fingerprint::builder()
-        .add_provider_identity(session_identity)
-        .add_journal_head(journal_head)
+        .add_provider_identity(parts.session_identity)
+        .add_journal_head(parts.journal_head)
         .add_algo_version(algo_version)
-        .add_param_bytes("cluster_id", &cluster.0.to_le_bytes())
+        .add_param_bytes("cluster_id", &parts.cluster.0.to_le_bytes())
         .add_param_bytes(
             "cluster_spike_count",
-            &(cluster_spike_count as u64).to_le_bytes(),
+            &(parts.cluster_spike_count as u64).to_le_bytes(),
         )
-        .add_param_bytes("cluster_spike_fingerprint", &cluster_spike_fingerprint)
-        .add_param_bytes("d_pcs", &(d_pcs as u64).to_le_bytes())
-        .add_param_bytes("channel_idx", &(channel_idx as u64).to_le_bytes())
-        .add_param_bytes("max_background", &(max_background as u64).to_le_bytes())
+        .add_param_bytes(
+            "cluster_spike_fingerprint",
+            &parts.cluster_spike_fingerprint,
+        )
+        .add_param_bytes("d_pcs", &(parts.d_pcs as u64).to_le_bytes())
+        .add_param_bytes("channel_idx", &(parts.channel_idx as u64).to_le_bytes())
+        .add_param_bytes(
+            "max_background",
+            &(parts.max_background as u64).to_le_bytes(),
+        )
         .finish();
     CacheKey::new(KIND, algo_version, fingerprint)
 }
@@ -72,14 +60,16 @@ mod tests {
     fn fixture_key(algo_version: u32, d_pcs: usize) -> CacheKey {
         key_with_algo_version(
             algo_version,
-            b"provider-identity",
-            17,
-            ClusterId(3),
-            2,
-            [0x5a; 32],
-            d_pcs,
-            0,
-            5_000,
+            KeyParts {
+                session_identity: b"provider-identity",
+                journal_head: 17,
+                cluster: ClusterId(3),
+                cluster_spike_count: 2,
+                cluster_spike_fingerprint: [0x5a; 32],
+                d_pcs,
+                channel_idx: 0,
+                max_background: 5_000,
+            },
         )
     }
 

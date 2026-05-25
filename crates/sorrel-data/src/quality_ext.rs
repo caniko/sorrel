@@ -145,16 +145,16 @@ fn isolation_cache_key<P: DataProvider>(
     }
     let (cluster_spike_count, cluster_spike_fingerprint) =
         cluster_spike_fingerprint(session, cluster);
-    let subspace_key = pc_subspace::key(
-        &session.provider.identity_bytes(),
-        session.journal_head(),
+    let subspace_key = pc_subspace::key(pc_subspace::KeyParts {
+        session_identity: &session.provider.identity_bytes(),
+        journal_head: session.journal_head(),
         cluster,
         cluster_spike_count,
         cluster_spike_fingerprint,
         d_pcs,
         channel_idx,
         max_background,
-    );
+    });
 
     Some(isolation::key(&subspace_key, k_nn))
 }

@@ -209,16 +209,16 @@ impl<P: DataProvider> Session<P> {
                 if cluster.spike_count == 0 {
                     continue;
                 }
-                let subspace_key = pc_subspace::key(
-                    &provider_identity,
-                    entry.prev_head,
-                    cluster.cluster,
-                    cluster.spike_count,
-                    cluster.cluster_spike_fingerprint,
-                    DEFAULT_D,
-                    DEFAULT_CHANNEL_IDX,
-                    DEFAULT_MAX_BACKGROUND,
-                );
+                let subspace_key = pc_subspace::key(pc_subspace::KeyParts {
+                    session_identity: &provider_identity,
+                    journal_head: entry.prev_head,
+                    cluster: cluster.cluster,
+                    cluster_spike_count: cluster.spike_count,
+                    cluster_spike_fingerprint: cluster.cluster_spike_fingerprint,
+                    d_pcs: DEFAULT_D,
+                    channel_idx: DEFAULT_CHANNEL_IDX,
+                    max_background: DEFAULT_MAX_BACKGROUND,
+                });
                 store.evict(&subspace_key)?;
                 store.evict(&isolation::key(&subspace_key, DEFAULT_K_NN))?;
             }
@@ -1193,16 +1193,16 @@ mod tests {
         let store = CacheStore::open(dir.path()).unwrap();
         let old_head = s.journal_head();
         let old_identity = s.cache_identity(ClusterId(0));
-        let old_key = pc_subspace::key(
-            &s.provider.identity_bytes(),
-            old_head,
-            old_identity.cluster,
-            old_identity.spike_count,
-            old_identity.cluster_spike_fingerprint,
-            DEFAULT_D,
-            DEFAULT_CHANNEL_IDX,
-            DEFAULT_MAX_BACKGROUND,
-        );
+        let old_key = pc_subspace::key(pc_subspace::KeyParts {
+            session_identity: &s.provider.identity_bytes(),
+            journal_head: old_head,
+            cluster: old_identity.cluster,
+            cluster_spike_count: old_identity.spike_count,
+            cluster_spike_fingerprint: old_identity.cluster_spike_fingerprint,
+            d_pcs: DEFAULT_D,
+            channel_idx: DEFAULT_CHANNEL_IDX,
+            max_background: DEFAULT_MAX_BACKGROUND,
+        });
         store
             .put(
                 &old_key,

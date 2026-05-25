@@ -65,16 +65,16 @@ pub fn collect_pc_subspace<P: DataProvider>(
     }
     let (cluster_spike_count, cluster_spike_fingerprint) =
         cluster_spike_fingerprint(session, cluster);
-    let cache_key = pc_subspace::key(
-        &session.provider.identity_bytes(),
-        session.journal_head(),
+    let cache_key = pc_subspace::key(pc_subspace::KeyParts {
+        session_identity: &session.provider.identity_bytes(),
+        journal_head: session.journal_head(),
         cluster,
         cluster_spike_count,
         cluster_spike_fingerprint,
         d_pcs,
         channel_idx,
         max_background,
-    );
+    });
     if let Some(dataset_dir) = session.cache_dataset_dir() {
         if let Ok(store) = CacheStore::open(dataset_dir) {
             match store.get::<CachedPcSubspace>(&cache_key) {
