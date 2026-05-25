@@ -34,7 +34,7 @@ jobs:
         run: command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked
 
       - name: Install cargo-deny
-        run: command -v cargo-deny >/dev/null 2>&1 || cargo install cargo-deny --locked
+        run: command -v cargo-deny >/dev/null 2>&1 || cargo install cargo-deny --locked --version 0.18.3
 
       - name: Audit dependencies
         run: cargo audit
