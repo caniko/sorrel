@@ -22,6 +22,21 @@ compute kernels are all statically dispatched.
 4. `replay_journal` re-applies every prior `CurationCommand` (including
    undo/redo records) so the open state matches the last running state.
 
+## Cache
+
+Derived artifacts that have cache support consult
+`<dataset>/.sorrel/cache/` first using the provider identity, current
+journal head, artifact algorithm version, parameters, and any
+per-cluster spike fingerprints. Misses fall through to the existing
+compute path and then write an archive for the next open.
+
+The journal head is the invalidation point. Applying a
+`CurationCommand` records the previous head and affected cluster
+identities in the session's in-memory invalidation log. Sorrel evicts
+known pre-edit derived artifacts at save and quit, while
+`CacheStore::open` runs bounded GC for orphaned, aged, and over-budget
+files. See [Derived Cache](./cache.md) for the full contract.
+
 ## Edit
 
 `CurationCommand` is a closed enum: `Relabel`, `Merge`, `Split`,
