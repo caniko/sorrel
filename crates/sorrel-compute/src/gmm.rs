@@ -68,7 +68,7 @@ pub fn gmm_split_proposal(amps: &[f32]) -> Option<GmmSplitProposal> {
         return None;
     }
     let ll1: f64 = xs.iter().map(|&x| log_normal(x, mu1, var1)).sum();
-    let bic1 = -2.0 * ll1 + (2.0_f64 * n_used.ln()); // k=2 free params (μ, σ²)
+    let bic1 = -2.0 * ll1 + (2.0_f64 * n_used.ln()); // 2 free params: μ, σ²
 
     // EM init: split the sample into two halves by median.
     let mut sorted = xs.clone();
@@ -90,18 +90,20 @@ pub fn gmm_split_proposal(amps: &[f32]) -> Option<GmmSplitProposal> {
     let mut resp = vec![0.0_f64; xs.len()];
 
     for _ in 0..MAX_EM_ITERS {
-        // E-step
+        // E-step, computed in the log domain so far-outlier spikes (whose
+        // linear-domain pdfs underflow to 0) still get a well-defined
+        // posterior instead of a fabricated 0.5. The responsibility is the
+        // logistic of the log-odds; the per-point log-likelihood is the
+        // logsumexp of the two log-weighted component densities.
         let mut ll = 0.0_f64;
         for (i, &x) in xs.iter().enumerate() {
-            let pa = w_a * normal_pdf(x, mu_a, var_a);
-            let pb = w_b * normal_pdf(x, mu_b, var_b);
-            let total = pa + pb;
-            if total > 0.0 {
-                resp[i] = pa / total;
-                ll += total.ln();
-            } else {
-                resp[i] = 0.5;
-            }
+            let la = w_a.ln() + log_normal(x, mu_a, var_a);
+            let lb = w_b.ln() + log_normal(x, mu_b, var_b);
+            // resp = pa / (pa + pb) = 1 / (1 + exp(lb - la)) = sigmoid(la - lb).
+            resp[i] = 1.0 / (1.0 + (lb - la).exp());
+            // logsumexp(la, lb) for the data log-likelihood.
+            let m = la.max(lb);
+            ll += m + ((la - m).exp() + (lb - m).exp()).ln();
         }
         if (ll - prev_ll).abs() < EM_TOL * (ll.abs().max(1.0)) {
             break;
@@ -138,13 +140,15 @@ pub fn gmm_split_proposal(amps: &[f32]) -> Option<GmmSplitProposal> {
         w_b = sum_b / xs.len() as f64;
     }
 
-    // Final log-likelihood + BIC for the 2-component model.
+    // Final log-likelihood + BIC for the 2-component model. Use logsumexp in
+    // the log domain (consistent with the E-step) to avoid underflow.
     let ll2: f64 = xs
         .iter()
         .map(|&x| {
-            let pa = w_a * normal_pdf(x, mu_a, var_a);
-            let pb = w_b * normal_pdf(x, mu_b, var_b);
-            (pa + pb).max(1e-300).ln()
+            let la = w_a.ln() + log_normal(x, mu_a, var_a);
+            let lb = w_b.ln() + log_normal(x, mu_b, var_b);
+            let m = la.max(lb);
+            m + ((la - m).exp() + (lb - m).exp()).ln()
         })
         .sum();
     // 2-component 1-D GMM has 5 free parameters: μ_a, μ_b, σ²_a, σ²_b, w_a.

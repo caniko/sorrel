@@ -139,13 +139,26 @@ pub fn isi_violation_rate(
     n as f32 / duration_s
 }
 
-/// Hill et al. (2011) refractory-period contamination ratio: the rate of
-/// double-counted spikes inside the refractory window relative to the total
-/// firing rate. Returns 0 when too few spikes to estimate.
+/// Hill et al. (2011) estimate of the refractory-period contamination
+/// fraction `f_p` — the fraction of spikes in the cluster that are false
+/// positives (from other units), inferred from how many spike pairs fall
+/// inside the refractory window. `0.0` means no detectable contamination;
+/// values approach (and are clamped at) `1.0` for heavily contaminated units.
+/// Returns 0 when too few spikes to estimate.
+///
+/// The estimator inverts the expected-violation relation
+/// `N_viol = 2·t_ref·N²·f_p·(1−f_p) / T` (Hill et al. 2011, J. Neurosci.
+/// 31:8699). We use the small-contamination linearisation
+/// `f_p ≈ N_viol·T / (2·t_ref·N²)`; the full quadratic has no real root once
+/// the observed violation count implies `f_p > 0.5`, in which case the unit
+/// is at least half contaminated and we saturate to `1.0`.
+///
+/// Note the `N²` denominator: `N_viol` grows with the number of spike *pairs*,
+/// so the contamination *fraction* normalises by `N²`, not `N`. The `N²` term
+/// is accumulated in `f64` because it overflows `f32` for large clusters.
 ///
 /// `refractory_samples` is the length of the refractory window in samples;
-/// `total_duration_samples` is the recording's total length used to compute
-/// the firing rate denominator.
+/// `total_duration_samples` is the recording's total length.
 pub fn refractory_contamination(
     spike_times: &[SampleIndex],
     refractory_samples: u64,
@@ -155,19 +168,18 @@ pub fn refractory_contamination(
     if spike_times.len() < 2 || refractory_samples == 0 || total_duration_samples == 0 {
         return 0.0;
     }
-    let n = spike_times.len() as f32;
-    let viol = isi_violations(spike_times, refractory_samples) as f32;
-    let total_s = total_duration_samples as f32 / sample_rate;
-    let rp_s = refractory_samples as f32 / sample_rate;
+    let n = spike_times.len() as f64;
+    let viol = isi_violations(spike_times, refractory_samples) as f64;
+    let total_s = total_duration_samples as f64 / sample_rate as f64;
+    let rp_s = refractory_samples as f64 / sample_rate as f64;
     if total_s <= 0.0 || rp_s <= 0.0 {
         return 0.0;
     }
-    // Hill formula: viol_rate / (n * 2 * rp / total_duration)
-    let denom = n * 2.0 * rp_s / total_s;
-    if denom <= 0.0 {
-        return 0.0;
-    }
-    viol / denom
+    // Hill 2011 linearised false-positive fraction: N_viol·T / (2·t_ref·N²).
+    let f_p = viol * total_s / (2.0 * rp_s * n * n);
+    // f_p > 0.5 means the quadratic has no real root → at least half
+    // contaminated; clamp to the valid [0, 1] fraction range.
+    (f_p as f32).clamp(0.0, 1.0)
 }
 
 /// Fraction of `n_bins` evenly-sized time bins that contain at least one
@@ -185,10 +197,10 @@ pub fn presence_ratio(
     let bin_width = (total_duration_samples as f64 / n_bins as f64).max(1.0);
     let mut filled = vec![false; n_bins];
     for &t in spike_times {
-        let idx = ((t.as_f64()) / bin_width) as usize;
-        if idx < n_bins {
-            filled[idx] = true;
-        }
+        // Clamp the final bin so a spike landing exactly at the recording end
+        // (idx == n_bins) is counted in the last bin rather than dropped.
+        let idx = ((t.as_f64() / bin_width) as usize).min(n_bins - 1);
+        filled[idx] = true;
     }
     let count = filled.iter().filter(|&&b| b).count();
     count as f32 / n_bins as f32
@@ -358,6 +370,48 @@ mod tests {
         let total = 5_000;
         let c = refractory_contamination(&times, rp, total, 1000.0);
         assert!(c > 0.0);
+    }
+
+    /// Golden test for the Hill (2011) estimator: build a large train with a
+    /// *known* number of refractory violations and confirm the recovered
+    /// false-positive fraction matches the analytic value
+    /// `f_p = N_viol·T / (2·t_ref·N²)`.
+    ///
+    /// This is the regression guard for the `N²` denominator. The previous
+    /// implementation divided by `N` instead of `N²`, which for `N = 10_000`
+    /// inflated the result by ~10_000× (the value saturated far above 1.0,
+    /// killing the contamination score). With the fix the recovered fraction
+    /// lands near the injected ~4.7% and stays well inside `[0, 1]`.
+    #[test]
+    fn refractory_contamination_recovers_known_fraction() {
+        let n: u64 = 10_000;
+        let k: u64 = 19; // injected consecutive violations
+        let t_ref: u64 = 60; // 2 ms at 30 kHz
+        let normal_gap: u64 = 3_000; // well outside the refractory window
+
+        // First `k` inter-spike gaps are inside the refractory window; the
+        // rest are not → exactly `k` ISI violations.
+        let mut times = Vec::with_capacity(n as usize);
+        let mut cursor = 0u64;
+        for j in 0..n {
+            times.push(SampleIndex(cursor));
+            cursor += if j < k { 10 } else { normal_gap };
+        }
+        let total = cursor; // recording length = last spike position
+        assert_eq!(isi_violations(&times, t_ref) as u64, k);
+
+        let recovered = refractory_contamination(&times, t_ref, total, 30_000.0);
+        let expected =
+            (k as f64 * total as f64 / (2.0 * t_ref as f64 * n as f64 * n as f64)) as f32;
+        assert!(
+            (recovered - expected).abs() < 1e-3,
+            "recovered {recovered} != analytic {expected}",
+        );
+        // The old (÷N instead of ÷N²) formula returned ~N× this, far above 1.
+        assert!(
+            recovered < 0.2,
+            "recovered fraction {recovered} implausibly large — N² denominator regressed?",
+        );
     }
 
     #[test]

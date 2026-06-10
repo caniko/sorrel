@@ -108,9 +108,16 @@ pub fn excess_kurtosis(values: &[f32]) -> f32 {
     Moments::from_f32(values).excess_kurtosis()
 }
 
-/// Sarle's bimodality coefficient: `(skew^2 + 1) / (kurt + 3 (n-1)^2 / ((n-2)(n-3)))`,
-/// where `kurt` is excess kurtosis. Values above ~0.555 (the BC of a uniform
+/// Sarle's bimodality coefficient (SAS form): `(G1^2 + 1) / (G2 + 3 (n-1)^2 /
+/// ((n-2)(n-3)))`, where `G1` and `G2` are the *bias-corrected* sample
+/// skewness and excess kurtosis. Values above ~0.555 (the BC of a uniform
 /// distribution) are considered evidence of bimodality.
+///
+/// The small-sample correction term `3 (n-1)^2 / ((n-2)(n-3))` in the
+/// denominator is only consistent with bias-corrected moments, so we convert
+/// the uncorrected `g1`/`g2` from `Moments` to `G1`/`G2` here rather than
+/// mixing conventions (which biased the coefficient for the small clusters
+/// this tool targets).
 ///
 /// Returns 0 when the input has fewer than 4 samples.
 pub fn bimodality_coefficient(values: &[f32]) -> f32 {
@@ -119,14 +126,17 @@ pub fn bimodality_coefficient(values: &[f32]) -> f32 {
     }
     let n = values.len() as f64;
     let m = Moments::from_f32(values);
-    let g = m.skewness() as f64;
-    let k = m.excess_kurtosis() as f64;
+    let g1 = m.skewness() as f64;
+    let g2 = m.excess_kurtosis() as f64;
+    // Bias-corrected sample skewness and excess kurtosis (the G1/G2 SAS uses).
+    let big_g1 = g1 * (n * (n - 1.0)).sqrt() / (n - 2.0);
+    let big_g2 = (n - 1.0) / ((n - 2.0) * (n - 3.0)) * ((n + 1.0) * g2 + 6.0);
     let correction = 3.0 * (n - 1.0).powi(2) / ((n - 2.0) * (n - 3.0));
-    let denom = k + correction;
+    let denom = big_g2 + correction;
     if denom.abs() < 1e-12 {
         return 0.0;
     }
-    ((g * g + 1.0) / denom) as f32
+    ((big_g1 * big_g1 + 1.0) / denom) as f32
 }
 
 /// Sarle's bimodality coefficient is our primary unimodality test (cheap,
@@ -214,10 +224,12 @@ pub fn ks_pvalue(d: f32, n: usize, m: usize) -> f32 {
 ///      mass is the estimated count of spikes that should have been
 ///      detected at low amplitudes but weren't.
 ///
-/// Returns a fraction in `[0, 1]`. Symmetric distributions (mode near the
+/// Returns a fraction in `[0, 0.5]`. Symmetric distributions (mode near the
 /// centre) score near 0; half-Gaussian distributions (mode at the lowest
-/// bin, hard cutoff) score near 0.5; total clipping past the mode would
-/// score higher, but that's pathological in practice.
+/// bin, hard cutoff) score near 0.5. The result is capped at 0.5 because a
+/// low-amplitude detection threshold can hide at most the unobserved half of
+/// the distribution — matching the Allen ecephys convention. Consumers
+/// (e.g. `quality::completeness_score`) rely on this 0.5 ceiling.
 pub fn amplitude_cutoff(amps: &[f32], n_bins: usize) -> f32 {
     let n = amps.len();
     if n < 8 || n_bins < 8 {
@@ -276,7 +288,10 @@ pub fn amplitude_cutoff(amps: &[f32], n_bins: usize) -> f32 {
         return 0.0;
     }
     let unmirrored: f32 = s[mirror_end..].iter().copied().sum();
-    (unmirrored / total).clamp(0.0, 1.0)
+    // Cap at 0.5: a hard low-amplitude cutoff can mask at most half the
+    // distribution. This bound is part of the contract with consumers that
+    // rescale via `1 - cutoff*2` (see `quality::completeness_score`).
+    (unmirrored / total).clamp(0.0, 0.5)
 }
 
 /// Quick percentile (linear interpolation between the two nearest ranks).
