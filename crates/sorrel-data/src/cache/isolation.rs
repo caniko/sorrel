@@ -3,13 +3,16 @@ use sorrel_cache::{CacheKey, Fingerprint};
 use sorrel_compute::IsolationMetrics;
 
 pub const KIND: &str = "isolation";
-pub const ALGO_VERSION: u32 = 1;
+// v2: added LDA d-prime and simplified silhouette fields.
+pub const ALGO_VERSION: u32 = 2;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct CachedIsolationMetrics {
     pub isolation_distance_sq: f32,
     pub l_ratio: f32,
     pub nn_isolation: f32,
+    pub d_prime: f32,
+    pub silhouette: f32,
     pub n_in: u32,
     pub n_out: u32,
     pub algo_version: u32,
@@ -21,6 +24,8 @@ impl CachedIsolationMetrics {
             isolation_distance_sq: metrics.isolation_distance_sq,
             l_ratio: metrics.l_ratio,
             nn_isolation: metrics.nn_isolation,
+            d_prime: metrics.d_prime,
+            silhouette: metrics.silhouette,
             n_in: metrics.n_in,
             n_out: metrics.n_out,
             algo_version: ALGO_VERSION,
@@ -56,6 +61,8 @@ pub fn archived_to_metrics(
         isolation_distance_sq: cached.isolation_distance_sq.to_native(),
         l_ratio: cached.l_ratio.to_native(),
         nn_isolation: cached.nn_isolation.to_native(),
+        d_prime: cached.d_prime.to_native(),
+        silhouette: cached.silhouette.to_native(),
         n_in: cached.n_in.to_native(),
         n_out: cached.n_out.to_native(),
     })
@@ -90,6 +97,8 @@ mod tests {
             isolation_distance_sq: 12.5,
             l_ratio: 0.25,
             nn_isolation: 0.875,
+            d_prime: 5.5,
+            silhouette: 0.42,
             n_in: 120,
             n_out: 500,
         };
@@ -106,6 +115,8 @@ mod tests {
         );
         assert_eq!(roundtrip.l_ratio, metrics.l_ratio);
         assert_eq!(roundtrip.nn_isolation, metrics.nn_isolation);
+        assert_eq!(roundtrip.d_prime, metrics.d_prime);
+        assert_eq!(roundtrip.silhouette, metrics.silhouette);
         assert_eq!(roundtrip.n_in, metrics.n_in);
         assert_eq!(roundtrip.n_out, metrics.n_out);
         assert!(!cached.bytes().is_empty());
@@ -126,6 +137,8 @@ mod tests {
                     isolation_distance_sq: 1.0,
                     l_ratio: 2.0,
                     nn_isolation: 3.0,
+                    d_prime: 4.5,
+                    silhouette: 0.1,
                     n_in: 4,
                     n_out: 5,
                     algo_version: ALGO_VERSION,

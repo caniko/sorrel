@@ -40,6 +40,8 @@ pub struct QcRow {
     pub isolation_distance_sq: f32,
     pub l_ratio: f32,
     pub nn_isolation: f32,
+    pub d_prime: f32,
+    pub silhouette: f32,
 }
 
 impl QcRow {
@@ -47,13 +49,13 @@ impl QcRow {
         "cluster_id\tn_spikes\tfiring_rate\tmean_amplitude\tpresence_ratio\t\
          isi_violations\tisi_violation_ratio\tamplitude_cutoff\tamplitude_snr\t\
          drift_correlation\tlongest_silent_gap\tcomposite_quality\t\
-         isolation_distance_sq\tl_ratio\tnn_isolation\n"
+         isolation_distance_sq\tl_ratio\tnn_isolation\td_prime\tsilhouette\n"
     }
 
     fn write_tsv(&self, w: &mut impl Write) -> std::io::Result<()> {
         writeln!(
             w,
-            "{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}",
+            "{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}",
             self.cluster_id,
             self.n_spikes,
             self.firing_rate_hz,
@@ -69,6 +71,8 @@ impl QcRow {
             fmt_or_empty(self.isolation_distance_sq),
             fmt_or_empty(self.l_ratio),
             fmt_or_empty(self.nn_isolation),
+            fmt_or_empty(self.d_prime),
+            fmt_or_empty(self.silhouette),
         )
     }
 
@@ -76,7 +80,7 @@ impl QcRow {
         let prefix = if leading_comma { ",\n" } else { "\n" };
         write!(
             w,
-            r#"{prefix}  {{"cluster_id": {}, "n_spikes": {}, "firing_rate_hz": {:.6}, "mean_amplitude": {:.6}, "presence_ratio": {:.6}, "isi_violations": {}, "isi_violation_ratio": {:.6}, "amplitude_cutoff": {:.6}, "amplitude_snr": {:.6}, "drift_correlation": {:.6}, "longest_silent_gap": {:.6}, "composite_quality": {:.6}, "isolation_distance_sq": {}, "l_ratio": {}, "nn_isolation": {}}}"#,
+            r#"{prefix}  {{"cluster_id": {}, "n_spikes": {}, "firing_rate_hz": {:.6}, "mean_amplitude": {:.6}, "presence_ratio": {:.6}, "isi_violations": {}, "isi_violation_ratio": {:.6}, "amplitude_cutoff": {:.6}, "amplitude_snr": {:.6}, "drift_correlation": {:.6}, "longest_silent_gap": {:.6}, "composite_quality": {:.6}, "isolation_distance_sq": {}, "l_ratio": {}, "nn_isolation": {}, "d_prime": {}, "silhouette": {}}}"#,
             self.cluster_id,
             self.n_spikes,
             self.firing_rate_hz,
@@ -92,6 +96,8 @@ impl QcRow {
             json_num(self.isolation_distance_sq),
             json_num(self.l_ratio),
             json_num(self.nn_isolation),
+            json_num(self.d_prime),
+            json_num(self.silhouette),
         )
     }
 }
@@ -152,9 +158,15 @@ pub fn collect_qc_rows<P: DataProvider>(session: &Session<P>) -> Vec<QcRow> {
             presence_ratio,
             longest_silent_gap_frac,
         );
-        let (iso2, l_ratio, nn) = match q.isolation {
-            Some(iso) => (iso.isolation_distance_sq, iso.l_ratio, iso.nn_isolation),
-            None => (f32::NAN, f32::NAN, f32::NAN),
+        let (iso2, l_ratio, nn, d_prime, silhouette) = match q.isolation {
+            Some(iso) => (
+                iso.isolation_distance_sq,
+                iso.l_ratio,
+                iso.nn_isolation,
+                iso.d_prime,
+                iso.silhouette,
+            ),
+            None => (f32::NAN, f32::NAN, f32::NAN, f32::NAN, f32::NAN),
         };
         rows.push(QcRow {
             cluster_id: c.0,
@@ -172,6 +184,8 @@ pub fn collect_qc_rows<P: DataProvider>(session: &Session<P>) -> Vec<QcRow> {
             isolation_distance_sq: iso2,
             l_ratio,
             nn_isolation: nn,
+            d_prime,
+            silhouette,
         });
     }
     rows

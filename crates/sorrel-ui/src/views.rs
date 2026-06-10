@@ -2132,6 +2132,7 @@ where
         .column(Column::auto().at_least(56.0))
         .column(Column::auto().at_least(54.0))
         .column(Column::auto().at_least(56.0))
+        .column(Column::auto().at_least(52.0))
         .column(Column::auto().at_least(64.0))
         .column(Column::auto().at_least(56.0))
         .column(Column::auto().at_least(58.0))
@@ -2146,6 +2147,11 @@ where
             });
             h.col(|ui| {
                 ui.strong("BC");
+            });
+            h.col(|ui| {
+                ui.strong("dip").on_hover_text(
+                    "Hartigan dip on amplitudes (0–0.25); higher = stronger departure from unimodality",
+                );
             });
             h.col(|ui| {
                 ui.strong("contam");
@@ -2176,6 +2182,9 @@ where
                     });
                     row.col(|ui| {
                         ui.label(format!("{:.2}", s.amp_bimodality));
+                    });
+                    row.col(|ui| {
+                        ui.label(format!("{:.3}", s.amp_dip));
                     });
                     row.col(|ui| {
                         ui.label(format!("{:.3}", s.contamination));

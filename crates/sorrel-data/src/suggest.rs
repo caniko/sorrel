@@ -14,7 +14,7 @@
 use crate::session::Session;
 use sorrel_compute::{
     amplitude_drift_correlation, amplitude_snr, analyse_refractory_dip, bimodality_coefficient,
-    cross_correlogram, gmm_split_proposal, ks_two_sample, mean_amplitude, percentile,
+    cross_correlogram, gmm_split_proposal, hartigan_dip, ks_two_sample, mean_amplitude, percentile,
     refractory_contamination, refractory_dip_score,
 };
 use sorrel_io::{ClusterId, DataProvider};
@@ -55,6 +55,11 @@ pub struct SplitCandidate {
     /// Above 0.555 = evidence of bimodality; we map this onto `[0, 1]` for
     /// the score.
     pub amp_bimodality: f32,
+    /// Hartigan dip statistic on the amplitude distribution — a rigorous
+    /// departure-from-unimodality measure (`[0, 0.25]`) that corroborates
+    /// the bimodality coefficient and catches multimodal shapes the
+    /// moment-based BC misses.
+    pub amp_dip: f32,
     /// Refractory contamination — high values often co-occur with
     /// over-merged clusters that should be split apart.
     pub contamination: f32,
@@ -130,7 +135,11 @@ pub fn rank_merge_candidates<P: DataProvider>(
     if max_lag_samples == 0 {
         return Vec::new();
     }
-    let bins = cfg.ccg_bins.max(2);
+    // `analyse_refractory_dip` assumes an even bin count so zero lag falls on
+    // the boundary between bins `half-1` and `half` and the refractory window
+    // `[half-r, half+r)` is symmetric around it. Round up to even so a
+    // user-configured odd `ccg_bins` can't silently mis-center the dip.
+    let bins = (cfg.ccg_bins.max(2) + 1) & !1;
     let bin_width = (2.0 * cfg.ccg_max_lag_seconds) / bins as f32;
     let refractory_bins = (cfg.refractory_seconds / bin_width.max(1e-9)).round() as usize;
     let refractory_bins = refractory_bins.max(1);
@@ -263,7 +272,18 @@ pub fn rank_split_candidates<P: DataProvider>(
             } else {
                 0.0
             };
-            let bc_score = ((bc - 0.4) / 0.4).clamp(0.0, 1.0);
+            // Hartigan dip corroborates the moment-based BC. Blend via `max`
+            // so the dip can only strengthen a detection the BC already
+            // supports (or catch a multimodal shape BC underweights), never
+            // weaken one.
+            let dip = if amps.len() >= 8 {
+                hartigan_dip(amps)
+            } else {
+                0.0
+            };
+            // dip ≈ 0.02 is noise-level; ≳ 0.06 is a clear gap.
+            let dip_score = ((dip - 0.02) / 0.04).clamp(0.0, 1.0);
+            let bc_score = ((bc - 0.4) / 0.4).clamp(0.0, 1.0).max(dip_score);
             let contamination =
                 refractory_contamination(times, refractory_samples, total_duration.0, sr);
             let cont_score = (contamination * 2.0).clamp(0.0, 1.0);
@@ -297,6 +317,7 @@ pub fn rank_split_candidates<P: DataProvider>(
                 cluster: c,
                 score: raw,
                 amp_bimodality: bc,
+                amp_dip: dip,
                 contamination,
                 drift_corr: drift,
                 n_spikes: times.len(),
@@ -446,10 +467,27 @@ mod tests {
         amps_bi.resize(1000, 8.0);
         let times_bi: Vec<SampleIndex> = (0..1000).map(|i| SampleIndex((i as u64) * 10)).collect();
 
-        // Cluster 1: unimodal amplitudes (Gaussian-ish around 5).
-        let amps_uni: Vec<f32> = (0..1000)
-            .map(|i| 5.0 + ((i as f32 * 0.7).sin()) * 0.5)
-            .collect();
+        // Cluster 1: genuinely unimodal amplitudes — a deterministic Gaussian
+        // cloud around 5.0. (The earlier `sin()` sweep was U-shaped/arcsine,
+        // i.e. genuinely *non*-unimodal, which the Hartigan dip correctly
+        // flags — so it was the wrong "unimodal" control.)
+        let amps_uni: Vec<f32> = {
+            let mut s: u32 = 0x9E37_79B9;
+            let mut out = Vec::with_capacity(1000);
+            for _ in 0..1000 {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                let u1 = (s as f64 / u32::MAX as f64).clamp(1e-9, 1.0);
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                let u2 = (s as f64 / u32::MAX as f64).clamp(1e-9, 1.0);
+                let g = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                out.push((5.0 + g * 0.5) as f32);
+            }
+            out
+        };
         let times_uni: Vec<SampleIndex> = (0..1000).map(|i| SampleIndex((i as u64) * 10)).collect();
 
         let prov = MockProvider {
