@@ -90,3 +90,15 @@ remove any path that is not a `.sorrel/cache` directory.
 
 The cache is local rebuildable state. Sorrel does not guarantee cross-machine
 cache portability, even if copying a dataset also copies `.sorrel/cache`.
+
+## Boundaries
+
+rkyv is a cache-only codec. It must not leak into:
+
+- **Compute kernels** (`crates/sorrel-compute/`). The kernel crate stays
+  dependency-free of rkyv; its types use plain Rust or serde.
+- **JSON ingest** (`crates/sorrel-io/src/{probeinterface,sorting_analyzer,open_ephys}.rs`).
+  External-format deserialisation continues to use `serde_json`.
+- **The curation journal** (`crates/sorrel-data/src/journal.rs`, `command.rs`).
+  The journal codec stays `rmp-serde` for schema evolution and forward
+  compatibility.

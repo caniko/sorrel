@@ -139,13 +139,6 @@ pub fn bimodality_coefficient(values: &[f32]) -> f32 {
     ((big_g1 * big_g1 + 1.0) / denom) as f32
 }
 
-/// Sarle's bimodality coefficient is our primary unimodality test (cheap,
-/// works well on amplitude/feature distributions). For more rigour, callers
-/// can also run `ks_two_sample` between two candidate sub-distributions.
-///
-/// (A full Hartigan dip implementation is non-trivial and would require its
-/// own crate-level dependency; intentionally omitted in favour of BC + KS,
-/// which together cover the same diagnostic ground for this curation tool.)
 /// Two-sample Kolmogorov-Smirnov statistic - the maximum absolute difference
 /// between the empirical CDFs of `a` and `b`. Range `[0, 1]`; large values
 /// indicate the two distributions don't come from the same population. The
@@ -294,6 +287,200 @@ pub fn amplitude_cutoff(amps: &[f32], n_bins: usize) -> f32 {
     (unmirrored / total).clamp(0.0, 0.5)
 }
 
+/// Hartigan & Hartigan (1985) dip statistic — the maximum distance between
+/// the empirical CDF and the closest unimodal distribution function.
+///
+/// This is the real dip test (a faithful port of Maechler's reference
+/// `diptest` C implementation, AS 217), **not** a bimodality-coefficient
+/// proxy. It is `0` for perfectly unimodal data and grows with the depth of
+/// the "dip" between modes; values are bounded in `[0, 0.25]`. Use it as a
+/// distribution-shape signal for over-merge / split detection where the
+/// bimodality coefficient's moment-based heuristic is too coarse.
+///
+/// Returns 0 for fewer than 4 samples or when all values are equal. Sorts a
+/// local copy; the input is left untouched.
+pub fn hartigan_dip(values: &[f32]) -> f32 {
+    let n = values.len();
+    if n < 4 {
+        return 0.0;
+    }
+    let mut x: Vec<f64> = values.iter().map(|&v| v as f64).collect();
+    x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if x[0] == x[n - 1] {
+        return 0.0;
+    }
+    // 1-indexed accessor matching the reference C (x[1..=n]).
+    let xv = |i: usize| x[i - 1];
+
+    // Index chains: greatest convex minorant (mn) and least concave
+    // majorant (mj) of the ECDF. Sized n+1 for 1-based indexing.
+    let mut mn = vec![0usize; n + 1];
+    let mut mj = vec![0usize; n + 1];
+    let mut gcm = vec![0usize; n + 1];
+    let mut lcm = vec![0usize; n + 1];
+
+    mn[1] = 1;
+    for j in 2..=n {
+        mn[j] = j - 1;
+        loop {
+            let mnj = mn[j];
+            let mnmnj = mn[mnj];
+            if mnj == 1
+                || (xv(j) - xv(mnj)) * (mnj as f64 - mnmnj as f64)
+                    < (xv(mnj) - xv(mnmnj)) * (j as f64 - mnj as f64)
+            {
+                break;
+            }
+            mn[j] = mnmnj;
+        }
+    }
+    mj[n] = n;
+    for k in (1..=n - 1).rev() {
+        mj[k] = k + 1;
+        loop {
+            let mjk = mj[k];
+            let mjmjk = mj[mjk];
+            if mjk == n
+                || (xv(k) - xv(mjk)) * (mjk as f64 - mjmjk as f64)
+                    < (xv(mjk) - xv(mjmjk)) * (k as f64 - mjk as f64)
+            {
+                break;
+            }
+            mj[k] = mjmjk;
+        }
+    }
+
+    // `min_is_0`: the dip of perfectly unimodal data is exactly 0 (modern
+    // diptest default), which is what we want for a departure-from-unimodality
+    // signal.
+    let mut low = 1usize;
+    let mut high = n;
+    let mut dip = 0.0_f64;
+
+    loop {
+        // GCM change points from high to low.
+        gcm[1] = high;
+        let mut i = 1usize;
+        while gcm[i] > low {
+            gcm[i + 1] = mn[gcm[i]];
+            i += 1;
+        }
+        let mut ig = i;
+        let l_gcm = i;
+        let mut ix = ig - 1;
+
+        // LCM change points from low to high.
+        lcm[1] = low;
+        let mut i2 = 1usize;
+        while lcm[i2] < high {
+            lcm[i2 + 1] = mj[lcm[i2]];
+            i2 += 1;
+        }
+        let mut ih = i2;
+        let l_lcm = i2;
+        let mut iv = 2usize;
+
+        let mut d = 0.0_f64;
+        if l_gcm != 2 || l_lcm != 2 {
+            loop {
+                let gcmix = gcm[ix];
+                let lcmiv = lcm[iv];
+                if gcmix > lcmiv {
+                    // Difference from the GCM side.
+                    let gcmi1 = gcm[ix + 1];
+                    let dx = (lcmiv as f64 - gcmi1 as f64 + 1.0)
+                        - (xv(lcmiv) - xv(gcmi1)) * (gcmix as f64 - gcmi1 as f64)
+                            / (xv(gcmix) - xv(gcmi1));
+                    iv += 1;
+                    if dx >= d {
+                        d = dx;
+                        ig = ix + 1;
+                        ih = iv - 1;
+                    }
+                } else {
+                    // Difference from the LCM side.
+                    let lcmiv1 = lcm[iv - 1];
+                    let dx = (xv(gcmix) - xv(lcmiv1)) * (lcmiv as f64 - lcmiv1 as f64)
+                        / (xv(lcmiv) - xv(lcmiv1))
+                        - (gcmix as f64 - lcmiv1 as f64 - 1.0);
+                    ix -= 1;
+                    if dx >= d {
+                        d = dx;
+                        ig = ix + 1;
+                        ih = iv;
+                    }
+                }
+                if ix < 1 {
+                    ix = 1;
+                }
+                if iv > l_lcm {
+                    iv = l_lcm;
+                }
+                if gcm[ix] == lcm[iv] {
+                    break;
+                }
+            }
+        }
+
+        if d < dip {
+            break;
+        }
+
+        // Dip over the convex minorant.
+        let mut dip_l = 0.0_f64;
+        for j in ig..l_gcm {
+            let mut max_t = 1.0_f64;
+            let jb = gcm[j + 1];
+            let je = gcm[j];
+            if je - jb > 1 && xv(je) != xv(jb) {
+                let cc = (je as f64 - jb as f64) / (xv(je) - xv(jb));
+                for jj in jb..=je {
+                    let t = (jj as f64 - jb as f64 + 1.0) - (xv(jj) - xv(jb)) * cc;
+                    if max_t < t {
+                        max_t = t;
+                    }
+                }
+            }
+            if dip_l < max_t {
+                dip_l = max_t;
+            }
+        }
+
+        // Dip over the concave majorant.
+        let mut dip_u = 0.0_f64;
+        for j in ih..l_lcm {
+            let mut max_t = 1.0_f64;
+            let jb = lcm[j];
+            let je = lcm[j + 1];
+            if je - jb > 1 && xv(je) != xv(jb) {
+                let cc = (je as f64 - jb as f64) / (xv(je) - xv(jb));
+                for jj in jb..=je {
+                    let t = (xv(jj) - xv(jb)) * cc - (jj as f64 - jb as f64 - 1.0);
+                    if max_t < t {
+                        max_t = t;
+                    }
+                }
+            }
+            if dip_u < max_t {
+                dip_u = max_t;
+            }
+        }
+
+        let dipnew = dip_l.max(dip_u);
+        if dip < dipnew {
+            dip = dipnew;
+        }
+
+        if low == gcm[ig] && high == lcm[ih] {
+            break;
+        }
+        low = gcm[ig];
+        high = lcm[ih];
+    }
+
+    (dip / (2.0 * n as f64)) as f32
+}
+
 /// Quick percentile (linear interpolation between the two nearest ranks).
 /// Sorts internally — pass a clone if you need to preserve order.
 pub fn percentile(mut values: Vec<f32>, p: f32) -> f32 {
@@ -311,17 +498,6 @@ pub fn percentile(mut values: Vec<f32>, p: f32) -> f32 {
         let frac = idx - lo as f32;
         values[lo] * (1.0 - frac) + values[hi] * frac
     }
-}
-
-/// Hartigans' dip statistic — measures departure from unimodality.
-///
-/// V1 is a thin proxy: we use the *bimodality coefficient* (which already
-/// lives in this module) as a stand-in. It rises with bimodal /
-/// heavy-tailed distributions, which is the property the dip is checking
-/// for, and avoids pulling in a heavyweight ECDF-based dip implementation
-/// for now.
-pub fn dip_statistic(values: &[f32]) -> f32 {
-    bimodality_coefficient(values)
 }
 
 #[cfg(test)]
@@ -631,9 +807,49 @@ mod tests {
     }
 
     #[test]
-    fn dip_statistic_returns_finite_for_typical_inputs() {
-        let v: Vec<f32> = (0..200).map(|i| (i as f32) * 0.05).collect();
-        let d = dip_statistic(&v);
-        assert!(d.is_finite());
+    fn hartigan_dip_small_or_constant_is_zero() {
+        assert_eq!(hartigan_dip(&[]), 0.0);
+        assert_eq!(hartigan_dip(&[1.0, 2.0, 3.0]), 0.0);
+        assert_eq!(hartigan_dip(&[5.0; 50]), 0.0);
+    }
+
+    #[test]
+    fn hartigan_dip_in_range_and_higher_for_bimodal() {
+        // Unimodal: a single dense linear ramp (≈ uniform) — small dip.
+        let uni: Vec<f32> = (0..400).map(|i| i as f32 / 400.0).collect();
+        // Bimodal: two well-separated tight clusters — large dip.
+        let mut bim: Vec<f32> = Vec::new();
+        for i in 0..200 {
+            bim.push(i as f32 / 2000.0); // [0, 0.1)
+        }
+        for i in 0..200 {
+            bim.push(10.0 + i as f32 / 2000.0); // [10, 10.1)
+        }
+        let d_uni = hartigan_dip(&uni);
+        let d_bim = hartigan_dip(&bim);
+        assert!(
+            (0.0..=0.25).contains(&d_uni),
+            "uni dip {d_uni} out of range"
+        );
+        assert!(
+            (0.0..=0.25).contains(&d_bim),
+            "bim dip {d_bim} out of range"
+        );
+        assert!(
+            d_bim > d_uni + 0.05,
+            "bimodal dip {d_bim} should clearly exceed unimodal {d_uni}",
+        );
+        // A clean 50/50 gap approaches the theoretical maximum of 0.25.
+        assert!(d_bim > 0.2, "well-separated bimodal dip {d_bim} too small");
+    }
+
+    #[test]
+    fn hartigan_dip_is_order_invariant() {
+        let mut a: Vec<f32> = (0..100).map(|i| (i * 7 % 100) as f32).collect();
+        let mut b = a.clone();
+        b.reverse();
+        // Disturb order further.
+        a.swap(3, 80);
+        assert!((hartigan_dip(&a) - hartigan_dip(&b)).abs() < 1e-6);
     }
 }

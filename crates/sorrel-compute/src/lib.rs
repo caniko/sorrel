@@ -21,8 +21,8 @@ pub use binning::{histogram_u64, isi_histogram};
 pub use ccg_analysis::{analyse_refractory_dip, refractory_dip_score, CcgRefractoryAnalysis};
 pub use cmr::subtract_channel_median;
 pub use distribution::{
-    amplitude_cutoff, bimodality_coefficient, excess_kurtosis, ks_pvalue, ks_two_sample, mean_f64,
-    mean_std, percentile, skewness, Moments,
+    amplitude_cutoff, bimodality_coefficient, excess_kurtosis, hartigan_dip, ks_pvalue,
+    ks_two_sample, mean_f64, mean_std, percentile, skewness, Moments,
 };
 pub use drift::{
     amplitude_drift_correlation, amplitude_drift_slope, longest_silent_gap_frac, presence_cv,
@@ -33,10 +33,12 @@ pub use gmm::{gmm_split_proposal, GmmSplitProposal};
 pub use lttb::lttb_downsample;
 pub use metrics::{
     amplitude_snr, auto_correlogram, cross_correlogram, fraction_below, isi_violation_rate,
-    isi_violations, mean_amplitude, presence_ratio, refractory_contamination, std_amplitude,
+    isi_violations, mean_amplitude, min_contamination_sliding_refractory, presence_ratio,
+    refractory_contamination, std_amplitude,
 };
 pub use metrics_iso::{
-    isolation_metrics, nn_isolation_metric, IsolationMetrics, MIN_CLUSTER_SPIKES,
+    isolation_metrics, lda_d_prime, nn_isolation_metric, simplified_silhouette, IsolationMetrics,
+    MIN_CLUSTER_SPIKES,
 };
 pub use quality::{quality_breakdown, QualityBreakdown};
-pub use snippets::{extract_snippets_single_channel, mean_snippet};
+pub use snippets::{extract_snippets_single_channel, mean_snippet, template_snr};

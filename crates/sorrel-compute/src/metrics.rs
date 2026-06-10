@@ -182,6 +182,55 @@ pub fn refractory_contamination(
     (f_p as f32).clamp(0.0, 1.0)
 }
 
+/// Llobet et al. (2022) sliding-refractory minimum contamination.
+///
+/// The true biological refractory period of a unit is unknown and varies, so
+/// estimating contamination at a single fixed window is fragile. This sweeps
+/// a range of candidate refractory periods `[min, max]` in `n_steps` and
+/// returns the **smallest** Hill false-positive fraction across them — the
+/// most likely true contamination, since the window that best matches the
+/// unit's real refractory period yields the cleanest (lowest) estimate.
+///
+/// Returns 0 when there are too few spikes or the window range is degenerate.
+/// The result is the same `[0, 1]` fraction as [`refractory_contamination`].
+pub fn min_contamination_sliding_refractory(
+    spike_times: &[SampleIndex],
+    min_refractory_samples: u64,
+    max_refractory_samples: u64,
+    n_steps: usize,
+    total_duration_samples: u64,
+    sample_rate: f32,
+) -> f32 {
+    if spike_times.len() < 2
+        || n_steps == 0
+        || total_duration_samples == 0
+        || max_refractory_samples < min_refractory_samples
+        || max_refractory_samples == 0
+    {
+        return 0.0;
+    }
+    let lo = min_refractory_samples.max(1);
+    let hi = max_refractory_samples.max(lo);
+    let mut min_contam = f32::INFINITY;
+    for step in 0..n_steps {
+        // Linearly spaced refractory windows from lo to hi (inclusive).
+        let rp = if n_steps == 1 {
+            hi
+        } else {
+            lo + ((hi - lo) * step as u64) / (n_steps as u64 - 1)
+        };
+        let c = refractory_contamination(spike_times, rp, total_duration_samples, sample_rate);
+        if c < min_contam {
+            min_contam = c;
+        }
+    }
+    if min_contam.is_finite() {
+        min_contam
+    } else {
+        0.0
+    }
+}
+
 /// Fraction of `n_bins` evenly-sized time bins that contain at least one
 /// spike. Closer to 1.0 indicates a unit that fires across the whole
 /// recording (good); closer to 0.0 indicates a unit only present in part of
@@ -411,6 +460,37 @@ mod tests {
         assert!(
             recovered < 0.2,
             "recovered fraction {recovered} implausibly large — N² denominator regressed?",
+        );
+    }
+
+    #[test]
+    fn sliding_refractory_min_is_clean_for_spread_train() {
+        // Well-spread train: no violations at any swept refractory period.
+        let times = siv((0..200).map(|i| (i as u64 + 1) * 10_000));
+        let total = 2_000_000;
+        let c = min_contamination_sliding_refractory(&times, 30, 300, 8, total, 30_000.0);
+        assert_eq!(c, 0.0);
+    }
+
+    #[test]
+    fn sliding_refractory_min_never_exceeds_single_window() {
+        // Some close pairs → nonzero contamination. The swept minimum must be
+        // ≤ the estimate at any single refractory window in the swept range.
+        let mut v = vec![0u64];
+        for i in 0..500u64 {
+            // Mostly spaced, but every 25th spike sits inside the refractory
+            // window of its predecessor.
+            let gap = if i % 25 == 0 { 20 } else { 5_000 };
+            v.push(v.last().unwrap() + gap);
+        }
+        let times = siv(v);
+        let total = *times.last().unwrap();
+        let min_c = min_contamination_sliding_refractory(&times, 30, 300, 10, total.0, 30_000.0);
+        let at_max = refractory_contamination(&times, 300, total.0, 30_000.0);
+        assert!((0.0..=1.0).contains(&min_c));
+        assert!(
+            min_c <= at_max + 1e-6,
+            "swept min {min_c} should not exceed single-window {at_max}",
         );
     }
 

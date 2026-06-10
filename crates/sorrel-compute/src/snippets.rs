@@ -67,6 +67,37 @@ pub fn mean_snippet(snippets: &[Vec<f32>]) -> Vec<f32> {
     sum.into_iter().map(|x| (x / n as f64) as f32).collect()
 }
 
+/// Template signal-to-noise ratio (Allen ecephys / SpikeInterface
+/// convention): the peak-to-peak amplitude of the mean waveform (template)
+/// divided by the background noise level.
+///
+/// `template` is a mean waveform such as [`mean_snippet`] produces;
+/// `noise_std` is the standard deviation (or robust MAD-derived equivalent)
+/// of the baseline signal on the same channel, in the same units as the
+/// template. A larger SNR means the unit's waveform stands further above the
+/// noise floor — a cleaner, more confidently detected unit.
+///
+/// Returns 0 when the template is empty or the noise level is non-positive.
+pub fn template_snr(template: &[f32], noise_std: f32) -> f32 {
+    if template.is_empty() || !noise_std.is_finite() || noise_std <= 0.0 {
+        return 0.0;
+    }
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    for &v in template {
+        if v < lo {
+            lo = v;
+        }
+        if v > hi {
+            hi = v;
+        }
+    }
+    if !lo.is_finite() || !hi.is_finite() {
+        return 0.0;
+    }
+    (hi - lo) / noise_std
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +224,27 @@ mod tests {
         for (got, want) in m.iter().zip(base.iter()) {
             assert!((got - (want + 20.0)).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn template_snr_is_peak_to_peak_over_noise() {
+        // Template swings from -3 to +5 → peak-to-peak 8; noise 2 → SNR 4.
+        let template = [0.0_f32, -3.0, 5.0, 1.0, 0.0];
+        assert!((template_snr(&template, 2.0) - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn template_snr_guards_degenerate_inputs() {
+        assert_eq!(template_snr(&[], 1.0), 0.0);
+        assert_eq!(template_snr(&[1.0, 2.0], 0.0), 0.0);
+        assert_eq!(template_snr(&[1.0, 2.0], -1.0), 0.0);
+    }
+
+    #[test]
+    fn template_snr_scales_inversely_with_noise() {
+        let template = [0.0_f32, 10.0, -2.0];
+        let hi = template_snr(&template, 1.0);
+        let lo = template_snr(&template, 4.0);
+        assert!(hi > lo, "lower noise should yield higher SNR: {hi} vs {lo}");
     }
 }

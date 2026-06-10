@@ -53,6 +53,13 @@ pub struct IsolationMetrics {
     /// Nearest-neighbour isolation in `[0, 1]`. 1.0 means every neighbour
     /// of every cluster spike is also in the cluster.
     pub nn_isolation: f32,
+    /// LDA d-prime: standardized mean separation between cluster and
+    /// background along the Fisher discriminant axis. Larger = more
+    /// discriminable; `≳ 4` is "well isolated". NaN if degenerate.
+    pub d_prime: f32,
+    /// Simplified silhouette in `[-1, 1]`: cluster tightness vs. distance to
+    /// the background centroid. Near 1 = well separated. NaN if degenerate.
+    pub silhouette: f32,
     /// Number of cluster spikes used in the calculation (after any
     /// sub-sampling).
     pub n_in: u32,
@@ -65,7 +72,9 @@ impl IsolationMetrics {
     pub fn has_evidence(&self) -> bool {
         !(self.isolation_distance_sq.is_nan()
             && self.l_ratio.is_nan()
-            && self.nn_isolation.is_nan())
+            && self.nn_isolation.is_nan()
+            && self.d_prime.is_nan()
+            && self.silhouette.is_nan())
     }
 
     /// Convert to a single `[0, 1]` isolation score for use in a weighted
@@ -87,6 +96,16 @@ impl IsolationMetrics {
         }
         if self.nn_isolation.is_finite() {
             parts.push(self.nn_isolation.clamp(0.0, 1.0));
+        }
+        if self.d_prime.is_finite() {
+            // d' of 4 is the rule-of-thumb "well isolated" threshold.
+            // Map via d'/(d'+2): d'=2 → 0.5, d'=4 → 0.67, d'=8 → 0.8.
+            let v = self.d_prime.max(0.0);
+            parts.push((v / (v + 2.0)).clamp(0.0, 1.0));
+        }
+        if self.silhouette.is_finite() {
+            // Silhouette ∈ [-1, 1] → [0, 1]; s=0 → 0.5, s=1 → 1.0.
+            parts.push(((self.silhouette + 1.0) * 0.5).clamp(0.0, 1.0));
         }
         if parts.is_empty() {
             return f32::NAN;
@@ -112,6 +131,8 @@ pub fn isolation_metrics(
         isolation_distance_sq: f32::NAN,
         l_ratio: f32::NAN,
         nn_isolation: f32::NAN,
+        d_prime: f32::NAN,
+        silhouette: f32::NAN,
         n_in: 0,
         n_out: 0,
     };
@@ -153,10 +174,16 @@ pub fn isolation_metrics(
     // scale is sensible regardless of feature units.
     let mean_diag = (0..d).map(|i| cov.get(i, i)).sum::<f64>() / d as f64;
     cov.ridge(mean_diag * RIDGE_FRAC);
+    // d-prime and silhouette use their own (pooled / centroid) geometry and
+    // don't depend on the cluster-covariance inverse, so compute them up front
+    // — they stay valid even on the singular-covariance fallback path below.
+    out.d_prime = lda_d_prime(features, is_in_cluster, d);
+    out.silhouette = simplified_silhouette(features, is_in_cluster, d);
+
     if invert(&mut cov, 1e-12).is_none() {
         // Even with the ridge, the covariance is singular — typical only
         // when every cluster spike has identical features. Leave the
-        // metrics as NaN.
+        // Mahalanobis-based metrics as NaN.
         out.nn_isolation = nn_isolation_metric(features, is_in_cluster, d, k_nn);
         return out;
     }
@@ -188,9 +215,17 @@ pub fn isolation_metrics(
     out
 }
 
-/// Nearest-neighbour isolation only. Cheap and works even when the
-/// covariance is singular; useful as a fallback signal when the
-/// Mahalanobis-based metrics return NaN.
+/// Nearest-neighbour isolation only (Chung et al. 2017 `nn_hit_rate`-style).
+/// Cheap and works even when the covariance is singular; useful as a fallback
+/// signal when the Mahalanobis-based metrics return NaN.
+///
+/// The in-cluster and background populations are **balanced** before counting
+/// neighbours: the background is sub-sampled down to the cluster size so the
+/// hit rate measures genuine feature-space separation rather than the
+/// in/out population ratio. Without balancing, a well-isolated cluster that is
+/// only a small fraction of all spikes reads artificially low, because near
+/// its boundary the far more numerous background spikes dominate the
+/// neighbour list (this matches SpikeInterface's balanced `nn_hit_rate`).
 pub fn nn_isolation_metric(features: &[f32], is_in_cluster: &[bool], d: usize, k: usize) -> f32 {
     let n = is_in_cluster.len();
     if n == 0 || d == 0 || k == 0 || features.len() != n * d {
@@ -200,14 +235,38 @@ pub fn nn_isolation_metric(features: &[f32], is_in_cluster: &[bool], d: usize, k
     if n_in < 2 {
         return f32::NAN;
     }
-    // Sub-sample for cost: brute-force k-NN is O(n_in × n × d).
-    // 200 cluster points × n=20k × d=3 = 12M ops — fine. Above ~500 we
-    // stride.
+    let n_out = n - n_in;
+    if n_out == 0 {
+        return f32::NAN;
+    }
+
+    // Balanced neighbour pool: every in-cluster spike plus a deterministically
+    // strided subsample of the background, sized to ~n_in so neither
+    // population dominates the k-NN counts.
+    let out_stride = (n_out / n_in).max(1);
+    let mut pool: Vec<usize> = Vec::with_capacity(2 * n_in);
+    let mut out_seen = 0usize;
+    for (i, &b) in is_in_cluster.iter().enumerate() {
+        if b {
+            pool.push(i);
+        } else {
+            if out_seen % out_stride == 0 {
+                pool.push(i);
+            }
+            out_seen += 1;
+        }
+    }
+
+    // Sub-sample the query points for cost: brute-force k-NN is
+    // O(queries × pool × d), e.g. 200 × ~2·n_in × 3.
     const TARGET: usize = 200;
     let stride = (n_in / TARGET).max(1);
-    let k_eff = k.min(n - 1);
+    let k_eff = k.min(pool.len() - 1);
+    if k_eff == 0 {
+        return f32::NAN;
+    }
 
-    // Pick out the cluster-spike indices we'll query, applying the stride.
+    // Query points: strided in-cluster spikes.
     let queries: Vec<usize> = is_in_cluster
         .iter()
         .enumerate()
@@ -223,7 +282,7 @@ pub fn nn_isolation_metric(features: &[f32], is_in_cluster: &[bool], d: usize, k
         .map(|&i| {
             let xi = &features[i * d..(i + 1) * d];
             let mut topk: Vec<(f32, bool)> = Vec::with_capacity(k_eff + 1);
-            for j in 0..n {
+            for &j in &pool {
                 if j == i {
                     continue;
                 }
@@ -255,6 +314,136 @@ pub fn nn_isolation_metric(features: &[f32], is_in_cluster: &[bool], d: usize, k
         return f32::NAN;
     }
     own as f32 / total as f32
+}
+
+/// Partition a row-major `(n, d)` feature buffer into in-cluster and
+/// background rows as `f64` (rows with any non-finite value are dropped).
+fn partition_rows(features: &[f32], is_in_cluster: &[bool], d: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut in_rows = Vec::new();
+    let mut out_rows = Vec::new();
+    for (i, &is_in) in is_in_cluster.iter().enumerate() {
+        let row = &features[i * d..(i + 1) * d];
+        if !row.iter().all(|v| v.is_finite()) {
+            continue;
+        }
+        if is_in {
+            in_rows.extend(row.iter().map(|&v| v as f64));
+        } else {
+            out_rows.extend(row.iter().map(|&v| v as f64));
+        }
+    }
+    (in_rows, out_rows)
+}
+
+/// Linear-discriminant-analysis d-prime between the cluster and its
+/// background (SpikeInterface `lda_metric` style, after Hill et al. 2011).
+///
+/// Projects every spike onto the Fisher LDA axis `w = Σ_w⁻¹ (μ_in − μ_out)`
+/// (with `Σ_w` the pooled within-class covariance) — the 1-D direction that
+/// best separates in- from out-of-cluster points — then reports the
+/// standardized mean separation along that axis:
+/// `d' = |μ_in − μ_out| / sqrt((σ²_in + σ²_out) / 2)`. Larger = more
+/// discriminable; `d' ≳ 4` is the rule-of-thumb "well isolated" threshold.
+///
+/// Returns `NaN` when either class has fewer than 2 finite rows or the pooled
+/// covariance is singular even after ridging.
+pub fn lda_d_prime(features: &[f32], is_in_cluster: &[bool], d: usize) -> f32 {
+    let n = is_in_cluster.len();
+    if d == 0 || n == 0 || features.len() != n * d {
+        return f32::NAN;
+    }
+    let (in_rows, out_rows) = partition_rows(features, is_in_cluster, d);
+    let n_in = in_rows.len() / d;
+    let n_out = out_rows.len() / d;
+    if n_in < 2 || n_out < 2 {
+        return f32::NAN;
+    }
+    let mu_in = row_mean(&in_rows, n_in, d);
+    let mu_out = row_mean(&out_rows, n_out, d);
+    let cov_in = covariance(&in_rows, n_in, d);
+    let cov_out = covariance(&out_rows, n_out, d);
+
+    // Pooled within-class covariance: ((n_in-1)·Σ_in + (n_out-1)·Σ_out) / df.
+    let df = (n_in + n_out - 2) as f64;
+    let mut sw = Sym::zeros(d);
+    for r in 0..d {
+        for c in 0..d {
+            let v = ((n_in - 1) as f64 * cov_in.get(r, c) + (n_out - 1) as f64 * cov_out.get(r, c))
+                / df;
+            sw.set(r, c, v);
+        }
+    }
+    let mean_diag = (0..d).map(|i| sw.get(i, i)).sum::<f64>() / d as f64;
+    sw.ridge(mean_diag * RIDGE_FRAC);
+    if invert(&mut sw, 1e-12).is_none() {
+        return f32::NAN;
+    }
+    // Fisher axis w = Σ_w⁻¹ (μ_in − μ_out).
+    let diff: Vec<f64> = (0..d).map(|j| mu_in[j] - mu_out[j]).collect();
+    let w: Vec<f64> = (0..d)
+        .map(|r| (0..d).map(|c| sw.get(r, c) * diff[c]).sum::<f64>())
+        .collect();
+
+    // Project each class onto w and take its mean / population variance.
+    let project = |rows: &[f64], count: usize| -> (f64, f64) {
+        let projs: Vec<f64> = (0..count)
+            .map(|i| (0..d).map(|j| w[j] * rows[i * d + j]).sum::<f64>())
+            .collect();
+        let mean = projs.iter().sum::<f64>() / count as f64;
+        let var = projs.iter().map(|&p| (p - mean).powi(2)).sum::<f64>() / count as f64;
+        (mean, var)
+    };
+    let (m_in, v_in) = project(&in_rows, n_in);
+    let (m_out, v_out) = project(&out_rows, n_out);
+    let pooled = 0.5 * (v_in + v_out);
+    if pooled <= 0.0 || pooled.is_nan() {
+        return f32::NAN;
+    }
+    ((m_in - m_out).abs() / pooled.sqrt()) as f32
+}
+
+/// Simplified silhouette (Hruschka et al. 2004) of the cluster against its
+/// pooled background. For each cluster spike, `a` is its Euclidean distance
+/// to the cluster centroid and `b` its distance to the background centroid;
+/// the score is the mean of `(b − a) / max(a, b)` over cluster spikes.
+///
+/// Ranges `[-1, 1]`: near 1 means a tight, well-separated cluster; near 0
+/// means it overlaps the background; negative means cluster spikes sit closer
+/// to the background centroid than their own. This is the binary (cluster vs
+/// pooled background) form — it treats all non-cluster spikes as one group
+/// rather than scoring against each neighbouring unit separately.
+///
+/// Returns `NaN` when either side is empty.
+pub fn simplified_silhouette(features: &[f32], is_in_cluster: &[bool], d: usize) -> f32 {
+    let n = is_in_cluster.len();
+    if d == 0 || n == 0 || features.len() != n * d {
+        return f32::NAN;
+    }
+    let (in_rows, out_rows) = partition_rows(features, is_in_cluster, d);
+    let n_in = in_rows.len() / d;
+    let n_out = out_rows.len() / d;
+    if n_in == 0 || n_out == 0 {
+        return f32::NAN;
+    }
+    let mu_in = row_mean(&in_rows, n_in, d);
+    let mu_out = row_mean(&out_rows, n_out, d);
+    let dist_to = |row: &[f64], centroid: &[f64]| -> f64 {
+        (0..d)
+            .map(|j| (row[j] - centroid[j]).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    };
+    let mut acc = 0.0_f64;
+    for i in 0..n_in {
+        let row = &in_rows[i * d..(i + 1) * d];
+        let a = dist_to(row, &mu_in);
+        let b = dist_to(row, &mu_out);
+        let m = a.max(b);
+        if m > 0.0 {
+            acc += (b - a) / m;
+        }
+    }
+    (acc / n_in as f64) as f32
 }
 
 #[cfg(test)]
@@ -389,5 +578,84 @@ mod tests {
         // standalone NN function still works.
         let nn = nn_isolation_metric(&feats, &is_in, 2, 4);
         assert!(nn.is_finite());
+    }
+
+    /// The balancing property: a moderately-separated cluster's NN isolation
+    /// must stay roughly stable as the background population grows. Without
+    /// the in/out balancing, a 10×-larger background pulls more out-cluster
+    /// spikes into every neighbour list and the score collapses; with
+    /// balancing the background is sub-sampled to the cluster size first, so
+    /// the score reflects separation, not the population ratio.
+    fn nn_with_background(n_out: usize) -> f32 {
+        let n_in = 200;
+        // Partial overlap (centroids ~3σ apart) so the metric is sensitive
+        // to neighbour composition rather than saturating at 1.0.
+        let mut feats = cloud(n_in, [0.0, 0.0], 1.0, 0xA11CE);
+        feats.extend(cloud(n_out, [3.0, 0.0], 1.0, 0xB0B));
+        let mut is_in = vec![true; n_in];
+        is_in.extend(vec![false; n_out]);
+        nn_isolation_metric(&feats, &is_in, 2, 5)
+    }
+
+    #[test]
+    fn nn_isolation_is_stable_under_background_growth() {
+        let small_bg = nn_with_background(200);
+        let large_bg = nn_with_background(2000);
+        assert!(small_bg.is_finite() && large_bg.is_finite());
+        // A 10× background change should barely move the balanced metric.
+        assert!(
+            (small_bg - large_bg).abs() < 0.1,
+            "balanced NN isolation drifted with background size: {small_bg} vs {large_bg}",
+        );
+    }
+
+    #[test]
+    fn d_prime_larger_for_better_separated() {
+        let n = 300;
+        let mut is_in = vec![true; n];
+        is_in.extend(vec![false; n]);
+        // Far-apart clusters → large d'.
+        let mut far = cloud(n, [0.0, 0.0], 1.0, 0x1111);
+        far.extend(cloud(n, [8.0, 0.0], 1.0, 0x2222));
+        // Near clusters → small d'.
+        let mut near = cloud(n, [0.0, 0.0], 1.0, 0x3333);
+        near.extend(cloud(n, [1.0, 0.0], 1.0, 0x4444));
+        let d_far = lda_d_prime(&far, &is_in, 2);
+        let d_near = lda_d_prime(&near, &is_in, 2);
+        assert!(d_far.is_finite() && d_near.is_finite());
+        assert!(
+            d_far > d_near,
+            "d' should grow with separation: far {d_far} vs near {d_near}",
+        );
+        // 8σ separation is very well isolated — comfortably past the d'≈4 rule.
+        assert!(d_far > 4.0, "well-separated d' {d_far} unexpectedly small");
+    }
+
+    #[test]
+    fn silhouette_high_when_separated_low_when_overlapping() {
+        let n = 300;
+        let mut is_in = vec![true; n];
+        is_in.extend(vec![false; n]);
+        let mut sep = cloud(n, [0.0, 0.0], 1.0, 0x5555);
+        sep.extend(cloud(n, [12.0, 0.0], 1.0, 0x6666));
+        let mut overlap = cloud(n, [0.0, 0.0], 1.0, 0x7777);
+        overlap.extend(cloud(n, [0.0, 0.0], 1.0, 0x8888));
+        let s_sep = simplified_silhouette(&sep, &is_in, 2);
+        let s_overlap = simplified_silhouette(&overlap, &is_in, 2);
+        assert!((-1.0..=1.0).contains(&s_sep) && (-1.0..=1.0).contains(&s_overlap));
+        assert!(s_sep > 0.5, "separated silhouette {s_sep} should be high",);
+        assert!(
+            s_overlap < s_sep,
+            "overlapping silhouette {s_overlap} should be below separated {s_sep}",
+        );
+    }
+
+    #[test]
+    fn d_prime_and_silhouette_nan_on_degenerate_inputs() {
+        // No background.
+        let feats = cloud(60, [0.0, 0.0], 1.0, 9);
+        let is_in = vec![true; 60];
+        assert!(lda_d_prime(&feats, &is_in, 2).is_nan());
+        assert!(simplified_silhouette(&feats, &is_in, 2).is_nan());
     }
 }
