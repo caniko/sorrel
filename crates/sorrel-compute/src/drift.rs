@@ -5,6 +5,12 @@
 //! gaps in firing (electrode-contact loss). These metrics quantify both so
 //! the curator can flag clusters that are likely *one neuron seen partially*
 //! rather than one neuron seen cleanly.
+//!
+//! These are per-cluster *quality-control indicators* (amplitude-vs-time
+//! correlation/slope, presence CV, silent-gap fraction), not a spatial
+//! motion estimate. They do not recover a µm-vs-time motion trace and are not
+//! the cross-correlation-of-depth-histogram registration that Kilosort2.5 /
+//! dredge perform; do not treat their output as a drift-correction signal.
 
 use sorrel_io::SampleIndex;
 

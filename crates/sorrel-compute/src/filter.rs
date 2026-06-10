@@ -4,6 +4,14 @@
 //! which is enough to flatten the LFP background under the ~300 Hz spike
 //! cutoff phy uses by default. Higher-order filters can be built by chaining
 //! sections — each `Biquad` keeps its own state, so a cascade is just a `Vec`.
+//!
+//! **Display only.** This is a single forward pass, so it is *causal* and
+//! introduces frequency-dependent group delay (tens of µs near the cutoff at
+//! 30 kHz) that shifts and asymmetrically distorts waveform features. That is
+//! fine for rendering traces — and matches phy's live display filter — but it
+//! must never feed any path that measures spike times, latencies, or
+//! cross-channel alignment. Such a path needs zero-phase (forward-backward,
+//! `filtfilt`-style) filtering instead.
 
 use std::f32::consts::PI;
 
