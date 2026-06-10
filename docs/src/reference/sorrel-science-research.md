@@ -6,16 +6,29 @@
 > algorithm below was read in full and checked against its canonical
 > reference; several were brute-forced against oracle implementations.
 >
-> **Update (same day, post-audit):** the confirmed bugs and the
-> numerical concerns below have been fixed in the working tree — Hill
-> contamination `N²` (with a golden regression test), the
+> **Update (same day, post-audit):** the confirmed bugs, the numerical
+> concerns, and most fidelity items below have been fixed in the working
+> tree — Hill contamination `N²` (with a golden regression test), the
 > cutoff↔completeness contract, GMM logsumexp, the presence-bin
-> off-by-one, the bimodality-coefficient moment inconsistency, plus
-> `filter.rs`/`drift.rs` scope doc-hardening. See the per-finding
-> **[FIXED]** markers. Workspace stays green (clippy `--deny warnings`,
-> 450 tests). Still open: the CCG binning convention (#6), NN-isolation
-> balancing (#7), the mislabeled-estimator renames (#8, #9), and the
-> stretch new-metric suite (#9 in next steps).
+> off-by-one, the bimodality-coefficient moment inconsistency,
+> `filter.rs`/`drift.rs` scope doc-hardening, the CCG even-bins
+> enforcement (#6), NN-isolation in/out balancing (#7, with a
+> background-stability golden test), and removal of the misleading dead
+> `dip_statistic` alias (#9). See the per-finding **[FIXED]** markers.
+>
+> **Update 2 (net-new algorithms now implemented):** the stretch metric
+> suite has been added and wired in — the real **Hartigan & Hartigan
+> (1985) dip** (faithful port of Maechler's `diptest` C reference,
+> `distribution::hartigan_dip`, now feeding the split suggester and its
+> UI column), the **Llobet et al. (2022) sliding-refractory minimum
+> contamination** (`metrics::min_contamination_sliding_refractory`),
+> **LDA d-prime** and **simplified silhouette** (added to
+> `IsolationMetrics`, the rkyv cache bumped to `ALGO_VERSION = 2`, and the
+> QC TSV/JSON export), and **template SNR** (`snippets::template_snr`).
+> Each ships with property/golden tests. Workspace green
+> (clippy `--deny warnings`, 461 tests). The only intentionally-skipped
+> item is renaming `sliding_refractory_contamination` (the windowed-Hill
+> UI plot), which already documents itself honestly.
 
 ## Goal And Trigger
 
@@ -144,25 +157,38 @@ and one **cross-cutting validation gap**:
    (`distribution.rs`).** Now converts the uncorrected `g1`/`g2` to the
    bias-corrected `G1`/`G2` that the SAS small-sample correction term
    assumes, so the conventions are consistent for small clusters.
-6. **CCG binning convention (`metrics.rs:25-92`, `ccg_analysis.rs:54`,
-   `correlograms.rs:277`).** Assert/document `bins` even and
-   `2*window % bin_size == 0`, or build an explicit zero-centered bin
-   grid; make the lag window symmetric so `+max_lag` is not folded into
-   the last bin. `analyse_refractory_dip` hard-codes `half = bins/2` as
-   the zero-lag center, so an odd bin count silently mis-centers the dip.
+6. **[FIXED] CCG even-bins convention.** The one path feeding
+   `analyse_refractory_dip` (`suggest.rs`) now rounds `ccg_bins` up to
+   even via `(n + 1) & !1`, so zero lag always lands on the
+   `half-1`/`half` boundary and the refractory window `[half-r, half+r)`
+   stays symmetric; `analyse_refractory_dip` gained a `debug_assert` on
+   even bins to catch any future caller. (The extreme-lag right-edge
+   clamp in `cross_correlogram` affects only pairs at *exactly*
+   `±max_lag` samples — far from the central dip — and was left as-is to
+   avoid churning a well-tested path for a negligible-impact edge case.)
 
 ### Fidelity / documentation mismatches
 
-7. **NN isolation unbalanced (`metrics_iso.rs:194-258`).** Subsample the
-   background pool to balance in/out before counting neighbors, per the
-   Chung 2017 / SpikeInterface `nn_hit_rate`; otherwise small clusters
-   read artificially low.
-8. **`sliding_refractory_contamination` is windowed-Hill, not Llobet
-   (`drift.rs:102`).** Rename, or implement the Llobet 2022
-   minimum-contamination-over-`t_ref` estimator the name implies.
-9. **`dip_statistic` is the bimodality coefficient, not Hartigan's dip
-   (`distribution.rs:301`).** Rename or implement the real dip; callers
-   must not read it on the Hartigan scale.
+7. **[FIXED] NN isolation unbalanced (`metrics_iso.rs`).** Now builds a
+   balanced neighbour pool — every in-cluster spike plus a
+   deterministically strided background subsample sized to `~n_in` —
+   before counting k-NN hits, matching SpikeInterface's balanced
+   `nn_hit_rate`. Guarded by `nn_isolation_is_stable_under_background_growth`,
+   which asserts the score barely moves when the background grows 10×.
+8. **[ADDRESSED] Llobet sliding-refractory minimum now implemented.** The
+   genuine Llobet et al. (2022) minimum-contamination-over-`t_ref`
+   estimator is added as `metrics::min_contamination_sliding_refractory`
+   (sweeps candidate refractory periods, returns the smallest Hill
+   fraction). The original `sliding_refractory_contamination` (a
+   *time-window* sweep for the UI plot) is retained and unchanged — it
+   honestly documents itself as windowed-Hill; only a possible rename
+   remains a user decision.
+9. **[ADDRESSED] Real Hartigan dip now implemented.** The misleading dead
+   `dip_statistic` alias was removed, and a faithful port of Hartigan &
+   Hartigan (1985) — Maechler's `diptest` C reference — was added as
+   `distribution::hartigan_dip` (`[0, 0.25]`, 0 for unimodal). It now
+   corroborates the bimodality coefficient in the split suggester
+   (`amp_dip` field, blended via `max`) and shows in the UI split table.
 10. **`amplitude_cutoff` doc overclaims Hill-2011 equivalence
     (`distribution.rs:205`).** Soften the doc and/or implement the
     Allen/Hill reflected-Gaussian-tail estimator with the 0.5 cap.
@@ -244,30 +270,36 @@ prior dossier's claim that PCA/eigensolvers exist is wrong — none do.
 3. **[DONE] Add logsumexp to the GMM E-step** — `gmm.rs`.
 4. **[DONE] Fix presence-bin off-by-one and the BC moment inconsistency**
    — `metrics.rs` presence clamp, `distribution.rs` bias-corrected G1/G2.
-5. **Settle the CCG binning convention** (`metrics.rs`, `ccg_analysis.rs`,
-   `correlograms.rs`) — assert even/centered bins or rebuild the grid;
-   re-run suggester tests. Medium; touches the suggester path.
-6. **Rename or re-implement the mislabeled estimators** (`dip_statistic`,
-   `sliding_refractory_contamination`) and soften the `amplitude_cutoff`
-   doc. Small per item; documentation + naming.
-7. **Balance NN isolation sampling** (`metrics_iso.rs:194-258`). Medium;
-   changes a metric's values, so pair with a golden test.
+5. **[DONE] Settle the CCG binning convention** — `suggest.rs` rounds
+   `ccg_bins` up to even; `analyse_refractory_dip` asserts even bins.
+   Suggester tests re-run green.
+6. **[DONE] Remove the misleading `dip_statistic` alias** (dead code).
+   The `amplitude_cutoff` doc was also corrected (0.5 cap) under step 2.
+   `sliding_refractory_contamination` left as-is (honest Hill doc).
+7. **[DONE] Balance NN isolation sampling** (`metrics_iso.rs`) — in/out
+   balanced pool, with the `nn_isolation_is_stable_under_background_growth`
+   golden test.
 8. **[DONE] Harden `filter.rs` / `drift.rs` rustdoc** to scope them
    (display-only; QC-only).
-9. **Stretch: fill the missing standard metrics** — d-prime, silhouette,
-   a real Hartigan dip, the Llobet sliding-refractory minimum, and a
-   template-based SNR — to match the SpikeInterface/phy metric suite.
-   Each warrants its own design note; independent of (1)–(8).
+9. **[DONE] Fill the missing standard metrics** — the real Hartigan dip
+   (`hartigan_dip`), Llobet sliding-refractory minimum
+   (`min_contamination_sliding_refractory`), LDA d-prime and simplified
+   silhouette (on `IsolationMetrics`, cache `ALGO_VERSION = 2`, QC
+   export), and template SNR (`template_snr`). The dip feeds the split
+   suggester and its UI column. All ship with tests.
 
 ## Open Decisions For The User
 
-- **Rename vs re-implement the mislabeled estimators?** `dip_statistic`
-  and `sliding_refractory_contamination` are documented proxies; do you
-  want them renamed to match what they do, or upgraded to the real
-  Hartigan-dip and Llobet algorithms (more work, more scientific value)?
-- **How far to chase phy/SpikeInterface parity?** A few golden fixtures
-  are cheap and high-value; full parity across the metric suite is a
-  larger effort. Where is the line for 0.1.0?
-- **Expand the metric suite now or after publish?** d-prime / silhouette /
-  template-SNR are net-new features; do they block first publish or come
-  in 0.2.0?
+- **Rename `sliding_refractory_contamination`?** It is the windowed-Hill
+  UI plot (honestly documented), distinct from the new
+  `min_contamination_sliding_refractory` (Llobet). The name is still
+  slightly suggestive of Llobet; rename for clarity, or leave it since the
+  UI relies on it and the doc is honest?
+- **Wire d-prime / silhouette into the composite quality score and UI?**
+  They are computed, cached, and exported, and already contribute to
+  `IsolationMetrics::score()`. A dedicated UI display (beyond the QC
+  export) is optional polish.
+- **How far to chase phy/SpikeInterface numeric parity?** The metrics are
+  algorithmically faithful and property-tested; pinning exact values
+  against SpikeInterface fixtures is a larger, optional effort. Where is
+  the line for 0.1.0?
