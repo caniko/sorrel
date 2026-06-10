@@ -26,6 +26,8 @@
 
 # Planning
 
+- [Sorrel improvement research](./planning/sorrel-improvement-research.md)
+- [Sorrel scientific correctness research](./planning/sorrel-science-research.md)
 - [rkyv derived-data cache](./planning/rkyv-derived-cache/README.md)
   - [01 — Cache infrastructure](./planning/rkyv-derived-cache/01-cache-infrastructure.md)
   - [02 — First consumer](./planning/rkyv-derived-cache/02-first-consumer.md)
