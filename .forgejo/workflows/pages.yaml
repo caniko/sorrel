@@ -1,25 +1,26 @@
-name: Publish Pages
+name: pages
 
 on:
   push:
-    branches: [trunk]
+    branches:
+      - trunk
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  publish:
-    runs-on: codeberg-small
+  pages:
+    runs-on: atlas-nix-trusted
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Nix
-        uses: https://github.com/cachix/install-nix-action@v31
-
+      - uses: actions/checkout@v4
       - name: Build site
         run: nix build .#site
-
-      - name: Publish to Codeberg Pages
-        uses: https://codeberg.org/git-pages/action@v2
-        with:
-          site: "https://${{ forge.repository_owner }}.codeberg.page/sorrel/"
-          token: ${{ forge.token }}
-          source: result/
+      - name: Deploy to Codeberg Pages
+        env:
+          GIT_AUTHOR_NAME: forgejo-actions
+          GIT_AUTHOR_EMAIL: forgejo-actions@noreply.codeberg.org
+          DEPLOY_REMOTE: pages-origin
+        run: |
+          git remote add pages-origin https://codeberg.org/caniko/$proj
+          nix run .#deploy-pages

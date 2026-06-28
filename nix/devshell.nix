@@ -11,7 +11,7 @@
 }: let
   inherit (deps) buildInputs nativeBuildInputs runtimeLibs hdf5C;
 in
-  rs-harbor.lib.mkDevShells {
+  (rs-harbor.lib.mkDevShells {
     inherit pkgs cross cargoConfig craneLib checks;
 
     pkgConfigDeps = buildInputs;
@@ -44,4 +44,29 @@ in
       echo "Website: cd website && zola serve"
       echo "Documentation: cd docs && mdbook serve"
     '';
+  })
+  // {
+    docs = rs-harbor.lib.mkDocsShell {
+      inherit pkgs cross cargoConfig craneLib checks;
+      pkgConfigDeps = buildInputs;
+      packages = with pkgs;
+        [
+          cargo-nextest
+          mdbook
+          pre-commit
+          rust-analyzer
+          hdf5
+        ]
+        ++ preCommitEnabledPackages
+        ++ buildInputs
+        ++ nativeBuildInputs;
+      extraEnv = {
+        LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
+        HDF5_DIR = "${hdf5C}";
+      };
+      extraShellHook = ''
+        ${shellHook}
+        echo "Documentation: mdbook serve docs"
+      '';
+    };
   }

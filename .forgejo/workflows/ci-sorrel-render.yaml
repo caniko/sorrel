@@ -4,34 +4,78 @@ name: CI
 on:
   push:
     branches: ["**"]
-  pull_request:
+    tags-ignore: ["**"]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
-    runs-on: atlas
-    container: rust:bookworm
+  atlas-nix-trusted:
+    runs-on: atlas-nix-trusted
+    env:
+      NIX_CONFIG: "experimental-features = nix-command flakes"
+      XDG_CACHE_HOME: "/tmp/.cache"
+      CARGO_HOME: "/tmp/.cargo"
     steps:
       - name: Checkout
         uses: https://code.forgejo.org/actions/checkout@v4
 
-      - name: Install Rust components
-        run: rustup component add clippy rustfmt
+      - name: Add cargo bin to PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
-      - name: Cache cargo bin (tools)
-        uses: https://code.forgejo.org/actions/cache@v4
-        with:
-          path: ~/.cargo/bin
-          key: cargo-bin-${{ runner.os }}-${{ hashFiles('.forgejo/workflows/ci.yaml', '.github/workflows/ci.yaml') }}
+      - name: Check flake
+        run: nix flake check
 
-      - name: Test all features
-        run: cargo test -p sorrel-render --all-features
+  codeberg-tiny:
+    needs: [atlas-nix-trusted]
+    runs-on: codeberg-tiny
+    env:
+      NIX_CONFIG: "experimental-features = nix-command flakes"
+      XDG_CACHE_HOME: "/tmp/.cache"
+      CARGO_HOME: "/tmp/.cargo"
+    steps:
+      - name: Checkout
+        uses: https://code.forgejo.org/actions/checkout@v4
 
-      - name: Clippy all features
-        run: cargo clippy -p sorrel-render --all-targets --all-features -- --deny warnings
+      - name: Add cargo bin to PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Format check
+        run: nix develop -c cargo fmt --all -- --check
+
+  codeberg-medium:
+    needs: [atlas-nix-trusted]
+    runs-on: codeberg-medium
+    env:
+      NIX_CONFIG: "experimental-features = nix-command flakes"
+      XDG_CACHE_HOME: "/tmp/.cache"
+      CARGO_HOME: "/tmp/.cargo"
+    steps:
+      - name: Checkout
+        uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Add cargo bin to PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Test
+        run: nix develop -c cargo test -p sorrel-render
 
       - name: Package crate
-        run: cargo package -p sorrel-render --allow-dirty
+        run: nix develop -c cargo package -p sorrel-render
+  codeberg-small:
+    needs: [atlas-nix-trusted]
+    runs-on: codeberg-small
+    env:
+      NIX_CONFIG: "experimental-features = nix-command flakes"
+      XDG_CACHE_HOME: "/tmp/.cache"
+      CARGO_HOME: "/tmp/.cargo"
+    steps:
+      - name: Checkout
+        uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Add cargo bin to PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Clippy
+        run: nix develop -c cargo clippy -p sorrel-render --all-targets -- --deny warnings

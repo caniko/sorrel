@@ -10,6 +10,10 @@
     flake-utils.follows = "rs-harbor/flake-utils";
     treefmt-nix.url = "github:numtide/treefmt-nix";
     git-hooks.url = "github:cachix/git-hooks.nix";
+    plinth = {
+      url = "git+https://codeberg.org/caniko/plinth.git";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
@@ -20,6 +24,7 @@
     rust-overlay,
     treefmt-nix,
     git-hooks,
+    plinth,
     ...
   }:
     flake-utils.lib.eachDefaultSystem (system: let
@@ -86,9 +91,14 @@
 
       formatter = treefmtEval.config.build.wrapper;
 
-      apps.default = {
-        type = "app";
-        program = "${sorrel}/bin/sorrel";
+      apps = {
+        default = {
+          type = "app";
+          program = "${sorrel}/bin/sorrel";
+        };
+        deploy-pages = plinth.lib.${system}.mkDeployPagesApp {
+          domain = "sorrel.tartanoglu.com";
+        };
       };
     });
 }
