@@ -44,7 +44,7 @@ the formulas.
 
 ## Current Reality
 
-The numerical *infrastructure* is unusually solid — covariance uses a
+The numerical _infrastructure_ is unusually solid — covariance uses a
 two-pass Bessel-corrected estimator, Mahalanobis distance is correct,
 LTTB matches Steinarsson 2013 bucket-for-bucket, the median is correct
 under brute-force testing, snippet templates accumulate in `f64`, and
@@ -64,9 +64,9 @@ and one **cross-cutting validation gap**:
   cluster**. This is the single most consequential scientific defect.
 
 - **No test pins any metric's numeric value.** There is no
-  golden-value or phy/SpikeInterface-parity test for *any* metric
+  golden-value or phy/SpikeInterface-parity test for _any_ metric
   magnitude. `crates/sorrel-data/tests/synthetic_ground_truth.rs`
-  checks only the *directional* behaviour of the merge/split suggesters
+  checks only the _directional_ behaviour of the merge/split suggesters
   (`merges not empty`, `dip_z > 2.0`, `score > 0.5`); the in-crate unit
   tests assert sanity bounds like `c > 0.0` (`metrics.rs:354-361`).
   Nothing would have caught the Hill scale error, and nothing guards
@@ -90,36 +90,36 @@ and one **cross-cutting validation gap**:
   heuristics, not Kilosort2.5/dredge spatial-motion estimation.
 
 - **No PCA exists in-tree.** PC features are precomputed upstream
-  (Kilosort) and only *extracted* in `feature_subspace.rs`; there is no
+  (Kilosort) and only _extracted_ in `feature_subspace.rs`; there is no
   eigendecomposition/SVD/whitening anywhere. Any roadmap item assuming
   sorrel computes its own feature subspace is mistaken.
 
 ## Evidence Inventory
 
-| Evidence | File:line / command | What it proves |
-|---|---|---|
-| Hill contamination missing N² | `metrics.rs:166` `denom = n * 2.0 * rp_s / total_s` | Returns `N_viol·T/(2·t_ref·N)`, ~N× the Hill fraction `N_viol·T/(2·t_ref·N²)` |
-| Contamination dimension dead | `quality.rs:111` `(1.0 - raw_contamination).clamp(0,1)` | Inflated raw value saturates score to 0 for real clusters |
-| Cutoff↔completeness contract mismatch | `quality.rs:119` `1.0 - raw_cutoff*2.0` vs `distribution.rs:279` clamp to 1.0 | `completeness_score` can be driven negative then clamped to 0 |
-| No numeric metric tests | `rg 'refractory_contamination\|isolation_distance\|l_ratio\|amplitude_cutoff' crates/**/tests` → none assert values | No golden/parity coverage; scale bugs invisible |
-| Suggester tests are directional only | `synthetic_ground_truth.rs:177-252` (`!merges.is_empty()`, `dip_z > 2.0`) | Validates pipeline direction, not metric magnitude |
-| Unit tests assert sanity only | `metrics.rs:354-361` (`assert!(c > 0.0)`) | Would not catch an N× scale error |
-| presence last-bin off-by-one | `metrics.rs:188-191` (`idx < n_bins` drops `idx==n_bins`); same `drift.rs:81-85` | Boundary spike at `t==total` silently dropped; biases ratio low |
-| GMM E-step no logsumexp | `gmm.rs:96-104` linear-domain `pa+pb`; `resp=0.5` on `total==0.0` | Far-outlier underflow fabricates a 0.5 posterior, biasing M-step |
-| BC mixes corrected/uncorrected moments | `distribution.rs:116-130` corrected `3(n-1)²/((n-2)(n-3))` with uncorrected `g1`,`g2` (lines 65,73) | Sarle BC internally inconsistent for small n |
-| CCG even-bin assumption | `ccg_analysis.rs:54` `half = bins/2` vs `correlograms.rs:277` `ceil(2*window/bin)` | Bin count even only if `2*window % bin == 0`; else zero-lag center off by half a bin |
-| CCG right-edge asymmetry | `metrics.rs:46-49` `dt==+max_lag → idx=bins` clamped to `bins-1` | Extreme positive lag folded into last bin; one-bin asymmetry vs `-max_lag` |
-| `dip_statistic` ≠ Hartigan dip | `distribution.rs:301-310` returns `bimodality_coefficient` | Name/scale mismatch (Hartigan dip ∈ ~[0,0.25]; BC ∈ [0,1]) |
-| `sliding_refractory` ≠ Llobet | `drift.rs:102-143` re-applies (buggy) Hill per window | Not the Llobet 2022 min-contamination estimator |
-| NN isolation unbalanced | `metrics_iso.rs:194-258` strides only in-cluster queries, never subsamples background | Deviates from balanced Chung 2017 / SpikeInterface nn_hit_rate |
-| Causal display filter | `filter.rs:79-99` single forward-pass DF2T biquad; only caller `sorrel-render/src/buffers.rs:209-226` | Group delay OK for display; must never feed spike-time measurement |
-| No PCA in-tree | `rg 'eigen\|jacobi\|svd\|whiten\|principal_component' crates/` → none; `feature_subspace.rs:153,175` extracts precomputed `feats[pc*n_chans+ch]` | PCs come from upstream sorter |
-| Covariance correct | `linalg.rs:65-91` `1/(n-1)`, two-pass, symmetrized | Confirmed-correct sample covariance |
-| Mahalanobis correct | `linalg.rs:170-186` `(x-μ)ᵀΣ⁻¹(x-μ)`, `.max(0.0)` guard | Confirmed correct |
-| LTTB correct | `lttb.rs:39-70` brute-forced vs Steinarsson 2013 oracle, all `(n,threshold)<2000` | Bucket boundaries + triangle area exact; no underflow/div-by-zero |
-| Median correct | `cmr.rs:38-53` brute-forced 200k random arrays vs sort oracle | `select_nth_unstable` tie-handling exact for even n |
-| L-ratio correct | `metrics_iso.rs:179-181` `Σ χ²-sf(D²,df=d) / N_in` | Matches Schmitzer-Torbert 2005 (initially suspected, confirmed correct) |
-| Isolation distance correct | `metrics_iso.rs:173-178` N-th nearest non-cluster Mahalanobis², guarded `n_out≥n_in` | Matches Schmitzer-Torbert 2005 |
+| Evidence                               | File:line / command                                                                                                                              | What it proves                                                                       |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
+| Hill contamination missing N²          | `metrics.rs:166` `denom = n * 2.0 * rp_s / total_s`                                                                                              | Returns `N_viol·T/(2·t_ref·N)`, ~N× the Hill fraction `N_viol·T/(2·t_ref·N²)`        |
+| Contamination dimension dead           | `quality.rs:111` `(1.0 - raw_contamination).clamp(0,1)`                                                                                          | Inflated raw value saturates score to 0 for real clusters                            |
+| Cutoff↔completeness contract mismatch  | `quality.rs:119` `1.0 - raw_cutoff*2.0` vs `distribution.rs:279` clamp to 1.0                                                                    | `completeness_score` can be driven negative then clamped to 0                        |
+| No numeric metric tests                | `rg 'refractory_contamination\|isolation_distance\|l_ratio\|amplitude_cutoff' crates/**/tests` → none assert values                              | No golden/parity coverage; scale bugs invisible                                      |
+| Suggester tests are directional only   | `synthetic_ground_truth.rs:177-252` (`!merges.is_empty()`, `dip_z > 2.0`)                                                                        | Validates pipeline direction, not metric magnitude                                   |
+| Unit tests assert sanity only          | `metrics.rs:354-361` (`assert!(c > 0.0)`)                                                                                                        | Would not catch an N× scale error                                                    |
+| presence last-bin off-by-one           | `metrics.rs:188-191` (`idx < n_bins` drops `idx==n_bins`); same `drift.rs:81-85`                                                                 | Boundary spike at `t==total` silently dropped; biases ratio low                      |
+| GMM E-step no logsumexp                | `gmm.rs:96-104` linear-domain `pa+pb`; `resp=0.5` on `total==0.0`                                                                                | Far-outlier underflow fabricates a 0.5 posterior, biasing M-step                     |
+| BC mixes corrected/uncorrected moments | `distribution.rs:116-130` corrected `3(n-1)²/((n-2)(n-3))` with uncorrected `g1`,`g2` (lines 65,73)                                              | Sarle BC internally inconsistent for small n                                         |
+| CCG even-bin assumption                | `ccg_analysis.rs:54` `half = bins/2` vs `correlograms.rs:277` `ceil(2*window/bin)`                                                               | Bin count even only if `2*window % bin == 0`; else zero-lag center off by half a bin |
+| CCG right-edge asymmetry               | `metrics.rs:46-49` `dt==+max_lag → idx=bins` clamped to `bins-1`                                                                                 | Extreme positive lag folded into last bin; one-bin asymmetry vs `-max_lag`           |
+| `dip_statistic` ≠ Hartigan dip         | `distribution.rs:301-310` returns `bimodality_coefficient`                                                                                       | Name/scale mismatch (Hartigan dip ∈ ~[0,0.25]; BC ∈ [0,1])                           |
+| `sliding_refractory` ≠ Llobet          | `drift.rs:102-143` re-applies (buggy) Hill per window                                                                                            | Not the Llobet 2022 min-contamination estimator                                      |
+| NN isolation unbalanced                | `metrics_iso.rs:194-258` strides only in-cluster queries, never subsamples background                                                            | Deviates from balanced Chung 2017 / SpikeInterface nn_hit_rate                       |
+| Causal display filter                  | `filter.rs:79-99` single forward-pass DF2T biquad; only caller `sorrel-render/src/buffers.rs:209-226`                                            | Group delay OK for display; must never feed spike-time measurement                   |
+| No PCA in-tree                         | `rg 'eigen\|jacobi\|svd\|whiten\|principal_component' crates/` → none; `feature_subspace.rs:153,175` extracts precomputed `feats[pc*n_chans+ch]` | PCs come from upstream sorter                                                        |
+| Covariance correct                     | `linalg.rs:65-91` `1/(n-1)`, two-pass, symmetrized                                                                                               | Confirmed-correct sample covariance                                                  |
+| Mahalanobis correct                    | `linalg.rs:170-186` `(x-μ)ᵀΣ⁻¹(x-μ)`, `.max(0.0)` guard                                                                                          | Confirmed correct                                                                    |
+| LTTB correct                           | `lttb.rs:39-70` brute-forced vs Steinarsson 2013 oracle, all `(n,threshold)<2000`                                                                | Bucket boundaries + triangle area exact; no underflow/div-by-zero                    |
+| Median correct                         | `cmr.rs:38-53` brute-forced 200k random arrays vs sort oracle                                                                                    | `select_nth_unstable` tie-handling exact for even n                                  |
+| L-ratio correct                        | `metrics_iso.rs:179-181` `Σ χ²-sf(D²,df=d) / N_in`                                                                                               | Matches Schmitzer-Torbert 2005 (initially suspected, confirmed correct)              |
+| Isolation distance correct             | `metrics_iso.rs:173-178` N-th nearest non-cluster Mahalanobis², guarded `n_out≥n_in`                                                             | Matches Schmitzer-Torbert 2005                                                       |
 
 ## Findings By Severity
 
@@ -163,7 +163,7 @@ and one **cross-cutting validation gap**:
    `half-1`/`half` boundary and the refractory window `[half-r, half+r)`
    stays symmetric; `analyse_refractory_dip` gained a `debug_assert` on
    even bins to catch any future caller. (The extreme-lag right-edge
-   clamp in `cross_correlogram` affects only pairs at *exactly*
+   clamp in `cross_correlogram` affects only pairs at _exactly_
    `±max_lag` samples — far from the central dip — and was left as-is to
    avoid churning a well-tested path for a negligible-impact edge case.)
 
@@ -180,7 +180,7 @@ and one **cross-cutting validation gap**:
    estimator is added as `metrics::min_contamination_sliding_refractory`
    (sweeps candidate refractory periods, returns the smallest Hill
    fraction). The original `sliding_refractory_contamination` (a
-   *time-window* sweep for the UI plot) is retained and unchanged — it
+   _time-window_ sweep for the UI plot) is retained and unchanged — it
    honestly documents itself as windowed-Hill; only a possible rename
    remains a user decision.
 9. **[ADDRESSED] Real Hartigan dip now implemented.** The misleading dead
@@ -226,7 +226,7 @@ prior dossier's claim that PCA/eigensolvers exist is wrong — none do.
 - **No reference oracle for metric values (validation blocker).** To
   prove a metric is correct (not just self-consistent), a golden dataset
   with known contamination/isolation is needed. Producer: this repo —
-  extend `synthetic_ground_truth.rs` with clusters of *known* injected
+  extend `synthetic_ground_truth.rs` with clusters of _known_ injected
   contamination fraction and assert the recovered `f_p` matches within
   tolerance; and/or port a handful of SpikeInterface/phy metric outputs
   on a small fixture as parity golden values (mirroring how
@@ -251,7 +251,7 @@ prior dossier's claim that PCA/eigensolvers exist is wrong — none do.
   accumulations must be `f64`; several metrics currently take
   `len() as f32` early (`metrics.rs:158`).
 - **Ordering:** land the validation harness (or at least the
-  known-contamination golden test) *alongside or before* the Hill fix so
+  known-contamination golden test) _alongside or before_ the Hill fix so
   the fix is proven, not just plausible.
 - **Pre-publish timing.** These are scientific-correctness fixes; landing
   them before the first crates.io publish (see the companion

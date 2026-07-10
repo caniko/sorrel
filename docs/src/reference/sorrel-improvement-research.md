@@ -16,7 +16,7 @@ without re-deriving the facts.
 ## Current Reality
 
 - **Workspace health is strong.** `cargo fmt --check`, `cargo clippy
-  --workspace --all-targets`, and `cargo test --workspace` all pass in
+--workspace --all-targets`, and `cargo test --workspace` all pass in
   the Nix dev shell (`nix develop -c …`; bare shell has no cargo).
   449 tests pass across 8 crates (164 sorrel-compute, 88+34
   sorrel-data, 62+18 sorrel-io, 47 sorrel-ui, 11 sorrel-render,
@@ -93,43 +93,43 @@ without re-deriving the facts.
 
 ## Evidence Inventory
 
-| Evidence | Command / file | What it proves |
-|---|---|---|
-| Quality gates pass | `nix develop -c cargo fmt --check / clippy --workspace --all-targets / test --workspace` (exit 0, 449 passed) | No lint/test debt blocking other work |
-| Doc-test gap | `nix develop -c cargo test --workspace --doc` → 6 doc-tests total, 5 crates with 0 | rustdoc/examples work needed before docs.rs exposure |
-| All 8 names unreserved | `curl -A '<real UA>' https://crates.io/api/v1/crates/<name>` → "does not exist" for all 8 | First publish pending; squatting window open on every name |
-| Publish metadata gap | `grep -L "^description" crates/*/Cargo.toml` → all 8 workspace crates; `[workspace.package]` has only version/edition/license/repository | `cargo publish` will hard-fail on every crate |
-| No license files | `ls LICENSE*` and `ls crates/*/LICENSE*` → nothing | Declared `MIT OR Apache-2.0` has no license texts; legal gap before publish |
-| No crate readmes | `ls crates/sorrel-io/`, no `readme` field in manifests | crates.io pages would be empty |
-| No release tags | `git tag` → empty | Tag-triggered publish workflows never ran |
-| CI drift (16 files) | `nix develop -c simit init ci --workspace --platform forgejo --check` → all 16 `ci-*`/`publish-crate-*` differ; suggests `--runner atlas` regen | Regeneration needed; README badge accurate |
-| simit config gap | `rg --files -g 'simit.toml'` → none | CI options inferred, not pinned |
-| Workflows on atlas | `grep runs-on .forgejo/workflows/*.yaml` → 16× `atlas`, 1× `codeberg-small` (pages.yaml) | Only Pages still on shared runners |
-| Publish workflow anatomy | `.forgejo/workflows/publish-crate-sorrel-io.yaml` (143 lines) | Signed-tag gate, tag==version check, idempotent skip, `CRATES_IO_API_TOKEN` required, no cross-crate ordering |
-| Signing key matches trust root | `gpg --show-keys keys/maintainers.gpg` → `0x4623DEA06FDACFE1` == `git config user.signingkey`; `tag.gpgSign=true` | Locally signed tags will pass `git verify-tag` in CI |
-| cargo-deny unenforced | `deny.toml` at root; `rg deny .forgejo/workflows/ nix/` → only clippy `--deny warnings` | Supply-chain gate exists on disk but never runs |
-| Trunk CI green after retries | Codeberg API `actions/tasks`: failures 2026-05-25, success 2026-05-27 for `d15ccf3` | Runner flakiness, not code failure |
-| Cache plan landed | `crates/sorrel-cache/src/{key,store,gc,tests}.rs`, `cache hit` logs in `session.rs:120`, `quality_ext.rs:67`, `feature_subspace.rs:83`, `cache/correlograms.rs:210`, bench `seed_amplitudes_cache.rs`, `docs/src/architecture/cache.md` in `SUMMARY.md` | All four phases shipped (commits `38a8e58`, `38832c3`, `944b50f`, `d15ccf3`) |
-| rkyv containment | `rg -l rkyv crates/sorrel-compute/src crates/sorrel-io/src/{probeinterface,sorting_analyzer,open_ephys}.rs` → no matches | Whole-set constraint honoured |
-| Invalidation tested | `crates/sorrel-cache/src/tests.rs` (`add_journal_head`), `session.rs:194,231` (`invalidate_caches`) | Acceptance criterion met |
-| README staleness | `README.md:39` "Undo (V1: stub)" vs `crates/sorrel-ui/src/app.rs:293-298`; workspace table vs `Cargo.toml` members | Docs drift from implementation |
-| Stray cargo config | `diff .cargo/config.toml docs/.cargo/config.toml` → identical; untracked | Accidental artifact; delete |
-| Stub backends | `crates/sorrel-io/src/nwb.rs:27`, `ks4_rez.rs:25` | NWB / KS4 `.rez` ingest unimplemented |
+| Evidence                       | Command / file                                                                                                                                                                                                                                          | What it proves                                                                                                |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Quality gates pass             | `nix develop -c cargo fmt --check / clippy --workspace --all-targets / test --workspace` (exit 0, 449 passed)                                                                                                                                           | No lint/test debt blocking other work                                                                         |
+| Doc-test gap                   | `nix develop -c cargo test --workspace --doc` → 6 doc-tests total, 5 crates with 0                                                                                                                                                                      | rustdoc/examples work needed before docs.rs exposure                                                          |
+| All 8 names unreserved         | `curl -A '<real UA>' https://crates.io/api/v1/crates/<name>` → "does not exist" for all 8                                                                                                                                                               | First publish pending; squatting window open on every name                                                    |
+| Publish metadata gap           | `grep -L "^description" crates/*/Cargo.toml` → all 8 workspace crates; `[workspace.package]` has only version/edition/license/repository                                                                                                                | `cargo publish` will hard-fail on every crate                                                                 |
+| No license files               | `ls LICENSE*` and `ls crates/*/LICENSE*` → nothing                                                                                                                                                                                                      | Declared `MIT OR Apache-2.0` has no license texts; legal gap before publish                                   |
+| No crate readmes               | `ls crates/sorrel-io/`, no `readme` field in manifests                                                                                                                                                                                                  | crates.io pages would be empty                                                                                |
+| No release tags                | `git tag` → empty                                                                                                                                                                                                                                       | Tag-triggered publish workflows never ran                                                                     |
+| CI drift (16 files)            | `nix develop -c simit init ci --workspace --platform forgejo --check` → all 16 `ci-*`/`publish-crate-*` differ; suggests `--runner atlas` regen                                                                                                         | Regeneration needed; README badge accurate                                                                    |
+| simit config gap               | `rg --files -g 'simit.toml'` → none                                                                                                                                                                                                                     | CI options inferred, not pinned                                                                               |
+| Workflows on atlas             | `grep runs-on .forgejo/workflows/*.yaml` → 16× `atlas`, 1× `codeberg-small` (pages.yaml)                                                                                                                                                                | Only Pages still on shared runners                                                                            |
+| Publish workflow anatomy       | `.forgejo/workflows/publish-crate-sorrel-io.yaml` (143 lines)                                                                                                                                                                                           | Signed-tag gate, tag==version check, idempotent skip, `CRATES_IO_API_TOKEN` required, no cross-crate ordering |
+| Signing key matches trust root | `gpg --show-keys keys/maintainers.gpg` → `0x4623DEA06FDACFE1` == `git config user.signingkey`; `tag.gpgSign=true`                                                                                                                                       | Locally signed tags will pass `git verify-tag` in CI                                                          |
+| cargo-deny unenforced          | `deny.toml` at root; `rg deny .forgejo/workflows/ nix/` → only clippy `--deny warnings`                                                                                                                                                                 | Supply-chain gate exists on disk but never runs                                                               |
+| Trunk CI green after retries   | Codeberg API `actions/tasks`: failures 2026-05-25, success 2026-05-27 for `d15ccf3`                                                                                                                                                                     | Runner flakiness, not code failure                                                                            |
+| Cache plan landed              | `crates/sorrel-cache/src/{key,store,gc,tests}.rs`, `cache hit` logs in `session.rs:120`, `quality_ext.rs:67`, `feature_subspace.rs:83`, `cache/correlograms.rs:210`, bench `seed_amplitudes_cache.rs`, `docs/src/architecture/cache.md` in `SUMMARY.md` | All four phases shipped (commits `38a8e58`, `38832c3`, `944b50f`, `d15ccf3`)                                  |
+| rkyv containment               | `rg -l rkyv crates/sorrel-compute/src crates/sorrel-io/src/{probeinterface,sorting_analyzer,open_ephys}.rs` → no matches                                                                                                                                | Whole-set constraint honoured                                                                                 |
+| Invalidation tested            | `crates/sorrel-cache/src/tests.rs` (`add_journal_head`), `session.rs:194,231` (`invalidate_caches`)                                                                                                                                                     | Acceptance criterion met                                                                                      |
+| README staleness               | `README.md:39` "Undo (V1: stub)" vs `crates/sorrel-ui/src/app.rs:293-298`; workspace table vs `Cargo.toml` members                                                                                                                                      | Docs drift from implementation                                                                                |
+| Stray cargo config             | `diff .cargo/config.toml docs/.cargo/config.toml` → identical; untracked                                                                                                                                                                                | Accidental artifact; delete                                                                                   |
+| Stub backends                  | `crates/sorrel-io/src/nwb.rs:27`, `ks4_rez.rs:25`                                                                                                                                                                                                       | NWB / KS4 `.rez` ingest unimplemented                                                                         |
 
 ## Existing Plan Status
 
 `docs/src/planning/rkyv-derived-cache/` (4 phases, phase 03 with 3
 sub-layers), audited against the working tree:
 
-| Phase | Claim | Status | Proof |
-|---|---|---|---|
-| 01 Cache infrastructure | `sorrel-cache` crate with key/store/GC | done | `crates/sorrel-cache/src/`, workspace member in `Cargo.toml` |
-| 02 First consumer | `seed_amplitudes` cached + bench | done | `session.rs:120` cache-hit log; `benches/seed_amplitudes_cache.rs` |
-| 03/01 PC subspaces | cached | done | `cache/pc_subspace.rs`, `feature_subspace.rs:83` |
-| 03/02 Isolation metrics | cached | done | `cache/isolation.rs`, `quality_ext.rs:67` |
-| 03/03 Correlograms | cached | done | `cache/correlograms.rs:210` |
-| 04 Invalidation, GC, docs | replay hook, GC, `cache.md` | done | `session.rs:194,231`, `sorrel-cache/src/gc.rs`, `architecture/cache.md` linked in `SUMMARY.md` |
-| Whole-set | tests pass; rkyv stays out of `sorrel-compute` and JSON ingest; invalidation unit-tested | done | test run + rg evidence above |
+| Phase                     | Claim                                                                                    | Status | Proof                                                                                          |
+| ------------------------- | ---------------------------------------------------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------- |
+| 01 Cache infrastructure   | `sorrel-cache` crate with key/store/GC                                                   | done   | `crates/sorrel-cache/src/`, workspace member in `Cargo.toml`                                   |
+| 02 First consumer         | `seed_amplitudes` cached + bench                                                         | done   | `session.rs:120` cache-hit log; `benches/seed_amplitudes_cache.rs`                             |
+| 03/01 PC subspaces        | cached                                                                                   | done   | `cache/pc_subspace.rs`, `feature_subspace.rs:83`                                               |
+| 03/02 Isolation metrics   | cached                                                                                   | done   | `cache/isolation.rs`, `quality_ext.rs:67`                                                      |
+| 03/03 Correlograms        | cached                                                                                   | done   | `cache/correlograms.rs:210`                                                                    |
+| 04 Invalidation, GC, docs | replay hook, GC, `cache.md`                                                              | done   | `session.rs:194,231`, `sorrel-cache/src/gc.rs`, `architecture/cache.md` linked in `SUMMARY.md` |
+| Whole-set                 | tests pass; rkyv stays out of `sorrel-compute` and JSON ingest; invalidation unit-tested | done   | test run + rg evidence above                                                                   |
 
 The plan set is complete and ready for formal `plan-and-verify` verify
 mode, which on success migrates durable knowledge into stable docs and
@@ -157,9 +157,9 @@ retires the planning files.
   crates. Producer: this repo. Fix: add `description` (and ideally
   `keywords`, `categories`) per crate or via `[workspace.package]`
   inheritance. Validation: `nix develop -c cargo publish --dry-run -p
-  sorrel-io` reaches packaging instead of metadata error.
+sorrel-io` reaches packaging instead of metadata error.
 - **License texts (publish-quality blocker).** `license = "MIT OR
-  Apache-2.0"` is declared but no `LICENSE-MIT` / `LICENSE-APACHE`
+Apache-2.0"` is declared but no `LICENSE-MIT` / `LICENSE-APACHE`
   files exist anywhere, and no crate ships a readme. Not a hard
   `cargo publish` error, but a legal/compliance gap for a public
   release. Producer: this repo (the `rust-crate-legal-readme` skill
@@ -172,7 +172,7 @@ retires the planning files.
   including every tag-triggered `publish-crate-*.yaml`, differ from
   simit 0.16.1 output; publishing through drifted generated workflows
   invites surprises. Producer: simit 0.16.1. Fix: `nix develop -c
-  simit init ci --platform forgejo --runner atlas --workspace` (the
+simit init ci --platform forgejo --runner atlas --workspace` (the
   exact command simit's check output suggests), review diff, commit —
   the `simit-dependent-fixes` skill owns this domain. Validation:
   the `--check` form reports no differences and the regenerated badge
@@ -229,7 +229,7 @@ retires the planning files.
    `LICENSE-MIT`/`LICENSE-APACHE` texts and per-crate `readme`
    wiring; commit. No dependencies; parallel-safe with (2).
 2. **Clear CI drift** — regenerate with `simit init ci --platform
-   forgejo --runner atlas --workspace`, add a `simit.toml` pinning the
+forgejo --runner atlas --workspace`, add a `simit.toml` pinning the
    `[ci]` options, re-run the badge update, and commit together with
    the pending README badge block. Should land **before** tagging
    `0.1.0` so publish workflows run from generated state. Verify the
