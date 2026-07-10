@@ -27,9 +27,9 @@ jobs:
       - name: Check flake
         run: nix flake check
 
-  codeberg-tiny:
+  atlas:
     needs: [atlas-nix-trusted]
-    runs-on: codeberg-tiny
+    runs-on: atlas
     env:
       NIX_CONFIG: "experimental-features = nix-command flakes"
       XDG_CACHE_HOME: "/tmp/.cache"
@@ -44,38 +44,17 @@ jobs:
       - name: Format check
         run: nix develop -c cargo fmt --all -- --check
 
-  codeberg-medium:
-    needs: [atlas-nix-trusted]
-    runs-on: codeberg-medium
-    env:
-      NIX_CONFIG: "experimental-features = nix-command flakes"
-      XDG_CACHE_HOME: "/tmp/.cache"
-      CARGO_HOME: "/tmp/.cargo"
-    steps:
-      - name: Checkout
-        uses: https://code.forgejo.org/actions/checkout@v4
-
-      - name: Add cargo bin to PATH
-        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-
       - name: Test
         run: nix develop -c cargo test -p sorrel-gpu
 
-      - name: Package crate
-        run: nix develop -c cargo package -p sorrel-gpu
-  codeberg-small:
-    needs: [atlas-nix-trusted]
-    runs-on: codeberg-small
-    env:
-      NIX_CONFIG: "experimental-features = nix-command flakes"
-      XDG_CACHE_HOME: "/tmp/.cache"
-      CARGO_HOME: "/tmp/.cargo"
-    steps:
-      - name: Checkout
-        uses: https://code.forgejo.org/actions/checkout@v4
+      - name: Check cargo-audit tool
+        run: nix develop -c command -v cargo-audit
 
-      - name: Add cargo bin to PATH
-        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      - name: Check cargo-deny tool
+        run: nix develop -c command -v cargo-deny
 
       - name: Clippy
         run: nix develop -c cargo clippy -p sorrel-gpu --all-targets -- --deny warnings
+
+      - name: Package crate
+        run: nix develop -c cargo package -p sorrel-gpu

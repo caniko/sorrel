@@ -10,13 +10,12 @@
     pkg-config
   ];
 
-  # Build-time linkable libs.
-  buildInputs = with pkgs;
-    [
+  # Build-time linkable libs for the native Linux package.  Keep these out of
+  # the cross-target argument sets below: Windows and macOS use their native
+  # window/GPU stacks and must not inherit Linux pkg-config dependencies.
+  linuxBuildInputs = with pkgs; [
       fontconfig
       freetype
-    ]
-    ++ lib.optionals stdenv.isLinux [
       # Wayland stack
       wayland
       libxkbcommon
@@ -31,6 +30,22 @@
       libGL
       vulkan-loader
     ];
+
+  aarch64LinuxPkgs = pkgs.pkgsCross.aarch64-multiplatform;
+  aarch64LinuxBuildInputs = with aarch64LinuxPkgs; [
+    fontconfig
+    freetype
+    wayland
+    libxkbcommon
+    libdecor
+    libx11
+    libxcursor
+    libxi
+    libxrandr
+    libxcb
+    libGL
+    vulkan-loader
+  ];
 
   # Libraries dlopen'd at runtime by wgpu/winit; rpath them into the
   # final binary so the package is self-contained on both Wayland and X11.
@@ -63,5 +78,6 @@
     paths = [pkgs.hdf5 pkgs.hdf5.dev];
   };
 in {
-  inherit nativeBuildInputs buildInputs runtimeLibs hdf5C;
+  buildInputs = lib.optionals stdenv.isLinux linuxBuildInputs;
+  inherit nativeBuildInputs linuxBuildInputs aarch64LinuxBuildInputs runtimeLibs hdf5C;
 }

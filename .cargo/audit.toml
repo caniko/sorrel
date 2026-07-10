@@ -1,0 +1,9 @@
+[advisories]
+# quick-xml is used here only by wayland-scanner's procedural-macro build
+# path.  wayland-scanner 0.31.10 constrains it to the vulnerable 0.39 line;
+# there is no compatible 0.41 release in that dependency line yet.  Keep the
+# exception narrow and revisit it when the Wayland stack updates.
+ignore = [
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]

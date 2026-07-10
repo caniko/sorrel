@@ -4,6 +4,22 @@
   inputs = {
     rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk";
 
+    simit = {
+      url = "git+https://codeberg.org/caniko/simit?ref=refs/tags/0.17.2";
+      inputs.rs-harbor.follows = "rs-harbor";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-overlay.follows = "rust-overlay";
+      inputs.flake-utils.follows = "flake-utils";
+    };
+
+    # Pinned SDK used by rs-harbor's reproducible osxcross builder.
+    rs-harbor-macos-sdk-pin.url = "git+ssh://git@codeberg.org/caniko/rs-harbor-macos-sdk-pin.git";
+
+    nix-appimage = {
+      url = "github:ralismark/nix-appimage";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
     nixpkgs.follows = "rs-harbor/nixpkgs";
     rust-overlay.follows = "rs-harbor/rust-overlay";
     flake-utils.url = "github:numtide/flake-utils";
@@ -25,6 +41,9 @@
     self,
     nixpkgs,
     rs-harbor,
+    simit,
+    rs-harbor-macos-sdk-pin,
+    nix-appimage,
     flake-utils,
     rust-overlay,
     treefmt-nix,
@@ -32,7 +51,72 @@
     plinth,
     ...
   }:
-    flake-utils.lib.eachDefaultSystem (system: let
+    {
+      # This is the sole simit project configuration source.  Keep CI and
+      # release policy next to the flake outputs it describes; simit.toml is
+      # intentionally not used.
+      simitConfig = {
+        flake.mode = "custom";
+        ci = {
+          runtime = "nix";
+          # Release and Nix evaluation jobs need the trusted runner.  The
+          # per-step routes below keep ordinary Cargo work on atlas.
+          runner = "atlas-nix-trusted";
+          packages = [
+            "sorrel"
+            "sorrel-cache"
+            "sorrel-compute"
+            "sorrel-data"
+            "sorrel-gpu"
+            "sorrel-io"
+            "sorrel-render"
+            "sorrel-ui"
+          ];
+          with_audit = true;
+          with_deny = true;
+          pages = {
+            repo = "caniko/sorrel";
+            site_output = "site";
+            token_secret = "CODEBERG_TOKEN";
+            source_branch = "trunk";
+            deploy_app = "deploy-pages";
+          };
+          step_runners = {
+            cargo-clippy = "atlas";
+            cargo-doc = "atlas";
+            cargo-fmt = "atlas";
+            cargo-package = "atlas";
+            cargo-test = "atlas";
+            nix-check = "atlas-nix-trusted";
+            quality-tools = "atlas";
+          };
+        };
+        release = {
+          publish.enforcement = "activated-remote";
+          smoke.command = "nix run .#release-smoke --";
+          codeberg = {
+            repo = "caniko/sorrel";
+            target_branch = "trunk";
+            token_secret = "CODEBERG_TOKEN";
+          };
+          artifacts = {
+            runner = "atlas-nix-trusted";
+            version_attr = "sorrel";
+            substituters = [
+              "https://attic.candee.baby/canix"
+              "https://cache.nixos.org"
+            ];
+            trusted_public_keys = [
+              "canix:lPzPzKrmYqW5Rxa5r0uQWvCqD3S5nx0h2eCy7XD5JM8="
+              "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+            ];
+            checksum_globs = ["*.tar.gz" "*.zip" "*.AppImage"];
+            build_commands = ["bash release/assemble.sh"];
+          };
+        };
+      };
+    }
+    // flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import nixpkgs {
         inherit system;
         overlays = [(import rust-overlay)];
@@ -40,7 +124,12 @@
 
       toolchain = rs-harbor.lib.mkToolchain {inherit pkgs;};
       inherit (toolchain) craneLib rustToolchain;
-      cross = rs-harbor.lib.mkCross {inherit pkgs system;};
+      cross = rs-harbor.lib.mkCross {
+        inherit pkgs system;
+        macosSdkStorePath = rs-harbor-macos-sdk-pin.storePath;
+        macosSdkOutputHash = rs-harbor-macos-sdk-pin.outputHash;
+        osxSdkVersion = rs-harbor-macos-sdk-pin.sdkVersion;
+      };
       cargoConfig = rs-harbor.lib.mkCargoConfig {inherit pkgs;};
 
       src = pkgs.lib.cleanSourceWith {
@@ -64,7 +153,54 @@
       rustPackages = import ./nix/rust-packages.nix {
         inherit pkgs craneLib src deps;
       };
-      inherit (rustPackages) sorrel sorrelHdf5 commonArgs cargoArtifacts;
+      inherit (rustPackages) sorrel commonArgs cargoArtifacts;
+      sorrelHdf5 = rustPackages.sorrelHdf5 or null;
+
+      sorrelVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+      crossSorrelPackages = rs-harbor.lib.mkCrossPackages {
+        inherit pkgs craneLib cross;
+        pname = "sorrel";
+        targets = ["aarch64-linux" "windows" "darwin-aarch64"];
+        commonArgs = {
+          inherit src;
+          version = sorrelVersion;
+          strictDeps = true;
+          nativeBuildInputs = deps.nativeBuildInputs;
+          cargoExtraArgs = "-p sorrel --locked";
+        };
+        targetArgs = {
+          aarch64-linux = {
+            buildInputs = deps.aarch64LinuxBuildInputs;
+            nativeBuildInputs = deps.nativeBuildInputs;
+            doCheck = false;
+          };
+          windows = {
+            buildInputs = [];
+            nativeBuildInputs = deps.nativeBuildInputs ++ [cross.mingwCC cross.mingwBinutils];
+            doCheck = false;
+          };
+          darwin-aarch64 = {
+            buildInputs = [];
+            nativeBuildInputs = deps.nativeBuildInputs;
+            doCheck = false;
+          };
+        };
+      };
+
+      sorrelAppImage = rs-harbor.lib.mkAppImage {
+        inherit system nix-appimage;
+        pname = "sorrel";
+        version = sorrelVersion;
+        program = "${sorrel}/bin/sorrel";
+      };
+
+      releaseSmoke = pkgs.writeShellApplication {
+        name = "sorrel-release-smoke";
+        runtimeInputs = with pkgs; [coreutils file findutils gnugrep gzip gnutar unzip];
+        text = ''
+          exec bash ${./release/smoke.sh} "$@"
+        '';
+      };
 
       siteOutputs = import ./nix/site.nix {
         inherit pkgs;
@@ -74,10 +210,13 @@
     in {
       packages = {
         default = sorrel;
-        inherit sorrel sorrelHdf5 website docs site;
-        sorrel-hdf5 = sorrelHdf5;
+        inherit sorrel website docs site;
         cargo-config = cargoConfig.configPath;
-      };
+        release-smoke = releaseSmoke;
+      }
+      // crossSorrelPackages
+      // pkgs.lib.optionalAttrs (sorrelHdf5 != null) {inherit sorrelHdf5;}
+      // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {sorrel-appimage = sorrelAppImage;};
 
       checks =
         (import ./nix/checks.nix {
@@ -103,6 +242,10 @@
         };
         deploy-pages = plinth.lib.${system}.mkDeployPagesApp {
           domain = "sorrel.tartanoglu.com";
+        };
+        release-smoke = {
+          type = "app";
+          program = "${releaseSmoke}/bin/sorrel-release-smoke";
         };
       };
     });

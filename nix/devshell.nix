@@ -10,6 +10,13 @@
   shellHook ? "",
 }: let
   inherit (deps) buildInputs nativeBuildInputs runtimeLibs hdf5C;
+  hdf5Packages = pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.hdf5];
+  hdf5Env =
+    if pkgs.stdenv.isLinux
+    then {
+      HDF5_DIR = "${hdf5C}";
+    }
+    else {};
 in
   (rs-harbor.lib.mkDevShells {
     inherit pkgs cross cargoConfig craneLib checks;
@@ -22,22 +29,13 @@ in
         pre-commit
         rust-analyzer
         zola
-        # libhdf5 is pulled in unconditionally so `cargo check
-        # --features hdf5` Just Works inside the dev shell. The default
-        # `cargo build` doesn't reference it.
-        hdf5
       ]
+      ++ hdf5Packages
       ++ preCommitEnabledPackages
       ++ buildInputs
       ++ nativeBuildInputs;
 
-    extraEnv = {
-      LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
-      # Point hdf5-metno-sys at the symlink-joined hdf5 tree (headers
-      # *and* libs under one prefix) so its build script's auto-detect
-      # finds both `H5pubconf.h` and `libhdf5.so`.
-      HDF5_DIR = "${hdf5C}";
-    };
+    extraEnv = {LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;} // hdf5Env;
 
     extraShellHook = ''
       ${shellHook}
@@ -55,15 +53,12 @@ in
           mdbook
           pre-commit
           rust-analyzer
-          hdf5
         ]
+        ++ hdf5Packages
         ++ preCommitEnabledPackages
         ++ buildInputs
         ++ nativeBuildInputs;
-      extraEnv = {
-        LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
-        HDF5_DIR = "${hdf5C}";
-      };
+      extraEnv = {LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;} // hdf5Env;
       extraShellHook = ''
         ${shellHook}
         echo "Documentation: mdbook serve docs"

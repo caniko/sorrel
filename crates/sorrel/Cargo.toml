@@ -21,6 +21,12 @@ anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
 
+# eframe's Linux window backends are deliberately enabled only for Linux
+# targets. Windows uses the native Win32 backend and macOS uses Cocoa/Metal;
+# neither should inherit Wayland/X11 feature dependencies.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { workspace = true, features = ["wayland", "x11"] }
+
 [features]
 default = []
 hdf5 = ["sorrel-io/hdf5", "sorrel-data/hdf5"]

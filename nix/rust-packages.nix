@@ -20,13 +20,17 @@
       "$out/bin/sorrel"
   '';
 
-  sorrelHdf5 = craneLib.buildPackage (commonArgs
-    // {
-      inherit cargoArtifacts;
-      buildInputs = buildInputs ++ [hdf5C];
-      cargoExtraArgs = "-p sorrel --locked --features hdf5";
-      postFixup = rpathFixup;
-    });
+  sorrelHdf5 =
+    if pkgs.stdenv.isLinux
+    then
+      craneLib.buildPackage (commonArgs
+        // {
+          inherit cargoArtifacts;
+          buildInputs = buildInputs ++ [hdf5C];
+          cargoExtraArgs = "-p sorrel --locked --features hdf5";
+          postFixup = rpathFixup;
+        })
+    else null;
 
   sorrel = craneLib.buildPackage (commonArgs
     // {
