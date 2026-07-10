@@ -6,6 +6,7 @@
   cargoConfig,
   checks,
   deps,
+  simit,
   preCommitEnabledPackages ? [],
   shellHook ? "",
 }: let
@@ -28,6 +29,7 @@ in
         mdbook
         pre-commit
         rust-analyzer
+        simit
         zola
       ]
       ++ hdf5Packages
@@ -53,6 +55,7 @@ in
           mdbook
           pre-commit
           rust-analyzer
+          simit
         ]
         ++ hdf5Packages
         ++ preCommitEnabledPackages

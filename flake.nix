@@ -59,8 +59,10 @@
         flake.mode = "custom";
         ci = {
           runtime = "nix";
-          # Release and Nix evaluation jobs need the trusted runner.  The
-          # per-step routes below keep ordinary Cargo work on atlas.
+          # Every generated step invokes the Nix development environment.  It
+          # therefore needs the trusted runner; keeping the mapping explicit
+          # preserves simit's per-step routing contract without dispatching
+          # `nix develop` to the bare atlas image.
           runner = "atlas-nix-trusted";
           packages = [
             "sorrel"
@@ -82,13 +84,13 @@
             deploy_app = "deploy-pages";
           };
           step_runners = {
-            cargo-clippy = "atlas";
-            cargo-doc = "atlas";
-            cargo-fmt = "atlas";
-            cargo-package = "atlas";
-            cargo-test = "atlas";
+            cargo-clippy = "atlas-nix-trusted";
+            cargo-doc = "atlas-nix-trusted";
+            cargo-fmt = "atlas-nix-trusted";
+            cargo-package = "atlas-nix-trusted";
+            cargo-test = "atlas-nix-trusted";
             nix-check = "atlas-nix-trusted";
-            quality-tools = "atlas";
+            quality-tools = "atlas-nix-trusted";
           };
         };
         release = {
@@ -229,6 +231,7 @@
 
       devShells = import ./nix/devshell.nix {
         inherit pkgs rs-harbor craneLib cross cargoConfig deps;
+        simit = simit.packages.${system}.default;
         checks = self.checks.${system};
         preCommitEnabledPackages = pre-commit-check.enabledPackages;
         shellHook = pre-commit-check.shellHook;
