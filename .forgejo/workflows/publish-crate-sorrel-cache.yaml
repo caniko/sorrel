@@ -41,7 +41,7 @@ jobs:
           fi
 
           # cargo pkgid scopes the version lookup to the crate this workflow publishes.
-          version="$(nix develop -c cargo pkgid -p sorrel-cache | awk -F'[#@]' '/@/ {print $NF}' | tail -n 1)"
+          version="$(nix develop -c cargo pkgid -p sorrel-cache | awk -F'[#@]' 'NF > 1 {print $NF}' | tail -n 1)"
           if [ -z "$version" ]; then
             echo "Could not read package version from cargo pkgid" >&2
             exit 1
