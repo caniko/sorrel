@@ -41,6 +41,7 @@
     cp -r ${website}/* $out/
     mkdir -p $out/docs
     cp -r ${docs}/* $out/docs/
+    printf '%s\n' sorrel.tartanoglu.com > $out/.domains
   '';
 in {
   inherit website docs site;
