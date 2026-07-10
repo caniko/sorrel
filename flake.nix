@@ -208,15 +208,16 @@
       };
       inherit (siteOutputs) website docs site;
     in {
-      packages = {
-        default = sorrel;
-        inherit sorrel website docs site;
-        cargo-config = cargoConfig.configPath;
-        release-smoke = releaseSmoke;
-      }
-      // crossSorrelPackages
-      // pkgs.lib.optionalAttrs (sorrelHdf5 != null) {inherit sorrelHdf5;}
-      // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {sorrel-appimage = sorrelAppImage;};
+      packages =
+        {
+          default = sorrel;
+          inherit sorrel website docs site;
+          cargo-config = cargoConfig.configPath;
+          release-smoke = releaseSmoke;
+        }
+        // crossSorrelPackages
+        // pkgs.lib.optionalAttrs (sorrelHdf5 != null) {inherit sorrelHdf5;}
+        // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {sorrel-appimage = sorrelAppImage;};
 
       checks =
         (import ./nix/checks.nix {

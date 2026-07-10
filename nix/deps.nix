@@ -14,22 +14,22 @@
   # the cross-target argument sets below: Windows and macOS use their native
   # window/GPU stacks and must not inherit Linux pkg-config dependencies.
   linuxBuildInputs = with pkgs; [
-      fontconfig
-      freetype
-      # Wayland stack
-      wayland
-      libxkbcommon
-      libdecor
-      # X11 stack (winit fallback)
-      libx11
-      libxcursor
-      libxi
-      libxrandr
-      libxcb
-      # GPU
-      libGL
-      vulkan-loader
-    ];
+    fontconfig
+    freetype
+    # Wayland stack
+    wayland
+    libxkbcommon
+    libdecor
+    # X11 stack (winit fallback)
+    libx11
+    libxcursor
+    libxi
+    libxrandr
+    libxcb
+    # GPU
+    libGL
+    vulkan-loader
+  ];
 
   aarch64LinuxPkgs = pkgs.pkgsCross.aarch64-multiplatform;
   aarch64LinuxBuildInputs = with aarch64LinuxPkgs; [
