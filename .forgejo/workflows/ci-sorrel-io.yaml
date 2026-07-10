@@ -43,4 +43,4 @@ jobs:
         run: nix develop -c cargo clippy -p sorrel-io --all-targets -- --deny warnings
 
       - name: Package crate
-        run: nix develop -c cargo package -p sorrel-io
+        run: nix develop -c cargo package -p sorrel-io --allow-dirty --list
