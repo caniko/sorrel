@@ -81,7 +81,7 @@
             site_output = "site";
             token_secret = "CODEBERG_TOKEN";
             source_branch = "trunk";
-            deploy_app = "deploy-pages";
+            deploy_app = ".#deploy-pages";
           };
           step_runners = {
             cargo-clippy = "atlas-nix-trusted";
