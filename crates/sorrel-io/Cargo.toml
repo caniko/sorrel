@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Data providers and file-format backends for Sorrel spike-sorting data."
 
 [dependencies]
 anyhow.workspace = true

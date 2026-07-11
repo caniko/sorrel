@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Generic curation session, journal, persistence, and analysis state for Sorrel."
 
 [dependencies]
 sorrel-io.workspace = true
