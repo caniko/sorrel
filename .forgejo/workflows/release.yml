@@ -194,7 +194,13 @@ jobs:
           elif [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then cat release.json; exit 1; fi
           release_id="$(jq -r '.id' release.json)"; test "$release_id" != "null"
           shopt -s nullglob
-          files=(release/*)
+          files=()
+          add_matches() { local pattern="$1" match; while IFS= read -r match; do files+=("$match"); done < <(compgen -G "$pattern" || true); }
+          add_matches 'release/SHA256SUMS.txt'
+          add_matches 'release/SHA256SUMS.txt.minisig'
+          add_matches 'release/*.tar.gz'
+          add_matches 'release/*.zip'
+          add_matches 'release/*.AppImage'
           while IFS= read -r file; do
             [ -f "$file" ] || continue
             name="$(basename "$file")"

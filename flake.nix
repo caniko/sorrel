@@ -5,7 +5,7 @@
     rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk";
 
     simit = {
-      url = "git+https://codeberg.org/caniko/simit?ref=refs/tags/0.17.6";
+      url = "git+https://codeberg.org/caniko/simit?ref=refs/tags/0.17.7";
       inputs.rs-harbor.follows = "rs-harbor";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
