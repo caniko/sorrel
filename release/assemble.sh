@@ -70,6 +70,13 @@ cp "$(readlink -f "$WORK_DIR/sorrel-appimage")" "$OUT_DIR/sorrel-${VERSION}-x86_
 git archive --format=tar --prefix="sorrel-${VERSION}/" HEAD | \
   gzip -n > "$OUT_DIR/sorrel-${VERSION}.tar.gz"
 
-find "$OUT_DIR" -maxdepth 1 -type f \
-  \( -name "sorrel-${VERSION}-*.tar.gz" -o -name "sorrel-${VERSION}-*.zip" -o -name "sorrel-${VERSION}-*.AppImage" -o -name "sorrel-${VERSION}.tar.gz" \) \
-  -print | LC_ALL=C sort
+shopt -s nullglob
+artifacts=(
+  "$OUT_DIR"/sorrel-"$VERSION"-*.tar.gz
+  "$OUT_DIR"/sorrel-"$VERSION"-*.zip
+  "$OUT_DIR"/sorrel-"$VERSION"-*.AppImage
+  "$OUT_DIR"/sorrel-"$VERSION".tar.gz
+)
+for artifact in "${artifacts[@]}"; do
+  printf '%s\n' "${artifact#"$OUT_DIR"/}"
+done | LC_ALL=C sort
