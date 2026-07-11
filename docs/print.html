@@ -1,0 +1,1512 @@
+<!DOCTYPE HTML>
+<html lang="en" class="coal sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Sorrel Documentation</title>
+        <meta name="robots" content="noindex">
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "coal";
+            const default_dark_theme = "coal";
+            window.path_to_searchindex_js = "searchindex-d79bb5a1.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-39bd1a1f.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('coal')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Sorrel Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://codeberg.org/caniko/sorrel" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="sorrel"><a class="header" href="#sorrel">Sorrel</a></h1>
+<p>Sorrel is a native, high-performance GUI for manual curation of spike-sorted
+electrophysiology data. It targets the same workflow as
+<a href="https://github.com/cortex-lab/phy">phy</a> — cluster-by-cluster inspection,
+relabelling, merging, and splitting — but is built around a zero-cost,
+monomorphised Rust core and a wgpu-backed renderer.</p>
+<h2 id="highlights"><a class="header" href="#highlights">Highlights</a></h2>
+<ul>
+<li><strong>Multiple backends.</strong> Reads phy/Kilosort directories, SpikeInterface
+<code>SortingAnalyzer</code> (binary folder), Kilosort 4 <code>rez.mat</code>, and NWB files.
+Recording-only formats (SpikeGLX, Open Ephys, Mountainsort MDA) are
+supported as raw trace sources.</li>
+<li><strong>Native egui + wgpu UI.</strong> Trace, raster, ISI, CCG, waveform, template,
+feature, drift, probe, similarity, quality, and suggestion views.</li>
+<li><strong>GPU compute path.</strong> Optional wgpu kernels for common-median
+referencing, high-pass filtering, and mean-snippet extraction along the
+trace window; transparent CPU fallback.</li>
+<li><strong>Static dispatch core.</strong> <code>Session&lt;P&gt;</code> is generic over a <code>DataProvider</code>
+trait — every hot path (downsampling, vertex generation, journaling,
+metrics) is monomorphised per backend.</li>
+<li><strong>Durable curation.</strong> Every label change, merge, split, and undo/redo is
+written to a SQLite journal <em>before</em> the in-memory session moves. The
+journal is replayable and idempotent.</li>
+<li><strong>Headless QC export.</strong> <code>--export-qc</code> runs the full metrics pipeline and
+writes <code>cluster_qc.tsv</code> + <code>cluster_qc.json</code> without spawning a window.</li>
+<li><strong>Python bridge.</strong> The <code>sorrel-py</code> crate exposes <code>sorrel.open(recording, sorting)</code> for SpikeInterface users.</li>
+</ul>
+<p>Source code is hosted at
+<a href="https://codeberg.org/caniko/sorrel">codeberg.org/caniko/sorrel</a>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="installation"><a class="header" href="#installation">Installation</a></h1>
+<p>Sorrel is a Rust workspace and a Nix flake. The default build is pure Rust;
+the NWB and Kilosort 4 <code>rez.mat</code> backends are gated behind an <code>hdf5</code>
+feature that links against <code>libhdf5</code>.</p>
+<h2 id="with-cargo"><a class="header" href="#with-cargo">With Cargo</a></h2>
+<pre><code class="language-bash">cargo build --release -p sorrel
+</code></pre>
+<p>The binary is written to <code>target/release/sorrel</code>.</p>
+<p>To enable the HDF5-backed readers (NWB, KS4 <code>rez.mat</code>):</p>
+<pre><code class="language-bash">cargo build --release -p sorrel --features hdf5
+</code></pre>
+<h2 id="with-nix"><a class="header" href="#with-nix">With Nix</a></h2>
+<pre><code class="language-bash">nix build .#sorrel        # default build, no HDF5
+nix build .#sorrelHdf5    # with HDF5 features
+</code></pre>
+<p><code>nix build</code> builds the default <code>sorrel</code> package. The flake also exposes:</p>
+<ul>
+<li><code>.#website</code> — the Zola landing page.</li>
+<li><code>.#docs</code> — this mdBook documentation.</li>
+<li><code>.#site</code> — combined static site, with the docs mounted under <code>/docs/</code>.</li>
+</ul>
+<h2 id="development-shell"><a class="header" href="#development-shell">Development Shell</a></h2>
+<pre><code class="language-bash">nix develop
+</code></pre>
+<p>The shell pulls in the Rust toolchain, native GUI dependencies (wgpu /
+egui), <code>mdbook</code> for the docs, and <code>zola</code> for the website.</p>
+<p>To run the docs and site locally:</p>
+<pre><code class="language-bash">cd docs    &amp;&amp; mdbook serve
+cd website &amp;&amp; zola serve
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="quick-start"><a class="header" href="#quick-start">Quick Start</a></h1>
+<p>Point Sorrel at a sorting output and it will auto-detect the backend:</p>
+<pre><code class="language-bash">sorrel &lt;DATA_DIR&gt;
+</code></pre>
+<p>The detector looks for, in order:</p>
+<ol>
+<li><code>spike_times.npy</code> + <code>spike_clusters.npy</code> → <strong>phy / Kilosort</strong>.</li>
+<li><code>recording.json</code> (or <code>binary.json</code>) + <code>sorting/</code> → <strong>SpikeInterface
+<code>SortingAnalyzer</code></strong>.</li>
+<li>A <code>.nwb</code> file path → <strong>NWB</strong> (requires <code>--features hdf5</code>).</li>
+<li>A <code>rez.mat</code> / <code>rez2.mat</code> file path → <strong>Kilosort 4 rez</strong> (requires
+<code>--features hdf5</code>).</li>
+</ol>
+<p>You can force the choice with <code>--backend kilosort | sorting-analyzer | nwb | ks4-rez</code>.</p>
+<h2 id="phy--kilosort"><a class="header" href="#phy--kilosort">Phy / Kilosort</a></h2>
+<pre><code class="language-bash">sorrel my_run/phy
+</code></pre>
+<p>Sample rate, channel count, dtype, header offset, and dat path are read
+from <code>params.py</code> when present. CLI flags override on a per-field basis:</p>
+<pre><code class="language-bash">sorrel my_run/phy \
+  --dat recording.dat \
+  --sample-rate 30000 \
+  --channels 384 \
+  --dtype int16
+</code></pre>
+<p>When the trace metadata isn’t in <code>params.py</code>, point Sorrel at a SpikeGLX
+or Open Ephys metadata file:</p>
+<pre><code class="language-bash">sorrel my_run/phy --spikeglx-meta run.imec0.ap.meta
+sorrel my_run/phy --oebin Record\ Node\ 101/structure.oebin
+</code></pre>
+<h2 id="spikeinterface-sortinganalyzer"><a class="header" href="#spikeinterface-sortinganalyzer">SpikeInterface SortingAnalyzer</a></h2>
+<pre><code class="language-bash">sorrel my_run/sorting_analyzer
+</code></pre>
+<p>The analyzer must be saved with <code>format='binary_folder'</code> and have a
+flattened sorting under <code>&lt;root&gt;/sorting/</code>. The Zarr variant is not yet
+supported.</p>
+<h2 id="nwb-and-ks4-rez"><a class="header" href="#nwb-and-ks4-rez">NWB and KS4 rez</a></h2>
+<pre><code class="language-bash">sorrel my_session.nwb                           # --features hdf5
+sorrel rez.mat --dat path/to/recording.bin      # --features hdf5
+</code></pre>
+<h2 id="curation-journal"><a class="header" href="#curation-journal">Curation journal</a></h2>
+<p><code>--journal PATH</code> overrides the on-disk SQLite log. The default is
+<code>&lt;root&gt;/sorrel.sqlite</code>. The journal is replayed on every open, so reopening
+the same directory restores all prior edits.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="cli-reference"><a class="header" href="#cli-reference">CLI Reference</a></h1>
+<pre><code class="language-text">sorrel &lt;DATA_DIR&gt; [OPTIONS]
+</code></pre>
+<p><code>&lt;DATA_DIR&gt;</code> is either a directory (phy / Kilosort or SortingAnalyzer)
+or a single file (<code>*.nwb</code>, <code>rez.mat</code>).</p>
+<h2 id="options"><a class="header" href="#options">Options</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--backend NAME</code></td><td><code>kilosort</code> | <code>sorting-analyzer</code> | <code>nwb</code> | <code>ks4-rez</code>. Auto-detected when omitted.</td></tr>
+<tr><td><code>--dat PATH</code></td><td>Raw recording. Overrides <code>params.py:dat_path</code>.</td></tr>
+<tr><td><code>--sample-rate Hz</code></td><td>Overrides <code>params.py:sample_rate</code>.</td></tr>
+<tr><td><code>--channels N</code></td><td>Overrides <code>params.py:n_channels_dat</code>.</td></tr>
+<tr><td><code>--dtype DTYPE</code></td><td><code>int16</code> | <code>uint16</code> | <code>int32</code> | <code>float32</code>. Overrides <code>params.py:dtype</code>.</td></tr>
+<tr><td><code>--offset BYTES</code></td><td>Header bytes to skip in the <code>.dat</code>.</td></tr>
+<tr><td><code>--journal PATH</code></td><td>SQLite curation log. Default: <code>&lt;root&gt;/sorrel.sqlite</code>.</td></tr>
+<tr><td><code>--spikeglx-meta P</code></td><td>Populate sample-rate / channels / dtype from a SpikeGLX <code>.meta</code>.</td></tr>
+<tr><td><code>--oebin PATH</code></td><td>Populate sample-rate / channels / dat path from an Open Ephys <code>structure.oebin</code>.</td></tr>
+<tr><td><code>--export-qc DIR</code></td><td>Headless: write <code>cluster_qc.tsv</code> + <code>cluster_qc.json</code> into <code>DIR</code> and exit. No GUI.</td></tr>
+<tr><td><code>-h</code>, <code>--help</code></td><td>Print usage.</td></tr>
+</tbody>
+</table>
+</div>
+<p>When <code>params.py</code> is present, sample-rate, channels, dtype, offset, and
+dat-path all default from it. CLI flags override per-field.</p>
+<h2 id="examples"><a class="header" href="#examples">Examples</a></h2>
+<pre><code class="language-bash"># Auto-detect, defaults from params.py
+sorrel my_run/phy
+
+# Force a backend
+sorrel my_run --backend sorting-analyzer
+
+# Override sample rate but inherit everything else from params.py
+sorrel my_run/phy --sample-rate 25000
+
+# SpikeGLX run without a params.py
+sorrel my_run/phy --spikeglx-meta run.imec0.ap.meta
+
+# Run all metrics headlessly and write QC artefacts
+sorrel my_run/phy --export-qc out/qc/
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="backends--inputs"><a class="header" href="#backends--inputs">Backends &amp; Inputs</a></h1>
+<p>Sorrel reads several sorting and recording formats. The general rule:</p>
+<ul>
+<li><strong>Sorting backends</strong> carry both a sorting and (optionally) the raw trace.</li>
+<li><strong>Recording-only formats</strong> plug into a sorting via <code>--dat</code> /
+<code>--spikeglx-meta</code> / <code>--oebin</code>.</li>
+</ul>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Kind</th><th>Format</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td>Sorting</td><td>phy / Kilosort directory</td><td>First-class. Reads phy artefacts as-is.</td></tr>
+<tr><td>Sorting</td><td>SpikeInterface <code>SortingAnalyzer</code> (binary folder)</td><td>Reads <code>recording.json</code>, the flat sorting under <code>sorting/</code>, optional <code>probe.json</code>, and <code>extensions/quality_metrics/metrics.csv</code>.</td></tr>
+<tr><td>Sorting</td><td>NWB</td><td>Requires <code>--features hdf5</code>. Reads <code>/units/spike_times</code> + <code>/general/extracellular_ephys/electrodes</code>.</td></tr>
+<tr><td>Sorting</td><td>Kilosort 4 <code>rez.mat</code></td><td>Requires <code>--features hdf5</code>. Reads <code>rez/st3</code>, <code>rez/ops/*</code>, <code>rez/xc</code>, <code>rez/yc</code>.</td></tr>
+<tr><td>Recording</td><td>SpikeGLX (<code>*.bin</code> + <code>*.meta</code>)</td><td>Use as <code>--dat</code>; pass <code>--spikeglx-meta</code> for sample rate / channels / dtype.</td></tr>
+<tr><td>Recording</td><td>Open Ephys binary (<code>continuous.dat</code> + <code>structure.oebin</code>)</td><td>Use as <code>--dat</code>; pass <code>--oebin</code> to inherit metadata.</td></tr>
+<tr><td>Recording</td><td>Mountainsort MDA (<code>*.mda</code>)</td><td>Use as <code>--dat</code>. Reads the MDA header.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="backend-detection"><a class="header" href="#backend-detection">Backend detection</a></h2>
+<p>When <code>--backend</code> is not specified, the detector is run on the input path:</p>
+<ol>
+<li>File path <code>*.nwb</code> → NWB (HDF5).</li>
+<li>File path <code>rez.mat</code> / <code>rez2.mat</code> → KS4 rez (HDF5).</li>
+<li>Directory containing <code>spike_times.npy</code> + <code>spike_clusters.npy</code> →
+phy / Kilosort.</li>
+<li>Directory containing <code>recording.json</code> (or <code>binary.json</code>) and a
+<code>sorting/</code> folder → SortingAnalyzer.</li>
+</ol>
+<p>If none match, Sorrel exits with a message listing what it looked for.</p>
+<h2 id="probe-geometry"><a class="header" href="#probe-geometry">Probe geometry</a></h2>
+<p>If a <code>probe.json</code> or <code>probegroup.json</code> (<a href="https://github.com/SpikeInterface/probeinterface">probeinterface</a>) is present in
+the directory, Sorrel uses it to lay out the WaveformView and ProbeView.
+Phy’s <code>channel_positions.npy</code> wins when both are present (it’s
+authoritative for the row order in the raw <code>.dat</code>).</p>
+<h2 id="quality-metrics-sidecars"><a class="header" href="#quality-metrics-sidecars">Quality metrics sidecars</a></h2>
+<p>Sorrel auto-loads cluster-level metrics at startup from any of:</p>
+<ul>
+<li><code>quality_metrics.csv</code> (one row per cluster, header columns become
+metric names — SI’s format).</li>
+<li><code>cluster_&lt;metric&gt;.tsv</code> files (one file per metric — phy’s format).</li>
+</ul>
+<p>NaNs mean the upstream tool didn’t report a value for that cluster.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="kilosort--phy2"><a class="header" href="#kilosort--phy2">Kilosort / phy2</a></h1>
+<p>Sorrel reads everything phy reads. The minimum is two arrays plus a
+trace; the rest of the phy artefacts are picked up opportunistically and
+unlock additional views.</p>
+<h2 id="required"><a class="header" href="#required">Required</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>File</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>spike_times.npy</code></td><td>Spike sample indices.</td></tr>
+<tr><td><code>spike_clusters.npy</code></td><td>Cluster ID for each spike.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Plus a raw trace — typically <code>recording.dat</code>. The path can come from
+<code>params.py:dat_path</code>, <code>--dat</code>, <code>--oebin</code>, or default to <code>recording.dat</code>
+inside the directory.</p>
+<h2 id="optional-used-when-present"><a class="header" href="#optional-used-when-present">Optional, used when present</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>File</th><th>Powers</th></tr>
+</thead>
+<tbody>
+<tr><td><code>params.py</code></td><td>Sample rate, n channels, dtype, offset, dat path.</td></tr>
+<tr><td><code>cluster_group.tsv</code></td><td>Initial good / mua / noise / unsorted labels.</td></tr>
+<tr><td><code>channel_positions.npy</code></td><td>Probe geometry — authoritative row order.</td></tr>
+<tr><td><code>templates.npy</code></td><td>Template view, similarity matrix.</td></tr>
+<tr><td><code>template_features.npy</code>, <code>template_feature_ind.npy</code></td><td>Template-feature scatter.</td></tr>
+<tr><td><code>pc_features.npy</code>, <code>pc_feature_ind.npy</code></td><td>Feature view (PC space).</td></tr>
+<tr><td><code>amplitudes.npy</code></td><td>Amplitude-vs-time scatter, drift map.</td></tr>
+<tr><td><code>similar_templates.npy</code></td><td>Similarity view shortcut.</td></tr>
+<tr><td><code>cluster_&lt;metric&gt;.tsv</code></td><td>Quality-metric columns in the cluster table.</td></tr>
+<tr><td><code>quality_metrics.csv</code></td><td>SI-style quality metrics.</td></tr>
+<tr><td><code>probe.json</code> / <code>probegroup.json</code></td><td>Probe geometry fallback (probeinterface).</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="loading-model"><a class="header" href="#loading-model">Loading model</a></h2>
+<p>Spike arrays and the raw <code>.dat</code> are memory-mapped. On open, Sorrel
+buckets spike times and amplitudes once per cluster; subsequent hot-path
+lookups are slice borrows into the bucket. The <code>.npy</code> parser supports
+the dtypes Kilosort actually emits for these arrays.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="integrations"><a class="header" href="#integrations">Integrations</a></h1>
+<p>Sorrel speaks the phy2 directory format natively. Most spike-sorting
+pipelines either emit phy directly or have a one-line export step that
+does. This page lists the integration paths.</p>
+<h2 id="spikeinterface"><a class="header" href="#spikeinterface">SpikeInterface</a></h2>
+<p><a href="https://spikeinterface.readthedocs.io">SpikeInterface</a> (SI) is the dominant Python framework for spike-sorting
+workflows. Two ways to bring an SI run into Sorrel:</p>
+<h3 id="1-phy-export-works-today-no-extra-deps"><a class="header" href="#1-phy-export-works-today-no-extra-deps">1. Phy export (works today, no extra deps)</a></h3>
+<pre><code class="language-python">import spikeinterface.exporters as siex
+siex.export_to_phy(
+    sorting_analyzer,        # SortingAnalyzer with templates + waveforms
+    output_folder="my_run/phy",
+    copy_binary=True,        # so sorrel can mmap recording.dat in place
+    compute_pc_features=True # enables the FeatureView
+)
+</code></pre>
+<p>Then:</p>
+<pre><code class="language-sh">sorrel my_run/phy
+</code></pre>
+<p>Sorrel reads <code>spike_times.npy</code>, <code>spike_clusters.npy</code>, <code>params.py</code>,
+<code>channel_positions.npy</code>, <code>templates.npy</code>, <code>pc_features.npy</code>,
+<code>similar_templates.npy</code>, and <code>cluster_group.tsv</code> exactly as phy does.</p>
+<h3 id="2-native-sortinganalyzer-binary-folder"><a class="header" href="#2-native-sortinganalyzer-binary-folder">2. Native SortingAnalyzer (binary folder)</a></h3>
+<p>If the analyzer was saved with <code>format='binary_folder'</code> and the sorting
+was flattened to <code>spike_times.npy</code> + <code>unit_indices.npy</code> under
+<code>&lt;root&gt;/sorting/</code>, point Sorrel directly at the analyzer root:</p>
+<pre><code class="language-sh">sorrel my_run/sorting_analyzer
+</code></pre>
+<p>The current implementation reads <code>recording.json</code> (sample rate, channel
+count, dtype, bin path), the flat sorting arrays, the optional
+<code>probe.json</code> for geometry, and <code>extensions/quality_metrics/metrics.csv</code>
+into the cluster table. The Zarr (<code>zarr_folder</code>) variant is not
+supported; export to <code>binary_folder</code> first.</p>
+<h3 id="round-tripping-curation-back-into-si"><a class="header" href="#round-tripping-curation-back-into-si">Round-tripping curation back into SI</a></h3>
+<p>Sorrel writes the same two files SI’s <code>read_phy()</code> reads:</p>
+<ul>
+<li><code>spike_clusters.npy</code> — updated per-spike cluster assignment after
+merges/splits.</li>
+<li><code>cluster_group.tsv</code> — <code>good</code>/<code>mua</code>/<code>noise</code>/<code>unsorted</code> labels.</li>
+</ul>
+<pre><code class="language-python">import spikeinterface.extractors as se
+sorting = se.read_phy("my_run/phy")  # picks up sorrel's edits
+</code></pre>
+<h2 id="quality-metrics"><a class="header" href="#quality-metrics">Quality metrics</a></h2>
+<p>Sorrel auto-loads sidecar metrics at startup:</p>
+<ul>
+<li>SI’s <code>quality_metrics.csv</code> (one row per cluster, header columns become
+metric names).</li>
+<li>Phy’s <code>cluster_&lt;metric&gt;.tsv</code> files (one file per metric).</li>
+</ul>
+<p>Metrics surface as columns in the cluster table. NaN means the upstream
+tool didn’t report a value for that cluster.</p>
+<h2 id="probe-geometry-1"><a class="header" href="#probe-geometry-1">Probe geometry</a></h2>
+<p>If the directory contains a <code>probe.json</code> or <code>probegroup.json</code> in
+<a href="https://github.com/SpikeInterface/probeinterface">probeinterface</a> format, Sorrel will use it for the WaveformView layout.
+Phy’s <code>channel_positions.npy</code> still wins when both are present (it’s
+authoritative for the row order in the raw bin).</p>
+<h2 id="recording-only-formats"><a class="header" href="#recording-only-formats">Recording-only formats</a></h2>
+<p>These are <em>recording</em> formats — they don’t carry a sorting on their own,
+but Sorrel can use them as the raw <code>.dat</code> for an existing phy directory:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Format</th><th>What we read</th><th>Use as <code>--dat</code></th></tr>
+</thead>
+<tbody>
+<tr><td><strong>SpikeGLX</strong></td><td><code>&lt;run&gt;.&lt;stream&gt;.bin</code> + <code>&lt;run&gt;.&lt;stream&gt;.meta</code></td><td>yes</td></tr>
+<tr><td><strong>Open Ephys binary</strong></td><td><code>continuous.dat</code> + <code>structure.oebin</code></td><td>yes</td></tr>
+<tr><td><strong>Mountainsort MDA</strong></td><td><code>*.mda</code> (header-prefixed flat array)</td><td>yes</td></tr>
+</tbody>
+</table>
+</div>
+<p>For SpikeGLX or Open Ephys, point <code>--dat</code> at the bin file and pass
+<code>--sample-rate</code>/<code>--channels</code> from the <code>.meta</code>/<code>.oebin</code> (or let Sorrel
+auto-detect — see <a href="#backend-detection-1">Backend detection</a>).</p>
+<h2 id="nwb--dandi"><a class="header" href="#nwb--dandi">NWB / DANDI</a></h2>
+<pre><code class="language-sh">sorrel my_session.nwb            # build with --features hdf5
+</code></pre>
+<p>Reads <code>/units/spike_times</code> (vlen) bucketed by <code>/units/id</code>, picks the first
+<code>ElectricalSeries</code> under <code>/acquisition</code> for the trace, and pulls
+<code>x</code>/<code>y</code>/<code>rel_x</code>/<code>rel_y</code> from <code>/general/extracellular_ephys/electrodes</code> for
+probe geometry. Spike times are converted from seconds to samples using
+the <code>ElectricalSeries</code> rate.</p>
+<p>Limitations:</p>
+<ul>
+<li>HDF5 backend is opt-in (<code>cargo build --features hdf5</code>); the default
+build does not link libhdf5.</li>
+<li>Trace data is loaded eagerly into RAM (NWB datasets are typically
+chunked + compressed, no mmap).</li>
+<li>Local files only — DANDI streaming is not yet wired up.</li>
+</ul>
+<h2 id="kilosort-4-rezmat"><a class="header" href="#kilosort-4-rezmat">Kilosort 4 <code>rez.mat</code></a></h2>
+<pre><code class="language-sh">sorrel rez.mat --dat path/to/recording.bin   # build with --features hdf5
+</code></pre>
+<p>Reads <code>rez/st3</code> for sample/template tuples, <code>rez/ops/fs</code> and
+<code>rez/ops/Nchan</code> for recording params, <code>rez/xc</code>/<code>rez/yc</code> for channel
+positions, and <code>rez/ops/fbinary</code>/<code>fproc</code> for the dat path (overridable
+with <code>--dat</code>).</p>
+<p>If you’d rather not enable the <code>hdf5</code> feature, KS4 writes a phy export
+under <code>&lt;output&gt;/phy/</code> automatically — open that directory instead.</p>
+<h2 id="python-jupyter"><a class="header" href="#python-jupyter">Python (Jupyter)</a></h2>
+<p>The <code>sorrel-py</code> crate (build with <code>maturin develop</code> from
+<code>crates/sorrel-py/</code>) exposes:</p>
+<pre><code class="language-python">import sorrel
+sorrel.open(recording, sorting)  # SpikeInterface objects
+</code></pre>
+<p>Internally this delegates to <code>export_to_phy</code> followed by the native
+backend. Zero-copy direct-numpy is on the roadmap but not the v1 path.</p>
+<h2 id="backend-detection-1"><a class="header" href="#backend-detection-1">Backend detection</a></h2>
+<p><code>sorrel &lt;DIR&gt;</code> walks a small detector list:</p>
+<ol>
+<li>If <code>spike_times.npy</code> + <code>spike_clusters.npy</code> are present → phy/Kilosort.</li>
+<li>Else if <code>recording.json</code> + <code>sorting/</code> are present → SortingAnalyzer.</li>
+<li>Else fail with a helpful message.</li>
+</ol>
+<p>Override with <code>--backend kilosort|sorting-analyzer</code>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="views"><a class="header" href="#views">Views</a></h1>
+<p>The central panel is a tab strip. Each tab consumes the active selection
+and renders into the available area; switching tabs preserves selection,
+trace window, and per-view caches.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Tab</th><th>What it shows</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Summary</strong></td><td>Cluster table + selection summary. The cluster table sorts by id, spike count, amplitude, ISI-violation rate, composite quality score, or label, with text and noise/empty filters.</td></tr>
+<tr><td><strong>Waveforms</strong></td><td>Mean ± std waveform per selected cluster, in probe layout when geometry is available, otherwise single-channel.</td></tr>
+<tr><td><strong>Templates</strong></td><td>Template traces (when <code>templates.npy</code> is present).</td></tr>
+<tr><td><strong>Amplitudes</strong></td><td>Per-spike amplitude vs time scatter for each selected cluster.</td></tr>
+<tr><td><strong>ISI</strong></td><td>Inter-spike interval histogram with a refractory-period overlay.</td></tr>
+<tr><td><strong>CCG</strong></td><td>Auto- and cross-correlograms across the selected clusters.</td></tr>
+<tr><td><strong>Features</strong></td><td>PC-feature scatter (uses <code>pc_features.npy</code> / <code>pc_feature_ind.npy</code>).</td></tr>
+<tr><td><strong>Raster</strong></td><td>Spike raster across selected clusters, time-aligned with the trace window.</td></tr>
+<tr><td><strong>Rate</strong></td><td>Sliding-window firing rate.</td></tr>
+<tr><td><strong>Probe</strong></td><td>Channel layout from probe geometry.</td></tr>
+<tr><td><strong>Similar</strong></td><td>Similarity ranking — <code>similar_templates.npy</code> when present, otherwise computed from templates.</td></tr>
+<tr><td><strong>Stats</strong></td><td>Per-cluster numeric breakdown: refractory contamination, ISI stats, amplitude IQR, etc.</td></tr>
+<tr><td><strong>Quality</strong></td><td>Composite quality breakdown (refractory, presence, isolation).</td></tr>
+<tr><td><strong>Suggest</strong></td><td>Ranked merge and split suggestions for the active selection.</td></tr>
+<tr><td><strong>DriftMap</strong></td><td>Spike amplitude vs depth over time.</td></tr>
+<tr><td><strong>ContamTime</strong></td><td>Sliding refractory contamination over the recording.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The trace view is always visible above the tabs. It uses LTTB
+downsampling on a configurable trace window (<code>H</code> / <code>L</code> to pan), with
+optional CMR + high-pass filtering applied before downsampling.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="keyboard--mouse"><a class="header" href="#keyboard--mouse">Keyboard &amp; Mouse</a></h1>
+<h2 id="labels"><a class="header" href="#labels">Labels</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>G</code></td><td>Mark active selection as <strong>good</strong>.</td></tr>
+<tr><td><code>M</code></td><td>Mark active selection as <strong>MUA</strong>.</td></tr>
+<tr><td><code>N</code></td><td>Mark active selection as <strong>noise</strong>.</td></tr>
+<tr><td><code>U</code></td><td>Mark active selection as <strong>unsorted</strong>.</td></tr>
+</tbody>
+</table>
+</div>
+<p>A label key applies to <em>every</em> cluster in the active selection, not just
+the focused one.</p>
+<h2 id="navigation"><a class="header" href="#navigation">Navigation</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>J</code> / <code>↓</code></td><td>Select the next cluster.</td></tr>
+<tr><td><code>K</code> / <code>↑</code></td><td>Select the previous cluster.</td></tr>
+<tr><td><code>H</code> / <code>←</code></td><td>Pan the trace window backward.</td></tr>
+<tr><td><code>L</code> / <code>→</code></td><td>Pan the trace window forward.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="curation-history"><a class="header" href="#curation-history">Curation history</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Cmd/Ctrl-Z</code></td><td>Undo.</td></tr>
+<tr><td><code>Cmd/Ctrl-Shift-Z</code></td><td>Redo.</td></tr>
+<tr><td><code>Cmd/Ctrl-S</code></td><td>Save curated state to disk (see <a href="#saving--qc-export">Saving</a>).</td></tr>
+</tbody>
+</table>
+</div>
+<p>Undo and redo are first-class records in the SQLite journal — replaying
+the journal reconstructs the same history and redo stacks.</p>
+<h2 id="cluster-table-mouse"><a class="header" href="#cluster-table-mouse">Cluster table mouse</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gesture</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td>Click</td><td>Replace selection with this cluster.</td></tr>
+<tr><td>Cmd/Ctrl-click</td><td>Toggle this cluster in the selection.</td></tr>
+<tr><td>Shift-click</td><td>Range-extend from the anchor to this cluster.</td></tr>
+<tr><td>Click column header</td><td>Sort by that column; click again to flip.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="journaling-guarantee"><a class="header" href="#journaling-guarantee">Journaling guarantee</a></h2>
+<p>Every label change, merge, split, and undo/redo is written to SQLite
+<strong>before</strong> the in-memory session changes. If Sorrel crashes between the
+journal write and the next event, the replay on next open recovers the
+exact same state.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="saving--qc-export"><a class="header" href="#saving--qc-export">Saving &amp; QC Export</a></h1>
+<p>Sorrel separates two persistence concerns:</p>
+<ol>
+<li><strong>The journal</strong> — every action goes here, automatically and
+synchronously, before the in-memory session moves. This is the
+source of truth for “what edits has the user made.”</li>
+<li><strong>Phy artefacts</strong> — the canonical files other tools read
+(<code>spike_clusters.npy</code>, <code>cluster_group.tsv</code>). These are written
+on demand.</li>
+</ol>
+<h2 id="saving-phy-artefacts"><a class="header" href="#saving-phy-artefacts">Saving phy artefacts</a></h2>
+<pre><code class="language-text">Cmd/Ctrl-S
+</code></pre>
+<p>Writes the current curated state into the directory the binary was
+opened with (<code>save_dir</code>):</p>
+<ul>
+<li><code>spike_clusters.npy</code> — updated per-spike cluster assignment after any
+merges and splits.</li>
+<li><code>cluster_group.tsv</code> — <code>good</code> / <code>mua</code> / <code>noise</code> / <code>unsorted</code> labels.</li>
+</ul>
+<p>These are exactly the files <code>spikeinterface.extractors.read_phy()</code> reads
+back, so a round trip into SpikeInterface or phy works without
+intermediate steps.</p>
+<p>The journal is <em>resealed</em> at save time so a fresh open replays cleanly
+from the new baseline rather than from the original sort.</p>
+<h2 id="headless-qc-export"><a class="header" href="#headless-qc-export">Headless QC export</a></h2>
+<pre><code class="language-bash">sorrel &lt;DATA_DIR&gt; --export-qc out/qc/
+</code></pre>
+<p>Loads the data, runs the full metrics pipeline (firing rate, presence,
+refractory contamination, amplitude stats, ISI violations, isolation
+distance where PC features are available, composite quality), writes
+both:</p>
+<ul>
+<li><code>out/qc/cluster_qc.tsv</code> — one row per cluster, header columns are
+metric names.</li>
+<li><code>out/qc/cluster_qc.json</code> — same data, JSON shape for programmatic
+consumption.</li>
+</ul>
+<p>…and exits without spawning a window. The journal is replayed first, so
+the export reflects current curation.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="workspace-layout"><a class="header" href="#workspace-layout">Workspace Layout</a></h1>
+<p>Sorrel is a Cargo workspace with one role per crate:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Crate</th><th>Role</th></tr>
+</thead>
+<tbody>
+<tr><td><code>sorrel-io</code></td><td>Concrete data backends and the <code>DataProvider</code> trait. Phy / Kilosort, SortingAnalyzer, NWB, KS4 rez, plus recording-only readers (SpikeGLX, Open Ephys, MDA, probeinterface).</td></tr>
+<tr><td><code>sorrel-cache</code></td><td>Rebuildable derived-artifact cache. Owns content-addressed keys, rkyv archive I/O, atomic writes, and mmap-backed bytechecked reads; deleting it never loses user data.</td></tr>
+<tr><td><code>sorrel-compute</code></td><td>CPU kernels: LTTB downsampling, histograms, ISI / CCG, CMR + filter, mean snippet, GMM, drift, quality metrics, isolation distance.</td></tr>
+<tr><td><code>sorrel-gpu</code></td><td>wgpu compute pipelines (CMR median, biquad HP filter, mean snippet) sharing the device and queue with the renderer.</td></tr>
+<tr><td><code>sorrel-data</code></td><td>Generic <code>Session&lt;P&gt;</code>, <code>CurationCommand</code>, SQLite <code>Journal</code>, save / replay, QC export, merge/split previews and suggestions.</td></tr>
+<tr><td><code>sorrel-render</code></td><td>Concrete vertex types and monomorphised buffer builders for the trace and raster paths.</td></tr>
+<tr><td><code>sorrel-ui</code></td><td>egui widgets and views, generic over <code>P: DataProvider</code>.</td></tr>
+<tr><td><code>sorrel</code></td><td>Binary. Parses CLI, detects backend, instantiates <code>SorrelApp&lt;P&gt;</code>.</td></tr>
+<tr><td><code>sorrel-py</code></td><td>Optional Python bridge (PyO3 / maturin) — exposes <code>sorrel.open(recording, sorting)</code> for SpikeInterface users.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The split is functional, not layered: each crate owns its concerns end
+to end, and the binary stitches one fully-monomorphised arm together
+per backend it supports.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="data-flow"><a class="header" href="#data-flow">Data Flow</a></h1>
+<p>Sorrel’s core path is generic over <code>P: DataProvider</code>. The binary detects
+a backend, constructs the concrete provider, opens the SQLite journal,
+and builds a <code>Session&lt;P&gt;</code>. From there the UI, render buffers, and
+compute kernels are all statically dispatched.</p>
+<h2 id="open"><a class="header" href="#open">Open</a></h2>
+<ol>
+<li><code>detect_backend</code> inspects the path (file vs directory, marker files,
+extension) and picks one of <code>Kilosort</code>, <code>SortingAnalyzer</code>, <code>Nwb</code>, or
+<code>Ks4Rez</code>. <code>--backend</code> skips the detector.</li>
+<li>The chosen provider opens its inputs:
+<ul>
+<li>Kilosort / phy mmaps <code>spike_times.npy</code>, <code>spike_clusters.npy</code>, and
+the raw <code>.dat</code>; reads optional artefacts for templates, PC
+features, amplitudes, similarity, probe geometry, and quality
+metric sidecars.</li>
+<li>Other backends do the equivalent for their formats.</li>
+</ul>
+</li>
+<li><code>Session::new</code> holds the provider and journal. <code>seed_*</code> calls bucket
+amplitudes, templates, PC features, and template waveforms once so
+hot-path lookups are O(1) slice borrows.</li>
+<li><code>replay_journal</code> re-applies every prior <code>CurationCommand</code> (including
+undo/redo records) so the open state matches the last running state.</li>
+</ol>
+<h2 id="cache"><a class="header" href="#cache">Cache</a></h2>
+<p>Derived artifacts that have cache support consult
+<code>&lt;dataset&gt;/.sorrel/cache/</code> first using the provider identity, current
+journal head, artifact algorithm version, parameters, and any
+per-cluster spike fingerprints. Misses fall through to the existing
+compute path and then write an archive for the next open.</p>
+<p>The journal head is the invalidation point. Applying a
+<code>CurationCommand</code> records the previous head and affected cluster
+identities in the session’s in-memory invalidation log. Sorrel evicts
+known pre-edit derived artifacts at save and quit, while
+<code>CacheStore::open</code> runs bounded GC for orphaned, aged, and over-budget
+files. See <a href="#derived-cache">Derived Cache</a> for the full contract.</p>
+<h2 id="edit"><a class="header" href="#edit">Edit</a></h2>
+<p><code>CurationCommand</code> is a closed enum: <code>Relabel</code>, <code>Merge</code>, <code>Split</code>,
+<code>Note</code>, <code>Batch</code>, <code>Undo</code>, <code>Redo</code>. The session applies a command in two
+strictly-ordered steps:</p>
+<ol>
+<li><strong>Append to the journal.</strong> A successful SQLite commit is the
+point-of-no-return.</li>
+<li><strong>Mutate in-memory state.</strong> The <code>ClusterIndex</code> updates, the
+selection moves, caches that depend on history are invalidated.</li>
+</ol>
+<p>If step 1 fails the in-memory session does not move. If the process is
+killed between step 1 and step 2, replay reconstructs the missing
+transition.</p>
+<h2 id="save"><a class="header" href="#save">Save</a></h2>
+<p><code>Cmd/Ctrl-S</code> writes <code>spike_clusters.npy</code> + <code>cluster_group.tsv</code> into the
+save directory and reseals the journal so future replays start from the
+new baseline rather than from the original sort.</p>
+<h2 id="render"><a class="header" href="#render">Render</a></h2>
+<p>The trace view assembles a window of the raw trace, optionally runs CMR</p>
+<ul>
+<li>HP filter (CPU or GPU), then LTTB-downsamples per channel into
+<code>TraceVertex</code> buffers consumed by the wgpu pipeline. Other views
+(raster, ISI, CCG, features, drift map…) build their geometry directly
+in egui from the per-cluster slice borrows the session exposes.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="derived-cache"><a class="header" href="#derived-cache">Derived Cache</a></h1>
+<p>Sorrel stores rebuildable derived artifacts under:</p>
+<pre><code class="language-text">&lt;dataset&gt;/.sorrel/cache/
+</code></pre>
+<p>The cache is not user data. Deleting this directory must never delete curation
+work, journal records, provider inputs, or exported phy files. It only removes
+derived archives that Sorrel can recompute from the dataset and journal.</p>
+<h2 id="contents"><a class="header" href="#contents">Contents</a></h2>
+<p>The cache stores expensive derived data such as seeded amplitude buckets,
+per-cluster PC subspaces, isolation metrics, and correlograms. It does not
+store the curation journal, external JSON sidecars, raw traces, spike arrays,
+or any file that is required to reopen the dataset.</p>
+<p>Each cache entry is an rkyv archive at:</p>
+<pre><code class="language-text">&lt;dataset&gt;/.sorrel/cache/&lt;kind&gt;/&lt;fingerprint&gt;.rkyv
+</code></pre>
+<p><code>INDEX</code> is an advisory append-only log with one entry per write:</p>
+<pre><code class="language-text">kind|fingerprint|len|mtime
+</code></pre>
+<p>The fingerprint is part of the filename and the index entry. The current file
+format does not embed an additional header inside the archive.</p>
+<h2 id="cache-keys"><a class="header" href="#cache-keys">Cache Keys</a></h2>
+<p>Every cache key includes:</p>
+<ul>
+<li>Provider identity bytes derived from input content, not the dataset path.</li>
+<li>Journal head, so any replay-visible curation change produces a miss.</li>
+<li>Artifact <code>algo_version</code>, bumped whenever the archive shape or computation changes.</li>
+<li>Artifact parameters such as dimensionality, channel index, bin size, window, or k-NN.</li>
+<li>Per-cluster spike fingerprints where applicable.</li>
+</ul>
+<p>Per-cluster PC subspaces and isolation metrics include a fingerprint of the
+cluster’s current spike membership. Correlograms include spike-time
+fingerprints for the cluster or ordered cluster pair. Cross-correlogram keys
+are directional: <code>(a, b)</code> and <code>(b, a)</code> are different entries.</p>
+<h2 id="lifecycle"><a class="header" href="#lifecycle">Lifecycle</a></h2>
+<p>On read, Sorrel builds the key from the current provider identity, journal
+head, parameters, and cluster inputs. A matching rkyv archive is memory-mapped
+and bytechecked before use. Corrupt archives are treated as misses and evicted.</p>
+<p>On miss, the caller computes the artifact normally and writes the archive
+atomically through a temporary file plus rename. The next open can then use the
+archive without recomputing.</p>
+<p>When a <code>CurationCommand</code> is dispatched, the journal append changes the journal
+head. The running session records a bounded in-memory invalidation log with the
+previous head and affected cluster identities. Sorrel does not evict on every
+command; it invalidates opportunistically at save and quit so the current
+session keeps warm caches while editing. The journal-head component still
+forces newly requested artifacts to miss after the command.</p>
+<h2 id="garbage-collection"><a class="header" href="#garbage-collection">Garbage Collection</a></h2>
+<p><code>CacheStore::open</code> runs a bounded GC pass over the cache root. GC removes:</p>
+<ul>
+<li>Orphan <code>.rkyv</code> files that are not referenced by <code>INDEX</code>.</li>
+<li>Entries older than <code>SORREL_CACHE_MAX_AGE_DAYS</code>, default <code>30</code>.</li>
+<li>Least-recently-modified entries when total cache bytes exceed <code>SORREL_CACHE_MAX_BYTES</code>, default <code>4294967296</code> bytes.</li>
+</ul>
+<p>The open-time sweep scans at most 1000 cache files per call to avoid turning a
+large cache into a visible startup stall. Larger caches finish over multiple
+opens.</p>
+<h2 id="user-operations"><a class="header" href="#user-operations">User Operations</a></h2>
+<p>Users can clear the cache without losing data:</p>
+<pre><code class="language-bash">sorrel --clear-cache &lt;dataset&gt;
+</code></pre>
+<p>This removes <code>&lt;dataset&gt;/.sorrel/cache/</code> and exits. Manual deletion of the same
+directory is also safe. The command canonicalizes the target and refuses to
+remove any path that is not a <code>.sorrel/cache</code> directory.</p>
+<p>The cache is local rebuildable state. Sorrel does not guarantee cross-machine
+cache portability, even if copying a dataset also copies <code>.sorrel/cache</code>.</p>
+<h2 id="boundaries"><a class="header" href="#boundaries">Boundaries</a></h2>
+<p>rkyv is a cache-only codec. It must not leak into:</p>
+<ul>
+<li><strong>Compute kernels</strong> (<code>crates/sorrel-compute/</code>). The kernel crate stays
+dependency-free of rkyv; its types use plain Rust or serde.</li>
+<li><strong>JSON ingest</strong> (<code>crates/sorrel-io/src/{probeinterface,sorting_analyzer,open_ephys}.rs</code>).
+External-format deserialisation continues to use <code>serde_json</code>.</li>
+<li><strong>The curation journal</strong> (<code>crates/sorrel-data/src/journal.rs</code>, <code>command.rs</code>).
+The journal codec stays <code>rmp-serde</code> for schema evolution and forward
+compatibility.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="gpu-compute"><a class="header" href="#gpu-compute">GPU Compute</a></h1>
+<p><code>sorrel-gpu</code> is a small set of wgpu compute pipelines that share the
+device and queue with eframe’s renderer. When the app is installed onto
+an <code>eframe::wgpu</code> render state, <code>install_gpu_compute</code> wires up the GPU
+preprocessor; otherwise the trace path silently falls back to the CPU
+kernels in <code>sorrel-compute</code>.</p>
+<h2 id="pipelines"><a class="header" href="#pipelines">Pipelines</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Shader</th><th>Pipeline</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cmr_median.wgsl</code></td><td>Per-sample channel median for common-median referencing on the trace window.</td></tr>
+<tr><td><code>biquad_hp.wgsl</code></td><td>Causal biquad high-pass filter applied per-channel after CMR.</td></tr>
+<tr><td><code>mean_snippet.wgsl</code></td><td>Mean-snippet extraction along a window for waveform / template overlays.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="why-gpu-here"><a class="header" href="#why-gpu-here">Why GPU here</a></h2>
+<p>The trace view repaints on every pan and resize. CMR + HP filter on a
+1-second × hundreds-of-channels window is fast on the CPU, but pinning
+it to the same wgpu device the renderer already uses lets the
+downsampled vertex stream stay on-device and avoids the round-trip
+through host memory.</p>
+<h2 id="fallback"><a class="header" href="#fallback">Fallback</a></h2>
+<p>The CPU implementations live in <code>sorrel-compute::cmr</code> and
+<code>sorrel-compute::filter</code> and are bit-equivalent up to floating-point
+ordering. Headless tools (<code>--export-qc</code>) and any host without a wgpu
+adapter use them directly.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="sorrel-improvement-research-dossier"><a class="header" href="#sorrel-improvement-research-dossier">Sorrel Improvement Research Dossier</a></h1>
+<blockquote>
+<p>Evidence gathered 2026-06-10 at commit <code>d15ccf3</code> (trunk, in sync with
+<code>origin/trunk</code>). Re-verified and extended later the same day at the
+same commit; the working tree now carries an uncommitted simit badge
+block in <code>README.md</code>, this dossier plus its <code>SUMMARY.md</code> entry, and a
+stray untracked <code>docs/.cargo/config.toml</code> (see Current Reality).</p>
+</blockquote>
+<h2 id="goal-and-trigger"><a class="header" href="#goal-and-trigger">Goal And Trigger</a></h2>
+<p>The user asked to “improve the sorrel project” with research-first
+discipline. This dossier records the evidence-backed current state and
+the improvement workstreams it supports, so future sessions can act
+without re-deriving the facts.</p>
+<h2 id="current-reality"><a class="header" href="#current-reality">Current Reality</a></h2>
+<ul>
+<li><strong>Workspace health is strong.</strong> <code>cargo fmt --check</code>, <code>cargo clippy --workspace --all-targets</code>, and <code>cargo test --workspace</code> all pass in
+the Nix dev shell (<code>nix develop -c …</code>; bare shell has no cargo).
+449 tests pass across 8 crates (164 sorrel-compute, 88+34
+sorrel-data, 62+18 sorrel-io, 47 sorrel-ui, 11 sorrel-render,
+11 sorrel-gpu, 8 sorrel-cache, 5 sorrel bin) with 2 ignored.
+Doc-tests are nearly absent: 6 in total (4 sorrel-compute,
+1 sorrel-data, 1 sorrel-ui; the other 5 crates have zero).</li>
+<li><strong>The rkyv derived-cache plan set has fully landed</strong> (see Existing
+Plan Status below) but its planning docs are still published in the
+mdBook under <code>Planning</code> in <code>docs/src/SUMMARY.md</code>.</li>
+<li><strong>First publish to crates.io has not happened.</strong> The crates.io API
+returns “crate does not exist” for <strong>all 8 workspace crate names</strong>
+(<code>sorrel</code>, <code>-io</code>, <code>-cache</code>, <code>-compute</code>, <code>-gpu</code>, <code>-data</code>, <code>-render</code>,
+<code>-ui</code>; verified 2026-06-10 — note the API requires a real
+<code>User-Agent</code> header or it returns a rate-limit error). <code>git tag</code> is
+empty; <code>CHANGELOG.md</code> already declares <code>0.1.0</code> (2026-05-25) and
+<code>RELEASE.md</code> documents the 8-crate publish order.</li>
+<li><strong>Generated CI has drifted — all 16 simit-managed workflows.</strong>
+<code>simit init ci --workspace --platform forgejo --check</code> (simit
+0.16.1) now reports all 8 <code>ci-sorrel-*.yaml</code> and all 8
+<code>publish-crate-*.yaml</code> files under <code>.forgejo/workflows/</code> as
+differing, and prints the canonical regeneration command itself:
+<code>simit init ci --platform forgejo --runner atlas --workspace</code>.
+(An earlier check the same day reported 12 files; 16 is the current
+number.) <code>pages.yaml</code> is not simit-managed and is not in the drift
+set. The simit-generated README badge block (uncommitted) correctly
+reads <code>CI: drift</code>. There is no <code>simit.toml</code> anywhere in the repo, so
+generation options are inferred on every check.</li>
+<li><strong>CI already runs on the self-hosted atlas runner.</strong> 16 of 17
+workflows declare <code>runs-on: atlas</code> (container <code>rust:bookworm</code>); only
+<code>pages.yaml</code> still runs on <code>codeberg-small</code> with
+<code>install-nix-action</code>.</li>
+<li><strong>CI on trunk head is green after retries.</strong> Codeberg API shows many
+<code>failure</code> runs for <code>d15ccf3</code> on 2026-05-25 followed by <code>success</code> on
+2026-05-27 — consistent with the “Retry CI/runners” commits
+(<code>92d528e</code>, <code>5661392</code>) pointing at runner flakiness.</li>
+<li><strong>Publish workflows are tag-fan-out with no cross-crate ordering.</strong>
+Every <code>publish-crate-*.yaml</code> triggers on the same <code>*.*.*</code> tag push,
+so one <code>0.1.0</code> tag fires all 8 concurrently. Each workflow: verifies
+the tag is GPG-signed by a key in <code>keys/maintainers.gpg</code>, checks tag
+== <code>cargo pkgid</code> version, runs tests + clippy (all-features and
+no-default-features), <code>cargo publish --dry-run</code>, then publishes with
+the <code>CRATES_IO_API_TOKEN</code> secret. Publishing is <strong>idempotent</strong>: a
+pre-publish crates.io check skips crates whose version is already
+live, so re-running failed downstream workflows in dependency order
+is safe.</li>
+<li><strong>Release trust roots are in place locally.</strong> <code>keys/maintainers.gpg</code>
+pins exactly one key (<code>0x4623DEA06FDACFE1</code>, Can H. Tartanoglu), which
+matches <code>git config user.signingkey</code>, and <code>tag.gpgSign</code> is <code>true</code> —
+a locally created release tag will pass the workflow’s
+<code>git verify-tag</code> gate.</li>
+<li><strong>No license files exist anywhere.</strong> All manifests declare
+<code>license = "MIT OR Apache-2.0"</code> via <code>[workspace.package]</code>, but there
+is no <code>LICENSE*</code>/<code>COPYING*</code> file at the repo root or in any crate
+directory. No crate has a <code>README.md</code> or <code>readme</code> field either, so
+published crates.io pages would render with no readme.</li>
+<li><strong><code>deny.toml</code> exists but nothing runs cargo-deny.</strong> Neither the
+Forgejo workflows nor the flake checks (<code>nix/checks.nix</code>,
+<code>nix/pre-commit.nix</code>) reference it.</li>
+<li><strong>README.md is stale.</strong> Its workspace table lists 6 crates, omitting
+<code>sorrel-cache</code> and <code>sorrel-gpu</code>; its keyboard table still says
+“Undo (V1: stub)” while <code>crates/sorrel-ui/src/app.rs:293-298</code>
+implements full undo/redo with per-command status messages, and the
+in-app hint also advertises redo and save.</li>
+<li><strong>A stray <code>docs/.cargo/config.toml</code> appeared (untracked).</strong> It is
+byte-identical to the root <code>.cargo/config.toml</code> (rs-harbor-generated,
+nightly-only flags like <code>-Zthreads</code>/cranelift) — almost certainly
+dropped by a tool run from inside <code>docs/</code>. It serves no purpose
+there and should be deleted, not committed.</li>
+<li><strong>Two IO backends are deliberate stubs</strong>:
+<code>crates/sorrel-io/src/nwb.rs:27</code> and
+<code>crates/sorrel-io/src/ks4_rez.rs:25</code> only expose <code>open_stub</code>.</li>
+<li><code>crates/sorrel-py</code> (PyO3 bindings) is intentionally excluded from the
+workspace and is the only crate with a <code>description</code> field.</li>
+</ul>
+<h2 id="evidence-inventory"><a class="header" href="#evidence-inventory">Evidence Inventory</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Evidence</th><th>Command / file</th><th>What it proves</th></tr>
+</thead>
+<tbody>
+<tr><td>Quality gates pass</td><td><code>nix develop -c cargo fmt --check / clippy --workspace --all-targets / test --workspace</code> (exit 0, 449 passed)</td><td>No lint/test debt blocking other work</td></tr>
+<tr><td>Doc-test gap</td><td><code>nix develop -c cargo test --workspace --doc</code> → 6 doc-tests total, 5 crates with 0</td><td>rustdoc/examples work needed before docs.rs exposure</td></tr>
+<tr><td>All 8 names unreserved</td><td><code>curl -A '&lt;real UA&gt;' https://crates.io/api/v1/crates/&lt;name&gt;</code> → “does not exist” for all 8</td><td>First publish pending; squatting window open on every name</td></tr>
+<tr><td>Publish metadata gap</td><td><code>grep -L "^description" crates/*/Cargo.toml</code> → all 8 workspace crates; <code>[workspace.package]</code> has only version/edition/license/repository</td><td><code>cargo publish</code> will hard-fail on every crate</td></tr>
+<tr><td>No license files</td><td><code>ls LICENSE*</code> and <code>ls crates/*/LICENSE*</code> → nothing</td><td>Declared <code>MIT OR Apache-2.0</code> has no license texts; legal gap before publish</td></tr>
+<tr><td>No crate readmes</td><td><code>ls crates/sorrel-io/</code>, no <code>readme</code> field in manifests</td><td>crates.io pages would be empty</td></tr>
+<tr><td>No release tags</td><td><code>git tag</code> → empty</td><td>Tag-triggered publish workflows never ran</td></tr>
+<tr><td>CI drift (16 files)</td><td><code>nix develop -c simit init ci --workspace --platform forgejo --check</code> → all 16 <code>ci-*</code>/<code>publish-crate-*</code> differ; suggests <code>--runner atlas</code> regen</td><td>Regeneration needed; README badge accurate</td></tr>
+<tr><td>simit config gap</td><td><code>rg --files -g 'simit.toml'</code> → none</td><td>CI options inferred, not pinned</td></tr>
+<tr><td>Workflows on atlas</td><td><code>grep runs-on .forgejo/workflows/*.yaml</code> → 16× <code>atlas</code>, 1× <code>codeberg-small</code> (pages.yaml)</td><td>Only Pages still on shared runners</td></tr>
+<tr><td>Publish workflow anatomy</td><td><code>.forgejo/workflows/publish-crate-sorrel-io.yaml</code> (143 lines)</td><td>Signed-tag gate, tag==version check, idempotent skip, <code>CRATES_IO_API_TOKEN</code> required, no cross-crate ordering</td></tr>
+<tr><td>Signing key matches trust root</td><td><code>gpg --show-keys keys/maintainers.gpg</code> → <code>0x4623DEA06FDACFE1</code> == <code>git config user.signingkey</code>; <code>tag.gpgSign=true</code></td><td>Locally signed tags will pass <code>git verify-tag</code> in CI</td></tr>
+<tr><td>cargo-deny unenforced</td><td><code>deny.toml</code> at root; <code>rg deny .forgejo/workflows/ nix/</code> → only clippy <code>--deny warnings</code></td><td>Supply-chain gate exists on disk but never runs</td></tr>
+<tr><td>Trunk CI green after retries</td><td>Codeberg API <code>actions/tasks</code>: failures 2026-05-25, success 2026-05-27 for <code>d15ccf3</code></td><td>Runner flakiness, not code failure</td></tr>
+<tr><td>Cache plan landed</td><td><code>crates/sorrel-cache/src/{key,store,gc,tests}.rs</code>, <code>cache hit</code> logs in <code>session.rs:120</code>, <code>quality_ext.rs:67</code>, <code>feature_subspace.rs:83</code>, <code>cache/correlograms.rs:210</code>, bench <code>seed_amplitudes_cache.rs</code>, <code>docs/src/architecture/cache.md</code> in <code>SUMMARY.md</code></td><td>All four phases shipped (commits <code>38a8e58</code>, <code>38832c3</code>, <code>944b50f</code>, <code>d15ccf3</code>)</td></tr>
+<tr><td>rkyv containment</td><td><code>rg -l rkyv crates/sorrel-compute/src crates/sorrel-io/src/{probeinterface,sorting_analyzer,open_ephys}.rs</code> → no matches</td><td>Whole-set constraint honoured</td></tr>
+<tr><td>Invalidation tested</td><td><code>crates/sorrel-cache/src/tests.rs</code> (<code>add_journal_head</code>), <code>session.rs:194,231</code> (<code>invalidate_caches</code>)</td><td>Acceptance criterion met</td></tr>
+<tr><td>README staleness</td><td><code>README.md:39</code> “Undo (V1: stub)” vs <code>crates/sorrel-ui/src/app.rs:293-298</code>; workspace table vs <code>Cargo.toml</code> members</td><td>Docs drift from implementation</td></tr>
+<tr><td>Stray cargo config</td><td><code>diff .cargo/config.toml docs/.cargo/config.toml</code> → identical; untracked</td><td>Accidental artifact; delete</td></tr>
+<tr><td>Stub backends</td><td><code>crates/sorrel-io/src/nwb.rs:27</code>, <code>ks4_rez.rs:25</code></td><td>NWB / KS4 <code>.rez</code> ingest unimplemented</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="existing-plan-status"><a class="header" href="#existing-plan-status">Existing Plan Status</a></h2>
+<p><code>docs/src/planning/rkyv-derived-cache/</code> (4 phases, phase 03 with 3
+sub-layers), audited against the working tree:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Phase</th><th>Claim</th><th>Status</th><th>Proof</th></tr>
+</thead>
+<tbody>
+<tr><td>01 Cache infrastructure</td><td><code>sorrel-cache</code> crate with key/store/GC</td><td>done</td><td><code>crates/sorrel-cache/src/</code>, workspace member in <code>Cargo.toml</code></td></tr>
+<tr><td>02 First consumer</td><td><code>seed_amplitudes</code> cached + bench</td><td>done</td><td><code>session.rs:120</code> cache-hit log; <code>benches/seed_amplitudes_cache.rs</code></td></tr>
+<tr><td>03/01 PC subspaces</td><td>cached</td><td>done</td><td><code>cache/pc_subspace.rs</code>, <code>feature_subspace.rs:83</code></td></tr>
+<tr><td>03/02 Isolation metrics</td><td>cached</td><td>done</td><td><code>cache/isolation.rs</code>, <code>quality_ext.rs:67</code></td></tr>
+<tr><td>03/03 Correlograms</td><td>cached</td><td>done</td><td><code>cache/correlograms.rs:210</code></td></tr>
+<tr><td>04 Invalidation, GC, docs</td><td>replay hook, GC, <code>cache.md</code></td><td>done</td><td><code>session.rs:194,231</code>, <code>sorrel-cache/src/gc.rs</code>, <code>architecture/cache.md</code> linked in <code>SUMMARY.md</code></td></tr>
+<tr><td>Whole-set</td><td>tests pass; rkyv stays out of <code>sorrel-compute</code> and JSON ingest; invalidation unit-tested</td><td>done</td><td>test run + rg evidence above</td></tr>
+</tbody>
+</table>
+</div>
+<p>The plan set is complete and ready for formal <code>plan-and-verify</code> verify
+mode, which on success migrates durable knowledge into stable docs and
+retires the planning files.</p>
+<h2 id="work-that-should-survive"><a class="header" href="#work-that-should-survive">Work That Should Survive</a></h2>
+<ul>
+<li><code>RELEASE.md</code> first-publish order (<code>sorrel-io</code> → <code>sorrel-cache</code> →
+<code>sorrel-compute</code> → <code>sorrel-gpu</code> → <code>sorrel-data</code> → <code>sorrel-render</code> →
+<code>sorrel-ui</code> → <code>sorrel</code>) and the name-reservation check
+(<code>cargo search &lt;crate&gt; --limit 1</code>).</li>
+<li>The derived-cache architecture doc (<code>docs/src/architecture/cache.md</code>)
+— already in stable docs; planning prose can retire.</li>
+<li>Global constraint from the plan set that remains binding for future
+work: rkyv stays out of <code>sorrel-compute</code> and the JSON ingest /
+<code>rmp-serde</code> journal codecs.</li>
+<li>The publish-workflow trust model (signed tag verified against
+<code>keys/maintainers.gpg</code>, tag==version gate, idempotent re-runs) — any
+CI regeneration must preserve it; confirm after running simit.</li>
+</ul>
+<h2 id="blockers-and-missing-artifacts"><a class="header" href="#blockers-and-missing-artifacts">Blockers And Missing Artifacts</a></h2>
+<ul>
+<li><strong>Crate descriptions (publish blocker).</strong> All 8 workspace
+<code>Cargo.toml</code> files lack <code>description</code>; <code>cargo publish</code> refuses such
+crates. Producer: this repo. Fix: add <code>description</code> (and ideally
+<code>keywords</code>, <code>categories</code>) per crate or via <code>[workspace.package]</code>
+inheritance. Validation: <code>nix develop -c cargo publish --dry-run -p sorrel-io</code> reaches packaging instead of metadata error.</li>
+<li><strong>License texts (publish-quality blocker).</strong> <code>license = "MIT OR Apache-2.0"</code> is declared but no <code>LICENSE-MIT</code> / <code>LICENSE-APACHE</code>
+files exist anywhere, and no crate ships a readme. Not a hard
+<code>cargo publish</code> error, but a legal/compliance gap for a public
+release. Producer: this repo (the <code>rust-crate-legal-readme</code> skill
+owns this domain). Fix: add dual license texts at the root, point
+each crate at them (<code>license-file</code> is not needed when texts are
+included via <code>include</code>/symlink convention), and add per-crate
+<code>readme</code>. Validation: <code>cargo package -p sorrel-io --list</code> shows the
+license files in the bundle.</li>
+<li><strong>CI drift (release-trust blocker).</strong> All 16 generated workflows,
+including every tag-triggered <code>publish-crate-*.yaml</code>, differ from
+simit 0.16.1 output; publishing through drifted generated workflows
+invites surprises. Producer: simit 0.16.1. Fix: <code>nix develop -c simit init ci --platform forgejo --runner atlas --workspace</code> (the
+exact command simit’s check output suggests), review diff, commit —
+the <code>simit-dependent-fixes</code> skill owns this domain. Validation:
+the <code>--check</code> form reports no differences and the regenerated badge
+block stops saying <code>drift</code>.</li>
+<li><strong><code>CRATES_IO_API_TOKEN</code> secret unverified.</strong> The publish workflows
+hard-fail without it, and repo secrets cannot be read from this
+environment. Producer: the user, in Codeberg repo settings
+(Settings → Actions → Secrets). Validation: a <code>workflow_dispatch</code>
+run of one publish workflow reaches the dry-run step, or the first
+real tag publish succeeds for <code>sorrel-io</code>.</li>
+<li>No other foundational inputs are missing; nothing here blocks the
+research itself.</li>
+</ul>
+<h2 id="risks-and-constraints"><a class="header" href="#risks-and-constraints">Risks And Constraints</a></h2>
+<ul>
+<li><strong>Publish sequencing vs tag fan-out:</strong> one <code>0.1.0</code> tag fires all 8
+publish workflows concurrently, but downstream crates fail dry-run
+until upstream crates are live (documented in <code>RELEASE.md</code>). The
+8-crate order is a hard constraint that CI does not encode. The
+idempotent already-published skip makes the safe procedure: let the
+fan-out run, then re-run failed workflows in dependency order (or
+pre-publish <code>sorrel-io</code> → … manually before tagging).</li>
+<li><strong>Signed-tag gate:</strong> the release tag must be an exact bare semver
+(<code>0.1.0</code>, no <code>v</code> prefix), must equal the Cargo version, and must be
+GPG-signed by the single key pinned in <code>keys/maintainers.gpg</code>.
+Local git config currently satisfies this; a tag pushed from any
+other machine/key will fail every publish workflow.</li>
+<li><strong>Crate-name squatting:</strong> all 8 names verified unreserved on
+2026-06-10; they stay exposed while publish is delayed. <code>RELEASE.md</code>
+mandates stopping on a taken name rather than auto-renaming.</li>
+<li><strong>Runner flakiness now scoped to Pages:</strong> 16 of 17 workflows already
+run on self-hosted <code>atlas</code>; only <code>pages.yaml</code> runs
+<code>install-nix-action</code> on <code>codeberg-small</code>. Moving it to
+<code>atlas-nix-trusted</code> is possible but subject to Codeberg ToU
+constraints (see <code>atlas-runner</code> skill). The May retry storm predates
+the current runner assignment evidence; treat historical flakiness
+attribution as uncertain.</li>
+<li><strong>Generated-file discipline:</strong> manual edits to <code>.forgejo/workflows/</code>
+will re-introduce drift; there is currently no <code>simit.toml</code> at all,
+so every check infers options — pinning <code>[ci]</code> options (platform,
+runner) in <code>simit.toml</code> would make <code>--check</code> deterministic.</li>
+<li><strong>Supply-chain gate unenforced:</strong> <code>deny.toml</code> exists but cargo-deny
+runs nowhere (not CI, not flake checks, not pre-commit). Advisory
+drift accumulates silently until wired in.</li>
+<li><strong>Docs publish planning prose:</strong> the mdBook publishes the completed
+plan set (and now this dossier via the uncommitted <code>SUMMARY.md</code>
+entry); retiring/curating it is a navigation/content change to the
+public site, not just a repo cleanup.</li>
+</ul>
+<h2 id="candidate-next-steps"><a class="header" href="#candidate-next-steps">Candidate Next Steps</a></h2>
+<ol>
+<li><strong>Unblock first publish (metadata + legal)</strong> — add
+<code>description</code>/<code>keywords</code>/<code>categories</code> to all 8 crates, add
+<code>LICENSE-MIT</code>/<code>LICENSE-APACHE</code> texts and per-crate <code>readme</code>
+wiring; commit. No dependencies; parallel-safe with (2).</li>
+<li><strong>Clear CI drift</strong> — regenerate with <code>simit init ci --platform forgejo --runner atlas --workspace</code>, add a <code>simit.toml</code> pinning the
+<code>[ci]</code> options, re-run the badge update, and commit together with
+the pending README badge block. Should land <strong>before</strong> tagging
+<code>0.1.0</code> so publish workflows run from generated state. Verify the
+signed-tag/idempotency logic survives regeneration. Parallel-safe
+with (1).</li>
+<li><strong>Execute first publish</strong> — confirm <code>CRATES_IO_API_TOKEN</code> is set in
+Codeberg secrets; per <code>RELEASE.md</code> order: name checks,
+<code>cargo package -p &lt;crate&gt;</code> for each, <code>simit changelog release</code>,
+create the signed <code>0.1.0</code> tag, push it, then re-run failed
+downstream publish workflows in dependency order (idempotent skip
+makes this safe). Depends on (1) and (2).</li>
+<li><strong>Verify + retire the rkyv-derived-cache plan set</strong> — run
+<code>plan-and-verify</code> verify mode; on success retire
+<code>docs/src/planning/rkyv-derived-cache/</code> from <code>SUMMARY.md</code>
+(<code>retire-docs-planning</code> flow). Independent of (1)–(3).</li>
+<li><strong>Refresh README.md</strong> — fix the workspace table (add <code>sorrel-cache</code>,
+<code>sorrel-gpu</code>), correct the undo row, add redo/save keys. Independent;
+trivial. Also delete the stray untracked <code>docs/.cargo/config.toml</code>.</li>
+<li><strong>Wire cargo-deny into CI or flake checks</strong> — <code>deny.toml</code> already
+exists; add a job/check so it actually gates. Small; independent.</li>
+<li><strong>Feature work: real NWB and KS4 <code>.rez</code> backends</strong> — currently
+stubs; the <code>DataProvider</code> trait boundary is the integration point.
+Larger design work; would warrant its own plan set.</li>
+<li><strong>Optional:</strong> move <code>pages.yaml</code> to <code>atlas-nix-trusted</code>; grow
+rustdoc examples/doc-tests (6 today, 5 crates at zero) before
+docs.rs exposure.</li>
+</ol>
+<h2 id="open-decisions-for-the-user"><a class="header" href="#open-decisions-for-the-user">Open Decisions For The User</a></h2>
+<ul>
+<li><strong>Publish now or later?</strong> Metadata and drift fixes are mechanical,
+but pushing the <code>0.1.0</code> tag publishes 8 crate names to crates.io —
+an outward-facing, irreversible step that should be an explicit call.
+The <code>CRATES_IO_API_TOKEN</code> secret must also be provisioned by the
+user before any tag push.</li>
+<li><strong>Where should the Pages job run</strong> — stay on <code>codeberg-small</code> (flaky
+but zero-config) or move to <code>atlas-nix-trusted</code> (faster, ToU
+considerations)? CI proper is already on atlas.</li>
+<li><strong>NWB / KS4 <code>.rez</code> priority</strong> — is backend expansion the next major
+feature, or does curation UX take precedence? This determines whether
+step (7) gets a plan set now.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="sorrel-scientific-correctness-research-dossier"><a class="header" href="#sorrel-scientific-correctness-research-dossier">Sorrel Scientific Correctness Research Dossier</a></h1>
+<blockquote>
+<p>Evidence gathered 2026-06-10 at commit <code>d15ccf3</code> (trunk). Scope: the
+electrophysiology / spike-sorting compute kernels and quality metrics
+in <code>sorrel-compute</code> and the <code>sorrel-data</code> metric consumers. Every
+algorithm below was read in full and checked against its canonical
+reference; several were brute-forced against oracle implementations.</p>
+<p><strong>Update (same day, post-audit):</strong> the confirmed bugs, the numerical
+concerns, and most fidelity items below have been fixed in the working
+tree — Hill contamination <code>N²</code> (with a golden regression test), the
+cutoff↔completeness contract, GMM logsumexp, the presence-bin
+off-by-one, the bimodality-coefficient moment inconsistency,
+<code>filter.rs</code>/<code>drift.rs</code> scope doc-hardening, the CCG even-bins
+enforcement (#6), NN-isolation in/out balancing (#7, with a
+background-stability golden test), and removal of the misleading dead
+<code>dip_statistic</code> alias (#9). See the per-finding <strong>[FIXED]</strong> markers.</p>
+<p><strong>Update 2 (net-new algorithms now implemented):</strong> the stretch metric
+suite has been added and wired in — the real <strong>Hartigan &amp; Hartigan
+(1985) dip</strong> (faithful port of Maechler’s <code>diptest</code> C reference,
+<code>distribution::hartigan_dip</code>, now feeding the split suggester and its
+UI column), the <strong>Llobet et al. (2022) sliding-refractory minimum
+contamination</strong> (<code>metrics::min_contamination_sliding_refractory</code>),
+<strong>LDA d-prime</strong> and <strong>simplified silhouette</strong> (added to
+<code>IsolationMetrics</code>, the rkyv cache bumped to <code>ALGO_VERSION = 2</code>, and the
+QC TSV/JSON export), and <strong>template SNR</strong> (<code>snippets::template_snr</code>).
+Each ships with property/golden tests. Workspace green
+(clippy <code>--deny warnings</code>, 461 tests). The only intentionally-skipped
+item is renaming <code>sliding_refractory_contamination</code> (the windowed-Hill
+UI plot), which already documents itself honestly.</p>
+</blockquote>
+<h2 id="goal-and-trigger-1"><a class="header" href="#goal-and-trigger-1">Goal And Trigger</a></h2>
+<p>The user asked to “improve the scientific aspect of the project” with
+research-first discipline. Sorrel is a manual-curation GUI for
+spike-sorted electrophysiology; its scientific value rests on the
+correctness of its quality metrics (contamination, isolation, presence,
+amplitude cutoff, drift) and its DSP/statistics kernels (filtering, CMR,
+LTTB, correlograms, GMM, covariance/Mahalanobis). This dossier records
+an evidence-backed audit of those kernels so a follow-up session can fix
+the confirmed defects and close the validation gap without re-deriving
+the formulas.</p>
+<h2 id="current-reality-1"><a class="header" href="#current-reality-1">Current Reality</a></h2>
+<p>The numerical <em>infrastructure</em> is unusually solid — covariance uses a
+two-pass Bessel-corrected estimator, Mahalanobis distance is correct,
+LTTB matches Steinarsson 2013 bucket-for-bucket, the median is correct
+under brute-force testing, snippet templates accumulate in <code>f64</code>, and
+the χ² survival function is a faithful Numerical-Recipes incomplete-gamma
+implementation. The defects are concentrated in a few <strong>metric formulas</strong>
+and one <strong>cross-cutting validation gap</strong>:</p>
+<ul>
+<li>
+<p><strong>The headline quality metric is wrong.</strong> <code>refractory_contamination</code>
+(<code>crates/sorrel-compute/src/metrics.rs:149-171</code>) implements the Hill
+et al. (2011) estimator with the denominator <code>n · 2 · t_ref / T</code> —
+<strong>missing a factor of N</strong>. Hill’s false-positive fraction is
+<code>f_p ≈ N_viol · T / (2 · t_ref · N²)</code>. The code returns a value ~N×
+too large (for N in the thousands it routinely exceeds 1.0), and the
+consumer <code>quality.rs:111</code> computes
+<code>contamination_score = (1 - raw_contamination).clamp(0,1)</code>, so the
+contamination dimension <strong>saturates to 0 for essentially every real
+cluster</strong>. This is the single most consequential scientific defect.</p>
+</li>
+<li>
+<p><strong>No test pins any metric’s numeric value.</strong> There is no
+golden-value or phy/SpikeInterface-parity test for <em>any</em> metric
+magnitude. <code>crates/sorrel-data/tests/synthetic_ground_truth.rs</code>
+checks only the <em>directional</em> behaviour of the merge/split suggesters
+(<code>merges not empty</code>, <code>dip_z &gt; 2.0</code>, <code>score &gt; 0.5</code>); the in-crate unit
+tests assert sanity bounds like <code>c &gt; 0.0</code> (<code>metrics.rs:354-361</code>).
+Nothing would have caught the Hill scale error, and nothing guards
+the other metrics against future regressions.</p>
+</li>
+<li>
+<p><strong>A consumer contract is internally inconsistent.</strong>
+<code>quality.rs:119</code> computes <code>completeness_score = 1 - raw_cutoff*2</code>,
+assuming <code>amplitude_cutoff</code> maxes at 0.5 — but
+<code>distribution.rs:204-280</code> permits its return to climb toward 1.0
+(only a saturating clamp, no 0.5 cap like the Allen routine). When
+cutoff &gt; 0.5, completeness goes negative and clamps to 0.</p>
+</li>
+<li>
+<p><strong>Several functions are named/documented for an algorithm they do not
+implement.</strong> <code>dip_statistic</code> returns the bimodality coefficient, not
+Hartigan’s dip (<code>distribution.rs:301</code>, self-disclosed);
+<code>sliding_refractory_contamination</code> is windowed-Hill, not the Llobet
+et al. (2022) minimum-contamination sliding estimator its name evokes
+(<code>drift.rs:102</code>); <code>amplitude_cutoff</code>’s doc claims equivalence to
+“Hill 2011 §3.2” but it is a coarse mirror-tail approximation
+(<code>distribution.rs:205</code>); the <code>drift.rs</code> metrics are amplitude-QC
+heuristics, not Kilosort2.5/dredge spatial-motion estimation.</p>
+</li>
+<li>
+<p><strong>No PCA exists in-tree.</strong> PC features are precomputed upstream
+(Kilosort) and only <em>extracted</em> in <code>feature_subspace.rs</code>; there is no
+eigendecomposition/SVD/whitening anywhere. Any roadmap item assuming
+sorrel computes its own feature subspace is mistaken.</p>
+</li>
+</ul>
+<h2 id="evidence-inventory-1"><a class="header" href="#evidence-inventory-1">Evidence Inventory</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Evidence</th><th>File:line / command</th><th>What it proves</th></tr>
+</thead>
+<tbody>
+<tr><td>Hill contamination missing N²</td><td><code>metrics.rs:166</code> <code>denom = n * 2.0 * rp_s / total_s</code></td><td>Returns <code>N_viol·T/(2·t_ref·N)</code>, ~N× the Hill fraction <code>N_viol·T/(2·t_ref·N²)</code></td></tr>
+<tr><td>Contamination dimension dead</td><td><code>quality.rs:111</code> <code>(1.0 - raw_contamination).clamp(0,1)</code></td><td>Inflated raw value saturates score to 0 for real clusters</td></tr>
+<tr><td>Cutoff↔completeness contract mismatch</td><td><code>quality.rs:119</code> <code>1.0 - raw_cutoff*2.0</code> vs <code>distribution.rs:279</code> clamp to 1.0</td><td><code>completeness_score</code> can be driven negative then clamped to 0</td></tr>
+<tr><td>No numeric metric tests</td><td><code>rg 'refractory_contamination|isolation_distance|l_ratio|amplitude_cutoff' crates/**/tests</code> → none assert values</td><td>No golden/parity coverage; scale bugs invisible</td></tr>
+<tr><td>Suggester tests are directional only</td><td><code>synthetic_ground_truth.rs:177-252</code> (<code>!merges.is_empty()</code>, <code>dip_z &gt; 2.0</code>)</td><td>Validates pipeline direction, not metric magnitude</td></tr>
+<tr><td>Unit tests assert sanity only</td><td><code>metrics.rs:354-361</code> (<code>assert!(c &gt; 0.0)</code>)</td><td>Would not catch an N× scale error</td></tr>
+<tr><td>presence last-bin off-by-one</td><td><code>metrics.rs:188-191</code> (<code>idx &lt; n_bins</code> drops <code>idx==n_bins</code>); same <code>drift.rs:81-85</code></td><td>Boundary spike at <code>t==total</code> silently dropped; biases ratio low</td></tr>
+<tr><td>GMM E-step no logsumexp</td><td><code>gmm.rs:96-104</code> linear-domain <code>pa+pb</code>; <code>resp=0.5</code> on <code>total==0.0</code></td><td>Far-outlier underflow fabricates a 0.5 posterior, biasing M-step</td></tr>
+<tr><td>BC mixes corrected/uncorrected moments</td><td><code>distribution.rs:116-130</code> corrected <code>3(n-1)²/((n-2)(n-3))</code> with uncorrected <code>g1</code>,<code>g2</code> (lines 65,73)</td><td>Sarle BC internally inconsistent for small n</td></tr>
+<tr><td>CCG even-bin assumption</td><td><code>ccg_analysis.rs:54</code> <code>half = bins/2</code> vs <code>correlograms.rs:277</code> <code>ceil(2*window/bin)</code></td><td>Bin count even only if <code>2*window % bin == 0</code>; else zero-lag center off by half a bin</td></tr>
+<tr><td>CCG right-edge asymmetry</td><td><code>metrics.rs:46-49</code> <code>dt==+max_lag → idx=bins</code> clamped to <code>bins-1</code></td><td>Extreme positive lag folded into last bin; one-bin asymmetry vs <code>-max_lag</code></td></tr>
+<tr><td><code>dip_statistic</code> ≠ Hartigan dip</td><td><code>distribution.rs:301-310</code> returns <code>bimodality_coefficient</code></td><td>Name/scale mismatch (Hartigan dip ∈ ~[0,0.25]; BC ∈ [0,1])</td></tr>
+<tr><td><code>sliding_refractory</code> ≠ Llobet</td><td><code>drift.rs:102-143</code> re-applies (buggy) Hill per window</td><td>Not the Llobet 2022 min-contamination estimator</td></tr>
+<tr><td>NN isolation unbalanced</td><td><code>metrics_iso.rs:194-258</code> strides only in-cluster queries, never subsamples background</td><td>Deviates from balanced Chung 2017 / SpikeInterface nn_hit_rate</td></tr>
+<tr><td>Causal display filter</td><td><code>filter.rs:79-99</code> single forward-pass DF2T biquad; only caller <code>sorrel-render/src/buffers.rs:209-226</code></td><td>Group delay OK for display; must never feed spike-time measurement</td></tr>
+<tr><td>No PCA in-tree</td><td><code>rg 'eigen|jacobi|svd|whiten|principal_component' crates/</code> → none; <code>feature_subspace.rs:153,175</code> extracts precomputed <code>feats[pc*n_chans+ch]</code></td><td>PCs come from upstream sorter</td></tr>
+<tr><td>Covariance correct</td><td><code>linalg.rs:65-91</code> <code>1/(n-1)</code>, two-pass, symmetrized</td><td>Confirmed-correct sample covariance</td></tr>
+<tr><td>Mahalanobis correct</td><td><code>linalg.rs:170-186</code> <code>(x-μ)ᵀΣ⁻¹(x-μ)</code>, <code>.max(0.0)</code> guard</td><td>Confirmed correct</td></tr>
+<tr><td>LTTB correct</td><td><code>lttb.rs:39-70</code> brute-forced vs Steinarsson 2013 oracle, all <code>(n,threshold)&lt;2000</code></td><td>Bucket boundaries + triangle area exact; no underflow/div-by-zero</td></tr>
+<tr><td>Median correct</td><td><code>cmr.rs:38-53</code> brute-forced 200k random arrays vs sort oracle</td><td><code>select_nth_unstable</code> tie-handling exact for even n</td></tr>
+<tr><td>L-ratio correct</td><td><code>metrics_iso.rs:179-181</code> <code>Σ χ²-sf(D²,df=d) / N_in</code></td><td>Matches Schmitzer-Torbert 2005 (initially suspected, confirmed correct)</td></tr>
+<tr><td>Isolation distance correct</td><td><code>metrics_iso.rs:173-178</code> N-th nearest non-cluster Mahalanobis², guarded <code>n_out≥n_in</code></td><td>Matches Schmitzer-Torbert 2005</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="findings-by-severity"><a class="header" href="#findings-by-severity">Findings By Severity</a></h2>
+<h3 id="confirmed-bugs"><a class="header" href="#confirmed-bugs">Confirmed bugs</a></h3>
+<ol>
+<li><strong>[FIXED] Hill contamination missing N² (<code>metrics.rs</code>).</strong> Now
+<code>f_p = viol * total_s / (2.0 * rp_s * n * n)</code> accumulated in <code>f64</code>,
+clamped to <code>[0, 1]</code> (the <code>f_p &gt; 0.5</code> “no real root” case saturates to
+1.0). Doc rewritten to state the estimator and the <code>N²</code> rationale.
+Guarded by the new golden test
+<code>refractory_contamination_recovers_known_fraction</code>, which injects a
+known violation count and asserts the recovered fraction matches the
+analytic Hill value — it fails under the old <code>÷N</code> formula.
+<strong>Was highest priority</strong> — the only finding that corrupted a shipped
+composite dimension.</li>
+<li><strong>[FIXED] <code>completeness_score</code> contract.</strong> <code>amplitude_cutoff</code> now
+clamps to <code>[0, 0.5]</code> (Allen convention: a hard low-amplitude cutoff
+masks at most half the distribution), so the consumer’s
+<code>1 - cutoff*2</code> rescale in <code>quality.rs</code> is valid and bounded. Both
+docs note the shared 0.5 ceiling.</li>
+</ol>
+<h3 id="numerical-concerns"><a class="header" href="#numerical-concerns">Numerical concerns</a></h3>
+<ol start="3">
+<li><strong>[FIXED] GMM E-step lacks logsumexp (<code>gmm.rs</code>).</strong> E-step and final
+log-likelihood now run in the log domain via <code>log_normal</code>:
+responsibility is <code>1/(1+exp(lb−la))</code> and the per-point LL is the
+logsumexp of the two log-weighted densities — no more fabricated
+<code>resp=0.5</code> on underflow.</li>
+<li><strong>[FIXED] Presence-bin off-by-one (<code>metrics.rs</code>).</strong> <code>presence_ratio</code>
+now clamps the bin index to <code>n_bins-1</code> so a spike at the recording
+end is counted, not dropped. (<code>drift.rs::presence_cv</code> uses the same
+pattern but its <code>idx &lt; n_bins</code> guard is harmless for a CV of counts;
+left as-is.)</li>
+<li><strong>[FIXED] Bimodality coefficient mixes corrected/uncorrected moments
+(<code>distribution.rs</code>).</strong> Now converts the uncorrected <code>g1</code>/<code>g2</code> to the
+bias-corrected <code>G1</code>/<code>G2</code> that the SAS small-sample correction term
+assumes, so the conventions are consistent for small clusters.</li>
+<li><strong>[FIXED] CCG even-bins convention.</strong> The one path feeding
+<code>analyse_refractory_dip</code> (<code>suggest.rs</code>) now rounds <code>ccg_bins</code> up to
+even via <code>(n + 1) &amp; !1</code>, so zero lag always lands on the
+<code>half-1</code>/<code>half</code> boundary and the refractory window <code>[half-r, half+r)</code>
+stays symmetric; <code>analyse_refractory_dip</code> gained a <code>debug_assert</code> on
+even bins to catch any future caller. (The extreme-lag right-edge
+clamp in <code>cross_correlogram</code> affects only pairs at <em>exactly</em>
+<code>±max_lag</code> samples — far from the central dip — and was left as-is to
+avoid churning a well-tested path for a negligible-impact edge case.)</li>
+</ol>
+<h3 id="fidelity--documentation-mismatches"><a class="header" href="#fidelity--documentation-mismatches">Fidelity / documentation mismatches</a></h3>
+<ol start="7">
+<li><strong>[FIXED] NN isolation unbalanced (<code>metrics_iso.rs</code>).</strong> Now builds a
+balanced neighbour pool — every in-cluster spike plus a
+deterministically strided background subsample sized to <code>~n_in</code> —
+before counting k-NN hits, matching SpikeInterface’s balanced
+<code>nn_hit_rate</code>. Guarded by <code>nn_isolation_is_stable_under_background_growth</code>,
+which asserts the score barely moves when the background grows 10×.</li>
+<li><strong>[ADDRESSED] Llobet sliding-refractory minimum now implemented.</strong> The
+genuine Llobet et al. (2022) minimum-contamination-over-<code>t_ref</code>
+estimator is added as <code>metrics::min_contamination_sliding_refractory</code>
+(sweeps candidate refractory periods, returns the smallest Hill
+fraction). The original <code>sliding_refractory_contamination</code> (a
+<em>time-window</em> sweep for the UI plot) is retained and unchanged — it
+honestly documents itself as windowed-Hill; only a possible rename
+remains a user decision.</li>
+<li><strong>[ADDRESSED] Real Hartigan dip now implemented.</strong> The misleading dead
+<code>dip_statistic</code> alias was removed, and a faithful port of Hartigan &amp;
+Hartigan (1985) — Maechler’s <code>diptest</code> C reference — was added as
+<code>distribution::hartigan_dip</code> (<code>[0, 0.25]</code>, 0 for unimodal). It now
+corroborates the bimodality coefficient in the split suggester
+(<code>amp_dip</code> field, blended via <code>max</code>) and shows in the UI split table.</li>
+<li><strong><code>amplitude_cutoff</code> doc overclaims Hill-2011 equivalence
+(<code>distribution.rs:205</code>).</strong> Soften the doc and/or implement the
+Allen/Hill reflected-Gaussian-tail estimator with the 0.5 cap.</li>
+<li><strong>[FIXED] <code>filter.rs</code> causal display filter — doc hardening.</strong> Module
+doc now states the single-pass biquad has frequency-dependent group
+delay and must never feed a spike-time/latency/alignment path (those
+need zero-phase filtfilt).</li>
+<li><strong>[FIXED] <code>drift.rs</code> scope.</strong> Module doc now states these are
+per-cluster amplitude-QC indicators, not a Kilosort/dredge spatial
+motion estimate.</li>
+</ol>
+<h3 id="confirmed-correct-do-not-fix"><a class="header" href="#confirmed-correct-do-not-fix">Confirmed correct (do not “fix”)</a></h3>
+<p>Covariance (N−1, two-pass, symmetrized), Mahalanobis, χ² survival via
+incomplete gamma, LTTB, median tie-handling, snippet <code>f64</code> template
+accumulation, ACG zero-lag self-exclusion, L-ratio normalization (÷N_in,
+df=d), and isolation-distance N-th-neighbor selection were all verified
+against their canonical definitions (several by brute force). The
+prior dossier’s claim that PCA/eigensolvers exist is wrong — none do.</p>
+<h2 id="work-that-should-survive-1"><a class="header" href="#work-that-should-survive-1">Work That Should Survive</a></h2>
+<ul>
+<li>The Hill-contamination correction and its <code>f64</code> <code>N²</code> requirement —
+this is the load-bearing fix.</li>
+<li>The binding constraint that <code>filter.rs</code> is <strong>display-only</strong>: any future
+spike-time/latency feature must add a separate zero-phase filtfilt path.</li>
+<li>The fact that PC features are <strong>upstream-provided</strong>, not computed here —
+governs any feature-space metric work.</li>
+<li>The metric→score consumer contracts in <code>quality.rs</code> (each <code>*_score</code> is
+a <code>(1 - raw).clamp(0,1)</code>-style transform of a raw metric); these must
+stay in agreement with each raw metric’s documented range.</li>
+</ul>
+<h2 id="blockers-and-missing-artifacts-1"><a class="header" href="#blockers-and-missing-artifacts-1">Blockers And Missing Artifacts</a></h2>
+<ul>
+<li><strong>No reference oracle for metric values (validation blocker).</strong> To
+prove a metric is correct (not just self-consistent), a golden dataset
+with known contamination/isolation is needed. Producer: this repo —
+extend <code>synthetic_ground_truth.rs</code> with clusters of <em>known</em> injected
+contamination fraction and assert the recovered <code>f_p</code> matches within
+tolerance; and/or port a handful of SpikeInterface/phy metric outputs
+on a small fixture as parity golden values (mirroring how
+<code>phy_parity.rs</code> already pins curation semantics). Validation: those
+tests fail on the current Hill formula and pass after the N² fix.</li>
+<li>No other foundational inputs are missing; all source is present and
+builds/tests green in the Nix dev shell.</li>
+</ul>
+<h2 id="risks-and-constraints-1"><a class="header" href="#risks-and-constraints-1">Risks And Constraints</a></h2>
+<ul>
+<li><strong>Fixing the Hill formula changes user-visible scores.</strong> Clusters that
+currently show <code>contamination_score = 0</code> will move to meaningful
+values; any saved thresholds, screenshots, or user expectations
+calibrated against the broken metric will shift. This is a
+behaviour-changing correctness fix, not a silent refactor — note it in
+<code>CHANGELOG.md</code> and ideally bump a metrics version if one is exposed.</li>
+<li><strong>Metric changes ripple into the merge/split suggesters.</strong> The CCG
+binning and contamination fixes feed <code>analyse_refractory_dip</code> and the
+suggesters; re-run <code>synthetic_ground_truth.rs</code> and confirm the
+directional assertions still hold after each change.</li>
+<li><strong><code>f32</code> vs <code>f64</code> discipline.</strong> The <code>N²</code> term and any long count
+accumulations must be <code>f64</code>; several metrics currently take
+<code>len() as f32</code> early (<code>metrics.rs:158</code>).</li>
+<li><strong>Ordering:</strong> land the validation harness (or at least the
+known-contamination golden test) <em>alongside or before</em> the Hill fix so
+the fix is proven, not just plausible.</li>
+<li><strong>Pre-publish timing.</strong> These are scientific-correctness fixes; landing
+them before the first crates.io publish (see the companion
+<code>sorrel-improvement-research.md</code> dossier) avoids shipping a 0.1.0 with a
+known-wrong contamination metric.</li>
+</ul>
+<h2 id="candidate-next-steps-1"><a class="header" href="#candidate-next-steps-1">Candidate Next Steps</a></h2>
+<ol>
+<li><strong>[DONE] Fix Hill contamination + add a known-contamination golden
+test</strong> — fixed in <code>metrics.rs</code> with the golden test
+<code>refractory_contamination_recovers_known_fraction</code> (placed in the
+crate unit tests rather than <code>synthetic_ground_truth.rs</code>, so it runs
+without a <code>Session</code> fixture).</li>
+<li><strong>[DONE] Reconcile the cutoff↔completeness contract</strong> — <code>amplitude_cutoff</code>
+capped at 0.5 in <code>distribution.rs</code>.</li>
+<li><strong>[DONE] Add logsumexp to the GMM E-step</strong> — <code>gmm.rs</code>.</li>
+<li><strong>[DONE] Fix presence-bin off-by-one and the BC moment inconsistency</strong>
+— <code>metrics.rs</code> presence clamp, <code>distribution.rs</code> bias-corrected G1/G2.</li>
+<li><strong>[DONE] Settle the CCG binning convention</strong> — <code>suggest.rs</code> rounds
+<code>ccg_bins</code> up to even; <code>analyse_refractory_dip</code> asserts even bins.
+Suggester tests re-run green.</li>
+<li><strong>[DONE] Remove the misleading <code>dip_statistic</code> alias</strong> (dead code).
+The <code>amplitude_cutoff</code> doc was also corrected (0.5 cap) under step 2.
+<code>sliding_refractory_contamination</code> left as-is (honest Hill doc).</li>
+<li><strong>[DONE] Balance NN isolation sampling</strong> (<code>metrics_iso.rs</code>) — in/out
+balanced pool, with the <code>nn_isolation_is_stable_under_background_growth</code>
+golden test.</li>
+<li><strong>[DONE] Harden <code>filter.rs</code> / <code>drift.rs</code> rustdoc</strong> to scope them
+(display-only; QC-only).</li>
+<li><strong>[DONE] Fill the missing standard metrics</strong> — the real Hartigan dip
+(<code>hartigan_dip</code>), Llobet sliding-refractory minimum
+(<code>min_contamination_sliding_refractory</code>), LDA d-prime and simplified
+silhouette (on <code>IsolationMetrics</code>, cache <code>ALGO_VERSION = 2</code>, QC
+export), and template SNR (<code>template_snr</code>). The dip feeds the split
+suggester and its UI column. All ship with tests.</li>
+</ol>
+<h2 id="open-decisions-for-the-user-1"><a class="header" href="#open-decisions-for-the-user-1">Open Decisions For The User</a></h2>
+<ul>
+<li><strong>Rename <code>sliding_refractory_contamination</code>?</strong> It is the windowed-Hill
+UI plot (honestly documented), distinct from the new
+<code>min_contamination_sliding_refractory</code> (Llobet). The name is still
+slightly suggestive of Llobet; rename for clarity, or leave it since the
+UI relies on it and the doc is honest?</li>
+<li><strong>Wire d-prime / silhouette into the composite quality score and UI?</strong>
+They are computed, cached, and exported, and already contribute to
+<code>IsolationMetrics::score()</code>. A dedicated UI display (beyond the QC
+export) is optional polish.</li>
+<li><strong>How far to chase phy/SpikeInterface numeric parity?</strong> The metrics are
+algorithmically faithful and property-tested; pinning exact values
+against SpikeInterface fixtures is a larger, optional effort. Where is
+the line for 0.1.0?</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+        <script>
+        window.addEventListener('load', function() {
+            window.setTimeout(window.print, 100);
+        });
+        </script>
+
+
+    </div>
+    </body>
+</html>

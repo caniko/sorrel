@@ -1,0 +1,540 @@
+<!DOCTYPE HTML>
+<html lang="en" class="coal sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Sorrel scientific correctness research - Sorrel Documentation</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-ae938929.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "coal";
+            const default_dark_theme = "coal";
+            window.path_to_searchindex_js = "../searchindex-d79bb5a1.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-39bd1a1f.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('coal')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Sorrel Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://codeberg.org/caniko/sorrel" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="sorrel-scientific-correctness-research-dossier"><a class="header" href="#sorrel-scientific-correctness-research-dossier">Sorrel Scientific Correctness Research Dossier</a></h1>
+<blockquote>
+<p>Evidence gathered 2026-06-10 at commit <code>d15ccf3</code> (trunk). Scope: the
+electrophysiology / spike-sorting compute kernels and quality metrics
+in <code>sorrel-compute</code> and the <code>sorrel-data</code> metric consumers. Every
+algorithm below was read in full and checked against its canonical
+reference; several were brute-forced against oracle implementations.</p>
+<p><strong>Update (same day, post-audit):</strong> the confirmed bugs, the numerical
+concerns, and most fidelity items below have been fixed in the working
+tree — Hill contamination <code>N²</code> (with a golden regression test), the
+cutoff↔completeness contract, GMM logsumexp, the presence-bin
+off-by-one, the bimodality-coefficient moment inconsistency,
+<code>filter.rs</code>/<code>drift.rs</code> scope doc-hardening, the CCG even-bins
+enforcement (#6), NN-isolation in/out balancing (#7, with a
+background-stability golden test), and removal of the misleading dead
+<code>dip_statistic</code> alias (#9). See the per-finding <strong>[FIXED]</strong> markers.</p>
+<p><strong>Update 2 (net-new algorithms now implemented):</strong> the stretch metric
+suite has been added and wired in — the real <strong>Hartigan &amp; Hartigan
+(1985) dip</strong> (faithful port of Maechler’s <code>diptest</code> C reference,
+<code>distribution::hartigan_dip</code>, now feeding the split suggester and its
+UI column), the <strong>Llobet et al. (2022) sliding-refractory minimum
+contamination</strong> (<code>metrics::min_contamination_sliding_refractory</code>),
+<strong>LDA d-prime</strong> and <strong>simplified silhouette</strong> (added to
+<code>IsolationMetrics</code>, the rkyv cache bumped to <code>ALGO_VERSION = 2</code>, and the
+QC TSV/JSON export), and <strong>template SNR</strong> (<code>snippets::template_snr</code>).
+Each ships with property/golden tests. Workspace green
+(clippy <code>--deny warnings</code>, 461 tests). The only intentionally-skipped
+item is renaming <code>sliding_refractory_contamination</code> (the windowed-Hill
+UI plot), which already documents itself honestly.</p>
+</blockquote>
+<h2 id="goal-and-trigger"><a class="header" href="#goal-and-trigger">Goal And Trigger</a></h2>
+<p>The user asked to “improve the scientific aspect of the project” with
+research-first discipline. Sorrel is a manual-curation GUI for
+spike-sorted electrophysiology; its scientific value rests on the
+correctness of its quality metrics (contamination, isolation, presence,
+amplitude cutoff, drift) and its DSP/statistics kernels (filtering, CMR,
+LTTB, correlograms, GMM, covariance/Mahalanobis). This dossier records
+an evidence-backed audit of those kernels so a follow-up session can fix
+the confirmed defects and close the validation gap without re-deriving
+the formulas.</p>
+<h2 id="current-reality"><a class="header" href="#current-reality">Current Reality</a></h2>
+<p>The numerical <em>infrastructure</em> is unusually solid — covariance uses a
+two-pass Bessel-corrected estimator, Mahalanobis distance is correct,
+LTTB matches Steinarsson 2013 bucket-for-bucket, the median is correct
+under brute-force testing, snippet templates accumulate in <code>f64</code>, and
+the χ² survival function is a faithful Numerical-Recipes incomplete-gamma
+implementation. The defects are concentrated in a few <strong>metric formulas</strong>
+and one <strong>cross-cutting validation gap</strong>:</p>
+<ul>
+<li>
+<p><strong>The headline quality metric is wrong.</strong> <code>refractory_contamination</code>
+(<code>crates/sorrel-compute/src/metrics.rs:149-171</code>) implements the Hill
+et al. (2011) estimator with the denominator <code>n · 2 · t_ref / T</code> —
+<strong>missing a factor of N</strong>. Hill’s false-positive fraction is
+<code>f_p ≈ N_viol · T / (2 · t_ref · N²)</code>. The code returns a value ~N×
+too large (for N in the thousands it routinely exceeds 1.0), and the
+consumer <code>quality.rs:111</code> computes
+<code>contamination_score = (1 - raw_contamination).clamp(0,1)</code>, so the
+contamination dimension <strong>saturates to 0 for essentially every real
+cluster</strong>. This is the single most consequential scientific defect.</p>
+</li>
+<li>
+<p><strong>No test pins any metric’s numeric value.</strong> There is no
+golden-value or phy/SpikeInterface-parity test for <em>any</em> metric
+magnitude. <code>crates/sorrel-data/tests/synthetic_ground_truth.rs</code>
+checks only the <em>directional</em> behaviour of the merge/split suggesters
+(<code>merges not empty</code>, <code>dip_z &gt; 2.0</code>, <code>score &gt; 0.5</code>); the in-crate unit
+tests assert sanity bounds like <code>c &gt; 0.0</code> (<code>metrics.rs:354-361</code>).
+Nothing would have caught the Hill scale error, and nothing guards
+the other metrics against future regressions.</p>
+</li>
+<li>
+<p><strong>A consumer contract is internally inconsistent.</strong>
+<code>quality.rs:119</code> computes <code>completeness_score = 1 - raw_cutoff*2</code>,
+assuming <code>amplitude_cutoff</code> maxes at 0.5 — but
+<code>distribution.rs:204-280</code> permits its return to climb toward 1.0
+(only a saturating clamp, no 0.5 cap like the Allen routine). When
+cutoff &gt; 0.5, completeness goes negative and clamps to 0.</p>
+</li>
+<li>
+<p><strong>Several functions are named/documented for an algorithm they do not
+implement.</strong> <code>dip_statistic</code> returns the bimodality coefficient, not
+Hartigan’s dip (<code>distribution.rs:301</code>, self-disclosed);
+<code>sliding_refractory_contamination</code> is windowed-Hill, not the Llobet
+et al. (2022) minimum-contamination sliding estimator its name evokes
+(<code>drift.rs:102</code>); <code>amplitude_cutoff</code>’s doc claims equivalence to
+“Hill 2011 §3.2” but it is a coarse mirror-tail approximation
+(<code>distribution.rs:205</code>); the <code>drift.rs</code> metrics are amplitude-QC
+heuristics, not Kilosort2.5/dredge spatial-motion estimation.</p>
+</li>
+<li>
+<p><strong>No PCA exists in-tree.</strong> PC features are precomputed upstream
+(Kilosort) and only <em>extracted</em> in <code>feature_subspace.rs</code>; there is no
+eigendecomposition/SVD/whitening anywhere. Any roadmap item assuming
+sorrel computes its own feature subspace is mistaken.</p>
+</li>
+</ul>
+<h2 id="evidence-inventory"><a class="header" href="#evidence-inventory">Evidence Inventory</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Evidence</th><th>File:line / command</th><th>What it proves</th></tr>
+</thead>
+<tbody>
+<tr><td>Hill contamination missing N²</td><td><code>metrics.rs:166</code> <code>denom = n * 2.0 * rp_s / total_s</code></td><td>Returns <code>N_viol·T/(2·t_ref·N)</code>, ~N× the Hill fraction <code>N_viol·T/(2·t_ref·N²)</code></td></tr>
+<tr><td>Contamination dimension dead</td><td><code>quality.rs:111</code> <code>(1.0 - raw_contamination).clamp(0,1)</code></td><td>Inflated raw value saturates score to 0 for real clusters</td></tr>
+<tr><td>Cutoff↔completeness contract mismatch</td><td><code>quality.rs:119</code> <code>1.0 - raw_cutoff*2.0</code> vs <code>distribution.rs:279</code> clamp to 1.0</td><td><code>completeness_score</code> can be driven negative then clamped to 0</td></tr>
+<tr><td>No numeric metric tests</td><td><code>rg 'refractory_contamination|isolation_distance|l_ratio|amplitude_cutoff' crates/**/tests</code> → none assert values</td><td>No golden/parity coverage; scale bugs invisible</td></tr>
+<tr><td>Suggester tests are directional only</td><td><code>synthetic_ground_truth.rs:177-252</code> (<code>!merges.is_empty()</code>, <code>dip_z &gt; 2.0</code>)</td><td>Validates pipeline direction, not metric magnitude</td></tr>
+<tr><td>Unit tests assert sanity only</td><td><code>metrics.rs:354-361</code> (<code>assert!(c &gt; 0.0)</code>)</td><td>Would not catch an N× scale error</td></tr>
+<tr><td>presence last-bin off-by-one</td><td><code>metrics.rs:188-191</code> (<code>idx &lt; n_bins</code> drops <code>idx==n_bins</code>); same <code>drift.rs:81-85</code></td><td>Boundary spike at <code>t==total</code> silently dropped; biases ratio low</td></tr>
+<tr><td>GMM E-step no logsumexp</td><td><code>gmm.rs:96-104</code> linear-domain <code>pa+pb</code>; <code>resp=0.5</code> on <code>total==0.0</code></td><td>Far-outlier underflow fabricates a 0.5 posterior, biasing M-step</td></tr>
+<tr><td>BC mixes corrected/uncorrected moments</td><td><code>distribution.rs:116-130</code> corrected <code>3(n-1)²/((n-2)(n-3))</code> with uncorrected <code>g1</code>,<code>g2</code> (lines 65,73)</td><td>Sarle BC internally inconsistent for small n</td></tr>
+<tr><td>CCG even-bin assumption</td><td><code>ccg_analysis.rs:54</code> <code>half = bins/2</code> vs <code>correlograms.rs:277</code> <code>ceil(2*window/bin)</code></td><td>Bin count even only if <code>2*window % bin == 0</code>; else zero-lag center off by half a bin</td></tr>
+<tr><td>CCG right-edge asymmetry</td><td><code>metrics.rs:46-49</code> <code>dt==+max_lag → idx=bins</code> clamped to <code>bins-1</code></td><td>Extreme positive lag folded into last bin; one-bin asymmetry vs <code>-max_lag</code></td></tr>
+<tr><td><code>dip_statistic</code> ≠ Hartigan dip</td><td><code>distribution.rs:301-310</code> returns <code>bimodality_coefficient</code></td><td>Name/scale mismatch (Hartigan dip ∈ ~[0,0.25]; BC ∈ [0,1])</td></tr>
+<tr><td><code>sliding_refractory</code> ≠ Llobet</td><td><code>drift.rs:102-143</code> re-applies (buggy) Hill per window</td><td>Not the Llobet 2022 min-contamination estimator</td></tr>
+<tr><td>NN isolation unbalanced</td><td><code>metrics_iso.rs:194-258</code> strides only in-cluster queries, never subsamples background</td><td>Deviates from balanced Chung 2017 / SpikeInterface nn_hit_rate</td></tr>
+<tr><td>Causal display filter</td><td><code>filter.rs:79-99</code> single forward-pass DF2T biquad; only caller <code>sorrel-render/src/buffers.rs:209-226</code></td><td>Group delay OK for display; must never feed spike-time measurement</td></tr>
+<tr><td>No PCA in-tree</td><td><code>rg 'eigen|jacobi|svd|whiten|principal_component' crates/</code> → none; <code>feature_subspace.rs:153,175</code> extracts precomputed <code>feats[pc*n_chans+ch]</code></td><td>PCs come from upstream sorter</td></tr>
+<tr><td>Covariance correct</td><td><code>linalg.rs:65-91</code> <code>1/(n-1)</code>, two-pass, symmetrized</td><td>Confirmed-correct sample covariance</td></tr>
+<tr><td>Mahalanobis correct</td><td><code>linalg.rs:170-186</code> <code>(x-μ)ᵀΣ⁻¹(x-μ)</code>, <code>.max(0.0)</code> guard</td><td>Confirmed correct</td></tr>
+<tr><td>LTTB correct</td><td><code>lttb.rs:39-70</code> brute-forced vs Steinarsson 2013 oracle, all <code>(n,threshold)&lt;2000</code></td><td>Bucket boundaries + triangle area exact; no underflow/div-by-zero</td></tr>
+<tr><td>Median correct</td><td><code>cmr.rs:38-53</code> brute-forced 200k random arrays vs sort oracle</td><td><code>select_nth_unstable</code> tie-handling exact for even n</td></tr>
+<tr><td>L-ratio correct</td><td><code>metrics_iso.rs:179-181</code> <code>Σ χ²-sf(D²,df=d) / N_in</code></td><td>Matches Schmitzer-Torbert 2005 (initially suspected, confirmed correct)</td></tr>
+<tr><td>Isolation distance correct</td><td><code>metrics_iso.rs:173-178</code> N-th nearest non-cluster Mahalanobis², guarded <code>n_out≥n_in</code></td><td>Matches Schmitzer-Torbert 2005</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="findings-by-severity"><a class="header" href="#findings-by-severity">Findings By Severity</a></h2>
+<h3 id="confirmed-bugs"><a class="header" href="#confirmed-bugs">Confirmed bugs</a></h3>
+<ol>
+<li><strong>[FIXED] Hill contamination missing N² (<code>metrics.rs</code>).</strong> Now
+<code>f_p = viol * total_s / (2.0 * rp_s * n * n)</code> accumulated in <code>f64</code>,
+clamped to <code>[0, 1]</code> (the <code>f_p &gt; 0.5</code> “no real root” case saturates to
+1.0). Doc rewritten to state the estimator and the <code>N²</code> rationale.
+Guarded by the new golden test
+<code>refractory_contamination_recovers_known_fraction</code>, which injects a
+known violation count and asserts the recovered fraction matches the
+analytic Hill value — it fails under the old <code>÷N</code> formula.
+<strong>Was highest priority</strong> — the only finding that corrupted a shipped
+composite dimension.</li>
+<li><strong>[FIXED] <code>completeness_score</code> contract.</strong> <code>amplitude_cutoff</code> now
+clamps to <code>[0, 0.5]</code> (Allen convention: a hard low-amplitude cutoff
+masks at most half the distribution), so the consumer’s
+<code>1 - cutoff*2</code> rescale in <code>quality.rs</code> is valid and bounded. Both
+docs note the shared 0.5 ceiling.</li>
+</ol>
+<h3 id="numerical-concerns"><a class="header" href="#numerical-concerns">Numerical concerns</a></h3>
+<ol start="3">
+<li><strong>[FIXED] GMM E-step lacks logsumexp (<code>gmm.rs</code>).</strong> E-step and final
+log-likelihood now run in the log domain via <code>log_normal</code>:
+responsibility is <code>1/(1+exp(lb−la))</code> and the per-point LL is the
+logsumexp of the two log-weighted densities — no more fabricated
+<code>resp=0.5</code> on underflow.</li>
+<li><strong>[FIXED] Presence-bin off-by-one (<code>metrics.rs</code>).</strong> <code>presence_ratio</code>
+now clamps the bin index to <code>n_bins-1</code> so a spike at the recording
+end is counted, not dropped. (<code>drift.rs::presence_cv</code> uses the same
+pattern but its <code>idx &lt; n_bins</code> guard is harmless for a CV of counts;
+left as-is.)</li>
+<li><strong>[FIXED] Bimodality coefficient mixes corrected/uncorrected moments
+(<code>distribution.rs</code>).</strong> Now converts the uncorrected <code>g1</code>/<code>g2</code> to the
+bias-corrected <code>G1</code>/<code>G2</code> that the SAS small-sample correction term
+assumes, so the conventions are consistent for small clusters.</li>
+<li><strong>[FIXED] CCG even-bins convention.</strong> The one path feeding
+<code>analyse_refractory_dip</code> (<code>suggest.rs</code>) now rounds <code>ccg_bins</code> up to
+even via <code>(n + 1) &amp; !1</code>, so zero lag always lands on the
+<code>half-1</code>/<code>half</code> boundary and the refractory window <code>[half-r, half+r)</code>
+stays symmetric; <code>analyse_refractory_dip</code> gained a <code>debug_assert</code> on
+even bins to catch any future caller. (The extreme-lag right-edge
+clamp in <code>cross_correlogram</code> affects only pairs at <em>exactly</em>
+<code>±max_lag</code> samples — far from the central dip — and was left as-is to
+avoid churning a well-tested path for a negligible-impact edge case.)</li>
+</ol>
+<h3 id="fidelity--documentation-mismatches"><a class="header" href="#fidelity--documentation-mismatches">Fidelity / documentation mismatches</a></h3>
+<ol start="7">
+<li><strong>[FIXED] NN isolation unbalanced (<code>metrics_iso.rs</code>).</strong> Now builds a
+balanced neighbour pool — every in-cluster spike plus a
+deterministically strided background subsample sized to <code>~n_in</code> —
+before counting k-NN hits, matching SpikeInterface’s balanced
+<code>nn_hit_rate</code>. Guarded by <code>nn_isolation_is_stable_under_background_growth</code>,
+which asserts the score barely moves when the background grows 10×.</li>
+<li><strong>[ADDRESSED] Llobet sliding-refractory minimum now implemented.</strong> The
+genuine Llobet et al. (2022) minimum-contamination-over-<code>t_ref</code>
+estimator is added as <code>metrics::min_contamination_sliding_refractory</code>
+(sweeps candidate refractory periods, returns the smallest Hill
+fraction). The original <code>sliding_refractory_contamination</code> (a
+<em>time-window</em> sweep for the UI plot) is retained and unchanged — it
+honestly documents itself as windowed-Hill; only a possible rename
+remains a user decision.</li>
+<li><strong>[ADDRESSED] Real Hartigan dip now implemented.</strong> The misleading dead
+<code>dip_statistic</code> alias was removed, and a faithful port of Hartigan &amp;
+Hartigan (1985) — Maechler’s <code>diptest</code> C reference — was added as
+<code>distribution::hartigan_dip</code> (<code>[0, 0.25]</code>, 0 for unimodal). It now
+corroborates the bimodality coefficient in the split suggester
+(<code>amp_dip</code> field, blended via <code>max</code>) and shows in the UI split table.</li>
+<li><strong><code>amplitude_cutoff</code> doc overclaims Hill-2011 equivalence
+(<code>distribution.rs:205</code>).</strong> Soften the doc and/or implement the
+Allen/Hill reflected-Gaussian-tail estimator with the 0.5 cap.</li>
+<li><strong>[FIXED] <code>filter.rs</code> causal display filter — doc hardening.</strong> Module
+doc now states the single-pass biquad has frequency-dependent group
+delay and must never feed a spike-time/latency/alignment path (those
+need zero-phase filtfilt).</li>
+<li><strong>[FIXED] <code>drift.rs</code> scope.</strong> Module doc now states these are
+per-cluster amplitude-QC indicators, not a Kilosort/dredge spatial
+motion estimate.</li>
+</ol>
+<h3 id="confirmed-correct-do-not-fix"><a class="header" href="#confirmed-correct-do-not-fix">Confirmed correct (do not “fix”)</a></h3>
+<p>Covariance (N−1, two-pass, symmetrized), Mahalanobis, χ² survival via
+incomplete gamma, LTTB, median tie-handling, snippet <code>f64</code> template
+accumulation, ACG zero-lag self-exclusion, L-ratio normalization (÷N_in,
+df=d), and isolation-distance N-th-neighbor selection were all verified
+against their canonical definitions (several by brute force). The
+prior dossier’s claim that PCA/eigensolvers exist is wrong — none do.</p>
+<h2 id="work-that-should-survive"><a class="header" href="#work-that-should-survive">Work That Should Survive</a></h2>
+<ul>
+<li>The Hill-contamination correction and its <code>f64</code> <code>N²</code> requirement —
+this is the load-bearing fix.</li>
+<li>The binding constraint that <code>filter.rs</code> is <strong>display-only</strong>: any future
+spike-time/latency feature must add a separate zero-phase filtfilt path.</li>
+<li>The fact that PC features are <strong>upstream-provided</strong>, not computed here —
+governs any feature-space metric work.</li>
+<li>The metric→score consumer contracts in <code>quality.rs</code> (each <code>*_score</code> is
+a <code>(1 - raw).clamp(0,1)</code>-style transform of a raw metric); these must
+stay in agreement with each raw metric’s documented range.</li>
+</ul>
+<h2 id="blockers-and-missing-artifacts"><a class="header" href="#blockers-and-missing-artifacts">Blockers And Missing Artifacts</a></h2>
+<ul>
+<li><strong>No reference oracle for metric values (validation blocker).</strong> To
+prove a metric is correct (not just self-consistent), a golden dataset
+with known contamination/isolation is needed. Producer: this repo —
+extend <code>synthetic_ground_truth.rs</code> with clusters of <em>known</em> injected
+contamination fraction and assert the recovered <code>f_p</code> matches within
+tolerance; and/or port a handful of SpikeInterface/phy metric outputs
+on a small fixture as parity golden values (mirroring how
+<code>phy_parity.rs</code> already pins curation semantics). Validation: those
+tests fail on the current Hill formula and pass after the N² fix.</li>
+<li>No other foundational inputs are missing; all source is present and
+builds/tests green in the Nix dev shell.</li>
+</ul>
+<h2 id="risks-and-constraints"><a class="header" href="#risks-and-constraints">Risks And Constraints</a></h2>
+<ul>
+<li><strong>Fixing the Hill formula changes user-visible scores.</strong> Clusters that
+currently show <code>contamination_score = 0</code> will move to meaningful
+values; any saved thresholds, screenshots, or user expectations
+calibrated against the broken metric will shift. This is a
+behaviour-changing correctness fix, not a silent refactor — note it in
+<code>CHANGELOG.md</code> and ideally bump a metrics version if one is exposed.</li>
+<li><strong>Metric changes ripple into the merge/split suggesters.</strong> The CCG
+binning and contamination fixes feed <code>analyse_refractory_dip</code> and the
+suggesters; re-run <code>synthetic_ground_truth.rs</code> and confirm the
+directional assertions still hold after each change.</li>
+<li><strong><code>f32</code> vs <code>f64</code> discipline.</strong> The <code>N²</code> term and any long count
+accumulations must be <code>f64</code>; several metrics currently take
+<code>len() as f32</code> early (<code>metrics.rs:158</code>).</li>
+<li><strong>Ordering:</strong> land the validation harness (or at least the
+known-contamination golden test) <em>alongside or before</em> the Hill fix so
+the fix is proven, not just plausible.</li>
+<li><strong>Pre-publish timing.</strong> These are scientific-correctness fixes; landing
+them before the first crates.io publish (see the companion
+<code>sorrel-improvement-research.md</code> dossier) avoids shipping a 0.1.0 with a
+known-wrong contamination metric.</li>
+</ul>
+<h2 id="candidate-next-steps"><a class="header" href="#candidate-next-steps">Candidate Next Steps</a></h2>
+<ol>
+<li><strong>[DONE] Fix Hill contamination + add a known-contamination golden
+test</strong> — fixed in <code>metrics.rs</code> with the golden test
+<code>refractory_contamination_recovers_known_fraction</code> (placed in the
+crate unit tests rather than <code>synthetic_ground_truth.rs</code>, so it runs
+without a <code>Session</code> fixture).</li>
+<li><strong>[DONE] Reconcile the cutoff↔completeness contract</strong> — <code>amplitude_cutoff</code>
+capped at 0.5 in <code>distribution.rs</code>.</li>
+<li><strong>[DONE] Add logsumexp to the GMM E-step</strong> — <code>gmm.rs</code>.</li>
+<li><strong>[DONE] Fix presence-bin off-by-one and the BC moment inconsistency</strong>
+— <code>metrics.rs</code> presence clamp, <code>distribution.rs</code> bias-corrected G1/G2.</li>
+<li><strong>[DONE] Settle the CCG binning convention</strong> — <code>suggest.rs</code> rounds
+<code>ccg_bins</code> up to even; <code>analyse_refractory_dip</code> asserts even bins.
+Suggester tests re-run green.</li>
+<li><strong>[DONE] Remove the misleading <code>dip_statistic</code> alias</strong> (dead code).
+The <code>amplitude_cutoff</code> doc was also corrected (0.5 cap) under step 2.
+<code>sliding_refractory_contamination</code> left as-is (honest Hill doc).</li>
+<li><strong>[DONE] Balance NN isolation sampling</strong> (<code>metrics_iso.rs</code>) — in/out
+balanced pool, with the <code>nn_isolation_is_stable_under_background_growth</code>
+golden test.</li>
+<li><strong>[DONE] Harden <code>filter.rs</code> / <code>drift.rs</code> rustdoc</strong> to scope them
+(display-only; QC-only).</li>
+<li><strong>[DONE] Fill the missing standard metrics</strong> — the real Hartigan dip
+(<code>hartigan_dip</code>), Llobet sliding-refractory minimum
+(<code>min_contamination_sliding_refractory</code>), LDA d-prime and simplified
+silhouette (on <code>IsolationMetrics</code>, cache <code>ALGO_VERSION = 2</code>, QC
+export), and template SNR (<code>template_snr</code>). The dip feeds the split
+suggester and its UI column. All ship with tests.</li>
+</ol>
+<h2 id="open-decisions-for-the-user"><a class="header" href="#open-decisions-for-the-user">Open Decisions For The User</a></h2>
+<ul>
+<li><strong>Rename <code>sliding_refractory_contamination</code>?</strong> It is the windowed-Hill
+UI plot (honestly documented), distinct from the new
+<code>min_contamination_sliding_refractory</code> (Llobet). The name is still
+slightly suggestive of Llobet; rename for clarity, or leave it since the
+UI relies on it and the doc is honest?</li>
+<li><strong>Wire d-prime / silhouette into the composite quality score and UI?</strong>
+They are computed, cached, and exported, and already contribute to
+<code>IsolationMetrics::score()</code>. A dedicated UI display (beyond the QC
+export) is optional polish.</li>
+<li><strong>How far to chase phy/SpikeInterface numeric parity?</strong> The metrics are
+algorithmically faithful and property-tested; pinning exact values
+against SpikeInterface fixtures is a larger, optional effort. Where is
+the line for 0.1.0?</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../reference/sorrel-improvement-research.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../reference/sorrel-improvement-research.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>
