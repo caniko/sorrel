@@ -2,7 +2,7 @@
   description = "Sorrel — spike-sorting curation GUI";
 
   inputs = {
-    rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk";
+    rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=9bfa8bdb0ecb22d7bc11448665f7fbaebae7a759";
 
     simit = {
       url = "git+https://codeberg.org/caniko/simit?ref=refs/tags/0.17.7";
