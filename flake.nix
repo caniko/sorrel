@@ -2,7 +2,7 @@
   description = "Sorrel — spike-sorting curation GUI";
 
   inputs = {
-    rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=9bfa8bdb0ecb22d7bc11448665f7fbaebae7a759";
+    rs-harbor.url = "github:caniko/rs-harbor/0.1.0";
 
     simit = {
       url = "git+https://codeberg.org/caniko/simit?ref=refs/tags/0.17.7";
@@ -63,7 +63,7 @@
           # therefore needs the trusted runner; keeping the mapping explicit
           # preserves simit's per-step routing contract without dispatching
           # `nix develop` to the bare atlas image.
-          runner = "atlas-nix-trusted";
+          runner = "ubuntu-24.04";
           packages = [
             "sorrel"
             "sorrel-cache"
@@ -84,25 +84,24 @@
             deploy_app = ".#deploy-pages";
           };
           step_runners = {
-            cargo-clippy = "atlas-nix-trusted";
-            cargo-doc = "atlas-nix-trusted";
-            cargo-fmt = "atlas-nix-trusted";
-            cargo-package = "atlas-nix-trusted";
-            cargo-test = "atlas-nix-trusted";
-            nix-check = "atlas-nix-trusted";
-            quality-tools = "atlas-nix-trusted";
+            cargo-clippy = "ubuntu-24.04";
+            cargo-doc = "ubuntu-24.04";
+            cargo-fmt = "ubuntu-24.04";
+            cargo-package = "ubuntu-24.04";
+            cargo-test = "ubuntu-24.04";
+            nix-check = "ubuntu-24.04";
+            quality-tools = "ubuntu-24.04";
           };
         };
         release = {
           publish.enforcement = "activated-remote";
           smoke.command = "nix run .#release-smoke --";
-          codeberg = {
+          github = {
             repo = "caniko/sorrel";
             target_branch = "trunk";
-            token_secret = "CODEBERG_TOKEN";
           };
           artifacts = {
-            runner = "atlas-nix-trusted";
+            runner = "ubuntu-24.04";
             version_attr = "sorrel";
             substituters = [
               "https://attic.candee.baby/canix"
@@ -124,7 +123,10 @@
         overlays = [(import rust-overlay)];
       };
 
-      toolchain = rs-harbor.lib.mkToolchain {inherit pkgs;};
+      toolchain = rs-harbor.lib.mkToolchain {
+        inherit pkgs;
+        cache.enable = false;
+      };
       inherit (toolchain) craneLib rustToolchain;
       cross = rs-harbor.lib.mkCross {
         inherit pkgs system;
@@ -161,6 +163,7 @@
       sorrelVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
       crossSorrelPackages = rs-harbor.lib.mkCrossPackages {
         inherit pkgs craneLib cross;
+        buildCache = null;
         pname = "sorrel";
         targets = ["aarch64-linux" "windows" "darwin-aarch64"];
         commonArgs = {
