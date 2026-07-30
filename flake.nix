@@ -2,7 +2,7 @@
   description = "Sorrel — spike-sorting curation GUI";
 
   inputs = {
-    rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=9bfa8bdb0ecb22d7bc11448665f7fbaebae7a759";
+    rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=c26b735eede8078f795651c4a9cbf0be8733b221";
 
     simit = {
       url = "git+https://codeberg.org/caniko/simit?ref=refs/tags/0.17.7";
@@ -78,7 +78,7 @@
           with_deny = true;
           pages = {
             repo = "caniko/sorrel";
-            site_output = "site";
+            site_output = ".#site";
             token_secret = "CODEBERG_TOKEN";
             source_branch = "trunk";
             deploy_app = ".#deploy-pages";
@@ -124,7 +124,7 @@
         overlays = [(import rust-overlay)];
       };
 
-      toolchain = rs-harbor.lib.mkToolchain {inherit pkgs;};
+      toolchain = rs-harbor.lib.mkToolchain {inherit pkgs; toolchainProfile = "nightly";};
       inherit (toolchain) craneLib rustToolchain;
       cross = rs-harbor.lib.mkCross {
         inherit pkgs system;

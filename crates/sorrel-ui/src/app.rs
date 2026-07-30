@@ -572,10 +572,13 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                 CentralTab::Summary => {
                     selection_summary(ui, &self.session, &selected, self.label_str);
                     ui.separator();
-                    ui.label(
-                        "Keys: G/M/N/U relabel · J/K next/prev · H/L pan · \
-                         Cmd/Ctrl-Z undo · Cmd/Ctrl-Shift-Z redo · Cmd/Ctrl-S save · \
-                         click select · Cmd/Ctrl-click toggle · Shift-click extend",
+                    ui.add(
+                        egui::Label::new(
+                            "Keys: G/M/N/U relabel · J/K next/prev · H/L pan\n\
+                             Cmd/Ctrl-Z undo · Cmd/Ctrl-Shift-Z redo · Cmd/Ctrl-S save\n\
+                             click select · Cmd/Ctrl-click toggle · Shift-click extend",
+                        )
+                        .wrap(),
                     );
                 }
                 CentralTab::Waveforms => {

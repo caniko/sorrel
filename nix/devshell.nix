@@ -24,14 +24,18 @@ in
 
     pkgConfigDeps = buildInputs;
     packages = with pkgs;
-      [
-        cargo-nextest
-        mdbook
-        pre-commit
-        rust-analyzer
-        simit
-        zola
-      ]
+        [
+          cargo-nextest
+          imagemagick
+          mdbook
+          pre-commit
+          rust-analyzer
+          simit
+          python3
+          xdotool
+          xorg.xorgserver
+          zola
+        ]
       ++ hdf5Packages
       ++ preCommitEnabledPackages
       ++ buildInputs
