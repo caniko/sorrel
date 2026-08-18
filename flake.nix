@@ -13,7 +13,7 @@
     };
 
     # Pinned SDK used by rs-harbor's reproducible osxcross builder.
-    rs-harbor-macos-sdk-pin.url = "git+ssh://git@codeberg.org/caniko/rs-harbor-macos-sdk-pin.git";
+    rs-harbor-macos-sdk-pin.url = "git+https://github.com/caniko/rs-harbor-macos-sdk-pin.git";
 
     nix-appimage = {
       url = "github:ralismark/nix-appimage";
