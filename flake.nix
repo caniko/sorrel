@@ -10,6 +10,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
       inputs.flake-utils.follows = "flake-utils";
+      inputs.plinth.follows = "plinth";
     };
 
     # Pinned SDK used by rs-harbor's reproducible osxcross builder.
