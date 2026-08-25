@@ -19,7 +19,7 @@ exclude = ["crates/sorrel-py"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://codeberg.org/caniko/sorrel"
+repository = "https://github.com/caniko/sorrel"
 
 [workspace.metadata.crane]
 name = "sorrel"

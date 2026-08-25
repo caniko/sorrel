@@ -1,6 +1,6 @@
 # sorrel-py
 
-Python bindings for the [Sorrel](https://codeberg.org/caniko/sorrel)
+Python bindings for the [Sorrel](https://github.com/caniko/sorrel)
 spike-sorting curation GUI.
 
 ## Build
