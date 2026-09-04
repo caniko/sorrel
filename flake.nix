@@ -2,26 +2,28 @@
   description = "Sorrel — spike-sorting curation GUI";
 
   inputs = {
-    rs-harbor.url = "git+ssh://git@github.com/caniko/rs-harbor.git?ref=trunk&rev=05cc4f162b55fa904b687db1821e2463fa813e50";
+    harbor-rs.url = "git+ssh://git@github.com/caniko/harbor-rs.git?ref=trunk&rev=05cc4f162b55fa904b687db1821e2463fa813e50";
+    rs-harbor.follows = "harbor-rs";
 
     simit = {
-      url = "git+https://codeberg.org/caniko/simit?ref=refs/tags/0.17.7";
-      inputs.rs-harbor.follows = "rs-harbor";
+      url = "git+https://github.com/caniko/simit?ref=refs/tags/0.17.7";
+      inputs.rs-harbor.follows = "harbor-rs";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
       inputs.flake-utils.follows = "flake-utils";
     };
 
-    # Pinned SDK used by rs-harbor's reproducible osxcross builder.
-    rs-harbor-macos-sdk-pin.url = "git+https://github.com/caniko/rs-harbor-macos-sdk-pin.git";
+    # Pinned SDK used by harbor-rs's reproducible osxcross builder.
+    harbor-macos-sdk-pin.url = "git+https://github.com/caniko/harbor-macos-sdk-pin.git";
+    rs-harbor-macos-sdk-pin.follows = "harbor-macos-sdk-pin";
 
     nix-appimage = {
       url = "github:ralismark/nix-appimage";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    nixpkgs.follows = "rs-harbor/nixpkgs";
-    rust-overlay.follows = "rs-harbor/rust-overlay";
+    nixpkgs.follows = "harbor-rs/nixpkgs";
+    rust-overlay.follows = "harbor-rs/rust-overlay";
     flake-utils.url = "github:numtide/flake-utils";
     treefmt-nix = {
       url = "github:numtide/treefmt-nix";
@@ -40,9 +42,9 @@
   outputs = {
     self,
     nixpkgs,
-    rs-harbor,
+    harbor-rs,
     simit,
-    rs-harbor-macos-sdk-pin,
+    harbor-macos-sdk-pin,
     nix-appimage,
     flake-utils,
     rust-overlay,
@@ -124,15 +126,15 @@
         overlays = [(import rust-overlay)];
       };
 
-      toolchain = rs-harbor.lib.mkToolchain {inherit pkgs; toolchainProfile = "nightly";};
+      toolchain = harbor-rs.lib.mkToolchain {inherit pkgs; toolchainProfile = "nightly";};
       inherit (toolchain) craneLib rustToolchain;
-      cross = rs-harbor.lib.mkCross {
+      cross = harbor-rs.lib.mkCross {
         inherit pkgs system;
-        macosSdkStorePath = rs-harbor-macos-sdk-pin.storePath;
-        macosSdkOutputHash = rs-harbor-macos-sdk-pin.outputHash;
-        osxSdkVersion = rs-harbor-macos-sdk-pin.sdkVersion;
+        macosSdkStorePath = harbor-macos-sdk-pin.storePath;
+        macosSdkOutputHash = harbor-macos-sdk-pin.outputHash;
+        osxSdkVersion = harbor-macos-sdk-pin.sdkVersion;
       };
-      cargoConfig = rs-harbor.lib.mkCargoConfig {inherit pkgs;};
+      cargoConfig = harbor-rs.lib.mkCargoConfig {inherit pkgs;};
 
       src = pkgs.lib.cleanSourceWith {
         src = ./.;
@@ -159,7 +161,7 @@
       sorrelHdf5 = rustPackages.sorrelHdf5 or null;
 
       sorrelVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
-      crossSorrelPackages = rs-harbor.lib.mkCrossPackages {
+      crossSorrelPackages = harbor-rs.lib.mkCrossPackages {
         inherit pkgs craneLib cross;
         pname = "sorrel";
         targets = ["aarch64-linux" "windows" "darwin-aarch64"];
@@ -189,7 +191,7 @@
         };
       };
 
-      sorrelAppImage = rs-harbor.lib.mkAppImage {
+      sorrelAppImage = harbor-rs.lib.mkAppImage {
         inherit system nix-appimage;
         pname = "sorrel";
         version = sorrelVersion;
@@ -230,7 +232,7 @@
         };
 
       devShells = import ./nix/devshell.nix {
-        inherit pkgs rs-harbor craneLib cross cargoConfig deps;
+        inherit pkgs harbor-rs craneLib cross cargoConfig deps;
         simit = simit.packages.${system}.default;
         checks = self.checks.${system};
         preCommitEnabledPackages = pre-commit-check.enabledPackages;

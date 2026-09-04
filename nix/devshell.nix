@@ -1,6 +1,6 @@
 {
   pkgs,
-  rs-harbor,
+  harbor-rs,
   craneLib,
   cross,
   cargoConfig,
@@ -19,7 +19,7 @@
     }
     else {};
 in
-  (rs-harbor.lib.mkDevShells {
+  (harbor-rs.lib.mkDevShells {
     inherit pkgs cross cargoConfig craneLib checks;
 
     pkgConfigDeps = buildInputs;
@@ -50,7 +50,7 @@ in
     '';
   })
   // {
-    docs = rs-harbor.lib.mkDocsShell {
+    docs = harbor-rs.lib.mkDocsShell {
       inherit pkgs cross cargoConfig craneLib checks;
       pkgConfigDeps = buildInputs;
       packages = with pkgs;

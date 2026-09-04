@@ -81,7 +81,7 @@ without re-deriving the facts.
   implements full undo/redo with per-command status messages, and the
   in-app hint also advertises redo and save.
 - **A stray `docs/.cargo/config.toml` appeared (untracked).** It is
-  byte-identical to the root `.cargo/config.toml` (rs-harbor-generated,
+  byte-identical to the root `.cargo/config.toml` (harbor-rs-generated,
   nightly-only flags like `-Zthreads`/cranelift) — almost certainly
   dropped by a tool run from inside `docs/`. It serves no purpose
   there and should be deleted, not committed.
