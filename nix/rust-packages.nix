@@ -42,7 +42,7 @@
 
       meta = with pkgs.lib; {
         description = "Native, monomorphised spike-sorting curation GUI";
-        homepage = "https://codeberg.org/caniko/sorrel";
+        homepage = "https://github.com/caniko/sorrel";
         license = with licenses; [mit asl20];
         mainProgram = "sorrel";
         platforms = platforms.unix;
