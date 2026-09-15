@@ -11,9 +11,9 @@
   shellHook ? "",
 }: let
   inherit (deps) buildInputs nativeBuildInputs runtimeLibs hdf5C;
-  hdf5Packages = pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.hdf5];
+  hdf5Packages = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.hdf5];
   hdf5Env =
-    if pkgs.stdenv.isLinux
+    if pkgs.stdenv.hostPlatform.isLinux
     then {
       HDF5_DIR = "${hdf5C}";
     }

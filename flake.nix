@@ -221,7 +221,7 @@
         }
         // crossSorrelPackages
         // pkgs.lib.optionalAttrs (sorrelHdf5 != null) {inherit sorrelHdf5;}
-        // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {sorrel-appimage = sorrelAppImage;};
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {sorrel-appimage = sorrelAppImage;};
 
       checks =
         (import ./nix/checks.nix {

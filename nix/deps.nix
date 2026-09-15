@@ -50,7 +50,7 @@
   # Libraries dlopen'd at runtime by wgpu/winit; rpath them into the
   # final binary so the package is self-contained on both Wayland and X11.
   runtimeLibs = with pkgs;
-    lib.optionals stdenv.isLinux [
+    lib.optionals stdenv.hostPlatform.isLinux [
       vulkan-loader
       libGL
       # Wayland: winit dlopens libwayland-client + libxkbcommon, and
@@ -78,6 +78,6 @@
     paths = [pkgs.hdf5 pkgs.hdf5.dev];
   };
 in {
-  buildInputs = lib.optionals stdenv.isLinux linuxBuildInputs;
+  buildInputs = lib.optionals stdenv.hostPlatform.isLinux linuxBuildInputs;
   inherit nativeBuildInputs linuxBuildInputs aarch64LinuxBuildInputs runtimeLibs hdf5C;
 }

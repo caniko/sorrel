@@ -15,13 +15,13 @@
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-  rpathFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+  rpathFixup = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
     patchelf --add-rpath "${pkgs.lib.makeLibraryPath runtimeLibs}" \
       "$out/bin/sorrel"
   '';
 
   sorrelHdf5 =
-    if pkgs.stdenv.isLinux
+    if pkgs.stdenv.hostPlatform.isLinux
     then
       craneLib.buildPackage (commonArgs
         // {
