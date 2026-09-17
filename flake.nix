@@ -3,11 +3,10 @@
 
   inputs = {
     harbor-rs.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk&rev=de6a15f5c102a63b14430fc09f73f9af02606ca6";
-    rs-harbor.follows = "harbor-rs";
 
     simit = {
       url = "git+https://github.com/caniko/simit?ref=refs/tags/0.17.7";
-      inputs.rs-harbor.follows = "harbor-rs";
+      inputs.harbor-rs.follows = "harbor-rs";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
       inputs.flake-utils.follows = "flake-utils";
@@ -16,7 +15,6 @@
 
     # Pinned SDK used by harbor-rs's reproducible osxcross builder.
     harbor-macos-sdk-pin.url = "git+https://github.com/caniko/harbor-macos-sdk-pin.git";
-    rs-harbor-macos-sdk-pin.follows = "harbor-macos-sdk-pin";
 
     nix-appimage = {
       url = "github:ralismark/nix-appimage";
