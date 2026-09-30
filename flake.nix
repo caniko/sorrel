@@ -58,12 +58,10 @@
       simitConfig = {
         flake.mode = "custom";
         ci = {
+          platform = "github";
+          provider = "actions";
           runtime = "nix";
-          # Every generated step invokes the Nix development environment.  It
-          # therefore needs the trusted runner; keeping the mapping explicit
-          # preserves simit's per-step routing contract without dispatching
-          # `nix develop` to the bare atlas image.
-          runner = "atlas-nix-trusted";
+          runner = "ubuntu-24.04";
           packages = [
             "sorrel"
             "sorrel-cache"
@@ -82,15 +80,6 @@
             token_secret = "CODEBERG_TOKEN";
             source_branch = "trunk";
             deploy_app = ".#deploy-pages";
-          };
-          step_runners = {
-            cargo-clippy = "atlas-nix-trusted";
-            cargo-doc = "atlas-nix-trusted";
-            cargo-fmt = "atlas-nix-trusted";
-            cargo-package = "atlas-nix-trusted";
-            cargo-test = "atlas-nix-trusted";
-            nix-check = "atlas-nix-trusted";
-            quality-tools = "atlas-nix-trusted";
           };
         };
         release = {
@@ -124,7 +113,10 @@
         overlays = [(import rust-overlay)];
       };
 
-      toolchain = harbor-rs.lib.mkToolchain {inherit pkgs; toolchainProfile = "nightly";};
+      toolchain = harbor-rs.lib.mkToolchain {
+        inherit pkgs;
+        toolchainProfile = "nightly";
+      };
       inherit (toolchain) craneLib rustToolchain;
       cross = harbor-rs.lib.mkCross {
         inherit pkgs system;
