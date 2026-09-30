@@ -113,7 +113,10 @@
         overlays = [(import rust-overlay)];
       };
 
-      toolchain = harbor-rs.lib.mkToolchain {inherit pkgs; toolchainProfile = "nightly";};
+      toolchain = harbor-rs.lib.mkToolchain {
+        inherit pkgs;
+        toolchainProfile = "nightly";
+      };
       inherit (toolchain) craneLib rustToolchain;
       cross = harbor-rs.lib.mkCross {
         inherit pkgs system;
