@@ -10,6 +10,9 @@
       fileset = pkgs.lib.fileset.maybeMissing (root + "/website");
     };
     nativeBuildInputs = [pkgs.zola];
+    # Zola constructs its data-loader HTTP client even for local templates.
+    # Supply the sandbox's trust roots through a store-backed certificate bundle.
+    SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
     phases = ["buildPhase" "installPhase"];
     buildPhase = ''
       cp -r --no-preserve=mode $src/website site
