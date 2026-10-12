@@ -1,5 +1,8 @@
 //! sorrel-ui: egui widgets bound to a generic `Session<P>`.
 
+// Native wgpu callbacks require deeper Send/Sync trait evaluation.
+#![recursion_limit = "256"]
+
 pub mod app;
 pub mod intent;
 pub mod selection;

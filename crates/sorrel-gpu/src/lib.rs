@@ -13,6 +13,9 @@
 //! UI bootstrap should construct the context from the eframe-supplied
 //! `RenderState` so we don't pay for a second GPU adapter.
 
+// wgpu's native device graph needs this depth for Send/Sync trait evaluation.
+#![recursion_limit = "256"]
+
 use std::sync::Arc;
 
 pub mod cmr;

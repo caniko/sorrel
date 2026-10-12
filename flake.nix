@@ -2,26 +2,23 @@
   description = "Sorrel — spike-sorting curation GUI";
 
   inputs = {
-    harbor-rs.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk&rev=ed89d0b13fc61dd1b2217bf4bba97f32cec27ba7";
+    harbor.url = "git+https://github.com/caniko/harbor.git?ref=feat/harbor-monorepo-components&rev=e8b1996580e4ecd51dd402edf4a16d9df88e3a1b";
 
     simit = {
-      url = "git+https://github.com/caniko/simit.git?ref=trunk";
+      url = "git+https://github.com/caniko/simit.git?ref=trunk&rev=532a5830057506586ffc94f4dd2dc66783e6842c";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
       inputs.flake-utils.follows = "flake-utils";
       inputs.plinth.follows = "plinth";
     };
 
-    # Pinned SDK used by harbor-rs's reproducible osxcross builder.
-    harbor-macos-sdk-pin.url = "git+https://github.com/caniko/harbor-macos-sdk-pin.git";
-
     nix-appimage = {
       url = "github:ralismark/nix-appimage";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    nixpkgs.follows = "harbor-rs/nixpkgs";
-    rust-overlay.follows = "harbor-rs/rust-overlay";
+    nixpkgs.follows = "harbor/nixpkgs";
+    rust-overlay.follows = "harbor/rust-overlay";
     flake-utils.url = "github:numtide/flake-utils";
     treefmt-nix = {
       url = "github:numtide/treefmt-nix";
@@ -40,9 +37,8 @@
   outputs = {
     self,
     nixpkgs,
-    harbor-rs,
+    harbor,
     simit,
-    harbor-macos-sdk-pin,
     nix-appimage,
     flake-utils,
     rust-overlay,
@@ -59,11 +55,9 @@
         flake.mode = "custom";
         ci = {
           runtime = "nix";
-          # Every generated step invokes the Nix development environment.  It
-          # therefore needs the trusted runner; keeping the mapping explicit
-          # preserves simit's per-step routing contract without dispatching
-          # `nix develop` to the bare atlas image.
-          runner = "atlas-nix-trusted";
+          provider = "actions";
+          platform = "github";
+          runner = "ubuntu-24.04";
           packages = [
             "sorrel"
             "sorrel-cache"
@@ -79,30 +73,21 @@
           pages = {
             repo = "caniko/sorrel";
             site_output = ".#site";
-            token_secret = "CODEBERG_TOKEN";
+            token_secret = "GITHUB_TOKEN";
             source_branch = "trunk";
             deploy_app = ".#deploy-pages";
-          };
-          step_runners = {
-            cargo-clippy = "atlas-nix-trusted";
-            cargo-doc = "atlas-nix-trusted";
-            cargo-fmt = "atlas-nix-trusted";
-            cargo-package = "atlas-nix-trusted";
-            cargo-test = "atlas-nix-trusted";
-            nix-check = "atlas-nix-trusted";
-            quality-tools = "atlas-nix-trusted";
           };
         };
         release = {
           publish.enforcement = "activated-remote";
           smoke.command = "nix run .#release-smoke --";
-          codeberg = {
+          github = {
             repo = "caniko/sorrel";
             target_branch = "trunk";
-            token_secret = "CODEBERG_TOKEN";
+            token_secret = "GITHUB_TOKEN";
           };
           artifacts = {
-            runner = "atlas-nix-trusted";
+            runner = "ubuntu-24.04";
             version_attr = "sorrel";
             substituters = [
               "https://attic.candee.baby/canix"
@@ -119,20 +104,28 @@
       };
     }
     // flake-utils.lib.eachDefaultSystem (system: let
-      pkgs = import nixpkgs {
-        inherit system;
-        overlays = [(import rust-overlay)];
-      };
+      pkgs =
+        import (
+          if system == "x86_64-darwin"
+          then harbor.inputs.nixpkgs-darwin
+          else nixpkgs
+        ) {
+          inherit system;
+          overlays = [(import rust-overlay)];
+        };
 
-      toolchain = harbor-rs.lib.mkToolchain {inherit pkgs; toolchainProfile = "nightly";};
-      inherit (toolchain) craneLib rustToolchain;
-      cross = harbor-rs.lib.mkCross {
-        inherit pkgs system;
-        macosSdkStorePath = harbor-macos-sdk-pin.storePath;
-        macosSdkOutputHash = harbor-macos-sdk-pin.outputHash;
-        osxSdkVersion = harbor-macos-sdk-pin.sdkVersion;
+      toolchain = harbor.lib.rust.mkToolchain {
+        inherit pkgs;
+        toolchainProfile = "nightly";
       };
-      cargoConfig = harbor-rs.lib.mkCargoConfig {inherit pkgs;};
+      inherit (toolchain) craneLib rustToolchain;
+      cross = harbor.lib.rust.mkCross {
+        inherit pkgs system;
+        macosSdkStorePath = harbor.lib.pins.macosSdk.storePath;
+        macosSdkOutputHash = harbor.lib.pins.macosSdk.outputHash;
+        osxSdkVersion = harbor.lib.pins.macosSdk.sdkVersion;
+      };
+      cargoConfig = harbor.lib.rust.mkCargoConfig {inherit pkgs;};
 
       src = pkgs.lib.cleanSourceWith {
         src = ./.;
@@ -141,7 +134,16 @@
           || pkgs.lib.hasSuffix ".wgsl" path;
       };
       treefmtEval = treefmt-nix.lib.evalModule pkgs (import ./nix/treefmt.nix);
-      pre-commit-check = git-hooks.lib.${system}.run {
+      gitHooks =
+        if system == "x86_64-darwin"
+        then
+          import "${git-hooks}/nix" {
+            nixpkgs = harbor.inputs.nixpkgs-darwin;
+            inherit system;
+            isFlakes = true;
+          }
+        else git-hooks.lib.${system};
+      pre-commit-check = gitHooks.run {
         src = ./.;
         hooks = import ./nix/pre-commit.nix {
           inherit pkgs;
@@ -159,7 +161,7 @@
       sorrelHdf5 = rustPackages.sorrelHdf5 or null;
 
       sorrelVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
-      crossSorrelPackages = harbor-rs.lib.mkCrossPackages {
+      crossSorrelPackages = harbor.lib.rust.mkCrossPackages {
         inherit pkgs craneLib cross;
         pname = "sorrel";
         targets = ["aarch64-linux" "windows" "darwin-aarch64"];
@@ -189,7 +191,7 @@
         };
       };
 
-      sorrelAppImage = harbor-rs.lib.mkAppImage {
+      sorrelAppImage = harbor.lib.rust.mkAppImage {
         inherit system nix-appimage;
         pname = "sorrel";
         version = sorrelVersion;
@@ -230,8 +232,21 @@
         };
 
       devShells = import ./nix/devshell.nix {
-        inherit pkgs harbor-rs craneLib cross cargoConfig deps;
-        simit = simit.packages.${system}.default;
+        inherit pkgs harbor craneLib cross cargoConfig deps;
+        # The current Simit flake omits Intel macOS. Build its accepted source
+        # with this platform's compatible package set for the editor shell.
+        simit =
+          if system == "x86_64-darwin"
+          then
+            craneLib.buildPackage {
+              pname = "simit";
+              version = (builtins.fromTOML (builtins.readFile (simit + "/Cargo.toml"))).package.version;
+              src = simit;
+              cargoExtraArgs = "--locked --bin simit";
+              strictDeps = true;
+              doCheck = false;
+            }
+          else simit.packages.${system}.default;
         checks = self.checks.${system};
         preCommitEnabledPackages = pre-commit-check.enabledPackages;
         shellHook = pre-commit-check.shellHook;
@@ -244,9 +259,13 @@
           type = "app";
           program = "${sorrel}/bin/sorrel";
         };
-        deploy-pages = plinth.lib.${system}.mkDeployPagesApp {
-          domain = "sorrel.tartanoglu.com";
-        };
+        deploy-pages =
+          (import "${plinth}/nix/project-site.nix" {
+            inherit pkgs;
+            inherit (pkgs) lib;
+          }).mkDeployPagesApp {
+            domain = "sorrel.tartanoglu.com";
+          };
         release-smoke = {
           type = "app";
           program = "${releaseSmoke}/bin/sorrel-release-smoke";

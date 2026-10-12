@@ -1,6 +1,6 @@
 {
   pkgs,
-  harbor-rs,
+  harbor,
   craneLib,
   cross,
   cargoConfig,
@@ -19,7 +19,7 @@
     }
     else {};
 in
-  (harbor-rs.lib.mkDevShells {
+  (harbor.lib.rust.mkDevShells {
     inherit pkgs cross cargoConfig craneLib checks;
 
     pkgConfigDeps = buildInputs;
@@ -32,10 +32,9 @@ in
         rust-analyzer
         simit
         python3
-        xdotool
-        xorg.xorgserver
         zola
       ]
+      ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.xdotool pkgs.xorg-server]
       ++ hdf5Packages
       ++ preCommitEnabledPackages
       ++ buildInputs
@@ -50,7 +49,7 @@ in
     '';
   })
   // {
-    docs = harbor-rs.lib.mkDocsShell {
+    docs = harbor.lib.rust.mkDocsShell {
       inherit pkgs cross cargoConfig craneLib checks;
       pkgConfigDeps = buildInputs;
       packages = with pkgs;
