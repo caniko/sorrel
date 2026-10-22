@@ -1,5 +1,9 @@
 //! sorrel-ui: egui widgets bound to a generic `Session<P>`.
 
+// wgpu's `Device: Send` proof nests deeper than the default 128 on current
+// nightlies (future-compat lint `recursion_depth_exceeding_limit`).
+#![recursion_limit = "256"]
+
 pub mod app;
 pub mod intent;
 pub mod selection;

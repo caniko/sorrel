@@ -13,6 +13,10 @@
 //! UI bootstrap should construct the context from the eframe-supplied
 //! `RenderState` so we don't pay for a second GPU adapter.
 
+// wgpu's `Device: Send` proof nests deeper than the default 128 on current
+// nightlies (future-compat lint `recursion_depth_exceeding_limit`).
+#![recursion_limit = "256"]
+
 use std::sync::Arc;
 
 pub mod cmr;
