@@ -7,15 +7,7 @@
     enable = true;
     name = "treefmt";
     package = treefmtWrapper;
-    entry = "${treefmtWrapper}/bin/treefmt --fail-on-change";
-    pass_filenames = false;
-  };
-
-  cargo-fmt = {
-    enable = true;
-    name = "cargo fmt";
-    entry = "cargo fmt --all -- --check";
-    extraPackages = pkgs.lib.optional (rustToolchain != null) rustToolchain;
+    entry = "${treefmtWrapper}/bin/treefmt --ci";
     pass_filenames = false;
   };
 

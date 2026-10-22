@@ -10,7 +10,7 @@
   preCommitEnabledPackages ? [],
   shellHook ? "",
 }: let
-  inherit (deps) buildInputs nativeBuildInputs runtimeLibs hdf5C;
+  inherit (deps) buildInputs runtimeLibs hdf5C;
   hdf5Packages = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.hdf5];
   hdf5Env =
     if pkgs.stdenv.hostPlatform.isLinux
@@ -29,7 +29,6 @@ in
         imagemagick
         mdbook
         pre-commit
-        rust-analyzer
         simit
         python3
         xdotool
@@ -38,8 +37,7 @@ in
       ]
       ++ hdf5Packages
       ++ preCommitEnabledPackages
-      ++ buildInputs
-      ++ nativeBuildInputs;
+      ++ buildInputs;
 
     extraEnv = {LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;} // hdf5Env;
 
@@ -58,13 +56,11 @@ in
           cargo-nextest
           mdbook
           pre-commit
-          rust-analyzer
           simit
         ]
         ++ hdf5Packages
         ++ preCommitEnabledPackages
-        ++ buildInputs
-        ++ nativeBuildInputs;
+        ++ buildInputs;
       extraEnv = {LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;} // hdf5Env;
       extraShellHook = ''
         ${shellHook}

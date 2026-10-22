@@ -2,7 +2,7 @@
   description = "Sorrel — spike-sorting curation GUI";
 
   inputs = {
-    harbor-rs.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk&rev=ed89d0b13fc61dd1b2217bf4bba97f32cec27ba7";
+    harbor-rs.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk";
 
     simit = {
       url = "git+https://github.com/caniko/simit.git?ref=trunk";
@@ -23,14 +23,8 @@
     nixpkgs.follows = "harbor-rs/nixpkgs";
     rust-overlay.follows = "harbor-rs/rust-overlay";
     flake-utils.url = "github:numtide/flake-utils";
-    treefmt-nix = {
-      url = "github:numtide/treefmt-nix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    git-hooks = {
-      url = "github:cachix/git-hooks.nix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    treefmt-nix.follows = "harbor-rs/treefmt-nix";
+    git-hooks.follows = "harbor-rs/git-hooks";
     plinth = {
       url = "git+https://github.com/caniko/plinth.git";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -118,13 +112,16 @@
         };
       };
     }
-    // flake-utils.lib.eachDefaultSystem (system: let
+    // flake-utils.lib.eachSystem ["x86_64-linux" "aarch64-linux" "aarch64-darwin"] (system: let
       pkgs = import nixpkgs {
         inherit system;
         overlays = [(import rust-overlay)];
       };
 
-      toolchain = harbor-rs.lib.mkToolchain {inherit pkgs; toolchainProfile = "nightly";};
+      toolchain = harbor-rs.lib.mkToolchain {
+        inherit pkgs;
+        toolchainProfile = "nightly";
+      };
       inherit (toolchain) craneLib rustToolchain;
       cross = harbor-rs.lib.mkCross {
         inherit pkgs system;
@@ -140,7 +137,7 @@
           (craneLib.filterCargoSources path type)
           || pkgs.lib.hasSuffix ".wgsl" path;
       };
-      treefmtEval = treefmt-nix.lib.evalModule pkgs (import ./nix/treefmt.nix);
+      treefmtEval = treefmt-nix.lib.evalModule pkgs (import ./nix/treefmt.nix {rustfmtPackage = rustToolchain;});
       pre-commit-check = git-hooks.lib.${system}.run {
         src = ./.;
         hooks = import ./nix/pre-commit.nix {
@@ -223,7 +220,7 @@
 
       checks =
         (import ./nix/checks.nix {
-          inherit craneLib src commonArgs cargoArtifacts sorrel;
+          inherit craneLib commonArgs cargoArtifacts sorrel;
         })
         // {
           formatting = treefmtEval.config.build.check self;

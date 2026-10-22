@@ -1,6 +1,5 @@
 {
   craneLib,
-  src,
   commonArgs,
   cargoArtifacts,
   sorrel,
@@ -12,6 +11,4 @@
       inherit cargoArtifacts;
       cargoClippyExtraArgs = "--workspace --all-targets -- --deny warnings";
     });
-
-  fmt = craneLib.cargoFmt {inherit src;};
 }
