@@ -9,7 +9,8 @@
       inherit root;
       fileset = pkgs.lib.fileset.maybeMissing (root + "/website");
     };
-    nativeBuildInputs = [pkgs.zola];
+    # zola initialises its HTTP client at startup, even without load_data.
+    nativeBuildInputs = [pkgs.zola pkgs.cacert];
     phases = ["buildPhase" "installPhase"];
     buildPhase = ''
       cp -r --no-preserve=mode $src/website site
