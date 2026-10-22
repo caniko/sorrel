@@ -104,6 +104,8 @@
             runner = "ubuntu-24.04";
             version_attr = "sorrel";
             prebuild_binaries = true;
+            # Pull-only credential for the private macOS SDK cache (darwin archive).
+            netrc_secret = "HARBOR_MACOS_SDK_NETRC";
             substituters = [
               "https://attic.candee.baby/canix"
               "https://attic.candee.baby/harbor-macos-sdk"

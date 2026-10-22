@@ -5,7 +5,7 @@
 //! memory. Practical channel-count cap is 512 (Neuropixels = 384) — beyond
 //! that the caller should fall back to CPU.
 
-use crate::{GpuContext, block_on_map};
+use crate::{block_on_map, GpuContext};
 use bytemuck::{Pod, Zeroable};
 use std::num::NonZeroU64;
 

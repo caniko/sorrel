@@ -1,13 +1,13 @@
-use crate::CacheKey;
 use crate::gc::GcConfig;
+use crate::CacheKey;
 use memmap2::Mmap;
 use rkyv::{
-    Archive, Portable, Serialize,
     api::high::{HighSerializer, HighValidator},
     bytecheck::CheckBytes,
     rancor::Error as RkyvError,
     ser::allocator::ArenaHandle,
     util::AlignedVec,
+    Archive, Portable, Serialize,
 };
 use std::{
     fs::{self, File, OpenOptions},

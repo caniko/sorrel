@@ -1035,11 +1035,11 @@
         "treefmt-nix": "treefmt-nix_3"
       },
       "locked": {
-        "lastModified": 1792313234,
-        "narHash": "sha256-wTETbg6laMOQllns0zBsJzx9u3An1eOSaqK4Jt9wK3g=",
+        "lastModified": 1792668407,
+        "narHash": "sha256-OSKKMGjZwlZBKFFPyMLE6uz+zpcVDO8RRyQu/O65o88=",
         "ref": "trunk",
-        "rev": "fb035f4b1ec7e82fcae22a1a1cc74c1221a9310c",
-        "revCount": 272,
+        "rev": "db4e78aaeedd160844d2a883a7c65c99d394e19d",
+        "revCount": 275,
         "type": "git",
         "url": "https://github.com/caniko/harbor-rs.git"
       },
@@ -2205,11 +2205,11 @@
         "treefmt-nix": "treefmt-nix_8"
       },
       "locked": {
-        "lastModified": 1792621914,
-        "narHash": "sha256-Kk4Jf8jLR47d0USs3vJAAettLPKTCJhB0D7cILBsUF0=",
+        "lastModified": 1792668402,
+        "narHash": "sha256-uKQB0fadtC1nFBp/UvGnWM/Ww47IpVqXAmlKPiZ/0xI=",
         "ref": "trunk",
-        "rev": "de3325be17104fbdb0d70f1da38149d4016f1790",
-        "revCount": 845,
+        "rev": "deadf786decd8c3bdd6b3e3734b95f7535dc3dca",
+        "revCount": 850,
         "type": "git",
         "url": "https://github.com/caniko/simit.git"
       },
