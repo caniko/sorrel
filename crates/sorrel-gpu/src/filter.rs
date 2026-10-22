@@ -5,7 +5,7 @@
 //! channel. State is kept in registers (not workgroup memory) so the
 //! filter is bit-identical to the single-channel CPU recursion.
 
-use crate::{GpuContext, block_on_map};
+use crate::{block_on_map, GpuContext};
 use bytemuck::{Pod, Zeroable};
 use sorrel_compute::Biquad;
 use std::num::NonZeroU64;
