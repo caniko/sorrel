@@ -39,6 +39,9 @@ pub struct TracePipeline {
     uniform_buffer: wgpu::Buffer,
     /// Capacity of `vertex_buffer` in bytes; grown on demand.
     vertex_capacity_bytes: u64,
+    /// Generation of the vertex data currently in `vertex_buffer`; the
+    /// upload is skipped while the caller's generation matches.
+    uploaded_generation: Option<u64>,
 }
 
 impl TracePipeline {
@@ -155,36 +158,42 @@ impl TracePipeline {
             vertex_buffer,
             uniform_buffer,
             vertex_capacity_bytes: INITIAL_VERTEX_CAPACITY * VERTEX_SIZE,
+            uploaded_generation: None,
         }
     }
 
     /// Upload vertex + uniform data for the next frame. Grows the vertex
-    /// buffer if the new data doesn't fit.
+    /// buffer if the new data doesn't fit; skips the vertex upload while
+    /// `generation` is unchanged.
     fn upload(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         vertices: &[TraceVertex],
+        generation: u64,
         uniforms: TraceUniforms,
     ) {
-        let bytes = bytemuck::cast_slice(vertices);
-        let needed = bytes.len() as u64;
-        if needed > self.vertex_capacity_bytes {
-            // Grow geometrically so frequent upsizes don't churn the GPU.
-            let mut new_cap = self.vertex_capacity_bytes.max(VERTEX_SIZE);
-            while new_cap < needed {
-                new_cap *= 2;
+        if self.uploaded_generation != Some(generation) {
+            let bytes = bytemuck::cast_slice(vertices);
+            let needed = bytes.len() as u64;
+            if needed > self.vertex_capacity_bytes {
+                // Grow geometrically so frequent upsizes don't churn the GPU.
+                let mut new_cap = self.vertex_capacity_bytes.max(VERTEX_SIZE);
+                while new_cap < needed {
+                    new_cap *= 2;
+                }
+                self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("sorrel.trace.verts"),
+                    size: new_cap,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.vertex_capacity_bytes = new_cap;
             }
-            self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("sorrel.trace.verts"),
-                size: new_cap,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.vertex_capacity_bytes = new_cap;
-        }
-        if !bytes.is_empty() {
-            queue.write_buffer(&self.vertex_buffer, 0, bytes);
+            if !bytes.is_empty() {
+                queue.write_buffer(&self.vertex_buffer, 0, bytes);
+            }
+            self.uploaded_generation = Some(generation);
         }
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -209,7 +218,9 @@ impl TracePipeline {
 /// only; `TracePipeline` (in `CallbackResources`) owns the persistent
 /// shader/buffer state.
 pub struct TraceCallback {
-    pub vertices: Vec<TraceVertex>,
+    pub vertices: std::sync::Arc<Vec<TraceVertex>>,
+    /// Bumped by the caller whenever `vertices` changed.
+    pub generation: u64,
     pub n_channels: u32,
     pub points_per_channel: u32,
     pub t0: f32,
@@ -246,7 +257,7 @@ impl egui_wgpu::CallbackTrait for TraceCallback {
             amp_scale: self.amp_scale,
             color: self.color,
         };
-        pipeline.upload(device, queue, &self.vertices, uniforms);
+        pipeline.upload(device, queue, &self.vertices, self.generation, uniforms);
         Vec::new()
     }
 

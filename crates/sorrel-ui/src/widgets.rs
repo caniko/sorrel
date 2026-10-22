@@ -1,16 +1,20 @@
 use crate::selection::SelectionSet;
+use crate::theme::{selection_colour, Theme};
+use crate::views::draw_axes;
 use crate::wgpu_trace::TraceCallback;
-use egui::{Color32, Rect, Sense, Stroke, Ui, Vec2};
+use egui::{Color32, Sense, Stroke, Ui, Vec2};
 use sorrel_compute::quality_breakdown;
 use sorrel_data::Session;
-use sorrel_io::{ClusterId, DataProvider};
+use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 use sorrel_render::{
-    build_trace_vertices_cfg, build_trace_vertices_gpu, GpuTracePreproc, TracePreproc, TraceVertex,
+    build_trace_vertices_cfg_shanked, build_trace_vertices_gpu_shanked, GpuTracePreproc,
+    TracePreproc, TraceVertex,
 };
+use std::sync::Arc;
 
 /// Sortable column on the cluster table. The widget mutates the table state
 /// on header clicks, so this stays in lockstep with the column rendering.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ClusterColumn {
     Id,
     SpikeCount,
@@ -33,9 +37,16 @@ pub struct ClusterTableState {
     /// snappy even on 1k-cluster recordings. Indexed by `ClusterId`.
     /// Recomputed when [`Self::quality_key`] no longer matches.
     quality_cache: Vec<f32>,
-    /// Snapshot of `(history_len, redo_len, n_clusters)` at the time the
-    /// cache was built. Any change invalidates the whole cache.
-    quality_key: (usize, usize, u32),
+    /// Curation version at the time the cache was built. Any change
+    /// invalidates the whole cache.
+    quality_key: u64,
+    /// The rows as last drawn — sorted and filtered. Keyboard navigation
+    /// and Shift-click walk this, so "next" means the next row the user
+    /// sees, not the next cluster id.
+    pub visible: Vec<ClusterId>,
+    /// Anchor the table last scrolled to; scroll again only when it
+    /// changes so the wheel isn't fought every frame.
+    last_scrolled: Option<ClusterId>,
 }
 
 impl Default for ClusterTableState {
@@ -47,7 +58,9 @@ impl Default for ClusterTableState {
             hide_empty: false,
             hide_noise: false,
             quality_cache: Vec::new(),
-            quality_key: (usize::MAX, usize::MAX, u32::MAX),
+            quality_key: u64::MAX,
+            visible: Vec::new(),
+            last_scrolled: None,
         }
     }
 }
@@ -55,12 +68,8 @@ impl Default for ClusterTableState {
 impl ClusterTableState {
     /// Refresh the quality cache if the curation history has moved.
     fn ensure_quality<P: DataProvider>(&mut self, session: &Session<P>) {
-        let key = (
-            session.history_len(),
-            session.redo_len(),
-            session.n_clusters(),
-        );
-        if key == self.quality_key && !self.quality_cache.is_empty() {
+        let key = session.version();
+        if key == self.quality_key {
             return;
         }
         let sr = session.provider.sample_rate().max(1.0);
@@ -132,6 +141,7 @@ pub fn cluster_table<P, F>(
     let refractory_samples = (session.provider.sample_rate() * 0.001).round() as u64;
 
     state.ensure_quality(session);
+    let theme = Theme::from_ui(ui);
 
     // Filter strip above the table.
     ui.horizontal(|ui| {
@@ -139,12 +149,17 @@ pub fn cluster_table<P, F>(
         ui.add(
             egui::TextEdit::singleline(&mut state.filter_text)
                 .desired_width(60.0)
-                .hint_text(""),
+                .hint_text("id"),
         );
         ui.checkbox(&mut state.hide_empty, "hide empty");
         ui.checkbox(&mut state.hide_noise, "hide noise");
-        let total_visible = "(filter applied)";
-        ui.weak(total_visible);
+        // `visible` is last frame's list; one frame of lag is invisible.
+        ui.weak(format!(
+            "{} / {}",
+            state.visible.len(),
+            session.n_clusters()
+        ))
+        .on_hover_text("visible / total clusters");
     });
 
     // Compute the list of visible cluster ids per the filter, then sort.
@@ -168,18 +183,19 @@ pub fn cluster_table<P, F>(
         .collect();
 
     let cmp_key = |c: ClusterId| -> (i64, f64) {
-        // Returns a (rank, tiebreak_id) pair so equal sort keys land in
-        // ascending id order.
-        let amps = session.spike_amplitudes(c);
-        let amp_mean = if amps.is_empty() {
-            f64::NEG_INFINITY
-        } else {
-            mean_amplitude(amps) as f64
-        };
+        // Returns `(id, primary)`; the id is the tie-breaker so equal sort
+        // keys land in ascending id order.
         let primary = match state.sort_by {
             ClusterColumn::Id => c.as_f64(),
             ClusterColumn::SpikeCount => session.spike_times(c).len() as f64,
-            ClusterColumn::Amplitude => amp_mean,
+            ClusterColumn::Amplitude => {
+                let amps = session.spike_amplitudes(c);
+                if amps.is_empty() {
+                    f64::NEG_INFINITY
+                } else {
+                    mean_amplitude(amps) as f64
+                }
+            }
             ClusterColumn::IsiViolations => {
                 isi_violations(session.spike_times(c), refractory_samples) as f64
             }
@@ -195,9 +211,6 @@ pub fn cluster_table<P, F>(
                 label_rank::<P, F>(&label_str, session.label(c).unwrap_or_default()) as f64
             }
         };
-        // Encode as (i64, f64) so we can sort with stable secondary on id.
-        // We pack the primary into f64 and use id as the tie-breaker
-        // (only matters when primary is equal across rows).
         (c.as_i64(), primary)
     };
 
@@ -219,70 +232,88 @@ pub fn cluster_table<P, F>(
         let mut text = label.to_string();
         if state.sort_by == col {
             text.push(' ');
-            text.push(if state.sort_descending { '▼' } else { '▲' });
+            text.push(if state.sort_descending { 'v' } else { '^' });
         }
         ui.add(egui::Label::new(egui::RichText::new(text).strong()).sense(Sense::click()))
     };
 
     let mut clicked: Option<ClusterColumn> = None;
 
-    TableBuilder::new(ui)
+    // Keep the keyboard anchor in view: scroll minimally (no alignment) and
+    // only when the anchor changed, so clicking a visible row or wheeling
+    // away from it never snaps the list.
+    let mut scroll_to: Option<usize> = None;
+    if let Some(anchor) = selection.anchor() {
+        if state.last_scrolled != Some(anchor) {
+            scroll_to = visible.iter().position(|&c| c == anchor);
+            state.last_scrolled = Some(anchor);
+        }
+    }
+
+    let headers: [(&str, ClusterColumn, &str); 6] = [
+        (
+            "ID",
+            ClusterColumn::Id,
+            "Cluster id. Swatch = colour in the plots.",
+        ),
+        ("# spikes", ClusterColumn::SpikeCount, "Spike count"),
+        ("amp", ClusterColumn::Amplitude, "Mean spike amplitude"),
+        (
+            "ISI<1ms",
+            ClusterColumn::IsiViolations,
+            "Inter-spike intervals under 1 ms (refractory violations)",
+        ),
+        (
+            "qual",
+            ClusterColumn::Quality,
+            "Composite quality 0–1: green ≥ 0.7, yellow ≥ 0.4, red below",
+        ),
+        (
+            "label",
+            ClusterColumn::Label,
+            "phy label: G/M/N/U keys relabel",
+        ),
+    ];
+
+    let mut table = TableBuilder::new(ui)
         .striped(true)
         .resizable(true)
-        .column(Column::auto().at_least(48.0))
-        .column(Column::auto().at_least(64.0))
-        .column(Column::auto().at_least(56.0))
-        .column(Column::auto().at_least(56.0))
+        .sense(Sense::click())
         .column(Column::auto().at_least(56.0))
         .column(Column::auto().at_least(64.0))
+        .column(Column::auto().at_least(56.0))
+        .column(Column::auto().at_least(56.0))
+        .column(Column::auto().at_least(56.0))
+        .column(Column::auto().at_least(64.0));
+    if let Some(row) = scroll_to {
+        table = table.scroll_to_row(row, None);
+    }
+    table
         .header(20.0, |mut h| {
-            h.col(|ui| {
-                if header_label(ui, "ID", ClusterColumn::Id, state).clicked() {
-                    clicked = Some(ClusterColumn::Id);
-                }
-            });
-            h.col(|ui| {
-                if header_label(ui, "# spikes", ClusterColumn::SpikeCount, state).clicked() {
-                    clicked = Some(ClusterColumn::SpikeCount);
-                }
-            });
-            h.col(|ui| {
-                if header_label(ui, "amp", ClusterColumn::Amplitude, state).clicked() {
-                    clicked = Some(ClusterColumn::Amplitude);
-                }
-            });
-            h.col(|ui| {
-                if header_label(ui, "ISI<1ms", ClusterColumn::IsiViolations, state).clicked() {
-                    clicked = Some(ClusterColumn::IsiViolations);
-                }
-            });
-            h.col(|ui| {
-                if header_label(ui, "qual", ClusterColumn::Quality, state).clicked() {
-                    clicked = Some(ClusterColumn::Quality);
-                }
-            });
-            h.col(|ui| {
-                if header_label(ui, "label", ClusterColumn::Label, state).clicked() {
-                    clicked = Some(ClusterColumn::Label);
-                }
-            });
+            for (label, col, tip) in headers {
+                h.col(|ui| {
+                    if header_label(ui, label, col, state)
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        clicked = Some(col);
+                    }
+                });
+            }
         })
         .body(|body| {
             body.rows(18.0, visible.len(), |mut row| {
                 let i = visible[row.index()];
-                let is_sel = selection.contains(i);
+                let slot = selection.iter().position(|&c| c == i);
+                row.set_selected(slot.is_some());
                 row.col(|ui| {
-                    let resp = ui.selectable_label(is_sel, format!("{i}"));
-                    if resp.clicked() {
-                        let mods = ui.ctx().input(|inp| inp.modifiers);
-                        if mods.command {
-                            selection.toggle(i);
-                        } else if mods.shift {
-                            selection.extend_to(i);
-                        } else {
-                            selection.replace(i);
+                    ui.horizontal(|ui| {
+                        if let Some(slot) = slot {
+                            let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                            ui.painter().rect_filled(r, 2.0, selection_colour(slot));
                         }
-                    }
+                        ui.label(format!("{i}"));
+                    });
                 });
                 row.col(|ui| {
                     ui.label(format!("{}", session.spike_times(i).len()));
@@ -302,29 +333,34 @@ pub fn cluster_table<P, F>(
                 row.col(|ui| {
                     let q = state.quality_for(i);
                     if q.is_finite() {
-                        // Colour-code: red below 0.4, yellow 0.4–0.7, green 0.7+.
-                        let colour = if q < 0.4 {
-                            Color32::from_rgb(225, 87, 89)
-                        } else if q < 0.7 {
-                            Color32::from_rgb(237, 201, 72)
-                        } else {
-                            Color32::from_rgb(89, 161, 79)
-                        };
-                        ui.colored_label(colour, format!("{q:.2}"));
+                        ui.colored_label(theme.quality_colour(q), format!("{q:.2}"));
                     } else {
                         ui.label("—");
                     }
                 });
                 row.col(|ui| {
-                    let lbl = session.label(i).unwrap_or_default();
-                    ui.label(label_str(&lbl));
+                    let lbl = label_str(&session.label(i).unwrap_or_default());
+                    ui.colored_label(theme.label_colour(lbl), lbl);
                 });
+                // Whole-row click (phy semantics): plain replaces,
+                // Cmd/Ctrl toggles, Shift extends in table order.
+                if row.response().clicked() {
+                    let mods = row.response().ctx.input(|inp| inp.modifiers);
+                    if mods.command {
+                        selection.toggle(i);
+                    } else if mods.shift {
+                        selection.extend_to(i, &visible);
+                    } else {
+                        selection.replace(i);
+                    }
+                }
             });
         });
 
     if let Some(col) = clicked {
         state.toggle_sort(col);
     }
+    state.visible = visible;
 }
 
 /// Map a label string into a stable sort rank — phy's display order: good,
@@ -343,9 +379,53 @@ where
     }
 }
 
+/// One selected cluster's spikes to mark on the trace.
+pub struct TraceMarker<'a> {
+    pub colour: Color32,
+    /// Sorted spike times (global samples).
+    pub times: &'a [SampleIndex],
+    /// Peak channel row to draw the tick on; `None` = full height.
+    pub channel: Option<usize>,
+}
+
+/// Navigation the user requested with the mouse on the trace.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TraceNav {
+    /// Pan in samples (positive = later in the recording).
+    pub pan: i64,
+    /// Factor to divide the window length by (`> 1` zooms in).
+    pub zoom: f32,
+    /// Horizontal fraction of the view the zoom should pivot around.
+    pub anchor: f32,
+}
+
+impl Default for TraceNav {
+    fn default() -> Self {
+        Self {
+            pan: 0,
+            zoom: 1.0,
+            anchor: 0.5,
+        }
+    }
+}
+
+/// Memo of the downsampled vertices for the current window, so the mmap
+/// read plus LTTB run once per change instead of every frame.
+#[derive(Default)]
+pub struct TraceCache {
+    /// `(window_start, window_len, target_points, hp bits, cmr, per-shank)`.
+    key: Option<(u64, u32, usize, Option<u32>, bool, bool)>,
+    verts: Arc<Vec<TraceVertex>>,
+    generation: u64,
+}
+
 /// Trace view. CPU runs LTTB to bound point count; GPU draws one line strip
 /// per channel via [`TraceCallback`] so we scale to Neuropixels-grade
 /// `n_channels × points_per_channel` without choking the egui painter.
+/// Selected clusters' spikes are ticked on their peak channel, the time
+/// axis is labelled, and the mouse pans (drag / wheel) and zooms
+/// (Ctrl-wheel / pinch).
+#[allow(clippy::too_many_arguments)]
 pub fn trace_view<P: DataProvider>(
     ui: &mut Ui,
     session: &Session<P>,
@@ -354,49 +434,93 @@ pub fn trace_view<P: DataProvider>(
     target_points: usize,
     cfg: TracePreproc,
     gpu: Option<&GpuTracePreproc>,
-) {
+    markers: &[TraceMarker<'_>],
+    shanks: &[u32],
+    cache: &mut TraceCache,
+) -> Option<TraceNav> {
+    let theme = Theme::from_ui(ui);
     let avail = ui.available_size();
-    let (rect, _resp) = ui.allocate_exact_size(avail, Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(avail, Sense::click_and_drag());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, Color32::from_gray(15));
+    painter.rect_filled(rect, 0.0, theme.plot_bg);
 
     let n_channels = session.provider.n_channels();
     if n_channels == 0 {
-        return;
+        return None;
     }
 
-    let window_start = sorrel_io::SampleIndex(window_start);
-    let verts: Vec<TraceVertex> = match gpu {
-        Some(g) => {
-            build_trace_vertices_gpu(session, window_start, window_len, target_points, cfg, g)
-        }
-        None => build_trace_vertices_cfg(session, window_start, window_len, target_points, cfg),
-    };
-    if verts.is_empty() {
+    let key = (
+        window_start,
+        window_len,
+        target_points,
+        cfg.hp().map(f32::to_bits),
+        cfg.has_cmr(),
+        !shanks.is_empty(),
+    );
+    // A remote guest's provider returns an empty window while the bytes
+    // are in flight; keep the key unset so the window is rebuilt once they
+    // land instead of caching the gap.
+    let fetching = session.provider.pending_fetches() > 0;
+    if cache.key != Some(key) || fetching {
+        let start = SampleIndex(window_start);
+        let verts = match gpu {
+            Some(g) => build_trace_vertices_gpu_shanked(
+                session,
+                start,
+                window_len,
+                target_points,
+                cfg,
+                g,
+                shanks,
+            ),
+            None => build_trace_vertices_cfg_shanked(
+                session,
+                start,
+                window_len,
+                target_points,
+                cfg,
+                shanks,
+            ),
+        };
+        cache.verts = Arc::new(verts);
+        cache.generation += 1;
+        cache.key = (!fetching).then_some(key);
+    }
+    if cache.verts.is_empty() {
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
             "no trace data",
             egui::FontId::proportional(14.0),
-            Color32::GRAY,
+            theme.caption,
         );
-        return;
+        return None;
     }
 
     // Each channel's strip is contiguous in the buffer; total len = n_channels * pts.
-    let points_per_channel = (verts.len() / n_channels as usize) as u32;
-    let t0 = verts.first().map(|v| v.pos[0]).unwrap_or(0.0);
-    let t1 = verts.last().map(|v| v.pos[0]).unwrap_or(t0 + 1.0);
+    let points_per_channel = (cache.verts.len() / n_channels as usize) as u32;
+    let t0 = cache.verts.first().map(|v| v.pos[0]).unwrap_or(0.0);
+    let t1 = cache.verts.last().map(|v| v.pos[0]).unwrap_or(t0 + 1.0);
     let t_span = (t1 - t0).max(1e-9);
 
-    // Channel separators painted on the egui side so they pick up theming.
-    for ch in 1..n_channels {
-        let y = rect.top() + rect.height() * ch as f32 / n_channels as f32;
-        painter.hline(
-            rect.x_range(),
-            y,
-            Stroke::new(0.5_f32, Color32::from_gray(40)),
-        );
+    // Channel separators + labels, painted on the egui side so they pick
+    // up theming. Labels thin out when rows get shorter than the text.
+    let row_h = rect.height() / n_channels as f32;
+    let label_every = (10.0 / row_h).ceil().max(1.0) as u32;
+    for ch in 0..n_channels {
+        let y = rect.top() + row_h * ch as f32;
+        if ch > 0 {
+            painter.hline(rect.x_range(), y, Stroke::new(0.5_f32, theme.grid));
+        }
+        if ch % label_every == 0 {
+            painter.text(
+                egui::pos2(rect.left() + 3.0, y + row_h * 0.5),
+                egui::Align2::LEFT_CENTER,
+                format!("{ch}"),
+                egui::FontId::monospace(9.0),
+                theme.caption,
+            );
+        }
     }
 
     // Amplitude scale: take 80% of a channel's row, normalised by full-scale.
@@ -406,21 +530,86 @@ pub fn trace_view<P: DataProvider>(
     let amp_scale = (row_clip_height * 0.4) / full_scale;
 
     let callback = TraceCallback {
-        vertices: verts,
+        vertices: Arc::clone(&cache.verts),
+        generation: cache.generation,
         n_channels,
         points_per_channel,
         t0,
         t_span,
         amp_scale,
-        color: [0.71, 0.86, 1.0, 1.0], // matches the previous Color32::from_rgb(180, 220, 255)
+        color: if theme.dark {
+            [0.71, 0.86, 1.0, 1.0]
+        } else {
+            [0.15, 0.3, 0.55, 1.0]
+        },
     };
     ui.painter()
         .add(eframe::egui_wgpu::Callback::new_paint_callback(
             rect, callback,
         ));
 
-    let _ = Vec2::ZERO;
-    let _ = Rect::NOTHING;
+    // Spike markers for the selection: a tick on the peak-channel row.
+    let w_end = window_start + window_len as u64;
+    let mut n_marked = 0usize;
+    for m in markers {
+        let lo = m.times.partition_point(|t| t.0 < window_start);
+        let hi = m.times.partition_point(|t| t.0 < w_end);
+        let stroke = Stroke::new(1.0_f32, m.colour.gamma_multiply(0.85));
+        for t in &m.times[lo..hi] {
+            let x = rect.left() + (t.0 - window_start) as f32 / window_len as f32 * rect.width();
+            let (y0, y1) = match m.channel {
+                Some(ch) if (ch as u32) < n_channels => {
+                    let y = rect.top() + row_h * ch as f32;
+                    (y, y + row_h)
+                }
+                _ => (rect.top(), rect.bottom()),
+            };
+            painter.line_segment([egui::pos2(x, y0), egui::pos2(x, y1)], stroke);
+            n_marked += 1;
+        }
+    }
+
+    let sr = session.provider.sample_rate().max(1.0);
+    draw_axes(
+        &painter,
+        rect,
+        (window_start as f32 / sr, w_end as f32 / sr),
+        (0.0, 0.0),
+        " s",
+        "",
+        &theme,
+    );
+    if !markers.is_empty() {
+        painter.text(
+            rect.right_top() + egui::vec2(-4.0, 2.0),
+            egui::Align2::RIGHT_TOP,
+            format!("{n_marked} selected spikes in window"),
+            egui::FontId::proportional(10.0),
+            theme.caption,
+        );
+    }
+
+    // Mouse navigation: drag or wheel pans, Ctrl-wheel / pinch zooms
+    // around the pointer.
+    let mut nav = TraceNav::default();
+    if resp.dragged() {
+        nav.pan -= (resp.drag_delta().x / rect.width() * window_len as f32) as i64;
+    }
+    if resp.hovered() {
+        let (scroll, zoom, pointer) =
+            ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.pointer.hover_pos()));
+        let d = if scroll.x.abs() > scroll.y.abs() {
+            scroll.x
+        } else {
+            scroll.y
+        };
+        nav.pan -= (d / rect.width() * window_len as f32) as i64;
+        nav.zoom = zoom;
+        if let Some(p) = pointer {
+            nav.anchor = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        }
+    }
+    (nav.pan != 0 || nav.zoom != 1.0).then_some(nav)
 }
 
 #[cfg(test)]

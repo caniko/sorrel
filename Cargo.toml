@@ -63,6 +63,7 @@ eframe = { version = "0.34.2", default-features = false, features = [
 ] }
 egui_extras = "0.34.2"
 egui-wgpu = "0.34.2"
+egui_tiles = "0.15"
 tempfile = "3"
 rayon = "1"
 pollster = "0.3"

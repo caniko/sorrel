@@ -6,7 +6,11 @@
 
 pub mod app;
 pub mod intent;
+pub mod jobs;
+pub mod layout;
+pub mod prefs;
 pub mod selection;
+pub mod theme;
 pub mod views;
 pub mod wgpu_raster;
 pub mod wgpu_trace;
@@ -14,7 +18,11 @@ pub mod widgets;
 
 pub use app::SorrelApp;
 pub use intent::Intent;
+pub use jobs::{Job, JobCtx, Memo};
+pub use layout::Pane;
+pub use prefs::UiPrefs;
 pub use selection::SelectionSet;
+pub use theme::{cluster_colour, selection_colour, Theme};
 pub use views::{FeatureViewState, RasterCache, WaveformCache};
 pub use wgpu_raster::RasterPipeline;
 pub use wgpu_trace::{TraceCallback, TracePipeline};

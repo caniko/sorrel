@@ -21,7 +21,8 @@ use sorrel_io::ClusterId;
 /// s.toggle(ClusterId(7));                         // ctrl-click
 /// assert_eq!(s.as_slice(), &[ClusterId(3), ClusterId(7)]);
 ///
-/// s.extend_to(ClusterId(5));                      // shift-click — range from anchor (7)
+/// let order: Vec<ClusterId> = (0..10).map(ClusterId).collect(); // table rows
+/// s.extend_to(ClusterId(5), &order);              // shift-click — range from anchor (7)
 /// assert_eq!(s.as_slice(), &[ClusterId(5), ClusterId(6), ClusterId(7)]);
 ///
 /// s.replace(ClusterId(99));                       // plain click
@@ -108,42 +109,91 @@ impl SelectionSet {
     }
 
     /// Replace the selection with the inclusive range between the current
-    /// anchor and `c`. With no anchor, behaves like `replace`.
-    pub fn extend_to(&mut self, c: ClusterId) {
+    /// anchor and `c`, walking `order` — the cluster table's visible rows in
+    /// their sorted, filtered order — so Shift-click selects what the user
+    /// sees between the two rows. Falls back to a raw-id range when either
+    /// end is not in `order`. With no anchor, behaves like `replace`.
+    pub fn extend_to(&mut self, c: ClusterId, order: &[ClusterId]) {
         let Some(anchor) = self.anchor else {
             return self.replace(c);
         };
-        let (lo, hi) = if anchor <= c {
-            (anchor, c)
-        } else {
-            (c, anchor)
-        };
+        let pos = |id| order.iter().position(|&x| x == id);
         self.items.clear();
-        for id in lo.0..=hi.0 {
-            self.items.push(ClusterId(id));
+        match (pos(anchor), pos(c)) {
+            (Some(a), Some(b)) => {
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                self.items.extend_from_slice(&order[lo..=hi]);
+            }
+            _ => {
+                let (lo, hi) = if anchor <= c {
+                    (anchor, c)
+                } else {
+                    (c, anchor)
+                };
+                self.items.extend((lo.0..=hi.0).map(ClusterId));
+            }
         }
         // Anchor is preserved so consecutive extend_to operations all pivot
         // around the original click — same as phy.
     }
 
-    /// Move the anchor by `delta` clusters (clamped to `[0, n_clusters)`)
-    /// and replace the selection with the new single id. Used by J/K /
-    /// arrow keyboard navigation.
-    pub fn bump(&mut self, delta: i32, n_clusters: u32) {
-        if n_clusters == 0 {
+    /// Move the anchor by `delta` rows of `order` (clamped to its bounds)
+    /// and replace the selection with that single id. Used by J/K / arrow
+    /// keyboard navigation, so "next" means the next *visible* table row.
+    /// An empty `order` clears the selection; an anchor missing from
+    /// `order` (filtered out) restarts from the first row.
+    pub fn bump(&mut self, delta: i32, order: &[ClusterId]) {
+        if order.is_empty() {
             self.clear();
             return;
         }
-        let cur = self.anchor.unwrap_or(ClusterId(0)).as_i64();
-        let max = (n_clusters - 1) as i64;
-        let next = ClusterId((cur + delta as i64).clamp(0, max) as u32);
-        self.replace(next);
+        let cur = self
+            .anchor
+            .and_then(|a| order.iter().position(|&x| x == a))
+            .unwrap_or(0) as i64;
+        let max = order.len() as i64 - 1;
+        let next = (cur + delta as i64).clamp(0, max) as usize;
+        self.replace(order[next]);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Identity table order `0..n` — the pre-table-order behaviour.
+    fn ids(n: u32) -> Vec<ClusterId> {
+        (0..n).map(ClusterId).collect()
+    }
+
+    #[test]
+    fn bump_and_extend_follow_table_order_not_ids() {
+        // Table sorted by quality with cluster 4 filtered out.
+        let order = [ClusterId(9), ClusterId(2), ClusterId(7), ClusterId(0)];
+        let mut s = SelectionSet::single(ClusterId(2));
+        s.bump(1, &order);
+        assert_eq!(s.as_slice(), &[ClusterId(7)], "next visible row, not id 3");
+        s.bump(1, &order);
+        s.bump(1, &order);
+        assert_eq!(s.as_slice(), &[ClusterId(0)], "clamps at the last row");
+        s.bump(-3, &order);
+        assert_eq!(s.as_slice(), &[ClusterId(9)]);
+
+        s.extend_to(ClusterId(7), &order);
+        assert_eq!(
+            s.as_slice(),
+            &[ClusterId(9), ClusterId(2), ClusterId(7)],
+            "range covers the visible rows between anchor and target"
+        );
+        // Anchor filtered out of the table: restart from the first row.
+        s.replace(ClusterId(4));
+        s.bump(1, &order);
+        assert_eq!(s.as_slice(), &[ClusterId(2)]);
+        // Target not in the table: fall back to a raw-id range.
+        s.replace(ClusterId(1));
+        s.extend_to(ClusterId(3), &order);
+        assert_eq!(s.as_slice(), &[ClusterId(1), ClusterId(2), ClusterId(3)]);
+    }
 
     #[test]
     fn default_is_empty() {
@@ -208,7 +258,7 @@ mod tests {
     #[test]
     fn extend_to_builds_inclusive_range_in_either_direction() {
         let mut s = SelectionSet::single(ClusterId(3));
-        s.extend_to(ClusterId(6));
+        s.extend_to(ClusterId(6), &ids(10));
         assert_eq!(
             s.as_slice(),
             &[ClusterId(3), ClusterId(4), ClusterId(5), ClusterId(6)]
@@ -220,7 +270,7 @@ mod tests {
         );
 
         // Extend the other way from the same anchor — phy semantics.
-        s.extend_to(ClusterId(1));
+        s.extend_to(ClusterId(1), &ids(10));
         assert_eq!(s.as_slice(), &[ClusterId(1), ClusterId(2), ClusterId(3)]);
         assert_eq!(s.anchor(), Some(ClusterId(3)));
     }
@@ -228,7 +278,7 @@ mod tests {
     #[test]
     fn extend_to_with_no_anchor_acts_like_replace() {
         let mut s = SelectionSet::new();
-        s.extend_to(ClusterId(9));
+        s.extend_to(ClusterId(9), &ids(10));
         assert_eq!(s.as_slice(), &[ClusterId(9)]);
         assert_eq!(s.anchor(), Some(ClusterId(9)));
     }
@@ -237,25 +287,25 @@ mod tests {
     fn bump_moves_anchor_within_bounds_and_replaces_selection() {
         let mut s = SelectionSet::single(ClusterId(5));
         s.toggle(ClusterId(7));
-        s.bump(1, 10);
+        s.bump(1, &ids(10));
         assert_eq!(s.as_slice(), &[ClusterId(8)]); // anchor was 7, +1 -> 8
-        s.bump(-100, 10);
+        s.bump(-100, &ids(10));
         assert_eq!(s.as_slice(), &[ClusterId(0)]);
-        s.bump(100, 10);
+        s.bump(100, &ids(10));
         assert_eq!(s.as_slice(), &[ClusterId(9)]);
     }
 
     #[test]
     fn bump_with_zero_clusters_clears_selection() {
         let mut s = SelectionSet::single(ClusterId(3));
-        s.bump(1, 0);
+        s.bump(1, &ids(0));
         assert!(s.is_empty());
     }
 
     #[test]
     fn extend_to_self_yields_single_id() {
         let mut s = SelectionSet::single(ClusterId(7));
-        s.extend_to(ClusterId(7));
+        s.extend_to(ClusterId(7), &ids(10));
         assert_eq!(s.as_slice(), &[ClusterId(7)]);
         assert_eq!(s.anchor(), Some(ClusterId(7)));
     }
@@ -263,9 +313,9 @@ mod tests {
     #[test]
     fn extend_to_adjacent_id_yields_two_id_range() {
         let mut s = SelectionSet::single(ClusterId(4));
-        s.extend_to(ClusterId(5));
+        s.extend_to(ClusterId(5), &ids(10));
         assert_eq!(s.as_slice(), &[ClusterId(4), ClusterId(5)]);
-        s.extend_to(ClusterId(3));
+        s.extend_to(ClusterId(3), &ids(10));
         assert_eq!(s.as_slice(), &[ClusterId(3), ClusterId(4)]);
     }
 
@@ -304,17 +354,17 @@ mod tests {
     #[test]
     fn bump_at_boundaries_clamps_correctly() {
         let mut s = SelectionSet::single(ClusterId(0));
-        s.bump(-1, 5);
+        s.bump(-1, &ids(5));
         assert_eq!(s.as_slice(), &[ClusterId(0)]);
         let mut s = SelectionSet::single(ClusterId(4));
-        s.bump(1, 5);
+        s.bump(1, &ids(5));
         assert_eq!(s.as_slice(), &[ClusterId(4)]);
     }
 
     #[test]
     fn bump_starts_at_zero_when_no_anchor() {
         let mut s = SelectionSet::new();
-        s.bump(1, 10);
+        s.bump(1, &ids(10));
         assert_eq!(s.as_slice(), &[ClusterId(1)]);
         assert_eq!(s.anchor(), Some(ClusterId(1)));
     }
@@ -322,7 +372,7 @@ mod tests {
     #[test]
     fn extend_to_with_descending_then_ascending_pivots_around_anchor() {
         let mut s = SelectionSet::single(ClusterId(5));
-        s.extend_to(ClusterId(1));
+        s.extend_to(ClusterId(1), &ids(10));
         assert_eq!(
             s.as_slice(),
             &[
@@ -334,7 +384,7 @@ mod tests {
             ]
         );
         // Anchor stayed at 5; extending up should walk back the other way.
-        s.extend_to(ClusterId(8));
+        s.extend_to(ClusterId(8), &ids(10));
         assert_eq!(
             s.as_slice(),
             &[ClusterId(5), ClusterId(6), ClusterId(7), ClusterId(8)]

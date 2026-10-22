@@ -43,6 +43,9 @@ pub struct RasterPipeline {
     vertex_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
     vertex_capacity_bytes: u64,
+    /// Generation of the vertex data currently in `vertex_buffer`; the
+    /// upload is skipped while the caller's generation matches.
+    uploaded_generation: Option<u64>,
 }
 
 impl RasterPipeline {
@@ -156,6 +159,7 @@ impl RasterPipeline {
             vertex_buffer,
             uniform_buffer,
             vertex_capacity_bytes: INITIAL_VERTEX_CAPACITY * VERTEX_SIZE,
+            uploaded_generation: None,
         }
     }
 
@@ -164,25 +168,29 @@ impl RasterPipeline {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         vertices: &[RasterVertex],
+        generation: u64,
         uniforms: RasterUniforms,
     ) {
-        let bytes = bytemuck::cast_slice(vertices);
-        let needed = bytes.len() as u64;
-        if needed > self.vertex_capacity_bytes {
-            let mut new_cap = self.vertex_capacity_bytes.max(VERTEX_SIZE);
-            while new_cap < needed {
-                new_cap *= 2;
+        if self.uploaded_generation != Some(generation) {
+            let bytes = bytemuck::cast_slice(vertices);
+            let needed = bytes.len() as u64;
+            if needed > self.vertex_capacity_bytes {
+                let mut new_cap = self.vertex_capacity_bytes.max(VERTEX_SIZE);
+                while new_cap < needed {
+                    new_cap *= 2;
+                }
+                self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("sorrel.raster.verts"),
+                    size: new_cap,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.vertex_capacity_bytes = new_cap;
             }
-            self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("sorrel.raster.verts"),
-                size: new_cap,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.vertex_capacity_bytes = new_cap;
-        }
-        if !bytes.is_empty() {
-            queue.write_buffer(&self.vertex_buffer, 0, bytes);
+            if !bytes.is_empty() {
+                queue.write_buffer(&self.vertex_buffer, 0, bytes);
+            }
+            self.uploaded_generation = Some(generation);
         }
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -198,10 +206,12 @@ impl RasterPipeline {
     }
 }
 
-/// Per-frame raster paint callback. Uploads vertices on `prepare` and
-/// issues a single `draw(0..n_vertices)` on `paint`.
+/// Per-frame raster paint callback. Shares the cached vertices (no clone)
+/// and uploads them on `prepare` only when `generation` changed; issues a
+/// single `draw(0..n_vertices)` on `paint`.
 pub struct RasterCallback {
-    pub vertices: Vec<RasterVertex>,
+    pub vertices: std::sync::Arc<Vec<RasterVertex>>,
+    pub generation: u64,
     pub n_vertices: u32,
     pub t0: f32,
     pub t_span: f32,
@@ -235,7 +245,7 @@ impl egui_wgpu::CallbackTrait for RasterCallback {
             },
             _pad: 0.0,
         };
-        pipeline.upload(device, queue, &self.vertices, uniforms);
+        pipeline.upload(device, queue, &self.vertices, self.generation, uniforms);
         Vec::new()
     }
 

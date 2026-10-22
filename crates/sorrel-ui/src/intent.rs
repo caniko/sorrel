@@ -25,6 +25,13 @@ pub enum Intent {
     PrevCluster,
     PageBack,
     PageForward,
+    /// Merge every selected cluster into the first-selected one (Cmd/Ctrl-G).
+    MergeSelection,
+    /// Escape: dismiss the confirm dialog, the help overlay, or an
+    /// in-progress lasso — whichever is active.
+    Cancel,
+    /// Toggle the keyboard/mouse help overlay (`?` or F1).
+    ToggleHelp,
 }
 
 pub fn from_key(key: egui::Key, modifiers: egui::Modifiers) -> Option<Intent> {
@@ -47,10 +54,16 @@ pub fn from_key_in_context(
     match key {
         Z if modifiers.command && modifiers.shift => return Some(Intent::Redo),
         Z if modifiers.command => return Some(Intent::Undo),
+        Y if modifiers.command => return Some(Intent::Redo),
         S if modifiers.command => return Some(Intent::Save),
+        G if modifiers.command => return Some(Intent::MergeSelection),
+        Escape => return Some(Intent::Cancel),
+        F1 => return Some(Intent::ToggleHelp),
         _ => {}
     }
-    if text_input_active {
+    // Plain-letter intents never fire with the command modifier held, so an
+    // unbound Cmd/Ctrl-N can't silently relabel the selection as noise.
+    if text_input_active || modifiers.command {
         return None;
     }
     Some(match key {
@@ -62,6 +75,8 @@ pub fn from_key_in_context(
         ArrowUp | K => Intent::PrevCluster,
         ArrowLeft | H => Intent::PageBack,
         ArrowRight | L => Intent::PageForward,
+        Questionmark => Intent::ToggleHelp,
+        Slash if modifiers.shift => Intent::ToggleHelp,
         _ => return None,
     })
 }
@@ -160,17 +175,34 @@ mod tests {
     }
 
     #[test]
-    fn cmd_modifier_does_not_swallow_label_keys() {
-        // Cmd+G is not a recognised binding; it should still produce the
-        // relabel intent because we don't filter on cmd for label keys.
+    fn cmd_modifier_binds_merge_and_blocks_label_keys() {
         let m = Modifiers {
             command: true,
             ..Default::default()
         };
+        assert!(matches!(from_key(Key::G, m), Some(Intent::MergeSelection)));
+        assert!(matches!(from_key(Key::Y, m), Some(Intent::Redo)));
+        // Cmd+N is unbound; it must not relabel the selection as noise.
+        assert!(from_key(Key::N, m).is_none());
+        assert!(from_key(Key::M, m).is_none());
+    }
+
+    #[test]
+    fn escape_and_help_keys_are_global() {
+        let m = Modifiers::default();
+        assert!(matches!(from_key(Key::Escape, m), Some(Intent::Cancel)));
+        assert!(matches!(from_key(Key::F1, m), Some(Intent::ToggleHelp)));
         assert!(matches!(
-            from_key(Key::G, m),
-            Some(Intent::Relabel(PhyLabelOp::SetGood))
+            from_key(Key::Questionmark, m),
+            Some(Intent::ToggleHelp)
         ));
+        // Escape still cancels while a text field has focus; `?` does not
+        // (the user is typing).
+        assert!(matches!(
+            from_key_in_context(Key::Escape, m, true),
+            Some(Intent::Cancel)
+        ));
+        assert!(from_key_in_context(Key::Questionmark, m, true).is_none());
     }
 
     #[test]
