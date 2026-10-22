@@ -42,7 +42,6 @@
     rust-overlay,
     treefmt-nix,
     git-hooks,
-    plinth,
     ...
   }:
     {
@@ -52,52 +51,16 @@
       simitConfig = {
         flake.mode = "custom";
         ci = {
+          platform = "github";
+          provider = "actions";
           runtime = "nix";
-          # Every generated step invokes the Nix development environment.  It
-          # therefore needs the trusted runner; keeping the mapping explicit
-          # preserves simit's per-step routing contract without dispatching
-          # `nix develop` to the bare atlas image.
-          runner = "atlas-nix-trusted";
-          packages = [
-            "sorrel"
-            "sorrel-cache"
-            "sorrel-compute"
-            "sorrel-data"
-            "sorrel-gpu"
-            "sorrel-io"
-            "sorrel-render"
-            "sorrel-ui"
-          ];
+          runner = "ubuntu-24.04";
+          workspace = true;
+          workspace_strategy = "aggregate";
           with_audit = true;
           with_deny = true;
-          pages = {
-            repo = "caniko/sorrel";
-            site_output = ".#site";
-            token_secret = "CODEBERG_TOKEN";
-            source_branch = "trunk";
-            deploy_app = ".#deploy-pages";
-          };
-          step_runners = {
-            cargo-clippy = "atlas-nix-trusted";
-            cargo-doc = "atlas-nix-trusted";
-            cargo-fmt = "atlas-nix-trusted";
-            cargo-package = "atlas-nix-trusted";
-            cargo-test = "atlas-nix-trusted";
-            nix-check = "atlas-nix-trusted";
-            quality-tools = "atlas-nix-trusted";
-          };
-        };
-        release = {
-          publish.enforcement = "activated-remote";
-          smoke.command = "nix run .#release-smoke --";
-          codeberg = {
-            repo = "caniko/sorrel";
-            target_branch = "trunk";
-            token_secret = "CODEBERG_TOKEN";
-          };
-          artifacts = {
-            runner = "atlas-nix-trusted";
-            version_attr = "sorrel";
+          # Public caches only; the private macOS SDK cache is a release concern.
+          cache = {
             substituters = [
               "https://attic.candee.baby/canix"
               "https://cache.nixos.org"
@@ -106,8 +69,55 @@
               "canix:lPzPzKrmYqW5Rxa5r0uQWvCqD3S5nx0h2eCy7XD5JM8="
               "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
             ];
+          };
+          pages = {
+            repo = "caniko/sorrel";
+            site_output = ".#site";
+            source_branch = "trunk";
+          };
+        };
+        # Linux closures only: the darwin build depends on the private macOS
+        # SDK and must never be published to the public canix cache.
+        prebuild = {
+          publish_attic = true;
+          attic_app = ".#push-flake-inputs";
+          system_runners.x86_64-linux = "ubuntu-24.04";
+          nix_builds = [
+            ".#packages.x86_64-linux.sorrel"
+            ".#packages.x86_64-linux.sorrel-appimage"
+          ];
+        };
+        release = {
+          publish.enforcement = "activated-remote";
+          smoke.command = "nix run .#release-smoke --";
+          github = {
+            repo = "caniko/sorrel";
+            target_branch = "trunk";
+          };
+          attic = {
+            cache = "canix";
+            url = "https://attic.candee.baby";
+            token_name = "sorrel";
+            token_secret = "ATTIC_TOKEN";
+          };
+          artifacts = {
+            runner = "ubuntu-24.04";
+            version_attr = "sorrel";
+            prebuild_binaries = true;
+            substituters = [
+              "https://attic.candee.baby/canix"
+              "https://attic.candee.baby/harbor-macos-sdk"
+              "https://cache.nixos.org"
+            ];
+            trusted_public_keys = [
+              "canix:lPzPzKrmYqW5Rxa5r0uQWvCqD3S5nx0h2eCy7XD5JM8="
+              "harbor-macos-sdk:MLRX9qZASKwDh48UWON67cvYxfEbqvjfIZQmGwt1v1E="
+              "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+            ];
             checksum_globs = ["*.tar.gz" "*.zip" "*.AppImage"];
-            build_commands = ["bash release/assemble.sh"];
+            build_commands = [
+              "git archive --format=tar --prefix=\"sorrel-$VERSION/\" HEAD | gzip -n > \"release/sorrel-$VERSION.tar.gz\""
+            ];
           };
         };
       };
@@ -216,7 +226,14 @@
         }
         // crossSorrelPackages
         // pkgs.lib.optionalAttrs (sorrelHdf5 != null) {inherit sorrelHdf5;}
-        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {sorrel-appimage = sorrelAppImage;};
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {sorrel-appimage = sorrelAppImage;}
+        // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          release-bundle = import ./nix/release.nix {
+            inherit pkgs harbor-rs;
+            version = sorrelVersion;
+            packages = self.packages.${system};
+          };
+        };
 
       checks =
         (import ./nix/checks.nix {
@@ -236,18 +253,33 @@
 
       formatter = treefmtEval.config.build.wrapper;
 
-      apps = {
-        default = {
-          type = "app";
-          program = "${sorrel}/bin/sorrel";
+      apps =
+        {
+          default = {
+            type = "app";
+            program = "${sorrel}/bin/sorrel";
+          };
+          release-smoke = {
+            type = "app";
+            program = "${releaseSmoke}/bin/sorrel-release-smoke";
+          };
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          # Simit prebuild publication on trunk (secret ATTIC_TOKEN). Linux
+          # outputs only: darwin builds use the private macOS SDK, which must
+          # never reach the public canix cache.
+          push-flake-inputs = harbor-rs.lib.mkAtticPush {
+            inherit pkgs;
+            flake = ".";
+            paths = [sorrel sorrelAppImage];
+            adapter = harbor-rs.lib.mkAdapter {
+              attic = {
+                endpoint = "https://attic.candee.baby";
+                cache = "canix";
+                tokenEnvVar = "ATTIC_TOKEN";
+              };
+            };
+          };
         };
-        deploy-pages = plinth.lib.${system}.mkDeployPagesApp {
-          domain = "sorrel.tartanoglu.com";
-        };
-        release-smoke = {
-          type = "app";
-          program = "${releaseSmoke}/bin/sorrel-release-smoke";
-        };
-      };
     });
 }
