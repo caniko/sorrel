@@ -16,6 +16,7 @@ sorrel-cache.workspace = true
 sorrel-data.workspace = true
 sorrel-render.workspace = true
 sorrel-ui.workspace = true
+sorrel-remote.workspace = true
 eframe.workspace = true
 egui.workspace = true
 anyhow.workspace = true

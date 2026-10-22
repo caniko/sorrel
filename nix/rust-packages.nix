@@ -48,6 +48,20 @@
         platforms = platforms.unix;
       };
     });
+  sorrelRelay = craneLib.buildPackage (commonArgs
+    // {
+      inherit cargoArtifacts;
+      pname = "sorrel-relay";
+      cargoExtraArgs = "-p sorrel-remote --bin sorrel-relay --locked";
+      doCheck = false;
+      meta = with pkgs.lib; {
+        description = "libp2p circuit relay for Sorrel remote work (proxy mode)";
+        homepage = "https://github.com/caniko/sorrel";
+        license = with licenses; [mit asl20];
+        mainProgram = "sorrel-relay";
+        platforms = platforms.unix;
+      };
+    });
 in {
-  inherit sorrel sorrelHdf5 commonArgs cargoArtifacts;
+  inherit sorrel sorrelHdf5 sorrelRelay commonArgs cargoArtifacts;
 }

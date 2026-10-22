@@ -1,0 +1,49 @@
+[package]
+name = "sorrel-remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Remote work protocol for Sorrel: share a dataset with a guest machine over piying/libp2p."
+
+[[bin]]
+name = "sorrel-relay"
+path = "src/bin/sorrel-relay.rs"
+
+[dependencies]
+sorrel-io.workspace = true
+sorrel-data.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+serde.workspace = true
+rmp-serde.workspace = true
+blake3.workspace = true
+xxhash-rust.workspace = true
+piying = { version = "=0.2.0", features = ["remote", "serde-codec"] }
+libp2p = { version = "0.57", features = [
+  "tokio",
+  "tcp",
+  "quic",
+  "noise",
+  "yamux",
+  "relay",
+  "websocket",
+  "dns",
+  "mdns",
+  "macros",
+] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "sync",
+  "time",
+  "signal",
+  "macros",
+] }
+futures = "0.3"
+argon2 = "0.5"
+serde_bytes = "0.11"
+getrandom = "0.3"
+
+[dev-dependencies]
+tempfile.workspace = true

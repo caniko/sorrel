@@ -145,7 +145,9 @@
         src = ./.;
         filter = path: type:
           (craneLib.filterCargoSources path type)
-          || pkgs.lib.hasSuffix ".wgsl" path;
+          || pkgs.lib.hasSuffix ".wgsl" path
+          # BIP-39 list embedded by sorrel-remote's pairing codes.
+          || pkgs.lib.hasSuffix "sorrel-remote/wordlist.txt" path;
       };
       treefmtEval = treefmt-nix.lib.evalModule pkgs (import ./nix/treefmt.nix {rustfmtPackage = rustToolchain;});
       pre-commit-check = git-hooks.lib.${system}.run {
@@ -162,7 +164,7 @@
       rustPackages = import ./nix/rust-packages.nix {
         inherit pkgs craneLib src deps;
       };
-      inherit (rustPackages) sorrel commonArgs cargoArtifacts;
+      inherit (rustPackages) sorrel sorrelRelay commonArgs cargoArtifacts;
       sorrelHdf5 = rustPackages.sorrelHdf5 or null;
 
       sorrelVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
@@ -174,13 +176,13 @@
           inherit src;
           version = sorrelVersion;
           strictDeps = true;
-          nativeBuildInputs = deps.nativeBuildInputs;
+          inherit (deps) nativeBuildInputs;
           cargoExtraArgs = "-p sorrel --locked";
         };
         targetArgs = {
           aarch64-linux = {
             buildInputs = deps.aarch64LinuxBuildInputs;
-            nativeBuildInputs = deps.nativeBuildInputs;
+            inherit (deps) nativeBuildInputs;
             doCheck = false;
           };
           windows = {
@@ -190,7 +192,7 @@
           };
           darwin-aarch64 = {
             buildInputs = [];
-            nativeBuildInputs = deps.nativeBuildInputs;
+            inherit (deps) nativeBuildInputs;
             doCheck = false;
           };
         };
@@ -221,6 +223,7 @@
         {
           default = sorrel;
           inherit sorrel website docs site;
+          sorrel-relay = sorrelRelay;
           cargo-config = cargoConfig.configPath;
           release-smoke = releaseSmoke;
         }
@@ -248,7 +251,7 @@
         simit = simit.packages.${system}.default;
         checks = self.checks.${system};
         preCommitEnabledPackages = pre-commit-check.enabledPackages;
-        shellHook = pre-commit-check.shellHook;
+        inherit (pre-commit-check) shellHook;
       };
 
       formatter = treefmtEval.config.build.wrapper;

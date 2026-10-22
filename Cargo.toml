@@ -8,6 +8,7 @@ members = [
   "crates/sorrel-data",
   "crates/sorrel-render",
   "crates/sorrel-ui",
+  "crates/sorrel-remote",
   "crates/sorrel",
 ]
 # `crates/sorrel-py` is intentionally excluded — it requires PyO3/maturin
@@ -32,6 +33,7 @@ sorrel-gpu = { version = "0.1.0", path = "crates/sorrel-gpu" }
 sorrel-data = { version = "0.1.0", path = "crates/sorrel-data" }
 sorrel-render = { version = "0.1.0", path = "crates/sorrel-render" }
 sorrel-ui = { version = "0.1.0", path = "crates/sorrel-ui" }
+sorrel-remote = { version = "0.1.0", path = "crates/sorrel-remote" }
 
 anyhow = "1"
 thiserror = "1"
