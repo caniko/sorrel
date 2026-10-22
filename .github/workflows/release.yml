@@ -5,6 +5,7 @@
 # - GITHUB_TOKEN: hosted release API token for release creation and asset upload.
 # - MINISIGN_SECRET_KEY, MINISIGN_PASSWORD: minisign signing of SHA256SUMS.txt.
 # - COSIGN_PRIVATE_KEY, COSIGN_PASSWORD: optional fallback when keyless Sigstore OIDC is unavailable.
+# - HARBOR_MACOS_SDK_NETRC: netrc for private Nix substituters.
 # - ATTIC_TOKEN: repository secret for native prebuild Attic publication.
 
 name: release
@@ -31,6 +32,12 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Configure Nix substituter credentials
+        env:
+          SIMIT_NIX_NETRC: ${{ secrets.HARBOR_MACOS_SDK_NETRC }}
+        run: |
+          umask 077
+          printf '%s\n' "$SIMIT_NIX_NETRC" > "$RUNNER_TEMP/simit-nix-netrc"
       - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
         with:
           extra_nix_config: |
@@ -39,6 +46,7 @@ jobs:
             cores = 2
             substituters = https://attic.candee.baby/canix https://attic.candee.baby/harbor-macos-sdk https://cache.nixos.org
             trusted-public-keys = canix:lPzPzKrmYqW5Rxa5r0uQWvCqD3S5nx0h2eCy7XD5JM8= harbor-macos-sdk:MLRX9qZASKwDh48UWON67cvYxfEbqvjfIZQmGwt1v1E= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+            netrc-file = ${{ runner.temp }}/simit-nix-netrc
 
       - name: Configure GitHub input transport
         run: |
@@ -101,6 +109,7 @@ jobs:
       release: true
     secrets:
       attic_token: ${{ secrets.ATTIC_TOKEN }}
+      HARBOR_MACOS_SDK_NETRC: ${{ secrets.HARBOR_MACOS_SDK_NETRC }}
   release:
     needs: [validate, prebuild]
     runs-on: ubuntu-24.04
@@ -113,6 +122,12 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Configure Nix substituter credentials
+        env:
+          SIMIT_NIX_NETRC: ${{ secrets.HARBOR_MACOS_SDK_NETRC }}
+        run: |
+          umask 077
+          printf '%s\n' "$SIMIT_NIX_NETRC" > "$RUNNER_TEMP/simit-nix-netrc"
       - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
         with:
           extra_nix_config: |
@@ -121,6 +136,7 @@ jobs:
             cores = 2
             substituters = https://attic.candee.baby/canix https://attic.candee.baby/harbor-macos-sdk https://cache.nixos.org
             trusted-public-keys = canix:lPzPzKrmYqW5Rxa5r0uQWvCqD3S5nx0h2eCy7XD5JM8= harbor-macos-sdk:MLRX9qZASKwDh48UWON67cvYxfEbqvjfIZQmGwt1v1E= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+            netrc-file = ${{ runner.temp }}/simit-nix-netrc
 
       - name: Configure GitHub input transport
         run: |
@@ -192,6 +208,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          HARBOR_MACOS_SDK_NETRC: ${{ secrets.HARBOR_MACOS_SDK_NETRC }}
           ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
         run: |
           set -euo pipefail
@@ -204,6 +221,7 @@ jobs:
           require_credential 'global/user secret' 'GITHUB_TOKEN' "${GITHUB_TOKEN:-}"
           require_credential 'repo secret' 'MINISIGN_SECRET_KEY' "${MINISIGN_SECRET_KEY:-}"
           require_credential 'repo secret' 'MINISIGN_PASSWORD' "${MINISIGN_PASSWORD:-}"
+          require_credential 'repo secret' 'HARBOR_MACOS_SDK_NETRC' "${HARBOR_MACOS_SDK_NETRC:-}"
           require_credential 'repo secret' 'ATTIC_TOKEN' "${ATTIC_TOKEN:-}"
           if [ -n "$missing" ]; then
             printf 'Missing release credentials:%s\n' "$missing" >&2
