@@ -14,6 +14,7 @@ bytemuck.workspace = true
 blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+flate2.workspace = true
 log.workspace = true
 
 # Optional HDF5 backend for NWB and Kilosort 4 `rez.mat` (MATLAB v7.3 = HDF5).

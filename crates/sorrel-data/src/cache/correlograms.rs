@@ -364,7 +364,7 @@ mod tests {
             ],
         };
         let dir = tempfile::tempdir().unwrap();
-        let journal = crate::SqliteJournal::open(&dir.path().join("j.sqlite")).unwrap();
+        let journal = crate::Journal::open(&dir.path().join("j.sqlite")).unwrap();
         (Session::new(provider, journal), dir)
     }
 

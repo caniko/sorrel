@@ -45,6 +45,69 @@ pub struct QcRow {
 }
 
 impl QcRow {
+    /// Every metric column name, in TSV order. The single source of truth
+    /// for names used by `get`, the rule engine, and the exports.
+    pub const METRICS: [&'static str; 16] = [
+        "n_spikes",
+        "firing_rate",
+        "mean_amplitude",
+        "presence_ratio",
+        "isi_violations",
+        "isi_violation_ratio",
+        "amplitude_cutoff",
+        "amplitude_snr",
+        "drift_correlation",
+        "longest_silent_gap",
+        "composite_quality",
+        "isolation_distance_sq",
+        "l_ratio",
+        "nn_isolation",
+        "d_prime",
+        "silhouette",
+    ];
+
+    /// `{"cluster_id": .., "<metric>": number | null, ...}` — NaN becomes
+    /// `null` so consumers never meet a non-JSON number.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        m.insert("cluster_id".into(), self.cluster_id.into());
+        for name in Self::METRICS {
+            let v = self.get(name).unwrap_or(f32::NAN);
+            m.insert(
+                name.to_string(),
+                if v.is_nan() {
+                    serde_json::Value::Null
+                } else {
+                    v.into()
+                },
+            );
+        }
+        serde_json::Value::Object(m)
+    }
+
+    /// Look a metric up by its column name; `None` for unknown names.
+    pub fn get(&self, name: &str) -> Option<f32> {
+        Some(match name {
+            "n_spikes" => self.n_spikes as f32,
+            "firing_rate" => self.firing_rate_hz,
+            "mean_amplitude" => self.mean_amplitude,
+            "presence_ratio" => self.presence_ratio,
+            "isi_violations" => self.isi_violations as f32,
+            "isi_violation_ratio" => self.isi_violation_ratio,
+            "amplitude_cutoff" => self.amplitude_cutoff,
+            "amplitude_snr" => self.amplitude_snr,
+            "drift_correlation" => self.drift_correlation,
+            "longest_silent_gap" => self.longest_silent_gap,
+            "composite_quality" => self.composite_quality,
+            "isolation_distance_sq" => self.isolation_distance_sq,
+            "l_ratio" => self.l_ratio,
+            "nn_isolation" => self.nn_isolation,
+            "d_prime" => self.d_prime,
+            "silhouette" => self.silhouette,
+            _ => return None,
+        })
+    }
+
     fn tsv_header() -> &'static str {
         "cluster_id\tn_spikes\tfiring_rate\tmean_amplitude\tpresence_ratio\t\
          isi_violations\tisi_violation_ratio\tamplitude_cutoff\tamplitude_snr\t\
@@ -80,7 +143,7 @@ impl QcRow {
         let prefix = if leading_comma { ",\n" } else { "\n" };
         write!(
             w,
-            r#"{prefix}  {{"cluster_id": {}, "n_spikes": {}, "firing_rate_hz": {:.6}, "mean_amplitude": {:.6}, "presence_ratio": {:.6}, "isi_violations": {}, "isi_violation_ratio": {:.6}, "amplitude_cutoff": {:.6}, "amplitude_snr": {:.6}, "drift_correlation": {:.6}, "longest_silent_gap": {:.6}, "composite_quality": {:.6}, "isolation_distance_sq": {}, "l_ratio": {}, "nn_isolation": {}, "d_prime": {}, "silhouette": {}}}"#,
+            r#"{prefix}  {{"cluster_id": {}, "n_spikes": {}, "firing_rate": {:.6}, "mean_amplitude": {:.6}, "presence_ratio": {:.6}, "isi_violations": {}, "isi_violation_ratio": {:.6}, "amplitude_cutoff": {:.6}, "amplitude_snr": {:.6}, "drift_correlation": {:.6}, "longest_silent_gap": {:.6}, "composite_quality": {:.6}, "isolation_distance_sq": {}, "l_ratio": {}, "nn_isolation": {}, "d_prime": {}, "silhouette": {}}}"#,
             self.cluster_id,
             self.n_spikes,
             self.firing_rate_hz,
@@ -232,17 +295,18 @@ pub fn export_qc<P: DataProvider>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::journal::SqliteJournal;
+    use crate::journal::Journal;
     use sorrel_io::{
         ClusterId, DataProvider, HasAmplitudes, SampleIndex, TraceSamples, TraceSlice,
     };
 
-    struct MockProvider {
-        spikes: Vec<Vec<SampleIndex>>,
-        amps: Vec<Vec<f32>>,
-        n_samples: SampleIndex,
+    /// Shared with `report::tests`.
+    pub(crate) struct MockProvider {
+        pub(crate) spikes: Vec<Vec<SampleIndex>>,
+        pub(crate) amps: Vec<Vec<f32>>,
+        pub(crate) n_samples: SampleIndex,
     }
     impl DataProvider for MockProvider {
         type Label = u8;
@@ -272,6 +336,16 @@ mod tests {
             vec![0; self.spikes.len()]
         }
     }
+    impl crate::session::ApplyPhyLabel for MockProvider {
+        fn label_from_op(op: crate::command::PhyLabelOp) -> u8 {
+            match op {
+                crate::command::PhyLabelOp::SetUnsorted => 0,
+                crate::command::PhyLabelOp::SetGood => 1,
+                crate::command::PhyLabelOp::SetMua => 2,
+                crate::command::PhyLabelOp::SetNoise => 3,
+            }
+        }
+    }
     impl HasAmplitudes for MockProvider {
         fn spike_amplitudes(&self, c: ClusterId) -> &[f32] {
             self.amps.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
@@ -290,7 +364,7 @@ mod tests {
             n_samples: SampleIndex(1000),
         };
         let dir = tempfile::tempdir().unwrap();
-        let journal = SqliteJournal::open(&dir.path().join("j.sqlite")).unwrap();
+        let journal = Journal::open(&dir.path().join("j.sqlite")).unwrap();
         let mut s = Session::new(prov, journal);
         s.seed_amplitudes();
 
@@ -311,6 +385,16 @@ mod tests {
         // Each row contains its cluster id.
         assert!(json.contains("\"cluster_id\": 0"));
         assert!(json.contains("\"cluster_id\": 2"));
+
+        // Both formats expose the same column names, in the same order, so
+        // downstream code can switch between them without a rename table.
+        let tsv_keys: Vec<&str> = lines[0].split('\t').collect();
+        let first_row = json
+            .lines()
+            .find(|l| l.contains("\"cluster_id\": 0"))
+            .unwrap();
+        let json_keys: Vec<&str> = first_row.split('"').skip(1).step_by(2).collect();
+        assert_eq!(tsv_keys, json_keys);
     }
 
     #[test]
@@ -321,7 +405,7 @@ mod tests {
             n_samples: SampleIndex(100),
         };
         let dir = tempfile::tempdir().unwrap();
-        let journal = SqliteJournal::open(&dir.path().join("j.sqlite")).unwrap();
+        let journal = Journal::open(&dir.path().join("j.sqlite")).unwrap();
         let mut s = Session::new(prov, journal);
         s.seed_amplitudes();
         let outdir = dir.path().join("export");

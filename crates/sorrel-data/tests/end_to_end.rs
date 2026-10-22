@@ -2,7 +2,10 @@
 //! full curation sequence, save back to disk, reopen, and verify the
 //! reopened state matches the saved state.
 
-use sorrel_data::{save_to_phy, CurationCommand, PhyLabelOp, Session, SqliteJournal};
+use sorrel_data::{
+    baseline_hash, save_and_reseal_journal, save_to_phy, CurationCommand, Journal, PhyLabelOp,
+    Session,
+};
 use sorrel_io::kilosort::{KilosortOpenParams, KilosortProvider, PhyLabel};
 use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 use std::io::Write;
@@ -72,7 +75,7 @@ fn merge_save_reopen_round_trips_cluster_assignments() {
 
     {
         let provider = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
-        let journal = SqliteJournal::open(&root.join("sorrel.sqlite")).unwrap();
+        let journal = Journal::open(&root.join("sorrel.sqlite")).unwrap();
         let mut session = Session::new(provider, journal);
 
         // Merge cluster 0 into 2 and label 1 as 'noise'.
@@ -134,7 +137,7 @@ fn split_save_reopen_introduces_new_cluster_id() {
     let new_n_clusters;
     {
         let provider = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
-        let journal = SqliteJournal::open(&root.join("sorrel.sqlite")).unwrap();
+        let journal = Journal::open(&root.join("sorrel.sqlite")).unwrap();
         let mut session = Session::new(provider, journal);
         // Split spike at local idx 1 of cluster 0 (time = 30) off into a
         // freshly allocated cluster.
@@ -161,16 +164,27 @@ fn split_save_reopen_introduces_new_cluster_id() {
     assert_eq!(provider.spike_times(new_id), &[SampleIndex(30)]);
 }
 
+/// Seal a journal against the on-disk `spike_clusters.npy`, exactly as the
+/// binary does for phy directories.
+fn open_sealed(root: &Path, journal_path: &Path, n_clusters: u32) -> anyhow::Result<Journal> {
+    let baseline = baseline_hash(&std::fs::read(root.join("spike_clusters.npy")).unwrap());
+    Journal::open_or_create(journal_path, baseline, n_clusters)
+}
+
+/// The production save path: the phy artifacts are rewritten *and* the
+/// journal is resealed, so reopening loads the saved state once instead
+/// of replaying the same edits on top of it (the pre-reseal bug turned
+/// every reopen-after-save into a second application of each split).
 #[test]
-fn replay_after_save_yields_identical_state() {
+fn reopen_after_save_and_reseal_yields_identical_state_once() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write_fixture(root);
 
-    let journal_path = root.join("sorrel.sqlite");
+    let journal_path = root.join("sorrel.journal");
     {
         let provider = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
-        let journal = SqliteJournal::open(&journal_path).unwrap();
+        let journal = open_sealed(root, &journal_path, provider.n_clusters()).unwrap();
         let mut session = Session::new(provider, journal);
 
         session
@@ -185,41 +199,70 @@ fn replay_after_save_yields_identical_state() {
                 target: ClusterId(2),
             })
             .unwrap();
-        // Save spike_clusters.npy / cluster_group.tsv — but the journal also
-        // captures the operations.
-        save_to_phy(&session, root, label_str).unwrap();
+        // Move the spike at t=30 (local index 1 of cluster 0) into a new cluster.
+        session
+            .dispatch(CurationCommand::Split {
+                cluster: ClusterId(0),
+                spike_idx: vec![1],
+                new_cluster: ClusterId(u32::MAX),
+            })
+            .unwrap();
+        let before = (session.history_len(), session.redo_len());
+        assert_eq!(before, (3, 0));
+
+        let journal = save_and_reseal_journal(&session, root, &journal_path, label_str).unwrap();
+        session.reseal(journal);
+        assert_eq!((session.history_len(), session.redo_len()), (0, 0));
     }
 
-    // New session, reopened from disk. Replay should reapply the journal
-    // on top of the freshly-loaded (already-merged) provider state.
-    //
-    // To make this test crisp, we delete the spike_clusters.npy that was
-    // just written and rely *only* on the journal to reconstruct the
-    // post-merge bucket layout.
-    {
-        // Restore the original spike_clusters.npy (clusters [0,0,1,2,0,1]
-        // — matches the time-sorted fixture order).
-        let clusters: [u32; 6] = [0, 0, 1, 2, 0, 1];
-        let bytes: Vec<u8> = clusters.iter().flat_map(|c| c.to_le_bytes()).collect();
-        write_npy_v1(
-            &root.join("spike_clusters.npy"),
-            "<u32",
-            clusters.len(),
-            &bytes,
-        );
-    }
+    // Reopen the way the binary does: the saved npy is the new baseline.
     let provider = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
-    let journal = SqliteJournal::open(&journal_path).unwrap();
+    let n_clusters = provider.n_clusters();
+    let journal = open_sealed(root, &journal_path, n_clusters).unwrap();
     let mut session = Session::new(provider, journal);
     session.replay_journal().unwrap();
 
-    // Cluster 0 was relabeled good.
+    assert_eq!(session.history_len(), 0, "resealed journal has no records");
+    assert_eq!(n_clusters, 4, "one split allocated exactly one cluster");
     assert_eq!(session.label(ClusterId(0)), Some(PhyLabel::Good));
-    // Cluster 1 was merged into 2 — so cluster 1 is empty, cluster 2 has both.
+    assert_eq!(
+        session.spike_times(ClusterId(0)),
+        &[SampleIndex(10), SampleIndex(150)]
+    );
+    assert_eq!(session.spike_times(ClusterId(3)), &[SampleIndex(30)]);
     assert!(session.spike_times(ClusterId(1)).is_empty());
     assert_eq!(
         session.spike_times(ClusterId(2)),
         &[SampleIndex(50), SampleIndex(100), SampleIndex(200)]
+    );
+}
+
+/// A plain `save_to_phy` (no reseal) followed by a sealed reopen must fail
+/// closed: the journal's edits were recorded against the pre-save bytes.
+#[test]
+fn sealed_open_refuses_journal_after_unresealed_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_fixture(root);
+
+    let journal_path = root.join("sorrel.journal");
+    {
+        let provider = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
+        let journal = open_sealed(root, &journal_path, provider.n_clusters()).unwrap();
+        let mut session = Session::new(provider, journal);
+        session
+            .dispatch(CurationCommand::Merge {
+                sources: vec![ClusterId(1)],
+                target: ClusterId(2),
+            })
+            .unwrap();
+        save_to_phy(&session, root, label_str).unwrap();
+    }
+
+    let err = open_sealed(root, &journal_path, 3).unwrap_err();
+    assert!(
+        err.to_string().contains("changed since"),
+        "unexpected error: {err:#}"
     );
 }
 
@@ -232,7 +275,7 @@ fn undo_then_save_emits_pre_merge_state() {
     let journal_path = root.join("sorrel.sqlite");
     {
         let provider = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
-        let journal = SqliteJournal::open(&journal_path).unwrap();
+        let journal = Journal::open(&journal_path).unwrap();
         let mut session = Session::new(provider, journal);
 
         session

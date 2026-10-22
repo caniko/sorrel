@@ -1,4 +1,4 @@
-use sorrel_data::{Session, SqliteJournal};
+use sorrel_data::{Journal, Session};
 use sorrel_io::{ClusterId, DataProvider, HasAmplitudes, SampleIndex, TraceSamples, TraceSlice};
 use std::time::{Duration, Instant};
 
@@ -44,7 +44,7 @@ impl DataProvider for SyntheticProvider {
     }
 
     fn n_clusters(&self) -> u32 {
-        N_CLUSTERS as u32
+        self.spikes.len() as u32
     }
 
     fn spike_times(&self, cluster: ClusterId) -> &[SampleIndex] {
@@ -63,7 +63,7 @@ impl DataProvider for SyntheticProvider {
     }
 
     fn initial_labels(&self) -> Vec<Self::Label> {
-        vec![0; N_CLUSTERS]
+        vec![0; self.spikes.len()]
     }
 }
 
@@ -79,7 +79,7 @@ impl HasAmplitudes for SyntheticProvider {
 
 fn timed_seed(root: &std::path::Path) -> Duration {
     let provider = SyntheticProvider::new();
-    let journal = SqliteJournal::open(&root.join("sorrel.journal")).unwrap();
+    let journal = Journal::open(&root.join("sorrel.journal")).unwrap();
     let mut session = Session::new(provider, journal);
     let start = Instant::now();
     session.seed_amplitudes();
@@ -95,4 +95,35 @@ fn main() {
     println!("seed_amplitudes cache cold: {cold:?}");
     println!("seed_amplitudes cache warm: {warm:?}");
     println!("seed_amplitudes cache warmup ratio: {ratio:.2}x");
+
+    let (k, t) = timed_index_build();
+    println!(
+        "index build ({k} clusters, {} spikes): {t:?}",
+        N_CLUSTERS * SPIKES_PER_CLUSTER
+    );
+}
+
+/// Time `ClusterIndex::from_provider` (via `Session::new`) for the k-way
+/// merge of per-cluster buckets. `SORREL_BENCH_CLUSTERS` overrides the
+/// cluster count so the K dependence is visible.
+fn timed_index_build() -> (usize, Duration) {
+    let n_clusters: usize = std::env::var("SORREL_BENCH_CLUSTERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(N_CLUSTERS);
+    let per = (N_CLUSTERS * SPIKES_PER_CLUSTER) / n_clusters.max(1);
+    let spikes: Vec<Vec<SampleIndex>> = (0..n_clusters)
+        .map(|c| {
+            (0..per)
+                .map(|i| SampleIndex::new((i * n_clusters + c) as u64))
+                .collect()
+        })
+        .collect();
+    let provider = SyntheticProvider {
+        amps: vec![Vec::new(); n_clusters],
+        spikes,
+    };
+    let start = Instant::now();
+    let index = sorrel_data::ClusterIndex::from_provider(&provider);
+    (index.n_clusters() as usize, start.elapsed())
 }

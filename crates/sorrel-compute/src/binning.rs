@@ -105,3 +105,50 @@ mod tests {
         assert_eq!(isi_histogram(&s, 100, 0), Vec::<u32>::new());
     }
 }
+
+/// Peri-event time histogram. For every event, spikes in
+/// `[event - pre, event + post)` are shifted to `rel = spike + pre - event`
+/// (so `rel == pre` is the event) and binned over `[0, pre + post)`.
+/// Returns the pooled counts and, per event, the relative spike times for
+/// an aligned raster. Spikes and events must be sorted ascending.
+pub fn psth(
+    spikes: &[SampleIndex],
+    events: &[SampleIndex],
+    pre: u64,
+    post: u64,
+    bins: usize,
+) -> (Vec<u32>, Vec<Vec<u64>>) {
+    let mut per_event = Vec::with_capacity(events.len());
+    let mut all = Vec::new();
+    for &e in events {
+        let lo = e.0.saturating_sub(pre);
+        let hi = e.0.saturating_add(post);
+        let a = spikes.partition_point(|s| s.0 < lo);
+        let b = spikes.partition_point(|s| s.0 < hi);
+        let rel: Vec<u64> = spikes[a..b].iter().map(|s| s.0 + pre - e.0).collect();
+        all.extend_from_slice(&rel);
+        per_event.push(rel);
+    }
+    (histogram_u64(&all, 0, pre + post, bins), per_event)
+}
+
+#[cfg(test)]
+mod psth_tests {
+    use super::*;
+
+    #[test]
+    fn psth_counts_relative_to_events() {
+        let spikes: Vec<SampleIndex> = [60u64, 100, 150, 290, 300, 400]
+            .iter()
+            .map(|&t| SampleIndex(t))
+            .collect();
+        let events = [SampleIndex(100), SampleIndex(300)];
+        // Window [-50, +100): bins of 50 → [-50,0), [0,50), [50,100).
+        let (counts, per_event) = psth(&spikes, &events, 50, 100, 3);
+        // event 100: 60 → rel 10 (bin 0), 100 → 50 (bin 1), 150 → 100 (bin 2).
+        // event 300: 290 → 40 (bin 0), 300 → 50 (bin 1), 400 → 150 (== span, out).
+        assert_eq!(counts, vec![2, 2, 1]);
+        assert_eq!(per_event, vec![vec![10, 50, 100], vec![40, 50]]);
+        assert_eq!(psth(&spikes, &[], 50, 100, 3).0, vec![0, 0, 0]);
+    }
+}

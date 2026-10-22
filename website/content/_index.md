@@ -3,7 +3,7 @@ title = "Sorrel"
 
 [extra]
 tagline = "Native spike-sorting curation"
-subtitle = "A high-performance GUI for manual curation of spike-sorted electrophysiology data — phy / Kilosort, SpikeInterface, NWB, and KS4 rez out of the box, with a monomorphised Rust core, wgpu compute, and a durable SQLite journal."
+subtitle = "A high-performance GUI for manual curation of spike-sorted electrophysiology data — phy / Kilosort, SpikeInterface, NWB, and KS4 rez out of the box, with a monomorphised Rust core, wgpu compute, and a durable append-only journal."
 install = "cargo build --release -p sorrel"
 
 [[extra.features]]
@@ -24,7 +24,7 @@ description = "Optional wgpu kernels for common-median referencing, high-pass fi
 
 [[extra.features]]
 title = "Durable curation journal"
-description = "Every relabel, merge, split, and undo/redo lands in SQLite before the in-memory session moves. Replay on open is idempotent; resealed at save."
+description = "Every relabel, merge, split, and undo/redo lands in the journal before the in-memory session moves. Replay on open is idempotent; resealed at save."
 
 [[extra.features]]
 title = "Built-in views"

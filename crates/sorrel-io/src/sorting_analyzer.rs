@@ -42,6 +42,8 @@ pub struct SortingAnalyzerProvider {
 
     spikes_per_cluster: Vec<Vec<SampleIndex>>,
     initial_labels: Vec<PhyLabel>,
+    /// SI unit ids, parallel to `spikes_per_cluster`. Can be sparse.
+    unit_ids: Vec<u32>,
 
     channel_positions: Vec<[f32; 2]>,
     channel_map: Vec<ChannelId>,
@@ -87,7 +89,14 @@ impl SortingAnalyzerProvider {
         for b in spikes_per_cluster.iter_mut() {
             b.sort_unstable();
         }
-        let initial_labels = vec![PhyLabel::Unsorted; n_clusters];
+        // SI has no phy-style label sidecar; a previous sorrel session (or
+        // `spikeinterface.curation`) may have left a `curation.json`.
+        let initial_labels = crate::curation_json::read_curation_labels(
+            &root.join("curation.json"),
+            n_clusters,
+            |uid| unit_ids.iter().position(|&u| u as u64 == uid),
+        )
+        .unwrap_or_else(|| vec![PhyLabel::Unsorted; n_clusters]);
 
         // Probe geometry via probeinterface JSON if SI exported one.
         let mut channel_positions = Vec::new();
@@ -125,6 +134,7 @@ impl SortingAnalyzerProvider {
             dtype: recording_meta.dtype,
             spikes_per_cluster,
             initial_labels,
+            unit_ids,
             channel_positions,
             channel_map,
             metrics,
@@ -477,11 +487,12 @@ fn read_u64_any(path: &Path) -> Result<Vec<SampleIndex>> {
         if payload.len() < n * 8 {
             bail!("truncated 64-bit array");
         }
-        let mut out = Vec::with_capacity(n);
-        for c in payload[..n * 8].chunks_exact(8) {
-            out.push(SampleIndex(u64::from_le_bytes(c.try_into().unwrap())));
-        }
-        Ok(out)
+        Ok(payload[..n * 8]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| SampleIndex(u64::from_le_bytes(*c)))
+            .collect())
     } else {
         let (v, _shape) = read_npy_u32_flat(path)?;
         Ok(v.into_iter().map(|x| SampleIndex(x as u64)).collect())
@@ -568,6 +579,19 @@ impl DataProvider for SortingAnalyzerProvider {
             start,
             n_channels: self.n_channels,
             samples: self.samples_window(start, len),
+        }
+    }
+
+    /// Clusters created by sorrel splits (index past the analyzer's units)
+    /// get ids appended after the largest SI id, matching
+    /// `apply_curation(new_id_strategy="append")`.
+    fn unit_id(&self, cluster: ClusterId) -> u32 {
+        match self.unit_ids.get(cluster.idx()) {
+            Some(&u) => u,
+            None => {
+                let max = self.unit_ids.iter().copied().max().unwrap_or(0);
+                max + 1 + (cluster.0 - self.unit_ids.len() as u32)
+            }
         }
     }
 
@@ -840,7 +864,7 @@ mod tests {
 
     /// Test helper: write an `.npy` v1 file with the given dtype string
     /// (record-dtype OK), shape `(n,)`, and raw payload bytes.
-    fn write_record_npy(path: &Path, descr: &str, n: usize, payload: &[u8]) {
+    pub(super) fn write_record_npy(path: &Path, descr: &str, n: usize, payload: &[u8]) {
         use std::io::Write;
         let dict = format!("{{'descr': {descr}, 'fortran_order': False, 'shape': ({n},), }}");
         let prelude_len = 6 + 2 + 2 + dict.len() + 1;
@@ -857,8 +881,59 @@ mod tests {
         f.write_all(payload).unwrap();
     }
 
-    fn write_u32_npy(path: &Path, data: &[u32]) {
+    pub(super) fn write_u32_npy(path: &Path, data: &[u32]) {
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         write_record_npy(path, "'<u4'", data.len(), &bytes);
+    }
+}
+
+#[cfg(test)]
+mod curation_tests {
+    use super::*;
+
+    /// `curation.json` seeds labels through SI unit ids, and clusters that
+    /// sorrel creates by splitting get ids appended after the largest one.
+    #[test]
+    fn curation_json_seeds_labels_by_unit_id_and_split_ids_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("recording.json"),
+            r#"{"kwargs":{"sampling_frequency":30000.0,"num_channels":1,"dtype":"int16","file_paths":["recording.dat"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("recording.dat"), [0u8; 20]).unwrap();
+        let sorting_dir = root.join("sorting");
+        std::fs::create_dir_all(&sorting_dir).unwrap();
+        let mut payload = Vec::new();
+        for (s, u) in [(10u64, 0u64), (20, 1), (30, 2)] {
+            payload.extend_from_slice(&s.to_le_bytes());
+            payload.extend_from_slice(&u.to_le_bytes());
+            payload.extend_from_slice(&0u64.to_le_bytes());
+        }
+        tests::write_record_npy(
+            &sorting_dir.join("spikes.npy"),
+            "[('sample_index', '<i8'), ('unit_index', '<i8'), ('segment_index', '<i8')]",
+            3,
+            &payload,
+        );
+        // Sparse SI ids: index 0 → 5, 1 → 7, 2 → 9.
+        tests::write_u32_npy(&sorting_dir.join("unit_ids.npy"), &[5, 7, 9]);
+        std::fs::write(
+            root.join("curation.json"),
+            r#"{"format_version":"2","unit_ids":[5,7,9],
+                "manual_labels":[{"unit_id":7,"labels":{"quality":["noise"]}}],
+                "merges":[],"splits":[],"removed":[]}"#,
+        )
+        .unwrap();
+
+        let p = SortingAnalyzerProvider::open(root).unwrap();
+        assert_eq!(
+            p.initial_labels(),
+            vec![PhyLabel::Unsorted, PhyLabel::Noise, PhyLabel::Unsorted]
+        );
+        assert_eq!(p.unit_id(ClusterId(1)), 7);
+        assert_eq!(p.unit_id(ClusterId(3)), 10, "first split-created cluster");
+        assert_eq!(p.unit_id(ClusterId(4)), 11);
     }
 }

@@ -1,5 +1,5 @@
 use crate::vertex::{ScatterVertex, TraceVertex};
-use sorrel_compute::{lttb_downsample, subtract_channel_median, Biquad, BiquadState};
+use sorrel_compute::{lttb_downsample, subtract_channel_median_grouped, Biquad, BiquadState};
 use sorrel_data::Session;
 use sorrel_gpu::{GpuBiquad, GpuCmr, GpuContext};
 use sorrel_io::{ClusterId, DataProvider, SampleIndex, TraceSamples};
@@ -80,6 +80,19 @@ pub fn build_trace_vertices_cfg<P: DataProvider>(
     target_points_per_channel: usize,
     cfg: TracePreproc,
 ) -> Vec<TraceVertex> {
+    build_trace_vertices_cfg_shanked(session, start, len, target_points_per_channel, cfg, &[])
+}
+
+/// [`build_trace_vertices_cfg`] with per-shank CMR: `shanks[ch]` is the shank
+/// of raw channel `ch` (empty = one shank), so the median never mixes shanks.
+pub fn build_trace_vertices_cfg_shanked<P: DataProvider>(
+    session: &Session<P>,
+    start: SampleIndex,
+    len: u32,
+    target_points_per_channel: usize,
+    cfg: TracePreproc,
+    shanks: &[u32],
+) -> Vec<TraceVertex> {
     let provider = &session.provider;
     let slice = provider.trace(start, len);
     let nc = slice.n_channels as usize;
@@ -93,7 +106,7 @@ pub fn build_trace_vertices_cfg<P: DataProvider>(
 
     if cfg.is_off() {
         // Fast path: dispatch on the native dtype, do no preprocessing.
-        return match slice.samples {
+        return match slice.samples.borrow() {
             TraceSamples::I16(s) => {
                 lttb_per_channel(s, nc, target_points_per_channel, x_origin, x_step, cap)
             }
@@ -115,12 +128,15 @@ pub fn build_trace_vertices_cfg<P: DataProvider>(
             TraceSamples::F32(s) => {
                 lttb_per_channel(s, nc, target_points_per_channel, x_origin, x_step, cap)
             }
+            TraceSamples::OwnedI16(v) => {
+                lttb_per_channel(&v, nc, target_points_per_channel, x_origin, x_step, cap)
+            }
         };
     }
 
     // Slow path: convert to f32, run CMR + per-channel HP, then LTTB.
     let mut buf = slice.samples.to_f32_centred();
-    apply_preproc_cpu(&mut buf, nc, cfg, provider.sample_rate());
+    apply_preproc_cpu(&mut buf, nc, cfg, provider.sample_rate(), shanks);
     lttb_per_channel(&buf, nc, target_points_per_channel, x_origin, x_step, cap)
 }
 
@@ -138,6 +154,28 @@ pub fn build_trace_vertices_gpu<P: DataProvider>(
     target_points_per_channel: usize,
     cfg: TracePreproc,
     gpu: &GpuTracePreproc,
+) -> Vec<TraceVertex> {
+    build_trace_vertices_gpu_shanked(
+        session,
+        start,
+        len,
+        target_points_per_channel,
+        cfg,
+        gpu,
+        &[],
+    )
+}
+
+/// [`build_trace_vertices_gpu`] with per-shank CMR; see
+/// [`build_trace_vertices_cfg_shanked`].
+pub fn build_trace_vertices_gpu_shanked<P: DataProvider>(
+    session: &Session<P>,
+    start: SampleIndex,
+    len: u32,
+    target_points_per_channel: usize,
+    cfg: TracePreproc,
+    gpu: &GpuTracePreproc,
+    shanks: &[u32],
 ) -> Vec<TraceVertex> {
     let provider = &session.provider;
     let slice = provider.trace(start, len);
@@ -157,10 +195,10 @@ pub fn build_trace_vertices_gpu<P: DataProvider>(
 
     let mut buf = slice.samples.to_f32_centred();
     let sr = provider.sample_rate();
-    if !gpu.apply(&mut buf, slice.n_channels, cfg, sr) {
+    if !gpu.apply_shanked(&mut buf, slice.n_channels, cfg, sr, shanks) {
         // GPU returned an error — finish on CPU so the user still sees the
         // trace.
-        apply_preproc_cpu(&mut buf, nc, cfg, sr);
+        apply_preproc_cpu(&mut buf, nc, cfg, sr, shanks);
     }
     lttb_per_channel(&buf, nc, target_points_per_channel, x_origin, x_step, cap)
 }
@@ -189,6 +227,26 @@ impl GpuTracePreproc {
         cfg: TracePreproc,
         sample_rate: f32,
     ) -> bool {
+        self.apply_shanked(buf, n_channels, cfg, sample_rate, &[])
+    }
+
+    /// [`Self::apply`] with per-shank CMR. The CMR kernel is global, so a
+    /// multi-shank request reports failure and the caller runs the CPU
+    /// path.
+    // ponytail: CPU fallback for shanked CMR; gather per-shank sub-buffers
+    // and run GpuCmr per shank if 384-ch multi-shank traces show up in
+    // frame time.
+    pub fn apply_shanked(
+        &self,
+        buf: &mut [f32],
+        n_channels: u32,
+        cfg: TracePreproc,
+        sample_rate: f32,
+        shanks: &[u32],
+    ) -> bool {
+        if cfg.has_cmr() && !shanks.is_empty() {
+            return false;
+        }
         if cfg.has_cmr() {
             if let Err(e) = self.cmr.run(buf, n_channels) {
                 log::warn!("GPU CMR failed, falling back to CPU: {e}");
@@ -206,9 +264,16 @@ impl GpuTracePreproc {
     }
 }
 
-fn apply_preproc_cpu(buf: &mut [f32], nc: usize, cfg: TracePreproc, sample_rate: f32) {
+/// CMR (per shank when `shanks` is non-empty) then causal HP, in place.
+pub fn apply_preproc_cpu(
+    buf: &mut [f32],
+    nc: usize,
+    cfg: TracePreproc,
+    sample_rate: f32,
+    shanks: &[u32],
+) {
     if cfg.has_cmr() {
-        subtract_channel_median(buf, nc);
+        subtract_channel_median_grouped(buf, nc, shanks);
     }
     if let Some(hz) = cfg.hp() {
         let f = Biquad::butterworth_hp(hz, sample_rate);
@@ -279,7 +344,7 @@ pub fn build_scatter_vertices<P: DataProvider>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sorrel_data::SqliteJournal;
+    use sorrel_data::Journal;
     use sorrel_io::{ClusterId, DataProvider, SampleIndex, TraceSlice};
 
     struct MockProvider {
@@ -326,7 +391,7 @@ mod tests {
 
     fn session_with(provider: MockProvider) -> (Session<MockProvider>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let j = SqliteJournal::open(&dir.path().join("j.sqlite")).unwrap();
+        let j = Journal::open(&dir.path().join("j.sqlite")).unwrap();
         (Session::new(provider, j), dir)
     }
 
@@ -568,5 +633,22 @@ mod tests {
                 vert.pos[1]
             );
         }
+    }
+
+    /// Shanked CMR keeps each shank's median inside that shank; empty shanks
+    /// is the ungrouped median. One time step, six channels, two shanks
+    /// interleaved (A = ch 0,2,4 → [1,5,3] median 3; B = ch 1,3,5 →
+    /// [10,100,50] median 50).
+    #[test]
+    fn cpu_preproc_cmr_respects_shanks() {
+        let shanks = [0u32, 1, 0, 1, 0, 1];
+        let mut grouped = vec![1.0_f32, 10.0, 5.0, 100.0, 3.0, 50.0];
+        apply_preproc_cpu(&mut grouped, 6, TracePreproc::Cmr, 1000.0, &shanks);
+        assert_eq!(grouped, vec![-2.0, -40.0, 2.0, 50.0, 0.0, 0.0]);
+
+        let mut flat = vec![1.0_f32, 10.0, 5.0, 100.0, 3.0, 50.0];
+        apply_preproc_cpu(&mut flat, 6, TracePreproc::Cmr, 1000.0, &[]);
+        // Global median of [1,10,5,100,3,50] = (5 + 10) / 2 = 7.5.
+        assert_eq!(flat, vec![-6.5, 2.5, -2.5, 92.5, -4.5, 42.5]);
     }
 }

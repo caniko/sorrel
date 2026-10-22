@@ -8,7 +8,7 @@ Sorrel is a Cargo workspace with one role per crate:
 | `sorrel-cache`   | Rebuildable derived-artifact cache. Owns content-addressed keys, rkyv archive I/O, atomic writes, and mmap-backed bytechecked reads; deleting it never loses user data.      |
 | `sorrel-compute` | CPU kernels: LTTB downsampling, histograms, ISI / CCG, CMR + filter, mean snippet, GMM, drift, quality metrics, isolation distance.                                          |
 | `sorrel-gpu`     | wgpu compute pipelines (CMR median, biquad HP filter, mean snippet) sharing the device and queue with the renderer.                                                          |
-| `sorrel-data`    | Generic `Session<P>`, `CurationCommand`, SQLite `Journal`, save / replay, QC export, merge/split previews and suggestions.                                                   |
+| `sorrel-data`    | Generic `Session<P>`, `CurationCommand`, append-only `Journal`, save / replay, QC export, merge/split previews and suggestions.                                              |
 | `sorrel-render`  | Concrete vertex types and monomorphised buffer builders for the trace and raster paths.                                                                                      |
 | `sorrel-ui`      | egui widgets and views, generic over `P: DataProvider`.                                                                                                                      |
 | `sorrel`         | Binary. Parses CLI, detects backend, instantiates `SorrelApp<P>`.                                                                                                            |

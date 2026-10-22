@@ -79,13 +79,13 @@ pub struct ClusterIndex {
     /// Flat `(n_spikes_orig, n_pcs, n_channels_per_template)` row-major
     /// PC feature buffer. Empty when not seeded. Indexed via
     /// `spike_pc_indices[g] * stride`.
-    pc_features_flat: Vec<f32>,
+    pc_features_flat: std::sync::Arc<[f32]>,
     /// `(n_pcs, n_channels_per_template)` shape of the PC feature buffer.
     pc_shape: (usize, usize),
 
     /// Flat `(n_templates, n_samples_per_template, n_channels)` template
     /// waveforms, copied from the provider when seeded. Empty otherwise.
-    template_waveforms: Vec<f32>,
+    template_waveforms: std::sync::Arc<[f32]>,
     template_shape: (usize, usize, usize),
     /// `(n_templates × n_templates)` similarity matrix, flat row-major.
     similar_templates: Vec<f32>,
@@ -105,35 +105,37 @@ impl ClusterIndex {
         let mut times_per_cluster: Vec<Vec<SampleIndex>> = Vec::with_capacity(n_clusters);
         let mut total_spikes = 0usize;
         for c in (0..n_clusters as u32).map(ClusterId) {
+            // ponytail: buckets are duplicated in provider + index (and the
+            // global array below). Collapse to one owner when >50M-spike
+            // sets appear; the index must stay the mutation substrate.
             let bucket: Vec<SampleIndex> = provider.spike_times(c).to_vec();
             total_spikes += bucket.len();
             times_per_cluster.push(bucket);
         }
 
-        // Materialise the global per-spike arrays in time order. Since each
-        // bucket is already sorted ascending, we merge by repeated argmin.
+        // Materialise the global per-spike arrays in time order. Each bucket
+        // is already sorted ascending, so this is a K-way merge: a min-heap
+        // of (next time, cluster) heads, O(N log K) instead of the O(N·K)
+        // argmin scan that took a second per million spikes at K=1000.
+        // Ties break on cluster id so the order is deterministic.
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
         let mut spike_times = Vec::with_capacity(total_spikes);
         let mut spike_clusters = Vec::with_capacity(total_spikes);
-        // Per-cluster cursors into times_per_cluster.
         let mut cursors = vec![0usize; n_clusters];
-        for _ in 0..total_spikes {
-            // Find the cluster whose next spike has the smallest time.
-            let mut best: Option<(ClusterId, SampleIndex)> = None;
-            for c in 0..n_clusters {
-                if cursors[c] < times_per_cluster[c].len() {
-                    let t = times_per_cluster[c][cursors[c]];
-                    if match best {
-                        Some((_, bt)) => t < bt,
-                        None => true,
-                    } {
-                        best = Some((ClusterId(c as u32), t));
-                    }
-                }
-            }
-            let (c, t) = best.expect("total_spikes counts the loop iterations exactly");
+        let mut heap: BinaryHeap<Reverse<(SampleIndex, u32)>> = times_per_cluster
+            .iter()
+            .enumerate()
+            .filter_map(|(c, b)| b.first().map(|&t| Reverse((t, c as u32))))
+            .collect();
+        while let Some(Reverse((t, c))) = heap.pop() {
             spike_times.push(t);
-            spike_clusters.push(c);
-            cursors[c.idx()] += 1;
+            spike_clusters.push(ClusterId(c));
+            let cur = &mut cursors[c as usize];
+            *cur += 1;
+            if let Some(&next) = times_per_cluster[c as usize].get(*cur) {
+                heap.push(Reverse((next, c)));
+            }
         }
 
         Self {
@@ -142,9 +144,9 @@ impl ClusterIndex {
             spike_amplitudes: Vec::new(),
             spike_templates: Vec::new(),
             spike_pc_indices: Vec::new(),
-            pc_features_flat: Vec::new(),
+            pc_features_flat: std::sync::Arc::from([]),
             pc_shape: (0, 0),
-            template_waveforms: Vec::new(),
+            template_waveforms: std::sync::Arc::from([]),
             template_shape: (0, 0, 0),
             similar_templates: Vec::new(),
             times_per_cluster,
@@ -191,7 +193,7 @@ impl ClusterIndex {
             OptionalRow::new,
             OptionalRow::NONE,
         );
-        self.pc_features_flat = provider.pc_features().to_vec();
+        self.pc_features_flat = provider.pc_features_shared();
         self.pc_shape = provider.pc_shape();
     }
 
@@ -297,7 +299,7 @@ impl ClusterIndex {
     /// them. Templates are immutable across curation, so we just copy them
     /// in once.
     pub fn seed_template_waveforms<P: HasTemplateWaveforms>(&mut self, provider: &P) {
-        self.template_waveforms = provider.template_waveforms().to_vec();
+        self.template_waveforms = provider.template_waveforms_shared();
         self.template_shape = provider.template_shape();
         self.similar_templates = provider.similar_templates().to_vec();
     }
@@ -1220,9 +1222,8 @@ mod tests {
 
     /// Stress: 1000 clusters × 1000 spikes each. Constructing the index,
     /// merging half into one bucket, and undoing should all complete in
-    /// reasonable time. `#[ignore]` so it doesn't run by default.
+    /// reasonable time (the index build is a heap merge, ~75 ms here).
     #[test]
-    #[ignore]
     fn stress_thousand_clusters_thousand_spikes_each() {
         let n_clusters = 1000usize;
         let n_per = 1000usize;

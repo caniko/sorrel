@@ -1,0 +1,38 @@
+# Example rule file for `sorrel apply <DATA_DIR> --rules rules.toml`.
+#
+# Rules are evaluated top to bottom per cluster; the first match wins.
+# Clusters matching no rule get `default` (omit it to leave them alone).
+# Metric names are the columns of `cluster_qc.tsv`; a rule never matches
+# when its metric is NaN for a cluster (e.g. isolation metrics without PC
+# features). Empty clusters are never relabelled.
+#
+# The thresholds below follow the commonly cited IBL single-unit criteria
+# (amplitude cutoff, refractory violations, presence) and the Bombcell
+# spike-count floor. Adjust them to your lab; they are illustrations, not
+# defaults baked into sorrel.
+
+default = "good"
+
+[[rule]]
+metric = "n_spikes"
+op = "<"
+value = 300
+label = "noise"
+
+[[rule]]
+metric = "presence_ratio"
+op = "<"
+value = 0.9
+label = "mua"
+
+[[rule]]
+metric = "amplitude_cutoff"
+op = ">"
+value = 0.1
+label = "mua"
+
+[[rule]]
+metric = "isi_violation_ratio"
+op = ">"
+value = 0.1
+label = "mua"

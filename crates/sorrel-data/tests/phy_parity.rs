@@ -15,7 +15,7 @@
 //!   - phylib/io/tests/test_model.py
 
 use sorrel_data::session::ApplyPhyLabel;
-use sorrel_data::{ClusterIndex, CurationCommand, PhyLabelOp, Session, SqliteJournal};
+use sorrel_data::{ClusterIndex, CurationCommand, Journal, PhyLabelOp, Session};
 use sorrel_io::{ClusterId, DataProvider, SampleIndex, TraceSamples, TraceSlice};
 
 // ---- Stub provider ------------------------------------------------------
@@ -91,7 +91,7 @@ impl ApplyPhyLabel for StubProvider {
 
 fn fresh_session_with(provider: StubProvider) -> (Session<StubProvider>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let journal = SqliteJournal::open(&dir.path().join("j.sqlite")).unwrap();
+    let journal = Journal::open(&dir.path().join("j.sqlite")).unwrap();
     (Session::new(provider, journal), dir)
 }
 

@@ -6,7 +6,7 @@
 //! the layout the rest of the pipeline (snippet extraction → GPU upload)
 //! wants anyway.
 
-use crate::{block_on_map, GpuContext};
+use crate::{GpuContext, block_on_map};
 use bytemuck::{Pod, Zeroable};
 use std::num::NonZeroU64;
 

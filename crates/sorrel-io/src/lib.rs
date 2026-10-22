@@ -4,6 +4,10 @@
 //! `sorrel-data` core takes a `P: DataProvider` so the compiler emits a
 //! bespoke, fully-inlined session for each backend.
 
+pub mod cbin;
+pub mod curation_json;
+pub mod detect;
+pub mod events;
 pub mod extras;
 pub mod kilosort;
 pub mod ks4_rez;
@@ -17,6 +21,10 @@ pub mod provider;
 pub mod sorting_analyzer;
 pub mod spikeglx;
 
+pub use cbin::CbinReader;
+pub use curation_json::read_curation_labels;
+pub use detect::{detect_backend, Backend};
+pub use events::Events;
 pub use extras::{
     HasAmplitudes, HasGeometry, HasPcFeatures, HasQualityMetrics, HasSpikeTemplates,
     HasTemplateWaveforms, QualityMetrics,

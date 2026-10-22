@@ -62,6 +62,6 @@ sorrel rez.mat --dat path/to/recording.bin      # --features hdf5
 
 ## Curation journal
 
-`--journal PATH` overrides the on-disk SQLite log. The default is
-`<root>/sorrel.sqlite`. The journal is replayed on every open, so reopening
+`--journal PATH` overrides the on-disk curation journal. The default is
+`<root>/sorrel.journal`. The journal is replayed on every open, so reopening
 the same directory restores all prior edits.

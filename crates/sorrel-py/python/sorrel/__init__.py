@@ -1,29 +1,29 @@
 """Sorrel — native curation GUI for SpikeInterface sortings.
 
-Public API:
+Two ways in:
 
-    sorrel.open(recording, sorting, **kwargs)
-        Curate a (recording, sorting) pair. Builds a SortingAnalyzer and
-        hands it to `open_analyzer`.
+In-process (no window), for notebooks and pipelines::
 
-    sorrel.open_analyzer(sorting_analyzer, **kwargs)
-        Curate a SortingAnalyzer. **No phy dump.** If the analyzer is already
-        a `binary_folder` on disk, sorrel launches on that folder directly
-        (zero copy). Otherwise it's saved with the lightweight
-        `save_as("binary_folder")` into a tempdir before launch.
+    s = sorrel.Session.open("my_run/phy")      # or a SortingAnalyzer binary_folder
+    s.qc()                                     # list of dicts, cluster_qc.tsv columns
+    s.suggest()                                # {"merges": [...], "splits": [...]}
+    s.set_label(3, "good"); s.merge([4, 5], 6) # journaled, undoable
+    s.save()                                   # phy files + curation.json
 
-    sorrel.export_phy(...) / sorrel.open_phy(path)
-        Escape hatches for the legacy phy-export workflow.
+GUI (subprocess, blocks until the window closes)::
 
-    sorrel.launch(path, binary=None)
-        Launch the sorrel binary on an existing data directory (phy or
-        SortingAnalyzer binary_folder — the binary auto-detects).
+    sorrel.open(recording, sorting)            # builds a SortingAnalyzer
+    sorrel.open_analyzer(sorting_analyzer)     # launches on its binary_folder
+    sorrel.open_phy(path) / sorrel.launch(path)
 
-    sorrel.inspect_phy(path)
-        Return (n_clusters, n_samples, sample_rate) for a phy directory.
+Reading curation back into SpikeInterface::
+
+    result_dir = sorrel.open_analyzer(analyzer)
+    curated = sc.apply_curation(analyzer, sorrel.read_curation(result_dir))
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import tempfile
@@ -34,13 +34,105 @@ from . import _native
 
 __version__ = _native.version()
 __all__ = [
+    "Session",
+    "export_phy",
+    "inspect_phy",
+    "launch",
     "open",
     "open_analyzer",
     "open_phy",
-    "export_phy",
-    "launch",
-    "inspect_phy",
+    "read_curation",
 ]
+
+
+class Session:
+    """In-process curation session; see the module docstring.
+
+    Thin wrapper over the native class that decodes its JSON payloads.
+    """
+
+    def __init__(self, native: Any):
+        self._n = native
+
+    @classmethod
+    def open(
+        cls,
+        path: str | os.PathLike,
+        *,
+        journal: str | os.PathLike | None = None,
+        discard_journal: bool = False,
+    ) -> "Session":
+        return cls(
+            _native.Session.open(
+                str(path),
+                None if journal is None else str(journal),
+                discard_journal,
+            )
+        )
+
+    # -- read -------------------------------------------------------------
+    @property
+    def n_clusters(self) -> int:
+        return self._n.n_clusters()
+
+    @property
+    def sample_rate(self) -> float:
+        return self._n.sample_rate()
+
+    @property
+    def version(self) -> int:
+        """Monotonic curation-state version; changes on every edit."""
+        return self._n.version()
+
+    def labels(self) -> list[str]:
+        return self._n.labels()
+
+    def spike_times(self, cluster: int) -> list[int]:
+        return self._n.spike_times(cluster)
+
+    def qc(self) -> list[dict[str, Any]]:
+        """One dict per cluster with the ``cluster_qc.tsv`` columns (NaN → None)."""
+        return json.loads(self._n.qc_json())
+
+    def suggest(self) -> dict[str, list[dict[str, Any]]]:
+        return json.loads(self._n.suggest_json())
+
+    def curation(self) -> dict[str, Any]:
+        """SpikeInterface curation document for the current state."""
+        return json.loads(self._n.curation_json())
+
+    # -- edit (journaled, undoable) --------------------------------------
+    def set_label(self, cluster: int, label: str) -> int:
+        return self._n.set_label(cluster, label)
+
+    def merge(self, sources: list[int], target: int) -> int:
+        return self._n.merge(list(sources), target)
+
+    def split(self, cluster: int, spike_idx: list[int]) -> int:
+        """Move ``spike_idx`` (positions in the cluster's time-sorted spikes)
+        into a new cluster; returns the new cluster id."""
+        return self._n.split(cluster, list(spike_idx))
+
+    def undo(self) -> int:
+        return self._n.undo()
+
+    def redo(self) -> int:
+        return self._n.redo()
+
+    def save(self) -> str:
+        """Write ``spike_clusters.npy``, ``cluster_group.tsv`` and
+        ``curation.json``; returns the directory."""
+        return self._n.save()
+
+
+def read_curation(path: str | os.PathLike) -> dict[str, Any]:
+    """Load ``curation.json`` from a dataset directory (or the file itself),
+    ready for ``spikeinterface.curation.apply_curation``."""
+    p = Path(path)
+    if p.is_dir():
+        p = p / "curation.json"
+    with p.open() as f:
+        return json.load(f)
 
 
 def inspect_phy(path: str | os.PathLike) -> tuple[int, int, float]:
@@ -57,12 +149,12 @@ def launch(
     return _native.launch(str(path), binary, extra_args)
 
 
-def open(  # noqa: A001 — intentionally shadowing built-in for ergonomics
+def open(
     recording: Any,
     sorting: Any,
     *,
     output_folder: str | os.PathLike | None = None,
-    keep_temp: bool = False,
+    keep_temp: bool = True,
     binary: str | None = None,
     **analyzer_kwargs: Any,
 ) -> str:
@@ -94,7 +186,7 @@ def open_analyzer(
     sorting_analyzer: Any,
     *,
     output_folder: str | os.PathLike | None = None,
-    keep_temp: bool = False,
+    keep_temp: bool = True,
     binary: str | None = None,
 ) -> str:
     """Curate a `SortingAnalyzer` in Sorrel — no phy dump.
@@ -104,8 +196,11 @@ def open_analyzer(
     on the existing folder. Otherwise call `analyzer.save_as("binary_folder")`
     into either `output_folder` or a tempdir.
 
-    Returns the directory the GUI loaded from (so callers can re-load it
-    with `si.load_sorting_analyzer(...)` to read curation back).
+    Returns the directory the GUI loaded from. It holds the curation
+    journal and, after a save in the GUI, ``curation.json``; feed that to
+    ``read_curation`` + ``apply_curation`` to get the curated analyzer.
+    The tempdir is kept by default for exactly that reason; pass
+    ``keep_temp=False`` to delete it (and the curation) on exit.
     """
     existing = _on_disk_binary_folder(sorting_analyzer)
     if existing is not None and output_folder is None:

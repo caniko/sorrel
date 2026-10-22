@@ -22,12 +22,47 @@ opened with (`save_dir`):
   merges and splits.
 - `cluster_group.tsv` — `good` / `mua` / `noise` / `unsorted` labels.
 
-These are exactly the files `spikeinterface.extractors.read_phy()` reads
-back, so a round trip into SpikeInterface or phy works without
+- `curation.json` — SpikeInterface's manual-curation document
+  (`format_version` 2), see below.
+
+The first two are exactly the files `spikeinterface.extractors.read_phy()`
+reads back, so a round trip into SpikeInterface or phy works without
 intermediate steps.
 
-The journal is _resealed_ at save time so a fresh open replays cleanly
-from the new baseline rather than from the original sort.
+### Journal sealing
+
+The journal is sealed against the data it was recorded on. For phy /
+Kilosort directories that seal is a hash of `spike_clusters.npy`, and
+saving _reseals_ it: the written artefacts become the new baseline and
+the undo history is cleared, so the next open loads the saved state once
+instead of replaying the same edits on top of it. Saving a
+SortingAnalyzer, NWB or `rez.mat` session does **not** reseal: those
+backends reload the original sort on every open, so the journal stays the
+source of truth and keeps its history.
+
+If the data changes underneath a journal (you re-ran the sorter, copied
+`spike_clusters.npy` from elsewhere, or the journal was written by a
+sorrel older than the seal), opening fails closed with a message naming
+the two ways out: `--discard-journal` when the curation was already
+saved, or restoring the file the journal was recorded against.
+
+### `curation.json`
+
+Every save also writes SpikeInterface's manual-curation document next to
+the phy files. It carries the `good` / `mua` / `noise` labels and, for
+backends that are not resealed, the merges and splits still pending in
+the journal, so a SortingAnalyzer round trip is one call:
+
+```python
+import spikeinterface.curation as sc
+curated = sc.apply_curation(analyzer, "my_run/sorting_analyzer/curation.json")
+```
+
+For phy directories the saved `spike_clusters.npy` already contains the
+merges and splits, so there `curation.json` is labels only and must not
+be applied on top of the npy a second time. Sorrel reads the file back
+on open when no `cluster_group.tsv` is present (phy dirs) and always for
+SortingAnalyzer folders, so labels made in SpikeInterface show up too.
 
 ## Headless QC export
 

@@ -5,7 +5,7 @@ use crate::cache::{isolation, pc_subspace};
 use crate::cluster_index::{ClusterIndex, MergeRecord, SplitRecord};
 use crate::command::{CurationCommand, PhyLabelOp};
 use crate::feature_subspace::{DEFAULT_CHANNEL_IDX, DEFAULT_D, DEFAULT_MAX_BACKGROUND};
-use crate::journal::SqliteJournal;
+use crate::journal::Journal;
 use crate::quality_ext::DEFAULT_K_NN;
 use anyhow::{bail, Result};
 use sorrel_cache::{CacheKey, CacheStore, Fingerprint};
@@ -74,20 +74,27 @@ struct CacheInvalidation {
 /// curation surface (spike→cluster reassignment lives here, not in the
 /// provider). All view code reads `Session::spike_times` / `spike_amplitudes`
 /// / `spike_templates` so it sees the live, post-curation state.
+/// Observer installed by [`Session::set_record_sink`].
+pub type RecordSink = Box<dyn FnMut(&CurationCommand) + Send + Sync>;
+
 pub struct Session<P: DataProvider> {
     pub provider: P,
     /// Indexed by `ClusterId`. `P::Label` is `Copy + 'static`, so this is a
     /// flat, cache-friendly buffer (1 byte per cluster for `PhyLabel`).
     labels: Vec<P::Label>,
     cluster_index: ClusterIndex,
-    journal: SqliteJournal,
+    journal: Journal,
     history: Vec<HistoryEntry<P::Label>>,
     redo: Vec<HistoryEntry<P::Label>>,
     cache_invalidations: VecDeque<CacheInvalidation>,
+    /// Observer called once per journaled record, right after the append is
+    /// durable and before the in-memory state moves. Used to stream records
+    /// to a remote host; `None` for ordinary local sessions.
+    record_sink: Option<RecordSink>,
 }
 
 impl<P: DataProvider> Session<P> {
-    pub fn new(provider: P, journal: SqliteJournal) -> Self {
+    pub fn new(provider: P, journal: Journal) -> Self {
         let labels = provider.initial_labels();
         let cluster_index = ClusterIndex::from_provider(&provider);
         Self {
@@ -98,7 +105,14 @@ impl<P: DataProvider> Session<P> {
             history: Vec::new(),
             redo: Vec::new(),
             cache_invalidations: VecDeque::new(),
+            record_sink: None,
         }
+    }
+
+    /// Install the per-record observer (see [`Session::dispatch`]). Replay does
+    /// not call it: only records this process appends are forwarded.
+    pub fn set_record_sink(&mut self, sink: impl FnMut(&CurationCommand) + Send + Sync + 'static) {
+        self.record_sink = Some(Box::new(sink));
     }
 
     /// Pull per-spike amplitudes from the provider into the cluster index.
@@ -186,6 +200,36 @@ impl<P: DataProvider> Session<P> {
 
     pub(crate) fn journal_head(&self) -> u64 {
         self.journal.head()
+    }
+
+    /// Monotonic version of the replay-visible curation state: changes on
+    /// every journaled command (including undo/redo) and on reseal. Use it
+    /// as the cache key for anything derived from curation state; the
+    /// `(history_len, redo_len)` pair is *not* safe because undo followed by
+    /// a different forward op lands on the same pair with different state.
+    #[inline]
+    pub fn version(&self) -> u64 {
+        self.journal.head()
+    }
+
+    /// Where the curation journal lives on disk.
+    pub fn journal_path(&self) -> &Path {
+        self.journal.path()
+    }
+
+    /// The sealed journal: baseline, record count, and path.
+    pub fn journal(&self) -> &Journal {
+        &self.journal
+    }
+
+    /// Swap in a freshly sealed journal (see `save_and_reseal_journal`).
+    /// The saved artifacts are now canonical, so the undo/redo stacks and
+    /// pending cache invalidations are dropped with the old journal.
+    pub fn reseal(&mut self, journal: Journal) {
+        self.journal = journal;
+        self.history.clear();
+        self.redo.clear();
+        self.cache_invalidations.clear();
     }
 
     /// Evict cache entries known to have been derived from pre-edit journal
@@ -337,6 +381,26 @@ impl<P: DataProvider> Session<P> {
         self.cluster_index.spike_templates(cluster)
     }
 
+    /// The template most of this cluster's spikes were assigned to, or
+    /// `None` when spike templates are not seeded. After merges a cluster
+    /// spans several templates; the mode is what phy shows as "its"
+    /// waveform.
+    pub fn primary_template(&self, cluster: ClusterId) -> Option<u32> {
+        let templates = self.spike_templates(cluster);
+        if templates.is_empty() {
+            return None;
+        }
+        let mut counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for &t in templates {
+            *counts.entry(t).or_insert(0) += 1;
+        }
+        // Ties resolve to the lowest id so the answer is deterministic.
+        counts
+            .into_iter()
+            .max_by_key(|&(t, c)| (c, std::cmp::Reverse(t)))
+            .map(|(t, _)| t)
+    }
+
     /// Read-only access to the underlying `ClusterIndex` (used by the
     /// save-to-phy writer).
     #[inline]
@@ -360,6 +424,47 @@ impl<P: DataProvider> Session<P> {
     /// undo stack, oldest first.
     pub fn history_commands(&self) -> impl Iterator<Item = &CurationCommand> {
         self.history.iter().map(|e| &e.cmd)
+    }
+
+    /// Iterator over the commands on the redo stack, next-to-redo last.
+    pub fn redo_commands(&self) -> impl Iterator<Item = &CurationCommand> {
+        self.redo.iter().map(|e| &e.cmd)
+    }
+
+    /// The forward commands on the undo stack, oldest first, with every
+    /// `Split.new_cluster` replaced by the id the index actually allocated
+    /// (the journal stores a placeholder; see `apply_forward`). This is the
+    /// list interchange writers need, since downstream tools must know
+    /// which unit a split produced.
+    pub fn applied_commands(&self) -> Vec<CurationCommand> {
+        fn resolve<L: Copy>(cmd: &CurationCommand, inv: &InverseOp<L>) -> CurationCommand {
+            match (cmd, inv) {
+                (
+                    CurationCommand::Split {
+                        cluster, spike_idx, ..
+                    },
+                    InverseOp::Split { record },
+                ) => CurationCommand::Split {
+                    cluster: *cluster,
+                    spike_idx: spike_idx.clone(),
+                    new_cluster: record.new_cluster,
+                },
+                (CurationCommand::Batch { children }, InverseOp::Batch { inverses }) => {
+                    CurationCommand::Batch {
+                        children: children
+                            .iter()
+                            .zip(inverses)
+                            .map(|(c, i)| resolve(c, i))
+                            .collect(),
+                    }
+                }
+                _ => cmd.clone(),
+            }
+        }
+        self.history
+            .iter()
+            .map(|e| resolve(&e.cmd, &e.inverse))
+            .collect()
     }
 
     /// Replay an existing journal on top of an already-loaded session,
@@ -396,6 +501,9 @@ impl<P: DataProvider> Session<P> {
         let prev_head = self.journal.head();
         let affected = self.cache_identities_for_command(&cmd);
         self.journal.append(&cmd)?;
+        if let Some(sink) = &mut self.record_sink {
+            sink(&cmd);
+        }
         let new_head = self.journal.head();
         self.apply_record(cmd)?;
         self.record_cache_invalidation(prev_head, new_head, affected);
@@ -774,7 +882,7 @@ mod tests {
             n_channels: 4,
         };
         let dir = tempfile::tempdir().unwrap();
-        let journal = SqliteJournal::open(&dir.path().join("j.sqlite")).unwrap();
+        let journal = Journal::open(&dir.path().join("j.sqlite")).unwrap();
         let session = Session::new(provider, journal);
         (session, dir)
     }
@@ -1091,7 +1199,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("j.sqlite");
         {
-            let mut j = SqliteJournal::open(&path).unwrap();
+            let mut j = Journal::open(&path).unwrap();
             j.append(&CurationCommand::Relabel {
                 cluster: ClusterId(0),
                 op: PhyLabelOp::SetMua,
@@ -1115,7 +1223,7 @@ mod tests {
             trace: vec![],
             n_channels: 1,
         };
-        let journal = SqliteJournal::open(&path).unwrap();
+        let journal = Journal::open(&path).unwrap();
         let mut session = Session::new(provider, journal);
         session.replay_journal().unwrap();
 
@@ -1131,7 +1239,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("j.sqlite");
         {
-            let mut j = SqliteJournal::open(&path).unwrap();
+            let mut j = Journal::open(&path).unwrap();
             j.append(&CurationCommand::Undo).unwrap();
         }
 
@@ -1141,7 +1249,7 @@ mod tests {
             trace: vec![],
             n_channels: 1,
         };
-        let journal = SqliteJournal::open(&path).unwrap();
+        let journal = Journal::open(&path).unwrap();
         let mut session = Session::new(provider, journal);
         assert!(session.replay_journal().is_err());
     }
@@ -1151,7 +1259,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("j.sqlite");
         {
-            let mut j = SqliteJournal::open(&path).unwrap();
+            let mut j = Journal::open(&path).unwrap();
             j.append(&CurationCommand::Merge {
                 sources: vec![ClusterId(0), ClusterId(1)],
                 target: ClusterId(2),
@@ -1169,7 +1277,7 @@ mod tests {
             trace: vec![],
             n_channels: 1,
         };
-        let journal = SqliteJournal::open(&path).unwrap();
+        let journal = Journal::open(&path).unwrap();
         let mut session = Session::new(provider, journal);
         session.replay_journal().unwrap();
 

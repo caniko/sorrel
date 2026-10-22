@@ -250,7 +250,7 @@ pub fn nn_isolation_metric(features: &[f32], is_in_cluster: &[bool], d: usize, k
         if b {
             pool.push(i);
         } else {
-            if out_seen % out_stride == 0 {
+            if out_seen.is_multiple_of(out_stride) {
                 pool.push(i);
             }
             out_seen += 1;

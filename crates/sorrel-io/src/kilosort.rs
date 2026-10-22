@@ -83,7 +83,7 @@ pub struct KilosortProvider {
 
     // PC features. Flat `(n_spikes, n_pcs, n_channels_per_template)` row-major.
     // Empty when the file is absent.
-    pc_features: Vec<f32>,
+    pc_features: std::sync::Arc<[f32]>,
     pc_shape: (usize, usize), // (n_pcs, n_channels_per_template)
     pc_feature_ind: Vec<u32>, // (n_templates * n_channels_per_template) flat
     /// Per-cluster, time-sorted, original NPY row indices into pc_features.
@@ -93,7 +93,7 @@ pub struct KilosortProvider {
     // Template waveforms `(n_templates, n_samples, n_channels)` flat. Empty
     // when `templates.npy` is absent. `similar_templates.npy` is the square
     // template-similarity matrix (`n_templates × n_templates`).
-    template_waveforms: Vec<f32>,
+    template_waveforms: std::sync::Arc<[f32]>,
     template_shape: (usize, usize, usize),
     similar_templates: Vec<f32>,
 
@@ -108,6 +108,12 @@ pub struct KilosortProvider {
     // We cast at access time based on `dtype`.
     trace_ptr: *const u8,
     trace_byte_len: usize,
+    /// Set when `dat_path` is an mtscomp `.cbin`; windows are decoded on
+    /// demand and `trace_ptr`/`trace_byte_len` stay empty.
+    cbin: Option<crate::cbin::CbinReader>,
+    dat_path: PathBuf,
+    dat_offset: u64,
+    trace_fetch: Option<std::sync::Arc<dyn crate::provider::TraceFetch>>,
 }
 
 // SAFETY: the raw pointer aliases data inside `_trace_mmap` which lives as long
@@ -118,7 +124,7 @@ unsafe impl Sync for KilosortProvider {}
 
 /// Optional overrides that take precedence over `params.py`. All fields are
 /// optional so callers can supply only what they want to override.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct KilosortOpenParams {
     pub sample_rate: Option<f32>,
     pub n_channels: Option<u32>,
@@ -128,6 +134,26 @@ pub struct KilosortOpenParams {
     /// it isn't absolute. Falls back to `params.py:dat_path`, then
     /// `<root>/recording.dat`.
     pub dat_path: Option<PathBuf>,
+    /// Remote-mirror hook: consulted before every trace read. `None` for
+    /// ordinary local datasets.
+    pub trace_fetch: Option<std::sync::Arc<dyn crate::provider::TraceFetch>>,
+    /// Replaces the file-metadata identity (a sparse mirror's mtime changes on
+    /// every fetch, which would churn derived caches).
+    pub identity_override: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for KilosortOpenParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KilosortOpenParams")
+            .field("sample_rate", &self.sample_rate)
+            .field("n_channels", &self.n_channels)
+            .field("dtype", &self.dtype)
+            .field("offset", &self.offset)
+            .field("dat_path", &self.dat_path)
+            .field("trace_fetch", &self.trace_fetch.is_some())
+            .field("identity_override", &self.identity_override.is_some())
+            .finish()
+    }
 }
 
 impl KilosortProvider {
@@ -217,7 +243,19 @@ impl KilosortProvider {
         // provider rather than dropping it on the floor.
         let pc_indices_per_cluster = indices_per_cluster;
 
-        let initial_labels = load_cluster_groups(&cluster_group_path, n_clusters);
+        // phy semantics: curated `cluster_group.tsv` wins, then a
+        // SpikeInterface `curation.json`, then the sorter's own
+        // `cluster_KSLabel.tsv` from a fresh Kilosort output.
+        let initial_labels = if cluster_group_path.exists() {
+            load_cluster_groups(&cluster_group_path, n_clusters)
+        } else {
+            crate::curation_json::read_curation_labels(
+                &root.join("curation.json"),
+                n_clusters,
+                |uid| usize::try_from(uid).ok(),
+            )
+            .unwrap_or_else(|| load_cluster_groups(&root.join("cluster_KSLabel.tsv"), n_clusters))
+        };
 
         // 2.5. Probe geometry. All optional; absence is fine.
         let channel_positions = read_optional_positions(&root.join("channel_positions.npy"))?;
@@ -257,10 +295,35 @@ impl KilosortProvider {
         } else {
             root.join(&dat_rel)
         };
-        let trace_file =
-            File::open(&dat_path).with_context(|| format!("open {}", dat_path.display()))?;
+        let is_cbin = dat_path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("cbin"));
+        let cbin = if is_cbin {
+            let r = crate::cbin::CbinReader::open(&dat_path)?;
+            if r.n_channels() != n_channels as usize {
+                bail!(
+                    "{}: n_channels {} does not match params ({n_channels})",
+                    dat_path.display(),
+                    r.n_channels()
+                );
+            }
+            if dtype != TraceDtype::I16 {
+                bail!("{}: mtscomp recordings are int16", dat_path.display());
+            }
+            Some(r)
+        } else {
+            None
+        };
+        // A compressed recording has no raw bytes to map: keep an empty map
+        // so every downstream byte-range computation clamps to zero.
+        let trace_file = if is_cbin {
+            File::open(dat_path.with_extension("ch"))
+        } else {
+            File::open(&dat_path)
+        }
+        .with_context(|| format!("open {}", dat_path.display()))?;
         let trace_mmap = unsafe { Mmap::map(&trace_file)? };
-        let total_bytes = trace_mmap.len();
+        let total_bytes = if is_cbin { 0 } else { trace_mmap.len() };
         if (offset as usize) > total_bytes {
             bail!(
                 "params.offset ({}) exceeds dat size ({})",
@@ -278,7 +341,10 @@ impl KilosortProvider {
                 dtype.size_bytes()
             );
         }
-        let n_samples = SampleIndex((payload_bytes / bytes_per_sample) as u64);
+        let n_samples = match &cbin {
+            Some(r) => SampleIndex(r.n_samples()),
+            None => SampleIndex((payload_bytes / bytes_per_sample) as u64),
+        };
         // SAFETY: pointer arithmetic stays inside the mmap; we just verified
         // `offset <= total_bytes`.
         let trace_ptr = unsafe { trace_mmap.as_ptr().add(offset as usize) };
@@ -306,26 +372,63 @@ impl KilosortProvider {
             channel_positions,
             channel_shanks,
             channel_map,
-            pc_features,
+            pc_features: pc_features.into(),
             pc_shape,
             pc_feature_ind,
             pc_indices_per_cluster,
-            template_waveforms,
+            template_waveforms: template_waveforms.into(),
             template_shape,
             similar_templates,
             metrics,
-            identity_bytes,
+            identity_bytes: overrides.identity_override.unwrap_or(identity_bytes),
             trace_ptr,
             trace_byte_len,
+            cbin,
+            dat_path,
+            dat_offset: offset,
+            trace_fetch: overrides.trace_fetch,
         })
     }
 
+    /// Byte range of the trace payload (offset already removed) that
+    /// `[start, start + len)` samples occupy, clamped to the file.
+    fn window_bytes(&self, start: SampleIndex, len: u32) -> std::ops::Range<u64> {
+        let frame = (self.n_channels as u64) * self.dtype.size_bytes() as u64;
+        let s = start
+            .0
+            .saturating_mul(frame)
+            .min(self.trace_byte_len as u64);
+        let e = (start.0 + len as u64)
+            .saturating_mul(frame)
+            .min(self.trace_byte_len as u64);
+        s..e
+    }
+
     fn samples_window(&self, start: SampleIndex, len: u32) -> TraceSamples<'_> {
+        if let Some(fetch) = &self.trace_fetch {
+            if !fetch.ensure(self.window_bytes(start, len)) {
+                // Not resident yet: same contract as a missing recording.
+                return TraceSamples::empty(self.dtype);
+            }
+        }
+        if let Some(r) = &self.cbin {
+            return TraceSamples::OwnedI16(r.window(start.0, len as usize));
+        }
         let nc = self.n_channels as usize;
         let s = start.idx().saturating_mul(nc);
         let e = s + (len as usize) * nc;
         let bytes = unsafe { std::slice::from_raw_parts(self.trace_ptr, self.trace_byte_len) };
         TraceSamples::from_bytes_clamped(bytes, self.dtype, s, e)
+    }
+
+    /// Resolved raw-recording path and the header bytes skipped before the
+    /// first sample.
+    pub fn dat_path(&self) -> &Path {
+        &self.dat_path
+    }
+
+    pub fn dat_offset(&self) -> u64 {
+        self.dat_offset
     }
 
     pub fn dtype(&self) -> TraceDtype {
@@ -378,6 +481,18 @@ impl DataProvider for KilosortProvider {
         self.identity_bytes.clone()
     }
 
+    fn prefetch(&self, windows: &[(SampleIndex, u32)]) {
+        if let Some(fetch) = &self.trace_fetch {
+            for &(start, len) in windows {
+                fetch.ensure(self.window_bytes(start, len));
+            }
+        }
+    }
+
+    fn pending_fetches(&self) -> usize {
+        self.trace_fetch.as_ref().map_or(0, |f| f.pending())
+    }
+
     fn amplitude_full_scale(&self) -> f32 {
         self.dtype.nominal_full_scale()
     }
@@ -423,6 +538,9 @@ impl HasPcFeatures for KilosortProvider {
     fn pc_features(&self) -> &[f32] {
         &self.pc_features
     }
+    fn pc_features_shared(&self) -> std::sync::Arc<[f32]> {
+        self.pc_features.clone()
+    }
     #[inline]
     fn pc_shape(&self) -> (usize, usize) {
         self.pc_shape
@@ -444,6 +562,9 @@ impl crate::extras::HasTemplateWaveforms for KilosortProvider {
     #[inline]
     fn template_waveforms(&self) -> &[f32] {
         &self.template_waveforms
+    }
+    fn template_waveforms_shared(&self) -> std::sync::Arc<[f32]> {
+        self.template_waveforms.clone()
     }
     #[inline]
     fn template_shape(&self) -> (usize, usize, usize) {
@@ -487,9 +608,8 @@ fn load_quality_metrics(root: &Path, n_clusters: usize) -> crate::extras::Qualit
             else {
                 continue;
             };
-            if matches!(stripped, "group" | "groups" | "KSLabel" | "purity" | "info")
-                && stripped == "group"
-            {
+            // Label/annotation sidecars are not numeric metrics.
+            if matches!(stripped, "group" | "groups" | "KSLabel" | "purity" | "info") {
                 continue;
             }
             if metrics.contains(stripped) {
@@ -512,7 +632,13 @@ fn ingest_si_metrics_csv(text: &str, n_clusters: usize, out: &mut crate::extras:
     let Some(header) = lines.next() else {
         return;
     };
-    let cols: Vec<&str> = header.split(',').collect();
+    // SpikeInterface writes commas, but exporters and hand edits also
+    // produce tab- or semicolon-separated files; sniff from the header.
+    let sep = ['\t', ';', ',']
+        .into_iter()
+        .find(|&c| header.contains(c))
+        .unwrap_or(',');
+    let cols: Vec<&str> = header.split(sep).collect();
     if cols.len() < 2 {
         return;
     }
@@ -523,7 +649,7 @@ fn ingest_si_metrics_csv(text: &str, n_clusters: usize, out: &mut crate::extras:
         }
     }
     for line in lines {
-        let cells: Vec<&str> = line.split(',').collect();
+        let cells: Vec<&str> = line.split(sep).collect();
         if cells.is_empty() {
             continue;
         }
@@ -793,6 +919,15 @@ fn read_int_array<T>(
 }
 
 fn read_u64_array(mmap: &Mmap, hdr: &NpyHeader, n: usize) -> Result<Vec<SampleIndex>> {
+    // `<i8`/`<u8` spike_times are the common case: one memcpy instead of
+    // a per-element decode (SampleIndex is a transparent u64).
+    if let Ok(d) = crate::npy::NpyDtype::parse(&hdr.dtype) {
+        let bytes = &mmap[hdr.data_offset as usize..];
+        let same = matches!(d, crate::npy::NpyDtype::I64 | crate::npy::NpyDtype::U64);
+        if let Some(v) = crate::npy::cast_fast::<SampleIndex>(bytes, n, same) {
+            return Ok(v);
+        }
+    }
     read_int_array(
         mmap,
         hdr,
@@ -809,26 +944,29 @@ fn read_u32_array(mmap: &Mmap, hdr: &NpyHeader, n: usize) -> Result<Vec<u32>> {
 
 fn load_cluster_groups(path: &Path, n_clusters: usize) -> Vec<PhyLabel> {
     let mut out = vec![PhyLabel::Unsorted; n_clusters];
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return out;
-    };
-    let mut lines = text.lines();
-    let Some(_header) = lines.next() else {
-        return out;
-    };
-    for line in lines {
-        let mut cols = line.split('\t');
-        let (Some(id), Some(group)) = (cols.next(), cols.next()) else {
-            continue;
-        };
-        let Ok(id) = id.trim().parse::<usize>() else {
-            continue;
-        };
-        if id < out.len() {
-            out[id] = PhyLabel::parse_tsv_value(group);
+    for (id, label) in read_cluster_group_tsv(path).unwrap_or_default() {
+        if (id as usize) < out.len() {
+            out[id as usize] = label;
         }
     }
     out
+}
+
+/// Parse a phy `cluster_group.tsv` (or any `cluster_id\t<label>` file such
+/// as `cluster_KSLabel.tsv`) into `(cluster_id, label)` rows, header
+/// skipped, unparsable rows dropped. `None` when the file is unreadable.
+pub fn read_cluster_group_tsv(path: &Path) -> Option<Vec<(u32, PhyLabel)>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(
+        text.lines()
+            .skip(1)
+            .filter_map(|line| {
+                let mut cols = line.split('\t');
+                let (id, group) = (cols.next()?, cols.next()?);
+                Some((id.trim().parse().ok()?, PhyLabel::parse_tsv_value(group)))
+            })
+            .collect(),
+    )
 }
 
 /// Convenience: count spikes per cluster (mostly for tests / status bars).

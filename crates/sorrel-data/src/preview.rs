@@ -243,7 +243,7 @@ impl MergePreview {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::SqliteJournal;
+    use crate::journal::Journal;
     use sorrel_io::{
         ClusterId, DataProvider, HasAmplitudes, SampleIndex, TraceSamples, TraceSlice,
     };
@@ -290,7 +290,7 @@ mod tests {
 
     fn make_session(prov: MockProvider) -> (Session<MockProvider>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let journal = SqliteJournal::open(&dir.path().join("j.sqlite")).unwrap();
+        let journal = Journal::open(&dir.path().join("j.sqlite")).unwrap();
         let mut s = Session::new(prov, journal);
         s.seed_amplitudes();
         (s, dir)

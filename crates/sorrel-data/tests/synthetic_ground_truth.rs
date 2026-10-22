@@ -14,7 +14,7 @@
 //! These are the failure modes that keep curators awake at night.
 
 use sorrel_data::{
-    journal::SqliteJournal, rank_merge_candidates, rank_split_candidates, Session, SuggestConfig,
+    journal::Journal, rank_merge_candidates, rank_split_candidates, Session, SuggestConfig,
 };
 use sorrel_io::{ClusterId, DataProvider, HasAmplitudes, SampleIndex, TraceSamples, TraceSlice};
 
@@ -168,7 +168,7 @@ fn build_ground_truth() -> GroundTruth {
 
 fn fresh_session(prov: GroundTruth) -> (Session<GroundTruth>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let journal = SqliteJournal::open(&dir.path().join("j.sqlite")).unwrap();
+    let journal = Journal::open(&dir.path().join("j.sqlite")).unwrap();
     let mut s = Session::new(prov, journal);
     s.seed_amplitudes();
     (s, dir)

@@ -1,7 +1,7 @@
 # Data Flow
 
 Sorrel's core path is generic over `P: DataProvider`. The binary detects
-a backend, constructs the concrete provider, opens the SQLite journal,
+a backend, constructs the concrete provider, opens the curation journal,
 and builds a `Session<P>`. From there the UI, render buffers, and
 compute kernels are all statically dispatched.
 
@@ -43,7 +43,7 @@ files. See [Derived Cache](./cache.md) for the full contract.
 `Note`, `Batch`, `Undo`, `Redo`. The session applies a command in two
 strictly-ordered steps:
 
-1. **Append to the journal.** A successful SQLite commit is the
+1. **Append to the journal.** A durable (fsynced) journal append is the
    point-of-no-return.
 2. **Mutate in-memory state.** The `ClusterIndex` updates, the
    selection moves, caches that depend on history are invalidated.

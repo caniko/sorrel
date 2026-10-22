@@ -17,9 +17,9 @@ pub mod metrics_iso;
 pub mod quality;
 pub mod snippets;
 
-pub use binning::{histogram_u64, isi_histogram};
+pub use binning::{histogram_u64, isi_histogram, psth};
 pub use ccg_analysis::{analyse_refractory_dip, refractory_dip_score, CcgRefractoryAnalysis};
-pub use cmr::subtract_channel_median;
+pub use cmr::{subtract_channel_median, subtract_channel_median_grouped};
 pub use distribution::{
     amplitude_cutoff, bimodality_coefficient, excess_kurtosis, hartigan_dip, ks_pvalue,
     ks_two_sample, mean_f64, mean_std, percentile, skewness, Moments,

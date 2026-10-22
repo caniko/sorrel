@@ -277,15 +277,30 @@ impl TraceDtype {
 
 /// Typed view into the raw mmap. Each variant carries a slice in the native
 /// dtype so consumers can run dtype-specialised inner loops without copying.
+/// `OwnedI16` is the one exception: decompressing sources (mtscomp `.cbin`)
+/// cannot hand out a borrow into a file, so they return the decoded window.
+/// Consumers match on [`TraceSamples::borrow`] and never see the difference.
 #[derive(Debug)]
 pub enum TraceSamples<'a> {
     I16(&'a [i16]),
     U16(&'a [u16]),
     I32(&'a [i32]),
     F32(&'a [f32]),
+    OwnedI16(Vec<i16>),
 }
 
 impl<'a> TraceSamples<'a> {
+    /// A borrowing view; the owned variant becomes `I16`.
+    #[inline]
+    pub fn borrow(&self) -> TraceSamples<'_> {
+        match self {
+            Self::I16(s) => TraceSamples::I16(s),
+            Self::U16(s) => TraceSamples::U16(s),
+            Self::I32(s) => TraceSamples::I32(s),
+            Self::F32(s) => TraceSamples::F32(s),
+            Self::OwnedI16(v) => TraceSamples::I16(v),
+        }
+    }
     #[inline]
     pub fn len(&self) -> usize {
         match self {
@@ -293,6 +308,7 @@ impl<'a> TraceSamples<'a> {
             Self::U16(s) => s.len(),
             Self::I32(s) => s.len(),
             Self::F32(s) => s.len(),
+            Self::OwnedI16(v) => v.len(),
         }
     }
     #[inline]
@@ -301,10 +317,21 @@ impl<'a> TraceSamples<'a> {
     }
     pub fn dtype(&self) -> TraceDtype {
         match self {
-            Self::I16(_) => TraceDtype::I16,
+            Self::I16(_) | Self::OwnedI16(_) => TraceDtype::I16,
             Self::U16(_) => TraceDtype::U16,
             Self::I32(_) => TraceDtype::I32,
             Self::F32(_) => TraceDtype::F32,
+        }
+    }
+
+    /// Zero samples of `dtype`. Use this instead of casting an empty byte
+    /// slice: `bytemuck` rejects a 1-byte-aligned pointer for wider types.
+    pub fn empty(dtype: TraceDtype) -> Self {
+        match dtype {
+            TraceDtype::I16 => Self::I16(&[]),
+            TraceDtype::U16 => Self::U16(&[]),
+            TraceDtype::I32 => Self::I32(&[]),
+            TraceDtype::F32 => Self::F32(&[]),
         }
     }
 
@@ -333,11 +360,12 @@ impl<'a> TraceSamples<'a> {
     /// `i16::MAX`. This matches the convention used by render and UI which
     /// treat U16 as zero-centred int16.
     pub fn to_f32_centred(&self) -> Vec<f32> {
-        match *self {
-            Self::I16(s) => s.iter().map(|&v| v as f32).collect(),
-            Self::U16(s) => s.iter().map(|&v| v as f32 - i16::MAX as f32).collect(),
-            Self::I32(s) => s.iter().map(|&v| v as f32).collect(),
-            Self::F32(s) => s.to_vec(),
+        match self.borrow() {
+            TraceSamples::I16(s) => s.iter().map(|&v| v as f32).collect(),
+            TraceSamples::U16(s) => s.iter().map(|&v| v as f32 - i16::MAX as f32).collect(),
+            TraceSamples::I32(s) => s.iter().map(|&v| v as f32).collect(),
+            TraceSamples::F32(s) => s.to_vec(),
+            TraceSamples::OwnedI16(v) => v.iter().map(|&v| v as f32).collect(),
         }
     }
 }
@@ -374,6 +402,14 @@ pub trait DataProvider: Send + Sync + 'static {
     /// Initial label vector loaded from the backend's on-disk schema.
     fn initial_labels(&self) -> Vec<Self::Label>;
 
+    /// The backend's own identifier for a cluster, as written to interchange
+    /// files such as SpikeInterface's `curation.json`. Phy directories number
+    /// clusters densely so the default is the cluster index itself; backends
+    /// with sparse unit ids override this.
+    fn unit_id(&self, cluster: ClusterId) -> u32 {
+        cluster.0
+    }
+
     /// Stable bytes identifying this provider's input data, not its path.
     ///
     /// Concrete file-backed providers should prefer content headers for
@@ -401,4 +437,30 @@ pub trait DataProvider: Send + Sync + 'static {
     fn amplitude_full_scale(&self) -> f32 {
         TraceDtype::I16.nominal_full_scale()
     }
+
+    /// Ask the backend to make these trace windows resident before a burst of
+    /// [`DataProvider::trace`] calls (e.g. one snippet per spike). Local
+    /// backends already have everything; remote-backed providers batch the
+    /// network round trip here.
+    fn prefetch(&self, _windows: &[(SampleIndex, u32)]) {}
+
+    /// Number of trace fetches still in flight. Non-zero means a recent
+    /// [`DataProvider::trace`] returned an incomplete window and the caller
+    /// should repaint soon.
+    fn pending_fetches(&self) -> usize {
+        0
+    }
+}
+
+/// Fills a trace mirror on demand. Implemented by remote backends; a provider
+/// holding one consults it before reading a window and returns an empty
+/// window while the bytes are still in flight.
+pub trait TraceFetch: Send + Sync + 'static {
+    /// Make `bytes` (payload-relative, i.e. after any header offset) resident.
+    /// Returns `true` when the whole range is already readable; `false`
+    /// schedules the fetch and returns immediately.
+    fn ensure(&self, bytes: std::ops::Range<u64>) -> bool;
+
+    /// Fetches scheduled but not yet written.
+    fn pending(&self) -> usize;
 }

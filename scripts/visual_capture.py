@@ -15,7 +15,6 @@ import tempfile
 import time
 from pathlib import Path
 
-
 TARGET = "sorrel/application"
 VIEWPORT = {"width": 1280, "height": 800, "dpr": 1.0}
 THEME = "dark"
@@ -178,7 +177,7 @@ def capture_window(root: Path, fixture: Path, visual_root: Path) -> Path:
         log_path = visual_root / "sorrel.log"
         log = log_path.open("w")
         process = subprocess.Popen(
-            [str(binary), str(fixture), "--journal", str(fixture / "sorrel.sqlite")],
+            [str(binary), str(fixture), "--journal", str(fixture / "sorrel.journal")],
             cwd=root,
             env=environment,
             stdout=log,
@@ -193,7 +192,7 @@ def capture_window(root: Path, fixture: Path, visual_root: Path) -> Path:
                 if process.poll() is not None:
                     raise RuntimeError(f"Sorrel exited with {process.returncode}; see {log_path}")
                 result = subprocess.run(
-                    ["xdotool", "search", "--onlyvisible", "--name", "^Sorrel$"],
+                    ["xdotool", "search", "--onlyvisible", "--name", "Sorrel$"],
                     env=environment,
                     capture_output=True,
                     text=True,

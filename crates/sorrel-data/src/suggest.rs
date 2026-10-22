@@ -21,7 +21,7 @@ use sorrel_io::{ClusterId, DataProvider};
 
 /// One suggested merge between two clusters, with the underlying evidence
 /// retained so the UI can show *why* this pair scored where it did.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct MergeCandidate {
     pub a: ClusterId,
     pub b: ClusterId,
@@ -45,7 +45,7 @@ pub struct MergeCandidate {
 /// concrete bipartition proposal (`bipartition_minor_idx`) when the
 /// amplitude distribution fits a 2-component GMM well — that lets the UI
 /// offer a one-click apply.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct SplitCandidate {
     pub cluster: ClusterId,
     /// Combined score in `[0, 1]`. Higher = stronger evidence of structure
@@ -368,7 +368,7 @@ pub fn amplitude_iqr_overlap(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::SqliteJournal;
+    use crate::journal::Journal;
     use sorrel_io::{
         ClusterId, DataProvider, HasAmplitudes, SampleIndex, TraceSamples, TraceSlice,
     };
@@ -417,7 +417,7 @@ mod tests {
 
     fn fresh_session(prov: MockProvider) -> (Session<MockProvider>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let journal = SqliteJournal::open(&dir.path().join("j.sqlite")).unwrap();
+        let journal = Journal::open(&dir.path().join("j.sqlite")).unwrap();
         let mut s = Session::new(prov, journal);
         s.seed_amplitudes();
         (s, dir)

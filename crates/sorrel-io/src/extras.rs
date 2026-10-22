@@ -56,6 +56,13 @@ pub trait HasPcFeatures: DataProvider {
     /// (from spike_times) to get the flat length.
     fn pc_shape(&self) -> (usize, usize);
 
+    /// The same buffer as a shared handle, so consumers that keep it (the
+    /// cluster index) do not copy hundreds of MB. Backends that already
+    /// hold an `Arc` override this to clone the handle.
+    fn pc_features_shared(&self) -> std::sync::Arc<[f32]> {
+        std::sync::Arc::from(self.pc_features())
+    }
+
     /// `(n_templates, n_channels_per_template)` channel id remap.
     fn pc_feature_ind(&self) -> &[u32];
 
@@ -78,6 +85,12 @@ pub trait HasTemplateWaveforms: DataProvider {
     /// `(n_templates, n_samples, n_channels)`. Returns `(0, 0, 0)` when the
     /// backend has no templates loaded.
     fn template_shape(&self) -> (usize, usize, usize);
+
+    /// Shared handle to [`Self::template_waveforms`]; see
+    /// [`HasPcFeatures::pc_features_shared`].
+    fn template_waveforms_shared(&self) -> std::sync::Arc<[f32]> {
+        std::sync::Arc::from(self.template_waveforms())
+    }
 
     /// `(n_templates, n_templates)` similarity matrix. Returns an empty
     /// slice when `similar_templates.npy` wasn't found.

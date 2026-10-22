@@ -88,6 +88,7 @@ but Sorrel can use them as the raw `.dat` for an existing phy directory:
 | **SpikeGLX**          | `<run>.<stream>.bin` + `<run>.<stream>.meta` | yes            |
 | **Open Ephys binary** | `continuous.dat` + `structure.oebin`         | yes            |
 | **Mountainsort MDA**  | `*.mda` (header-prefixed flat array)         | yes            |
+| **mtscomp (IBL)**     | `<run>.cbin` + `<run>.ch` (zlib chunks)      | yes            |
 
 For SpikeGLX or Open Ephys, point `--dat` at the bin file and pass
 `--sample-rate`/`--channels` from the `.meta`/`.oebin` (or let Sorrel
@@ -130,15 +131,35 @@ under `<output>/phy/` automatically — open that directory instead.
 ## Python (Jupyter)
 
 The `sorrel-py` crate (build with `maturin develop` from
-`crates/sorrel-py/`) exposes:
+`crates/sorrel-py/`) has two layers.
+
+**In-process, no window** — the notebook and pipeline API. It opens the
+same journal the GUI uses, so edits made here show up in the GUI and
+vice versa:
 
 ```python
 import sorrel
-sorrel.open(recording, sorting)  # SpikeInterface objects
+s = sorrel.Session.open("my_run/phy")        # or a SortingAnalyzer binary_folder
+s.qc()                                       # list of dicts, cluster_qc.tsv columns
+s.suggest()                                  # {"merges": [...], "splits": [...]}
+s.set_label(3, "good"); s.merge([4, 5], 6)   # journaled, undoable
+new = s.split(0, [1, 7, 9])                  # local spike indices → new cluster id
+s.save()                                     # phy files + curation.json
 ```
 
-Internally this delegates to `export_to_phy` followed by the native
-backend. Zero-copy direct-numpy is on the roadmap but not the v1 path.
+**GUI launcher** — subprocesses the `sorrel` binary (egui needs the main
+thread, which a Jupyter kernel cannot give it):
+
+```python
+sorrel.open(recording, sorting)         # builds a SortingAnalyzer, saves it as binary_folder
+result_dir = sorrel.open_analyzer(sorting_analyzer)
+```
+
+The directory it returns keeps the curation journal and, once you save
+in the GUI, `curation.json`; round-trip into SpikeInterface with
+`sc.apply_curation(analyzer, sorrel.read_curation(result_dir))`. The
+temporary directory is kept by default so that file survives; pass
+`keep_temp=False` to discard it.
 
 ## Backend detection
 

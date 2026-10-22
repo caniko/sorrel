@@ -17,6 +17,7 @@ crate-type = ["cdylib"]
 sorrel-io = { path = "../sorrel-io" }
 sorrel-data = { path = "../sorrel-data" }
 anyhow = "1"
+serde_json = "1"
 
 [dependencies.pyo3]
 version = "0.22"

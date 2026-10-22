@@ -15,6 +15,7 @@
 //! Both files are written atomically (write-then-rename) so a crash
 //! mid-save never leaves the directory half-written.
 
+use crate::curation_json::write_curation_json;
 use crate::journal::{baseline_hash, Journal};
 use crate::session::Session;
 use anyhow::{Context, Result};
@@ -60,7 +61,8 @@ where
     std::fs::write(&tmp, &text).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &tsv_path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), tsv_path.display()))?;
-    Ok(())
+
+    write_curation_json(session, &root.join("curation.json"), label_str)
 }
 
 /// Save the curation state to phy artifacts AND reseal the journal at
@@ -78,14 +80,25 @@ where
     P: DataProvider,
     F: Fn(&P::Label) -> &'static str,
 {
-    save_to_phy(session, root, label_str)?;
+    save_to_phy(session, root, &label_str)?;
 
     // Hash the bytes we just wrote (post-rename, post-fsync).
     let bytes = std::fs::read(root.join("spike_clusters.npy"))
         .context("hash freshly-written spike_clusters.npy")?;
     let new_baseline = baseline_hash(&bytes);
     let n_clusters = session.n_clusters();
-    Journal::truncate(journal_path, new_baseline, n_clusters)
+    let journal = Journal::truncate(journal_path, new_baseline, n_clusters)?;
+    // The artifacts now carry every merge and split, so the interchange
+    // document must not repeat them: rewrite it as labels only. The session
+    // still holds the old history until the caller swaps in `journal`.
+    let labels_only = crate::curation_json::curation_document_sealed(session, label_str);
+    let json_path = root.join("curation.json");
+    let tmp = json_path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&labels_only)?)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &json_path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), json_path.display()))?;
+    Ok(journal)
 }
 
 fn with_tmp_suffix(path: &Path) -> std::path::PathBuf {
@@ -99,7 +112,7 @@ mod tests {
     use super::*;
     use crate::command::PhyLabelOp;
     use crate::session::ApplyPhyLabel;
-    use crate::{CurationCommand, Session, SqliteJournal};
+    use crate::{CurationCommand, Journal, Session};
     use sorrel_io::npy::read_1d_u32;
     use sorrel_io::{ClusterId, DataProvider, SampleIndex, TraceSamples, TraceSlice};
 
@@ -178,8 +191,65 @@ mod tests {
             labels: vec![MockLabel::Unsorted; 3],
         };
         let dir = tempfile::tempdir().unwrap();
-        let journal = SqliteJournal::open(&dir.path().join("j.sqlite")).unwrap();
+        let journal = Journal::open(&dir.path().join("j.sqlite")).unwrap();
         (Session::new(provider, journal), dir)
+    }
+
+    #[test]
+    fn save_writes_spikeinterface_curation_json_and_reseal_drops_structure() {
+        use sorrel_io::read_curation_labels;
+        let (mut s, dir) = fresh_session();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetGood,
+        })
+        .unwrap();
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(1)],
+            target: ClusterId(2),
+        })
+        .unwrap();
+        // Split spike t=30 (local index 1) out of cluster 0 → new cluster 3.
+        s.dispatch(CurationCommand::Split {
+            cluster: ClusterId(0),
+            spike_idx: vec![1],
+            new_cluster: ClusterId(u32::MAX),
+        })
+        .unwrap();
+
+        save_to_phy(&s, dir.path(), label_str).unwrap();
+        let path = dir.path().join("curation.json");
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        assert_eq!(doc["format_version"], "2");
+        assert_eq!(doc["unit_ids"], serde_json::json!([0, 1, 2]));
+        assert_eq!(doc["label_definitions"]["quality"]["exclusive"], true);
+        assert_eq!(
+            doc["manual_labels"],
+            serde_json::json!([{ "unit_id": 0, "labels": { "quality": ["good"] } }])
+        );
+        assert_eq!(doc["merges"][0]["unit_ids"], serde_json::json!([1, 2]));
+        assert_eq!(doc["merges"][0]["new_unit_id"], 2);
+        assert_eq!(doc["splits"][0]["unit_id"], 0);
+        assert_eq!(doc["splits"][0]["indices"], serde_json::json!([[1]]));
+        // The journal placeholder (u32::MAX) was resolved to the allocated id.
+        assert_eq!(doc["splits"][0]["new_unit_ids"], serde_json::json!([3]));
+        assert_eq!(doc["removed"], serde_json::json!([]));
+
+        let labels = read_curation_labels(&path, 4, |u| Some(u as usize)).unwrap();
+        assert_eq!(labels[0].as_str(), "good");
+        assert_eq!(labels[1].as_str(), "unsorted");
+
+        // Reseal: the artifacts now carry the merge and split, so the JSON
+        // becomes labels-only over every cluster.
+        save_and_reseal_journal(&s, dir.path(), &dir.path().join("j.sqlite"), label_str).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["unit_ids"], serde_json::json!([0, 1, 2, 3]));
+        assert_eq!(doc["merges"], serde_json::json!([]));
+        assert_eq!(doc["splits"], serde_json::json!([]));
+        assert!(!dir.path().join("curation.json.tmp").exists());
     }
 
     #[test]

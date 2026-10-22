@@ -31,10 +31,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// Backwards-compatible alias for callers still using the old name.
-/// New code should use [`Journal`] directly.
-pub type SqliteJournal = Journal;
-
 /// Magic header. Bumping the trailing byte invalidates older files.
 pub const MAGIC: &[u8; 8] = b"SORREL\x00\x02";
 /// On-disk format version.
@@ -59,6 +55,9 @@ pub struct Journal {
     writer: BufWriter<File>,
     baseline: u64,
     n_clusters_at_baseline: u32,
+    /// Fully committed records on disk. Kept in memory so [`Journal::head`]
+    /// never touches the file.
+    n_records: u64,
 }
 
 impl Journal {
@@ -99,6 +98,7 @@ impl Journal {
             writer: BufWriter::new(f),
             baseline: expected_baseline,
             n_clusters_at_baseline: n_clusters,
+            n_records: 0,
         })
     }
 
@@ -135,11 +135,15 @@ impl Journal {
             .append(true)
             .open(path)
             .with_context(|| format!("reopen journal {}", path.display()))?;
+        // Counting records also truncates any partial trailing record, so
+        // the appender below starts at a clean boundary.
+        let n_records = Self::replay_at(path)?.len() as u64;
         Ok(Self {
             path: path.to_path_buf(),
             writer: BufWriter::new(f),
             baseline,
             n_clusters_at_baseline: n_clusters,
+            n_records,
         })
     }
 
@@ -162,6 +166,13 @@ impl Journal {
         self.n_clusters_at_baseline
     }
 
+    /// Number of fully committed records since the seal. Monotonic within
+    /// one seal, so it doubles as a sync cursor for anything mirroring the
+    /// journal.
+    pub fn n_records(&self) -> u64 {
+        self.n_records
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -172,10 +183,9 @@ impl Journal {
     /// fully committed records. This is cheap, deterministic, and changes
     /// whenever replay-visible curation state changes.
     pub fn head(&self) -> u64 {
-        let applied_count = self.replay().map(|cmds| cmds.len() as u64).unwrap_or(0);
         let mut bytes = [0u8; 16];
         bytes[..8].copy_from_slice(&self.baseline.to_le_bytes());
-        bytes[8..].copy_from_slice(&applied_count.to_le_bytes());
+        bytes[8..].copy_from_slice(&self.n_records.to_le_bytes());
         xxhash_rust::xxh3::xxh3_64(&bytes)
     }
 
@@ -188,6 +198,7 @@ impl Journal {
         self.writer.write_all(&payload)?;
         self.writer.flush()?;
         self.writer.get_ref().sync_all().context("fsync journal")?;
+        self.n_records += 1;
         Ok(())
     }
 
@@ -195,11 +206,16 @@ impl Journal {
     /// Truncates a partial trailing record if one is present (crash
     /// recovery — the partial record was never durable).
     pub fn replay(&self) -> Result<Vec<CurationCommand>> {
-        let mut f = File::open(&self.path)
-            .with_context(|| format!("open journal {}", self.path.display()))?;
+        Self::replay_at(&self.path)
+    }
+
+    /// [`Journal::replay`] for a journal file that is not open. Used when
+    /// opening (to count committed records) and by headless inspection.
+    pub fn replay_at(path: &Path) -> Result<Vec<CurationCommand>> {
+        let mut f = File::open(path).with_context(|| format!("open journal {}", path.display()))?;
         let total = f.metadata()?.len();
         if total < HEADER_SIZE {
-            bail!("{}: journal smaller than header", self.path.display());
+            bail!("{}: journal smaller than header", path.display());
         }
         f.seek(SeekFrom::Start(HEADER_SIZE))?;
 
@@ -220,7 +236,7 @@ impl Journal {
                 // Partial payload — never durable. Truncate.
                 log::warn!(
                     "{}: truncating partial record at offset {pos}",
-                    self.path.display()
+                    path.display()
                 );
                 break;
             }
@@ -234,7 +250,7 @@ impl Journal {
                 Err(e) => {
                     log::warn!(
                         "{}: skipping malformed record at offset {pos}: {e}",
-                        self.path.display(),
+                        path.display(),
                     );
                     break;
                 }
@@ -245,8 +261,8 @@ impl Journal {
         if last_good_pos < total {
             let f = OpenOptions::new()
                 .write(true)
-                .open(&self.path)
-                .with_context(|| format!("open for truncate {}", self.path.display()))?;
+                .open(path)
+                .with_context(|| format!("open for truncate {}", path.display()))?;
             f.set_len(last_good_pos)?;
             f.sync_all()?;
         }

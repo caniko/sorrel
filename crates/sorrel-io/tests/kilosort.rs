@@ -749,3 +749,86 @@ fn metric_names_are_sorted_alphabetically() {
     let names = p.metric_names();
     assert_eq!(names, &["alpha", "delta", "zeta"]);
 }
+
+#[test]
+fn quality_metrics_csv_accepts_tab_separated_rows() {
+    use sorrel_io::HasQualityMetrics;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_minimal_fixture(root, 2, 2);
+    std::fs::write(
+        root.join("quality_metrics.csv"),
+        "cluster_id\tsnr\tfiring_rate\n0\t5.0\t12.3\n1\t8.5\t7.7\n",
+    )
+    .unwrap();
+
+    let p = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
+    let snr = p.metric_values("snr").expect("tab-separated metrics load");
+    assert!((snr[0] - 5.0).abs() < 1e-6);
+    assert!((snr[1] - 8.5).abs() < 1e-6);
+}
+
+#[test]
+fn kslabel_seeds_labels_when_cluster_group_is_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_minimal_fixture(root, 3, 2);
+    std::fs::write(
+        root.join("cluster_KSLabel.tsv"),
+        "cluster_id\tKSLabel\n0\tgood\n1\tmua\n",
+    )
+    .unwrap();
+
+    let p = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
+    assert_eq!(
+        p.initial_labels(),
+        vec![PhyLabel::Good, PhyLabel::Mua, PhyLabel::Unsorted]
+    );
+    // The string column must not be mistaken for a numeric metric.
+    use sorrel_io::HasQualityMetrics;
+    assert!(p.metric_values("KSLabel").is_none());
+
+    // A curated cluster_group.tsv takes precedence over the sorter's labels.
+    std::fs::write(
+        root.join("cluster_group.tsv"),
+        "cluster_id\tgroup\n0\tnoise\n",
+    )
+    .unwrap();
+    let p = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
+    assert_eq!(p.initial_labels()[0], PhyLabel::Noise);
+    assert_eq!(p.initial_labels()[1], PhyLabel::Unsorted);
+}
+
+#[test]
+fn params_dat_path_may_point_at_an_mtscomp_cbin() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_minimal_fixture(root, 2, 2);
+    // Replace the raw recording with a compressed one: 50 samples × 2 ch.
+    let samples: Vec<i16> = (0..100).map(|i| (i as i16) * 7 - 300).collect();
+    sorrel_io::cbin::write_cbin(&root.join("recording.cbin"), &samples, 2, 1000.0, 16).unwrap();
+    std::fs::remove_file(root.join("recording.dat")).unwrap();
+    std::fs::write(
+        root.join("params.py"),
+        "dat_path = 'recording.cbin'\nn_channels_dat = 2\nsample_rate = 1000.\ndtype = 'int16'\n",
+    )
+    .unwrap();
+
+    let p = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
+    assert_eq!(p.n_samples(), SampleIndex(50));
+    let slice = p.trace(SampleIndex(14), 5); // spans the 16-row chunk edge
+    assert_eq!(slice.samples.len(), 10);
+    match slice.samples.borrow() {
+        TraceSamples::I16(s) => assert_eq!(s, &samples[28..38]),
+        other => panic!("expected I16, got {other:?}"),
+    }
+    assert!(p.trace(SampleIndex(50), 4).samples.is_empty());
+
+    // A channel-count mismatch is refused rather than silently misread.
+    std::fs::write(
+        root.join("params.py"),
+        "dat_path = 'recording.cbin'\nn_channels_dat = 3\nsample_rate = 1000.\ndtype = 'int16'\n",
+    )
+    .unwrap();
+    assert!(KilosortProvider::open(root, KilosortOpenParams::default()).is_err());
+}

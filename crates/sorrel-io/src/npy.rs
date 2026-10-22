@@ -68,6 +68,23 @@ impl NpyDtype {
     }
 }
 
+/// One `memcpy` when the on-disk element type already is `T` and the
+/// payload is aligned (numpy pads headers to 64 bytes, so real files are;
+/// hand-rolled fixtures may not be and fall through to the per-element
+/// decoder). `None` means "not applicable", never an error.
+pub(crate) fn cast_fast<T: bytemuck::Pod>(
+    bytes: &[u8],
+    n: usize,
+    same_type: bool,
+) -> Option<Vec<T>> {
+    if !same_type || bytes.len() < n * std::mem::size_of::<T>() {
+        return None;
+    }
+    bytemuck::try_cast_slice::<u8, T>(&bytes[..n * std::mem::size_of::<T>()])
+        .ok()
+        .map(<[T]>::to_vec)
+}
+
 /// Decode `n` elements of `dtype` from `bytes`, applying `f` to each chunk.
 /// Returns `Err` if the buffer is short.
 fn decode_chunks<T>(
@@ -163,11 +180,11 @@ fn parse_shape(s: &str) -> Result<Vec<usize>> {
         .collect()
 }
 
-/// Open a `.npy` file, parse its header, and return the (header, raw bytes
-/// after the header) pair. The byte slice owns its data so callers don't have
-/// to keep an mmap alive — use the lower-level [`read_header`] + [`memmap2`]
-/// when zero-copy access matters.
-fn read_payload(path: &Path) -> Result<(NpyHeader, Vec<u8>)> {
+/// Open a `.npy` file, parse its header, and map the file. The returned
+/// map starts at the file head; `header.data_offset` is where the payload
+/// begins (see [`payload`]). Mapping instead of reading keeps peak memory
+/// at one copy: the decoded `Vec` is the only allocation.
+fn read_payload(path: &Path) -> Result<(NpyHeader, memmap2::Mmap)> {
     let header = read_header(path)?;
     if header.fortran_order {
         bail!(
@@ -175,20 +192,55 @@ fn read_payload(path: &Path) -> Result<(NpyHeader, Vec<u8>)> {
             path.display()
         );
     }
-    let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    f.seek(std::io::SeekFrom::Start(header.data_offset))?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
-    Ok((header, buf))
+    let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    // SAFETY: the file is opened read-only and sorrel never writes an npy it
+    // is reading; concurrent external modification is a documented hazard
+    // of every mmap-backed reader in this crate.
+    let map =
+        unsafe { memmap2::Mmap::map(&f) }.with_context(|| format!("mmap {}", path.display()))?;
+    if (map.len() as u64) < header.data_offset {
+        bail!("{}: shorter than its header", path.display());
+    }
+    Ok((header, map))
+}
+
+/// The bytes after the header.
+fn payload<'a>(h: &NpyHeader, map: &'a memmap2::Mmap) -> &'a [u8] {
+    &map[h.data_offset as usize..]
 }
 
 /// Read a 1-D array of `f32`. Accepts `<f4` and `<f8` (downcast).
 pub fn read_1d_f32(path: &Path) -> Result<Vec<f32>> {
-    let (h, bytes) = read_payload(path)?;
+    let (h, map) = read_payload(path)?;
+    let bytes = payload(&h, &map);
     if h.shape.len() != 1 {
         bail!("expected 1-D array, got shape {:?}", h.shape);
     }
-    decode_f32(&h, &bytes, h.elem_count())
+    decode_f32(&h, bytes, h.elem_count())
+}
+
+/// Read a 1-D array as `f64`. Accepts `<f8` and `<f4` (upcast); event times
+/// in seconds lose millisecond precision in `f32` past a few hours.
+pub fn read_1d_f64(path: &Path) -> Result<Vec<f64>> {
+    let (h, map) = read_payload(path)?;
+    let bytes = payload(&h, &map);
+    if h.shape.len() != 1 {
+        bail!("expected 1-D array, got shape {:?}", h.shape);
+    }
+    let n = h.elem_count();
+    let dtype = NpyDtype::parse(&h.dtype)?;
+    if let Some(v) = cast_fast::<f64>(bytes, n, dtype == NpyDtype::F64) {
+        return Ok(v);
+    }
+    match dtype {
+        NpyDtype::F64 => decode_chunks(bytes, n, dtype, |c| {
+            f64::from_le_bytes(c.try_into().unwrap())
+        }),
+        NpyDtype::F32 => decode_chunks(bytes, n, dtype, |c| {
+            f32::from_le_bytes(c.try_into().unwrap()) as f64
+        }),
+        d => bail!("unsupported float dtype {d:?}"),
+    }
 }
 
 /// Read an N-D array of `f32` as a flat row-major buffer plus the original
@@ -196,45 +248,52 @@ pub fn read_1d_f32(path: &Path) -> Result<Vec<f32>> {
 /// the existing 1-D / 2-D readers don't fit; this returns the shape verbatim
 /// and lets the caller decide how to index.
 pub fn read_npy_f32_flat(path: &Path) -> Result<(Vec<f32>, Vec<usize>)> {
-    let (h, bytes) = read_payload(path)?;
+    let (h, map) = read_payload(path)?;
+    let bytes = payload(&h, &map);
     let n: usize = h.shape.iter().product();
-    let v = decode_f32(&h, &bytes, n)?;
+    let v = decode_f32(&h, bytes, n)?;
     Ok((v, h.shape))
 }
 
 /// Same idea for `u32`-shaped integer arrays of any rank.
 pub fn read_npy_u32_flat(path: &Path) -> Result<(Vec<u32>, Vec<usize>)> {
-    let (h, bytes) = read_payload(path)?;
+    let (h, map) = read_payload(path)?;
+    let bytes = payload(&h, &map);
     let n: usize = h.shape.iter().product();
-    let v = decode_u32(&h, &bytes, n)?;
+    let v = decode_u32(&h, bytes, n)?;
     Ok((v, h.shape))
 }
 
 /// Read a 2-D array of `f32` as a flat row-major buffer plus the (rows, cols)
 /// shape. Accepts `<f4` and `<f8`.
 pub fn read_2d_f32(path: &Path) -> Result<(Vec<f32>, (usize, usize))> {
-    let (h, bytes) = read_payload(path)?;
+    let (h, map) = read_payload(path)?;
+    let bytes = payload(&h, &map);
     if h.shape.len() != 2 {
         bail!("expected 2-D array, got shape {:?}", h.shape);
     }
     let rows = h.shape[0];
     let cols = h.shape[1];
-    let v = decode_f32(&h, &bytes, rows * cols)?;
+    let v = decode_f32(&h, bytes, rows * cols)?;
     Ok((v, (rows, cols)))
 }
 
 /// Read a 1-D array of unsigned 32-bit ints. Accepts `<i4`/`<u4`/`<i8`/`<u8`
 /// (downcast where the value fits).
 pub fn read_1d_u32(path: &Path) -> Result<Vec<u32>> {
-    let (h, bytes) = read_payload(path)?;
+    let (h, map) = read_payload(path)?;
+    let bytes = payload(&h, &map);
     if h.shape.len() != 1 {
         bail!("expected 1-D array, got shape {:?}", h.shape);
     }
-    decode_u32(&h, &bytes, h.elem_count())
+    decode_u32(&h, bytes, h.elem_count())
 }
 
 fn decode_f32(h: &NpyHeader, bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     let dtype = NpyDtype::parse(&h.dtype)?;
+    if let Some(v) = cast_fast::<f32>(bytes, n, dtype == NpyDtype::F32) {
+        return Ok(v);
+    }
     match dtype {
         NpyDtype::F32 => decode_chunks(bytes, n, dtype, |c| {
             f32::from_le_bytes(c.try_into().unwrap())
@@ -315,6 +374,9 @@ fn write_npy_1d<F: FnOnce(&mut File) -> std::io::Result<()>>(
 
 fn decode_u32(h: &NpyHeader, bytes: &[u8], n: usize) -> Result<Vec<u32>> {
     let dtype = NpyDtype::parse(&h.dtype)?;
+    if let Some(v) = cast_fast::<u32>(bytes, n, matches!(dtype, NpyDtype::I32 | NpyDtype::U32)) {
+        return Ok(v);
+    }
     match dtype {
         NpyDtype::I32 | NpyDtype::U32 => decode_chunks(bytes, n, dtype, |c| {
             u32::from_le_bytes(c.try_into().unwrap())
@@ -617,5 +679,40 @@ mod tests {
         assert_eq!(h.dtype, "<u4");
         assert_eq!(h.shape, vec![3]);
         assert!(!h.fortran_order);
+    }
+
+    /// The cast fast path needs an aligned payload; a header that is not
+    /// 64-padded makes `data_offset` odd and must fall through to the
+    /// per-element decoder with the same result.
+    #[test]
+    fn unaligned_payload_decodes_like_aligned() {
+        let dir = tempfile::tempdir().unwrap();
+        let vals: Vec<f32> = (0..7).map(|i| i as f32 * 1.5 - 2.0).collect();
+        let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let aligned = dir.path().join("a.npy");
+        write_npy_v1(&aligned, "<f4", &[7], &data);
+
+        // Same dict, padded to an odd header length.
+        let dict = "{'descr': '<f4', 'fortran_order': False, 'shape': (7,), }";
+        let mut header = dict.as_bytes().to_vec();
+        header.push(b' ');
+        header.push(b'\n');
+        assert!((10 + header.len()) % 2 == 1, "fixture must be unaligned");
+        let unaligned = dir.path().join("u.npy");
+        let mut f = std::fs::File::create(&unaligned).unwrap();
+        f.write_all(b"\x93NUMPY\x01\x00").unwrap();
+        f.write_all(&(header.len() as u16).to_le_bytes()).unwrap();
+        f.write_all(&header).unwrap();
+        f.write_all(&data).unwrap();
+
+        assert_eq!(read_header(&aligned).unwrap().data_offset % 64, 0);
+        assert_eq!(read_header(&unaligned).unwrap().data_offset % 2, 1);
+        assert_eq!(read_1d_f32(&aligned).unwrap(), vals);
+        assert_eq!(read_1d_f32(&unaligned).unwrap(), vals);
+
+        let ints: Vec<u8> = [7u32, 8, 9].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let p = dir.path().join("i.npy");
+        write_npy_v1(&p, "<u4", &[3], &ints);
+        assert_eq!(read_1d_u32(&p).unwrap(), vec![7, 8, 9]);
     }
 }

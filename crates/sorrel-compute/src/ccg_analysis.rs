@@ -44,7 +44,7 @@ pub fn analyse_refractory_dip(
     // Zero lag is the boundary between bins `half-1` and `half`, which only
     // centers the refractory window correctly when the count is even.
     debug_assert!(
-        bins % 2 == 0 || bins == 0,
+        bins.is_multiple_of(2),
         "analyse_refractory_dip expects an even bin count (got {bins}); \
          zero lag would be mis-centered otherwise",
     );

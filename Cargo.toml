@@ -52,6 +52,9 @@ log = "0.4"
 env_logger = "0.11"
 wgpu = "29.0.3"
 egui = "0.34.2"
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+flate2 = "1"
 eframe = { version = "0.34.2", default-features = false, features = [
   "default_fonts",
   "wgpu",

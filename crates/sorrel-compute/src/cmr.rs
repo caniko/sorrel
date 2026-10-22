@@ -33,6 +33,49 @@ pub fn subtract_channel_median(samples: &mut [f32], n_channels: usize) {
     }
 }
 
+/// Per-shank CMR: `groups[ch]` names the shank of channel `ch` and the median
+/// is taken within each shank, so one shank's common-mode noise is never
+/// pushed onto another. An empty `groups` (single-shank probe, or geometry
+/// without shank ids) is the plain [`subtract_channel_median`].
+///
+/// Channels whose shank id is missing from `groups` (shorter slice) form
+/// one extra group.
+pub fn subtract_channel_median_grouped(samples: &mut [f32], n_channels: usize, groups: &[u32]) {
+    if groups.is_empty() {
+        return subtract_channel_median(samples, n_channels);
+    }
+    if n_channels == 0 || samples.is_empty() {
+        return;
+    }
+    debug_assert_eq!(samples.len() % n_channels, 0);
+    // Channel index lists per group, computed once.
+    let mut members: Vec<Vec<usize>> = Vec::new();
+    let mut ids: Vec<u32> = Vec::new();
+    for ch in 0..n_channels {
+        let g = groups.get(ch).copied().unwrap_or(u32::MAX);
+        let slot = match ids.iter().position(|&x| x == g) {
+            Some(i) => i,
+            None => {
+                ids.push(g);
+                members.push(Vec::new());
+                ids.len() - 1
+            }
+        };
+        members[slot].push(ch);
+    }
+    let mut row: Vec<f32> = Vec::with_capacity(n_channels);
+    for chunk in samples.chunks_exact_mut(n_channels) {
+        for m in &members {
+            row.clear();
+            row.extend(m.iter().map(|&ch| chunk[ch]));
+            let med = median_in_place(&mut row);
+            for &ch in m {
+                chunk[ch] -= med;
+            }
+        }
+    }
+}
+
 /// Exact median of a small slice via partial sort. We accept that the input
 /// gets shuffled — callers pass a scratch buffer.
 fn median_in_place(buf: &mut [f32]) -> f32 {
@@ -55,6 +98,22 @@ fn median_in_place(buf: &mut [f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grouped_cmr_zeroes_each_groups_row_median_and_empty_groups_is_ungrouped() {
+        // 2 groups × 3 channels, one time step: group A = [1,5,3] (median 3),
+        // group B = [10,100,50] (median 50). Interleaved so grouping matters.
+        let groups = [0u32, 1, 0, 1, 0, 1];
+        let mut s = vec![1.0_f32, 10.0, 5.0, 100.0, 3.0, 50.0];
+        subtract_channel_median_grouped(&mut s, 6, &groups);
+        assert_eq!(s, vec![-2.0, -40.0, 2.0, 50.0, 0.0, 0.0]);
+
+        let mut a = vec![1.0_f32, 5.0, 3.0, 10.0, 100.0, 50.0];
+        let mut b = a.clone();
+        subtract_channel_median(&mut a, 3);
+        subtract_channel_median_grouped(&mut b, 3, &[]);
+        assert_eq!(a, b);
+    }
 
     #[test]
     fn empty_input_is_a_noop() {
