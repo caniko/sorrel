@@ -12,14 +12,17 @@ Sorrel is built around **zero-cost abstractions**: the entire core is generic ov
 
 ## Workspace
 
-| Crate            | Role                                                     |
-| ---------------- | -------------------------------------------------------- |
-| `sorrel-io`      | Concrete data backends; `DataProvider` trait bound.      |
-| `sorrel-compute` | Generic kernels (LTTB, histograms).                      |
-| `sorrel-data`    | Generic `Session<P>`, `CurationCommand`, SQLite journal. |
-| `sorrel-render`  | Concrete vertex types + monomorphised buffer builders.   |
-| `sorrel-ui`      | egui widgets, generic over `P: DataProvider`.            |
-| `sorrel`         | Binary; detects backend and instantiates `SorrelApp<P>`. |
+| Crate            | Role                                                                                                                             |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `sorrel-io`      | Concrete data backends; `DataProvider` trait bound.                                                                              |
+| `sorrel-compute` | Generic kernels (LTTB, histograms).                                                                                              |
+| `sorrel-data`    | Generic `Session<P>`, `CurationCommand`, append-only journal, QC export, SI `curation.json`, rules, report, JSON-RPC server.     |
+| `sorrel-cache`   | Rebuildable derived-data cache (rkyv, GC).                                                                                       |
+| `sorrel-gpu`     | wgpu kernels for CMR, high-pass and mean snippets.                                                                               |
+| `sorrel-render`  | Concrete vertex types + monomorphised buffer builders.                                                                           |
+| `sorrel-ui`      | egui widgets, generic over `P: DataProvider`.                                                                                    |
+| `sorrel`         | Binary; `sorrel <DIR>` opens the GUI, subcommands (`qc`, `suggest`, `apply`, `report`, `serve`, `diff`, `journal`) run headless. |
+| `sorrel-py`      | PyO3 bindings: in-process `Session` plus the GUI launcher (outside the workspace; `maturin develop`).                            |
 
 ## V1 (Kilosort / phy2)
 
@@ -29,16 +32,23 @@ sorrel <KILOSORT_DIR> --dat recording.dat --sample-rate 30000 --channels 32
 
 - Memory-maps `spike_times.npy`, `spike_clusters.npy`, and the raw `.dat`.
 - Loads `cluster_group.tsv` into a `Vec<PhyLabel>` (1 byte per cluster).
-- Curation operations are journaled synchronously to SQLite **before** the in-memory state changes.
+- Curation operations are journaled synchronously to the journal **before** the in-memory state changes.
 
 ### Keyboard
 
-| Key                   | Action                                             |
-| --------------------- | -------------------------------------------------- |
-| `G` / `M` / `N` / `U` | Set selected cluster Good / MUA / Noise / Unsorted |
-| `J` / `K` / arrows    | Next / previous cluster                            |
-| `H` / `L`             | Pan trace window                                   |
-| `Cmd/Ctrl-Z`          | Undo (V1: stub)                                    |
+| Key                               | Action                                                                   |
+| --------------------------------- | ------------------------------------------------------------------------ |
+| `G` / `M` / `N` / `U`             | Label the selection Good / MUA / Noise / Unsorted                        |
+| `J` / `K` / arrows                | Next / previous cluster in table order                                   |
+| `H` / `L`                         | Pan trace window (drag / wheel in the trace also pans; Ctrl-wheel zooms) |
+| `Cmd/Ctrl-G`                      | Merge the selection into the first-selected cluster                      |
+| `Cmd/Ctrl-Z` / `Cmd/Ctrl-Shift-Z` | Undo / redo                                                              |
+| `Cmd/Ctrl-S`                      | Save `spike_clusters.npy` + `cluster_group.tsv`                          |
+| `?` / `F1`                        | Keyboard & mouse help overlay                                            |
+
+Views are dockable tiles: drag tabs to rearrange, `×` to close, the
+**View** menu to reopen. See `docs/src/usage/views.md` and
+`docs/src/usage/keyboard-controls.md`.
 
 ## Build
 

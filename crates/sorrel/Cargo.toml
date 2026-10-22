@@ -22,9 +22,9 @@ egui.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
-
 clap.workspace = true
 serde_json.workspace = true
+
 # eframe's Linux window backends are deliberately enabled only for Linux
 # targets. Windows uses the native Win32 backend and macOS uses Cocoa/Metal;
 # neither should inherit Wayland/X11 feature dependencies.
