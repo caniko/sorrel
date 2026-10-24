@@ -13,7 +13,7 @@
     };
 
     # Pinned SDK used by harbor-rs's reproducible osxcross builder.
-    harbor-macos-sdk-pin.url = "git+https://github.com/caniko/harbor-macos-sdk-pin.git";
+    harbor-macos-sdk-pin.url = "git+https://github.com/caniko/harbor-macos-sdk-pin.git?ref=trunk";
 
     nix-appimage = {
       url = "github:ralismark/nix-appimage";
@@ -26,7 +26,7 @@
     treefmt-nix.follows = "harbor-rs/treefmt-nix";
     git-hooks.follows = "harbor-rs/git-hooks";
     plinth = {
-      url = "git+https://github.com/caniko/plinth.git";
+      url = "git+https://github.com/caniko/plinth.git?ref=trunk";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
