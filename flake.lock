@@ -3103,11 +3103,11 @@
         "treefmt-nix": "treefmt-nix_13"
       },
       "locked": {
-        "lastModified": 1793019831,
-        "narHash": "sha256-H8+UmrO41ldHqynHkE3iCs0QCeZqLRWZ3Z4ZX030NDk=",
+        "lastModified": 1793028417,
+        "narHash": "sha256-GyG5lUjpfhcBDUmQo0bqnMtNR35zkCwiBtL0peXw1Yc=",
         "ref": "trunk",
-        "rev": "5f6078c6bc13048bc2ff236faabb0356442215fb",
-        "revCount": 904,
+        "rev": "9ffacf22c9b69385e370846ea55ce6226a26b8ad",
+        "revCount": 906,
         "type": "git",
         "url": "https://github.com/caniko/simit.git"
       },
