@@ -3,15 +3,30 @@
 Python bindings for the [Sorrel](https://github.com/caniko/sorrel)
 spike-sorting curation GUI.
 
-## Build
+## Install
+
+Each GitHub release carries one wheel per platform (Linux x86_64 and
+aarch64 with glibc 2.34 or newer, Windows x86_64, macOS arm64), for any
+Python from 3.8 on:
+
+```sh
+pip install https://github.com/caniko/sorrel/releases/download/<VERSION>/sorrel-<VERSION>-cp38-abi3-<PLATFORM>.whl
+```
+
+The wheel holds the Rust extension, the Python wrapper and the `sorrel`
+GUI binary, which pip puts on the environment's PATH. PyPI publication
+(`pip install sorrel`) is pending.
+
+## Build from source
 
 ```sh
 cd crates/sorrel-py
 maturin develop --release
 ```
 
-This compiles the Rust extension and installs `sorrel` into the active
-Python environment alongside its pure-Python wrapper.
+This compiles the Rust extension into the active environment; the GUI
+launcher then needs a `sorrel` binary on PATH (`cargo install --path
+crates/sorrel`). The release wheels are built by `nix/wheel.nix` instead.
 
 ## Use
 

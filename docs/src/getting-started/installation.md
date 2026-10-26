@@ -26,6 +26,20 @@ Full phy export (`sorrel export-phy`, the `export_phy` serve tool, the
 cargo build --release -p sorrel --no-default-features
 ```
 
+## Python
+
+Each GitHub release attaches a wheel per platform (Linux x86_64 / aarch64
+with glibc 2.34+, Windows x86_64, macOS arm64; Python 3.8+) holding the
+Python API and the GUI binary:
+
+```bash
+pip install https://github.com/caniko/sorrel/releases/download/<VERSION>/sorrel-<VERSION>-cp38-abi3-<PLATFORM>.whl
+```
+
+`nix build .#release-bundle.wheels.x86_64-linux` builds one locally
+(`aarch64-linux`, `windows`, `darwin-aarch64` likewise). See
+[Integrations](../usage/integrations.md#python-jupyter) for the API.
+
 ## With Nix
 
 ```bash

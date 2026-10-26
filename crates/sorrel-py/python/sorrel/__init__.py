@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sysconfig
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -153,7 +154,18 @@ def launch(
     extra_args: list[str] | None = None,
 ) -> int:
     """Spawn the sorrel binary on `path`. Blocks until close."""
-    return _native.launch(str(path), binary, extra_args)
+    return _native.launch(str(path), binary or _bundled_binary(), extra_args)
+
+
+def _bundled_binary() -> str | None:
+    """The `sorrel` the wheel installed into this environment's scripts dir,
+    for kernels whose PATH lacks it (e.g. a notebook started outside the
+    venv). None falls back to PATH."""
+    if shutil.which("sorrel"):
+        return None
+    scripts = Path(sysconfig.get_path("scripts"))
+    exe = scripts / ("sorrel.exe" if os.name == "nt" else "sorrel")
+    return str(exe) if exe.is_file() else None
 
 
 def open(

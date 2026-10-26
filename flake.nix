@@ -114,7 +114,7 @@
               "harbor-macos-sdk:MLRX9qZASKwDh48UWON67cvYxfEbqvjfIZQmGwt1v1E="
               "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
             ];
-            checksum_globs = ["*.tar.gz" "*.zip" "*.AppImage"];
+            checksum_globs = ["*.tar.gz" "*.zip" "*.AppImage" "*.whl"];
             build_commands = [
               "git archive --format=tar --prefix=\"sorrel-$VERSION/\" HEAD | gzip -n > \"release/sorrel-$VERSION.tar.gz\""
             ];
@@ -204,6 +204,51 @@
         };
       };
 
+      # The `_native` extension for the Python wheels (nix/wheel.nix). sorrel-py
+      # is its own Cargo workspace, hence the manifest path and lockfile.
+      crossSorrelPyPackages = harbor-rs.lib.mkCrossPackages {
+        inherit pkgs craneLib cross;
+        pname = "sorrel-py";
+        targets = ["native" "aarch64-linux" "windows" "darwin-aarch64"];
+        commonArgs = {
+          inherit src;
+          version = sorrelVersion;
+          strictDeps = true;
+          cargoLock = ./crates/sorrel-py/Cargo.lock;
+          cargoExtraArgs = "--manifest-path crates/sorrel-py/Cargo.toml --locked";
+          CARGO_TARGET_DIR = "target";
+          # crane installs `cargoLock` at the source root.
+          preBuild = "cp Cargo.lock crates/sorrel-py/Cargo.lock";
+          doCheck = false;
+          # crane's default install runs `cargo metadata` at the root, which
+          # is the other workspace. Copy the cdylib for whichever target.
+          doNotPostBuildInstallCargoBinaries = true;
+          installPhaseCommand = ''
+            mkdir -p $out/lib
+            find target -maxdepth 3 -path '*/release/*' \
+              \( -name libsorrel.so -o -name sorrel.dll -o -name libsorrel.dylib \) \
+              -exec cp {} $out/lib/ \;
+            test -n "$(ls $out/lib)"
+          '';
+        };
+        targetArgs = {
+          # pyo3 reads the interpreter config on native builds; cross builds
+          # use the abi3 defaults.
+          native = {
+            nativeBuildInputs = [pkgs.python3];
+            PYO3_PYTHON = "${pkgs.python3}/bin/python3";
+          };
+          windows = {
+            nativeBuildInputs = [cross.mingwCC cross.mingwBinutils];
+            # pyo3's import-lib generator runs dlltool from the vendored
+            # (read-only) crate dir, where dlltool writes its temp files.
+            PYO3_MINGW_DLLTOOL = pkgs.writeShellScript "dlltool-in-tmp" ''
+              cd "''${TMPDIR:-/tmp}" && exec x86_64-w64-mingw32-dlltool "$@"
+            '';
+          };
+        };
+      };
+
       # glibc-2.31 binaries for the Linux tarballs and the AppImage.
       portable = import ./nix/portable.nix {
         inherit pkgs craneLib src;
@@ -235,6 +280,7 @@
           release-smoke = releaseSmoke;
         }
         // crossSorrelPackages
+        // crossSorrelPyPackages
         // pkgs.lib.optionalAttrs (sorrelHdf5 != null) {inherit sorrelHdf5;}
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux portable
         // pkgs.lib.optionalAttrs (system == "x86_64-linux") {

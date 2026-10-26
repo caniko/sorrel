@@ -130,8 +130,10 @@ under `<output>/phy/` automatically — open that directory instead.
 
 ## Python (Jupyter)
 
-The `sorrel-py` crate (build with `maturin develop` from
-`crates/sorrel-py/`) has two layers.
+Install the `sorrel` Python package from the wheel attached to each
+GitHub release (see [Installation](../getting-started/installation.md#python));
+it bundles the GUI binary. `maturin develop` from `crates/sorrel-py/`
+builds it from source. The package has two layers.
 
 **In-process, no window** — the notebook and pipeline API. It opens the
 same journal the GUI uses, so edits made here show up in the GUI and

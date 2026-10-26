@@ -87,6 +87,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added (CLI and interchange)
 
+- **Python wheels** on every GitHub release: one `cp38-abi3` wheel per
+  platform (manylinux_2_34 x86_64 / aarch64, win_amd64, macosx_11_0_arm64)
+  with the `sorrel` Python API and the GUI binary, assembled by
+  `nix/wheel.nix` from the release cross builds. `sorrel.launch` also finds
+  the bundled binary when the kernel's PATH lacks the environment's
+  scripts directory.
 - `sorrel gpu-check` lists every GPU adapter wgpu can see (vendor, backend,
   driver) and checks CMR, high-pass and mean-snippet kernels against the CPU
   on each, exiting non-zero on a mismatch. Headless GPU contexts (tests,
