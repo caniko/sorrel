@@ -52,6 +52,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   built with cargo-zigbuild against glibc 2.31 and load the host's
   Vulkan/GL libraries, and with them its Mesa or NVIDIA driver. The
   AppImage wraps that binary instead of a Nix closure.
+- **The Windows release builds again.** `aws-lc-sys` (via libp2p-quic)
+  needs winpthreads' `<sched.h>`, which the MinGW compiler did not see.
 
 ### Added (automatic curation)
 

@@ -190,6 +190,10 @@
           windows = {
             buildInputs = [];
             nativeBuildInputs = deps.nativeBuildInputs ++ [cross.mingwCC cross.mingwBinutils];
+            # aws-lc-sys (via libp2p-quic) compiles jitterentropy, which needs
+            # winpthreads' <sched.h>; harbor-rs only puts winpthreads on the
+            # link path.
+            CFLAGS_x86_64_pc_windows_gnu = "-I${cross.winpthreads}/include";
             doCheck = false;
           };
           darwin-aarch64 = {
