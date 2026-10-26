@@ -75,6 +75,7 @@ pub struct KilosortProvider {
     amps_per_cluster: Vec<Vec<f32>>,
     templates_per_cluster: Vec<Vec<u32>>,
     initial_labels: Vec<PhyLabel>,
+    initial_tags: Vec<Vec<String>>,
 
     // Probe geometry. Empty when the corresponding `.npy` file is absent.
     channel_positions: Vec<[f32; 2]>,
@@ -257,6 +258,8 @@ impl KilosortProvider {
             .unwrap_or_else(|| load_cluster_groups(&root.join("cluster_KSLabel.tsv"), n_clusters))
         };
 
+        let initial_tags = read_tags_tsv(&root.join(TAGS_TSV));
+
         // 2.5. Probe geometry. All optional; absence is fine.
         let channel_positions = read_optional_positions(&root.join("channel_positions.npy"))?;
         let channel_shanks =
@@ -369,6 +372,7 @@ impl KilosortProvider {
             amps_per_cluster,
             templates_per_cluster,
             initial_labels,
+            initial_tags,
             channel_positions,
             channel_shanks,
             channel_map,
@@ -475,6 +479,10 @@ impl DataProvider for KilosortProvider {
 
     fn initial_labels(&self) -> Vec<Self::Label> {
         self.initial_labels.clone()
+    }
+
+    fn initial_tags(&self) -> Vec<Vec<String>> {
+        self.initial_tags.clone()
     }
 
     fn identity_bytes(&self) -> Vec<u8> {
@@ -609,7 +617,10 @@ fn load_quality_metrics(root: &Path, n_clusters: usize) -> crate::extras::Qualit
                 continue;
             };
             // Label/annotation sidecars are not numeric metrics.
-            if matches!(stripped, "group" | "groups" | "KSLabel" | "purity" | "info") {
+            if matches!(
+                stripped,
+                "group" | "groups" | "KSLabel" | "purity" | "info" | "sorrel_tags"
+            ) {
                 continue;
             }
             if metrics.contains(stripped) {
@@ -967,6 +978,43 @@ pub fn read_cluster_group_tsv(path: &Path) -> Option<Vec<(u32, PhyLabel)>> {
             })
             .collect(),
     )
+}
+
+/// Sorrel's tag sidecar in a phy directory: `cluster_id\tsorrel_tags` with
+/// comma-joined tags, which phy shows as an ordinary column.
+pub const TAGS_TSV: &str = "cluster_sorrel_tags.tsv";
+
+/// A tag must survive the comma-joined TSV column and curation.json.
+pub fn valid_tag(tag: &str) -> bool {
+    !tag.is_empty() && !tag.contains([',', '\t', '\n', '\r'])
+}
+
+/// Parse [`TAGS_TSV`] into a per-cluster tag vector indexed by cluster id
+/// (empty when the file is absent or unreadable).
+pub fn read_tags_tsv(path: &Path) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    for line in text.lines().skip(1) {
+        let mut cols = line.split('\t');
+        let (Some(id), Some(tags)) = (cols.next(), cols.next()) else {
+            continue;
+        };
+        let Ok(id) = id.trim().parse::<usize>() else {
+            continue;
+        };
+        if out.len() <= id {
+            out.resize_with(id + 1, Vec::new);
+        }
+        out[id] = tags
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
+    out
 }
 
 /// Convenience: count spikes per cluster (mostly for tests / status bars).

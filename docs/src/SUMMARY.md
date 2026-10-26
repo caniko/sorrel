@@ -16,6 +16,7 @@
 - [Views](./usage/views.md)
 - [Keyboard & Mouse](./usage/keyboard-controls.md)
 - [Saving & QC Export](./usage/saving.md)
+- [Automatic Curation](./usage/auto-curation.md)
 - [Remote Work](./usage/remote.md)
 
 # Architecture

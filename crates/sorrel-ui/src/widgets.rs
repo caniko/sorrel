@@ -22,6 +22,7 @@ pub enum ClusterColumn {
     IsiViolations,
     Quality,
     Label,
+    Tags,
 }
 
 /// Persistent cluster-table UI state — sort + filter live on the app.
@@ -32,6 +33,8 @@ pub struct ClusterTableState {
     pub filter_text: String,
     pub hide_empty: bool,
     pub hide_noise: bool,
+    /// Only clusters carrying a `review:*` tag (the queue `sorrel auto` leaves).
+    pub review_only: bool,
     /// Cached "quick quality" composite score per cluster — uses only the
     /// cheap metrics (no PC-feature isolation k-NN) so the table sort is
     /// snappy even on 1k-cluster recordings. Indexed by `ClusterId`.
@@ -57,6 +60,7 @@ impl Default for ClusterTableState {
             filter_text: String::new(),
             hide_empty: false,
             hide_noise: false,
+            review_only: false,
             quality_cache: Vec::new(),
             quality_key: u64::MAX,
             visible: Vec::new(),
@@ -114,6 +118,7 @@ impl ClusterTableState {
                     | ClusterColumn::Amplitude
                     | ClusterColumn::IsiViolations
                     | ClusterColumn::Quality
+                    | ClusterColumn::Tags
             );
         }
     }
@@ -145,14 +150,17 @@ pub fn cluster_table<P, F>(
 
     // Filter strip above the table.
     ui.horizontal(|ui| {
-        ui.label("filter id:");
+        ui.label("filter:");
         ui.add(
             egui::TextEdit::singleline(&mut state.filter_text)
-                .desired_width(60.0)
-                .hint_text("id"),
-        );
+                .desired_width(80.0)
+                .hint_text("id or tag"),
+        )
+        .on_hover_text("Cluster id, or part of a tag (e.g. merged, src:llm, bc:snr)");
         ui.checkbox(&mut state.hide_empty, "hide empty");
         ui.checkbox(&mut state.hide_noise, "hide noise");
+        ui.checkbox(&mut state.review_only, "review")
+            .on_hover_text("Only clusters `sorrel auto` tagged review:*; any edit clears the tag");
         // `visible` is last frame's list; one frame of lag is invisible.
         ui.weak(format!(
             "{} / {}",
@@ -175,7 +183,14 @@ pub fn cluster_table<P, F>(
             if state.hide_noise && label_str(&lbl) == "noise" {
                 return false;
             }
-            if !filter.is_empty() && !i.to_string().contains(filter) {
+            let tags = session.tags(i);
+            if state.review_only && !tags.iter().any(|t| t.starts_with("review:")) {
+                return false;
+            }
+            if !filter.is_empty()
+                && !i.to_string().contains(filter)
+                && !tags.iter().any(|t| t.contains(filter))
+            {
                 return false;
             }
             true
@@ -209,6 +224,12 @@ pub fn cluster_table<P, F>(
             }
             ClusterColumn::Label => {
                 label_rank::<P, F>(&label_str, session.label(c).unwrap_or_default()) as f64
+            }
+            // Review tags first, then by how many tags (how much evidence).
+            ClusterColumn::Tags => {
+                let tags = session.tags(c);
+                let review = tags.iter().filter(|t| t.starts_with("review:")).count();
+                (review * 1000 + tags.len()) as f64
             }
         };
         (c.as_i64(), primary)
@@ -250,7 +271,7 @@ pub fn cluster_table<P, F>(
         }
     }
 
-    let headers: [(&str, ClusterColumn, &str); 6] = [
+    let headers: [(&str, ClusterColumn, &str); 7] = [
         (
             "ID",
             ClusterColumn::Id,
@@ -273,6 +294,12 @@ pub fn cluster_table<P, F>(
             ClusterColumn::Label,
             "phy label: G/M/N/U keys relabel",
         ),
+        (
+            "tags",
+            ClusterColumn::Tags,
+            "Provenance from `sorrel auto` (src:*, merged:*, bc:*, conf:*); review:* in red. \
+             Sort puts the review queue first",
+        ),
     ];
 
     let mut table = TableBuilder::new(ui)
@@ -284,7 +311,8 @@ pub fn cluster_table<P, F>(
         .column(Column::auto().at_least(56.0))
         .column(Column::auto().at_least(56.0))
         .column(Column::auto().at_least(56.0))
-        .column(Column::auto().at_least(64.0));
+        .column(Column::auto().at_least(64.0))
+        .column(Column::remainder().at_least(80.0));
     if let Some(row) = scroll_to {
         table = table.scroll_to_row(row, None);
     }
@@ -341,6 +369,27 @@ pub fn cluster_table<P, F>(
                 row.col(|ui| {
                     let lbl = label_str(&session.label(i).unwrap_or_default());
                     ui.colored_label(theme.label_colour(lbl), lbl);
+                });
+                row.col(|ui| {
+                    let tags = session.tags(i);
+                    if tags.is_empty() {
+                        return;
+                    }
+                    // Review reasons first and in red; the rest dimmed.
+                    let (review, rest): (Vec<&String>, Vec<&String>) =
+                        tags.iter().partition(|t| t.starts_with("review:"));
+                    ui.horizontal(|ui| {
+                        if !review.is_empty() {
+                            let text: Vec<&str> =
+                                review.iter().map(|t| &t["review:".len()..]).collect();
+                            ui.colored_label(theme.danger, text.join(" "));
+                        }
+                        let src: Vec<&str> =
+                            rest.iter().filter_map(|t| t.strip_prefix("src:")).collect();
+                        ui.weak(src.join("+"));
+                    })
+                    .response
+                    .on_hover_text(tags.join("\n"));
                 });
                 // Whole-row click (phy semantics): plain replaces,
                 // Cmd/Ctrl toggles, Shift extends in table order.

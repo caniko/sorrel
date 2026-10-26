@@ -20,7 +20,7 @@ use crate::command::CurationCommand;
 use crate::session::Session;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use sorrel_io::curation_json::QUALITY_KEY;
+use sorrel_io::curation_json::{QUALITY_KEY, TAGS_KEY};
 use sorrel_io::DataProvider;
 use std::path::Path;
 
@@ -74,21 +74,33 @@ where
     };
     let unit_ids: Vec<u32> = (0..n_units).map(|c| uid(sorrel_io::ClusterId(c))).collect();
 
-    let manual_labels: Vec<Value> = session
-        .labels()
-        .iter()
-        .take(n_units as usize)
-        .enumerate()
-        .filter_map(|(i, l)| {
-            let s = label_str(l);
-            (!s.is_empty() && s != "unsorted").then(|| {
-                json!({
-                    "unit_id": uid(sorrel_io::ClusterId(i as u32)),
-                    "labels": { QUALITY_KEY: [s] },
-                })
-            })
+    let mut tag_options = std::collections::BTreeSet::new();
+    let manual_labels: Vec<Value> = (0..n_units)
+        .filter_map(|i| {
+            let c = sorrel_io::ClusterId(i);
+            let mut sets = serde_json::Map::new();
+            if let Some(s) = session.label(c).map(|l| label_str(&l)) {
+                if !s.is_empty() && s != "unsorted" {
+                    sets.insert(QUALITY_KEY.into(), json!([s]));
+                }
+            }
+            let tags = session.tags(c);
+            if !tags.is_empty() {
+                tag_options.extend(tags.iter().cloned());
+                sets.insert(TAGS_KEY.into(), json!(tags));
+            }
+            (!sets.is_empty()).then(|| json!({ "unit_id": uid(c), "labels": sets }))
         })
         .collect();
+    let mut label_definitions = json!({
+        QUALITY_KEY: { "label_options": ["good", "mua", "noise"], "exclusive": true }
+    });
+    // SpikeInterface needs every used value listed and at least two options.
+    if !tag_options.is_empty() {
+        tag_options.insert("src:sorrel".into());
+        tag_options.insert("src:human".into());
+        label_definitions[TAGS_KEY] = json!({ "label_options": tag_options, "exclusive": false });
+    }
 
     let mut merges = Vec::new();
     let mut splits = Vec::new();
@@ -120,12 +132,87 @@ where
     json!({
         "format_version": "2",
         "unit_ids": unit_ids,
-        "label_definitions": {
-            QUALITY_KEY: { "label_options": ["good", "mua", "noise"], "exclusive": true }
-        },
+        "label_definitions": label_definitions,
         "manual_labels": manual_labels,
         "merges": merges,
         "splits": splits,
         "removed": [],
     })
+}
+
+/// The commands that replay an imported curation document onto `session`:
+/// relabels and retags first (deltas only, so re-importing is a no-op),
+/// then one merge per group into its lowest cluster id. Labelling before
+/// merging matches `apply_curation`, and the auto pipeline gives every
+/// member of a merge group the same label and tags.
+///
+/// `current` maps a cluster to its present label string (`"good"`, ...).
+/// Unknown unit ids, invalid tags and units in two merge groups are errors:
+/// a partially applied import would be worse than none.
+pub fn import_commands<P: DataProvider>(
+    session: &Session<P>,
+    doc: &sorrel_io::CurationImport,
+    current: impl Fn(sorrel_io::ClusterId) -> &'static str,
+) -> Result<Vec<CurationCommand>> {
+    use crate::rules::label_op;
+    use anyhow::bail;
+    use sorrel_io::kilosort::valid_tag;
+    use sorrel_io::ClusterId;
+
+    let by_unit: std::collections::HashMap<u64, ClusterId> = (0..session.provider.n_clusters())
+        .map(|c| {
+            (
+                u64::from(session.provider.unit_id(ClusterId(c))),
+                ClusterId(c),
+            )
+        })
+        .collect();
+    let cluster = |uid: u64| {
+        by_unit
+            .get(&uid)
+            .copied()
+            .with_context(|| format!("unit id {uid} is not in this dataset"))
+    };
+
+    let mut out = Vec::new();
+    for (uid, quality, tags) in &doc.labels {
+        let c = cluster(*uid)?;
+        if let Some(q) = quality {
+            let op = label_op(q.as_str())?;
+            if label_op(current(c))? != op {
+                out.push(CurationCommand::Relabel { cluster: c, op });
+            }
+        }
+        if let Some(bad) = tags.iter().find(|t| !valid_tag(t)) {
+            bail!("unit {uid}: invalid tag {bad:?} (empty, or contains a comma/tab/newline)");
+        }
+        if session.tags(c) != tags.as_slice() {
+            out.push(CurationCommand::Tag {
+                cluster: c,
+                tags: tags.clone(),
+            });
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for group in &doc.merges {
+        let mut members = group
+            .iter()
+            .map(|&u| cluster(u))
+            .collect::<Result<Vec<_>>>()?;
+        members.sort_unstable();
+        members.dedup();
+        if let Some(dup) = members.iter().find(|c| !seen.insert(**c)) {
+            bail!("cluster {} appears in more than one merge group", dup.0);
+        }
+        if let Some((&target, sources)) = members.split_first() {
+            // Already merged (e.g. imported, then saved): nothing left to move.
+            if sources.iter().any(|&s| !session.spike_times(s).is_empty()) {
+                out.push(CurationCommand::Merge {
+                    sources: sources.to_vec(),
+                    target,
+                });
+            }
+        }
+    }
+    Ok(out)
 }

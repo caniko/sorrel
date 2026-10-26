@@ -47,6 +47,7 @@ fn describe_command(cmd: &CurationCommand) -> String {
             format!("split cluster {} ({} spikes)", cluster.0, spike_idx.len())
         }
         CurationCommand::Note { cluster, .. } => format!("note on cluster {}", cluster.0),
+        CurationCommand::Tag { cluster, .. } => format!("retag cluster {}", cluster.0),
         CurationCommand::Batch { children } => {
             // A multi-select relabel is journaled as one batch so a single
             // Undo reverts it; say so instead of "batch of N ops".
@@ -460,6 +461,9 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     fn commit_with_follow(&mut self, cmd: CurationCommand, follow: Option<Vec<ClusterId>>) -> bool {
         let desc = describe_command(&cmd);
         self.cancel_jobs();
+        // Every GUI edit is a human decision: it clears the touched clusters'
+        // `review:*` tags (from `sorrel auto`), so the review queue drains.
+        let cmd = read(&self.session).with_human_review(cmd);
         if let Err(e) = write(&self.session).dispatch(cmd) {
             self.error = Some(format!("{desc} failed: {e}"));
             return false;

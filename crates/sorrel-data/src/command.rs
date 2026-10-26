@@ -48,6 +48,13 @@ pub enum CurationCommand {
     },
     Undo,
     Redo,
+    /// Replace the cluster's tag set (provenance and review markers such as
+    /// `src:unitrefine` or `review:merge`). Appended last so older journals
+    /// keep their variant indices.
+    Tag {
+        cluster: ClusterId,
+        tags: Vec<String>,
+    },
 }
 
 impl CurationCommand {
@@ -58,7 +65,7 @@ impl CurationCommand {
             Self::Relabel { cluster, .. } => Some(*cluster),
             Self::Merge { target, .. } => Some(*target),
             Self::Split { cluster, .. } => Some(*cluster),
-            Self::Note { cluster, .. } => Some(*cluster),
+            Self::Note { cluster, .. } | Self::Tag { cluster, .. } => Some(*cluster),
             Self::Batch { children } => children.first().and_then(|c| c.primary_cluster()),
             Self::Undo | Self::Redo => None,
         }

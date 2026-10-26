@@ -32,6 +32,36 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   `pc_features.npy` and the other per-spike arrays whenever the source was
   unsorted or had simultaneous spikes in different clusters.
 
+### Added (automatic curation)
+
+- **`sorrel auto`**: Kilosort output in, curated session out. An embedded
+  SpikeInterface (≥ 0.105) pipeline runs:
+  - redundant-unit detection
+  - the `similarity_correlograms` and `slay` merge presets
+  - Bombcell and UnitRefine labels on the merged units
+  - with `--llm`, a Claude verdict on the units the classifiers disagree on
+    or are unsure about, and on merges only one preset found
+
+  The structured numeric evidence and each verdict are kept in
+  `evidence.json`. Everything is applied as one undoable batch.
+  See [Automatic curation](docs/src/usage/auto-curation.md).
+
+- **Cluster tags.** Every automatic decision records its source (`src:*`,
+  `merged:*`, `bc:*`, `conf:*`), and uncertain ones get `review:*`.
+  - Tags are journaled and undoable (`CurationCommand::Tag`).
+  - They are saved to `cluster_sorrel_tags.tsv` (a phy column) and to a
+    `tags` category in `curation.json`.
+  - The cluster table has a tags column and a **review** filter, and its
+    filter box matches tags.
+  - A GUI edit clears the cluster's `review:*` tags and adds `src:human`.
+- `sorrel apply --curation FILE` imports a SpikeInterface `curation.json`
+  (labels, tags and merges) as one undoable batch. Importing the same
+  document again changes nothing.
+- `sorrel report --tag PREFIX` renders only matching clusters
+  (`--tag review:` gives the review queue).
+- `sorrel serve` adds `tag` and `evidence`, and `list_clusters` takes a tag
+  filter.
+
 ### Added (CLI and interchange)
 
 - `clap` command line with subcommands: `qc`, `suggest [--json]`,

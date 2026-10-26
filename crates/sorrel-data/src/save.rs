@@ -24,7 +24,8 @@ use sorrel_io::npy::write_1d_u32_atomic;
 use sorrel_io::DataProvider;
 use std::path::Path;
 
-/// Write `spike_clusters.npy` and `cluster_group.tsv` into `root`.
+/// Write `spike_clusters.npy`, `cluster_group.tsv` and `curation.json` into
+/// `root`.
 ///
 /// `label_str` maps each backend label to the string phy expects in the TSV
 /// (`"good"`, `"mua"`, `"noise"`, `"unsorted"`). Unsorted entries are
@@ -52,12 +53,31 @@ where
             text.push_str(&format!("{i}\t{s}\n"));
         }
     }
-    let tmp = with_tmp_suffix(&tsv_path);
-    std::fs::write(&tmp, &text).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &tsv_path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), tsv_path.display()))?;
+    write_atomic(&tsv_path, &text)?;
+
+    // Tags: written whenever a cluster has any, or to clear a stale sidecar.
+    let tags_path = root.join(sorrel_io::kilosort::TAGS_TSV);
+    let mut tags_text = String::from("cluster_id\tsorrel_tags\n");
+    let mut any = false;
+    for c in 0..session.n_clusters() {
+        let tags = session.tags(sorrel_io::ClusterId(c));
+        if !tags.is_empty() {
+            any = true;
+            tags_text.push_str(&format!("{c}\t{}\n", tags.join(",")));
+        }
+    }
+    if any || tags_path.exists() {
+        write_atomic(&tags_path, &tags_text)?;
+    }
 
     write_curation_json(session, &root.join("curation.json"), label_str)
+}
+
+fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    let tmp = with_tmp_suffix(path);
+    std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
 }
 
 /// The per-spike cluster ids in the backend's original row order (the order
@@ -273,6 +293,97 @@ mod tests {
         assert_eq!(doc["merges"], serde_json::json!([]));
         assert_eq!(doc["splits"], serde_json::json!([]));
         assert!(!dir.path().join("curation.json.tmp").exists());
+    }
+
+    #[test]
+    fn save_writes_tags_to_tsv_and_curation_json() {
+        let (mut s, dir) = fresh_session();
+        s.dispatch(CurationCommand::Tag {
+            cluster: ClusterId(1),
+            tags: vec!["src:unitrefine".into(), "review:low-conf".into()],
+        })
+        .unwrap();
+        save_to_phy(&s, dir.path(), label_str).unwrap();
+
+        let tsv = dir.path().join(sorrel_io::kilosort::TAGS_TSV);
+        let read = sorrel_io::kilosort::read_tags_tsv(&tsv);
+        assert_eq!(read[1], ["src:unitrefine", "review:low-conf"]);
+        assert!(read[0].is_empty());
+
+        let doc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("curation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            doc["manual_labels"],
+            serde_json::json!([{ "unit_id": 1, "labels": { "tags": ["src:unitrefine", "review:low-conf"] } }])
+        );
+        assert_eq!(doc["label_definitions"]["tags"]["exclusive"], false);
+        let imported = sorrel_io::read_curation(&dir.path().join("curation.json")).unwrap();
+        assert_eq!(imported.labels[0].2, ["src:unitrefine", "review:low-conf"]);
+
+        // Clearing every tag rewrites the sidecar rather than leaving it stale.
+        s.dispatch(CurationCommand::Tag {
+            cluster: ClusterId(1),
+            tags: vec![],
+        })
+        .unwrap();
+        save_to_phy(&s, dir.path(), label_str).unwrap();
+        assert!(sorrel_io::kilosort::read_tags_tsv(&tsv)
+            .iter()
+            .all(Vec::is_empty));
+    }
+
+    #[test]
+    fn import_is_a_delta_batch_that_one_undo_reverts() {
+        use crate::curation_json::import_commands;
+        use sorrel_io::kilosort::PhyLabel;
+        use sorrel_io::CurationImport;
+        let (mut s, _d) = fresh_session();
+        let doc = CurationImport {
+            labels: vec![
+                (0, Some(PhyLabel::Good), vec!["agree".into()]),
+                (1, Some(PhyLabel::Noise), vec!["merged:consensus".into()]),
+                (2, Some(PhyLabel::Noise), vec!["merged:consensus".into()]),
+            ],
+            merges: vec![vec![2, 1]],
+        };
+        let current = |c: ClusterId| label_str(&s.label(c).unwrap_or_default());
+        let cmds = import_commands(&s, &doc, current).unwrap();
+        assert_eq!(cmds.len(), 7, "3 relabels + 3 retags + 1 merge: {cmds:?}");
+        assert!(matches!(
+            cmds.last(),
+            Some(CurationCommand::Merge { sources, target })
+                if *target == ClusterId(1) && sources == &[ClusterId(2)]
+        ));
+        s.dispatch(CurationCommand::batch(cmds).unwrap()).unwrap();
+        assert_eq!(s.tags(ClusterId(1)), ["merged:consensus"]);
+        assert!(s.spike_times(ClusterId(2)).is_empty());
+        // Re-importing the same document is a no-op, merge included.
+        let current = |c: ClusterId| label_str(&s.label(c).unwrap_or_default());
+        let again = import_commands(&s, &doc, current).unwrap();
+        assert!(again.is_empty(), "{again:?}");
+
+        s.dispatch(CurationCommand::Undo).unwrap();
+        assert!(s.tags(ClusterId(1)).is_empty());
+        assert_eq!(s.spike_times(ClusterId(2)).len(), 1);
+
+        let current = |_| "unsorted";
+        let unknown = CurationImport {
+            labels: vec![(9, None, vec![])],
+            merges: vec![],
+        };
+        assert!(import_commands(&s, &unknown, current).is_err());
+        let bad_tag = CurationImport {
+            labels: vec![(0, None, vec!["a,b".into()])],
+            merges: vec![],
+        };
+        assert!(import_commands(&s, &bad_tag, current).is_err());
+        let twice = CurationImport {
+            labels: vec![],
+            merges: vec![vec![0, 1], vec![1, 2]],
+        };
+        assert!(import_commands(&s, &twice, current).is_err());
     }
 
     #[test]

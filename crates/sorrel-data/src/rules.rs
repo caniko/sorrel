@@ -105,7 +105,7 @@ fn compare(op: &str, v: f32, threshold: f32) -> Result<bool> {
     })
 }
 
-fn label_op(s: &str) -> Result<PhyLabelOp> {
+pub(crate) fn label_op(s: &str) -> Result<PhyLabelOp> {
     Ok(match s.trim().to_ascii_lowercase().as_str() {
         "good" => PhyLabelOp::SetGood,
         "mua" => PhyLabelOp::SetMua,

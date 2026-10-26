@@ -80,9 +80,49 @@ enum Cmd {
         #[command(flatten)]
         open: OpenArgs,
         /// TOML rule file; see docs/src/usage/rules-example.toml
-        #[arg(long, value_name = "FILE")]
-        rules: PathBuf,
+        #[arg(long, value_name = "FILE", required_unless_present = "curation")]
+        rules: Option<PathBuf>,
+        /// SpikeInterface curation.json (labels, `tags`, merges) to import,
+        /// e.g. the one `sorrel auto` writes
+        #[arg(long, value_name = "FILE", conflicts_with = "rules")]
+        curation: Option<PathBuf>,
         /// Print the relabels without journaling them
+        #[arg(long)]
+        dry_run: bool,
+        /// Also write the phy artifacts (same as Ctrl-S in the GUI)
+        #[arg(long)]
+        save: bool,
+    },
+    /// Headless: automatic curation with SpikeInterface (cleanup, merge
+    /// presets, Bombcell + UnitRefine labels, optional Claude tiebreak),
+    /// applied as one undoable batch; every decision is tagged with its
+    /// source, and anything uncertain gets a `review:*` tag
+    Auto {
+        #[command(flatten)]
+        open: OpenArgs,
+        /// Ask Claude to settle units the classifiers disagree on and merges
+        /// only one preset found (API key or `ant auth login` required)
+        #[arg(long)]
+        llm: bool,
+        /// Claude model for --llm
+        #[arg(long, value_name = "MODEL", default_value = "claude-opus-5")]
+        llm_model: String,
+        /// Microvolts per ADC bit (e.g. 2.34375 for Neuropixels 1.0 at gain
+        /// 500). Bombcell's amplitude threshold is in uV; without this (or
+        /// --spikeglx-meta) amplitudes stay in ADC units
+        #[arg(long, value_name = "UV")]
+        gain_to_uv: Option<f32>,
+        /// Skip the merge presets
+        #[arg(long)]
+        no_merge: bool,
+        /// Skip the UnitRefine models (offline): Bombcell labels only
+        #[arg(long)]
+        no_unitrefine: bool,
+        /// Import the existing <DATA_DIR>/sorrel_auto/curation.json instead
+        /// of rerunning SpikeInterface
+        #[arg(long)]
+        reuse: bool,
+        /// Print the changes without journaling them
         #[arg(long)]
         dry_run: bool,
         /// Also write the phy artifacts (same as Ctrl-S in the GUI)
@@ -102,6 +142,10 @@ enum Cmd {
         /// Only clusters with this label (good | mua | noise | unsorted)
         #[arg(long, value_name = "LABEL")]
         label: Option<String>,
+        /// Only clusters with a tag starting with PREFIX (`review:` = the
+        /// review queue `sorrel auto` leaves)
+        #[arg(long, value_name = "PREFIX")]
+        tag: Option<String>,
     },
     /// Serve JSON-RPC 2.0 over stdio (MCP shape) so agents and notebooks can
     /// inspect metrics, request plots and curate through the journal
@@ -720,8 +764,18 @@ impl SessionVisitor for Replay {
     }
 }
 
+enum ApplySource {
+    Rules(PathBuf),
+    /// A curation.json import; `tag_splits` adds `review:split` tags from
+    /// sorrel's own split ranking (the auto pipeline has no split detector).
+    Curation {
+        path: PathBuf,
+        tag_splits: bool,
+    },
+}
+
 struct Apply {
-    rules: PathBuf,
+    source: ApplySource,
     dry_run: bool,
     save: bool,
 }
@@ -730,24 +784,48 @@ impl SessionVisitor for Apply {
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
+        use sorrel_data::CurationCommand;
         let mut session = seeded(session, seed)?;
-        let rules = RuleSet::from_path(&self.rules)?;
-        let rows = collect_qc_rows(&session);
         let current = |c: sorrel_io::ClusterId| session.label(c).unwrap_or_default().as_str();
-        let cmds = apply_rules(&rules, &rows, current)?;
+        let cmds = match &self.source {
+            ApplySource::Rules(path) => {
+                let rules = RuleSet::from_path(path)?;
+                apply_rules(&rules, &collect_qc_rows(&session), current)?
+            }
+            ApplySource::Curation { path, tag_splits } => {
+                let doc = sorrel_io::read_curation(path)?;
+                let mut cmds =
+                    sorrel_data::curation_json::import_commands(&session, &doc, current)?;
+                if *tag_splits {
+                    tag_split_candidates(&session, &mut cmds);
+                }
+                cmds
+            }
+        };
+        let (mut retags, mut merges, mut review) = (0, 0, 0);
         for cmd in &cmds {
-            if let sorrel_data::CurationCommand::Relabel { cluster, op } = cmd {
-                println!(
+            match cmd {
+                CurationCommand::Relabel { cluster, op } => println!(
                     "{}\t{} -> {}",
                     cluster.0,
                     current(*cluster),
                     P::label_from_op(*op).as_str()
-                );
+                ),
+                CurationCommand::Merge { sources, target } => {
+                    merges += 1;
+                    let ids: Vec<String> = sources.iter().map(|s| s.0.to_string()).collect();
+                    println!("{}\t<- merge {}", target.0, ids.join(","));
+                }
+                CurationCommand::Tag { tags, .. } => {
+                    retags += 1;
+                    review += usize::from(tags.iter().any(|t| t.starts_with("review:")));
+                }
+                _ => {}
             }
         }
+        let relabels = cmds.len() - retags - merges;
         println!(
-            "{} relabels{}",
-            cmds.len(),
+            "{relabels} relabels, {merges} merges, {retags} retags ({review} need review){}",
             if self.dry_run { " (dry run)" } else { "" }
         );
         if self.dry_run || cmds.is_empty() {
@@ -770,6 +848,119 @@ impl SessionVisitor for Apply {
         }
         Ok(())
     }
+}
+
+/// Add `review:split` + `src:sorrel` to every cluster for which sorrel's
+/// split ranking has a concrete (one-click) bipartition, on top of the tags
+/// `cmds` already gives it. Merge-group members are skipped: the ranking saw
+/// them before the merge. Retags that would not change anything are dropped,
+/// so re-importing the same document is a no-op.
+fn tag_split_candidates<P: DataProvider>(
+    session: &Session<P>,
+    cmds: &mut Vec<sorrel_data::CurationCommand>,
+) {
+    use sorrel_data::CurationCommand;
+    let merged: Vec<sorrel_io::ClusterId> = cmds
+        .iter()
+        .filter_map(|c| match c {
+            CurationCommand::Merge { sources, target } => Some(sources.iter().chain([target])),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect();
+    for cand in rank_split_candidates(session, &SuggestConfig::default()) {
+        if cand.bipartition_minor_idx.is_empty() || merged.contains(&cand.cluster) {
+            continue;
+        }
+        let pending = cmds.iter_mut().find_map(|c| match c {
+            CurationCommand::Tag { cluster, tags } if *cluster == cand.cluster => Some(tags),
+            _ => None,
+        });
+        let tags = match pending {
+            Some(tags) => tags,
+            None => {
+                cmds.push(CurationCommand::Tag {
+                    cluster: cand.cluster,
+                    tags: session.tags(cand.cluster).to_vec(),
+                });
+                match cmds.last_mut() {
+                    Some(CurationCommand::Tag { tags, .. }) => tags,
+                    _ => unreachable!("just pushed a Tag"),
+                }
+            }
+        };
+        for t in ["review:split", "src:sorrel"] {
+            if !tags.iter().any(|x| x == t) {
+                tags.push(t.into());
+            }
+        }
+    }
+    cmds.retain(|c| {
+        !matches!(c, CurationCommand::Tag { cluster, tags } if session.tags(*cluster) == tags.as_slice())
+    });
+}
+
+/// The SpikeInterface pipeline, embedded so an installed binary carries it.
+const AUTO_SCRIPT: &str = include_str!("../../../scripts/sorrel_auto.py");
+
+/// Run `scripts/sorrel_auto.py` into `out`: with `uv run --script` when uv is
+/// on PATH (its PEP 723 header pins the dependencies), else with
+/// `$SORREL_PYTHON` / `python3`, which must already have them installed.
+fn run_auto_sidecar(open: &OpenArgs, out: &Path, flags: &[String]) -> Result<()> {
+    if !matches!(open.backend, None | Some(Backend::Kilosort)) || !open.root().is_dir() {
+        bail!("sorrel auto supports Kilosort/phy directories");
+    }
+    if open.oebin.is_some() {
+        bail!("sorrel auto: pass --dat/--sample-rate/--channels instead of --oebin");
+    }
+    std::fs::create_dir_all(out).with_context(|| format!("create {}", out.display()))?;
+    let script = out.join("sorrel_auto.py");
+    std::fs::write(&script, AUTO_SCRIPT).with_context(|| format!("write {}", script.display()))?;
+
+    let mut args: Vec<std::ffi::OsString> = vec![
+        script.into(),
+        "--data-dir".into(),
+        open.root().into(),
+        "--out".into(),
+        out.into(),
+    ];
+    let mut opt = |flag: &str, v: Option<String>| {
+        if let Some(v) = v {
+            args.extend([flag.into(), v.into()]);
+        }
+    };
+    opt("--dat", open.dat.as_ref().map(|p| p.display().to_string()));
+    opt("--sample-rate", open.sample_rate.map(|v| v.to_string()));
+    opt("--channels", open.n_channels.map(|v| v.to_string()));
+    opt("--dtype", open.dtype.map(|d| d.phy_name().to_string()));
+    opt("--offset", open.offset.map(|v| v.to_string()));
+    opt(
+        "--spikeglx-meta",
+        open.spikeglx_meta.as_ref().map(|p| p.display().to_string()),
+    );
+    args.extend(flags.iter().map(Into::into));
+
+    let uv = std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join("uv").is_file()));
+    let mut cmd = if uv && std::env::var_os("SORREL_PYTHON").is_none() {
+        let mut c = std::process::Command::new("uv");
+        c.args(["run", "--script"]);
+        c
+    } else {
+        std::process::Command::new(
+            std::env::var_os("SORREL_PYTHON").unwrap_or_else(|| "python3".into()),
+        )
+    };
+    log::info!("running the SpikeInterface pipeline (first run computes the analyzer; slow)");
+    let status = cmd
+        .args(&args)
+        .status()
+        .context("spawn the sorrel_auto.py sidecar (install uv, or set SORREL_PYTHON)")?;
+    if !status.success() {
+        bail!("sorrel_auto.py failed ({status})");
+    }
+    Ok(())
 }
 
 struct Report {
@@ -907,16 +1098,67 @@ fn main() -> Result<()> {
         Some(Cmd::Apply {
             open,
             rules,
+            curation,
             dry_run,
             save,
-        }) => with_session(
-            &open,
-            Apply {
-                rules,
-                dry_run,
-                save,
-            },
-        ),
+        }) => {
+            let source = match (rules, curation) {
+                (Some(rules), _) => ApplySource::Rules(rules),
+                (None, Some(path)) => ApplySource::Curation {
+                    path,
+                    tag_splits: false,
+                },
+                (None, None) => unreachable!("clap requires --rules or --curation"),
+            };
+            with_session(
+                &open,
+                Apply {
+                    source,
+                    dry_run,
+                    save,
+                },
+            )
+        }
+        Some(Cmd::Auto {
+            open,
+            llm,
+            llm_model,
+            gain_to_uv,
+            no_merge,
+            no_unitrefine,
+            reuse,
+            dry_run,
+            save,
+        }) => {
+            let out = open.root().join("sorrel_auto");
+            if !reuse {
+                let mut flags = vec![];
+                if llm {
+                    flags.extend(["--llm".to_string(), "--llm-model".into(), llm_model]);
+                }
+                if let Some(g) = gain_to_uv {
+                    flags.extend(["--gain-to-uv".to_string(), g.to_string()]);
+                }
+                if no_merge {
+                    flags.push("--no-merge".into());
+                }
+                if no_unitrefine {
+                    flags.push("--no-unitrefine".into());
+                }
+                run_auto_sidecar(&open, &out, &flags)?;
+            }
+            with_session(
+                &open,
+                Apply {
+                    source: ApplySource::Curation {
+                        path: out.join("curation.json"),
+                        tag_splits: true,
+                    },
+                    dry_run,
+                    save,
+                },
+            )
+        }
         Some(Cmd::Diff { a, b, json }) => diff_tsvs(&a, &b, json),
         Some(Cmd::Serve { open }) => with_session(&open, Serve),
         Some(Cmd::Report {
@@ -924,11 +1166,16 @@ fn main() -> Result<()> {
             out,
             clusters,
             label,
+            tag,
         }) => with_session(
             &open,
             Report {
                 out,
-                filter: ReportFilter { clusters, label },
+                filter: ReportFilter {
+                    clusters,
+                    label,
+                    tag,
+                },
             },
         ),
         Some(Cmd::Journal {

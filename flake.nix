@@ -147,7 +147,9 @@
           (craneLib.filterCargoSources path type)
           || pkgs.lib.hasSuffix ".wgsl" path
           # BIP-39 list embedded by sorrel-remote's pairing codes.
-          || pkgs.lib.hasSuffix "sorrel-remote/wordlist.txt" path;
+          || pkgs.lib.hasSuffix "sorrel-remote/wordlist.txt" path
+          # SpikeInterface sidecar `sorrel auto` embeds with include_str!.
+          || pkgs.lib.hasSuffix "scripts/sorrel_auto.py" path;
       };
       treefmtEval = treefmt-nix.lib.evalModule pkgs (import ./nix/treefmt.nix {rustfmtPackage = rustToolchain;});
       pre-commit-check = git-hooks.lib.${system}.run {

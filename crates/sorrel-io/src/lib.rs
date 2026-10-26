@@ -22,7 +22,7 @@ pub mod sorting_analyzer;
 pub mod spikeglx;
 
 pub use cbin::CbinReader;
-pub use curation_json::read_curation_labels;
+pub use curation_json::{read_curation, read_curation_labels, CurationImport};
 pub use detect::{detect_backend, Backend};
 pub use events::Events;
 pub use extras::{

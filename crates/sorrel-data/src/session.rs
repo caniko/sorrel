@@ -32,6 +32,8 @@ enum InverseOp<L: Copy> {
     Merge {
         /// Pre-merge label for each source cluster, captured in source order.
         labels: Vec<(ClusterId, L)>,
+        /// Target and its tag set before the sources' tags were unioned in.
+        target_tags: (ClusterId, Vec<String>),
         /// Reversible record of the spike-table rewrite.
         record: MergeRecord,
     },
@@ -44,6 +46,10 @@ enum InverseOp<L: Copy> {
     /// not themselves be `Batch` (enforced by [`CurationCommand::batch`]).
     Batch {
         inverses: Vec<InverseOp<L>>,
+    },
+    Tag {
+        cluster: ClusterId,
+        prev: Vec<String>,
     },
 }
 
@@ -82,6 +88,9 @@ pub struct Session<P: DataProvider> {
     /// Indexed by `ClusterId`. `P::Label` is `Copy + 'static`, so this is a
     /// flat, cache-friendly buffer (1 byte per cluster for `PhyLabel`).
     labels: Vec<P::Label>,
+    /// Provenance/review tags per cluster, indexed by `ClusterId`; grown on
+    /// demand, so a missing slot means no tags.
+    tags: Vec<Vec<String>>,
     cluster_index: ClusterIndex,
     journal: Journal,
     history: Vec<HistoryEntry<P::Label>>,
@@ -96,10 +105,12 @@ pub struct Session<P: DataProvider> {
 impl<P: DataProvider> Session<P> {
     pub fn new(provider: P, journal: Journal) -> Self {
         let labels = provider.initial_labels();
+        let tags = provider.initial_tags();
         let cluster_index = ClusterIndex::from_provider(&provider);
         Self {
             provider,
             labels,
+            tags,
             cluster_index,
             journal,
             history: Vec::new(),
@@ -359,6 +370,75 @@ impl<P: DataProvider> Session<P> {
         self.labels.get(cluster.idx()).copied()
     }
 
+    /// Provenance/review tags of `cluster` (empty when it has none).
+    pub fn tags(&self, cluster: ClusterId) -> &[String] {
+        self.tags.get(cluster.idx()).map_or(&[], Vec::as_slice)
+    }
+
+    /// `cmd` as a human decision: preceded by retags that drop the touched
+    /// clusters' `review:*` tags and add `src:human`, all in one undoable
+    /// batch. Untagged clusters are left alone (sessions that never ran
+    /// `sorrel auto` stay tag-free). Retags go first so a merge unions, and
+    /// a split child inherits, the cleaned set.
+    pub fn with_human_review(&self, cmd: CurationCommand) -> CurationCommand {
+        let children: &[CurationCommand] = match &cmd {
+            CurationCommand::Batch { children } => children,
+            CurationCommand::Undo | CurationCommand::Redo => return cmd,
+            other => std::slice::from_ref(other),
+        };
+        let mut clusters = Vec::new();
+        for c in children {
+            match c {
+                CurationCommand::Relabel { cluster, .. }
+                | CurationCommand::Split { cluster, .. } => clusters.push(*cluster),
+                CurationCommand::Merge { sources, target } => {
+                    clusters.push(*target);
+                    clusters.extend_from_slice(sources);
+                }
+                _ => {}
+            }
+        }
+        clusters.sort_unstable();
+        clusters.dedup();
+        let mut out: Vec<CurationCommand> = clusters
+            .into_iter()
+            .filter_map(|c| {
+                let old = self.tags(c);
+                if old.is_empty() {
+                    return None;
+                }
+                let mut tags: Vec<String> = old
+                    .iter()
+                    .filter(|t| !t.starts_with("review:"))
+                    .cloned()
+                    .collect();
+                if !tags.iter().any(|t| t == "src:human") {
+                    tags.push("src:human".into());
+                }
+                (tags != old).then_some(CurationCommand::Tag { cluster: c, tags })
+            })
+            .collect();
+        if out.is_empty() {
+            return cmd;
+        }
+        match cmd {
+            CurationCommand::Batch { children } => out.extend(children),
+            other => out.push(other),
+        }
+        CurationCommand::Batch { children: out }
+    }
+
+    /// Replace `cluster`'s tags, returning the previous set.
+    fn swap_tags(&mut self, cluster: ClusterId, tags: Vec<String>) -> Vec<String> {
+        if self.tags.len() <= cluster.idx() {
+            if tags.is_empty() {
+                return Vec::new();
+            }
+            self.tags.resize_with(cluster.idx() + 1, Vec::new);
+        }
+        std::mem::replace(&mut self.tags[cluster.idx()], tags)
+    }
+
     /// Number of clusters currently addressable. Grows when a split allocates
     /// a fresh id; never shrinks (use the `is_empty` helper to filter).
     #[inline]
@@ -575,8 +655,20 @@ impl<P: DataProvider> Session<P> {
                     .iter()
                     .map(|&s| (s, self.label(s).unwrap_or_default()))
                     .collect();
+                // The merged unit carries every source's provenance.
+                let mut union = self.tags(*target).to_vec();
+                for &s in sources {
+                    union.extend_from_slice(self.tags(s));
+                }
+                union.sort_unstable();
+                union.dedup();
+                let target_tags = (*target, self.swap_tags(*target, union));
                 let record = self.cluster_index.merge(sources, *target);
-                InverseOp::Merge { labels, record }
+                InverseOp::Merge {
+                    labels,
+                    target_tags,
+                    record,
+                }
             }
             CurationCommand::Split {
                 cluster,
@@ -589,9 +681,16 @@ impl<P: DataProvider> Session<P> {
                 // physical id is determined by the index that performs the
                 // mutation, which guarantees no collision after replay.
                 let record = self.cluster_index.split(*cluster, spike_idx);
+                // The split-off child inherits the parent's provenance.
+                let inherited = self.tags(*cluster).to_vec();
+                self.swap_tags(record.new_cluster, inherited);
                 InverseOp::Split { record }
             }
             CurationCommand::Note { .. } => InverseOp::None,
+            CurationCommand::Tag { cluster, tags } => InverseOp::Tag {
+                cluster: *cluster,
+                prev: self.swap_tags(*cluster, tags.clone()),
+            },
             CurationCommand::Batch { children } => {
                 let mut inverses = Vec::with_capacity(children.len());
                 for child in children {
@@ -623,7 +722,12 @@ impl<P: DataProvider> Session<P> {
                     *slot = prev;
                 }
             }
-            InverseOp::Merge { labels, record } => {
+            InverseOp::Merge {
+                labels,
+                target_tags,
+                record,
+            } => {
+                self.swap_tags(target_tags.0, target_tags.1);
                 self.cluster_index.unmerge(record);
                 for (c, l) in labels {
                     if let Some(slot) = self.labels.get_mut(c.idx()) {
@@ -632,7 +736,11 @@ impl<P: DataProvider> Session<P> {
                 }
             }
             InverseOp::Split { record } => {
+                self.swap_tags(record.new_cluster, Vec::new());
                 self.cluster_index.unsplit(record);
+            }
+            InverseOp::Tag { cluster, prev } => {
+                self.swap_tags(cluster, prev);
             }
             InverseOp::Batch { inverses } => {
                 // Reverse order: undo the last-applied child first so each
@@ -718,7 +826,8 @@ fn collect_affected_clusters(cmd: &CurationCommand, out: &mut Vec<ClusterId>) {
                 collect_affected_clusters(child, out);
             }
         }
-        CurationCommand::Undo | CurationCommand::Redo => {}
+        // Tags never touch spikes, so no cache depends on them.
+        CurationCommand::Tag { .. } | CurationCommand::Undo | CurationCommand::Redo => {}
     }
 }
 
@@ -1061,6 +1170,82 @@ mod tests {
         .unwrap();
         assert_eq!(s.label(ClusterId(0)), Some(MockLabel::Unsorted));
         assert_eq!(s.history_len(), 1);
+    }
+
+    #[test]
+    fn tags_follow_merge_split_undo_and_replay() {
+        let (mut s, d) = fresh_session();
+        let tag = |c: u32, t: &[&str]| CurationCommand::Tag {
+            cluster: ClusterId(c),
+            tags: t.iter().map(|s| s.to_string()).collect(),
+        };
+        s.dispatch(tag(0, &["src:bombcell", "agree"])).unwrap();
+        s.dispatch(tag(2, &["review:merge"])).unwrap();
+        assert_eq!(s.tags(ClusterId(0)), ["src:bombcell", "agree"]);
+        assert!(s.tags(ClusterId(1)).is_empty());
+
+        // Merge unions source tags into the target; undo restores them.
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(0)],
+            target: ClusterId(2),
+        })
+        .unwrap();
+        assert_eq!(
+            s.tags(ClusterId(2)),
+            ["agree", "review:merge", "src:bombcell"]
+        );
+        s.dispatch(CurationCommand::Undo).unwrap();
+        assert_eq!(s.tags(ClusterId(2)), ["review:merge"]);
+
+        // A split child inherits the parent's tags and loses them on undo.
+        let child = ClusterId(s.n_clusters());
+        s.dispatch(CurationCommand::Split {
+            cluster: ClusterId(0),
+            spike_idx: vec![1],
+            new_cluster: child,
+        })
+        .unwrap();
+        assert_eq!(s.tags(child), ["src:bombcell", "agree"]);
+        s.dispatch(CurationCommand::Undo).unwrap();
+        assert!(s.tags(child).is_empty());
+
+        // A human decision clears review tags in the same undoable batch,
+        // and leaves untagged clusters untagged.
+        let human = s.with_human_review(CurationCommand::Relabel {
+            cluster: ClusterId(2),
+            op: PhyLabelOp::SetGood,
+        });
+        s.dispatch(human).unwrap();
+        assert_eq!(s.tags(ClusterId(2)), ["src:human"]);
+        let plain = s.with_human_review(CurationCommand::Relabel {
+            cluster: ClusterId(1),
+            op: PhyLabelOp::SetGood,
+        });
+        assert!(matches!(plain, CurationCommand::Relabel { .. }));
+        s.dispatch(CurationCommand::Undo).unwrap();
+        assert_eq!(s.tags(ClusterId(2)), ["review:merge"]);
+
+        // Retag undo restores the previous set; the journal replays it.
+        s.dispatch(tag(0, &["src:human"])).unwrap();
+        s.dispatch(tag(0, &[])).unwrap();
+        s.dispatch(CurationCommand::Undo).unwrap();
+        assert_eq!(s.tags(ClusterId(0)), ["src:human"]);
+
+        let path = s.journal_path().to_path_buf();
+        let provider = MockProvider {
+            spikes: (0..3)
+                .map(|c| s.provider.spike_times(ClusterId(c)).to_vec())
+                .collect(),
+            labels: vec![MockLabel::Unsorted; 3],
+            trace: vec![],
+            n_channels: 1,
+        };
+        drop(s);
+        let mut r = Session::new(provider, Journal::open(&path).unwrap());
+        r.replay_journal().unwrap();
+        assert_eq!(r.tags(ClusterId(0)), ["src:human"]);
+        assert_eq!(r.tags(ClusterId(2)), ["review:merge"]);
+        drop(d);
     }
 
     #[test]

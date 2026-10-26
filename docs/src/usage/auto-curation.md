@@ -1,0 +1,136 @@
+# Automatic Curation
+
+`sorrel auto` handles the repetitive part of curating a Kilosort sort, using
+the classifiers the SpikeInterface project recommends:
+
+```bash
+sorrel auto /data/session1 --gain-to-uv 2.34375          # label + merge, journaled
+sorrel auto /data/session1 --reuse --save                # re-import, write phy files
+sorrel auto /data/session1 --llm                         # Claude settles the uncertain cases
+```
+
+All of its edits go into one batch in the curation journal, so one
+**Undo** in the GUI reverts the whole run. Every cluster gets **tags** that
+record who decided what. Clusters that still need a person get a
+`review:*` tag; the GUI's **review** filter shows only those clusters.
+
+## Pipeline
+
+`sorrel auto` runs `scripts/sorrel_auto.py` (embedded in the binary) using
+SpikeInterface ≥ 0.105. The script needs either
+[uv](https://docs.astral.sh/uv/) on `PATH`, which installs the pinned
+dependencies on first use, or `SORREL_PYTHON` pointing to an interpreter
+that already has them.
+
+1. **Load.** It loads the raw recording from `params.py` (or `--dat`,
+   `--spikeglx-meta`), applies a 300 Hz high-pass and median CMR, and builds
+   the sorting from `spike_times.npy` and `spike_clusters.npy`, so the unit
+   ids are the same cluster ids sorrel uses.
+2. **Analyzer.** It computes waveforms, templates, PCs, spike locations,
+   correlograms, template similarity, quality metrics and template metrics.
+   The analyzer is cached in `<DATA_DIR>/sorrel_auto/analyzer` and rebuilt
+   only when `spike_clusters.npy` or the recording options change.
+3. **Redundant units.** Near-duplicate spike trains found by
+   `remove_redundant_units` are labelled `noise` and tagged `redundant`.
+   They are not deleted.
+4. **Merges.** The `similarity_correlograms` and `slay` presets of
+   `compute_merge_unit_groups` run separately. Their groups are combined,
+   then merged in the analyzer so the merged units are measured again.
+5. **Labels.** Bombcell rules and the two UnitRefine random forests label
+   each merged unit. SUA counts as `good`. Bombcell's non-somatic call
+   becomes the tag `non-somatic`.
+6. **Claude (`--llm`, optional).** Claude decides the units where the two
+   classifiers disagree or UnitRefine is unsure, and the merges that only one
+   preset found (see [below](#claude)).
+7. **Output.** The script writes `sorrel_auto/curation.json` (SpikeInterface
+   curation format v2, keyed by original cluster ids, validated before
+   writing) and `sorrel_auto/evidence.json`. Every member of a merge group
+   gets the merged unit's label and tags.
+
+Sorrel then imports `curation.json`, the same as running
+`sorrel apply --curation`. It also adds `review:split` to clusters where its
+own split ranking found a concrete two-way split; SpikeInterface has no
+standard automatic split. Importing the same document again changes
+nothing.
+
+Bombcell's amplitude threshold is in µV. Pass `--gain-to-uv`
+(e.g. `2.34375` for Neuropixels 1.0 at AP gain 500) or `--spikeglx-meta`.
+Without one of them, amplitudes stay in ADC units and that one Bombcell
+rule is meaningless.
+
+## Tags
+
+| Tag                                                       | Meaning                                                                         |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `src:bombcell`, `src:unitrefine`                          | That classifier contributed to the label.                                       |
+| `src:llm`                                                 | Claude decided the label or the merge.                                          |
+| `src:spikeinterface`                                      | Set by SpikeInterface cleanup (`redundant`).                                    |
+| `src:sorrel`                                              | Set by sorrel's own ranking (`review:split`).                                   |
+| `src:human`                                               | Someone edited the cluster in the GUI after the run.                            |
+| `agree` / `disagree`                                      | Whether Bombcell and UnitRefine gave the same label.                            |
+| `conf:high` / `conf:mid` / `conf:low`                     | UnitRefine probability ≥ 0.85, in between, or < 0.6.                            |
+| `bc:<metric>`                                             | A Bombcell threshold the unit failed, e.g. `bc:snr`, `bc:sliding_rp_violation`. |
+| `non-somatic`, `redundant`                                | Bombcell's non-somatic waveform call; a near-duplicate spike train.             |
+| `merged:similarity_correlograms`, `merged:slay`           | The merge preset(s) that proposed the merge.                                    |
+| `merged:consensus`                                        | Both presets agreed on the merge.                                               |
+| `review:disagree`, `review:low-conf`, `review:llm-unsure` | The label needs a person.                                                       |
+| `review:merge`                                            | The merge (applied or vetoed) needs a person.                                   |
+| `review:split`                                            | Sorrel's split ranking has a split proposal for this cluster.                   |
+
+Tags are saved in `cluster_sorrel_tags.tsv`, which phy shows as an ordinary
+column, and in the `tags` category of `curation.json`. Any GUI edit to a
+tagged cluster (relabel, merge, split) removes its `review:*` tags and adds
+`src:human` in the same undoable step.
+
+## Reviewing
+
+- **GUI:** check **review** above the cluster table. Sort by **tags** to
+  list the clusters with the most review tags first. The filter box matches
+  tags as well as ids, e.g. `merged`, `src:llm` or `bc:snr`.
+- **HTML:** `sorrel report DIR --tag review: --out review.html`.
+- **Agents:** `sorrel serve` adds `list_clusters {"tag": "review:"}`,
+  `evidence {"cluster": N}` (the classifier outputs and Claude verdicts) and
+  `tag`, so an MCP client can go through the queue with the same evidence.
+
+## Claude
+
+With `--llm`, the uncertain cases go to Claude (`--llm-model`, default
+`claude-opus-5`; credentials from `ANTHROPIC_API_KEY` or `ant auth login`).
+
+Claude is sent **numbers, not plots**:
+
+- the metrics
+- both classifiers' outputs and the Bombcell rules the unit failed
+- the peak-channel template resampled to 25 points
+- the spatial footprint (ptp on the 8 nearest channels, with offsets in µm)
+- the ACG for 0–30 ms
+- firing rate and median amplitude per tenth of the recording
+
+Merge cases get both templates on the shared channel, the CCG, template
+similarity and distance.
+
+Everything that decides a label is already numeric, so asking a vision
+model to read it back off a plot only loses precision. SpikeAgent (the only
+published LLM curation study) also found that images alone were unreliable
+until numbers were added.
+
+The reply is a JSON verdict (label or merge/no-merge, a confidence and up to
+three reasons). It is stored in `evidence.json` next to the exact input that
+produced it. A verdict below 0.7 confidence keeps the case in review as
+`review:llm-unsure`. A confident "do not merge" vetoes a merge that only one
+preset found.
+
+## Checking it on your data
+
+Compare `sorrel auto` with your own curation of the same dataset:
+
+```bash
+cp DIR/cluster_group.tsv human.tsv                       # a curated copy
+sorrel auto DIR --discard-journal --save                 # on a fresh copy of the sort
+sorrel diff human.tsv DIR/cluster_group.tsv              # kappa + disagreements
+```
+
+Repeat with `--no-unitrefine`, without `--llm` and with `--llm` to see
+which stage helps on your recordings. A synthetic self-check lives in
+`scripts/test_sorrel_auto.py`
+(`uv run --script scripts/test_sorrel_auto.py [--unitrefine]`).

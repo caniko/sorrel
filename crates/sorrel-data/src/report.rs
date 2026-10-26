@@ -24,6 +24,8 @@ pub struct ReportFilter {
     pub clusters: Option<Vec<u32>>,
     /// Only clusters whose label string equals this (`"good"`, ...).
     pub label: Option<String>,
+    /// Only clusters with a tag starting with this (`"review:"` = the review queue).
+    pub tag: Option<String>,
 }
 
 /// The three plots of one cluster card, as SVG fragments.
@@ -154,6 +156,14 @@ where
                     .unwrap_or(false)
             })
         })
+        .filter(|r| {
+            filter.tag.as_deref().is_none_or(|t| {
+                session
+                    .tags(ClusterId(r.cluster_id))
+                    .iter()
+                    .any(|x| x.starts_with(t))
+            })
+        })
         .collect();
 
     let cards: Vec<String> = rows
@@ -175,11 +185,12 @@ where
                 })
                 .collect();
             format!(
-                r#"<section id="cluster-{id}" class="{label}"><h2>cluster {id} <span class="label">{label}</span></h2><div class="row"><table>{metrics}</table><div class="plots"><figure>{wf}<figcaption>template, peak channel</figcaption></figure><figure>{isi}<figcaption>ISI 0–50 ms</figcaption></figure><figure>{acg}<figcaption>ACG ±50 ms</figcaption></figure></div></div></section>"#,
+                r#"<section id="cluster-{id}" class="{label}"><h2>cluster {id} <span class="label">{label}</span></h2>{tags}<div class="row"><table>{metrics}</table><div class="plots"><figure>{wf}<figcaption>template, peak channel</figcaption></figure><figure>{isi}<figcaption>ISI 0–50 ms</figcaption></figure><figure>{acg}<figcaption>ACG ±50 ms</figcaption></figure></div></div></section>"#,
                 id = row.cluster_id,
                 wf = svgs.waveform.unwrap_or_else(|| "<p class=\"none\">no templates</p>".into()),
                 isi = svgs.isi,
                 acg = svgs.acg,
+                tags = tags_html(session.tags(c)),
             )
         })
         .collect();
@@ -194,6 +205,7 @@ section.good h2 .label{{color:#2a7}}section.mua h2 .label{{color:#c80}}section.n
 th{{text-align:left;padding:1px 8px 1px 0;font-weight:normal;color:#555}}td{{font-variant-numeric:tabular-nums}}
 .plots{{display:flex;gap:1rem;flex-wrap:wrap}}figure{{margin:0}}figcaption{{font-size:11px;color:#666;text-align:center}}
 .none{{color:#999;font-size:12px}}
+.tags{{margin:0 0 .5rem;font-size:12px;color:#555}}.tags b{{color:#c33;font-weight:normal}}
 </style></head><body><h1>sorrel report</h1><p>{n} clusters</p>{cards}</body></html>"#,
         n = rows.len(),
         cards = cards.join("\n"),
@@ -201,6 +213,29 @@ th{{text-align:left;padding:1px 8px 1px 0;font-weight:normal;color:#555}}td{{fon
 }
 
 /// Write the report to `path`.
+/// The card's tag line, `review:*` tags highlighted; empty without tags.
+fn tags_html(tags: &[String]) -> String {
+    if tags.is_empty() {
+        return String::new();
+    }
+    let esc = |t: &str| {
+        t.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let items: Vec<String> = tags
+        .iter()
+        .map(|t| {
+            if t.starts_with("review:") {
+                format!("<b>{}</b>", esc(t))
+            } else {
+                esc(t)
+            }
+        })
+        .collect();
+    format!(r#"<p class="tags">{}</p>"#, items.join(" · "))
+}
+
 pub fn write_report<P, F>(
     session: &Session<P>,
     path: &Path,
@@ -253,6 +288,7 @@ mod tests {
         let only_one = ReportFilter {
             clusters: Some(vec![1]),
             label: None,
+            tag: None,
         };
         let html = render_report(&s, label, &only_one);
         assert!(html.contains("id=\"cluster-1\"") && !html.contains("id=\"cluster-0\""));
@@ -260,6 +296,7 @@ mod tests {
         let none_good = ReportFilter {
             clusters: None,
             label: Some("good".into()),
+            tag: None,
         };
         assert_eq!(
             render_report(&s, label, &none_good)

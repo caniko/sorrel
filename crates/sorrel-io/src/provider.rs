@@ -262,6 +262,16 @@ impl TraceDtype {
         }
     }
 
+    /// The numpy name phy writes in `params.py` (inverse of [`Self::from_phy_name`]).
+    pub const fn phy_name(self) -> &'static str {
+        match self {
+            Self::I16 => "int16",
+            Self::U16 => "uint16",
+            Self::I32 => "int32",
+            Self::F32 => "float32",
+        }
+    }
+
     /// Approximate full-scale magnitude used by render code for amplitude
     /// normalisation. Float buffers are assumed already in physical units of
     /// magnitude ~1 — callers should override this when they know better.
@@ -401,6 +411,12 @@ pub trait DataProvider: Send + Sync + 'static {
 
     /// Initial label vector loaded from the backend's on-disk schema.
     fn initial_labels(&self) -> Vec<Self::Label>;
+
+    /// Saved provenance/review tags per cluster (phy: `cluster_sorrel_tags.tsv`).
+    /// Missing slots mean no tags.
+    fn initial_tags(&self) -> Vec<Vec<String>> {
+        Vec::new()
+    }
 
     /// The backend's own identifier for a cluster, as written to interchange
     /// files such as SpikeInterface's `curation.json`. Phy directories number

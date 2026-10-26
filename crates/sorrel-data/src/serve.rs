@@ -4,7 +4,7 @@
 //! curate through the same journaled commands the GUI uses.
 //!
 //! One JSON object per line in, one per line out. Hand-rolled on
-//! `serde_json`: eight synchronous tools on a single stdin loop do not
+//! `serde_json`: a handful of synchronous tools on a single stdin loop do not
 //! justify an async runtime.
 //!
 //! Plots come back as SVG resources (see `report`); PNG needs a GPU
@@ -29,8 +29,8 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 pub fn tool_list() -> Value {
     let cluster = json!({"type": "object", "properties": {"cluster": {"type": "integer"}}, "required": ["cluster"]});
     json!([
-        {"name": "list_clusters", "description": "Cluster ids with spike count and label; optional label filter",
-         "inputSchema": {"type": "object", "properties": {"label": {"type": "string"}}}},
+        {"name": "list_clusters", "description": "Cluster ids with spike count, label and tags; optional label filter and tag-prefix filter (\"review:\" = the review queue)",
+         "inputSchema": {"type": "object", "properties": {"label": {"type": "string"}, "tag": {"type": "string"}}}},
         {"name": "metrics", "description": "Quality metrics for one cluster (same columns as cluster_qc.tsv)",
          "inputSchema": cluster},
         {"name": "suggest", "description": "Ranked merge and split suggestions for the current curation",
@@ -43,6 +43,10 @@ pub fn tool_list() -> Value {
          "inputSchema": {"type": "object", "properties": {"sources": {"type": "array", "items": {"type": "integer"}}, "target": {"type": "integer"}}, "required": ["sources", "target"]}},
         {"name": "split", "description": "Move the given spike indices (positions in the cluster's time-sorted spikes) into a new cluster",
          "inputSchema": {"type": "object", "properties": {"cluster": {"type": "integer"}, "spike_idx": {"type": "array", "items": {"type": "integer"}}}, "required": ["cluster", "spike_idx"]}},
+        {"name": "tag", "description": "Replace a cluster's tag set (provenance/review markers, e.g. drop review:* once decided); journaled and undoable",
+         "inputSchema": {"type": "object", "properties": {"cluster": {"type": "integer"}, "tags": {"type": "array", "items": {"type": "string"}}}, "required": ["cluster", "tags"]}},
+        {"name": "evidence", "description": "What `sorrel auto` recorded for a cluster: classifier outputs, Bombcell failures, Claude verdicts and merge records",
+         "inputSchema": cluster},
         {"name": "undo", "description": "Undo the last curation command", "inputSchema": {"type": "object", "properties": {}}},
         {"name": "save", "description": "Write spike_clusters.npy, cluster_group.tsv and curation.json", "inputSchema": {"type": "object", "properties": {}}},
     ])
@@ -172,17 +176,62 @@ where
     Ok(match name {
         "list_clusters" => {
             let want = args.get("label").and_then(Value::as_str);
+            let tag = args.get("tag").and_then(Value::as_str);
             let rows: Vec<Value> = (0..session.n_clusters())
                 .map(ClusterId)
                 .filter(|&c| !session.spike_times(c).is_empty())
+                .filter(|&c| tag.is_none_or(|t| session.tags(c).iter().any(|x| x.starts_with(t))))
                 .filter_map(|c| {
                     let label = label_str(&session.label(c)?);
                     (want.is_none_or(|w| w == label)).then(|| {
-                        json!({"cluster": c.0, "n_spikes": session.spike_times(c).len(), "label": label})
+                        json!({"cluster": c.0, "n_spikes": session.spike_times(c).len(),
+                               "label": label, "tags": session.tags(c)})
                     })
                 })
                 .collect();
             text(json!(rows))
+        }
+        "tag" => {
+            let cluster = check(arg_u32(args, "cluster")?)?;
+            let tags: Vec<String> = args
+                .get("tags")
+                .and_then(Value::as_array)
+                .and_then(|a| a.iter().map(|v| v.as_str().map(str::to_owned)).collect())
+                .ok_or_else(|| ToolError::Failed("missing string list \"tags\"".into()))?;
+            if let Some(bad) = tags.iter().find(|t| !sorrel_io::kilosort::valid_tag(t)) {
+                return Err(ToolError::Failed(format!("invalid tag {bad:?}")));
+            }
+            session.dispatch(CurationCommand::Tag { cluster, tags })?;
+            text(json!({"ok": true, "version": session.version()}))
+        }
+        "evidence" => {
+            let c = check(arg_u32(args, "cluster")?)?;
+            let uid = u64::from(session.provider.unit_id(c));
+            let path = save_dir.join("sorrel_auto").join("evidence.json");
+            let doc: Value = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .ok_or_else(|| {
+                    ToolError::Failed(format!("no {} (run `sorrel auto` first)", path.display()))
+                })?;
+            let has = |v: &Value| {
+                v.as_array()
+                    .is_some_and(|a| a.iter().any(|m| m.as_u64() == Some(uid)))
+            };
+            // Merged units are keyed by their post-merge id and list members.
+            let unit = doc["units"].as_object().and_then(|units| {
+                units
+                    .iter()
+                    .find(|(k, v)| k.parse() == Ok(uid) || has(&v["members"]))
+                    .map(|(_, v)| v.clone())
+            });
+            let merges: Vec<&Value> = doc["merges"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|m| has(&m["units"]))
+                .collect();
+            text(json!({"unit": unit, "merges": merges, "tags": session.tags(c)}))
         }
         "metrics" => {
             let c = check(arg_u32(args, "cluster")?)?;
@@ -352,7 +401,7 @@ mod tests {
             .collect();
         assert_eq!(replies.len(), 10, "notification gets no reply");
         assert_eq!(replies[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
-        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 11);
         assert_eq!(replies[2]["id"], 3);
         assert_eq!(replies[2]["result"]["isError"], false);
         assert_eq!(s.label(ClusterId(0)), Some(1));
@@ -386,5 +435,68 @@ mod tests {
         assert_eq!(replies[9]["result"]["isError"], false);
         assert!(dir.path().join("cluster_group.tsv").exists());
         assert!(dir.path().join("curation.json").exists());
+    }
+
+    #[test]
+    fn review_queue_tag_and_evidence_tools() {
+        let prov = MockProvider {
+            spikes: vec![vec![SampleIndex(10)], vec![SampleIndex(20)]],
+            amps: vec![vec![1.0], vec![2.0]],
+            n_samples: SampleIndex(1000),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Session::new(prov, Journal::open(&dir.path().join("j.journal")).unwrap());
+        std::fs::create_dir(dir.path().join("sorrel_auto")).unwrap();
+        std::fs::write(
+            dir.path().join("sorrel_auto/evidence.json"),
+            r#"{"units":{"7":{"members":[0,1],"bombcell":"mua"}},"merges":[{"units":[0,1],"verdict":null}]}"#,
+        )
+        .unwrap();
+        let call = |id: u32, name: &str, args: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#
+            ) + "\n"
+        };
+        let input = [
+            call(
+                1,
+                "tag",
+                r#"{"cluster":1,"tags":["review:merge","src:bombcell"]}"#,
+            ),
+            call(2, "list_clusters", r#"{"tag":"review:"}"#),
+            call(3, "tag", r#"{"cluster":1,"tags":["a,b"]}"#),
+            call(4, "evidence", r#"{"cluster":1}"#),
+        ]
+        .concat();
+        let mut out = Vec::new();
+        serve(
+            &mut s,
+            dir.path(),
+            false,
+            |_: &u8| "unsorted",
+            Cursor::new(input),
+            &mut out,
+        )
+        .unwrap();
+        let replies: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let text = |i: usize| -> Value {
+            serde_json::from_str(replies[i]["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap()
+        };
+        assert_eq!(s.tags(ClusterId(1)), ["review:merge", "src:bombcell"]);
+        assert_eq!(
+            text(1),
+            json!([{"cluster": 1, "n_spikes": 1, "label": "unsorted", "tags": ["review:merge", "src:bombcell"]}])
+        );
+        assert_eq!(
+            replies[2]["result"]["isError"], true,
+            "comma would corrupt the TSV"
+        );
+        assert_eq!(text(3)["unit"]["bombcell"], "mua");
+        assert_eq!(text(3)["merges"].as_array().unwrap().len(), 1);
     }
 }
