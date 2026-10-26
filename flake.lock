@@ -1368,13 +1368,14 @@
       "locked": {
         "lastModified": 1791442905,
         "narHash": "sha256-sNh6JpHuvsD1dJs+/pyjbGE3SHpJ0J9VCu1/22KjH2A=",
-        "ref": "refs/heads/trunk",
+        "ref": "trunk",
         "rev": "9762fd3652db7ebb3f92db8ad18b6e3253097f58",
         "revCount": 11,
         "type": "git",
         "url": "https://github.com/caniko/harbor-macos-sdk-pin.git"
       },
       "original": {
+        "ref": "trunk",
         "type": "git",
         "url": "https://github.com/caniko/harbor-macos-sdk-pin.git"
       }
@@ -2759,13 +2760,14 @@
       "locked": {
         "lastModified": 1792908222,
         "narHash": "sha256-5wVLTHbJKJ4uTI2ScQ6P86JZS/XnU/Qs3RxnGtrvAo8=",
-        "ref": "refs/heads/trunk",
+        "ref": "trunk",
         "rev": "a21321fddd3d06eecf3399765d720923ff055780",
         "revCount": 402,
         "type": "git",
         "url": "https://github.com/caniko/plinth.git"
       },
       "original": {
+        "ref": "trunk",
         "type": "git",
         "url": "https://github.com/caniko/plinth.git"
       }
