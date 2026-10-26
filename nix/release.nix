@@ -26,12 +26,12 @@ in
     inherit pkgs pname version;
     artifacts = {
       x86_64-linux = archive {
-        package = packages.sorrel;
+        package = packages.sorrel-portable;
         system = "x86_64-linux";
         rustTarget = "x86_64-unknown-linux-gnu";
       };
       aarch64-linux = archive {
-        package = packages.sorrel-aarch64-linux;
+        package = packages.sorrel-portable-aarch64-linux;
         system = "aarch64-linux";
         rustTarget = "aarch64-unknown-linux-gnu";
       };

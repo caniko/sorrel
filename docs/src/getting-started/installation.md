@@ -54,6 +54,9 @@ supports compute shaders, and on the CPU otherwise.
   `services.xserver.videoDrivers = [ "nvidia" ];` for NVIDIA. A Nix-built
   `sorrel` on another distribution needs
   [nixGL](https://github.com/nix-community/nixGL) to find the host driver.
+- **Release tarballs and AppImage:** need glibc 2.31 or newer (Ubuntu 20.04,
+  Debian 11, Fedora 32, RHEL 9 and later) and use the distribution's own
+  Vulkan/GL loader and drivers.
 - **Windows and macOS:** no extra setup.
 
 Run `sorrel gpu-check` to see every adapter, which one the GUI prefers, and

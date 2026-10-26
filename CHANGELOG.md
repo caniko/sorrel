@@ -46,6 +46,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   validation builds a compute pipeline on every device, which NVIDIA's GL 3.3
   EGL context cannot run. Sorrel issues no indirect calls, so it is off for
   every Sorrel wgpu instance (`WGPU_VALIDATION_INDIRECT_CALL=1` restores it).
+- **The Linux tarballs and the AppImage use the host's GPU drivers.** They
+  used to ship a Nix-built binary (glibc 2.44, `/nix/store` loader) that
+  either did not start on Ubuntu or Fedora or found no GPU. They are now
+  built with cargo-zigbuild against glibc 2.31 and load the host's
+  Vulkan/GL libraries, and with them its Mesa or NVIDIA driver. The
+  AppImage wraps that binary instead of a Nix closure.
 
 ### Added (automatic curation)
 

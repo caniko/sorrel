@@ -200,12 +200,13 @@
         };
       };
 
-      sorrelAppImage = harbor-rs.lib.mkAppImage {
-        inherit system nix-appimage;
-        pname = "sorrel";
+      # glibc-2.31 binaries for the Linux tarballs and the AppImage.
+      portable = import ./nix/portable.nix {
+        inherit pkgs craneLib src;
         version = sorrelVersion;
-        program = "${sorrel}/bin/sorrel";
+        appimageRuntime = nix-appimage.packages.${system}.appimage-runtimes.appimage-type2-runtime;
       };
+      sorrelAppImage = portable.sorrel-appimage;
 
       releaseSmoke = pkgs.writeShellApplication {
         name = "sorrel-release-smoke";
@@ -231,7 +232,7 @@
         }
         // crossSorrelPackages
         // pkgs.lib.optionalAttrs (sorrelHdf5 != null) {inherit sorrelHdf5;}
-        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {sorrel-appimage = sorrelAppImage;}
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux portable
         // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           release-bundle = import ./nix/release.nix {
             inherit pkgs harbor-rs;
