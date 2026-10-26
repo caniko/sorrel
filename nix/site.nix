@@ -4,7 +4,7 @@
 }: let
   website = pkgs.stdenv.mkDerivation {
     pname = "sorrel-website";
-    version = "0.1.0";
+    version = "0.2.0";
     src = pkgs.lib.fileset.toSource {
       inherit root;
       fileset = pkgs.lib.fileset.maybeMissing (root + "/website");
@@ -23,7 +23,7 @@
 
   docs = pkgs.stdenv.mkDerivation {
     pname = "sorrel-docs";
-    version = "0.1.0";
+    version = "0.2.0";
     src = pkgs.lib.fileset.toSource {
       inherit root;
       fileset = pkgs.lib.fileset.maybeMissing (root + "/docs");

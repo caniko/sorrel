@@ -10,7 +10,7 @@
     inherit src buildInputs nativeBuildInputs;
     strictDeps = true;
     pname = "sorrel";
-    version = "0.1.0";
+    version = "0.2.0";
   };
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
