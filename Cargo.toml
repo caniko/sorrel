@@ -59,12 +59,14 @@ flate2 = "1"
 wgpu = "29.0.3"
 egui = "0.34.2"
 eframe = { version = "0.34.2", default-features = false, features = [
+  "accesskit",
   "default_fonts",
   "wgpu",
 ] }
 egui_extras = "0.34.2"
 egui-wgpu = "0.34.2"
 egui_tiles = "0.15"
+egui_kittest = { version = "0.34.2", features = ["eframe", "wgpu", "snapshot"] }
 tempfile = "3"
 rayon = "1"
 pollster = "0.3"

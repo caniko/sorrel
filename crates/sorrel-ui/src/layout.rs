@@ -144,6 +144,17 @@ pub fn missing_panes(tree: &Tree<Pane>) -> Vec<Pane> {
         .collect()
 }
 
+/// The active child of every tab group.
+pub fn active_tabs(tree: &Tree<Pane>) -> Vec<TileId> {
+    tree.tiles
+        .tiles()
+        .filter_map(|t| match t {
+            Tile::Container(Container::Tabs(tabs)) => tabs.active,
+            _ => None,
+        })
+        .collect()
+}
+
 fn is_tabs(tiles: &Tiles<Pane>, id: TileId) -> bool {
     matches!(tiles.get(id), Some(Tile::Container(Container::Tabs(_))))
 }
@@ -244,6 +255,8 @@ pub struct ViewBehavior<'a, P: DataProvider> {
     pub trace: TraceControls<'a>,
     /// Panes currently closed, for the per-group "+" menu.
     pub closed: Vec<Pane>,
+    /// The visible tab of every tab group; only these show a close button.
+    pub active_tabs: Vec<TileId>,
     pub actions: Vec<ViewAction>,
 }
 
@@ -462,8 +475,28 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
         pane.title().into()
     }
 
-    fn is_tab_closable(&self, _tiles: &Tiles<Pane>, _tile_id: TileId) -> bool {
-        true
+    /// egui_tiles paints tab titles without widget info, so screen readers
+    /// (and AccessKit-driven tests) cannot find or switch panes. Name them.
+    fn on_tab_button(
+        &mut self,
+        tiles: &mut Tiles<Pane>,
+        tile_id: TileId,
+        response: egui::Response,
+    ) -> egui::Response {
+        if let Some(Tile::Pane(pane)) = tiles.get(tile_id) {
+            let title = pane.title();
+            response
+                .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, title));
+        }
+        response
+    }
+
+    /// Only the active tab shows its close button; a × on every tab cost
+    /// ~20 px each and pushed most titles behind the overflow arrows.
+    fn is_tab_closable(&self, _tiles: &Tiles<Pane>, tile_id: TileId) -> bool {
+        // egui_tiles detaches the tab group while drawing its bar, so the
+        // parent cannot be looked up here; `active_tabs` is taken up front.
+        self.active_tabs.contains(&tile_id)
     }
 
     fn simplification_options(&self) -> SimplificationOptions {

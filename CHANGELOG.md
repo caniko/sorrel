@@ -7,6 +7,33 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed (UI)
+
+- **Trace view shows spikes.** Gain followed the dtype's full scale (32768
+  for int16), so spikes of a few hundred counts drew as flat lines. The
+  window's largest excursion now spans one channel row.
+- **Views get more room.** The cluster panel no longer opens at ~40% of a
+  1280 px window: table columns size to their content and the filter strip
+  wraps. Only the active tab shows its close button, so most tab titles fit
+  without the overflow arrows.
+- Captions that were clipped now fit or wrap: Quality (its wide table
+  scrolls sideways), Features axis pickers, CCG and Waveforms.
+- **Contrast.** Weak text in dark mode, warnings in light mode and errors in
+  both now meet WCAG AA. A unit test pins the colours.
+- **Accessibility.** Screen readers are supported (eframe `accesskit`). Pane
+  tabs and the cluster filter now have accessible names.
+- The load-error screen names the dataset.
+
+### Added (testing)
+
+- `crates/sorrel-ui/tests/ui_states.rs` drives the real app headless with
+  egui_kittest. It renders 26 states (startup, selection, help, quit
+  confirmation, load error, a 40-unit dataset across eight panes; dark and
+  light) through wgpu and compares them with committed snapshots. The dev
+  shell pins Mesa's lavapipe (`SORREL_LAVAPIPE_ICD`), so GPU-less CI runners
+  render the same pixels as a workstation. Accept intended changes with
+  `UPDATE_SNAPSHOTS=1 cargo test -p sorrel-ui --test ui_states`.
+
 ### Fixed (data integrity)
 
 - Per-spike arrays stored as `(n, 1)` columns, as written by Kilosort 2 and

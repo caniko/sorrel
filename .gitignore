@@ -11,3 +11,7 @@ website/public/
 /.claude/
 /.nix-results/
 __pycache__/
+# egui_kittest failure artefacts next to committed snapshots
+*.diff.png
+*.new.png
+*.old.png

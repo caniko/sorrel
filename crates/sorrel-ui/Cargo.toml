@@ -31,4 +31,5 @@ rayon.workspace = true
 eframe = { workspace = true, features = ["wayland", "x11"] }
 
 [dev-dependencies]
+egui_kittest.workspace = true
 tempfile.workspace = true
