@@ -22,7 +22,7 @@
       entries.${binary} = "bin/${binary}";
     };
 
-  # `pip install sorrel` wheels: the `_native` extension plus the GUI binary.
+  # `pip install sorrel-ephys` wheels: the `_native` extension plus the GUI binary.
   # The tag covers both files: the portable binary needs glibc 2.31, the
   # extension (plain nixpkgs toolchain) 2.34, so 2.34 binds.
   # ponytail: build the extension with zigbuild too for manylinux_2_31

@@ -10,12 +10,13 @@ aarch64 with glibc 2.34 or newer, Windows x86_64, macOS arm64), for any
 Python from 3.8 on:
 
 ```sh
-pip install https://github.com/caniko/sorrel/releases/download/<VERSION>/sorrel-<VERSION>-cp38-abi3-<PLATFORM>.whl
+pip install sorrel-ephys
 ```
 
-The wheel holds the Rust extension, the Python wrapper and the `sorrel`
-GUI binary, which pip puts on the environment's PATH. PyPI publication
-(`pip install sorrel`) is pending.
+The distribution is `sorrel-ephys` (PyPI's `sorrel` is an unrelated
+project); the import is still `import sorrel`. The wheel holds the Rust
+extension, the Python wrapper and the `sorrel` GUI binary, which pip puts on
+the environment's PATH. Each GitHub release also attaches the wheels.
 
 ## Build from source
 

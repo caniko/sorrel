@@ -106,10 +106,13 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added (CLI and interchange)
 
-- **Python wheels** on every GitHub release: one `cp38-abi3` wheel per
+- **Python wheels on PyPI as `sorrel-ephys`** (`pip install sorrel-ephys`,
+  then `import sorrel`; PyPI's `sorrel` is an unrelated project), also
+  attached to every GitHub release: one `cp38-abi3` wheel per
   platform (manylinux_2_34 x86_64 / aarch64, win_amd64, macosx_11_0_arm64)
   with the `sorrel` Python API and the GUI binary, assembled by
-  `nix/wheel.nix` from the release cross builds. `sorrel.launch` also finds
+  `nix/wheel.nix` from the release cross builds and uploaded by the release
+  workflow with PyPI trusted publishing. `sorrel.launch` also finds
   the bundled binary when the kernel's PATH lacks the environment's
   scripts directory.
 - `sorrel gpu-check` lists every GPU adapter wgpu can see (vendor, backend,

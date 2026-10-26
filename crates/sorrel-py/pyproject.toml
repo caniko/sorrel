@@ -3,7 +3,7 @@ requires = ["maturin>=1.4,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "sorrel"
+name = "sorrel-ephys"
 version = "0.2.0"
 description = "Native curation GUI for SpikeInterface sortings"
 requires-python = ">=3.8"

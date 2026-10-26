@@ -38,10 +38,14 @@
     project.optional-dependencies)
     ++ [""]));
 
+  # PyPI `sorrel` belongs to another project; the distribution is
+  # `sorrel-ephys` (wheel names normalise `-` to `_`), the import stays `sorrel`.
+  dist = builtins.replaceStrings ["-"] ["_"] project.name;
+
   mkWheel = name: t: let
     tag = "cp38-abi3-${t.platform}";
-    file = "sorrel-${version}-${tag}.whl";
-    root = "sorrel-${version}";
+    file = "${dist}-${version}-${tag}.whl";
+    root = "${dist}-${version}";
   in
     pkgs.runCommand "sorrel-wheel-${name}-${version}" {
       nativeBuildInputs = [pkgs.python3Packages.wheel pkgs.patchelf];

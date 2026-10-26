@@ -28,13 +28,17 @@ cargo build --release -p sorrel --no-default-features
 
 ## Python
 
-Each GitHub release attaches a wheel per platform (Linux x86_64 / aarch64
-with glibc 2.34+, Windows x86_64, macOS arm64; Python 3.8+) holding the
-Python API and the GUI binary:
+Wheels for Linux x86_64 / aarch64 (glibc 2.34+), Windows x86_64 and macOS
+arm64 (Python 3.8+) hold the Python API and the GUI binary. They are on PyPI
+as `sorrel-ephys`, since PyPI's `sorrel` is an unrelated project. The import
+is still `import sorrel`:
 
 ```bash
-pip install https://github.com/caniko/sorrel/releases/download/<VERSION>/sorrel-<VERSION>-cp38-abi3-<PLATFORM>.whl
+pip install sorrel-ephys
 ```
+
+Each GitHub release attaches the same wheels
+(`sorrel_ephys-<VERSION>-cp38-abi3-<PLATFORM>.whl`).
 
 `nix build .#release-bundle.wheels.x86_64-linux` builds one locally
 (`aarch64-linux`, `windows`, `darwin-aarch64` likewise). See
