@@ -264,6 +264,55 @@ impl GpuTracePreproc {
     }
 }
 
+/// The trace window [`extract_snippet`] reads for a spike at `t`:
+/// `(start, len, margin)`, where the first `margin` samples only let the
+/// causal HP filter settle (~7 time constants of the Butterworth poles,
+/// 5.3 ms at 300 Hz) and are trimmed after preprocessing.
+pub fn snippet_window(
+    sample_rate: f32,
+    t: SampleIndex,
+    pre: u32,
+    post: u32,
+    cfg: TracePreproc,
+) -> (SampleIndex, u32, u32) {
+    let lo = t.0.saturating_sub(pre as u64);
+    let settle = cfg
+        .hp()
+        .map_or(0, |hz| (1.6 * sample_rate / hz.max(1.0)).ceil() as u64);
+    let margin = lo.min(settle) as u32;
+    (
+        SampleIndex(lo - margin as u64),
+        pre + post + 1 + margin,
+        margin,
+    )
+}
+
+/// One `pre + post + 1`-sample snippet around `t` (interleaved, centred
+/// f32), preprocessed like the trace view. `None` when the window runs off
+/// the recording or its bytes are not available yet.
+pub fn extract_snippet<P: DataProvider>(
+    provider: &P,
+    t: SampleIndex,
+    pre: u32,
+    post: u32,
+    cfg: TracePreproc,
+    shanks: &[u32],
+) -> Option<Vec<f32>> {
+    let nc = provider.n_channels() as usize;
+    let sr = provider.sample_rate();
+    let (start, len, margin) = snippet_window(sr, t, pre, post, cfg);
+    let slice = provider.trace(start, len);
+    if nc == 0 || slice.samples.len() != len as usize * nc {
+        return None;
+    }
+    let mut buf = slice.samples.to_f32_centred();
+    if !cfg.is_off() {
+        apply_preproc_cpu(&mut buf, nc, cfg, sr, shanks);
+    }
+    buf.drain(..margin as usize * nc);
+    Some(buf)
+}
+
 /// CMR (per shank when `shanks` is non-empty) then causal HP, in place.
 pub fn apply_preproc_cpu(
     buf: &mut [f32],
@@ -393,6 +442,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let j = Journal::open(&dir.path().join("j.sqlite")).unwrap();
         (Session::new(provider, j), dir)
+    }
+
+    #[test]
+    fn hp_snippet_drops_dc_offset_and_keeps_the_spike() {
+        // One channel, 1000-count DC offset, a -500 impulse at sample 1000.
+        let mut trace = vec![1000i16; 2000];
+        trace[1000] = 500;
+        let p = MockProvider {
+            spikes: vec![],
+            trace,
+            n_channels: 1,
+            sr: 30_000.0,
+        };
+        let raw = extract_snippet(&p, SampleIndex(1000), 30, 30, TracePreproc::Off, &[]).unwrap();
+        assert_eq!(raw.len(), 61);
+        assert_eq!(raw[30], 500.0);
+
+        let hp = TracePreproc::Hp(TracePreproc::HP_DEFAULT_HZ);
+        let snip = extract_snippet(&p, SampleIndex(1000), 30, 30, hp, &[]).unwrap();
+        assert_eq!(snip.len(), 61);
+        // The settling margin absorbed the DC step: the baseline is ~0.
+        assert!(
+            snip[..30].iter().all(|v| v.abs() < 2.0),
+            "{:?}",
+            &snip[..30]
+        );
+        assert!(snip[30] < -400.0, "spike lost: {}", snip[30]);
+
+        // Near the start there is no room for the margin; still a snippet.
+        let (start, len, margin) = snippet_window(30_000.0, SampleIndex(40), 30, 30, hp);
+        assert_eq!((start, len, margin), (SampleIndex(0), 71, 10));
+        assert!(extract_snippet(&p, SampleIndex(1990), 30, 30, hp, &[]).is_none());
     }
 
     #[test]

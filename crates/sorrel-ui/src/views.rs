@@ -14,6 +14,7 @@ use sorrel_data::{
     MergeCandidate, Session, SpikeDepths, SplitCandidate, SuggestConfig,
 };
 use sorrel_io::{ClusterId, DataProvider, Events, SampleIndex};
+use sorrel_render::{extract_snippet, snippet_window, TracePreproc};
 
 use crate::theme::{cluster_colour, selection_colour, Theme};
 
@@ -345,24 +346,30 @@ pub(crate) fn waveform_window_samples(sr: f32) -> u32 {
     (sr.max(1.0) * 0.001).round() as u32
 }
 
-/// Cached snippet extraction keyed on `(selection, pre, post)`. Spike
+/// Cached snippet extraction keyed on `(selection, pre, post, preproc)`.
+/// Snippets go through the trace pane's HP/CMR setting (see
+/// [`WaveformCache::set_preproc`]) so waveforms match the trace. Spike
 /// extraction walks the trace mmap N times per spike, which is fast in the
 /// steady state thanks to the page cache, but recomputing it every paint
 /// stalls the egui thread on cluster switches.
 #[derive(Debug, Default)]
 pub struct WaveformCache {
-    key: WaveformKey,
+    key: Option<WaveformKey>,
+    cfg: TracePreproc,
+    /// Shank id per channel for per-shank CMR (empty = global).
+    shanks: Vec<u32>,
     /// `[cluster][spike][sample_in_snippet * n_channels + channel]`
     snippets: Vec<Vec<Vec<f32>>>,
     /// `[cluster][channel][sample_in_snippet]`
     means: Vec<Vec<Vec<f32>>>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct WaveformKey {
     clusters: Vec<ClusterId>,
     pre: u32,
     post: u32,
+    cfg: TracePreproc,
     n_channels: u32,
     /// Curation version: merges/splits/undo change which spikes a cluster
     /// owns, so the snippets must be re-extracted.
@@ -372,6 +379,15 @@ struct WaveformKey {
 impl WaveformCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Preprocess snippets like the trace pane; re-extracts on change.
+    pub(crate) fn set_preproc(&mut self, cfg: TracePreproc, shanks: &[u32]) {
+        if self.shanks != shanks {
+            self.shanks = shanks.to_vec();
+            self.key = None;
+        }
+        self.cfg = cfg;
     }
 
     /// Peak channel (argmax of |mean|) of the cluster at `slot` in the
@@ -402,10 +418,11 @@ impl WaveformCache {
             clusters: selection.to_vec(),
             pre,
             post,
+            cfg: self.cfg,
             n_channels: session.provider.n_channels(),
             version: session.version(),
         };
-        if key == self.key {
+        if self.key.as_ref() == Some(&key) {
             return;
         }
         let snippet_len = (pre + post + 1) as usize;
@@ -416,7 +433,7 @@ impl WaveformCache {
         // Pick the snippet windows first and prefetch them in one call, so
         // a remote provider needs one round trip instead of one per spike
         // (a no-op for local, memory-mapped backends).
-        let starts: Vec<Vec<SampleIndex>> = selection
+        let spikes: Vec<Vec<SampleIndex>> = selection
             .iter()
             .map(|&c| {
                 let times = session.spike_times(c);
@@ -428,28 +445,29 @@ impl WaveformCache {
                     .iter()
                     .step_by(stride)
                     .take(MAX_SPIKES_PER_CLUSTER)
-                    .map(|&t| SampleIndex(t.0.saturating_sub(pre as u64)))
+                    .copied()
                     .collect()
             })
             .collect();
-        let windows: Vec<(SampleIndex, u32)> = starts
+        let sr = session.provider.sample_rate();
+        let windows: Vec<(SampleIndex, u32)> = spikes
             .iter()
             .flatten()
-            .map(|&s| (s, snippet_len as u32))
+            .map(|&t| {
+                let (start, len, _) = snippet_window(sr, t, pre, post, key.cfg);
+                (start, len)
+            })
             .collect();
         session.provider.prefetch(&windows);
 
         let mut snippets: Vec<Vec<Vec<f32>>> = Vec::with_capacity(selection.len());
-        for cluster_starts in &starts {
-            let mut bucket = Vec::new();
-            for &lo in cluster_starts {
-                let slice = session.provider.trace(lo, snippet_len as u32);
-                if slice.samples.len() != snippet_len * nc {
-                    continue;
-                }
-                let buf: Vec<f32> = slice.samples.to_f32_centred();
-                bucket.push(buf);
-            }
+        for cluster_spikes in &spikes {
+            let bucket = cluster_spikes
+                .iter()
+                .filter_map(|&t| {
+                    extract_snippet(&session.provider, t, pre, post, key.cfg, &self.shanks)
+                })
+                .collect();
             snippets.push(bucket);
         }
         // Bytes still in flight (remote guest): show what we have but keep
@@ -480,7 +498,7 @@ impl WaveformCache {
         }
 
         if !incomplete {
-            self.key = key;
+            self.key = Some(key);
         }
         self.snippets = snippets;
         self.means = means;

@@ -110,6 +110,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Changed (UI)
 
+- Waveforms and mean waveforms follow the Trace pane's HP/CMR toggles
+  (per shank when enabled) instead of always showing the raw recording;
+  each snippet is read with a filter-settling margin so the HP transient
+  never reaches it.
 - `J`/`K` and Shift-click follow the cluster table's visible order instead
   of raw ids; whole rows are clickable and the table scrolls to the
   keyboard selection.
