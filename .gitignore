@@ -7,3 +7,7 @@ result*
 .DS_Store
 docs/book/
 website/public/
+# Local agent state, canix build-result links and Python bytecode
+/.claude/
+/.nix-results/
+__pycache__/
