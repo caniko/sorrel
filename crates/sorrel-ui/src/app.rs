@@ -179,6 +179,8 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     show_help: bool,
     /// Last window title sent to the OS; only re-sent when it changes.
     last_title: String,
+    /// AA-contrast visuals go in on the first frame (no ctx before then).
+    visuals_installed: bool,
 }
 
 /// A staged action that needs explicit user approval before it runs.
@@ -273,6 +275,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             close_approved: false,
             show_help: false,
             last_title: String::new(),
+            visuals_installed: false,
         }
     }
 
@@ -1089,6 +1092,12 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     /// Loading / load-error screens. Returns `true` when the normal UI
     /// must not run this frame (the loader still owns the session).
     fn show_loading(&mut self, ctx: &egui::Context, root_ui: &mut egui::Ui) -> bool {
+        let name = self
+            .save_dir
+            .as_deref()
+            .and_then(Path::file_name)
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "the recording".into());
         if let Some(rx) = &self.loading {
             match rx.try_recv() {
                 Ok(Ok(())) => {
@@ -1105,12 +1114,6 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     self.load_error = Some("loader thread exited without a result".into());
                 }
                 Err(TryRecvError::Empty) => {
-                    let name = self
-                        .save_dir
-                        .as_deref()
-                        .and_then(Path::file_name)
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "recording".into());
                     egui::CentralPanel::default().show_inside(root_ui, |ui| {
                         ui.centered_and_justified(|ui| {
                             ui.vertical_centered(|ui| {
@@ -1130,7 +1133,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             egui::CentralPanel::default().show_inside(root_ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() * 0.3);
-                    ui.heading("Could not open the recording");
+                    ui.heading(format!("Could not open {name}"));
                     ui.colored_label(ui.visuals().error_fg_color, err);
                     ui.add_space(8.0);
                     if ui.button("Quit").clicked() {
@@ -1148,6 +1151,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
 impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root_ui.ctx().clone();
+        if !self.visuals_installed {
+            crate::theme::install_visuals(&ctx);
+            self.visuals_installed = true;
+        }
         if self.show_loading(&ctx, root_ui) {
             return;
         }
@@ -1253,6 +1260,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
             // side effects as actions, applied once the read lock is gone.
             let selected: Vec<ClusterId> = self.selection.iter().copied().collect();
             let closed = layout::missing_panes(&self.tree);
+            let active_tabs = layout::active_tabs(&self.tree);
             let jobs = JobCtx {
                 session: Arc::clone(&self.session),
                 egui: ctx.clone(),
@@ -1308,6 +1316,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                         per_shank: &mut self.per_shank_cmr,
                     },
                     closed,
+                    active_tabs,
                     actions: Vec::new(),
                 };
                 self.tree.ui(&mut behavior, ui);

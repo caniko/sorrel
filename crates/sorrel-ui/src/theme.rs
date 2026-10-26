@@ -35,6 +35,29 @@ pub fn cluster_colour(c: ClusterId) -> Color32 {
     PALETTE[c.idx() % PALETTE.len()]
 }
 
+/// egui's stock weak text (dark), warning (light) and error colours miss
+/// WCAG AA on its own backgrounds; `text_tokens_meet_wcag_aa_in_both_themes`
+/// pins the replacements.
+pub fn accessible_visuals(mut v: egui::Visuals) -> egui::Visuals {
+    if v.dark_mode {
+        v.weak_text_color = Some(Color32::from_gray(118));
+        v.error_fg_color = Color32::from_rgb(255, 85, 85);
+    } else {
+        v.warn_fg_color = Color32::from_rgb(175, 85, 0);
+        v.error_fg_color = Color32::from_rgb(200, 0, 0);
+    }
+    v
+}
+
+/// Install [`accessible_visuals`] for both themes.
+pub fn install_visuals(ctx: &egui::Context) {
+    ctx.set_visuals_of(egui::Theme::Dark, accessible_visuals(egui::Visuals::dark()));
+    ctx.set_visuals_of(
+        egui::Theme::Light,
+        accessible_visuals(egui::Visuals::light()),
+    );
+}
+
 /// Semantic colours resolved from the current `Visuals`, so plots follow
 /// the light/dark theme instead of always painting on near-black.
 #[derive(Clone, Copy, Debug)]
@@ -54,7 +77,10 @@ pub struct Theme {
 
 impl Theme {
     pub fn from_ui(ui: &Ui) -> Self {
-        let v = ui.visuals();
+        Self::from_visuals(ui.visuals())
+    }
+
+    pub fn from_visuals(v: &egui::Visuals) -> Self {
         Self {
             plot_bg: v.extreme_bg_color,
             panel: v.faint_bg_color,
@@ -137,5 +163,47 @@ mod tests {
         assert_eq!(t.quality_colour(0.9), Color32::GREEN);
         assert_eq!(t.label_colour("good"), Color32::GREEN);
         assert_eq!(t.label_colour("unsorted"), Color32::WHITE);
+    }
+
+    /// WCAG 2 contrast ratio between two opaque colours.
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let lum = |c: Color32| {
+            let ch = |v: u8| {
+                let v = v as f32 / 255.0;
+                if v <= 0.03928 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+        };
+        let (hi, lo) = (lum(a).max(lum(b)), lum(a).min(lum(b)));
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn text_tokens_meet_wcag_aa_in_both_themes() {
+        // Body and status text need 4.5:1; captions are secondary, 3:1.
+        let mut failures = Vec::new();
+        for v in [egui::Visuals::dark(), egui::Visuals::light()].map(accessible_visuals) {
+            let t = Theme::from_visuals(&v);
+            for (bg_name, bg) in [("plot_bg", t.plot_bg), ("panel_fill", v.panel_fill)] {
+                for (name, fg, min) in [
+                    ("text", t.text, 4.5),
+                    ("good", t.good, 4.5),
+                    ("warn", t.warn, 4.5),
+                    ("danger", t.danger, 4.5),
+                    ("caption", t.caption, 3.0),
+                ] {
+                    let r = contrast(fg, bg);
+                    if r < min {
+                        let mode = if t.dark { "dark" } else { "light" };
+                        failures.push(format!("{mode} {name} on {bg_name}: {r:.2} < {min}"));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

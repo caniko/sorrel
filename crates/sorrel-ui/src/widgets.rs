@@ -148,14 +148,15 @@ pub fn cluster_table<P, F>(
     state.ensure_quality(session);
     let theme = Theme::from_ui(ui);
 
-    // Filter strip above the table.
-    ui.horizontal(|ui| {
-        ui.label("filter:");
+    // Filter strip above the table; wraps so it never sets the panel width.
+    ui.horizontal_wrapped(|ui| {
+        let label = ui.label("filter:");
         ui.add(
             egui::TextEdit::singleline(&mut state.filter_text)
                 .desired_width(80.0)
                 .hint_text("id or tag"),
         )
+        .labelled_by(label.id)
         .on_hover_text("Cluster id, or part of a tag (e.g. merged, src:llm, bc:snr)");
         ui.checkbox(&mut state.hide_empty, "hide empty");
         ui.checkbox(&mut state.hide_noise, "hide noise");
@@ -306,13 +307,10 @@ pub fn cluster_table<P, F>(
         .striped(true)
         .resizable(true)
         .sense(Sense::click())
-        .column(Column::auto().at_least(56.0))
-        .column(Column::auto().at_least(64.0))
-        .column(Column::auto().at_least(56.0))
-        .column(Column::auto().at_least(56.0))
-        .column(Column::auto().at_least(56.0))
-        .column(Column::auto().at_least(64.0))
-        .column(Column::remainder().at_least(80.0));
+        // Content-sized columns: fixed minimums summed past 430 px and
+        // pushed the side panel to 40% of a laptop screen.
+        .columns(Column::auto(), 6)
+        .column(Column::remainder().at_least(40.0));
     if let Some(row) = scroll_to {
         table = table.scroll_to_row(row, None);
     }
@@ -465,6 +463,8 @@ pub struct TraceCache {
     /// `(window_start, window_len, target_points, hp bits, cmr, per-shank)`.
     key: Option<(u64, u32, usize, Option<u32>, bool, bool)>,
     verts: Arc<Vec<TraceVertex>>,
+    /// Largest |sample| in `verts`; sets the gain.
+    peak: f32,
     generation: u64,
 }
 
@@ -531,6 +531,7 @@ pub fn trace_view<P: DataProvider>(
                 shanks,
             ),
         };
+        cache.peak = verts.iter().fold(0.0, |m, v| m.max(v.pos[1].abs()));
         cache.verts = Arc::new(verts);
         cache.generation += 1;
         cache.key = (!fetching).then_some(key);
@@ -572,11 +573,12 @@ pub fn trace_view<P: DataProvider>(
         }
     }
 
-    // Amplitude scale: take 80% of a channel's row, normalised by full-scale.
-    // Full-scale comes from the provider so non-int16 dtypes don't get squashed.
+    // Gain: the window's largest excursion spans one row, so spikes of a
+    // few hundred counts stay visible (dtype full-scale flattened them).
+    // ponytail: per-window auto-gain rescales while panning; add a gain
+    // knob if users want it fixed.
     let row_clip_height = 2.0 / n_channels as f32;
-    let full_scale = session.provider.amplitude_full_scale().max(1.0);
-    let amp_scale = (row_clip_height * 0.4) / full_scale;
+    let amp_scale = row_clip_height * 0.5 / cache.peak.max(f32::EPSILON);
 
     let callback = TraceCallback {
         vertices: Arc::clone(&cache.verts),

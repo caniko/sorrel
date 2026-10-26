@@ -97,6 +97,10 @@ pub fn draw_axes(
             theme.caption,
         );
     }
+    // Views without a value axis (trace, raster) pass an empty y range.
+    if y.1 <= y.0 {
+        return;
+    }
     let yt = nice_ticks(y.0, y.1, ((rect.height() / 50.0) as usize).clamp(2, 6));
     let y_step = yt.windows(2).map(|w| w[1] - w[0]).next().unwrap_or(1.0);
     for (i, &v) in yt.iter().enumerate() {
@@ -726,7 +730,8 @@ fn draw_probe_layout(
     // Per-subplot box size: divide the panel into a grid sized to the
     // probe's aspect ratio while keeping each subplot at least 60×40px.
     let panel_w = rect.width() - 24.0;
-    let panel_h = rect.height() - 24.0;
+    // 12 px bottom margin, 20 px top so the caption clears the top label.
+    let panel_h = rect.height() - 32.0;
     // Sub-rect width/height proportional to the spacing between picked
     // channels — roughly half the smallest x-gap and y-gap.
     let mut min_dx = x_span;
@@ -899,8 +904,12 @@ pub fn correlogram_grid_view<P: DataProvider>(
     let cell_h = ((panel_h - 4.0) / n as f32).max(40.0);
 
     let total_h = cell_h * n as f32 + 8.0 + header_h;
-    let (rect, _resp) =
+    let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(avail.x.max(120.0), total_h), Sense::hover());
+    resp.on_hover_text(
+        "Diagonal: autocorrelograms. Off-diagonal: cross-correlograms. \
+         The shaded band is the 1 ms refractory period.",
+    );
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme.plot_bg);
 
@@ -909,7 +918,7 @@ pub fn correlogram_grid_view<P: DataProvider>(
         rect.left_top() + egui::vec2(6.0, 2.0),
         egui::Align2::LEFT_TOP,
         format!(
-            "ACG diag · CCG off-diag · ±{:.0} ms · 1 ms bins · refractory shaded",
+            "ACG/CCG · ±{:.0} ms · 1 ms bins",
             max_lag_samples as f32 / sr * 1000.0,
         ),
         egui::FontId::proportional(11.0),
@@ -1054,7 +1063,7 @@ pub fn feature_view<P: DataProvider>(
     }
 
     // Axis pickers. Bounds: PC < n_pcs, channel < n_chans.
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label("x:");
         ui.add(
             egui::DragValue::new(&mut state.pc_x)
@@ -2642,8 +2651,16 @@ pub fn quality_view<P: DataProvider>(
         return;
     };
     let has_features = session.has_pc_features();
+    // Caption first: below the table it wrapped at the table's width and
+    // was clipped by the pane.
+    ui.weak(
+        "Higher is better. Composite = geometric mean of all available sub-scores — \
+         one weak dimension drags it down. Hover any score for the raw metric.",
+    );
+    ui.add_space(4.0);
 
     use egui_extras::{Column, TableBuilder};
+    egui::ScrollArea::horizontal().show(ui, |ui| {
     let mut tb = TableBuilder::new(ui)
         .striped(true)
         .resizable(true)
@@ -2742,11 +2759,7 @@ pub fn quality_view<P: DataProvider>(
                 });
             }
         });
-    ui.add_space(4.0);
-    ui.weak(
-        "Higher is better. Composite = geometric mean of all available sub-scores — \
-         one weak dimension drags it down. Hover any score for the raw metric.",
-    );
+    });
 }
 
 // ---- DriftMapView (amp vs time scatter colour-coded by density) ---------
