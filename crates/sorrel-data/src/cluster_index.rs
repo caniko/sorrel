@@ -234,6 +234,13 @@ impl ClusterIndex {
         &self.spike_clusters
     }
 
+    /// Global per-spike sample indices, time-sorted; parallel to
+    /// [`Self::spike_clusters`].
+    #[inline]
+    pub fn all_spike_times(&self) -> &[SampleIndex] {
+        &self.spike_times
+    }
+
     #[inline]
     pub fn spike_times(&self, cluster: ClusterId) -> &[SampleIndex] {
         self.times_per_cluster

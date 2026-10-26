@@ -64,6 +64,46 @@ be applied on top of the npy a second time. Sorrel reads the file back
 on open when no `cluster_group.tsv` is present (phy dirs) and always for
 SortingAnalyzer folders, so labels made in SpikeInterface show up too.
 
+## Exporting a phy directory
+
+Saving updates the curation files in place. Exporting writes a complete
+phy template-gui directory somewhere else, from any backend, so phy,
+`spikeinterface.extractors.read_phy()` or a colleague without Sorrel can
+open the curated result:
+
+```bash
+sorrel export-phy <DATA_DIR> --out curated_phy/ [--copy-raw]
+phy template-gui curated_phy/params.py
+```
+
+The same export is available as the `export_phy` tool of `sorrel serve`,
+the **Export phy** button (it writes `<dataset>_phy` next to the dataset),
+and `Session.export_phy(out_dir, copy_raw=False)` in `sorrel-py`. It is the
+`phy-export` Cargo feature, on by default.
+
+What goes into the directory depends on the source:
+
+- **phy / Kilosort**: every `*.npy`, `*.tsv` and `*.csv` file is copied
+  byte for byte (templates, amplitudes, PC features, whitening, …), with
+  `spike_clusters.npy` and `cluster_group.tsv` rewritten from the curation.
+  Large non-phy files such as `temp_wh.dat` or `rez.mat` stay behind.
+- **SortingAnalyzer, NWB, `rez.mat`**: `spike_times.npy`,
+  `spike_clusters.npy`, `spike_templates.npy` (one template per cluster),
+  `templates.npy`, `channel_map.npy`, `channel_positions.npy` (and
+  `channel_shanks.npy` when known) and `cluster_group.tsv`. Templates are
+  mean waveforms of up to 500 spikes per cluster, 1 ms before to 2 ms after
+  each spike, from the raw trace with the per-channel mean removed (no
+  high-pass filter). There are no amplitudes, PC features or similarity
+  matrix, so phy falls back to its defaults for those views.
+
+`params.py` points at the original raw recording by absolute path. With
+`--copy-raw`, or for NWB, whose trace is held in memory, the trace is
+streamed into `recording.dat` in its native dtype instead, which also
+decompresses an mtscomp `.cbin`. `params.py` is written last, so an
+interrupted export never looks complete to phy. The export refuses to
+write into the source directory. The exported directory has no journal:
+opening it in Sorrel starts a fresh curation on top of the exported state.
+
 ## Headless QC export
 
 ```bash

@@ -1,5 +1,5 @@
 use crate::intent::{from_key_in_context, Intent};
-use crate::jobs::{read, write, JobCtx};
+use crate::jobs::{read, write, Job, JobCtx};
 use crate::layout::{self, Pane, TraceControls, ViewAction, ViewBehavior};
 use crate::prefs::UiPrefs;
 use crate::selection::SelectionSet;
@@ -98,6 +98,10 @@ fn toast(msg: impl Into<String>) -> Option<(String, Instant)> {
 /// [`SorrelApp::set_depth_source`]).
 pub type DepthFn<P> = fn(&Session<P>) -> Option<SpikeDepths>;
 
+/// Whole-dataset phy exporter the binary plugs in (see
+/// [`SorrelApp::set_phy_export`]); returns the directory it wrote.
+pub type PhyExportFn<P> = Arc<dyn Fn(&Session<P>) -> anyhow::Result<PathBuf> + Send + Sync>;
+
 /// Generic eframe app. The whole window is monomorphised against `P`.
 ///
 /// The session sits behind an `Arc<RwLock<_>>`: the UI thread takes short
@@ -158,6 +162,11 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     depth_fn: Option<DepthFn<P>>,
     /// Depths memoised per curation version, computed on a worker.
     depth_memo: crate::jobs::Memo<u64, Arc<Option<SpikeDepths>>>,
+    /// Phy exporter (see [`Self::set_phy_export`]); no button when unset.
+    phy_export: Option<PhyExportFn<P>>,
+    /// The running export. Not cancelled by curation: a command waits for
+    /// its read lock instead, so a long copy is never silently dropped.
+    phy_export_job: Option<Job<(), anyhow::Result<PathBuf>>>,
     /// GPU compute pipelines for trace CMR + HP filtering. `None` until the
     /// app is installed onto an eframe wgpu render state.
     gpu_preproc: Option<GpuTracePreproc>,
@@ -257,6 +266,8 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             psth_cache: Default::default(),
             depth_fn: None,
             depth_memo: Default::default(),
+            phy_export: None,
+            phy_export_job: None,
             gpu_preproc: None,
             pending_confirm: None,
             close_approved: false,
@@ -408,6 +419,11 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         self.events = Some(Arc::new(events));
     }
 
+    /// Enable the "Export phy" button; `f` runs on a worker thread.
+    pub fn set_phy_export(&mut self, f: PhyExportFn<P>) {
+        self.phy_export = Some(f);
+    }
+
     /// Supply probe geometry so the WaveformView can render in probe layout
     /// (top-N channels by amplitude positioned at their `(x, y)` coords).
     /// Length must equal `provider.n_channels()`; mismatched lengths are
@@ -437,7 +453,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     }
 
     fn jobs_pending(&self) -> bool {
-        self.suggest_cache.pending() || self.quality_cache.pending() || self.depth_memo.pending()
+        self.suggest_cache.pending()
+            || self.quality_cache.pending()
+            || self.depth_memo.pending()
+            || self.phy_export_job.is_some()
     }
 
     /// Dispatch a curation command and do the bookkeeping every mutation
@@ -850,6 +869,16 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 self.dispatch_intent(Intent::MergeSelection);
             }
 
+            if let Some(done) = self.phy_export_job.as_ref().and_then(Job::try_take) {
+                self.phy_export_job = None;
+                match done {
+                    Ok(dir) => {
+                        self.status = toast(format!("exported phy to {}", dir.display()));
+                        self.error = None;
+                    }
+                    Err(e) => self.error = Some(format!("phy export failed: {e:#}")),
+                }
+            }
             if let Some(err) = self.error.clone() {
                 ui.separator();
                 ui.colored_label(ui.visuals().error_fg_color, &err);
@@ -929,6 +958,28 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                                     "save target not configured (no kilosort directory)".into(),
                                 );
                             }
+                        }
+                    }
+                    if let Some(export) = self.phy_export.clone() {
+                        if ui
+                            .add_enabled(
+                                self.phy_export_job.is_none(),
+                                egui::Button::new("Export phy").small(),
+                            )
+                            .on_hover_text(
+                                "Write the curated data as a complete phy directory next to \
+                                 the dataset (<dataset>_phy); params.py points at the raw file.",
+                            )
+                            .on_disabled_hover_text("Export running…")
+                            .clicked()
+                        {
+                            let ctx = ui.ctx().clone();
+                            self.phy_export_job = Some(Job::spawn(
+                                (),
+                                Arc::clone(&self.session),
+                                move || ctx.request_repaint(),
+                                move |s: &Session<P>, _| export(s),
+                            ));
                         }
                     }
                     // Show the configured save target so users know where

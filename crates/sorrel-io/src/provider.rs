@@ -1,4 +1,5 @@
 use std::fmt::Debug;
+use std::path::{Path, PathBuf};
 
 #[repr(transparent)]
 #[derive(
@@ -334,6 +335,17 @@ impl<'a> TraceSamples<'a> {
         }
     }
 
+    /// The samples as native-endian bytes, as they sit in a raw `.dat`.
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::I16(s) => bytemuck::cast_slice(s),
+            Self::U16(s) => bytemuck::cast_slice(s),
+            Self::I32(s) => bytemuck::cast_slice(s),
+            Self::F32(s) => bytemuck::cast_slice(s),
+            Self::OwnedI16(v) => bytemuck::cast_slice(v),
+        }
+    }
+
     /// Zero samples of `dtype`. Use this instead of casting an empty byte
     /// slice: `bytemuck` rejects a 1-byte-aligned pointer for wider types.
     pub fn empty(dtype: TraceDtype) -> Self {
@@ -388,6 +400,16 @@ pub struct TraceSlice<'a> {
     pub start: SampleIndex,
     pub n_channels: u32,
     pub samples: TraceSamples<'a>,
+}
+
+/// A raw recording on disk, described the way phy's `params.py` does.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawFile {
+    pub path: PathBuf,
+    pub dtype: TraceDtype,
+    /// Header bytes before the first sample.
+    pub offset: u64,
+    pub hp_filtered: bool,
 }
 
 /// Static contract every backend implements. The `Label` associated type lets
@@ -465,6 +487,17 @@ pub trait DataProvider: Send + Sync + 'static {
     /// should repaint soon.
     fn pending_fetches(&self) -> usize {
         0
+    }
+
+    /// The file behind [`DataProvider::trace`], for exporters that point at it
+    /// instead of copying it. `None` when the samples live only in memory.
+    fn raw_file(&self) -> Option<RawFile> {
+        None
+    }
+
+    /// The phy/Kilosort directory this provider reads, if it reads one.
+    fn phy_dir(&self) -> Option<&Path> {
+        None
     }
 }
 

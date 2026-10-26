@@ -23,7 +23,9 @@ xxhash-rust.workspace = true
 log.workspace = true
 
 [features]
-default = []
+default = ["phy-export"]
+# Write a complete phy template-gui directory from any backend (`export_phy`).
+phy-export = []
 # Forwarded to sorrel-io: enables HDF5-backed NWB and KS4 rez.mat readers.
 hdf5 = ["sorrel-io/hdf5"]
 

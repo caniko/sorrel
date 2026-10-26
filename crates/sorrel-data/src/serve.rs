@@ -18,7 +18,7 @@ use crate::session::{ApplyPhyLabel, Session};
 use crate::suggest::{rank_merge_candidates, rank_split_candidates, SuggestConfig};
 use anyhow::Result;
 use serde_json::{json, Value};
-use sorrel_io::{ClusterId, DataProvider};
+use sorrel_io::{ClusterId, DataProvider, HasGeometry};
 use std::io::{BufRead, Write};
 use std::path::Path;
 
@@ -28,7 +28,7 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 /// Tool catalogue returned by `tools/list`.
 pub fn tool_list() -> Value {
     let cluster = json!({"type": "object", "properties": {"cluster": {"type": "integer"}}, "required": ["cluster"]});
-    json!([
+    let tools = json!([
         {"name": "list_clusters", "description": "Cluster ids with spike count, label and tags; optional label filter and tag-prefix filter (\"review:\" = the review queue)",
          "inputSchema": {"type": "object", "properties": {"label": {"type": "string"}, "tag": {"type": "string"}}}},
         {"name": "metrics", "description": "Quality metrics for one cluster (same columns as cluster_qc.tsv)",
@@ -49,7 +49,17 @@ pub fn tool_list() -> Value {
          "inputSchema": cluster},
         {"name": "undo", "description": "Undo the last curation command", "inputSchema": {"type": "object", "properties": {}}},
         {"name": "save", "description": "Write spike_clusters.npy, cluster_group.tsv and curation.json", "inputSchema": {"type": "object", "properties": {}}},
-    ])
+    ]);
+    #[cfg(feature = "phy-export")]
+    let tools = {
+        let mut tools = tools;
+        tools.as_array_mut().expect("array").push(json!(
+        {"name": "export_phy", "description": "Write the curated session as a complete phy directory at out (params.py references the raw file unless copy_raw)",
+         "inputSchema": {"type": "object", "properties": {"out": {"type": "string"}, "copy_raw": {"type": "boolean"}}, "required": ["out"]}}
+        ));
+        tools
+    };
+    tools
 }
 
 /// Serve until `input` closes. `reseal_on_save` follows the same rule as
@@ -63,7 +73,7 @@ pub fn serve<P, F>(
     mut output: impl Write,
 ) -> Result<()>
 where
-    P: DataProvider + ApplyPhyLabel,
+    P: DataProvider + ApplyPhyLabel + HasGeometry,
     F: Fn(&P::Label) -> &'static str + Sync,
 {
     let mut qc: Option<(u64, Vec<QcRow>)> = None;
@@ -162,7 +172,7 @@ fn call_tool<P, F>(
     args: &Value,
 ) -> Result<Value, ToolError>
 where
-    P: DataProvider + ApplyPhyLabel,
+    P: DataProvider + ApplyPhyLabel + HasGeometry,
     F: Fn(&P::Label) -> &'static str + Sync,
 {
     let text = |v: Value| json!([{"type": "text", "text": v.to_string()}]);
@@ -314,6 +324,19 @@ where
             }
             text(json!({"ok": true, "save_dir": save_dir.display().to_string()}))
         }
+        #[cfg(feature = "phy-export")]
+        "export_phy" => {
+            let out = args
+                .get("out")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolError::Failed("missing string argument \"out\"".into()))?;
+            let copy_raw = args
+                .get("copy_raw")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            crate::phy_export::export_phy(session, Path::new(out), copy_raw, label_str)?;
+            text(json!({"ok": true, "out": out}))
+        }
         _ => return Err(ToolError::Unknown),
     })
 }
@@ -336,6 +359,12 @@ mod tests {
     use crate::qc_export::tests::MockProvider;
     use sorrel_io::SampleIndex;
     use std::io::Cursor;
+
+    impl HasGeometry for MockProvider {
+        fn channel_positions(&self) -> &[[f32; 2]] {
+            &[]
+        }
+    }
 
     #[test]
     fn list_relabel_merge_and_save_through_the_rpc_loop() {
@@ -401,7 +430,10 @@ mod tests {
             .collect();
         assert_eq!(replies.len(), 10, "notification gets no reply");
         assert_eq!(replies[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
-        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 11);
+        assert_eq!(
+            replies[1]["result"]["tools"].as_array().unwrap().len(),
+            11 + usize::from(cfg!(feature = "phy-export"))
+        );
         assert_eq!(replies[2]["id"], 3);
         assert_eq!(replies[2]["result"]["isError"], false);
         assert_eq!(s.label(ClusterId(0)), Some(1));

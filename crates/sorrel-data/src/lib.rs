@@ -9,6 +9,8 @@ pub mod diff;
 pub mod feature_subspace;
 pub mod journal;
 pub mod open;
+#[cfg(feature = "phy-export")]
+pub mod phy_export;
 pub mod preview;
 pub mod qc_export;
 pub mod quality_ext;
@@ -33,6 +35,8 @@ pub use open::{
     journal_path, open_identity_sealed, open_journal, open_phy, open_sorting_analyzer, seed_phy,
     JournalOpts,
 };
+#[cfg(feature = "phy-export")]
+pub use phy_export::export_phy;
 pub use preview::{preview_merge, MergeDelta, MergePreview};
 pub use qc_export::{collect_qc_rows, export_qc, write_qc_json, write_qc_tsv, QcRow};
 pub use quality_ext::{cluster_quality, compute_isolation};

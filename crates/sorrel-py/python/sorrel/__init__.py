@@ -124,6 +124,13 @@ class Session:
         ``curation.json``; returns the directory."""
         return self._n.save()
 
+    def export_phy(self, out_dir: str | os.PathLike, *, copy_raw: bool = False) -> str:
+        """Write the curated session as a complete phy directory at
+        ``out_dir``; ``params.py`` points at the raw file unless ``copy_raw``.
+        Needs the native module built with the default ``phy-export``
+        feature. Returns the directory."""
+        return self._n.export_phy(os.fspath(out_dir), copy_raw)
+
 
 def read_curation(path: str | os.PathLike) -> dict[str, Any]:
     """Load ``curation.json`` from a dataset directory (or the file itself),
@@ -243,7 +250,8 @@ def export_phy(
 ) -> str:
     """Legacy escape hatch: dump a `SortingAnalyzer` via SpikeInterface's
     `export_to_phy` and (optionally) open it. Use only when you specifically
-    need the phy directory layout — `open_analyzer` is faster and lighter.
+    need the phy directory layout — `open_analyzer` is faster and lighter,
+    and `open_analyzer(path).export_phy(out)` writes phy natively.
     """
     try:
         from spikeinterface.exporters import export_to_phy

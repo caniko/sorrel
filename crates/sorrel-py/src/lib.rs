@@ -223,6 +223,15 @@ impl Session {
         }
         Ok(dir.display().to_string())
     }
+
+    /// Write the curated session as a complete phy directory at `out_dir`
+    /// (`params.py` points at the raw file unless `copy_raw`); returns it.
+    #[cfg(feature = "phy-export")]
+    #[pyo3(signature = (out_dir, copy_raw = false))]
+    fn export_phy(&self, out_dir: PathBuf, copy_raw: bool) -> PyResult<String> {
+        with_session!(self, s => sorrel_data::export_phy(s, &out_dir, copy_raw, label_str).map_err(err)?);
+        Ok(out_dir.display().to_string())
+    }
 }
 
 /// Validate that `path` is a phy directory we can read. Returns

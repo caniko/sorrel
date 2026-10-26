@@ -14,7 +14,7 @@ use crate::npy::{
 };
 use crate::params::PhyParams;
 use crate::provider::{
-    ChannelId, ClusterId, DataProvider, SampleIndex, TraceDtype, TraceSamples, TraceSlice,
+    ChannelId, ClusterId, DataProvider, RawFile, SampleIndex, TraceDtype, TraceSamples, TraceSlice,
 };
 use anyhow::{bail, Context, Result};
 use memmap2::Mmap;
@@ -54,7 +54,6 @@ impl PhyLabel {
 }
 
 pub struct KilosortProvider {
-    #[allow(dead_code)]
     root: PathBuf,
     sample_rate: f32,
     n_channels: u32,
@@ -114,6 +113,7 @@ pub struct KilosortProvider {
     cbin: Option<crate::cbin::CbinReader>,
     dat_path: PathBuf,
     dat_offset: u64,
+    hp_filtered: bool,
     trace_fetch: Option<std::sync::Arc<dyn crate::provider::TraceFetch>>,
 }
 
@@ -390,6 +390,7 @@ impl KilosortProvider {
             cbin,
             dat_path,
             dat_offset: offset,
+            hp_filtered: params.hp_filtered.unwrap_or(false),
             trace_fetch: overrides.trace_fetch,
         })
     }
@@ -503,6 +504,19 @@ impl DataProvider for KilosortProvider {
 
     fn amplitude_full_scale(&self) -> f32 {
         self.dtype.nominal_full_scale()
+    }
+
+    fn raw_file(&self) -> Option<RawFile> {
+        Some(RawFile {
+            path: self.dat_path.clone(),
+            dtype: self.dtype,
+            offset: self.dat_offset,
+            hp_filtered: self.hp_filtered,
+        })
+    }
+
+    fn phy_dir(&self) -> Option<&Path> {
+        Some(&self.root)
     }
 }
 

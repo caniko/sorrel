@@ -32,7 +32,9 @@ serde_json.workspace = true
 eframe = { workspace = true, features = ["wayland", "x11"] }
 
 [features]
-default = []
+default = ["phy-export"]
+# `sorrel export-phy`, the serve tool and the GUI button.
+phy-export = ["sorrel-data/phy-export"]
 hdf5 = ["sorrel-io/hdf5", "sorrel-data/hdf5"]
 
 [dev-dependencies]

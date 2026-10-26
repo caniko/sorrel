@@ -200,6 +200,21 @@ enum Cmd {
         #[arg(long, value_name = "DIR")]
         into: Option<PathBuf>,
     },
+    /// Write the curated data as a complete phy directory into --out: a
+    /// phy source is copied with its curation applied; other backends get
+    /// templates computed from the raw trace
+    #[cfg(feature = "phy-export")]
+    ExportPhy {
+        #[command(flatten)]
+        open: OpenArgs,
+        /// Output directory (created if missing; must not be the source)
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+        /// Copy the raw recording into DIR/recording.dat instead of pointing
+        /// params.py at the original
+        #[arg(long)]
+        copy_raw: bool,
+    },
     /// Remove <DATA_DIR>/.sorrel/cache/
     ClearCache {
         /// Dataset directory (or an .nwb / rez.mat file inside it)
@@ -764,6 +779,29 @@ impl SessionVisitor for Replay {
     }
 }
 
+#[cfg(feature = "phy-export")]
+struct ExportPhy {
+    out: PathBuf,
+    copy_raw: bool,
+}
+#[cfg(feature = "phy-export")]
+impl SessionVisitor for ExportPhy {
+    fn visit<P>(self, session: Session<P>, seed: Seed<P>, _: OpenCtx<P>) -> Result<()>
+    where
+        P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
+    {
+        let session = seeded(session, seed)?;
+        sorrel_data::export_phy(&session, &self.out, self.copy_raw, phy_label_str)
+            .with_context(|| format!("exporting phy to {}", self.out.display()))?;
+        println!(
+            "exported {} clusters as phy into {}",
+            session.n_clusters(),
+            self.out.display()
+        );
+        Ok(())
+    }
+}
+
 enum ApplySource {
     Rules(PathBuf),
     /// A curation.json import; `tag_splits` adds `review:split` tags from
@@ -1047,10 +1085,27 @@ fn run_app<P>(
     events: Option<Events>,
 ) -> Result<()>
 where
-    P: DataProvider<Label = PhyLabel> + ApplyPhyLabel,
+    P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
 {
     // Seeding and replay run on a worker behind the loading screen.
     let mut app = SorrelApp::with_loader(session, phy_label_str, seed);
+    #[cfg(feature = "phy-export")]
+    {
+        // A sibling of the dataset, so `share` (which syncs everything under
+        // it) never ships the export to guests.
+        let dir = ctx
+            .save_dir
+            .canonicalize()
+            .unwrap_or_else(|_| ctx.save_dir.clone());
+        let name = dir
+            .file_name()
+            .map_or("sorrel".into(), |n| n.to_string_lossy());
+        let out = dir.with_file_name(format!("{name}_phy"));
+        app.set_phy_export(std::sync::Arc::new(move |s: &Session<P>| {
+            sorrel_data::export_phy(s, &out, false, phy_label_str)?;
+            Ok(out.clone())
+        }));
+    }
     app.set_save_dir(ctx.save_dir, ctx.reseal_on_save);
     if let Some(events) = events {
         app.set_events(events);
@@ -1184,6 +1239,12 @@ fn main() -> Result<()> {
         Some(Cmd::Journal {
             action: JournalCmd::Replay { open, out },
         }) => with_session(&open, Replay(out)),
+        #[cfg(feature = "phy-export")]
+        Some(Cmd::ExportPhy {
+            open,
+            out,
+            copy_raw,
+        }) => with_session(&open, ExportPhy { out, copy_raw }),
         Some(Cmd::Share { open, port, relay }) => run_share(&open, port, relay),
         Some(Cmd::Join {
             code,
@@ -1265,6 +1326,17 @@ mod tests {
                 action: JournalCmd::Dump { json: true, .. }
             })
         ));
+
+        #[cfg(feature = "phy-export")]
+        {
+            let cli =
+                Cli::try_parse_from(["sorrel", "export-phy", "/x", "--out", "o", "--copy-raw"])
+                    .unwrap();
+            assert!(matches!(
+                cli.cmd,
+                Some(Cmd::ExportPhy { copy_raw: true, .. })
+            ));
+        }
 
         let cli = Cli::try_parse_from(["sorrel", "/x", "--events", "e.csv"]).unwrap();
         assert_eq!(cli.open.events, Some(PathBuf::from("e.csv")));

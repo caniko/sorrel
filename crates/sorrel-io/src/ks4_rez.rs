@@ -43,7 +43,8 @@ mod imp {
     use crate::extras::{HasGeometry, HasSpikeTemplates};
     use crate::kilosort::PhyLabel;
     use crate::provider::{
-        ChannelId, ClusterId, DataProvider, SampleIndex, TraceDtype, TraceSamples, TraceSlice,
+        ChannelId, ClusterId, DataProvider, RawFile, SampleIndex, TraceDtype, TraceSamples,
+        TraceSlice,
     };
     use anyhow::{anyhow, bail, Context, Result};
     use hdf5_metno as hdf5;
@@ -61,6 +62,7 @@ mod imp {
         initial_labels: Vec<PhyLabel>,
         channel_positions: Vec<[f32; 2]>,
         identity_bytes: Vec<u8>,
+        raw: Option<RawFile>,
         _trace_mmap: Option<Mmap>,
         trace_ptr: *const u8,
         trace_byte_len: usize,
@@ -166,10 +168,17 @@ mod imp {
                 .or_else(|| read_string_dataset(&ops, "fbinary").map(PathBuf::from))
                 .or_else(|| read_string_dataset(&ops, "fproc").map(PathBuf::from));
             let identity_bytes = provider_identity_bytes(path, dat_path.as_deref());
-            let (trace_mmap, trace_ptr, trace_byte_len, n_samples) = match dat_path {
-                Some(p) => map_dat(&p, n_channels)?,
+            let (trace_mmap, trace_ptr, trace_byte_len, n_samples) = match &dat_path {
+                Some(p) => map_dat(p, n_channels)?,
                 None => (None, std::ptr::null(), 0usize, SampleIndex::new(0)),
             };
+            // KS4 binaries are int16 with no header.
+            let raw = trace_mmap.as_ref().and(dat_path).map(|path| RawFile {
+                path,
+                dtype: TraceDtype::I16,
+                offset: 0,
+                hp_filtered: false,
+            });
 
             Ok(Self {
                 sample_rate,
@@ -180,6 +189,7 @@ mod imp {
                 initial_labels,
                 channel_positions,
                 identity_bytes,
+                raw,
                 _trace_mmap: trace_mmap,
                 trace_ptr,
                 trace_byte_len,
@@ -246,6 +256,10 @@ mod imp {
 
         fn amplitude_full_scale(&self) -> f32 {
             TraceDtype::I16.nominal_full_scale()
+        }
+
+        fn raw_file(&self) -> Option<RawFile> {
+            self.raw.clone()
         }
     }
 

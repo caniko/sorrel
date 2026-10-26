@@ -320,30 +320,38 @@ fn decode_f32(h: &NpyHeader, bytes: &[u8], n: usize) -> Result<Vec<f32>> {
 /// when `path`'s directory allows rename: writes to `<path>.tmp` first and
 /// renames on success.
 pub fn write_1d_u32_atomic(path: &Path, data: &[u32]) -> Result<()> {
-    let tmp = with_tmp_suffix(path);
-    write_npy_1d(&tmp, "<u4", data.len(), |f| {
-        for &v in data {
-            f.write_all(&v.to_le_bytes())?;
-        }
-        Ok(())
-    })?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
+    write_atomic(path, "<u4", &[data.len()], |f| {
+        data.iter().try_for_each(|v| f.write_all(&v.to_le_bytes()))
+    })
 }
 
 /// Write a 1-D `i32` array as an NPY 1.0 file, with `descr='<i4'`.
 pub fn write_1d_i32_atomic(path: &Path, data: &[i32]) -> Result<()> {
-    let tmp = with_tmp_suffix(path);
-    write_npy_1d(&tmp, "<i4", data.len(), |f| {
-        for &v in data {
-            f.write_all(&v.to_le_bytes())?;
-        }
-        Ok(())
-    })?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
+    write_atomic(path, "<i4", &[data.len()], |f| {
+        data.iter().try_for_each(|v| f.write_all(&v.to_le_bytes()))
+    })
+}
+
+/// Write a 1-D `u64` array as an NPY 1.0 file, with `descr='<u8'`.
+pub fn write_1d_u64_atomic(path: &Path, data: &[u64]) -> Result<()> {
+    write_atomic(path, "<u8", &[data.len()], |f| {
+        data.iter().try_for_each(|v| f.write_all(&v.to_le_bytes()))
+    })
+}
+
+/// Write a C-order `f32` array of any `shape` as an NPY 1.0 file, with
+/// `descr='<f4'`. `data.len()` must equal the product of `shape`.
+pub fn write_f32_atomic(path: &Path, shape: &[usize], data: &[f32]) -> Result<()> {
+    if shape.iter().product::<usize>() != data.len() {
+        bail!(
+            "{}: shape {shape:?} does not match {} elements",
+            path.display(),
+            data.len()
+        );
+    }
+    write_atomic(path, "<f4", shape, |f| {
+        data.iter().try_for_each(|v| f.write_all(&v.to_le_bytes()))
+    })
 }
 
 fn with_tmp_suffix(path: &Path) -> std::path::PathBuf {
@@ -352,15 +360,25 @@ fn with_tmp_suffix(path: &Path) -> std::path::PathBuf {
     p.into()
 }
 
-/// Shared driver for the 1-D writers above. Writes header + payload then
-/// fsync's so the rename in the caller is durable.
-fn write_npy_1d<F: FnOnce(&mut File) -> std::io::Result<()>>(
+/// Shared driver for the writers above: header + payload into
+/// `<path>.tmp`, fsync, then rename over `path`.
+fn write_atomic<F: FnOnce(&mut std::io::BufWriter<File>) -> std::io::Result<()>>(
     path: &Path,
     descr: &str,
-    n: usize,
+    shape: &[usize],
     write_payload: F,
 ) -> Result<()> {
-    let dict = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': ({n},), }}");
+    let shape = match shape {
+        [n] => format!("({n},)"),
+        dims => format!(
+            "({})",
+            dims.iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    let dict = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape}, }}");
     // NPY 1.0 prelude: \x93NUMPY (6) + version (2) + header_len (2) + dict + \n.
     // Pad the dict so the prelude is a multiple of 64 bytes, matching the
     // numpy convention (and what our reader's tests expect for parity).
@@ -372,14 +390,20 @@ fn write_npy_1d<F: FnOnce(&mut File) -> std::io::Result<()>>(
     let header_len =
         u16::try_from(header.len()).context("npy v1 header longer than u16::MAX — switch to v2")?;
 
-    let mut f = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let tmp = with_tmp_suffix(path);
+    let file = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+    let mut f = std::io::BufWriter::new(file);
     f.write_all(b"\x93NUMPY")?;
     f.write_all(&[1u8, 0u8])?;
     f.write_all(&header_len.to_le_bytes())?;
     f.write_all(&header)?;
     write_payload(&mut f)?;
-    f.sync_all()
-        .with_context(|| format!("fsync {}", path.display()))?;
+    f.into_inner()
+        .map_err(|e| e.into_error())?
+        .sync_all()
+        .with_context(|| format!("fsync {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
 

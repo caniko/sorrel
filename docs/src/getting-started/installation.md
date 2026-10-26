@@ -18,6 +18,14 @@ To enable the HDF5-backed readers (NWB, KS4 `rez.mat`):
 cargo build --release -p sorrel --features hdf5
 ```
 
+Full phy export (`sorrel export-phy`, the `export_phy` serve tool, the
+**Export phy** button and `Session.export_phy` in `sorrel-py`) is the
+`phy-export` feature, on by default. Leave it out with:
+
+```bash
+cargo build --release -p sorrel --no-default-features
+```
+
 ## With Nix
 
 ```bash

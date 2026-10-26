@@ -27,7 +27,7 @@ use crate::extras::{HasGeometry, HasQualityMetrics};
 use crate::kilosort::PhyLabel;
 use crate::npy::{read_1d_u32, read_header};
 use crate::provider::{
-    ChannelId, ClusterId, DataProvider, SampleIndex, TraceDtype, TraceSamples, TraceSlice,
+    ChannelId, ClusterId, DataProvider, RawFile, SampleIndex, TraceDtype, TraceSamples, TraceSlice,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use memmap2::Mmap;
@@ -50,6 +50,9 @@ pub struct SortingAnalyzerProvider {
 
     metrics: crate::extras::QualityMetrics,
     identity_bytes: Vec<u8>,
+
+    /// The mapped recording bin, for exporters.
+    raw: Option<RawFile>,
 
     _trace_mmap: Option<Mmap>,
     trace_ptr: *const u8,
@@ -126,6 +129,16 @@ impl SortingAnalyzerProvider {
         let (trace_mmap, trace_ptr, trace_byte_len, n_samples) =
             map_recording(root, &recording_meta)?;
         let identity_bytes = provider_identity_bytes(root, &recording_meta);
+        // `join` keeps an absolute `file_paths` entry as-is.
+        let raw = trace_mmap
+            .as_ref()
+            .and(recording_meta.file_paths.first())
+            .map(|p| RawFile {
+                path: root.join(p),
+                dtype: recording_meta.dtype,
+                offset: recording_meta.offset,
+                hp_filtered: false,
+            });
 
         Ok(Self {
             sample_rate: recording_meta.sample_rate,
@@ -139,6 +152,7 @@ impl SortingAnalyzerProvider {
             channel_map,
             metrics,
             identity_bytes,
+            raw,
             _trace_mmap: trace_mmap,
             trace_ptr,
             trace_byte_len,
@@ -605,6 +619,10 @@ impl DataProvider for SortingAnalyzerProvider {
 
     fn amplitude_full_scale(&self) -> f32 {
         self.dtype.nominal_full_scale()
+    }
+
+    fn raw_file(&self) -> Option<RawFile> {
+        self.raw.clone()
     }
 }
 

@@ -72,6 +72,14 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   relabel / merge / split / undo / save), `diff A.tsv B.tsv` (confusion
   table, Cohen's kappa, disagreements), `journal dump|replay`,
   `clear-cache`. `sorrel <DIR> [flags]` still opens the GUI.
+- **Full phy export** (Cargo feature `phy-export`, on by default):
+  `sorrel export-phy <DIR> --out OUT [--copy-raw]`, the `export_phy`
+  serve tool, an **Export phy** button and `Session.export_phy(out)` in
+  `sorrel-py` all write a complete phy template-gui directory from any
+  backend. A phy source is copied with its curation applied. SortingAnalyzer,
+  NWB and `rez.mat` sessions get mean templates computed from the raw trace.
+  `params.py` points at the raw file; `--copy-raw` (or an NWB source, whose
+  trace lives in memory) streams it into `recording.dat`.
 - Every save also writes SpikeInterface's `curation.json`
   (`format_version` 2) next to the phy files; labels (and, for
   SortingAnalyzer folders, pending merges and splits) round-trip through
@@ -116,6 +124,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added (UI)
 
+- **Export phy** button next to Export QC: writes the curated session as a
+  phy directory beside the dataset (`<dataset>_phy`) on a worker thread.
 - Dockable layout: every view is an `egui_tiles` tile that can be dragged,
   split, closed and reopened (`View` menu, `+` per tab bar, "Reset layout").
   The layout, table sort/filter, trace settings and last selection persist

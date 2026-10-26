@@ -41,6 +41,21 @@ where
     P: DataProvider,
     F: Fn(&P::Label) -> &'static str,
 {
+    write_phy_assignments(session, root, &label_str)?;
+    write_curation_json(session, &root.join("curation.json"), label_str)
+}
+
+/// Write `spike_clusters.npy` and `cluster_group.tsv` into `root`: the two
+/// files phy itself reads curation from.
+pub(crate) fn write_phy_assignments<P, F>(
+    session: &Session<P>,
+    root: &Path,
+    label_str: F,
+) -> Result<()>
+where
+    P: DataProvider,
+    F: Fn(&P::Label) -> &'static str,
+{
     let path = root.join("spike_clusters.npy");
     write_1d_u32_atomic(&path, &clusters_in_row_order(session.cluster_index()))
         .with_context(|| format!("write {}", path.display()))?;
@@ -69,8 +84,7 @@ where
     if any || tags_path.exists() {
         write_atomic(&tags_path, &tags_text)?;
     }
-
-    write_curation_json(session, &root.join("curation.json"), label_str)
+    Ok(())
 }
 
 fn write_atomic(path: &Path, text: &str) -> Result<()> {
