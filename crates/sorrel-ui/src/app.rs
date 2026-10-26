@@ -350,6 +350,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         device: std::sync::Arc<wgpu::Device>,
         queue: std::sync::Arc<wgpu::Queue>,
     ) {
+        if !sorrel_gpu::supports_compute(&device) {
+            log::info!("GPU adapter has no compute support; trace preprocessing stays on the CPU");
+            return;
+        }
         let ctx = GpuContext::from_existing(device, queue);
         self.gpu_preproc = Some(GpuTracePreproc::new(&ctx));
     }

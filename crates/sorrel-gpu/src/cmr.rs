@@ -107,6 +107,7 @@ impl GpuCmr {
         let queue = &self.ctx.queue;
 
         let byte_len = std::mem::size_of_val(samples) as u64;
+        crate::check_limits(device, byte_len, n_time).map_err(GpuCmrError::Limits)?;
         let storage = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sorrel-gpu.cmr.data"),
             size: byte_len,
@@ -177,6 +178,7 @@ impl GpuCmr {
 pub enum GpuCmrError {
     TooManyChannels(u32),
     ShapeMismatch,
+    Limits(String),
     Readback(String),
 }
 
@@ -187,6 +189,7 @@ impl std::fmt::Display for GpuCmrError {
                 write!(f, "GPU CMR limit is {MAX_CHANNELS} channels, got {n}")
             }
             Self::ShapeMismatch => write!(f, "samples length not a multiple of n_channels"),
+            Self::Limits(e) => write!(f, "{e}"),
             Self::Readback(e) => write!(f, "readback failed: {e}"),
         }
     }
@@ -257,6 +260,16 @@ mod tests {
         let mut buf = vec![0.0f32; 1024];
         let r = cmr.run(&mut buf, 1024);
         assert!(matches!(r, Err(GpuCmrError::TooManyChannels(1024))));
+    }
+
+    #[test]
+    fn long_window_errors_instead_of_panicking() {
+        let Some(ctx) = ctx() else { return };
+        let cmr = GpuCmr::new(&ctx);
+        // One workgroup per row: a 5 s window at 30 kHz exceeds the 65535 cap.
+        let mut buf = vec![0.0f32; 150_000];
+        let r = cmr.run(&mut buf, 1);
+        assert!(matches!(r, Err(GpuCmrError::Limits(_))), "{r:?}");
     }
 
     #[test]

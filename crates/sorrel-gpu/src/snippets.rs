@@ -113,6 +113,8 @@ impl GpuMeanSnippet {
 
         let in_bytes = std::mem::size_of_val(snippets) as u64;
         let out_bytes = (snippet_len as usize * std::mem::size_of::<f32>()) as u64;
+        crate::check_limits(device, in_bytes, snippet_len.div_ceil(64))
+            .map_err(GpuMeanSnippetError::Limits)?;
 
         let in_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sorrel-gpu.snippets.in"),
@@ -191,6 +193,7 @@ impl GpuMeanSnippet {
 #[derive(Debug)]
 pub enum GpuMeanSnippetError {
     ShapeMismatch,
+    Limits(String),
     Readback(String),
 }
 
@@ -198,6 +201,7 @@ impl std::fmt::Display for GpuMeanSnippetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ShapeMismatch => write!(f, "snippets length not a multiple of snippet_len"),
+            Self::Limits(e) => write!(f, "{e}"),
             Self::Readback(e) => write!(f, "readback failed: {e}"),
         }
     }

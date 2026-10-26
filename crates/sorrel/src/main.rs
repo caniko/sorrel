@@ -1120,8 +1120,13 @@ where
         app.set_depth_source(f);
     }
 
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
+        setup.instance_descriptor.flags = sorrel_gpu::instance_flags();
+    }
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]),
+        wgpu_options,
         ..Default::default()
     };
     eframe::run_native(

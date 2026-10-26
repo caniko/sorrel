@@ -112,6 +112,8 @@ impl GpuBiquad {
         let queue = &self.ctx.queue;
 
         let byte_len = std::mem::size_of_val(samples) as u64;
+        crate::check_limits(device, byte_len, n_channels.div_ceil(64))
+            .map_err(GpuBiquadError::Limits)?;
         let storage = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sorrel-gpu.biquad.data"),
             size: byte_len,
@@ -186,6 +188,7 @@ impl GpuBiquad {
 #[derive(Debug)]
 pub enum GpuBiquadError {
     ShapeMismatch,
+    Limits(String),
     Readback(String),
 }
 
@@ -193,6 +196,7 @@ impl std::fmt::Display for GpuBiquadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ShapeMismatch => write!(f, "samples length not a multiple of n_channels"),
+            Self::Limits(e) => write!(f, "{e}"),
             Self::Readback(e) => write!(f, "readback failed: {e}"),
         }
     }

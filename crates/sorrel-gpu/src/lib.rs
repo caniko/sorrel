@@ -45,6 +45,7 @@ impl GpuContext {
     async fn headless_async() -> Result<Self, GpuInitError> {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::PRIMARY;
+        descriptor.flags = instance_flags();
         let instance = wgpu::Instance::new(descriptor);
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -76,6 +77,51 @@ impl GpuContext {
     pub fn from_existing(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Self {
         Self { device, queue }
     }
+}
+
+/// wgpu's default instance flags without indirect-call validation, for every
+/// Sorrel instance (GUI included). That validation builds an internal compute
+/// pipeline on each device, which loses the device on GL contexts without
+/// compute (NVIDIA's EGL reports GL 3.3). Sorrel issues no indirect calls.
+/// On D3D12 this zeroes `@builtin(num_workgroups)`, so shaders must not use
+/// it. `WGPU_VALIDATION_INDIRECT_CALL=1` turns it back on.
+pub fn instance_flags() -> wgpu::InstanceFlags {
+    wgpu::InstanceFlags::from_build_config()
+        .difference(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL)
+        .with_env()
+}
+
+/// Whether `device` can run every kernel in this crate. False on eframe's GL
+/// fallback, which requests WebGL2 limits (no compute, no storage buffers);
+/// callers then keep preprocessing on the CPU.
+pub fn supports_compute(device: &wgpu::Device) -> bool {
+    let l = device.limits();
+    l.max_compute_invocations_per_workgroup >= 256
+        && l.max_compute_workgroup_size_x >= 256
+        && l.max_storage_buffers_per_shader_stage >= 2
+}
+
+/// Reject a dispatch the device would fail validation on (wgpu panics on
+/// uncaptured validation errors), so the caller falls back to the CPU.
+pub(crate) fn check_limits(
+    device: &wgpu::Device,
+    bytes: u64,
+    workgroups: u32,
+) -> Result<(), String> {
+    let l = device.limits();
+    let max_bytes = l.max_storage_buffer_binding_size.min(l.max_buffer_size);
+    if bytes > max_bytes {
+        return Err(format!(
+            "{bytes} B exceeds the {max_bytes} B storage buffer limit"
+        ));
+    }
+    if workgroups > l.max_compute_workgroups_per_dimension {
+        return Err(format!(
+            "{workgroups} workgroups exceed the {} per-dimension limit",
+            l.max_compute_workgroups_per_dimension
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -137,7 +183,14 @@ pub(crate) mod test_support {
 
     pub(crate) fn ctx() -> Option<TestGpuContext> {
         let guard = GPU_TEST_LOCK.lock().expect("GPU test lock poisoned");
-        match GPU_TEST_CONTEXT.get_or_init(|| GpuContext::headless().map_err(format_gpu_error)) {
+        match GPU_TEST_CONTEXT.get_or_init(|| {
+            GpuContext::headless()
+                .map_err(format_gpu_error)
+                .and_then(|ctx| match super::supports_compute(&ctx.device) {
+                    true => Ok(ctx),
+                    false => Err("adapter lacks compute support".into()),
+                })
+        }) {
             Ok(ctx) => Some(TestGpuContext { _guard: guard, ctx }),
             Err(e) => {
                 eprintln!("skipping GPU test: {e}");

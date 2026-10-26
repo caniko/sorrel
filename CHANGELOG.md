@@ -32,6 +32,21 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   `pc_features.npy` and the other per-spike arrays whenever the source was
   unsorted or had simultaneous spikes in different clusters.
 
+### Fixed (GPU)
+
+- **No more crashes on the OpenGL fallback.** When wgpu picks a GL adapter
+  (old Intel iGPUs, NVIDIA without a Vulkan driver, VMs, `WGPU_BACKEND=gl`),
+  eframe gets no compute support; trace CMR and high-pass now stay on the
+  CPU there instead of panicking on pipeline creation.
+- **Long trace windows no longer crash on any GPU.** Windows longer than
+  about 2 s at 30 kHz exceeded the 65,535-workgroup and 128 MiB
+  storage-buffer limits; the kernels now check device limits and the trace
+  falls back to the CPU.
+- **OpenGL on NVIDIA no longer loses the device.** wgpu's indirect-call
+  validation builds a compute pipeline on every device, which NVIDIA's GL 3.3
+  EGL context cannot run. Sorrel issues no indirect calls, so it is off for
+  every Sorrel wgpu instance (`WGPU_VALIDATION_INDIRECT_CALL=1` restores it).
+
 ### Added (automatic curation)
 
 - **`sorrel auto`**: Kilosort output in, curated session out. An embedded
