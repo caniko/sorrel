@@ -58,7 +58,7 @@ EXTENSIONS = [
     "quality_metrics",
 ]
 EXTENSION_PARAMS = {
-    "random_spikes": {"max_spikes_per_unit": 500},
+    "random_spikes": {"max_spikes_per_unit": 500, "seed": 0},  # reproducible reruns
     "waveforms": {"ms_before": 1.0, "ms_after": 2.0},
     "principal_components": {"n_components": 5, "mode": "by_channel_local"},
     "template_metrics": {"include_multi_channel_metrics": True},
@@ -154,7 +154,18 @@ def load(args):
     if chan_map_path.exists():
         chan_map = np.load(chan_map_path).ravel().astype(int)
         rec = rec.select_channels(rec.channel_ids[chan_map])
-    rec.set_dummy_probe_from_locations(np.load(data_dir / "channel_positions.npy"))
+    positions = np.load(data_dir / "channel_positions.npy").astype(float)
+    gaps = np.linalg.norm(positions[:, None] - positions[None], axis=-1)
+    geometry_ok = bool(np.min(gaps[gaps > 0], initial=np.inf) >= 5.0)
+    if not geometry_ok:
+        # Tetrode/index layouts: Bombcell and UnitRefine were built on real
+        # probe geometry (Neuropixels), so their spatial metrics mislead here.
+        log(
+            "WARNING: channels are < 5 um apart; channel_positions look like indices, "
+            "so spatial metrics (exp_decay, spread, velocity, drift) and the labels "
+            "built on them are unreliable for this recording; every unit gets review:geometry"
+        )
+    rec.set_dummy_probe_from_locations(positions)
     if not params.get("hp_filtered", False):
         rec = spre.highpass_filter(rec, freq_min=300.0)
     rec = spre.common_reference(rec, operator="median")
@@ -168,19 +179,21 @@ def load(args):
     clusters = np.load(clusters_path).ravel().astype(np.int64)
     sorting = sc.NumpySorting.from_samples_and_labels([times], [clusters], float(fs))
     sorting = scur.remove_excess_spikes(sorting, rec)
-    return rec, sorting, bool(gain)
+    return rec, sorting, bool(gain), geometry_ok
 
 
 def fingerprint(args) -> str:
-    """What the cached analyzer depends on: the spike->cluster assignment
-    (rewritten by every sorrel save) and the recording parameters."""
+    """What the cached analyzer depends on: the spike trains and their cluster
+    assignment (values, not bytes: a sorrel save rewrites the same ids as
+    uint32), the extension parameters and the recording options."""
     h = hashlib.sha256()
     data_dir = Path(args.data_dir)
-    for name in ("spike_clusters.npy", "spike_templates.npy", "spike_times.npy"):
-        p = data_dir / name
-        if p.exists():
-            h.update(p.read_bytes())
-            break
+    clusters = data_dir / "spike_clusters.npy"
+    if not clusters.exists():
+        clusters = data_dir / "spike_templates.npy"
+    for p in (data_dir / "spike_times.npy", clusters):
+        h.update(np.load(p).ravel().astype(np.int64).tobytes())
+    h.update(json.dumps(EXTENSION_PARAMS, sort_keys=True).encode())
     for key in ("dat", "sample_rate", "channels", "dtype", "offset", "spikeglx_meta", "gain_to_uv"):
         h.update(f"{key}={getattr(args, key)!r};".encode())
     return h.hexdigest()
@@ -349,18 +362,26 @@ def merge_evidence(analyzer, group, presets) -> dict:
 
 def bombcell_failures(row, thresholds: dict, section: str) -> list[str]:
     """The metrics of `section` ('noise' / 'mua') a unit fails, for `bc:*` tags.
-    Labels themselves come from SpikeInterface; this only explains them."""
+    Labels themselves come from SpikeInterface; this only explains them, with
+    its rules: inclusive bounds (`greater` is >=, `less` is <=), and NaN fails
+    every noise threshold but only the listed MUA metrics."""
+    from spikeinterface.curation import bombcell_curation
+
+    nan_fails = section == "noise" or None
+    listed = getattr(bombcell_curation, "_NAN_MEANS_FAIL_METRICS", ())
     failed = []
     for metric, spec in (thresholds.get(section) or {}).items():
         if not isinstance(spec, dict) or metric not in getattr(row, "index", []):
             continue
-        v = finite(row[metric])
-        if v is None:
+        v = float(row[metric])  # unrounded: some bounds are 0.0001 s
+        if not np.isfinite(v):
+            if nan_fails or metric in listed:
+                failed.append(metric)
             continue
         if spec.get("abs"):
             v = abs(v)
         lo, hi = spec.get("greater"), spec.get("less")
-        if (lo is not None and not v > lo) or (hi is not None and not v < hi):
+        if (lo is not None and v < lo) or (hi is not None and v > hi):
             failed.append(metric)
     return failed
 
@@ -546,12 +567,12 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    rec, sorting, in_uv = load(args)
+    rec, sorting, in_uv, geometry_ok = load(args)
     analyzer = build_analyzer(rec, sorting, out, fingerprint(args))
     original_ids = [int(u) for u in analyzer.unit_ids]
     labels: dict[int, str] = {}
     tags: dict[int, set] = {u: set() for u in original_ids}
-    evidence: dict = {"units": {}, "merges": [], "spikeinterface": spikeinterface.__version__, "amplitudes_in_uv": in_uv}
+    evidence: dict = {"units": {}, "merges": [], "spikeinterface": spikeinterface.__version__, "amplitudes_in_uv": in_uv, "geometry_ok": geometry_ok}
 
     # 1. Redundant units (near-duplicate spike trains): labelled noise, never deleted.
     kept = scur.remove_redundant_units(analyzer, remove_strategy="minimum_shift")
@@ -700,6 +721,8 @@ def main() -> None:
         for m in members.get(u, [u]):
             labels[m] = label
             tags[m] |= t
+            if not geometry_ok:
+                tags[m].add("review:geometry")
 
     all_tags = set().union(*tags.values()) | {"src:human", "src:sorrel"}
     doc = {

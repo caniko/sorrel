@@ -58,6 +58,14 @@ Bombcell's amplitude threshold is in µV. Pass `--gain-to-uv`
 Without one of them, amplitudes stay in ADC units and that one Bombcell
 rule is meaningless.
 
+Bombcell and UnitRefine were built on silicon probes with real geometry,
+mostly Neuropixels. If any two channels in `channel_positions.npy` are less
+than 5 µm apart, as with tetrode sorts that store channel indices instead of
+µm, the spatial metrics are meaningless. In that case every unit gets
+`review:geometry` and the run is only a starting point. On two such
+tetrode recordings, `sorrel auto` called 58 of 65 human-kept units noise,
+while never keeping a unit the human had marked noise.
+
 ## Tags
 
 | Tag                                                       | Meaning                                                                         |
@@ -76,6 +84,7 @@ rule is meaningless.
 | `review:disagree`, `review:low-conf`, `review:llm-unsure` | The label needs a person.                                                       |
 | `review:merge`                                            | The merge (applied or vetoed) needs a person.                                   |
 | `review:split`                                            | Sorrel's split ranking has a split proposal for this cluster.                   |
+| `review:geometry`                                         | Channel positions look like indices, not µm; every label needs checking.        |
 
 Tags are saved in `cluster_sorrel_tags.tsv`, which phy shows as an ordinary
 column, and in the `tags` category of `curation.json`. Any GUI edit to a

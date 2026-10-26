@@ -41,6 +41,8 @@ impl NpyHeader {
 pub enum NpyDtype {
     F32,
     F64,
+    /// Old SpikeInterface phy exports store `amplitudes.npy` as int16.
+    I16,
     I32,
     U32,
     I64,
@@ -55,6 +57,7 @@ impl NpyDtype {
         Ok(match s.trim() {
             "<f4" | "f4" | "<float32" | "float32" => Self::F32,
             "<f8" | "f8" | "<float64" | "float64" => Self::F64,
+            "<i2" | "i2" | "<i16" | "i16" => Self::I16,
             "<i4" | "i4" | "<i32" | "i32" => Self::I32,
             "<u4" | "u4" | "<u32" | "u32" => Self::U32,
             "<i8" | "i8" | "<i64" | "i64" => Self::I64,
@@ -65,6 +68,7 @@ impl NpyDtype {
 
     pub const fn size_bytes(self) -> usize {
         match self {
+            Self::I16 => 2,
             Self::F32 | Self::I32 | Self::U32 => 4,
             Self::F64 | Self::I64 | Self::U64 => 8,
         }
@@ -312,7 +316,23 @@ fn decode_f32(h: &NpyHeader, bytes: &[u8], n: usize) -> Result<Vec<f32>> {
         NpyDtype::F64 => decode_chunks(bytes, n, dtype, |c| {
             f64::from_le_bytes(c.try_into().unwrap()) as f32
         }),
-        d => bail!("unsupported float dtype {d:?}"),
+        // Integer arrays where floats are expected (int16 amplitudes, int64
+        // channel positions from older exporters) widen losslessly enough.
+        NpyDtype::I16 => decode_chunks(bytes, n, dtype, |c| {
+            i16::from_le_bytes(c.try_into().unwrap()) as f32
+        }),
+        NpyDtype::I32 => decode_chunks(bytes, n, dtype, |c| {
+            i32::from_le_bytes(c.try_into().unwrap()) as f32
+        }),
+        NpyDtype::U32 => decode_chunks(bytes, n, dtype, |c| {
+            u32::from_le_bytes(c.try_into().unwrap()) as f32
+        }),
+        NpyDtype::I64 => decode_chunks(bytes, n, dtype, |c| {
+            i64::from_le_bytes(c.try_into().unwrap()) as f32
+        }),
+        NpyDtype::U64 => decode_chunks(bytes, n, dtype, |c| {
+            u64::from_le_bytes(c.try_into().unwrap()) as f32
+        }),
     }
 }
 
@@ -494,6 +514,15 @@ mod tests {
             .collect();
         write_npy_v1(&p, "<u4", &[2, 2], &data);
         assert!(read_1d_u32(&p).is_err());
+
+        // Old SpikeInterface phy exports: int16 amplitudes as a column.
+        let data: Vec<u8> = [-5i16, 7].iter().flat_map(|v| v.to_le_bytes()).collect();
+        write_npy_v1(&p, "<i2", &[2, 1], &data);
+        assert_eq!(read_1d_f32(&p).unwrap(), vec![-5.0, 7.0]);
+        // ... and int64 channel positions.
+        let data: Vec<u8> = [16i64, -40].iter().flat_map(|v| v.to_le_bytes()).collect();
+        write_npy_v1(&p, "<i8", &[1, 2], &data);
+        assert_eq!(read_2d_f32(&p).unwrap(), (vec![16.0, -40.0], (1, 2)));
     }
 
     #[test]

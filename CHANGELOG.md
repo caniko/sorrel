@@ -7,6 +7,25 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+
+- Old SpikeInterface phy exports load. Their `amplitudes.npy` is int16 and
+  their `channel_positions.npy` int64. Integer arrays read where floats are
+  expected are now widened instead of rejected.
+- `sorrel auto` changes:
+  - **Geometry check.** On recordings whose channel positions look like
+    indices (< 5 µm apart, e.g. tetrode sorts), it warns and tags every
+    unit `review:geometry`. Bombcell's and UnitRefine's spatial metrics are
+    meaningless there. On two labelled tetrode recordings it called 58 of 65
+    human-kept units noise.
+  - **Reruns are reproducible.** The random spike sample is seeded, and the
+    analyzer cache is keyed on the extension parameters.
+  - **No full recompute after a save.** The cache key is now the spike-train
+    values rather than the file bytes.
+  - **`bc:*` reason tags follow SpikeInterface's rules.** Bounds are
+    inclusive and NaN metrics fail where Bombcell says they do. Previously
+    the tags could name a rule the unit had passed. Labels were unaffected.
+
 ### Fixed (UI)
 
 - **Trace view shows spikes.** Gain followed the dtype's full scale (32768
