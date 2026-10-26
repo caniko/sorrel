@@ -26,6 +26,7 @@ or a single file (`*.nwb`, `rez.mat`).
 | `journal replay <DATA_DIR> --out DIR`                                                   | Replay the journal and write `spike_clusters.npy`, `cluster_group.tsv`, `curation.json` into `DIR`.                                                                                                                              |
 | `export-phy <DATA_DIR> --out DIR [--copy-raw]`                                          | Write the curated data as a complete phy directory into `DIR`, from any backend; see [Exporting a phy directory](../usage/saving.md#exporting-a-phy-directory).                                                                  |
 | `clear-cache <DATA_DIR>`                                                                | Remove `<DATA_DIR>/.sorrel/cache/`.                                                                                                                                                                                              |
+| `gpu-check`                                                                             | List every GPU adapter and check the compute kernels against the CPU on each; see [GPU drivers](installation.md#gpu-drivers).                                                                                                    |
 
 Every subcommand that takes `<DATA_DIR>` accepts the open options below,
 opens the data through the same backend detection, and replays the same

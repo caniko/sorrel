@@ -245,10 +245,11 @@ mod tests {
         cpu_apply_per_channel(&mut cpu_in, nc, b);
         // IIR recursion drifts in f32 over thousands of steps even between
         // bit-identical formulations — different FMA fusion on GPU vs CPU is
-        // enough. Compare relative.
+        // enough. Compare against the signal peak (near zero crossings the
+        // per-sample error is ~1e-3 on llvmpipe).
+        let tol = 1e-4 * cpu_in.iter().fold(1.0f32, |m, v| m.max(v.abs()));
         for (i, (g, c)) in gpu_in.iter().zip(cpu_in.iter()).enumerate() {
-            let scale = g.abs().max(c.abs()).max(1.0);
-            assert!((g - c).abs() / scale < 1e-3, "i={i}: gpu={g} cpu={c}",);
+            assert!((g - c).abs() < tol, "i={i}: gpu={g} cpu={c} tol={tol}");
         }
     }
 

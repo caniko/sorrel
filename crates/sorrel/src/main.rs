@@ -221,6 +221,8 @@ enum Cmd {
         #[arg(value_name = "DATA_DIR")]
         root: PathBuf,
     },
+    /// List GPU adapters and check the compute kernels against the CPU on each
+    GpuCheck,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1063,6 +1065,13 @@ fn journal_dump(path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn gpu_check() -> Result<()> {
+    let (report, ok) = sorrel_gpu::self_check();
+    print!("{report}");
+    anyhow::ensure!(ok, "GPU check failed");
+    Ok(())
+}
+
 fn clear_cache(root: &Path) -> Result<()> {
     let dataset_dir = if root.is_file() {
         root.parent().unwrap_or_else(|| Path::new("."))
@@ -1258,6 +1267,7 @@ fn main() -> Result<()> {
             into,
         }) => run_join(&code, direct, relay, into),
         Some(Cmd::ClearCache { root }) => clear_cache(&root),
+        Some(Cmd::GpuCheck) => gpu_check(),
     }
 }
 

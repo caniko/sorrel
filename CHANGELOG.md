@@ -79,6 +79,11 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added (CLI and interchange)
 
+- `sorrel gpu-check` lists every GPU adapter wgpu can see (vendor, backend,
+  driver) and checks CMR, high-pass and mean-snippet kernels against the CPU
+  on each, exiting non-zero on a mismatch. Headless GPU contexts (tests,
+  this command) honour `WGPU_BACKEND`, `WGPU_ADAPTER_NAME` and
+  `WGPU_POWER_PREF`, like the GUI.
 - `clap` command line with subcommands: `qc`, `suggest [--json]`,
   `apply --rules FILE [--dry-run] [--save]` (QC-threshold auto-labels as
   one undoable batch), `report` (self-contained HTML with per-cluster

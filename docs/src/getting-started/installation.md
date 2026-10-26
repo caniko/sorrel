@@ -39,6 +39,32 @@ nix build .#sorrelHdf5    # with HDF5 features
 - `.#docs` — this mdBook documentation.
 - `.#site` — combined static site, with the docs mounted under `/docs/`.
 
+## GPU drivers
+
+Sorrel draws through wgpu, so it runs on Intel, AMD and NVIDIA GPUs alike.
+It uses Vulkan (Linux, Windows), DX12 (Windows) or Metal (macOS), and falls back to
+OpenGL. Trace CMR and high-pass filtering run on the GPU when the adapter
+supports compute shaders, and on the CPU otherwise.
+
+- **Linux, AMD and Intel:** Mesa (`radv` / `anv` Vulkan drivers; distro
+  packages `mesa-vulkan-drivers` and `libvulkan1` on Debian/Ubuntu).
+- **Linux, NVIDIA:** the proprietary driver with its Vulkan ICD. On nouveau,
+  use Mesa's NVK.
+- **NixOS:** `hardware.graphics.enable = true;`, plus
+  `services.xserver.videoDrivers = [ "nvidia" ];` for NVIDIA. A Nix-built
+  `sorrel` on another distribution needs
+  [nixGL](https://github.com/nix-community/nixGL) to find the host driver.
+- **Windows and macOS:** no extra setup.
+
+Run `sorrel gpu-check` to see every adapter, which one the GUI prefers, and
+whether the compute kernels match the CPU on each. The usual wgpu variables
+override the choice, for example on hybrid laptops:
+
+```bash
+WGPU_POWER_PREF=low sorrel ...   # integrated instead of discrete GPU
+WGPU_BACKEND=gl sorrel ...       # OpenGL if Vulkan misbehaves
+```
+
 ## Development Shell
 
 ```bash

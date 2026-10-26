@@ -19,10 +19,12 @@
 
 use std::sync::Arc;
 
+mod check;
 pub mod cmr;
 pub mod filter;
 pub mod snippets;
 
+pub use check::self_check;
 pub use cmr::GpuCmr;
 pub use filter::GpuBiquad;
 pub use snippets::GpuMeanSnippet;
@@ -42,24 +44,36 @@ impl GpuContext {
         pollster::block_on(Self::headless_async())
     }
 
+    /// Honours the same `WGPU_BACKEND`, `WGPU_ADAPTER_NAME` and
+    /// `WGPU_POWER_PREF` overrides eframe applies to the GUI.
     async fn headless_async() -> Result<Self, GpuInitError> {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::PRIMARY;
         descriptor.flags = instance_flags();
-        let instance = wgpu::Instance::new(descriptor);
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await
-            .map_err(|_| GpuInitError::NoAdapter)?;
+        let instance = wgpu::Instance::new(descriptor.with_env());
+        let adapter = match wgpu::util::initialize_adapter_from_env(&instance, None).await {
+            Ok(adapter) => adapter,
+            Err(_) => instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::from_env()
+                        .unwrap_or(wgpu::PowerPreference::HighPerformance),
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                })
+                .await
+                .map_err(|_| GpuInitError::NoAdapter)?,
+        };
+        Self::from_adapter(&adapter).await
+    }
+
+    /// Open a device on `adapter` with everything it supports, so
+    /// [`supports_compute`] reports the adapter's real capability.
+    pub async fn from_adapter(adapter: &wgpu::Adapter) -> Result<Self, GpuInitError> {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("sorrel-gpu.headless"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits: adapter.limits(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
