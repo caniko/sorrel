@@ -1,4 +1,4 @@
-use crate::{CacheError, CacheStore, store::sync_dir};
+use crate::{store::sync_dir, CacheError, CacheStore};
 use std::{
     collections::HashSet,
     fs,
