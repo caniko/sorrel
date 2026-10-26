@@ -8,8 +8,9 @@
 //!   semicolon separator is accepted as for the metrics CSV.
 //! - `events.npy`: 1-D `f64` (or `f32`) seconds, one unnamed label.
 //!
-//! NWB `/intervals/trials` is the natural third source and belongs in the
-//! `hdf5`-gated reader; it is not wired yet.
+//! An NWB file (`hdf5` feature) contributes `/intervals/trials/start_time`,
+//! labelled by the first of `trial_type`, `stimulus`, `condition` that is a
+//! string column. It is read by [`Events::read`] only, never auto-detected.
 
 use crate::npy::read_1d_f64;
 use crate::provider::SampleIndex;
@@ -76,6 +77,8 @@ impl Events {
                     .with_context(|| format!("read {}", path.display()))?;
                 Self::parse_csv(&text)?
             }
+            #[cfg(feature = "hdf5")]
+            "nwb" => Self::read_nwb_trials(path)?,
             other => bail!("{}: unsupported events file type {other:?}", path.display()),
         };
         // Keep (time, label) pairs together while sorting by time.
@@ -109,15 +112,48 @@ impl Events {
                 .and_then(|c| c.parse().ok())
                 .with_context(|| format!("events line {}: bad time {:?}", n + 2, line))?;
             let name = l_col.and_then(|c| cells.get(c)).copied().unwrap_or("event");
-            let idx = match ev.names.iter().position(|x| x == name) {
-                Some(i) => i,
-                None => {
-                    ev.names.push(name.to_string());
-                    ev.names.len() - 1
-                }
-            };
-            ev.times_s.push(t);
-            ev.label.push(idx as u16);
+            ev.push(t, name);
+        }
+        Ok(ev)
+    }
+
+    fn push(&mut self, t: f64, name: &str) {
+        let idx = match self.names.iter().position(|x| x == name) {
+            Some(i) => i,
+            None => {
+                self.names.push(name.to_string());
+                self.names.len() - 1
+            }
+        };
+        self.times_s.push(t);
+        self.label.push(idx as u16);
+    }
+
+    #[cfg(feature = "hdf5")]
+    fn read_nwb_trials(path: &Path) -> Result<Self> {
+        use hdf5_metno::types::{VarLenAscii, VarLenUnicode};
+        let f =
+            hdf5_metno::File::open(path).with_context(|| format!("open NWB {}", path.display()))?;
+        let g = f
+            .group("intervals/trials")
+            .with_context(|| format!("{}: no /intervals/trials table", path.display()))?;
+        let starts: Vec<f64> = g.dataset("start_time")?.read_raw()?;
+        let names: Option<Vec<String>> = ["trial_type", "stimulus", "condition"]
+            .iter()
+            .filter_map(|c| g.dataset(c).ok())
+            .find_map(|ds| {
+                ds.read_raw::<VarLenUnicode>()
+                    .map(|v| v.iter().map(|s| s.to_string()).collect())
+                    .or_else(|_| {
+                        ds.read_raw::<VarLenAscii>()
+                            .map(|v| v.iter().map(|s| s.to_string()).collect())
+                    })
+                    .ok()
+            })
+            .filter(|n: &Vec<String>| n.len() == starts.len());
+        let mut ev = Self::default();
+        for (i, &t) in starts.iter().enumerate() {
+            ev.push(t, names.as_ref().map_or("trial", |n| n[i].as_str()));
         }
         Ok(ev)
     }
@@ -148,5 +184,30 @@ mod tests {
         assert!(Events::detect(&dir.path().join("missing"))
             .unwrap()
             .is_none());
+    }
+
+    #[cfg(feature = "hdf5")]
+    #[test]
+    fn nwb_trials_with_trial_type() {
+        use hdf5_metno::types::VarLenUnicode;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.nwb");
+        {
+            let f = hdf5_metno::File::create(&p).unwrap();
+            let g = f.create_group("intervals/trials").unwrap();
+            g.new_dataset_builder()
+                .with_data(&[1.5f64, 0.5])
+                .create("start_time")
+                .unwrap();
+            let kinds: Vec<VarLenUnicode> = ["go", "nogo"].map(|s| s.parse().unwrap()).into();
+            g.new_dataset_builder()
+                .with_data(&kinds)
+                .create("trial_type")
+                .unwrap();
+        }
+        let ev = Events::read(&p).unwrap();
+        assert_eq!(ev.times_s, vec![0.5, 1.5]);
+        assert_eq!(ev.names, vec!["go", "nogo"]);
+        assert_eq!(ev.label, vec![1, 0]);
     }
 }

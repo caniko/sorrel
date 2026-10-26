@@ -401,6 +401,12 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         self.depth_memo.invalidate();
     }
 
+    /// Events for the PSTH pane, replacing any `events.csv|npy` that
+    /// [`Self::set_save_dir`] detected; call it after that.
+    pub fn set_events(&mut self, events: Events) {
+        self.events = Some(Arc::new(events));
+    }
+
     /// Supply probe geometry so the WaveformView can render in probe layout
     /// (top-N channels by amplitude positioned at their `(x, y)` coords).
     /// Length must equal `provider.n_channels()`; mismatched lengths are

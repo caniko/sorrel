@@ -104,7 +104,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Loading screen while a recording is seeded on a worker thread; Suggest
   ranking and quality metrics run in the background with spinners.
 - PSTH pane: event-aligned firing rate and per-trial raster from
-  `events.csv` / `events.npy`; the Drift pane plots spike depth over time
+  `events.csv` / `events.npy`, `--events FILE` or an NWB trials table
+  (`start_time`, labelled by `trial_type`); the Drift pane plots spike depth over time
   when the backend can estimate it; the Trace pane offers per-shank CMR on
   multi-shank probes.
 

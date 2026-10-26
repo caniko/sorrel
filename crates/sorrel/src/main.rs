@@ -18,7 +18,9 @@ use sorrel_data::{
 use sorrel_io::kilosort::{read_cluster_group_tsv, KilosortOpenParams, PhyLabel};
 use sorrel_io::open_ephys::OebinMeta;
 use sorrel_io::spikeglx::SpikeGlxMeta;
-use sorrel_io::{DataProvider, HasGeometry, KilosortProvider, SortingAnalyzerProvider, TraceDtype};
+use sorrel_io::{
+    DataProvider, Events, HasGeometry, KilosortProvider, SortingAnalyzerProvider, TraceDtype,
+};
 use sorrel_ui::{RasterPipeline, SorrelApp, TracePipeline};
 use std::path::{Path, PathBuf};
 
@@ -163,6 +165,8 @@ enum Cmd {
 }
 
 #[derive(Subcommand, Debug)]
+// Parsed once at startup; boxing OpenArgs would buy nothing.
+#[allow(clippy::large_enum_variant)]
 enum JournalCmd {
     /// Print every committed record, oldest first
     Dump {
@@ -222,6 +226,11 @@ struct OpenArgs {
     /// Populate sample-rate / channels / dat path from an Open Ephys structure.oebin
     #[arg(long, value_name = "PATH")]
     oebin: Option<PathBuf>,
+    /// Events for the PSTH pane: events.csv (time,label) or events.npy
+    /// (seconds), or an .nwb file for its trials table. Default:
+    /// <DATA_DIR>/events.csv|npy, else the opened NWB file's trials
+    #[arg(long, value_name = "FILE")]
+    events: Option<PathBuf>,
     /// Deprecated alias for `sorrel qc <DATA_DIR> --out DIR`
     #[arg(long, value_name = "DIR", hide = true)]
     export_qc: Option<PathBuf>,
@@ -590,7 +599,7 @@ fn run_join(
         shanks: Vec::new(),
         depth_source: Some(sorrel_data::spike_depths),
     };
-    run_app(joined.session, Box::new(|_| Ok(())), ctx)
+    run_app(joined.session, Box::new(|_| Ok(())), ctx, None)
 }
 
 /// Shared open path for single-file backends (`.nwb`, `rez.mat`): the
@@ -632,13 +641,13 @@ where
 
 // ---------------------------------------------------------------- commands
 
-struct Gui;
+struct Gui(Option<Events>);
 impl SessionVisitor for Gui {
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
-        run_app(session, seed, ctx)
+        run_app(session, seed, ctx, self.0)
     }
 }
 
@@ -840,13 +849,21 @@ fn clear_cache(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_app<P>(session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
+fn run_app<P>(
+    session: Session<P>,
+    seed: Seed<P>,
+    ctx: OpenCtx<P>,
+    events: Option<Events>,
+) -> Result<()>
 where
     P: DataProvider<Label = PhyLabel> + ApplyPhyLabel,
 {
     // Seeding and replay run on a worker behind the loading screen.
     let mut app = SorrelApp::with_loader(session, phy_label_str, seed);
     app.set_save_dir(ctx.save_dir, ctx.reseal_on_save);
+    if let Some(events) = events {
+        app.set_events(events);
+    }
     if !ctx.positions.is_empty() {
         app.set_channel_positions(ctx.positions);
     }
@@ -941,7 +958,26 @@ fn run_open(open: OpenArgs) -> Result<()> {
         log::warn!("--export-qc is deprecated; use `sorrel qc <DATA_DIR> --out DIR`");
         return with_session(&open, Qc(out));
     }
-    with_session(&open, Gui)
+    let events = match &open.events {
+        Some(p) => {
+            Some(Events::read(p).with_context(|| format!("reading events {}", p.display()))?)
+        }
+        // Sidecar events next to an NWB file win (the app detects them);
+        // otherwise its trials table, whose absence is normal.
+        None if open
+            .root()
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("nwb"))
+            && matches!(
+                Events::detect(open.root().parent().unwrap_or(Path::new("."))),
+                Ok(None)
+            ) =>
+        {
+            Events::read(open.root()).ok()
+        }
+        None => None,
+    };
+    with_session(&open, Gui(events))
 }
 
 #[cfg(test)]
@@ -982,6 +1018,9 @@ mod tests {
                 action: JournalCmd::Dump { json: true, .. }
             })
         ));
+
+        let cli = Cli::try_parse_from(["sorrel", "/x", "--events", "e.csv"]).unwrap();
+        assert_eq!(cli.open.events, Some(PathBuf::from("e.csv")));
 
         let cli = Cli::try_parse_from(["sorrel", "/x", "--export-qc", "out"]).unwrap();
         assert_eq!(cli.open.export_qc, Some(PathBuf::from("out")));

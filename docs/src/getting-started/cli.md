@@ -44,6 +44,7 @@ current curation.
 | `--discard-journal` | Delete the existing journal before opening (see [Saving](../usage/saving.md)).      |
 | `--spikeglx-meta P` | Populate sample-rate / channels / dtype from a SpikeGLX `.meta`.                    |
 | `--oebin PATH`      | Populate sample-rate / channels / dat path from an Open Ephys `structure.oebin`.    |
+| `--events FILE`     | PSTH events: `events.csv`, `events.npy`, or an `.nwb` trials table (GUI only).      |
 | `-h`, `--help`      | Print usage.                                                                        |
 
 When `params.py` is present, sample-rate, channels, dtype, offset, and
