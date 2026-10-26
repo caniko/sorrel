@@ -3,7 +3,7 @@
 //! Save semantics: the `.sorrel` journal is the running source of truth.
 //! `save_to_phy` is an *export* — it writes:
 //! - `spike_clusters.npy` — `uint32` array of length `n_spikes`, the
-//!   per-spike cluster assignment.
+//!   per-spike cluster assignment, in `spike_times.npy` row order.
 //! - `cluster_group.tsv` — one row per cluster with a non-default label.
 //!
 //! After a successful export, the journal is **resealed**: its baseline
@@ -15,6 +15,7 @@
 //! Both files are written atomically (write-then-rename) so a crash
 //! mid-save never leaves the directory half-written.
 
+use crate::cluster_index::ClusterIndex;
 use crate::curation_json::write_curation_json;
 use crate::journal::{baseline_hash, Journal};
 use crate::session::Session;
@@ -39,14 +40,8 @@ where
     P: DataProvider,
     F: Fn(&P::Label) -> &'static str,
 {
-    let spike_clusters: Vec<u32> = session
-        .cluster_index()
-        .spike_clusters()
-        .iter()
-        .map(|c| c.0)
-        .collect();
     let path = root.join("spike_clusters.npy");
-    write_1d_u32_atomic(&path, &spike_clusters)
+    write_1d_u32_atomic(&path, &clusters_in_row_order(session.cluster_index()))
         .with_context(|| format!("write {}", path.display()))?;
 
     let tsv_path = root.join("cluster_group.tsv");
@@ -63,6 +58,34 @@ where
         .with_context(|| format!("rename {} -> {}", tmp.display(), tsv_path.display()))?;
 
     write_curation_json(session, &root.join("curation.json"), label_str)
+}
+
+/// The per-spike cluster ids in the backend's original row order (the order
+/// of `spike_times.npy`, `amplitudes.npy`, `pc_features.npy`, ...), so the
+/// written file stays aligned with every other per-spike array. The index
+/// itself is time-sorted with ties broken by cluster id, which differs from
+/// the file order for unsorted inputs and for simultaneous spikes.
+///
+/// Falls back to time order when the row map is absent or not a
+/// permutation; only phy sessions carry one, and only phy directories have
+/// sibling arrays to stay aligned with.
+fn clusters_in_row_order(index: &ClusterIndex) -> Vec<u32> {
+    let clusters = index.spike_clusters();
+    let rows = index.spike_pc_indices();
+    let time_order = || clusters.iter().map(|c| c.0).collect::<Vec<u32>>();
+    if rows.len() != clusters.len() {
+        return time_order();
+    }
+    // Cluster ids never reach u32::MAX (split placeholders are resolved
+    // before they land in the index), so it marks an unfilled row.
+    let mut out = vec![u32::MAX; clusters.len()];
+    for (c, r) in clusters.iter().zip(rows) {
+        match r.get().and_then(|r| out.get_mut(r as usize)) {
+            Some(slot) if *slot == u32::MAX => *slot = c.0,
+            _ => return time_order(),
+        }
+    }
+    out
 }
 
 /// Save the curation state to phy artifacts AND reseal the journal at

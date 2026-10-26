@@ -34,10 +34,8 @@ fn label_str(l: &PhyLabel) -> &'static str {
 
 /// Lay down a phy fixture: 6 spikes, 3 clusters, params.py + a tiny .dat.
 ///
-/// Times are written in ascending order to match Kilosort's convention.
-/// `save_to_phy` writes `spike_clusters.npy` in the same on-disk row order
-/// as `spike_times.npy`, so the original order *must* equal the time-sorted
-/// order for round-trip correctness.
+/// Times are written in ascending order to match Kilosort's convention;
+/// `save_to_phy` keeps `spike_times.npy` row order either way.
 fn write_fixture(root: &Path) {
     // Time-sorted: 10, 30, 50, 100, 150, 200.
     // Original cluster assignment (unmerged): [0, 0, 1, 2, 0, 1]

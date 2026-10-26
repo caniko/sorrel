@@ -27,6 +27,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   `cluster_KSLabel.tsv` seeds labels when there is no `cluster_group.tsv`
   (and is no longer mistaken for a numeric metric); `--export-qc` works
   for every backend; the QC JSON key is `firing_rate` like the TSV.
+- `spike_clusters.npy` is saved in `spike_times.npy` row order. It used to be
+  written in time order, which misaligned it with `amplitudes.npy`,
+  `pc_features.npy` and the other per-spike arrays whenever the source was
+  unsorted or had simultaneous spikes in different clusters.
 
 ### Added (CLI and interchange)
 
