@@ -4,10 +4,11 @@
   inputs = {
     harbor-rs.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk";
 
+    # No nixpkgs/rust-overlay/crane follows: simit must keep its own locked
+    # toolchain so the dev shell hits the closure simit's trunk prebuild
+    # publishes to the canix Attic cache instead of compiling it.
     simit = {
       url = "git+https://github.com/caniko/simit.git?ref=trunk";
-      inputs.nixpkgs.follows = "nixpkgs";
-      inputs.rust-overlay.follows = "rust-overlay";
       inputs.flake-utils.follows = "flake-utils";
       inputs.plinth.follows = "plinth";
     };

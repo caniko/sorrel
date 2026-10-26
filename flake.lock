@@ -3092,12 +3092,16 @@
         "git-hooks": "git-hooks_9",
         "harbor": "harbor",
         "nixpkgs": [
+          "simit",
+          "harbor",
           "nixpkgs"
         ],
         "plinth": [
           "plinth"
         ],
         "rust-overlay": [
+          "simit",
+          "harbor",
           "rust-overlay"
         ],
         "treefmt-nix": "treefmt-nix_13"
