@@ -20,6 +20,17 @@ impl NpyHeader {
     pub fn elem_count(&self) -> usize {
         self.shape.iter().product()
     }
+
+    /// A vector in any of the shapes writers use for one: `(n,)`, or the
+    /// column `(n, 1)` Kilosort 2 and SpikeInterface's `export_to_phy` write
+    /// (or `(1, n)`). All three hold the same contiguous elements.
+    pub fn is_vector(&self) -> bool {
+        match self.shape.as_slice() {
+            [_] => true,
+            [r, c] => *r == 1 || *c == 1,
+            _ => false,
+        }
+    }
 }
 
 /// Numpy dtype tags we accept for the arrays Kilosort and SpikeInterface
@@ -213,7 +224,7 @@ fn payload<'a>(h: &NpyHeader, map: &'a memmap2::Mmap) -> &'a [u8] {
 pub fn read_1d_f32(path: &Path) -> Result<Vec<f32>> {
     let (h, map) = read_payload(path)?;
     let bytes = payload(&h, &map);
-    if h.shape.len() != 1 {
+    if !h.is_vector() {
         bail!("expected 1-D array, got shape {:?}", h.shape);
     }
     decode_f32(&h, bytes, h.elem_count())
@@ -224,7 +235,7 @@ pub fn read_1d_f32(path: &Path) -> Result<Vec<f32>> {
 pub fn read_1d_f64(path: &Path) -> Result<Vec<f64>> {
     let (h, map) = read_payload(path)?;
     let bytes = payload(&h, &map);
-    if h.shape.len() != 1 {
+    if !h.is_vector() {
         bail!("expected 1-D array, got shape {:?}", h.shape);
     }
     let n = h.elem_count();
@@ -283,7 +294,7 @@ pub fn read_2d_f32(path: &Path) -> Result<(Vec<f32>, (usize, usize))> {
 pub fn read_1d_u32(path: &Path) -> Result<Vec<u32>> {
     let (h, map) = read_payload(path)?;
     let bytes = payload(&h, &map);
-    if h.shape.len() != 1 {
+    if !h.is_vector() {
         bail!("expected 1-D array, got shape {:?}", h.shape);
     }
     decode_u32(&h, bytes, h.elem_count())
@@ -442,6 +453,23 @@ mod tests {
         let h = read_header(&p).unwrap();
         assert_eq!(h.shape, vec![2, 3]);
         assert_eq!(h.elem_count(), 6);
+    }
+
+    #[test]
+    fn column_vectors_read_as_1d_and_matrices_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("col.npy");
+        let data: Vec<u8> = [7u32, 8, 9].iter().flat_map(|v| v.to_le_bytes()).collect();
+        write_npy_v1(&p, "<u4", &[3, 1], &data);
+        assert_eq!(read_1d_u32(&p).unwrap(), vec![7, 8, 9]);
+        write_npy_v1(&p, "<u4", &[1, 3], &data);
+        assert_eq!(read_1d_u32(&p).unwrap(), vec![7, 8, 9]);
+        let data: Vec<u8> = [1u32, 2, 3, 4]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        write_npy_v1(&p, "<u4", &[2, 2], &data);
+        assert!(read_1d_u32(&p).is_err());
     }
 
     #[test]

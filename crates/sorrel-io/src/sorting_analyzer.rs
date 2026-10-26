@@ -476,7 +476,7 @@ fn read_int_le(bytes: &[u8], width: usize) -> Result<i64> {
 fn read_u64_any(path: &Path) -> Result<Vec<SampleIndex>> {
     use crate::npy::read_npy_u32_flat;
     let h = read_header(path)?;
-    if h.shape.len() != 1 {
+    if !h.is_vector() {
         bail!("{}: expected 1-D, got {:?}", path.display(), h.shape);
     }
     if h.dtype.contains("8") {

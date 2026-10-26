@@ -9,6 +9,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed (data integrity)
 
+- Per-spike arrays stored as `(n, 1)` columns, as written by Kilosort 2 and
+  SpikeInterface's `export_to_phy`, now load. They used to fail with
+  "expected 1-D array".
+
 - **Saving no longer corrupts the next session.** `Ctrl-S` on a phy /
   Kilosort directory now reseals the journal against the freshly written
   `spike_clusters.npy`, and the binary seals every journal against its
