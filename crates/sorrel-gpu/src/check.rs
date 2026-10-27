@@ -5,8 +5,10 @@ use crate::{supports_compute, GpuBiquad, GpuCmr, GpuContext, GpuMeanSnippet};
 use sorrel_compute::{mean_snippet, subtract_channel_median, Biquad, BiquadState};
 use std::fmt::Write;
 
-/// Human-readable report plus `true` when at least one adapter exists and no
-/// compute-capable adapter produced a wrong result.
+/// Human-readable report plus `true` unless an adapter produced a wrong result
+/// or no adapter exists. A kernel-creation failure ("kernels unavailable", e.g.
+/// a shader-compiler bug in one driver) is reported per adapter and only fails
+/// the check when no compute-capable adapter could run the kernels at all.
 pub fn self_check() -> (String, bool) {
     pollster::block_on(self_check_async())
 }
@@ -23,6 +25,7 @@ async fn self_check_async() -> (String, bool) {
         return (out, false);
     }
     let mut ok = true;
+    let (mut attempted, mut passed) = (0, 0);
     for adapter in &adapters {
         let i = adapter.get_info();
         let _ = writeln!(
@@ -63,13 +66,37 @@ async fn self_check_async() -> (String, bool) {
             out.push_str("  kernels: skipped (no compute support)\n");
             continue;
         }
-        match kernels(&ctx) {
-            Ok(()) => out.push_str("  kernels: PASS\n"),
+        attempted += 1;
+        let set = match (
+            GpuCmr::new(&ctx),
+            GpuBiquad::new(&ctx),
+            GpuMeanSnippet::new(&ctx),
+        ) {
+            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+            (a, b, c) => {
+                let e = a
+                    .err()
+                    .or(b.err())
+                    .or(c.err())
+                    .map_or_else(String::new, |e| e.to_string());
+                let _ = writeln!(out, "  kernels unavailable: {e}");
+                continue;
+            }
+        };
+        match kernels(set) {
+            Ok(()) => {
+                passed += 1;
+                out.push_str("  kernels: PASS\n");
+            }
             Err(e) => {
                 let _ = writeln!(out, "  kernels: FAIL ({e})");
                 ok = false;
             }
         }
+    }
+    if attempted > 0 && passed == 0 {
+        out.push_str("no adapter can run the compute kernels\n");
+        ok = false;
     }
     let pick = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
@@ -86,15 +113,14 @@ async fn self_check_async() -> (String, bool) {
     (out, ok)
 }
 
-fn kernels(ctx: &GpuContext) -> Result<(), String> {
+fn kernels((cmr, biquad, snippets): (GpuCmr, GpuBiquad, GpuMeanSnippet)) -> Result<(), String> {
     // CMR on a Neuropixels-sized row.
     let nc = 384usize;
     let mut gpu: Vec<f32> = (0..nc * 64)
         .map(|i| ((i * 37) % 8191) as f32 - 4000.0)
         .collect();
     let mut cpu = gpu.clone();
-    GpuCmr::new(ctx)
-        .run(&mut gpu, nc as u32)
+    cmr.run(&mut gpu, nc as u32)
         .map_err(|e| format!("CMR: {e}"))?;
     subtract_channel_median(&mut cpu, nc);
     compare("CMR", &gpu, &cpu, |g, c| (g - c).abs() < 1e-3)?;
@@ -106,7 +132,7 @@ fn kernels(ctx: &GpuContext) -> Result<(), String> {
         .map(|i| ((i as f32 * 0.013).sin() + (i as f32 * 0.057).cos()) * 100.0)
         .collect();
     let mut cpu = gpu.clone();
-    GpuBiquad::new(ctx)
+    biquad
         .run(&mut gpu, nc as u32, b)
         .map_err(|e| format!("biquad: {e}"))?;
     let mut states = vec![BiquadState::default(); nc];
@@ -129,7 +155,7 @@ fn kernels(ctx: &GpuContext) -> Result<(), String> {
                 .collect()
         })
         .collect();
-    let gpu = GpuMeanSnippet::new(ctx)
+    let gpu = snippets
         .run(&rows.concat(), len as u32)
         .map_err(|e| format!("mean snippet: {e}"))?;
     compare("mean snippet", &gpu, &mean_snippet(&rows), |g, c| {

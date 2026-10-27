@@ -5,7 +5,7 @@
 //! channel. State is kept in registers (not workgroup memory) so the
 //! filter is bit-identical to the single-channel CPU recursion.
 
-use crate::{block_on_map, GpuContext};
+use crate::{block_on_map, GpuContext, GpuInitError};
 use bytemuck::{Pod, Zeroable};
 use sorrel_compute::Biquad;
 use std::num::NonZeroU64;
@@ -35,62 +35,64 @@ pub struct GpuBiquad {
 }
 
 impl GpuBiquad {
-    pub fn new(ctx: &GpuContext) -> Self {
+    pub fn new(ctx: &GpuContext) -> Result<Self, GpuInitError> {
         let device = &ctx.device;
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("sorrel-gpu.biquad.shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-        });
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("sorrel-gpu.biquad.bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: NonZeroU64::new(PARAMS_SIZE),
+        crate::guarded(device, "biquad", || {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("sorrel-gpu.biquad.shader"),
+                source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            });
+            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("sorrel-gpu.biquad.bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: NonZeroU64::new(PARAMS_SIZE),
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("sorrel-gpu.biquad.layout"),
-            bind_group_layouts: &[Some(&bgl)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("sorrel-gpu.biquad.pipeline"),
-            layout: Some(&layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sorrel-gpu.biquad.params"),
-            size: PARAMS_SIZE,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        Self {
-            ctx: ctx.clone(),
-            pipeline,
-            bgl,
-            params_buf,
-        }
+                ],
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("sorrel-gpu.biquad.layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("sorrel-gpu.biquad.pipeline"),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sorrel-gpu.biquad.params"),
+                size: PARAMS_SIZE,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            Self {
+                ctx: ctx.clone(),
+                pipeline,
+                bgl,
+                params_buf,
+            }
+        })
     }
 
     /// Apply `biquad` in-place to `samples` (time-major, `n_channels` per row).
@@ -233,7 +235,7 @@ mod tests {
     #[test]
     fn matches_cpu_per_channel_high_pass() {
         let Some(ctx) = ctx() else { return };
-        let gpu = GpuBiquad::new(&ctx);
+        let gpu = GpuBiquad::new(&ctx).unwrap();
         let b = Biquad::butterworth_hp(300.0, 30_000.0);
         let nc = 8usize;
         let n = 2048usize;
@@ -256,7 +258,7 @@ mod tests {
     #[test]
     fn dc_is_attenuated() {
         let Some(ctx) = ctx() else { return };
-        let gpu = GpuBiquad::new(&ctx);
+        let gpu = GpuBiquad::new(&ctx).unwrap();
         let b = Biquad::butterworth_hp(300.0, 30_000.0);
         let nc = 4usize;
         let n = 4096usize;
@@ -272,7 +274,7 @@ mod tests {
     #[test]
     fn many_channels_run_in_parallel() {
         let Some(ctx) = ctx() else { return };
-        let gpu = GpuBiquad::new(&ctx);
+        let gpu = GpuBiquad::new(&ctx).unwrap();
         let b = Biquad::butterworth_hp(300.0, 30_000.0);
         let nc = 384usize;
         let n = 256usize;

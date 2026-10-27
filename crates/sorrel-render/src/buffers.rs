@@ -1,7 +1,7 @@
 use crate::vertex::{ScatterVertex, TraceVertex};
 use sorrel_compute::{lttb_downsample, subtract_channel_median_grouped, Biquad, BiquadState};
 use sorrel_data::Session;
-use sorrel_gpu::{GpuBiquad, GpuCmr, GpuContext};
+use sorrel_gpu::{GpuBiquad, GpuCmr, GpuContext, GpuInitError};
 use sorrel_io::{ClusterId, DataProvider, SampleIndex, TraceSamples};
 
 /// Optional pre-processing applied to the trace window before LTTB.
@@ -204,18 +204,19 @@ pub fn build_trace_vertices_gpu_shanked<P: DataProvider>(
 }
 
 /// Reusable GPU preprocessor for trace windows. Owns one CMR pipeline and
-/// one Biquad pipeline so we don't recompile shaders every frame.
+/// one Biquad pipeline so we don't recompile shaders every frame. `Err` when the
+/// backend rejects a kernel; the caller stays on the CPU path.
 pub struct GpuTracePreproc {
     cmr: GpuCmr,
     biquad: GpuBiquad,
 }
 
 impl GpuTracePreproc {
-    pub fn new(ctx: &GpuContext) -> Self {
-        Self {
-            cmr: GpuCmr::new(ctx),
-            biquad: GpuBiquad::new(ctx),
-        }
+    pub fn new(ctx: &GpuContext) -> Result<Self, GpuInitError> {
+        Ok(Self {
+            cmr: GpuCmr::new(ctx)?,
+            biquad: GpuBiquad::new(ctx)?,
+        })
     }
 
     /// Apply CMR + HP filter on the GPU. Returns `false` if any stage fails

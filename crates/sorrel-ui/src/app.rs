@@ -352,13 +352,24 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         &mut self,
         device: std::sync::Arc<wgpu::Device>,
         queue: std::sync::Arc<wgpu::Queue>,
+        adapter: &wgpu::AdapterInfo,
     ) {
+        // egui's pipelines exist by now (their failure stays fatal); from here a
+        // stray wgpu error is logged instead of killing the session.
+        sorrel_gpu::log_uncaptured_errors(&device);
         if !sorrel_gpu::supports_compute(&device) {
             log::info!("GPU adapter has no compute support; trace preprocessing stays on the CPU");
             return;
         }
         let ctx = GpuContext::from_existing(device, queue);
-        self.gpu_preproc = Some(GpuTracePreproc::new(&ctx));
+        match GpuTracePreproc::new(&ctx) {
+            Ok(p) => self.gpu_preproc = Some(p),
+            Err(e) => log::warn!(
+                "GPU kernels unavailable on {} ({:?}); trace preprocessing stays on the CPU: {e}",
+                adapter.name,
+                adapter.backend
+            ),
+        }
     }
 
     /// Configure where Cmd/Ctrl-S writes the curated state. The binary
