@@ -316,6 +316,16 @@
             version = sorrelVersion;
             packages = self.packages.${system};
           };
+          # What release/smoke-windows.ps1 runs on a windows runner: the release
+          # binary and the Windows wheel, from the release derivations.
+          sorrel-windows-smoke = let
+            wheel = self.packages.${system}.release-bundle.wheels.windows;
+          in
+            pkgs.runCommand "sorrel-windows-smoke-${sorrelVersion}" {} ''
+              mkdir -p $out
+              cp ${self.packages.${system}.sorrel-windows}/bin/sorrel.exe $out/
+              cp ${wheel}/${wheel.file} $out/
+            '';
         };
 
       checks =
