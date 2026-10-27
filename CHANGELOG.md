@@ -115,6 +115,11 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   workflow with PyPI trusted publishing. `sorrel.launch` also finds
   the bundled binary when the kernel's PATH lacks the environment's
   scripts directory.
+- **Windows packages on winget (`Caniko.Sorrel`) and Chocolatey
+  (`sorrel`).** The release workflow submits both from the release's
+  Windows zip on every stable tag. The repository now carries the
+  `LICENSE-MIT` and `LICENSE-APACHE` texts its `MIT OR Apache-2.0` license
+  names.
 - `sorrel gpu-check` lists every GPU adapter wgpu can see (vendor, backend,
   driver) and checks CMR, high-pass and mean-snippet kernels against the CPU
   on each, exiting non-zero on a mismatch. Headless GPU contexts (tests,

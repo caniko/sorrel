@@ -123,6 +123,27 @@
             ];
           };
         };
+        winget = {
+          package_id = "Caniko.Sorrel";
+          download_repo = "caniko/sorrel";
+          zip_archive = "sorrel-{version}-x86_64-windows.zip";
+          publisher = "Caniko";
+          license = "MIT OR Apache-2.0";
+          license_url = "https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT";
+          short_description = "Native GUI for curating spike-sorted electrophysiology data";
+        };
+        chocolatey = {
+          name = "sorrel";
+          download_repo = "caniko/sorrel";
+          description = "Native high-performance GUI for manual curation of spike-sorted electrophysiology data.";
+          project_url = "https://github.com/caniko/sorrel";
+          authors = "Can H. Tartanoglu";
+          license_url = "https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT";
+          archive_pattern = "sorrel-{version}-{arch}-windows.zip";
+          # chocolatey isn't in nixpkgs yet, and the dev shell no longer ships simit.
+          nix_tool = "github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=9ec9a5721eac983d93776419ac5e94cdfd5d2cfe";
+          api_key_secret = "CHOCOLATEY_API_KEY";
+        };
       };
     }
     // flake-utils.lib.eachSystem ["x86_64-linux" "aarch64-linux" "aarch64-darwin"] (system: let

@@ -6,6 +6,8 @@
 # - MINISIGN_SECRET_KEY, MINISIGN_PASSWORD: minisign signing of SHA256SUMS.txt.
 # - COSIGN_PRIVATE_KEY, COSIGN_PASSWORD: optional fallback when keyless Sigstore OIDC is unavailable.
 # - HARBOR_MACOS_SDK_NETRC: netrc for private Nix substituters.
+# - CHOCOLATEY_API_KEY: optional Chocolatey push API key (env CHOCOLATEY_API_KEY).
+# - WINGET_PAT: optional GitHub PAT for winget-pkgs PRs.
 # - ATTIC_TOKEN: repository secret for native prebuild Attic publication.
 
 name: release
@@ -277,6 +279,7 @@ jobs:
           add_matches '*.tar.gz'
           add_matches '*.zip'
           add_matches '*.AppImage'
+          add_matches '*.whl'
           : > SHA256SUMS.txt
           count=0
           while IFS= read -r file; do
@@ -366,6 +369,7 @@ jobs:
           add_matches 'release/*.tar.gz'
           add_matches 'release/*.zip'
           add_matches 'release/*.AppImage'
+          add_matches 'release/*.whl'
           while IFS= read -r file; do
             [ -f "$file" ] || continue
             name=$(basename "$file")
@@ -418,8 +422,163 @@ jobs:
           write_state apt not-configured '-'
           write_state aur not-configured '-'
           write_state copr not-configured '-'
-          write_state chocolatey not-configured '-'
+          CHOCO_FILTER="$(printf '%s' 'Id eq '\''sorrel'\'' and IsLatestVersion' | jq -sRr @uri)"
+          export CHOCO_FILTER
+          # Expand the filter in the child shell.
+          # shellcheck disable=SC2016
+          stable_or_state chocolatey 'sorrel' bash -c 'curl -fsSL "https://community.chocolatey.org/api/v2/Packages()?%24filter=${CHOCO_FILTER}" | grep -q "<entry>"'
           write_state homebrew not-configured '-'
           write_state scoop not-configured '-'
           write_state flathub not-configured '-'
-          write_state winget not-configured '-'
+          stable_or_state winget 'Caniko.Sorrel' curl -fsSL 'https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/c/Caniko/Sorrel'
+      - name: Publish winget manifest PR
+        env:
+          WINGET_PAT: ${{ secrets.WINGET_PAT }}
+        run: |
+          set -euo pipefail
+          . ./release-env
+          if [ "$IS_PRERELEASE" = "true" ]; then echo "Prerelease ${VERSION}; skipping winget manifest update."; exit 0; fi
+          if [ -f release-publisher-state.env ]; then . ./release-publisher-state.env; fi
+          publisher_missing() {
+            channel="$1"; message="$2"
+            var="PUBLISH_$(printf '%s' "$channel" | tr '[:lower:]-' '[:upper:]_')_STATE"
+            state="${!var:-inactive-soft}"
+            if [ "$state" = active-required ]; then echo "::error::${channel}: ${message}" >&2; exit 1; fi
+            echo "::warning::${channel}: ${message}; staged publisher is not active yet." >&2
+            exit 0
+          }
+          if [ -z "${WINGET_PAT:-}" ]; then publisher_missing winget 'WINGET_PAT unset'; fi
+          ZIP_NAME="sorrel-${VERSION}-x86_64-windows.zip"; ZIP_URL="https://github.com/caniko/sorrel/releases/download/${TAG}/${ZIP_NAME}"
+          test -s "release/${ZIP_NAME}" || publisher_missing winget "missing release/${ZIP_NAME}"
+          export ZIP_NAME ZIP_URL VERSION WINGET_PAT PUBLISH_WINGET_STATE
+          nix shell nixpkgs#curl nixpkgs#jq nixpkgs#unzip nixpkgs#wineWow64Packages.stable nixpkgs#util-linux -c bash <<'SCRIPT' || publisher_missing winget 'wingetcreate submission failed'
+          set -euo pipefail
+          tmpdir="$(mktemp -d)"; trap 'rm -rf "$tmpdir"' EXIT
+          export WINEPREFIX="$tmpdir/wine"; export WINEDEBUG=-all; export TERM=xterm
+          release_json="$(curl -fsSL https://api.github.com/repos/microsoft/winget-create/releases/latest)"
+          url="$(printf '%s' "$release_json" | jq -r '.assets[] | select(.name == "wingetcreate.exe") | .browser_download_url' | head -n 1)"
+          curl -fsSL -o "$tmpdir/wingetcreate.exe" "$url"
+          state="${PUBLISH_WINGET_STATE:-}"
+          if [ "$state" = active-required ]; then
+            wine "$tmpdir/wingetcreate.exe" update Caniko.Sorrel --version "$VERSION" --urls "${ZIP_URL}|x64" --token "$WINGET_PAT" --submit
+          else
+            # yaml(): double-quoted YAML scalar; f KEY VALUE writes one field.
+            yaml() { local s="${1//\\/\\\\}"; printf '"%s"' "${s//\"/\\\"}"; }
+            f() { printf '%s: %s\n' "$1" "$(yaml "$2")"; }
+            dir="$tmpdir/"'manifests/c/Caniko/Sorrel'"/$VERSION"; mkdir -p "$dir"
+            sha="$(sha256sum "release/${ZIP_NAME}" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')"
+            { f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'DefaultLocale: en-US'; echo 'ManifestType: version'; echo 'ManifestVersion: 1.10.0'; } > "$dir"/'Caniko.Sorrel'.yaml
+            { f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'InstallerType: zip'; echo 'NestedInstallerType: portable'; echo 'NestedInstallerFiles:'; printf '%s\n' "- RelativeFilePath: $(yaml 'sorrel.exe')" "  PortableCommandAlias: $(yaml 'sorrel')"; echo 'Installers:'; echo '- Architecture: x64'; printf '%s\n' "  InstallerUrl: $(yaml "$ZIP_URL")" "  InstallerSha256: $sha"; echo 'ManifestType: installer'; echo 'ManifestVersion: 1.10.0'; } > "$dir"/'Caniko.Sorrel'.installer.yaml
+            { f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'PackageLocale: en-US'; f Publisher 'Caniko'; f PackageName 'Sorrel'; f License 'MIT OR Apache-2.0'; f LicenseUrl 'https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT'; f ShortDescription 'Native GUI for curating spike-sorted electrophysiology data'; echo 'ManifestType: defaultLocale'; echo 'ManifestVersion: 1.10.0'; } > "$dir"/'Caniko.Sorrel'.locale.en-US.yaml
+            wine "$tmpdir/wingetcreate.exe" submit "$(winepath -w "$dir")" --token "$WINGET_PAT"
+          fi
+          SCRIPT
+      - name: Prepare Chocolatey package
+        id: chocolatey-source
+        run: |
+          set -euo pipefail
+          . ./release-env
+          if [ "$IS_PRERELEASE" = "true" ]; then echo "Prerelease ${VERSION}; skipping Chocolatey package preparation."; exit 0; fi
+          if [ -f release-publisher-state.env ]; then . ./release-publisher-state.env; fi
+          publisher_missing() {
+            channel="$1"; message="$2"
+            var="PUBLISH_$(printf '%s' "$channel" | tr '[:lower:]-' '[:upper:]_')_STATE"
+            state="${!var:-inactive-soft}"
+            if [ "$state" = active-required ]; then echo "::error::${channel}: ${message}" >&2; exit 1; fi
+            echo "::warning::${channel}: ${message}; staged publisher is not active yet." >&2
+            exit 0
+          }
+          ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=9ec9a5721eac983d93776419ac5e94cdfd5d2cfe -c simit dist chocolatey bump \
+            --version "$VERSION" \
+            --package-dir chocolatey-package \
+            --archive "x64=$ZIP" \
+            --choco-name 'sorrel' \
+            --choco-id 'sorrel' \
+            --choco-title 'sorrel' \
+            --choco-authors 'Can H. Tartanoglu' \
+            --choco-description 'Native high-performance GUI for manual curation of spike-sorted electrophysiology data.' \
+            --choco-project-url 'https://github.com/caniko/sorrel' \
+            --choco-license-url 'https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT' \
+            --choco-download-repo 'caniko/sorrel' \
+            --choco-archive-pattern 'sorrel-{version}-{arch}-windows.zip' \
+            --api-key-env CHOCOLATEY_API_KEY
+          printf 'prepared=true\n' >> "$GITHUB_OUTPUT"
+      - name: Restore exact Chocolatey candidate
+        if: steps.chocolatey-source.outputs.prepared == 'true'
+        id: chocolatey-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: chocolatey-package/.simit-candidates
+          key: chocolatey-${{ github.repository }}-${{ github.ref }}-${{ github.sha }}-${{ hashFiles('chocolatey-package/*.nuspec', 'chocolatey-package/tools/*.ps1') }}
+      - name: Pack Chocolatey candidate without publication credentials
+        if: steps.chocolatey-source.outputs.prepared == 'true'
+        run: |
+          set -euo pipefail
+          . ./release-env
+          ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=9ec9a5721eac983d93776419ac5e94cdfd5d2cfe -c simit dist chocolatey bump \
+            --version "$VERSION" \
+            --package-dir chocolatey-package \
+            --archive "x64=$ZIP" \
+            --choco-name 'sorrel' \
+            --choco-id 'sorrel' \
+            --choco-title 'sorrel' \
+            --choco-authors 'Can H. Tartanoglu' \
+            --choco-description 'Native high-performance GUI for manual curation of spike-sorted electrophysiology data.' \
+            --choco-project-url 'https://github.com/caniko/sorrel' \
+            --choco-license-url 'https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT' \
+            --choco-download-repo 'caniko/sorrel' \
+            --choco-archive-pattern 'sorrel-{version}-{arch}-windows.zip' \
+            --pack --api-key-env CHOCOLATEY_API_KEY
+      - name: Persist Chocolatey candidate before publication
+        if: steps.chocolatey-source.outputs.prepared == 'true' && steps.chocolatey-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: chocolatey-package/.simit-candidates
+          key: chocolatey-${{ github.repository }}-${{ github.ref }}-${{ github.sha }}-${{ hashFiles('chocolatey-package/*.nuspec', 'chocolatey-package/tools/*.ps1') }}
+      - name: Require persisted Chocolatey candidate
+        id: chocolatey-persisted
+        if: steps.chocolatey-source.outputs.prepared == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: chocolatey-package/.simit-candidates
+          key: chocolatey-${{ github.repository }}-${{ github.ref }}-${{ github.sha }}-${{ hashFiles('chocolatey-package/*.nuspec', 'chocolatey-package/tools/*.ps1') }}
+          fail-on-cache-miss: true
+      - name: Publish Chocolatey package
+        env:
+          CHOCO_CANDIDATE_CACHE_HIT: ${{ steps.chocolatey-persisted.outputs.cache-hit }}
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+          CHOCO_PUSH_SOURCE: https://push.chocolatey.org/
+        run: |
+          set -euo pipefail
+          . ./release-env
+          if [ "$IS_PRERELEASE" = "true" ]; then echo "Prerelease ${VERSION}; skipping Chocolatey package update."; exit 0; fi
+          if [ -f release-publisher-state.env ]; then . ./release-publisher-state.env; fi
+          publisher_missing() {
+            channel="$1"; message="$2"
+            var="PUBLISH_$(printf '%s' "$channel" | tr '[:lower:]-' '[:upper:]_')_STATE"
+            state="${!var:-inactive-soft}"
+            if [ "$state" = active-required ]; then echo "::error::${channel}: ${message}" >&2; exit 1; fi
+            echo "::warning::${channel}: ${message}; staged publisher is not active yet." >&2
+            exit 0
+          }
+          if [ -z "${CHOCOLATEY_API_KEY:-}" ]; then publisher_missing chocolatey 'CHOCOLATEY_API_KEY unset'; fi
+          ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
+          if [ "${CHOCO_CANDIDATE_CACHE_HIT:-}" != true ]; then echo 'Chocolatey candidate persistence was not verified.' >&2; exit 1; fi
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=9ec9a5721eac983d93776419ac5e94cdfd5d2cfe -c simit dist chocolatey bump \
+            --version "$VERSION" \
+            --package-dir chocolatey-package \
+            --archive "x64=$ZIP" \
+            --choco-name 'sorrel' \
+            --choco-id 'sorrel' \
+            --choco-title 'sorrel' \
+            --choco-authors 'Can H. Tartanoglu' \
+            --choco-description 'Native high-performance GUI for manual curation of spike-sorted electrophysiology data.' \
+            --choco-project-url 'https://github.com/caniko/sorrel' \
+            --choco-license-url 'https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT' \
+            --choco-download-repo 'caniko/sorrel' \
+            --choco-archive-pattern 'sorrel-{version}-{arch}-windows.zip' \
+            --push \
+            --push-source "$CHOCO_PUSH_SOURCE" \
+            --api-key-env CHOCOLATEY_API_KEY

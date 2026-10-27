@@ -44,6 +44,20 @@ Each GitHub release attaches the same wheels
 (`aarch64-linux`, `windows`, `darwin-aarch64` likewise). See
 [Integrations](../usage/integrations.md#python-jupyter) for the API.
 
+## Windows
+
+Stable releases go to winget and Chocolatey. Both install `sorrel.exe` from
+the release's `sorrel-<VERSION>-x86_64-windows.zip` and put `sorrel` on your
+`PATH`:
+
+```powershell
+winget install Caniko.Sorrel
+choco install sorrel
+```
+
+New versions show up once the winget-pkgs PR is merged and Chocolatey
+moderation passes, which can take a few days after the GitHub release.
+
 ## With Nix
 
 ```bash
