@@ -7,6 +7,18 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+
+- A GPU backend that rejects a compute kernel no longer kills Sorrel. Kernel
+  creation now runs under wgpu error scopes, so a driver or shader-compiler
+  failure (FXC on D3D12 was the case seen) leaves trace preprocessing on the
+  CPU and logs one warning naming the adapter and backend, instead of
+  panicking at startup. Uncaptured wgpu errors on Sorrel's own devices are
+  logged rather than fatal.
+- `sorrel gpu-check` reports "kernels unavailable" per adapter and carries
+  on with the others instead of panicking. It exits non-zero on a CPU/GPU
+  mismatch, or when no compute-capable adapter can run the kernels.
+
 ## [0.2.0] - 2026-10-26
 
 ### Fixed (data integrity)
