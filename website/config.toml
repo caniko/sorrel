@@ -1,4 +1,4 @@
-base_url = "https://caniko.codeberg.page/sorrel"
+base_url = "https://sorrel.tartanoglu.com"
 title = "Sorrel"
 description = "Native, high-performance GUI for manual curation of spike-sorted electrophysiology data."
 default_language = "en"
