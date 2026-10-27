@@ -95,6 +95,9 @@
             repo = "caniko/sorrel";
             target_branch = "trunk";
           };
+          # Upload the bundle's wheels (`sorrel-ephys`) after the GitHub
+          # release; the PyPI trusted publisher is registered for release.yml.
+          pypi.trusted_publishing = true;
           attic = {
             cache = "canix";
             url = "https://attic.candee.baby";
@@ -141,7 +144,7 @@
           license_url = "https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT";
           archive_pattern = "sorrel-{version}-{arch}-windows.zip";
           # chocolatey isn't in nixpkgs yet, and the dev shell no longer ships simit.
-          nix_tool = "github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=9ec9a5721eac983d93776419ac5e94cdfd5d2cfe";
+          nix_tool = "github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=54f5f86d06ea7ab00ec0c9d1314676b65f88a81b";
           api_key_secret = "CHOCOLATEY_API_KEY";
         };
       };

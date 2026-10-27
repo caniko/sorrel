@@ -429,8 +429,13 @@ jobs:
           stable_or_state chocolatey 'sorrel' bash -c 'curl -fsSL "https://community.chocolatey.org/api/v2/Packages()?%24filter=${CHOCO_FILTER}" | grep -q "<entry>"'
           write_state homebrew not-configured '-'
           write_state scoop not-configured '-'
+          pypi_wheels=(release/*.whl); pypi_name="${pypi_wheels[0]##*/}"; pypi_name="${pypi_name%%-*}"
+          active_or_soft pypi "$pypi_name" curl -fsS -o /dev/null "https://pypi.org/pypi/${pypi_name}/json"
           write_state flathub not-configured '-'
-          stable_or_state winget 'Caniko.Sorrel' curl -fsSL 'https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/c/Caniko/Sorrel'
+          winget_code="$(curl -sS -o /dev/null -w '%{http_code}' 'https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/c/Caniko/Sorrel' || true)"
+          case "$winget_code" in 200) winget_state=active-required ;; 404) winget_state=inactive-soft ;; *) winget_state=probe-failed ;; esac
+          if [ "$IS_PRERELEASE" = "true" ]; then winget_state=skipped-prerelease; fi
+          write_state winget "$winget_state" 'Caniko.Sorrel'
       - name: Publish winget manifest PR
         env:
           WINGET_PAT: ${{ secrets.WINGET_PAT }}
@@ -443,7 +448,7 @@ jobs:
             channel="$1"; message="$2"
             var="PUBLISH_$(printf '%s' "$channel" | tr '[:lower:]-' '[:upper:]_')_STATE"
             state="${!var:-inactive-soft}"
-            if [ "$state" = active-required ]; then echo "::error::${channel}: ${message}" >&2; exit 1; fi
+            case "$state" in active-required|probe-failed) echo "::error::${channel}: ${message} (${state})" >&2; exit 1 ;; esac
             echo "::warning::${channel}: ${message}; staged publisher is not active yet." >&2
             exit 0
           }
@@ -451,6 +456,7 @@ jobs:
           ZIP_NAME="sorrel-${VERSION}-x86_64-windows.zip"; ZIP_URL="https://github.com/caniko/sorrel/releases/download/${TAG}/${ZIP_NAME}"
           test -s "release/${ZIP_NAME}" || publisher_missing winget "missing release/${ZIP_NAME}"
           export ZIP_NAME ZIP_URL VERSION WINGET_PAT PUBLISH_WINGET_STATE
+          case "${PUBLISH_WINGET_STATE:-}" in active-required|inactive-soft) ;; *) echo "::error::winget: winget-pkgs probe was inconclusive (${PUBLISH_WINGET_STATE:-unset}); not guessing between an update and a first submission." >&2; exit 1 ;; esac
           nix shell nixpkgs#curl nixpkgs#jq nixpkgs#unzip nixpkgs#wineWow64Packages.stable nixpkgs#util-linux -c bash <<'SCRIPT' || publisher_missing winget 'wingetcreate submission failed'
           set -euo pipefail
           tmpdir="$(mktemp -d)"; trap 'rm -rf "$tmpdir"' EXIT
@@ -473,6 +479,22 @@ jobs:
             wine "$tmpdir/wingetcreate.exe" submit "$(winepath -w "$dir")" --token "$WINGET_PAT"
           fi
           SCRIPT
+      - name: Publish wheels to PyPI
+        run: |
+          set -euo pipefail
+          if [ -f release-publisher-state.env ]; then . ./release-publisher-state.env; fi
+          publisher_missing() {
+            channel="$1"; message="$2"
+            var="PUBLISH_$(printf '%s' "$channel" | tr '[:lower:]-' '[:upper:]_')_STATE"
+            state="${!var:-inactive-soft}"
+            case "$state" in active-required|probe-failed) echo "::error::${channel}: ${message} (${state})" >&2; exit 1 ;; esac
+            echo "::warning::${channel}: ${message}; staged publisher is not active yet." >&2
+            exit 0
+          }
+          shopt -s nullglob
+          wheels=(release/*.whl)
+          if [ "${#wheels[@]}" -eq 0 ]; then publisher_missing pypi 'no release/*.whl to publish'; fi
+          nix shell nixpkgs#uv -c uv publish --check-url https://pypi.org/simple/ --trusted-publishing always "${wheels[@]}"
       - name: Prepare Chocolatey package
         id: chocolatey-source
         run: |
@@ -484,12 +506,12 @@ jobs:
             channel="$1"; message="$2"
             var="PUBLISH_$(printf '%s' "$channel" | tr '[:lower:]-' '[:upper:]_')_STATE"
             state="${!var:-inactive-soft}"
-            if [ "$state" = active-required ]; then echo "::error::${channel}: ${message}" >&2; exit 1; fi
+            case "$state" in active-required|probe-failed) echo "::error::${channel}: ${message} (${state})" >&2; exit 1 ;; esac
             echo "::warning::${channel}: ${message}; staged publisher is not active yet." >&2
             exit 0
           }
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=9ec9a5721eac983d93776419ac5e94cdfd5d2cfe -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=54f5f86d06ea7ab00ec0c9d1314676b65f88a81b -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -517,7 +539,7 @@ jobs:
           set -euo pipefail
           . ./release-env
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=9ec9a5721eac983d93776419ac5e94cdfd5d2cfe -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=54f5f86d06ea7ab00ec0c9d1314676b65f88a81b -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -559,14 +581,14 @@ jobs:
             channel="$1"; message="$2"
             var="PUBLISH_$(printf '%s' "$channel" | tr '[:lower:]-' '[:upper:]_')_STATE"
             state="${!var:-inactive-soft}"
-            if [ "$state" = active-required ]; then echo "::error::${channel}: ${message}" >&2; exit 1; fi
+            case "$state" in active-required|probe-failed) echo "::error::${channel}: ${message} (${state})" >&2; exit 1 ;; esac
             echo "::warning::${channel}: ${message}; staged publisher is not active yet." >&2
             exit 0
           }
           if [ -z "${CHOCOLATEY_API_KEY:-}" ]; then publisher_missing chocolatey 'CHOCOLATEY_API_KEY unset'; fi
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
           if [ "${CHOCO_CANDIDATE_CACHE_HIT:-}" != true ]; then echo 'Chocolatey candidate persistence was not verified.' >&2; exit 1; fi
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=9ec9a5721eac983d93776419ac5e94cdfd5d2cfe -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=54f5f86d06ea7ab00ec0c9d1314676b65f88a81b -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
