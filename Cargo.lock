@@ -5847,6 +5847,7 @@ dependencies = [
  "egui_extras",
  "egui_kittest",
  "egui_tiles",
+ "image",
  "log",
  "rayon",
  "serde",

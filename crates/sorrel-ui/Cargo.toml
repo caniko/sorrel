@@ -24,6 +24,9 @@ bytemuck.workspace = true
 log.workspace = true
 anyhow.workspace = true
 rayon.workspace = true
+# PNG screenshots of a pane (phy `screenshot`); already in the graph
+# through eframe's clipboard support, so no new crate.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # eframe's Linux window backends are deliberately enabled only for Linux
 # targets. Windows and macOS use their native winit backends.

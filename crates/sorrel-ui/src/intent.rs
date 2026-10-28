@@ -4,81 +4,562 @@ use sorrel_io::ClusterId;
 /// User intents — a closed enum, dispatched in a single `match`. No heap, no
 /// virtual calls in the input path.
 ///
-/// `Relabel` carries only the op, not a cluster id, because the dispatcher
-/// applies it to the entire active selection. `SelectCluster` and friends
-/// drive that selection.
-#[derive(Copy, Clone, Debug)]
+/// `Move` carries only who and the op, not cluster ids, because the
+/// dispatcher resolves the targets from the current best/similar
+/// selection. `SelectCluster` and friends drive that selection.
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Intent {
-    /// Replace the active selection with this single id (plain click / J/K).
+    /// Replace the active selection with this single id (plain click).
     SelectCluster(ClusterId),
     /// Toggle membership of `id` in the active selection (Ctrl/Cmd-click).
     ToggleCluster(ClusterId),
     /// Range-extend from the anchor to `id` (Shift-click).
     ExtendCluster(ClusterId),
-    /// Apply this label transition to every cluster in the active selection.
-    Relabel(PhyLabelOp),
+    /// phy `move_{best,similar,all}_to_{group}`: label those clusters, then
+    /// advance the wizard.
+    Move(MoveTarget, PhyLabelOp),
     Undo,
     Redo,
     /// Persist the curated state (spike_clusters.npy + cluster_group.tsv).
     Save,
+    /// phy `next_best` / `previous_best` / `first` / `last` over the
+    /// visible cluster-table rows.
     NextCluster,
     PrevCluster,
+    FirstCluster,
+    LastCluster,
+    /// phy `next` / `previous` (Space): step through the similar clusters.
+    NextSimilar,
+    PrevSimilar,
+    /// phy `select_first_similar` (Ctrl+Space).
+    SelectFirstSimilar,
+    /// phy `unselect_similar` (Backspace).
+    UnselectSimilar,
+    /// phy `reset_wizard` (Ctrl+Alt+Space): select the first table row.
+    ResetWizard,
     PageBack,
     PageForward,
-    /// Merge every selected cluster into the first-selected one (Cmd/Ctrl-G).
+    TraceStart,
+    TraceEnd,
+    TraceNarrow,
+    TraceWiden,
+    /// phy `toggle_spike_reorder` (Ctrl+R).
+    ToggleSpikeReorder,
+    /// phy v2.1 `toggle_merge_mode` (`v`).
+    ToggleMergeMode,
+    /// phy TraceView toggles: `switch_origin` (Alt+O), `toggle_highlighted_spikes`
+    /// (Alt+S), `toggle_show_labels` (Alt+L), and the gain (Ctrl+Alt+↑/↓).
+    TraceOrigin,
+    TraceAllSpikes,
+    TraceLabels,
+    TraceGain(i32),
+    /// phy `go_to_next_spike` / `go_to_previous_spike` (Alt+PgDn / Alt+PgUp):
+    /// centre the trace on the selection's next / previous spike.
+    NextSpike,
+    PrevSpike,
+    /// Merge every selected cluster into the first-selected one (`g`).
     MergeSelection,
-    /// Escape: dismiss the confirm dialog, the help overlay, or an
-    /// in-progress lasso — whichever is active.
+    /// Escape: dismiss the confirm dialog, the help overlay, the snippet
+    /// bar, or an in-progress lasso — whichever is active.
     Cancel,
-    /// Toggle the keyboard/mouse help overlay (`?` or F1).
+    /// Toggle the keyboard/mouse help overlay.
     ToggleHelp,
+    /// phy `split` (`k`): split off the spikes inside the Features lasso.
+    Split,
+    /// phy `split_init` (Shift+Ctrl+K): one cluster per original template.
+    SplitInit,
+    /// phy `toggle_automatic_channel_selection` (`c`) in the Features pane.
+    ToggleFeatureChannels,
+    /// phy `next_amplitudes_type` / `previous_amplitudes_type` (`a` / Shift+`a`).
+    CycleAmplitudes(i32),
+    /// phy snippet mode (`:`), opened with this text already typed.
+    Snippet(&'static str),
+    Quit,
+}
+
+/// Which clusters a phy `move_*` action labels.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MoveTarget {
+    Best,
+    Similar,
+    All,
+}
+
+/// Help-window grouping.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Section {
+    Curation,
+    Navigation,
+    Views,
+}
+
+/// One key chord. `shift: None` accepts either state, for symbols that
+/// need Shift on common layouts (`?`, `:`, `+`).
+#[derive(Copy, Clone, Debug)]
+pub struct Binding {
+    pub key: egui::Key,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: Option<bool>,
+    pub intent: Intent,
+    pub section: Section,
+    pub help: &'static str,
+}
+
+const fn bind(
+    key: egui::Key,
+    mods: u8,
+    intent: Intent,
+    section: Section,
+    help: &'static str,
+) -> Binding {
+    Binding {
+        key,
+        ctrl: mods & CTRL != 0,
+        alt: mods & ALT != 0,
+        shift: if mods & ANY_SHIFT != 0 {
+            None
+        } else {
+            Some(mods & SHIFT != 0)
+        },
+        intent,
+        section,
+        help,
+    }
+}
+
+const NONE: u8 = 0;
+const CTRL: u8 = 1;
+const ALT: u8 = 2;
+const SHIFT: u8 = 4;
+const ANY_SHIFT: u8 = 8;
+
+use egui::Key as K;
+use MoveTarget::{All, Best, Similar};
+use PhyLabelOp::{SetGood, SetMua, SetNoise, SetUnsorted};
+use Section::{Curation as Cur, Navigation as Nav, Views};
+
+/// phy's default TemplateGUI shortcuts (cortex-lab/phy master, v2.1).
+/// Entries sharing a `help` text show as one help row.
+pub const KEYMAP: &[Binding] = &[
+    bind(
+        K::G,
+        NONE,
+        Intent::MergeSelection,
+        Cur,
+        "merge the selected clusters",
+    ),
+    bind(
+        K::K,
+        NONE,
+        Intent::Split,
+        Cur,
+        "split off the spikes inside the lasso",
+    ),
+    bind(
+        K::K,
+        CTRL | SHIFT,
+        Intent::SplitInit,
+        Cur,
+        "split the selection by original template",
+    ),
+    bind(
+        K::R,
+        CTRL,
+        Intent::ToggleSpikeReorder,
+        Views,
+        "time axes: toggle spike_reorder.npy",
+    ),
+    bind(
+        K::V,
+        NONE,
+        Intent::ToggleMergeMode,
+        Cur,
+        "merge mode: stage the selection, G merges, V cancels",
+    ),
+    bind(
+        K::L,
+        NONE,
+        Intent::Snippet(":l "),
+        Cur,
+        "set a label (:l name value)",
+    ),
+    bind(
+        K::G,
+        ALT,
+        Intent::Move(Best, SetGood),
+        Cur,
+        "move best to good · mua · noise · unsorted",
+    ),
+    bind(
+        K::M,
+        ALT,
+        Intent::Move(Best, SetMua),
+        Cur,
+        "move best to good · mua · noise · unsorted",
+    ),
+    bind(
+        K::N,
+        ALT,
+        Intent::Move(Best, SetNoise),
+        Cur,
+        "move best to good · mua · noise · unsorted",
+    ),
+    bind(
+        K::U,
+        ALT,
+        Intent::Move(Best, SetUnsorted),
+        Cur,
+        "move best to good · mua · noise · unsorted",
+    ),
+    bind(
+        K::G,
+        CTRL,
+        Intent::Move(Similar, SetGood),
+        Cur,
+        "move similar to good · mua · noise · unsorted",
+    ),
+    bind(
+        K::M,
+        CTRL,
+        Intent::Move(Similar, SetMua),
+        Cur,
+        "move similar to good · mua · noise · unsorted",
+    ),
+    bind(
+        K::N,
+        CTRL,
+        Intent::Move(Similar, SetNoise),
+        Cur,
+        "move similar to good · mua · noise · unsorted",
+    ),
+    bind(
+        K::U,
+        CTRL,
+        Intent::Move(Similar, SetUnsorted),
+        Cur,
+        "move similar to good · mua · noise · unsorted",
+    ),
+    bind(
+        K::G,
+        CTRL | ALT,
+        Intent::Move(All, SetGood),
+        Cur,
+        "move all to good · mua · noise · unsorted",
+    ),
+    bind(
+        K::M,
+        CTRL | ALT,
+        Intent::Move(All, SetMua),
+        Cur,
+        "move all to good · mua · noise · unsorted",
+    ),
+    bind(
+        K::N,
+        CTRL | ALT,
+        Intent::Move(All, SetNoise),
+        Cur,
+        "move all to good · mua · noise · unsorted",
+    ),
+    bind(
+        K::U,
+        CTRL | ALT,
+        Intent::Move(All, SetUnsorted),
+        Cur,
+        "move all to good · mua · noise · unsorted",
+    ),
+    bind(K::Z, CTRL, Intent::Undo, Cur, "undo"),
+    bind(K::Z, CTRL | SHIFT, Intent::Redo, Cur, "redo"),
+    bind(K::Y, CTRL, Intent::Redo, Cur, "redo"),
+    bind(K::S, CTRL, Intent::Save, Cur, "save"),
+    bind(
+        K::ArrowDown,
+        NONE,
+        Intent::NextCluster,
+        Nav,
+        "next · previous best cluster",
+    ),
+    bind(
+        K::ArrowUp,
+        NONE,
+        Intent::PrevCluster,
+        Nav,
+        "next · previous best cluster",
+    ),
+    bind(
+        K::Home,
+        NONE,
+        Intent::FirstCluster,
+        Nav,
+        "first · last best cluster",
+    ),
+    bind(
+        K::End,
+        NONE,
+        Intent::LastCluster,
+        Nav,
+        "first · last best cluster",
+    ),
+    bind(
+        K::Space,
+        NONE,
+        Intent::NextSimilar,
+        Nav,
+        "next · previous similar cluster",
+    ),
+    bind(
+        K::Space,
+        SHIFT,
+        Intent::PrevSimilar,
+        Nav,
+        "next · previous similar cluster",
+    ),
+    bind(
+        K::Space,
+        CTRL,
+        Intent::SelectFirstSimilar,
+        Nav,
+        "select the first 15 similar clusters",
+    ),
+    bind(
+        K::Backspace,
+        NONE,
+        Intent::UnselectSimilar,
+        Nav,
+        "unselect the similar clusters",
+    ),
+    bind(
+        K::Space,
+        CTRL | ALT,
+        Intent::ResetWizard,
+        Nav,
+        "reset the wizard (first cluster)",
+    ),
+    bind(
+        K::ArrowLeft,
+        ALT,
+        Intent::PageBack,
+        Nav,
+        "trace: previous · next window",
+    ),
+    bind(
+        K::ArrowRight,
+        ALT,
+        Intent::PageForward,
+        Nav,
+        "trace: previous · next window",
+    ),
+    bind(
+        K::Home,
+        ALT,
+        Intent::TraceStart,
+        Nav,
+        "trace: start · end of recording",
+    ),
+    bind(
+        K::End,
+        ALT,
+        Intent::TraceEnd,
+        Nav,
+        "trace: start · end of recording",
+    ),
+    bind(
+        K::Plus,
+        ALT | ANY_SHIFT,
+        Intent::TraceNarrow,
+        Nav,
+        "trace: narrow · widen the window",
+    ),
+    bind(
+        K::Equals,
+        ALT | ANY_SHIFT,
+        Intent::TraceNarrow,
+        Nav,
+        "trace: narrow · widen the window",
+    ),
+    bind(
+        K::Minus,
+        ALT,
+        Intent::TraceWiden,
+        Nav,
+        "trace: narrow · widen the window",
+    ),
+    bind(
+        K::PageDown,
+        ALT,
+        Intent::NextSpike,
+        Nav,
+        "trace: next · previous spike of the selection",
+    ),
+    bind(
+        K::PageUp,
+        ALT,
+        Intent::PrevSpike,
+        Nav,
+        "trace: next · previous spike of the selection",
+    ),
+    bind(
+        K::T,
+        ALT,
+        Intent::Snippet(":tg "),
+        Nav,
+        "trace: go to a time (:tg seconds)",
+    ),
+    bind(
+        K::O,
+        ALT,
+        Intent::TraceOrigin,
+        Nav,
+        "trace: channel 0 at the top or bottom",
+    ),
+    bind(
+        K::S,
+        ALT,
+        Intent::TraceAllSpikes,
+        Nav,
+        "trace: mark every cluster's spikes or the selection's",
+    ),
+    bind(
+        K::L,
+        ALT,
+        Intent::TraceLabels,
+        Nav,
+        "trace: show or hide channel labels",
+    ),
+    bind(
+        K::ArrowUp,
+        CTRL | ALT,
+        Intent::TraceGain(1),
+        Nav,
+        "trace: increase · decrease the gain",
+    ),
+    bind(
+        K::ArrowDown,
+        CTRL | ALT,
+        Intent::TraceGain(-1),
+        Nav,
+        "trace: increase · decrease the gain",
+    ),
+    bind(
+        K::C,
+        NONE,
+        Intent::ToggleFeatureChannels,
+        Views,
+        "Features: fix or release the channels",
+    ),
+    bind(
+        K::A,
+        NONE,
+        Intent::CycleAmplitudes(1),
+        Views,
+        "Amplitudes: next · previous type",
+    ),
+    bind(
+        K::A,
+        SHIFT,
+        Intent::CycleAmplitudes(-1),
+        Views,
+        "Amplitudes: next · previous type",
+    ),
+    bind(
+        K::Colon,
+        ANY_SHIFT,
+        Intent::Snippet(":"),
+        Views,
+        "snippet mode (:g, :c 3 7, :s n_spikes, …)",
+    ),
+    bind(K::H, NONE, Intent::ToggleHelp, Views, "show this help"),
+    bind(
+        K::Questionmark,
+        ANY_SHIFT,
+        Intent::ToggleHelp,
+        Views,
+        "show this help",
+    ),
+    bind(K::F1, NONE, Intent::ToggleHelp, Views, "show this help"),
+    bind(K::Q, CTRL, Intent::Quit, Views, "quit"),
+    bind(
+        K::Escape,
+        NONE,
+        Intent::Cancel,
+        Views,
+        "close a dialog, the snippet bar or the lasso",
+    ),
+];
+
+impl Binding {
+    fn matches(&self, key: egui::Key, m: egui::Modifiers) -> bool {
+        self.key == key
+            && self.ctrl == m.command
+            && self.alt == m.alt
+            && self.shift.is_none_or(|s| s == m.shift)
+    }
+
+    /// Fires while a text field has focus: Ctrl chords, Esc and F1.
+    fn is_global(&self) -> bool {
+        self.ctrl || matches!(self.key, K::Escape | K::F1)
+    }
+
+    /// `Ctrl+Alt+G`-style label for the help window.
+    pub fn chord(&self) -> String {
+        let mut s = String::new();
+        if self.ctrl {
+            s.push_str("Ctrl+");
+        }
+        if self.alt {
+            s.push_str("Alt+");
+        }
+        if self.shift == Some(true) {
+            s.push_str("Shift+");
+        }
+        s.push_str(match self.key {
+            K::Plus => "+",
+            K::Equals => "=",
+            K::Minus => "-",
+            K::Colon => ":",
+            K::Questionmark => "?",
+            K::ArrowDown => "↓",
+            K::ArrowUp => "↑",
+            K::ArrowLeft => "←",
+            K::ArrowRight => "→",
+            k => k.name(),
+        });
+        s
+    }
+}
+
+/// Help rows `(section, chords, help)`, bindings with the same help text
+/// joined, in keymap order.
+pub fn help_rows() -> Vec<(Section, String, &'static str)> {
+    let mut rows: Vec<(Section, String, &'static str)> = Vec::new();
+    for b in KEYMAP {
+        match rows.iter_mut().find(|r| r.2 == b.help) {
+            Some(row) => {
+                row.1.push_str(" · ");
+                row.1.push_str(&b.chord());
+            }
+            None => rows.push((b.section, b.chord(), b.help)),
+        }
+    }
+    rows
 }
 
 pub fn from_key(key: egui::Key, modifiers: egui::Modifiers) -> Option<Intent> {
     from_key_in_context(key, modifiers, false)
 }
 
-/// Like [`from_key`] but suppresses single-letter intents (relabel, navigation,
-/// pan) when a text input has focus, while still honouring command-modified
-/// shortcuts (Save / Undo / Redo). Without this gate, typing into a filter
-/// box would relabel selected clusters mid-keystroke.
+/// Like [`from_key`] but suppresses plain-key intents (merge, split,
+/// navigation) while a text input has focus, so typing into the filter box
+/// never merges clusters mid-keystroke; Ctrl chords, Esc and F1 still fire.
 pub fn from_key_in_context(
     key: egui::Key,
     modifiers: egui::Modifiers,
     text_input_active: bool,
 ) -> Option<Intent> {
-    use egui::Key::*;
-    // Cmd/Ctrl-modified intents are always global — they survive text focus
-    // because phy/spike-sorting tooling expects Save/Undo/Redo to work even
-    // while a search field is active.
-    match key {
-        Z if modifiers.command && modifiers.shift => return Some(Intent::Redo),
-        Z if modifiers.command => return Some(Intent::Undo),
-        Y if modifiers.command => return Some(Intent::Redo),
-        S if modifiers.command => return Some(Intent::Save),
-        G if modifiers.command => return Some(Intent::MergeSelection),
-        Escape => return Some(Intent::Cancel),
-        F1 => return Some(Intent::ToggleHelp),
-        _ => {}
-    }
-    // Plain-letter intents never fire with the command modifier held, so an
-    // unbound Cmd/Ctrl-N can't silently relabel the selection as noise.
-    if text_input_active || modifiers.command {
-        return None;
-    }
-    Some(match key {
-        G => Intent::Relabel(PhyLabelOp::SetGood),
-        M => Intent::Relabel(PhyLabelOp::SetMua),
-        N => Intent::Relabel(PhyLabelOp::SetNoise),
-        U => Intent::Relabel(PhyLabelOp::SetUnsorted),
-        ArrowDown | J => Intent::NextCluster,
-        ArrowUp | K => Intent::PrevCluster,
-        ArrowLeft | H => Intent::PageBack,
-        ArrowRight | L => Intent::PageForward,
-        Questionmark => Intent::ToggleHelp,
-        Slash if modifiers.shift => Intent::ToggleHelp,
-        _ => return None,
-    })
+    KEYMAP
+        .iter()
+        .find(|b| b.matches(key, modifiers) && (!text_input_active || b.is_global()))
+        .map(|b| b.intent)
 }
 
 #[cfg(test)]
@@ -86,234 +567,92 @@ mod tests {
     use super::*;
     use egui::{Key, Modifiers};
 
-    #[test]
-    fn label_keys_emit_relabel_with_just_the_op() {
-        let m = Modifiers::default();
-        assert!(matches!(
-            from_key(Key::G, m),
-            Some(Intent::Relabel(PhyLabelOp::SetGood))
-        ));
-        assert!(matches!(
-            from_key(Key::M, m),
-            Some(Intent::Relabel(PhyLabelOp::SetMua))
-        ));
-        assert!(matches!(
-            from_key(Key::N, m),
-            Some(Intent::Relabel(PhyLabelOp::SetNoise))
-        ));
-        assert!(matches!(
-            from_key(Key::U, m),
-            Some(Intent::Relabel(PhyLabelOp::SetUnsorted))
-        ));
-    }
-
-    #[test]
-    fn navigation_keys_emit_cluster_and_pan_intents() {
-        let m = Modifiers::default();
-        assert!(matches!(from_key(Key::J, m), Some(Intent::NextCluster)));
-        assert!(matches!(
-            from_key(Key::ArrowDown, m),
-            Some(Intent::NextCluster)
-        ));
-        assert!(matches!(from_key(Key::K, m), Some(Intent::PrevCluster)));
-        assert!(matches!(
-            from_key(Key::ArrowUp, m),
-            Some(Intent::PrevCluster)
-        ));
-        assert!(matches!(from_key(Key::H, m), Some(Intent::PageBack)));
-        assert!(matches!(
-            from_key(Key::ArrowLeft, m),
-            Some(Intent::PageBack)
-        ));
-        assert!(matches!(from_key(Key::L, m), Some(Intent::PageForward)));
-        assert!(matches!(
-            from_key(Key::ArrowRight, m),
-            Some(Intent::PageForward)
-        ));
-    }
-
-    #[test]
-    fn cmd_z_undoes_and_cmd_shift_z_redoes() {
-        let m = Modifiers {
-            command: true,
+    fn mods(ctrl: bool, alt: bool, shift: bool) -> Modifiers {
+        Modifiers {
+            command: ctrl,
+            ctrl,
+            alt,
+            shift,
             ..Default::default()
-        };
-        assert!(matches!(from_key(Key::Z, m), Some(Intent::Undo)));
-
-        let redo = Modifiers {
-            command: true,
-            shift: true,
-            ..Default::default()
-        };
-        assert!(matches!(from_key(Key::Z, redo), Some(Intent::Redo)));
+        }
     }
 
     #[test]
-    fn cmd_s_emits_save() {
-        let m = Modifiers {
-            command: true,
-            ..Default::default()
-        };
-        assert!(matches!(from_key(Key::S, m), Some(Intent::Save)));
-        // Bare `s` is not an intent.
-        let m = Modifiers::default();
-        assert!(from_key(Key::S, m).is_none());
+    fn every_binding_resolves_to_itself_and_chords_are_unique() {
+        for b in KEYMAP {
+            let m = mods(b.ctrl, b.alt, b.shift.unwrap_or(false));
+            assert_eq!(from_key(b.key, m), Some(b.intent), "{}", b.chord());
+            let clashes = KEYMAP.iter().filter(|o| o.matches(b.key, m)).count();
+            assert_eq!(clashes, 1, "{} is bound twice", b.chord());
+        }
     }
 
     #[test]
-    fn shift_alone_does_not_change_label_intents() {
-        // Shift+G should still emit a relabel — phy emits the same intent
-        // regardless of shift state on label keys.
-        let m = Modifiers {
-            shift: true,
-            ..Default::default()
-        };
-        assert!(matches!(
-            from_key(Key::G, m),
-            Some(Intent::Relabel(PhyLabelOp::SetGood))
-        ));
-    }
-
-    #[test]
-    fn cmd_modifier_binds_merge_and_blocks_label_keys() {
-        let m = Modifiers {
-            command: true,
-            ..Default::default()
-        };
-        assert!(matches!(from_key(Key::G, m), Some(Intent::MergeSelection)));
-        assert!(matches!(from_key(Key::Y, m), Some(Intent::Redo)));
-        // Cmd+N is unbound; it must not relabel the selection as noise.
-        assert!(from_key(Key::N, m).is_none());
-        assert!(from_key(Key::M, m).is_none());
-    }
-
-    #[test]
-    fn escape_and_help_keys_are_global() {
-        let m = Modifiers::default();
-        assert!(matches!(from_key(Key::Escape, m), Some(Intent::Cancel)));
-        assert!(matches!(from_key(Key::F1, m), Some(Intent::ToggleHelp)));
-        assert!(matches!(
-            from_key(Key::Questionmark, m),
+    fn phy_supervisor_keys() {
+        let none = Modifiers::default();
+        assert_eq!(from_key(Key::G, none), Some(Intent::MergeSelection));
+        assert_eq!(from_key(Key::K, none), Some(Intent::Split));
+        assert_eq!(
+            from_key(Key::G, mods(false, true, false)),
+            Some(Intent::Move(Best, SetGood))
+        );
+        assert_eq!(
+            from_key(Key::N, mods(true, false, false)),
+            Some(Intent::Move(Similar, SetNoise))
+        );
+        assert_eq!(
+            from_key(Key::M, mods(true, true, false)),
+            Some(Intent::Move(All, SetMua))
+        );
+        assert_eq!(from_key(Key::Space, none), Some(Intent::NextSimilar));
+        assert_eq!(
+            from_key(Key::Space, mods(false, false, true)),
+            Some(Intent::PrevSimilar)
+        );
+        assert_eq!(
+            from_key(Key::Space, mods(true, true, false)),
+            Some(Intent::ResetWizard)
+        );
+        assert_eq!(
+            from_key(Key::Questionmark, mods(false, false, true)),
             Some(Intent::ToggleHelp)
-        ));
-        // Escape still cancels while a text field has focus; `?` does not
-        // (the user is typing).
-        assert!(matches!(
-            from_key_in_context(Key::Escape, m, true),
-            Some(Intent::Cancel)
-        ));
-        assert!(from_key_in_context(Key::Questionmark, m, true).is_none());
+        );
+        // Sorrel's old single-letter relabel keys are gone: plain M and N
+        // do nothing, and Shift+G is not a merge.
+        assert_eq!(from_key(Key::M, none), None);
+        assert_eq!(from_key(Key::G, mods(false, false, true)), None);
     }
 
     #[test]
-    fn arrow_keys_alias_to_jklh() {
-        let m = Modifiers::default();
-        let down = from_key(Key::ArrowDown, m);
-        let j = from_key(Key::J, m);
-        assert!(matches!(down, Some(Intent::NextCluster)));
-        assert!(matches!(j, Some(Intent::NextCluster)));
-
-        let up = from_key(Key::ArrowUp, m);
-        let k = from_key(Key::K, m);
-        assert!(matches!(up, Some(Intent::PrevCluster)));
-        assert!(matches!(k, Some(Intent::PrevCluster)));
-
-        let left = from_key(Key::ArrowLeft, m);
-        let h = from_key(Key::H, m);
-        assert!(matches!(left, Some(Intent::PageBack)));
-        assert!(matches!(h, Some(Intent::PageBack)));
-
-        let right = from_key(Key::ArrowRight, m);
-        let l = from_key(Key::L, m);
-        assert!(matches!(right, Some(Intent::PageForward)));
-        assert!(matches!(l, Some(Intent::PageForward)));
-    }
-
-    #[test]
-    fn ctrl_shift_z_emits_redo_via_command_modifier() {
-        // egui's `Modifiers::command` is the platform's "primary" modifier:
-        // ctrl on Linux/Windows, cmd on macOS. With shift it's redo.
-        let m = Modifiers {
-            command: true,
-            shift: true,
-            ..Default::default()
-        };
-        assert!(matches!(from_key(Key::Z, m), Some(Intent::Redo)));
-    }
-
-    #[test]
-    fn shift_alone_z_is_not_an_intent() {
-        // Shift-Z without command should not be undo/redo.
-        let m = Modifiers {
-            shift: true,
-            ..Default::default()
-        };
-        assert!(from_key(Key::Z, m).is_none());
-    }
-
-    #[test]
-    fn unrecognised_keys_with_modifiers_still_return_none() {
-        let m = Modifiers {
-            command: true,
-            shift: true,
-            alt: true,
-            ..Default::default()
-        };
-        assert!(from_key(Key::Q, m).is_none());
-    }
-
-    #[test]
-    fn bare_z_is_not_an_intent() {
-        let m = Modifiers::default();
-        assert!(from_key(Key::Z, m).is_none());
-    }
-
-    #[test]
-    fn unrecognised_key_returns_none() {
-        let m = Modifiers::default();
-        assert!(from_key(Key::Q, m).is_none());
-    }
-
-    #[test]
-    fn text_input_focus_suppresses_relabel_keys() {
-        let m = Modifiers::default();
-        // Without focus, G relabels.
-        assert!(matches!(
-            from_key_in_context(Key::G, m, false),
-            Some(Intent::Relabel(_))
-        ));
-        // With focus, plain letter keys are passed through to the widget
-        // instead of becoming intents.
-        assert!(from_key_in_context(Key::G, m, true).is_none());
-        assert!(from_key_in_context(Key::M, m, true).is_none());
-        assert!(from_key_in_context(Key::J, m, true).is_none());
-        assert!(from_key_in_context(Key::ArrowDown, m, true).is_none());
-    }
-
-    #[test]
-    fn text_input_focus_preserves_command_shortcuts() {
-        // Save/Undo/Redo should still work while typing in a filter box —
-        // matches phy and standard editor conventions.
-        let m = Modifiers {
-            command: true,
-            ..Default::default()
-        };
-        assert!(matches!(
-            from_key_in_context(Key::S, m, true),
+    fn text_focus_keeps_only_global_chords() {
+        let none = Modifiers::default();
+        assert_eq!(from_key_in_context(Key::G, none, true), None);
+        assert_eq!(from_key_in_context(Key::Space, none, true), None);
+        assert_eq!(from_key_in_context(Key::ArrowDown, none, true), None);
+        assert_eq!(
+            from_key_in_context(Key::G, mods(false, true, false), true),
+            None
+        );
+        assert_eq!(
+            from_key_in_context(Key::S, mods(true, false, false), true),
             Some(Intent::Save)
-        ));
-        assert!(matches!(
-            from_key_in_context(Key::Z, m, true),
-            Some(Intent::Undo)
-        ));
-        let redo = Modifiers {
-            command: true,
-            shift: true,
-            ..Default::default()
-        };
-        assert!(matches!(
-            from_key_in_context(Key::Z, redo, true),
+        );
+        assert_eq!(
+            from_key_in_context(Key::Z, mods(true, false, true), true),
             Some(Intent::Redo)
-        ));
+        );
+        assert_eq!(
+            from_key_in_context(Key::Escape, none, true),
+            Some(Intent::Cancel)
+        );
+    }
+
+    #[test]
+    fn help_rows_join_chords_that_share_a_description() {
+        let rows = help_rows();
+        let redo = rows.iter().find(|r| r.2 == "redo").unwrap();
+        assert_eq!(redo.1, "Ctrl+Shift+Z · Ctrl+Y");
+        let best = rows.iter().find(|r| r.2.starts_with("move best")).unwrap();
+        assert_eq!(best.1, "Alt+G · Alt+M · Alt+N · Alt+U");
     }
 }

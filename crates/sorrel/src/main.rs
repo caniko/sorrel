@@ -19,9 +19,10 @@ use sorrel_io::kilosort::{read_cluster_group_tsv, KilosortOpenParams, PhyLabel};
 use sorrel_io::open_ephys::OebinMeta;
 use sorrel_io::spikeglx::SpikeGlxMeta;
 use sorrel_io::{
-    DataProvider, Events, HasGeometry, KilosortProvider, SortingAnalyzerProvider, TraceDtype,
+    DataProvider, Events, HasGeometry, HasQualityMetrics, KilosortProvider,
+    SortingAnalyzerProvider, TraceDtype,
 };
-use sorrel_ui::{RasterPipeline, SorrelApp, TracePipeline};
+use sorrel_ui::{RasterPipeline, ScatterPipeline, SorrelApp, TracePipeline};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -128,6 +129,11 @@ enum Cmd {
         /// Also write the phy artifacts (same as Ctrl-S in the GUI)
         #[arg(long)]
         save: bool,
+    },
+    /// Print a dataset summary (phy `template-describe`)
+    Describe {
+        #[command(flatten)]
+        open: OpenArgs,
     },
     /// Headless: write a self-contained HTML report with one card per cluster
     Report {
@@ -452,6 +458,9 @@ struct OpenCtx<P: DataProvider> {
     positions: Vec<[f32; 2]>,
     /// Shank id per raw channel (empty = single shank); drives per-shank CMR.
     shanks: Vec<u32>,
+    /// Per-cluster quality metrics (KS `cluster_*.tsv`, SI `quality_metrics.csv`);
+    /// empty when the backend has none.
+    metrics: sorrel_io::QualityMetrics,
     /// Per-spike depth for the drift map; needs PC features + geometry, so
     /// only the phy backend provides it (`sorrel_data::spike_depths`).
     depth_source: Option<sorrel_ui::app::DepthFn<P>>,
@@ -504,6 +513,7 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
             let journal_path = journal_path(open, &root, "sorrel");
             let journal = open_journal(open, &journal_path, baseline, provider.n_clusters())?;
             let session = Session::new(provider, journal);
+            let metrics = session.provider.quality_metrics().clone();
             let positions = session.provider.channel_positions().to_vec();
             let shanks = session.provider.channel_shanks().to_vec();
             v.visit(
@@ -514,6 +524,7 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
                     reseal_on_save: false,
                     positions,
                     shanks,
+                    metrics,
                     depth_source: None,
                 },
             )
@@ -565,6 +576,7 @@ fn open_kilosort(
     let journal_path = journal_path(open, &root, "sorrel");
     let journal = open_journal(open, &journal_path, baseline, provider.n_clusters())?;
     let session = Session::new(provider, journal);
+    let metrics = session.provider.quality_metrics().clone();
     let positions = session.provider.channel_positions().to_vec();
     let shanks = session.provider.channel_shanks().to_vec();
     Ok((
@@ -574,6 +586,7 @@ fn open_kilosort(
             reseal_on_save: true,
             positions,
             shanks,
+            metrics,
             depth_source: Some(sorrel_data::spike_depths),
         },
     ))
@@ -658,6 +671,7 @@ fn run_join(
         reseal_on_save: false,
         positions: joined.positions,
         shanks: Vec::new(),
+        metrics: Default::default(),
         depth_source: Some(sorrel_data::spike_depths),
     };
     run_app(joined.session, Box::new(|_| Ok(())), ctx, None)
@@ -695,6 +709,7 @@ where
             reseal_on_save: false,
             positions,
             shanks,
+            metrics: Default::default(),
             depth_source: None,
         },
     ))
@@ -752,11 +767,17 @@ impl SessionVisitor for Suggest {
                 m.score, m.a.0, m.b.0, m.ccg_dip_z, m.amp_ks
             );
         }
-        println!("splits (score, cluster, bimodality, dip, contamination, gmm_bic_delta)");
+        println!("splits (score, cluster, method, bimodality, dip, contamination, gmm_bic_delta)");
         for s in &splits {
             println!(
-                "  {:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.1}",
-                s.score, s.cluster.0, s.amp_bimodality, s.amp_dip, s.contamination, s.gmm_bic_delta
+                "  {:.3}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.1}",
+                s.score,
+                s.cluster.0,
+                s.method,
+                s.amp_bimodality,
+                s.amp_dip,
+                s.contamination,
+                s.gmm_bic_delta
             );
         }
         Ok(())
@@ -1019,6 +1040,98 @@ impl SessionVisitor for Report {
     }
 }
 
+struct Describe;
+impl SessionVisitor for Describe {
+    fn visit<P>(self, session: Session<P>, seed: Seed<P>, _: OpenCtx<P>) -> Result<()>
+    where
+        P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
+    {
+        let s = seeded(session, seed)?;
+        print!("{}", describe(&s));
+        Ok(())
+    }
+}
+
+/// phy `template-describe`: one `name  value` line per dataset fact.
+fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> String {
+    let p = &s.provider;
+    let sr = p.sample_rate();
+    let n_spikes: usize = (0..s.n_clusters())
+        .map(|c| s.spike_times(sorrel_io::ClusterId(c)).len())
+        .sum();
+    let alive = (0..s.n_clusters())
+        .filter(|&c| !s.spike_times(sorrel_io::ClusterId(c)).is_empty())
+        .count();
+    let (n_pcs, n_pc_ch) = s.pc_shape();
+    let (n_templates, n_t, _) = s.template_shape();
+    let mut groups = std::collections::BTreeMap::<&str, usize>::new();
+    for c in (0..s.n_clusters()).filter(|&c| !s.spike_times(sorrel_io::ClusterId(c)).is_empty()) {
+        *groups
+            .entry(
+                s.label(sorrel_io::ClusterId(c))
+                    .map_or("unsorted", |l| l.as_str()),
+            )
+            .or_default() += 1;
+    }
+    let rows = [
+        (
+            "data files",
+            p.raw_file()
+                .map_or("—".into(), |r| r.path.display().to_string()),
+        ),
+        (
+            "dtype",
+            p.raw_file()
+                .map_or("—".into(), |r| format!("{:?}", r.dtype)),
+        ),
+        ("sample rate", format!("{:.1} kHz", sr / 1000.0)),
+        (
+            "duration",
+            format!("{:.1} s", p.n_samples().0 as f64 / sr.max(1.0) as f64),
+        ),
+        ("# channels", p.n_channels().to_string()),
+        ("# spikes", n_spikes.to_string()),
+        (
+            "# clusters",
+            format!("{alive} (ids up to {})", s.n_clusters()),
+        ),
+        (
+            "groups",
+            groups
+                .iter()
+                .map(|(g, n)| format!("{g} {n}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        (
+            "# templates",
+            if n_templates > 0 {
+                format!("{n_templates} × {n_t} samples")
+            } else {
+                "—".into()
+            },
+        ),
+        (
+            "pc features",
+            if n_pcs > 0 {
+                format!("{n_pcs} PCs × {n_pc_ch} channels")
+            } else {
+                "— (FeatureView fits PCs on raw snippets)".into()
+            },
+        ),
+        ("labels", {
+            let k = s.custom_label_keys();
+            if k.is_empty() {
+                "—".into()
+            } else {
+                k.join(", ")
+            }
+        }),
+        ("undo history", s.history_len().to_string()),
+    ];
+    rows.iter().map(|(k, v)| format!("{k:<14}{v}\n")).collect()
+}
+
 struct Serve;
 impl SessionVisitor for Serve {
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
@@ -1125,6 +1238,9 @@ where
     if !ctx.shanks.is_empty() {
         app.set_channel_shanks(ctx.shanks);
     }
+    if !ctx.metrics.is_empty() {
+        app.set_cluster_metrics(ctx.metrics);
+    }
     if let Some(f) = ctx.depth_source {
         app.set_depth_source(f);
     }
@@ -1146,6 +1262,7 @@ where
             if let Some(rs) = cc.wgpu_render_state.as_ref() {
                 TracePipeline::install(rs);
                 RasterPipeline::install(rs);
+                ScatterPipeline::install(rs);
                 app.install_gpu_compute(rs.device.clone().into(), rs.queue.clone().into());
             } else {
                 log::warn!("no wgpu render state available; trace view will not render");
@@ -1230,6 +1347,7 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Diff { a, b, json }) => diff_tsvs(&a, &b, json),
         Some(Cmd::Serve { open }) => with_session(&open, Serve),
+        Some(Cmd::Describe { open }) => with_session(&open, Describe),
         Some(Cmd::Report {
             open,
             out,

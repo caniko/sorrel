@@ -24,6 +24,9 @@ struct TraceUniforms {
     n_channels_inv: f32,
     amp_scale: f32,
     color: [f32; 4],
+    /// `-1.0` puts channel 0 at the bottom (phy `switch_origin`).
+    flip: f32,
+    _pad: [f32; 3],
 }
 
 const VERTEX_SIZE: u64 = std::mem::size_of::<TraceVertex>() as u64;
@@ -227,6 +230,8 @@ pub struct TraceCallback {
     pub t_span: f32,
     pub amp_scale: f32,
     pub color: [f32; 4],
+    /// Channel 0 at the bottom instead of the top.
+    pub flip: bool,
 }
 
 impl egui_wgpu::CallbackTrait for TraceCallback {
@@ -256,6 +261,8 @@ impl egui_wgpu::CallbackTrait for TraceCallback {
             },
             amp_scale: self.amp_scale,
             color: self.color,
+            flip: if self.flip { -1.0 } else { 1.0 },
+            _pad: [0.0; 3],
         };
         pipeline.upload(device, queue, &self.vertices, self.generation, uniforms);
         Vec::new()
@@ -286,6 +293,10 @@ struct Uniforms {
     n_channels_inv: f32,
     amp_scale: f32,
     color: vec4<f32>,
+    flip: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -301,7 +312,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
     // y_center for channel ch in clip space (top = +1, bottom = -1):
     //   row 0 should sit near the top, last row near the bottom.
     let row = f32(input.channel) + 0.5;
-    let y_center = 1.0 - row * 2.0 * u.n_channels_inv;
+    let y_center = u.flip * (1.0 - row * 2.0 * u.n_channels_inv);
     let y_clip = y_center - input.pos.y * u.amp_scale;
     var out: VertexOut;
     out.clip_pos = vec4<f32>(x_clip, y_clip, 0.0, 1.0);
