@@ -32,6 +32,10 @@ pub enum ClusterColumn {
     Similarity,
     /// A column of the dataset's quality-metrics table, by name.
     Metric(String),
+    /// `Auto[<sorter>]` / `Sorrel[<method>]`; the hover shows the lineage.
+    Origin,
+    /// Free-text per-cluster note (`:note`).
+    Note,
 }
 
 impl ClusterColumn {
@@ -50,6 +54,8 @@ impl ClusterColumn {
             Self::Quality => "qual",
             Self::Label => "label",
             Self::Tags => "tags",
+            Self::Origin => "origin",
+            Self::Note => "note",
             Self::Similarity => "similarity",
             Self::Metric(m) => m,
         }
@@ -58,7 +64,7 @@ impl ClusterColumn {
     fn header(&self) -> &str {
         match self {
             Self::Id => "ID",
-            Self::SpikeCount => "# spikes",
+            Self::SpikeCount => "n",
             Self::IsiViolations => "ISI<1ms",
             other => other.name(),
         }
@@ -71,9 +77,10 @@ impl ClusterColumn {
             Self::Shank => "Shank of the peak channel",
             Self::Depth => "Probe y of the peak channel (µm)",
             Self::FiringRate => "Spikes per second",
-            Self::SpikeCount => "Spike count",
+            Self::SpikeCount => "n_spikes: spike count",
             Self::Amplitude => {
-                "Peak-to-peak of the primary template (mean spike amplitude without templates)"
+                "Mean spike amplitude × peak-to-peak of the primary template, as in phy \
+                 (mean spike amplitude alone without templates)"
             }
             Self::IsiViolations => "Inter-spike intervals under 1 ms (refractory violations)",
             Self::Quality => "Composite quality 0–1: green ≥ 0.7, yellow ≥ 0.4, red below",
@@ -82,6 +89,11 @@ impl ClusterColumn {
                 "Provenance from `sorrel auto` (src:*, merged:*, bc:*, conf:*); review:* in red. \
                  Sort puts the review queue first"
             }
+            Self::Origin => {
+                "Where the unit came from: Auto[<sorter>] or Sorrel[Manual|Algo:x|LLM:x]; \
+                 hover for the lineage"
+            }
+            Self::Note => "Free-text note (:note text); first line shown, hover for all",
             Self::Similarity => "Template similarity to the last selected cluster",
             Self::Metric(_) => "Metric from the dataset's quality-metrics file",
         }
@@ -89,17 +101,25 @@ impl ClusterColumn {
 
     /// Everything but the id, the label and the tags is a right-aligned number.
     fn numeric(&self) -> bool {
-        !matches!(self, Self::Id | Self::Label | Self::Tags)
+        !matches!(
+            self,
+            Self::Id | Self::Label | Self::Tags | Self::Origin | Self::Note
+        )
     }
 
     fn width(&self) -> f32 {
         match self {
-            Self::Id => 44.0,
-            Self::SpikeCount => 65.0,
+            // Default six (ID, ch, fr, n, qual, label) must fit the 300 px
+            // default panel: 42+28+46+50+40+56 plus 6 px gaps.
+            Self::Id => 42.0,
+            Self::SpikeCount => 50.0,
+            Self::FiringRate => 46.0,
             Self::IsiViolations => 60.0,
-            Self::Quality | Self::Channel | Self::Shank => 42.0,
+            Self::Quality => 40.0,
+            Self::Channel | Self::Shank => 28.0,
             Self::Label => 56.0,
             Self::Tags => 70.0,
+            Self::Origin | Self::Note => 120.0,
             _ => 56.0,
         }
     }
@@ -369,7 +389,28 @@ pub struct ClusterRows {
     has_sh: bool,
     has_depth: bool,
     has_tags: bool,
+    /// Per cluster: origin label (and its lowercase, for filtering), note,
+    /// and the lineage hover text.
+    origin: Vec<String>,
+    origin_lc: Vec<String>,
+    note: Vec<String>,
+    lineage: Vec<String>,
     metric_names: Vec<String>,
+}
+
+/// Hover text for the origin cell; empty without parents.
+fn lineage(sorrel: bool, parents: &[ClusterId]) -> String {
+    let ids = parents
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    match (sorrel, parents.len()) {
+        (_, 0) => String::new(),
+        (true, 1) => format!("split from {ids}"),
+        (true, _) => format!("merged from {ids}"),
+        (false, _) => format!("absorbed {ids}"),
+    }
 }
 
 /// Names of the fixed numeric columns, in storage order.
@@ -394,6 +435,16 @@ fn peak_ptp(template: &[f32], n_channels: usize) -> Option<(usize, f64)> {
     (0..n_channels)
         .map(|ch| (ch, (hi[ch] - lo[ch]) as f64))
         .max_by(|a, b| a.1.total_cmp(&b.1))
+}
+
+/// phy's ClusterView amplitude: mean spike amplitude × primary-template
+/// peak-to-peak; either alone when the other is missing.
+fn amp_value(mean_amp: Option<f64>, ptp: Option<f64>) -> f64 {
+    match (mean_amp, ptp) {
+        (Some(a), Some(p)) => a * p,
+        (Some(v), None) | (None, Some(v)) => v,
+        (None, None) => f64::NAN,
+    }
 }
 
 impl ClusterRows {
@@ -434,11 +485,8 @@ impl ClusterRows {
                 }
                 let amps = session.spike_amplitudes(c);
                 r[3] = times.len() as f64 / duration_s.max(f64::MIN_POSITIVE);
-                r[4] = if amps.is_empty() {
-                    f64::NAN
-                } else {
-                    mean_amplitude(amps) as f64
-                };
+                let mean_amp = (!amps.is_empty()).then(|| mean_amplitude(amps) as f64);
+                let mut ptp_val = None;
                 if let Some((ch, ptp)) = session
                     .primary_template(c)
                     .and_then(|t| session.template_waveform(t))
@@ -447,8 +495,9 @@ impl ClusterRows {
                     r[0] = ch as f64;
                     r[1] = inputs.shanks.get(ch).map_or(f64::NAN, |&s| s as f64);
                     r[2] = inputs.positions.get(ch).map_or(f64::NAN, |p| p[1] as f64);
-                    r[4] = ptp;
+                    ptp_val = Some(ptp);
                 }
+                r[4] = amp_value(mean_amp, ptp_val);
                 r[6] = isi_violations(times, isi_window) as f64;
                 r[7] = quality_breakdown(times, amps, refractory, total, sr, 50).composite() as f64;
                 let tags = session.tags(c);
@@ -466,6 +515,19 @@ impl ClusterRows {
         self.has_sh = !inputs.shanks.is_empty() && rows.iter().any(|r| r[1].is_finite());
         self.has_depth = rows.iter().any(|r| r[2].is_finite());
         self.has_tags = (0..n as u32).any(|c| !session.tags(ClusterId(c)).is_empty());
+        let ids = || (0..n as u32).map(ClusterId);
+        self.origin = ids().map(|c| session.origin_label(c)).collect();
+        self.origin_lc = self.origin.iter().map(|o| o.to_ascii_lowercase()).collect();
+        self.note = ids().map(|c| session.note(c).to_owned()).collect();
+        self.lineage = ids()
+            .map(|c| {
+                let sorrel = matches!(
+                    session.origin(c),
+                    sorrel_data::command::UnitOrigin::Sorrel(_)
+                );
+                lineage(sorrel, session.parents(c))
+            })
+            .collect();
         self.group = (0..n as u32)
             .map(|c| label_str(&session.label(ClusterId(c)).unwrap_or_default()))
             .collect();
@@ -504,6 +566,29 @@ impl ClusterRows {
             .map(|(_, v)| v.as_slice())
     }
 
+    /// String cells (`group`/`label`, `origin`, `note`) for filter lookups.
+    fn str_cell(&self, name: &str, c: ClusterId) -> Option<Val> {
+        let col: &[String] = match name.to_ascii_lowercase().as_str() {
+            "origin" => &self.origin,
+            "note" => &self.note,
+            "group" | "label" => {
+                return self.group.get(c.idx()).map(|g| Val::Str((*g).to_owned()));
+            }
+            _ => return None,
+        };
+        col.get(c.idx()).map(|s| Val::Str(s.clone()))
+    }
+
+    /// Non-expression filter text: id, tag or origin label substring.
+    fn matches_text(&self, c: ClusterId, filter: &str, tags: &[String]) -> bool {
+        c.to_string().contains(filter)
+            || tags.iter().any(|t| t.contains(filter))
+            // Origin matches case-insensitively, so `llm` finds `Sorrel[LLM:..]`.
+            || self.origin_lc.get(c.idx()).is_some_and(|o| {
+                o.contains(&filter.to_ascii_lowercase())
+            })
+    }
+
     /// The columns this dataset can show, in display order. `similar` adds
     /// the similarity column right after the id.
     fn columns(&self, similar: bool) -> Vec<ClusterColumn> {
@@ -523,6 +608,8 @@ impl ClusterRows {
             (true, Quality),
             (true, Label),
             (self.has_tags, Tags),
+            (true, Origin),
+            (true, Note),
         ] {
             if show {
                 v.push(col);
@@ -605,6 +692,8 @@ impl ClusterTableState {
             Quality,
             Label,
             Tags,
+            Origin,
+            Note,
             Similarity,
         ]
         .into_iter()
@@ -684,18 +773,52 @@ pub struct TableCtx<'a> {
 }
 
 /// Right-click header menu: one checkbox per column.
-fn column_menu(ui: &mut Ui, all: &[ClusterColumn], hidden: &mut Vec<String>) {
-    for c in all.iter().filter(|c| **c != ClusterColumn::Id) {
-        let pos = hidden.iter().position(|h| h.eq_ignore_ascii_case(c.name()));
-        let mut shown = pos.is_none();
+fn column_menu(ui: &mut Ui, all: &[ClusterColumn], hidden: &mut Vec<String>, similar: bool) {
+    for c in all
+        .iter()
+        .filter(|c| !matches!(c, ClusterColumn::Id | ClusterColumn::Similarity))
+    {
+        let mut shown = col_shown(c, hidden, similar);
         if ui.checkbox(&mut shown, c.name()).changed() {
-            match pos {
-                Some(p) => {
-                    hidden.remove(p);
-                }
-                None => hidden.push(c.name().to_owned()),
-            }
+            toggle_col(c, hidden, similar);
         }
+    }
+}
+
+/// Columns off until the user opts in (a `+name` entry in the prefs'
+/// hidden list; plain `name` entries still hide, so old prefs load as
+/// before). The Similar table is leaner: ch and fr are opt-in there too.
+fn opt_in(c: &ClusterColumn, similar: bool) -> bool {
+    use ClusterColumn::*;
+    matches!(
+        c,
+        Shank | Depth | Amplitude | IsiViolations | Tags | Origin | Note
+    ) || (similar && matches!(c, Channel | FiringRate))
+}
+
+fn has_entry(hidden: &[String], key: &str) -> Option<usize> {
+    hidden.iter().position(|h| h.eq_ignore_ascii_case(key))
+}
+
+fn col_shown(c: &ClusterColumn, hidden: &[String], similar: bool) -> bool {
+    if opt_in(c, similar) {
+        has_entry(hidden, &format!("+{}", c.name())).is_some()
+    } else {
+        has_entry(hidden, c.name()).is_none()
+    }
+}
+
+fn toggle_col(c: &ClusterColumn, hidden: &mut Vec<String>, similar: bool) {
+    let key = if opt_in(c, similar) {
+        format!("+{}", c.name())
+    } else {
+        c.name().to_owned()
+    };
+    match has_entry(hidden, &key) {
+        Some(p) => {
+            hidden.remove(p);
+        }
+        None => hidden.push(key),
     }
 }
 
@@ -708,7 +831,8 @@ fn header_label(ui: &mut Ui, label: &str, active: bool, up: bool, right: bool) -
         let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 10.0), Sense::hover());
         if active {
             let c = r.center();
-            let (a, b) = if up { (2.5, -2.5) } else { (-2.5, 2.5) };
+            // Apex up for ascending (▲), down for descending (▼).
+            let (a, b) = if up { (-2.5, 2.5) } else { (2.5, -2.5) };
             ui.painter().add(egui::Shape::convex_polygon(
                 vec![
                     egui::pos2(c.x - 4.0, c.y - a),
@@ -761,38 +885,41 @@ pub fn cluster_table<P: DataProvider>(
     // lives in the panel heading.
     // The panel has no side margin so the table runs edge to edge; the
     // strip pads itself.
-    egui::Frame::new()
-        .inner_margin(egui::Margin::symmetric(12, 0))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let label = ui.label("filter:");
-                let edit = ui
-                    .add(
-                        egui::TextEdit::singleline(&mut state.filter_text)
-                            .desired_width(ui.available_width())
-                            .hint_text("id, tag or n_spikes > 50 and group == \"good\""),
-                    )
-                    .labelled_by(label.id);
-                // Esc clears the field; egui drops focus on Esc in the same frame.
-                if (edit.has_focus() || edit.lost_focus())
-                    && ui.input(|i| i.key_pressed(egui::Key::Escape))
-                {
-                    state.filter_text.clear();
-                }
-                edit.on_hover_text(
-                    "Cluster id or part of a tag (e.g. merged, src:llm, bc:snr), or a phy \
+    // The Similar table has no filter strip (the Clusters pane owns it).
+    if similar.is_none() {
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(12, 0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let label = ui.label("filter:");
+                    let edit = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut state.filter_text)
+                                .desired_width(ui.available_width())
+                                .hint_text("id, tag or n_spikes > 50"),
+                        )
+                        .labelled_by(label.id);
+                    // Esc clears the field; egui drops focus on Esc in the same frame.
+                    if (edit.has_focus() || edit.lost_focus())
+                        && ui.input(|i| i.key_pressed(egui::Key::Escape))
+                    {
+                        state.filter_text.clear();
+                    }
+                    edit.on_hover_text(
+                        "Cluster id or part of a tag (e.g. merged, src:llm, bc:snr), or a phy \
                      expression: columns, == != < <= > >=, and/or/not, parentheses; \
-                     `group` is the label. Esc clears",
-                );
+                     `group` is the label, e.g. n_spikes > 50 and group == \"good\". Esc clears",
+                    );
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut state.hide_empty, "hide empty");
+                    ui.checkbox(&mut state.hide_noise, "hide noise");
+                    ui.checkbox(&mut state.review_only, "review").on_hover_text(
+                        "Only clusters `sorrel auto` tagged review:*; any edit clears the tag",
+                    );
+                });
             });
-            ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut state.hide_empty, "hide empty");
-                ui.checkbox(&mut state.hide_noise, "hide noise");
-                ui.checkbox(&mut state.review_only, "review").on_hover_text(
-                    "Only clusters `sorrel auto` tagged review:*; any edit clears the tag",
-                );
-            });
-        });
+    }
     ui.add_space(4.0);
 
     let n = session.n_clusters() as usize;
@@ -814,7 +941,7 @@ pub fn cluster_table<P: DataProvider>(
     let filter = state.filter_text.trim();
     let expr = Expr::parse(filter);
     let lookup = |name: &str, c: ClusterId| match name.to_ascii_lowercase().as_str() {
-        "group" | "label" => rows.group.get(c.idx()).map(|g| Val::Str((*g).to_owned())),
+        "group" | "label" | "origin" | "note" => rows.str_cell(name, c),
         "id" => Some(Val::Num(c.as_f64())),
         "similarity" if similar.is_some() => {
             Some(Val::Num(sim.get(c.idx()).copied().unwrap_or(f64::NAN)))
@@ -842,7 +969,7 @@ pub fn cluster_table<P: DataProvider>(
             match &expr {
                 // A row whose predicate errors stays visible, as in phy.
                 Some(e) => e.eval(&|name| lookup(name, i)).unwrap_or(true),
-                None => i.to_string().contains(filter) || tags.iter().any(|t| t.contains(filter)),
+                None => rows.matches_text(i, filter, tags),
             }
         })
         .collect();
@@ -857,18 +984,40 @@ pub fn cluster_table<P: DataProvider>(
         sort_vals.map_or(c.as_f64(), |v| v.get(c.idx()).copied().unwrap_or(f64::NAN))
     };
     let desc = state.sort_descending;
-    visible.sort_by(|&a, &b| cmp_nan_last(key(a), key(b), desc).then(a.cmp(&b)));
+    let text_col: Option<&[String]> = match &state.sort_by {
+        ClusterColumn::Origin => Some(&rows.origin),
+        ClusterColumn::Note => Some(&rows.note),
+        _ => None,
+    };
+    if let Some(t) = text_col {
+        let s = |c: ClusterId| t.get(c.idx()).map_or("", String::as_str);
+        visible.sort_by(|&a, &b| {
+            let o = s(a).cmp(s(b));
+            (if desc { o.reverse() } else { o }).then(a.cmp(&b))
+        });
+    } else {
+        visible.sort_by(|&a, &b| cmp_nan_last(key(a), key(b), desc).then(a.cmp(&b)));
+    }
 
     let all = rows.columns(similar.is_some());
     let shown: Vec<ClusterColumn> = all
         .iter()
         .filter(|c| {
-            **c == ClusterColumn::Id || !hidden.iter().any(|h| h.eq_ignore_ascii_case(c.name()))
+            matches!(c, ClusterColumn::Id | ClusterColumn::Similarity)
+                || col_shown(c, hidden, similar.is_some())
         })
         .cloned()
         .collect();
     // Wider than the panel: scroll sideways instead of squeezing.
-    let scroll = shown.iter().map(|c| c.width() + 6.0).sum::<f32>() + 40.0 > ui.available_width();
+    // The last column is a remainder (min 40 px), so it only needs 40 px.
+    let scroll = shown
+        .iter()
+        .rev()
+        .skip(1)
+        .map(|c| c.width() + 6.0)
+        .sum::<f32>()
+        + 40.0
+        > ui.available_width();
 
     // Keep the keyboard anchor in view: scroll minimally (no alignment) and
     // only when the anchor changed, so clicking a visible row or wheeling
@@ -889,6 +1038,7 @@ pub fn cluster_table<P: DataProvider>(
         v.and_then(|v| v.get(i.idx()).copied()).unwrap_or(f64::NAN)
     };
 
+    let is_similar = similar.is_some();
     let sort_col = state.sort_by.clone();
     let up = !state.sort_descending;
     let mut draw = |ui: &mut Ui| {
@@ -906,10 +1056,22 @@ pub fn cluster_table<P: DataProvider>(
         ui.spacing_mut().item_spacing.x = 6.0;
         // egui_extras adds item_spacing.y between rows; rows are 24 px flat.
         ui.spacing_mut().item_spacing.y = 0.0;
+        // Body viewport = a whole number of rows. The scroll area otherwise
+        // fills whatever height is left, so its maximum offset is not a
+        // multiple of the row height and a row sits half-clipped under the
+        // header whenever the list is scrolled to the end (selected row near
+        // the bottom).
+        const HEADER_H: f32 = 26.0;
+        const ROW_H: f32 = 24.0;
+        let body_h = ((ui.available_height() - HEADER_H) / ROW_H)
+            .floor()
+            .max(1.0)
+            * ROW_H;
         // Not resizable: resize handles draw column rules down the whole panel.
         let mut table = TableBuilder::new(ui)
             .striped(true)
             .resizable(false)
+            .max_scroll_height(body_h)
             .sense(Sense::click())
             // Shrink vertically so the column rules stop at the last row.
             .auto_shrink([false, true]);
@@ -922,10 +1084,12 @@ pub fn cluster_table<P: DataProvider>(
             };
         }
         if let Some(row) = scroll_to {
+            // Minimal scroll: with a whole-row viewport the offset lands on a
+            // row boundary (row at the top or bottom edge), never half-clipped.
             table = table.scroll_to_row(row, None);
         }
         table
-            .header(26.0, |mut h| {
+            .header(HEADER_H, |mut h| {
                 for col in &shown {
                     h.col(|ui| {
                         // Rule under the header, unclipped so it spans the gaps.
@@ -948,7 +1112,7 @@ pub fn cluster_table<P: DataProvider>(
                             let r =
                                 header_label(ui, col.header(), sort_col == *col, up, col.numeric())
                                     .on_hover_text(col.tip());
-                            r.context_menu(|ui| column_menu(ui, &all, hidden));
+                            r.context_menu(|ui| column_menu(ui, &all, hidden, is_similar));
                             if r.clicked() {
                                 clicked = Some(col.clone());
                             }
@@ -957,28 +1121,19 @@ pub fn cluster_table<P: DataProvider>(
                 }
             })
             .body(|body| {
-                body.rows(24.0, visible.len(), |mut row| {
+                body.rows(ROW_H, visible.len(), |mut row| {
                     let i = visible[row.index()];
                     let slot = selected.iter().position(|&c| c == i);
                     row.set_selected(slot.is_some());
                     let group = rows.group.get(i.idx()).copied().unwrap_or("unsorted");
-                    // phy: good in green, mua and noise dimmed. Selected rows
-                    // keep the normal text so the selection stays legible.
-                    let tint = match (slot, group) {
-                        (Some(_), _) => None,
-                        (None, "good") => Some(theme.label_colour(group)),
-                        (None, "mua" | "noise") => Some(theme.caption),
-                        _ => None,
-                    };
+                    // Only the label cell carries the label colour.
                     for col in &shown {
                         row.col(|ui| {
-                            if tint.is_some() {
-                                ui.visuals_mut().override_text_color = tint;
-                            }
                             match col {
                                 ClusterColumn::Id => {
                                     let cell = ui.max_rect();
                                     ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 3.0;
                                         ui.add_space(4.0);
                                         // The swatch slot is always allocated so ids don't
                                         // shift when a row becomes selected.
@@ -1043,6 +1198,24 @@ pub fn cluster_table<P: DataProvider>(
                                     .response
                                     .on_hover_text(tags.join("\n"));
                                 }
+                                ClusterColumn::Origin => {
+                                    let text = rows.origin.get(i.idx()).map_or("", String::as_str);
+                                    let r = ui.add(egui::Label::new(text).truncate());
+                                    if let Some(l) =
+                                        rows.lineage.get(i.idx()).filter(|l| !l.is_empty())
+                                    {
+                                        r.on_hover_text(l);
+                                    }
+                                }
+                                ClusterColumn::Note => {
+                                    let note = rows.note.get(i.idx()).map_or("", String::as_str);
+                                    if note.is_empty() {
+                                        return;
+                                    }
+                                    let first = note.lines().next().unwrap_or("");
+                                    ui.add(egui::Label::new(first).truncate())
+                                        .on_hover_text(note);
+                                }
                                 num => {
                                     let v = value(num, i);
                                     // NaN is "no value": blank.
@@ -1076,6 +1249,7 @@ pub fn cluster_table<P: DataProvider>(
     };
     let (clicked, picked) = if scroll {
         egui::ScrollArea::horizontal()
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .auto_shrink([false, true])
             .show(ui, draw)
             .inner
@@ -1197,6 +1371,77 @@ mod tests {
         v.sort_by(|a, b| cmp_nan_last(*a, *b, true));
         assert_eq!(&v[..3], &[3.0, 2.0, 1.0]);
         assert!(v[3].is_nan());
+    }
+
+    #[test]
+    fn amp_is_mean_amplitude_times_template_ptp_with_fallbacks() {
+        assert_eq!(amp_value(Some(2.0), Some(1.5)), 3.0);
+        assert_eq!(amp_value(Some(2.0), None), 2.0);
+        assert_eq!(amp_value(None, Some(1.5)), 1.5);
+        assert!(amp_value(None, None).is_nan());
+    }
+
+    #[test]
+    fn optional_columns_are_opt_in_and_defaults_show_the_rest() {
+        use ClusterColumn::*;
+        let mut hidden: Vec<String> = Vec::new();
+        for c in [Id, Channel, FiringRate, SpikeCount, Quality, Label] {
+            assert!(col_shown(&c, &hidden, false), "{c:?}");
+        }
+        for c in [Depth, Shank, Amplitude, IsiViolations, Tags] {
+            assert!(!col_shown(&c, &hidden, false), "{c:?}");
+        }
+        toggle_col(&Amplitude, &mut hidden, false);
+        assert!(col_shown(&Amplitude, &hidden, false));
+        toggle_col(&Amplitude, &mut hidden, false);
+        assert!(hidden.is_empty());
+        // Old prefs hid by name; that still hides default columns.
+        toggle_col(&Channel, &mut hidden, false);
+        assert_eq!(hidden, ["ch"]);
+        assert!(!col_shown(&Channel, &hidden, false));
+        // The Similar table also opts ch and fr in.
+        assert!(!col_shown(&FiringRate, &[], true));
+    }
+
+    #[test]
+    fn origin_and_note_filter_sort_and_lineage() {
+        let rows = ClusterRows {
+            origin: vec!["Auto[kilosort4]".into(), "Sorrel[Manual]".into()],
+            origin_lc: vec!["auto[kilosort4]".into(), "sorrel[manual]".into()],
+            note: vec![String::new(), "check me".into()],
+            group: vec!["good", "mua"],
+            ..Default::default()
+        };
+        let llm = ClusterRows {
+            origin: vec!["Sorrel[LLM:x]".into()],
+            origin_lc: vec!["sorrel[llm:x]".into()],
+            ..Default::default()
+        };
+        assert!(llm.matches_text(ClusterId(0), "llm", &[]));
+        let visible = |text: &str| -> Vec<u32> {
+            let expr = Expr::parse(text);
+            (0..2u32)
+                .map(ClusterId)
+                .filter(|&c| match &expr {
+                    Some(e) => e.eval(&|n| rows.str_cell(n, c)).unwrap_or(true),
+                    None => rows.matches_text(c, text, &[]),
+                })
+                .map(|c| c.0)
+                .collect()
+        };
+        assert_eq!(visible("origin == \"Sorrel[Manual]\""), [1]);
+        assert_eq!(visible("note != \"\""), [1]);
+        assert_eq!(visible("kilosort4"), [0]);
+        assert_eq!(lineage(true, &[ClusterId(12)]), "split from 12");
+        assert_eq!(
+            lineage(false, &[ClusterId(4), ClusterId(9)]),
+            "absorbed 4, 9"
+        );
+        assert_eq!(lineage(false, &[]), "");
+        for c in [ClusterColumn::Origin, ClusterColumn::Note] {
+            assert!(!col_shown(&c, &[], false), "{c:?} is opt-in");
+            assert!(!c.numeric());
+        }
     }
 
     #[test]
