@@ -19,8 +19,9 @@ compute kernels are all statically dispatched.
 3. `Session::new` holds the provider and journal. `seed_*` calls bucket
    amplitudes, templates, PC features, and template waveforms once so
    hot-path lookups are O(1) slice borrows.
-4. `replay_journal` re-applies every prior `CurationCommand` (including
-   undo/redo records) so the open state matches the last running state.
+4. `replay_journal` rebuilds the action tree from the journal and applies
+   the path from the sort as loaded to the current edit, so the open state
+   matches the last running state.
 
 ## Cache
 
@@ -40,8 +41,11 @@ files. See [Derived Cache](./cache.md) for the full contract.
 ## Edit
 
 `CurationCommand` is a closed enum: `Relabel`, `Merge`, `Split`,
-`Note`, `Batch`, `Undo`, `Redo`. The session applies a command in two
-strictly-ordered steps:
+`Note`, `Tag`, `AddSpikes`, `Batch`, `Undo`, `Redo`. Every frontend (GUI,
+MCP, remote) edits through `SessionHost::apply`, which tags the edit with
+its actor and announces it to subscribers. A forward command becomes a new
+node under the current one; `Undo`/`Redo` and History clicks move the
+current node. The session applies an edit in two strictly-ordered steps:
 
 1. **Append to the journal.** A durable (fsynced) journal append is the
    point-of-no-return.
@@ -55,8 +59,8 @@ transition.
 ## Save
 
 `Cmd/Ctrl-S` writes `spike_clusters.npy` + `cluster_group.tsv` into the
-save directory and reseals the journal so future replays start from the
-new baseline rather than from the original sort.
+save directory and journals a seal. Replays still start from the original
+sort, kept in `sorrel_original/` for phy directories.
 
 ## Render
 

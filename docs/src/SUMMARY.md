@@ -19,6 +19,8 @@
 - [Automatic Curation](./usage/auto-curation.md)
 - [Spike rescue](./usage/rescue.md)
 - [Remote Work](./usage/remote.md)
+- [Agents & Headless Mode](./usage/agents.md)
+- [History](./usage/history.md)
 
 # Architecture
 

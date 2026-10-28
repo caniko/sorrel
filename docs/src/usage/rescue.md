@@ -41,7 +41,7 @@ For each target unit:
 | `--hybrid-frac F`          | off     | Inject hybrid spikes for a recall check. See [Hybrid check](#hybrid-check). |
 | `--json`                   | off     | Print the report as JSON.                                                   |
 | `--apply`                  | off     | Journal the additions as one undoable batch.                                |
-| `--save`                   | off     | With `--apply`, save with a journal reseal. See [Saving](#saving).          |
+| `--save`                   | off     | With `--apply`, save the directory. See [Saving](#saving).                  |
 | `--seed`                   | 1       | Random seed for the nulls and the hybrid injection.                         |
 
 The usual recording flags also apply, as for `sorrel auto`.
@@ -86,8 +86,9 @@ See the tag table in [Automatic Curation](./auto-curation.md#tags).
 
 ## Saving
 
-`--save` saves with a journal reseal. Because added spikes change the row
-count, the save rewrites every per-spike array in time order:
+`--save` saves the directory (see [Saving](./saving.md)). Because added
+spikes change the row count, the save rewrites every per-spike array in
+time order:
 
 - `spike_times.npy`, `spike_clusters.npy`, `spike_templates.npy`,
   `amplitudes.npy`, `pc_features.npy`, `template_features.npy`, every other
@@ -98,17 +99,19 @@ count, the save rewrites every per-spike array in time order:
 Safeguards:
 
 - Before the first rewrite, the originals are hard-linked into
-  `sorrel_original/`.
+  `sorrel_original/`. They are the sort as loaded, which the journal
+  replays onto, so the rescue stays undoable after the save.
 - phy's `.phy/` cache is renamed to `.phy.sorrel-stale`, so phy does not use
   it with the rewritten arrays.
 - A manifest of pending renames is written first, which makes the save
   crash-safe.
 - The save refuses to run if the directory holds an unknown per-spike
   `.npy`, because it cannot reorder that file.
-- A save without a reseal is refused while there are added spikes, because
-  the arrays would no longer match the journal.
+- Writing phy files elsewhere without the per-spike arrays (`journal replay`)
+  is refused while there are added spikes, because the arrays would no
+  longer match.
 
-Reopen the directory after saving.
+Undoing the rescue and saving again writes the original arrays back.
 
 ## New spike features
 

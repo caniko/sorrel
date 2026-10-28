@@ -9,6 +9,25 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
+- History that never discards: undo moves back, an edit after an undo starts
+  a branch, and the whole tree survives saving and reopening. A **History**
+  pane lists every edit with who made it and when, marks branches and saves,
+  and goes back to any edit on click. See [History](docs/src/usage/history.md).
+- One session host for the GUI, MCP agents and remote guests. Every edit is
+  journaled with its actor (you, an agent's client name, an algorithm, a
+  remote peer).
+- `sorrel mcp <DATA_DIR>` connects an agent to the GUI or headless host on
+  the directory, or serves the dataset itself. `sorrel --headless <DATA_DIR>`
+  runs the host without a window. See [Agents](docs/src/usage/agents.md).
+- Agent edits in the GUI: a toast names the agent and the edit, the touched
+  clusters are selected and tinted in the table, and the top bar lists the
+  connected agents with an activity dot.
+- **Direct | Propose** switch for agents. Under Propose, agent edits wait as
+  cards in the new **Proposals** pane; Accept applies one as your decision
+  (an accepted split keeps the agent as its method), Reject leaves the
+  not-merge / not-split memory.
+- Agents get `notifications/message` when someone else changes the session.
+
 - Unit origin: every unit is `Auto[<sorter>]` or `Sorrel[Manual]`,
   `Sorrel[Algo:<name>]` or `Sorrel[LLM:<name>]`, with direct parents and a
   free-text note (`:note`). Auto units edited in sorrel are tagged `tuned` or
@@ -28,9 +47,24 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Changed
 
-- The curation journal is format v2 (`Split` records how the unit was made,
-  plus `AddSpikes`). v1 journals are upgraded on open; sorrel 0.2.x refuses
-  a v2 journal instead of truncating it. Remote protocol v2.
+- The curation journal is format v3, a tree of edits with their actor and
+  time, head moves and save seals. v1 and v2 journals are upgraded on open,
+  their undone commands kept as branches; sorrel 0.2.x refuses a v3 journal
+  ("bad magic") instead of truncating it. Remote protocol v3.
+- Saving no longer clears the undo history. For phy directories, the first
+  save that replaces a file keeps its original in `sorrel_original/` (listed
+  in `sorrel_original/ROOT`), and reopening replays the journal onto those
+  originals.
+- Opening a phy directory whose `spike_clusters.npy` or `cluster_group.tsv`
+  changed outside sorrel since its last save (e.g. curated in phy) fails
+  instead of letting the next save overwrite that work.
+  `--discard-journal` now renames the journal and `sorrel_original/` aside
+  instead of deleting them.
+- After a rescue save, undoing the rescue and saving again writes the
+  original per-spike arrays back; the directory no longer needs a reopen.
+- `sorrel serve` is now an alias of `sorrel mcp`. MCP agents can edit while
+  the GUI is open; `propose`, `select` and `selection` work in the same
+  server.
 - Suggestions are memoised per cluster. Re-ranking after an edit takes
   137 ms instead of 807 ms on 1000 clusters and 2M spikes (about 5.7×).
 - Merge suggestions include drift-fragment pairs: nearby peak channels with
@@ -78,8 +112,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   - The top bar is 36 px and tab bars are 30 px, with 6 px gaps between panes.
   - The cluster panel opens at 340 px.
 - **Save state is always visible.** A chip next to the title reads
-  "unsaved", "saved" or "save failed". Hovering it shows the save path,
-  whether the undo history was sealed, or the full error.
+  "unsaved", "saved" or "save failed". Hovering it shows the save path or
+  the full error.
   - A Save button joins Undo, Redo and Merge, and Merge names its target
     ("Merge 2 -> c1").
   - The save message no longer prints over the toolbar.

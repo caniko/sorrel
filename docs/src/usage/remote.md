@@ -33,6 +33,15 @@ Only one writer exists while a share is active: the host runs headless and
 only applies what the guest sends. Open the host directory normally after
 the share ends.
 
+Current limits of protocol v3:
+
+- The guest's edits reach the host as journal records, so they appear in
+  the host's History with the actor `guest`.
+- An undo, redo or save the guest made while disconnected cannot be pushed
+  to the host; `join` refuses and asks for a fresh join directory.
+- `sorrel_original/` travels with the other files, so the guest replays the
+  same history the host has, saves included.
+
 ## Pairing
 
 `share` prints six words. Both machines derive their network identities
