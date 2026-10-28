@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-28
+
 ### Added
 
 - Unit origin: every unit is `Auto[<sorter>]` or `Sorrel[Manual]`,
@@ -416,5 +418,6 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Downstream dry-runs can fail until their local path dependencies have been
   published in order. See `RELEASE.md` for the publish sequence.
 
-[Unreleased]: https://github.com/caniko/sorrel/compare/0.2.1...HEAD
+[Unreleased]: https://github.com/caniko/sorrel/compare/0.2.2...HEAD
+[0.2.2]: https://github.com/caniko/sorrel/compare/0.2.1...0.2.2
 [0.2.1]: https://github.com/caniko/sorrel/compare/0.2.0...0.2.1
