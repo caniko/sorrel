@@ -217,6 +217,9 @@ struct Unit {
     primary: u32,
     /// Accepted spike times, ascending.
     times: Vec<u64>,
+    /// Per `times` entry: the spike is on the primary template, so the
+    /// model describes it (only those are subtracted).
+    fit: Vec<bool>,
     chans: Vec<u32>,
     /// `C x NT` channel-major raw-space (preprocessed) templates.
     global: Vec<f32>,
@@ -263,8 +266,99 @@ struct Ctx<'a> {
     shanks: &'a [u32],
     c: usize,
     block: usize,
-    noise: Vec<f32>,
-    noise_n: usize,
+    /// Random recording windows with the templates of the spikes near each.
+    pool: Vec<NoiseWin>,
+    /// Per template, the channels it reaches; empty when unknown.
+    foot: Vec<Vec<bool>>,
+}
+
+/// `NOISE_LEN x nc` preprocessed rows and the template of every spike near them.
+struct NoiseWin {
+    rows: Vec<f32>,
+    tpl: Vec<u32>,
+}
+
+/// Candidate noise windows drawn per run; each unit keeps the ones that are
+/// clean on its own channels.
+const NOISE_POOL: usize = 8 * NOISE_WINDOWS;
+
+/// Channels each template reaches (peak-to-peak >= 20% of its largest); an
+/// empty entry, or no entries, means unknown.
+fn footprints<P: DataProvider>(s: &Session<P>, nc: usize) -> Vec<Vec<bool>> {
+    let (n_t, ns, tnc) = s.template_shape();
+    if tnc != nc {
+        return vec![];
+    }
+    (0..n_t as u32)
+        .map(|t| {
+            let Some(w) = s.template_waveform(t) else {
+                return vec![];
+            };
+            let ptp: Vec<f32> = (0..nc)
+                .map(|ch| {
+                    let (lo, hi) = (0..ns)
+                        .filter_map(|i| w.get(i * nc + ch))
+                        .fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+                    hi - lo
+                })
+                .collect();
+            let m = ptp.iter().copied().fold(0.0, f32::max);
+            ptp.iter().map(|&p| p >= 0.2 * m).collect()
+        })
+        .collect()
+}
+
+/// True when a spike near the window reaches one of `chans` (unknown
+/// footprints count as reaching them).
+fn window_hits(foot: &[Vec<bool>], tpl: &[u32], chans: &[u32]) -> bool {
+    tpl.iter().any(|&t| match foot.get(t as usize) {
+        Some(f) if !f.is_empty() => chans.iter().any(|&ch| f[ch as usize]),
+        _ => true,
+    })
+}
+
+/// Draw the noise pool shared by every unit's covariance estimate.
+fn build_ctx<'a, P: DataProvider>(
+    s: &Session<P>,
+    cfg: TracePreproc,
+    shanks: &'a [u32],
+    c: usize,
+    block: usize,
+    rng: &mut Rng,
+) -> Result<Ctx<'a>> {
+    let nc = s.provider.n_channels() as usize;
+    let n_samples = s.provider.n_samples().get() as usize;
+    let ci = s.cluster_index();
+    let (all, tg) = (ci.all_spike_times(), ci.spike_templates_global());
+    let mut pool = vec![];
+    for _ in 0..NOISE_POOL {
+        let ws = 300 + rng.below((n_samples - NOISE_LEN - 600) as u64);
+        let i = all.partition_point(|t| t.0 + (NT as u64) < ws);
+        let n = all[i..].partition_point(|t| t.0 <= ws + (NOISE_LEN + NT) as u64);
+        if let Some(rows) = extract_snippet(
+            &s.provider,
+            SampleIndex(ws + PRE as u64),
+            PRE as u32,
+            (NOISE_LEN - PRE - 1) as u32,
+            cfg,
+            shanks,
+        ) {
+            pool.push(NoiseWin {
+                rows,
+                tpl: tg[i..i + n].to_vec(),
+            });
+        }
+    }
+    ensure!(!pool.is_empty(), "could not read noise windows");
+    Ok(Ctx {
+        nc,
+        cfg,
+        shanks,
+        c,
+        block,
+        pool,
+        foot: footprints(s, nc),
+    })
 }
 
 /// Template, channels, noise precision and (targets) feature models of one unit.
@@ -352,17 +446,34 @@ fn train<P: DataProvider>(
         })
         .collect();
 
-    let mut sub = Vec::with_capacity(cx.noise_n * c);
-    for r in 0..cx.noise_n {
-        sub.extend(chans.iter().map(|&ch| cx.noise[r * nc + ch as usize]));
+    // Noise only needs to be spike-free on this unit's channels.
+    let mut sub = Vec::with_capacity(NOISE_WINDOWS * NOISE_LEN * c);
+    let mut rows = 0;
+    for w in cx
+        .pool
+        .iter()
+        .filter(|w| !window_hits(&cx.foot, &w.tpl, &chans))
+        .take(NOISE_WINDOWS)
+    {
+        for r in 0..NOISE_LEN {
+            sub.extend(chans.iter().map(|&ch| w.rows[r * nc + ch as usize]));
+        }
+        rows += NOISE_LEN;
     }
-    let cov_inv = estimate_noise_cov_inv(&sub, cx.noise_n, c, 0.01)?;
+    if rows < 4 * NOISE_LEN {
+        return None;
+    }
+    let cov_inv = estimate_noise_cov_inv(&sub, rows, c, 0.01)?;
 
+    let fit = (0..times.len())
+        .map(|i| tpl.get(i) == Some(&primary))
+        .collect();
     let mut u = Unit {
         id,
         target,
         primary,
         times,
+        fit,
         chans,
         global,
         blocks,
@@ -539,47 +650,8 @@ pub fn run<P: DataProvider<Label = PhyLabel>>(
     let target_ids = parse_targets(s, &a.units, &usable)?;
     ensure!(!target_ids.is_empty(), "no target units");
 
-    // Spike-free preprocessed samples shared by every unit's covariance.
     let all = ci.all_spike_times();
-    let mut noise = vec![];
-    let mut noise_n = 0;
-    for _ in 0..4000 {
-        if noise_n >= NOISE_WINDOWS * NOISE_LEN {
-            break;
-        }
-        let ws = 300 + rng.below((n_samples - NOISE_LEN - 600) as u64);
-        let i = all.partition_point(|t| t.0 + (NT as u64) < ws);
-        if all
-            .get(i)
-            .is_some_and(|t| t.0 <= ws + (NOISE_LEN + NT) as u64)
-        {
-            continue;
-        }
-        if let Some(v) = extract_snippet(
-            &s.provider,
-            SampleIndex(ws + PRE as u64),
-            PRE as u32,
-            (NOISE_LEN - PRE - 1) as u32,
-            cfg,
-            shanks,
-        ) {
-            noise.extend(v);
-            noise_n += NOISE_LEN;
-        }
-    }
-    ensure!(
-        noise_n >= 4 * NOISE_LEN,
-        "could not find spike-free noise windows"
-    );
-    let cx = Ctx {
-        nc,
-        cfg,
-        shanks,
-        c,
-        block,
-        noise,
-        noise_n,
-    };
+    let cx = build_ctx(s, cfg, shanks, c, block, &mut rng)?;
 
     let groups = groups_of(s);
     let mut skipped = vec![];
@@ -609,6 +681,15 @@ pub fn run<P: DataProvider<Label = PhyLabel>>(
     let mut blocked: Vec<u64> = unmodelled
         .iter()
         .flat_map(|&id| s.spike_times(ClusterId::new(id)).iter().map(|t| t.0))
+        // Spikes of a trained unit on its other templates are not modelled
+        // either: never subtracted, never re-detected.
+        .chain(units.iter().flat_map(|u| {
+            u.times
+                .iter()
+                .zip(&u.fit)
+                .filter(|(_, &f)| !f)
+                .map(|(&t, _)| t)
+        }))
         .collect();
     blocked.sort_unstable();
 
@@ -700,6 +781,33 @@ pub fn run<P: DataProvider<Label = PhyLabel>>(
             if !ok {
                 apply_preproc_cpu(&mut buf, nc, cfg, sr, shanks);
             }
+            // ponytail: accepted spikes are removed with one least-squares
+            // scale (clamped to SCALE) times the unit's template; overlaps
+            // are subtracted in sequence, not jointly. Spikes on the unit's
+            // other templates are left alone.
+            for u in &units {
+                let i0 = u.times.partition_point(|&t| (t as usize) < b0 + PRE);
+                for (&t, _) in u.times[i0..]
+                    .iter()
+                    .zip(&u.fit[i0..])
+                    .take_while(|(&t, _)| t as usize - PRE + NT <= b0 + n_time)
+                    .filter(|(_, &f)| f)
+                {
+                    let wl = t as usize - PRE - b0;
+                    let m = u.tmpl(b);
+                    let sc = clamp_scale(
+                        dot(&u.window(&buf, nc, wl), m) / dot(m, m).max(f32::MIN_POSITIVE),
+                    );
+                    for (ci_, &ch) in u.chans.iter().enumerate() {
+                        for k in 0..NT {
+                            buf[(wl + k) * nc + ch as usize] -= sc * m[ci_ * NT + k];
+                        }
+                    }
+                }
+            }
+            // The shifted-null passes score the buffer without injections,
+            // or the known spikes would count as false positives.
+            let clean = a.hybrid_frac.is_some().then(|| buf.clone());
             // ponytail: hybrid spikes are added after preprocessing (HP is
             // linear, CMR nearly so) instead of into the raw samples.
             for (ui, u) in units.iter().enumerate() {
@@ -717,27 +825,6 @@ pub fn run<P: DataProvider<Label = PhyLabel>>(
                     }
                 }
             }
-            // ponytail: accepted spikes are removed with one least-squares
-            // scale (clamped to SCALE) times the unit's template; overlaps
-            // are subtracted in sequence, not jointly.
-            for u in &units {
-                let i0 = u.times.partition_point(|&t| (t as usize) < b0 + PRE);
-                for &t in u.times[i0..]
-                    .iter()
-                    .take_while(|&&t| t as usize - PRE + NT <= b0 + n_time)
-                {
-                    let wl = t as usize - PRE - b0;
-                    let m = u.tmpl(b);
-                    let sc = clamp_scale(
-                        dot(&u.window(&buf, nc, wl), m) / dot(m, m).max(f32::MIN_POSITIVE),
-                    );
-                    for (ci_, &ch) in u.chans.iter().enumerate() {
-                        for k in 0..NT {
-                            buf[(wl + k) * nc + ch as usize] -= sc * m[ci_ * NT + k];
-                        }
-                    }
-                }
-            }
 
             let lo_s = margin.saturating_sub(NT / 2);
             let hi_s = (margin + len + NT / 2 + 1).min(n_time - NT + 1);
@@ -751,13 +838,17 @@ pub fn run<P: DataProvider<Label = PhyLabel>>(
                         }
                     })
                     .collect();
-                let scores = match mf.as_ref().map(|m| m.run(&buf, nc as u32, &bank, &shifts)) {
+                let src = match (pass, &clean) {
+                    (1.., Some(cl)) => cl,
+                    _ => &buf,
+                };
+                let scores = match mf.as_ref().map(|m| m.run(src, nc as u32, &bank, &shifts)) {
                     Some(Ok(v)) => v,
                     other => {
                         if let Some(Err(e)) = other {
                             log::warn!("GPU matched filter failed, using the CPU reference: {e}");
                         }
-                        matched_filter_reference(&buf, nc, &filt, &chans_flat, NT, c, &shifts)
+                        matched_filter_reference(src, nc, &filt, &chans_flat, NT, c, &shifts)
                     }
                 };
                 // Best and second-best explained energy over all units.
