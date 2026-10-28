@@ -24,7 +24,9 @@ pub trait Served: Send + 'static {
     fn n_clusters_at_baseline(&self) -> u32;
     fn identity_bytes(&self) -> Vec<u8>;
     fn journal_path(&self) -> PathBuf;
-    fn apply(&mut self, cmd: CurationCommand) -> Result<()>;
+    /// Apply a guest's `cmd` if the journal is still at `expected` (checked
+    /// and applied atomically); returns the cursor after it.
+    fn apply_at(&mut self, expected: Cursor, cmd: CurationCommand) -> Result<Cursor, HostError>;
 }
 
 /// The served session: the same host a local GUI or MCP client edits.
@@ -32,11 +34,7 @@ pub struct SessionServed<P: DataProvider>(pub Arc<SessionHost<P>>);
 
 impl<P: DataProvider + ApplyPhyLabel> Served for SessionServed<P> {
     fn cursor(&self) -> Cursor {
-        let s = self.0.read();
-        Cursor {
-            baseline: s.journal().baseline(),
-            n_records: s.journal().n_records(),
-        }
+        session_cursor(&self.0.read())
     }
     fn n_clusters_at_baseline(&self) -> u32 {
         self.0.read().journal().n_clusters_at_baseline()
@@ -47,13 +45,60 @@ impl<P: DataProvider + ApplyPhyLabel> Served for SessionServed<P> {
     fn journal_path(&self) -> PathBuf {
         self.0.read().journal_path().to_path_buf()
     }
-    fn apply(&mut self, cmd: CurationCommand) -> Result<()> {
+    fn apply_at(&mut self, expected: Cursor, cmd: CurationCommand) -> Result<Cursor, HostError> {
+        guest_may(&cmd).map_err(HostError::Rejected)?;
         // ponytail: one guest per host, so the peer is not named yet; name
         // it when several guests can join.
         let guest = Actor::Remote {
             peer: "guest".into(),
         };
-        self.0.apply(guest, cmd).map(drop)
+        // The cursor check and the apply share one write lock, so a host or
+        // MCP edit cannot land in between.
+        self.0
+            .apply_if(guest, cmd, |s| {
+                let here = session_cursor(s);
+                if here != expected {
+                    return Err(HostError::Diverged { host: here }.into());
+                }
+                Ok(())
+            })
+            .map_err(|e| e.downcast::<HostError>().unwrap_or_else(failed))?;
+        Ok(self.cursor())
+    }
+}
+
+/// Guests are human collaborators: they relabel, merge, split, tag and
+/// note (alone or in one flat batch), but do not move the head or bring in
+/// new spikes. The agent propose/direct policy does not apply to them.
+fn guest_may(cmd: &CurationCommand) -> Result<(), String> {
+    use CurationCommand::*;
+    let leaf = |c: &CurationCommand| {
+        matches!(
+            c,
+            Relabel { .. } | Merge { .. } | Split { .. } | Tag { .. } | Note { .. }
+        )
+    };
+    // Undo/Redo are a guest's own undo keys forwarded by its record sink: they
+    // move the shared head, as before, under the same cursor check.
+    let ok = match cmd {
+        Batch { children } => children.iter().all(leaf),
+        Undo | Redo => true,
+        c => leaf(c),
+    };
+    match ok {
+        true => Ok(()),
+        false => Err(
+            "guests may relabel, merge, split, tag, note, undo and redo (edits alone or in \
+             a flat batch); add-spikes and nested batches stay with the host"
+                .into(),
+        ),
+    }
+}
+
+fn session_cursor<P: DataProvider>(s: &sorrel_data::Session<P>) -> Cursor {
+    Cursor {
+        baseline: s.journal().baseline(),
+        n_records: s.journal().n_records(),
     }
 }
 
@@ -178,6 +223,15 @@ fn failed(e: impl std::fmt::Display) -> HostError {
     HostError::Failed(e.to_string())
 }
 
+/// Run lock and disk work without stalling the async worker threads.
+fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 #[piying::remote_message("sorrel/hello/1")]
 impl Message<Hello> for HostActor {
     type Reply = Result<HostInfo, HostError>;
@@ -240,7 +294,9 @@ impl Message<JournalTail> for HostActor {
         msg: JournalTail,
         _: &mut ActorContext<Self, Self::Reply>,
     ) -> Self::Reply {
-        let all = Journal::replay_at(&self.served.journal_path()).map_err(failed)?;
+        // Read-only: never truncates the journal the host is appending to.
+        let path = self.served.journal_path();
+        let all = blocking(|| Journal::read_only_records(&path)).map_err(failed)?;
         let from = (msg.from as usize).min(all.len());
         Ok(all[from..].to_vec())
     }
@@ -286,12 +342,7 @@ impl Message<Record> for HostActor {
         msg: Record,
         _: &mut ActorContext<Self, Self::Reply>,
     ) -> Self::Reply {
-        let here = self.served.cursor();
-        if msg.cursor != here {
-            return Err(HostError::Diverged { host: here });
-        }
-        self.served.apply(msg.cmd).map_err(failed)?;
-        Ok(self.served.cursor())
+        blocking(|| self.served.apply_at(msg.cursor, msg.cmd))
     }
 }
 

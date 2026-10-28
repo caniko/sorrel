@@ -52,6 +52,47 @@ fn toast(msg: impl Into<String>) -> Option<(String, Instant)> {
     Some((msg.into(), Instant::now()))
 }
 
+/// The selection after an edit, computed from the edit's own event.
+type Follow = Box<dyn FnOnce(&HostEvent) -> Vec<ClusterId>>;
+
+/// The ids a split allocated: the tail of its event's clusters.
+fn new_ids(ev: &HostEvent, k: usize) -> &[ClusterId] {
+    &ev.clusters[ev.clusters.len().saturating_sub(k)..]
+}
+
+/// Why accepting `p` would no longer do what it proposed, if so: a cluster
+/// it names has since been emptied, or a split index is out of range.
+fn stale_reason<P: DataProvider>(
+    p: &sorrel_data::proposals::Proposal,
+    s: &Session<P>,
+) -> Option<String> {
+    use sorrel_data::proposals::Action;
+    let named: Vec<ClusterId> = match &p.action {
+        Action::Merge { clusters } => clusters.clone(),
+        Action::Relabel { cluster, .. }
+        | Action::Split { cluster, .. }
+        | Action::Accept { cluster } => vec![*cluster],
+    };
+    if let Some(c) = named.iter().find(|&&c| s.spike_times(c).is_empty()) {
+        return Some(format!("cluster {} is empty now", c.0));
+    }
+    match &p.action {
+        Action::Split { cluster, spike_idx } => {
+            let n = s.spike_times(*cluster).len();
+            spike_idx
+                .iter()
+                .any(|&i| i as usize >= n)
+                .then(|| format!("cluster {} has only {n} spikes now", cluster.0))
+        }
+        _ => None,
+    }
+}
+
+/// Select a split's source and the new half it made.
+fn follow_split(cluster: ClusterId) -> Follow {
+    Box::new(move |ev| [&[cluster][..], new_ids(ev, 1)].concat())
+}
+
 /// Per-spike depth estimator a backend can plug in (see
 /// [`SorrelApp::set_depth_source`]).
 pub type DepthFn<P> = fn(&Session<P>) -> Option<SpikeDepths>;
@@ -584,30 +625,43 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         };
         let what = describe_proposal(&p);
         // Select the result the way the same edit made by hand would.
-        let follow = match &p.action {
-            _ if !accept => None,
-            Action::Merge { clusters } => clusters.first().map(|&t| vec![t]),
-            Action::Split { cluster, .. } => {
-                Some(vec![*cluster, ClusterId(read(&self.session).n_clusters())])
+        let follow: Follow = match &p.action {
+            _ if !accept => Box::new(|_| Vec::new()),
+            Action::Merge { clusters } => {
+                let target: Vec<_> = clusters.first().copied().into_iter().collect();
+                Box::new(move |_| target)
             }
-            _ => None,
+            Action::Split { cluster, .. } => follow_split(*cluster),
+            _ => Box::new(|_| Vec::new()),
         };
-        // Accept and relabel-reject can leave nothing to journal.
-        if let Some(batch) = CurationCommand::batch(cmds).filter(|b| !b.clusters().is_empty()) {
-            if !self.commit_with_follow(batch, follow) {
-                // The edit failed (error shown): keep the card.
-                self.host.propose(p);
-                return;
-            }
+        // Accept and relabel-reject can leave nothing to journal. A proposal
+        // that no longer fits the clusters (or whose edit fails) is audited
+        // as superseded and its card dropped; the error says why.
+        let stale = if accept {
+            stale_reason(&p, &read(&self.session))
+        } else {
+            None
+        };
+        if let Some(why) = &stale {
+            self.error = Some(format!("proposal no longer applies ({why}): {what}"));
         }
-        let outcome = match accept {
-            true => sorrel_data::proposals::Outcome::Accepted,
-            false => sorrel_data::proposals::Outcome::Rejected,
+        let applied = stale.is_none()
+            && match CurationCommand::batch(cmds).filter(|b| !b.clusters().is_empty()) {
+                Some(batch) => self.commit_with_follow(batch, follow),
+                None => true,
+            };
+        let outcome = match (applied, accept) {
+            (false, _) => sorrel_data::proposals::Outcome::Superseded,
+            (true, true) => sorrel_data::proposals::Outcome::Accepted,
+            (true, false) => sorrel_data::proposals::Outcome::Rejected,
         };
         if let Some(dir) = &self.save_dir {
             if let Err(e) = sorrel_data::proposals::record_outcome(dir, id, outcome) {
                 log::warn!("proposal audit log: {e}");
             }
+        }
+        if !applied {
+            return;
         }
         let verb = if accept { "accepted" } else { "rejected" };
         self.status = toast(format!("{verb}: {what}"));
@@ -978,35 +1032,38 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     /// target / both halves of a split) so the next view shows what just
     /// changed. Returns `true` on success.
     fn commit(&mut self, cmd: CurationCommand) -> bool {
-        let follow = match &cmd {
-            CurationCommand::Merge { target, .. } => Some(vec![*target]),
-            // `ClusterIndex::split` always allocates the new id at the tail.
-            CurationCommand::Split { cluster, .. } => {
-                Some(vec![*cluster, ClusterId(read(&self.session).n_clusters())])
+        let follow: Follow = match &cmd {
+            CurationCommand::Merge { target, .. } => {
+                let target = vec![*target];
+                Box::new(move |_| target)
             }
-            _ => None,
+            CurationCommand::Split { cluster, .. } => follow_split(*cluster),
+            _ => Box::new(|_| Vec::new()),
         };
         self.commit_with_follow(cmd, follow)
     }
 
     /// Every view cache is keyed on `Session::version()`, so nothing needs
     /// invalidating by hand here: the next frame rebuilds what changed.
-    fn commit_with_follow(&mut self, cmd: CurationCommand, follow: Option<Vec<ClusterId>>) -> bool {
+    fn commit_with_follow(&mut self, cmd: CurationCommand, follow: Follow) -> bool {
         let desc = describe_command(&cmd);
         self.cancel_jobs();
         // Every GUI edit is a human decision: the host clears the touched
         // clusters' `review:*` tags (from `sorrel auto`), so the review
         // queue drains.
-        if let Err(e) = self.host.apply(Actor::Human, cmd) {
-            self.error = Some(format!("{desc} failed: {e}"));
-            return false;
-        }
-        if let Some(ids) = follow {
-            if let Some((&first, rest)) = ids.split_first() {
-                self.selection.replace(first);
-                for &c in rest {
-                    self.selection.toggle(c);
-                }
+        let ev = match self.host.apply(Actor::Human, cmd) {
+            Ok(ev) => ev,
+            Err(e) => {
+                self.error = Some(format!("{desc} failed: {e}"));
+                return false;
+            }
+        };
+        // The ids come from our own event, not from a cluster count read
+        // before the apply: an MCP edit may have landed in between.
+        if let Some((&first, rest)) = follow(&ev).split_first() {
+            self.selection.replace(first);
+            for &c in rest {
+                self.selection.toggle(c);
             }
         }
         self.status = toast(desc);
@@ -1028,12 +1085,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     /// Turn lasso hits into one journal entry (a batch when several
     /// clusters were lassoed) and select source + new halves afterwards.
     fn apply_lasso_splits(&mut self, splits: Vec<(ClusterId, Vec<u32>)>) {
-        let n = read(&self.session).n_clusters();
         let mut cmds = Vec::new();
-        let mut follow = Vec::new();
+        let mut sources = Vec::new();
         for (cluster, spike_idx) in splits.into_iter().filter(|(_, s)| !s.is_empty()) {
-            follow.push(cluster);
-            follow.push(ClusterId(n + cmds.len() as u32));
+            sources.push(cluster);
             cmds.push(CurationCommand::Split {
                 cluster,
                 spike_idx,
@@ -1049,7 +1104,16 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 None => return,
             },
         };
-        self.commit_with_follow(cmd, Some(follow));
+        // The new halves are the tail of the event, in command order.
+        let follow: Follow = Box::new(move |ev| {
+            let new = new_ids(ev, sources.len());
+            sources
+                .iter()
+                .zip(new)
+                .flat_map(|(&c, &n)| [c, n])
+                .collect()
+        });
+        self.commit_with_follow(cmd, follow);
     }
 
     fn save(&mut self) {
@@ -2535,6 +2599,55 @@ mod tests {
             (outcome(split), outcome(merge)),
             (Outcome::Accepted, Outcome::Rejected)
         );
+    }
+
+    /// The selection after a split comes from the applied event (the ids
+    /// the apply allocated), also when several splits go in one batch.
+    #[test]
+    fn split_follow_uses_the_ids_the_apply_allocated() {
+        let (mut app, _d) = make_app();
+        app.apply_lasso_splits(vec![(ClusterId(0), vec![0])]);
+        assert_eq!(app.selection.as_slice(), &[ClusterId(0), ClusterId(3)]);
+        // Cluster 1 still has both spikes (a split must leave one behind).
+        assert!(app.commit(CurationCommand::Split {
+            cluster: ClusterId(1),
+            spike_idx: vec![0],
+            new_cluster: ClusterId(u32::MAX),
+            by: sorrel_data::command::Method::Manual,
+        }));
+        assert_eq!(app.selection.as_slice(), &[ClusterId(1), ClusterId(4)]);
+    }
+
+    /// A proposal that no longer applies leaves an audit line and no card.
+    #[test]
+    fn stale_proposal_is_audited_when_it_fails() {
+        use sorrel_data::proposals::{self, Action, Outcome, Proposal, Source};
+        let (mut app, dir) = make_app();
+        app.set_save_dir(dir.path().to_path_buf(), false);
+        let p = Proposal::new(
+            Source::Agent,
+            // Cluster 2 is merged away before the human gets to it.
+            Action::Split {
+                cluster: ClusterId(2),
+                spike_idx: vec![0],
+            },
+            0.8,
+            vec![],
+            Default::default(),
+        );
+        let id = p.id;
+        app.commit(CurationCommand::Merge {
+            sources: vec![ClusterId(2)],
+            target: ClusterId(0),
+        });
+        proposals::append(dir.path(), &p).unwrap();
+        app.host.propose(p);
+        app.apply_view_action(ViewAction::Decide { id, accept: true });
+        assert!(app.error.is_some(), "the failure is shown");
+        assert!(app.host.proposals().is_empty());
+        let log = proposals::read_log(dir.path());
+        assert_eq!(log[0].outcome, Outcome::Superseded);
+        assert_eq!(read(&app.session).n_clusters(), 3, "nothing applied");
     }
 
     /// A History click checks out another branch through the host and

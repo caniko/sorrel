@@ -41,3 +41,11 @@ pub fn rt() -> &'static tokio::runtime::Runtime {
             .expect("tokio runtime")
     })
 }
+
+/// Block until Ctrl-C (SIGINT), so a headless host can return and drop its
+/// listener instead of dying with a stale `mcp.json`.
+pub fn wait_for_ctrl_c() {
+    rt().block_on(async {
+        let _ = tokio::signal::ctrl_c().await;
+    });
+}

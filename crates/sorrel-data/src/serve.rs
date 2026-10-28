@@ -32,7 +32,7 @@ use crate::session::{ApplyPhyLabel, Session};
 use crate::suggest::{
     rank_merge_candidates, rank_split_candidates, MergeCandidate, SplitCandidate, SuggestConfig,
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use sorrel_io::{ClusterId, DataProvider, HasGeometry};
 use std::io::{BufRead, Read, Write};
@@ -482,8 +482,11 @@ where
             ok(host.apply(agent, CurationCommand::Merge { sources, target })?)
         }
         "split" => {
-            let cluster = check(&host.read(), arg_u32(args, "cluster")?)?;
-            let spike_idx = arg_u32_list(args, "spike_idx")?;
+            let (cluster, spike_idx) = {
+                let s = host.read();
+                let cluster = check(&s, arg_u32(args, "cluster")?)?;
+                (cluster, split_indices(&s, cluster, args)?)
+            };
             let ev = host.apply(
                 agent.clone(),
                 CurationCommand::Split {
@@ -589,6 +592,28 @@ fn edit_as_proposal(name: &str, args: &Value) -> Value {
     out
 }
 
+/// The sorted, deduplicated `spike_idx` of a split of `cluster`: a proper
+/// non-empty subset of its spikes (shared by `split` and `propose`).
+fn split_indices<P: DataProvider>(
+    session: &Session<P>,
+    cluster: ClusterId,
+    args: &Value,
+) -> Result<Vec<u32>, ToolError> {
+    let mut spike_idx = arg_u32_list(args, "spike_idx")?;
+    spike_idx.sort_unstable();
+    spike_idx.dedup();
+    let n = session.spike_times(cluster).len();
+    if spike_idx.is_empty()
+        || spike_idx.len() >= n
+        || spike_idx.last().is_some_and(|&i| i as usize >= n)
+    {
+        return fail(format!(
+            "spike_idx must be a proper non-empty subset of 0..{n}"
+        ));
+    }
+    Ok(spike_idx)
+}
+
 /// Validate `propose` arguments against the session; nothing is changed.
 fn parse_proposal<P: DataProvider>(
     session: &Session<P>,
@@ -630,18 +655,7 @@ fn parse_proposal<P: DataProvider>(
         "merge" => return fail("merge needs at least two clusters"),
         "split" => {
             let cluster = one()?;
-            let mut spike_idx = arg_u32_list(args, "spike_idx")?;
-            spike_idx.sort_unstable();
-            spike_idx.dedup();
-            let n = session.spike_times(cluster).len();
-            if spike_idx.is_empty()
-                || spike_idx.len() >= n
-                || spike_idx.last().is_some_and(|&i| i as usize >= n)
-            {
-                return fail(format!(
-                    "spike_idx must be a proper non-empty subset of 0..{n}"
-                ));
-            }
+            let spike_idx = split_indices(session, cluster, args)?;
             Action::Split { cluster, spike_idx }
         }
         "accept" => Action::Accept { cluster: one()? },
@@ -919,9 +933,15 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// `<save_dir>/.sorrel/mcp.json` = `{port, token}`, mode 0600, written
-/// atomically (tmp + rename) so a client never reads half of it.
-fn write_mcp_json(save_dir: &Path, port: u16, token: &str) -> std::io::Result<PathBuf> {
+/// `<save_dir>/.sorrel/mcp.json` = `{port, token, pid, nonce}`, mode 0600,
+/// written atomically (tmp + rename) so a client never reads half of it.
+/// `pid` and `nonce` identify the writer: only it removes the file.
+fn write_mcp_json(
+    save_dir: &Path,
+    port: u16,
+    token: &str,
+    nonce: &str,
+) -> std::io::Result<PathBuf> {
     let path = save_dir.join(MCP_JSON);
     std::fs::create_dir_all(path.parent().expect("has parent"))?;
     let tmp = path.with_extension("json.tmp");
@@ -930,7 +950,8 @@ fn write_mcp_json(save_dir: &Path, port: u16, token: &str) -> std::io::Result<Pa
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
     let mut f = opts.open(&tmp)?;
-    f.write_all(json!({"port": port, "token": token}).to_string().as_bytes())?;
+    let body = json!({"port": port, "token": token, "pid": std::process::id(), "nonce": nonce});
+    f.write_all(body.to_string().as_bytes())?;
     f.sync_all()?;
     std::fs::rename(&tmp, &path)?;
     Ok(path)
@@ -942,6 +963,7 @@ pub struct ListenerHandle {
     port: u16,
     token: String,
     mcp_json: PathBuf,
+    nonce: String,
     stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -957,7 +979,17 @@ impl ListenerHandle {
 impl Drop for ListenerHandle {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = std::fs::remove_file(&self.mcp_json);
+        // Only the writer of the file removes it: a later host in the same
+        // directory (or a stale file we no longer own) is left alone.
+        let ours = std::fs::read_to_string(&self.mcp_json)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .is_some_and(|v| {
+                v["pid"] == std::process::id() && v["nonce"].as_str() == Some(&self.nonce)
+            });
+        if ours {
+            let _ = std::fs::remove_file(&self.mcp_json);
+        }
         // Wake the blocking accept so its thread sees `stop`.
         let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
     }
@@ -984,12 +1016,14 @@ where
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let token = random_token();
-    let mcp_json = write_mcp_json(save_dir, port, &token)?;
+    let nonce = random_token();
+    let mcp_json = write_mcp_json(save_dir, port, &token, &nonce)?;
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = ListenerHandle {
         port,
         token: token.clone(),
         mcp_json,
+        nonce,
         stop: stop.clone(),
     };
     let save_dir = save_dir.to_owned();
@@ -1055,9 +1089,11 @@ pub fn read_mcp_json(save_dir: &Path) -> Option<(u16, String)> {
 
 /// `sorrel mcp`: pipe `input` to the host listening in `save_dir` and
 /// its replies to `output`, line by line, until either side closes. Returns
-/// `Ok(false)` without touching either stream when no listener answers (no
-/// `mcp.json`, refused connection, rejected token): the caller then falls
-/// back to a headless `serve`.
+/// `Ok(false)` without touching either stream only when there is provably no
+/// listener (no `mcp.json`, or the connection is refused: a stale file): the
+/// caller then falls back to a headless `serve`. A host that accepts the
+/// connection but times out, rejects the token or sends a bad ack is alive,
+/// so that is an error, never a second writer on its journal.
 pub fn attach(
     save_dir: &Path,
     input: impl Read + Send + 'static,
@@ -1075,15 +1111,19 @@ pub fn attach(
     else {
         return Ok(false);
     };
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
-        return Ok(false);
+    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(false),
+        Err(e) => bail!("sorrel host on port {port} did not accept the connection: {e}"),
     };
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     write_json(&mut stream, &json!({"token": token}))?;
     let mut reader = std::io::BufReader::new(stream.try_clone()?);
     let mut ack = String::new();
-    if reader.read_line(&mut ack).unwrap_or(0) == 0 {
-        return Ok(false);
+    match reader.read_line(&mut ack) {
+        Ok(n) if n > 0 && ack.trim() == "{\"ok\":true}" => {}
+        Ok(_) => bail!("sorrel host on port {port} rejected the connection (bad token or ack)"),
+        Err(e) => bail!("sorrel host on port {port} did not acknowledge: {e}"),
     }
     stream.set_read_timeout(None)?;
     let mut up = stream.try_clone()?;
@@ -1638,5 +1678,89 @@ mod tests {
             !attach(dir.path(), Cursor::new(""), &mut out).unwrap(),
             "no listener: caller falls back"
         );
+    }
+
+    /// Direct-mode `split` applies the same proper-subset rule as `propose`.
+    #[test]
+    fn direct_split_rejects_empty_full_and_out_of_range_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SessionHost::new(mock_session(dir.path()));
+        let mut env = Env::new(dir.path(), false, label);
+        let mut run = |idx: Value| {
+            let line = call(1, "split", json!({"cluster": 0, "spike_idx": idx}));
+            handle_line(&h, &mut env, &line).unwrap()
+        };
+        for bad in [json!([]), json!([0, 1, 2]), json!([0, 7]), json!([3])] {
+            assert_eq!(run(bad.clone())["result"]["isError"], true, "{bad}");
+        }
+        drop(run);
+        assert_eq!(h.read().n_clusters(), 2, "nothing was split");
+        assert_eq!(h.read().history_len(), 0);
+    }
+
+    /// A refused connection (stale `mcp.json`) falls back; a host that
+    /// accepts but never acknowledges is alive, so that is an error.
+    #[test]
+    fn attach_falls_back_only_when_nobody_listens() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = || Cursor::new("");
+        // No file.
+        assert!(!attach(dir.path(), none(), Vec::new()).unwrap());
+        // Stale file: the port is closed.
+        let dead = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = dead.local_addr().unwrap().port();
+        drop(dead);
+        write_mcp_json(dir.path(), port, "t", "n").unwrap();
+        assert!(!attach(dir.path(), none(), Vec::new()).unwrap());
+        // Live but silent: accepts, never answers.
+        let silent = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        write_mcp_json(dir.path(), silent.local_addr().unwrap().port(), "t", "n").unwrap();
+        let hold = std::thread::spawn(move || silent.accept().map(|(s, _)| s));
+        let err = attach(dir.path(), none(), Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("did not acknowledge"), "{err}");
+        drop(hold.join().unwrap());
+    }
+
+    /// A wrong token after connecting is an error too, not a fallback.
+    #[test]
+    fn attach_with_a_rejected_token_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Arc::new(SessionHost::new(mock_session(dir.path())));
+        let _handle = spawn_listener(h, dir.path(), false, label, None).unwrap();
+        let (port, _) = read_mcp_json(dir.path()).unwrap();
+        write_mcp_json(dir.path(), port, "wrong", "n").unwrap();
+        let err = attach(dir.path(), Cursor::new(""), Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("rejected"), "{err}");
+    }
+
+    /// The handle that wrote `mcp.json` is the only one that removes it.
+    #[test]
+    fn a_second_handles_drop_keeps_the_first_ones_file() {
+        let (a, b, shared) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let host = |d: &tempfile::TempDir| Arc::new(SessionHost::new(mock_session(d.path())));
+        let first = spawn_listener(host(&a), shared.path(), false, label, None).unwrap();
+        let second = spawn_listener(host(&b), shared.path(), false, label, None).unwrap();
+        // The later host owns the file now; the earlier one must not delete it.
+        drop(first);
+        assert_eq!(read_mcp_json(shared.path()).unwrap().0, second.port());
+        drop(second);
+        assert!(!shared.path().join(MCP_JSON).exists());
+    }
+
+    /// A second host on a directory whose journal is already open fails
+    /// with the busy error and leaves the first host's listener alone.
+    #[test]
+    fn a_second_host_on_the_same_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Arc::new(SessionHost::new(mock_session(dir.path())));
+        let first = spawn_listener(h, dir.path(), false, label, None).unwrap();
+        let err = Journal::open(&dir.path().join("j.journal")).unwrap_err();
+        let busy = err.downcast_ref::<crate::journal::JournalBusy>().unwrap();
+        assert!(busy.to_string().contains("already open"), "{busy}");
+        assert_eq!(read_mcp_json(dir.path()).unwrap().0, first.port());
     }
 }

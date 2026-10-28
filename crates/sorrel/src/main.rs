@@ -309,8 +309,10 @@ struct OpenArgs {
     /// Curation journal (default: <DATA_DIR>/sorrel.journal)
     #[arg(long, value_name = "PATH")]
     journal: Option<PathBuf>,
-    /// Delete the existing journal before opening. The escape hatch for a
-    /// journal sealed against a spike_clusters.npy that has since changed.
+    /// Set the existing journal aside before opening (renamed to
+    /// `<journal>.<unix seconds>`, not deleted; a phy root's sorrel_original/
+    /// is set aside too). The escape hatch for a journal sealed against a
+    /// spike_clusters.npy that has since changed.
     #[arg(long)]
     discard_journal: bool,
     /// Populate sample-rate / channels / dtype from a SpikeGLX .meta
@@ -1169,7 +1171,21 @@ fn run_mcp(open: &OpenArgs) -> Result<()> {
     if sorrel_data::attach(&host_dir(open), std::io::stdin(), std::io::stdout())? {
         return Ok(());
     }
-    with_session(open, Serve)
+    // attach found no listener. If another process still has the journal
+    // open, serving here would be a second writer: refuse and say so.
+    with_session(open, Serve).map_err(busy_hint)
+}
+
+/// Name the process holding the journal when `e` is a [`JournalBusy`].
+fn busy_hint(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast_ref::<sorrel_data::journal::JournalBusy>() {
+        Some(b) => anyhow::anyhow!(
+            "{b}: another sorrel owns this dataset but its MCP listener is not \
+             reachable (no usable .sorrel/mcp.json). Close it, or run `sorrel mcp` \
+             once its host (the GUI or `sorrel --headless`) is up"
+        ),
+        None => e,
+    }
 }
 
 /// `sorrel --headless`: the host and its MCP listener, no window.
@@ -1192,9 +1208,10 @@ impl SessionVisitor for Headless {
             listener.port(),
             ctx.save_dir.display()
         );
-        loop {
-            std::thread::park();
-        }
+        // Ctrl-C returns, dropping the listener so it removes its mcp.json.
+        sorrel_remote::wait_for_ctrl_c();
+        drop(listener);
+        Ok(())
     }
 }
 
@@ -1232,7 +1249,7 @@ fn diff_tsvs(a: &Path, b: &Path, json: bool) -> Result<()> {
 }
 
 fn journal_dump(path: &Path, json: bool) -> Result<()> {
-    let records = Journal::replay_at(path)?;
+    let records = Journal::read_only_records(path)?;
     if json {
         serde_json::to_writer_pretty(std::io::stdout().lock(), &records)?;
         println!();
@@ -1499,6 +1516,23 @@ fn run_open(open: OpenArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sorrel mcp` on a dataset another process has open names the owner
+    /// instead of becoming a second writer.
+    #[test]
+    fn busy_journal_is_reported_with_its_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sorrel.journal");
+        let _owner = Journal::open_or_create(&path, 0, 1).unwrap();
+        let busy = Journal::open_or_create(&path, 0, 1).unwrap_err();
+        let msg = busy_hint(busy.context("open journal")).to_string();
+        assert!(
+            msg.contains("already open") && msg.contains("mcp.json"),
+            "{msg}"
+        );
+        let other = busy_hint(anyhow::anyhow!("disk full"));
+        assert_eq!(other.to_string(), "disk full");
+    }
 
     #[test]
     fn bare_directory_with_flags_means_open() {
