@@ -1,5 +1,7 @@
 result*
 /target
+# sorrel-py is outside the workspace and builds into its own target dir
+/crates/sorrel-py/target/
 *.sqlite
 # rs-harbor materialises this on dev-shell entry
 /.cargo/config.toml
