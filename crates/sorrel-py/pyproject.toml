@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "sorrel-ephys"
-version = "0.2.1"
+version = "0.2.2"
 description = "Native curation GUI for SpikeInterface sortings"
 requires-python = ">=3.8"
 dependencies = []
