@@ -13,9 +13,7 @@ use sorrel_io::{ClusterId, DataProvider};
 use crate::correlogram_view::{band_fill, wheel_scale};
 use crate::prefs::IsiParams;
 use crate::theme::{contrast_text, selection_colour, Theme};
-use crate::views::{
-    axes, axes_data_rect, fill_height, int_ticks, param_bar, AxisOpts, TICK_PX,
-};
+use crate::views::{axes, axes_data_rect, fill_height, int_ticks, param_bar, AxisOpts, TICK_PX};
 
 /// Rows past this are not drawn (phy's grid limit; keeps the pane legible).
 const MAX_CLUSTERS: usize = 20;
@@ -151,8 +149,15 @@ pub fn isi_view<P: DataProvider>(
         for (slot, &c) in shown.iter().enumerate() {
             let n = session.spike_times(c).len();
             let viol = isi_violations(session.spike_times(c), refractory_samples);
-            let pct = if n == 0 { 0.0 } else { viol as f32 / n as f32 * 100.0 };
-            let (bg, text) = (selection_colour(slot), format!("c{c} <1 ms {viol}/{n} ({pct:.1}%)"));
+            let pct = if n == 0 {
+                0.0
+            } else {
+                viol as f32 / n as f32 * 100.0
+            };
+            let (bg, text) = (
+                selection_colour(slot),
+                format!("c{c} <1 ms {viol}/{n} ({pct:.1}%)"),
+            );
             let fg = contrast_text(bg);
             let g = ui
                 .painter()
@@ -170,13 +175,7 @@ pub fn isi_view<P: DataProvider>(
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme.plot_bg);
     let data = axes_data_rect(rect, true);
-    let max_count = hists
-        .iter()
-        .flatten()
-        .copied()
-        .max()
-        .unwrap_or(1)
-        .max(1) as f32;
+    let max_count = hists.iter().flatten().copied().max().unwrap_or(1).max(1) as f32;
     let y_top = max_count * 1.1;
     let yt = int_ticks(max_count, 3);
     axes(

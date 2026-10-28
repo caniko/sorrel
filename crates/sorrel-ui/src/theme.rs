@@ -349,8 +349,14 @@ mod tests {
 
     #[test]
     fn contrast_text_is_readable_on_every_slot() {
-        assert_eq!(contrast_text(Color32::from_rgb(0xf2, 0x8e, 0x2b)), Color32::BLACK);
-        assert_eq!(contrast_text(Color32::from_rgb(0xb0, 0x7a, 0xa1)), Color32::BLACK);
+        assert_eq!(
+            contrast_text(Color32::from_rgb(0xf2, 0x8e, 0x2b)),
+            Color32::BLACK
+        );
+        assert_eq!(
+            contrast_text(Color32::from_rgb(0xb0, 0x7a, 0xa1)),
+            Color32::BLACK
+        );
         let lum = |c: Color32| {
             let lin = |v: u8| {
                 let v = f32::from(v) / 255.0;

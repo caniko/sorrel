@@ -86,7 +86,10 @@ const BACKGROUND_RADIUS: f32 = 0.5;
 /// Columns (2 to 4) and square cell side for a pane `width` wide.
 fn grid_geometry(width: f32) -> (usize, f32) {
     let cols = ((width / COL_W) as usize).clamp(2, 4);
-    (cols, ((width - (cols - 1) as f32 * CELL_GAP) / cols as f32).max(40.0))
+    (
+        cols,
+        ((width - (cols - 1) as f32 * CELL_GAP) / cols as f32).max(40.0),
+    )
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -369,10 +372,8 @@ pub fn feature_view<P: DataProvider>(
                         row as f32 * (side + LABEL_H + CELL_GAP),
                     );
                 let strip = Rect::from_min_size(origin, egui::vec2(side, LABEL_H));
-                let rect = Rect::from_min_size(
-                    origin + egui::vec2(0.0, LABEL_H),
-                    egui::vec2(side, side),
-                );
+                let rect =
+                    Rect::from_min_size(origin + egui::vec2(0.0, LABEL_H), egui::vec2(side, side));
                 if !ui.is_rect_visible(strip.union(rect)) {
                     continue;
                 }

@@ -165,7 +165,11 @@ pub(crate) fn band_fill(theme: &Theme) -> Color32 {
 
 /// Independent-firing baseline: stronger than the gridlines in both themes.
 fn baseline_colour(theme: &Theme) -> Color32 {
-    blend(theme.plot_bg, theme.text, if theme.dark { 0.75 } else { 0.9 })
+    blend(
+        theme.plot_bg,
+        theme.text,
+        if theme.dark { 0.75 } else { 0.9 },
+    )
 }
 
 /// Rounded label chip with its top-left at `pos`; text contrasts the fill.
@@ -181,8 +185,12 @@ fn chip(painter: &egui::Painter, pos: egui::Pos2, text: &str, bg: Color32) -> eg
 /// One row: window inline, the rest behind the gear.
 fn header(ui: &mut Ui, p: &mut CcgParams) {
     let caption = format!("ACG/CCG · {}", ccg_caption(p.window_ms, p.bin_ms));
-    let (window, bin, refrac, uniform) =
-        (&mut p.window_ms, &mut p.bin_ms, &mut p.refrac_ms, &mut p.uniform);
+    let (window, bin, refrac, uniform) = (
+        &mut p.window_ms,
+        &mut p.bin_ms,
+        &mut p.refrac_ms,
+        &mut p.uniform,
+    );
     param_bar(
         ui,
         &caption,
@@ -304,8 +312,20 @@ pub fn correlogram_grid_view<P: DataProvider>(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             grid(
-                ui, &theme, &data, shown, session, p, total, (dw, dh), (gap, header_h), ext,
-                tick_ms, global_max, bin_s, half,
+                ui,
+                &theme,
+                &data,
+                shown,
+                session,
+                p,
+                total,
+                (dw, dh),
+                (gap, header_h),
+                ext,
+                tick_ms,
+                global_max,
+                bin_s,
+                half,
             );
         });
 }
