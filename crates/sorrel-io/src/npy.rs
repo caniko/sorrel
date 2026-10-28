@@ -388,6 +388,105 @@ fn write_atomic<F: FnOnce(&mut std::io::BufWriter<File>) -> std::io::Result<()>>
     shape: &[usize],
     write_payload: F,
 ) -> Result<()> {
+    let tmp = write_tmp(path, descr, shape, write_payload)?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
+}
+
+/// A `.npy` opened for row access in any dtype: rows are raw byte slices of
+/// `prod(shape[1..]) * itemsize`, so they can be permuted or interleaved with
+/// new rows without decoding (see [`write_rows_tmp`]).
+pub struct NpyRows {
+    pub descr: String,
+    pub tail: Vec<usize>,
+    pub n_rows: usize,
+    row_bytes: usize,
+    start: usize,
+    map: memmap2::Mmap,
+}
+
+/// Element size in bytes from a numpy `descr` (`'<f4'` -> 4).
+fn itemsize(descr: &str) -> Result<usize> {
+    descr
+        .trim_start_matches(|c: char| !c.is_ascii_digit())
+        .parse()
+        .map_err(|_| anyhow!("unsupported numpy dtype {descr}"))
+}
+
+impl NpyRows {
+    pub fn open(path: &Path) -> Result<Self> {
+        let (h, map) = read_payload(path)?;
+        let (n_rows, tail) = h
+            .shape
+            .split_first()
+            .ok_or_else(|| anyhow!("{}: a scalar has no rows", path.display()))?;
+        let row_bytes = tail.iter().product::<usize>() * itemsize(&h.dtype)?;
+        if map.len() < h.data_offset as usize + n_rows * row_bytes {
+            bail!("{}: shorter than its header says", path.display());
+        }
+        Ok(Self {
+            n_rows: *n_rows,
+            tail: tail.to_vec(),
+            row_bytes,
+            start: h.data_offset as usize,
+            descr: h.dtype,
+            map,
+        })
+    }
+
+    pub fn row(&self, i: usize) -> &[u8] {
+        let at = self.start + i * self.row_bytes;
+        &self.map[at..at + self.row_bytes]
+    }
+
+    /// `vals` as one row in this file's dtype (`f4`, `f8` and `u4` only).
+    pub fn encode(&self, vals: &[f32]) -> Result<Vec<u8>> {
+        let enc: fn(f32) -> Vec<u8> = match NpyDtype::parse(&self.descr)? {
+            NpyDtype::F32 => |v| v.to_le_bytes().to_vec(),
+            NpyDtype::F64 => |v| f64::from(v).to_le_bytes().to_vec(),
+            NpyDtype::U32 => |v| (v as u32).to_le_bytes().to_vec(),
+            _ => bail!("cannot encode new rows as {}", self.descr),
+        };
+        Ok(vals.iter().flat_map(|&v| enc(v)).collect())
+    }
+}
+
+/// Write `<path>.tmp` (fsynced, not renamed) with `descr`, shape
+/// `(rows.len(), tail..)` and the given rows, every one `prod(tail) *
+/// itemsize` bytes. The caller renames it into place.
+pub fn write_rows_tmp<R: AsRef<[u8]>>(
+    path: &Path,
+    descr: &str,
+    tail: &[usize],
+    rows: impl ExactSizeIterator<Item = R>,
+) -> Result<std::path::PathBuf> {
+    let row_bytes = tail.iter().product::<usize>() * itemsize(descr)?;
+    let shape: Vec<usize> = std::iter::once(rows.len())
+        .chain(tail.iter().copied())
+        .collect();
+    write_tmp(path, descr, &shape, |f| {
+        for r in rows {
+            let r = r.as_ref();
+            if r.len() != row_bytes {
+                return Err(std::io::Error::other(format!(
+                    "row of {} bytes, expected {row_bytes}",
+                    r.len()
+                )));
+            }
+            f.write_all(r)?;
+        }
+        Ok(())
+    })
+}
+
+/// Everything [`write_atomic`] does except the final rename; returns the
+/// fsynced `<path>.tmp`.
+fn write_tmp<F: FnOnce(&mut std::io::BufWriter<File>) -> std::io::Result<()>>(
+    path: &Path,
+    descr: &str,
+    shape: &[usize],
+    write_payload: F,
+) -> Result<std::path::PathBuf> {
     let shape = match shape {
         [n] => format!("({n},)"),
         dims => format!(
@@ -422,9 +521,7 @@ fn write_atomic<F: FnOnce(&mut std::io::BufWriter<File>) -> std::io::Result<()>>
         .map_err(|e| e.into_error())?
         .sync_all()
         .with_context(|| format!("fsync {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
+    Ok(tmp)
 }
 
 fn decode_u32(h: &NpyHeader, bytes: &[u8], n: usize) -> Result<Vec<u32>> {

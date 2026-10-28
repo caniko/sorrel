@@ -25,6 +25,8 @@ use sorrel_io::{
 use sorrel_ui::{RasterPipeline, ScatterPipeline, SorrelApp, TracePipeline};
 use std::path::{Path, PathBuf};
 
+mod rescue;
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum Backend {
     Kilosort,
@@ -229,6 +231,15 @@ enum Cmd {
     },
     /// List GPU adapters and check the compute kernels against the CPU on each
     GpuCheck,
+    /// Headless: matched-filter rescue of spikes a sorter missed from known
+    /// units (FDR-controlled, dry run unless --apply), plus a virtual
+    /// hybrid-injection recall test (--hybrid-frac)
+    Rescue {
+        #[command(flatten)]
+        open: OpenArgs,
+        #[command(flatten)]
+        args: rescue::RescueArgs,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -918,18 +929,28 @@ impl SessionVisitor for Apply {
             session.dispatch(batch)?;
         }
         if self.save {
-            if ctx.reseal_on_save {
-                let journal_path = session.journal_path().to_path_buf();
-                let journal =
-                    save_and_reseal_journal(&session, &ctx.save_dir, &journal_path, phy_label_str)?;
-                session.reseal(journal);
-            } else {
-                save_to_phy(&session, &ctx.save_dir, phy_label_str)?;
-            }
-            println!("saved → {}", ctx.save_dir.display());
+            save_session(&mut session, &ctx)?;
         }
         Ok(())
     }
+}
+
+/// Write the phy artifacts like Ctrl-S in the GUI (resealing the journal on
+/// backends that read the saved clusters back).
+fn save_session<P>(session: &mut Session<P>, ctx: &OpenCtx<P>) -> Result<()>
+where
+    P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
+{
+    if ctx.reseal_on_save {
+        let journal_path = session.journal_path().to_path_buf();
+        let journal =
+            save_and_reseal_journal(session, &ctx.save_dir, &journal_path, phy_label_str)?;
+        session.reseal(journal);
+    } else {
+        save_to_phy(session, &ctx.save_dir, phy_label_str)?;
+    }
+    println!("saved → {}", ctx.save_dir.display());
+    Ok(())
 }
 
 /// Add `review:split` + `src:sorrel` to every cluster for which sorrel's
@@ -1407,6 +1428,7 @@ fn main() -> Result<()> {
         }) => run_join(&code, direct, relay, into),
         Some(Cmd::ClearCache { root }) => clear_cache(&root),
         Some(Cmd::GpuCheck) => gpu_check(),
+        Some(Cmd::Rescue { open, args }) => with_session(&open, rescue::Rescue(args)),
     }
 }
 

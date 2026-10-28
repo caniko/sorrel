@@ -19,9 +19,10 @@ use crate::cluster_index::ClusterIndex;
 use crate::curation_json::write_curation_json;
 use crate::journal::{baseline_hash, Journal};
 use crate::session::Session;
-use anyhow::{Context, Result};
-use sorrel_io::npy::write_1d_u32_atomic;
+use anyhow::{ensure, Context, Result};
+use sorrel_io::npy::{read_1d_u32, read_header, write_1d_u32_atomic, write_rows_tmp, NpyRows};
 use sorrel_io::DataProvider;
+use std::borrow::Cow;
 use std::path::Path;
 
 /// Write `spike_clusters.npy`, `cluster_group.tsv` and `curation.json` into
@@ -37,6 +38,19 @@ use std::path::Path;
 /// then commits the journal so future opens treat the saved state as
 /// canonical.
 pub fn save_to_phy<P, F>(session: &Session<P>, root: &Path, label_str: F) -> Result<()>
+where
+    P: DataProvider,
+    F: Fn(&P::Label) -> &'static str,
+{
+    ensure!(
+        !has_added_spikes(session.cluster_index()),
+        "this session added spikes: save with reseal (save_and_reseal_journal); a plain save \
+         would leave them only in the journal and the next replay would add them twice"
+    );
+    write_curation(session, root, label_str)
+}
+
+fn write_curation<P, F>(session: &Session<P>, root: &Path, label_str: F) -> Result<()>
 where
     P: DataProvider,
     F: Fn(&P::Label) -> &'static str,
@@ -206,7 +220,8 @@ fn clusters_in_row_order(index: &ClusterIndex) -> Vec<u32> {
     let clusters = index.spike_clusters();
     let rows = index.spike_pc_indices();
     let time_order = || clusters.iter().map(|c| c.0).collect::<Vec<u32>>();
-    if rows.len() != clusters.len() {
+    // After `rewrite_spike_arrays` every file is in global (time) order.
+    if rows.len() != clusters.len() || has_added_spikes(index) {
         return time_order();
     }
     // Cluster ids never reach u32::MAX (split placeholders are resolved
@@ -236,7 +251,10 @@ where
     P: DataProvider,
     F: Fn(&P::Label) -> &'static str,
 {
-    save_to_phy(session, root, &label_str)?;
+    if has_added_spikes(session.cluster_index()) {
+        rewrite_spike_arrays(session, root)?;
+    }
+    write_curation(session, root, &label_str)?;
 
     // Hash the bytes we just wrote (post-rename, post-fsync).
     let bytes = std::fs::read(root.join("spike_clusters.npy"))
@@ -261,6 +279,275 @@ fn with_tmp_suffix(path: &Path) -> std::path::PathBuf {
     let mut p = path.as_os_str().to_owned();
     p.push(".tmp");
     p.into()
+}
+
+/// Original files of a rewrite are hard-linked (or copied) here, once.
+const BACKUP_DIR: &str = "sorrel_original";
+/// Attribute marking spikes inserted by `AddSpikes` (u32 0/1).
+const RESCUED: &str = "sorrel_rescued";
+
+/// True when the session holds spikes no file has yet: feature rows past the
+/// provider's (see `ClusterIndex::add_spikes`).
+pub(crate) fn has_added_spikes(index: &ClusterIndex) -> bool {
+    let n = index.n_orig_rows();
+    index
+        .spike_pc_indices()
+        .iter()
+        .any(|r| r.get().is_some_and(|r| r as usize >= n))
+}
+
+/// Rewrite every per-spike array of a phy directory in global (time) order so
+/// they include the spikes added by `AddSpikes`. Crash-safe: tmp files are
+/// fsynced, a manifest naming them is fsynced, then the renames are rolled
+/// out by [`sorrel_io::kilosort::roll_forward_pending`], which
+/// `KilosortProvider::open` also runs after an interruption. Originals go to
+/// `sorrel_original/` first (never overwritten), and phy's `.phy/` cache,
+/// now stale, is moved to `.phy.sorrel-stale`.
+///
+/// The session's own index keeps the old row numbering: reopen the directory
+/// afterwards (a second rewrite from the same session is refused).
+pub(crate) fn rewrite_spike_arrays<P: DataProvider>(
+    session: &Session<P>,
+    root: &Path,
+) -> Result<()> {
+    use sorrel_io::kilosort::{roll_forward_pending, REWRITE_PENDING};
+    use std::io::Write;
+    let names = write_spike_array_tmps(session, root, root)?;
+    let tmp_of = |n: &String| root.join(format!("{n}.tmp"));
+    let prepare = || -> Result<()> {
+        let bak = root.join(BACKUP_DIR);
+        std::fs::create_dir_all(&bak).with_context(|| format!("create {}", bak.display()))?;
+        for n in &names {
+            let (from, to) = (root.join(n), bak.join(n));
+            if from.exists() && !to.exists() && std::fs::hard_link(&from, &to).is_err() {
+                std::fs::copy(&from, &to).with_context(|| format!("back up {n}"))?;
+            }
+        }
+        let phy = root.join(".phy");
+        if phy.exists() {
+            let stale = root.join(".phy.sorrel-stale");
+            let _ = std::fs::remove_dir_all(&stale);
+            std::fs::rename(&phy, &stale).context("move aside stale .phy cache")?;
+        }
+        // Manifest via tmp + rename so a torn one is never seen.
+        let manifest = root.join(REWRITE_PENDING);
+        let tmp = with_tmp_suffix(&manifest);
+        let text: String = names.iter().map(|n| format!("{n}.tmp\t{n}\n")).collect();
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &manifest).context("publish rewrite manifest")
+    };
+    if let Err(e) = prepare() {
+        names
+            .iter()
+            .for_each(|n| drop(std::fs::remove_file(tmp_of(n))));
+        return Err(e);
+    }
+    roll_forward_pending(root)?;
+    // ponytail: best effort (a directory cannot be opened on Windows).
+    let _ = std::fs::File::open(root).and_then(|d| d.sync_all());
+    Ok(())
+}
+
+/// Write every per-spike array of `session` as `<dst>/<name>.tmp` (fsynced,
+/// not renamed), reading the originals from `src`, and return the names.
+/// Rows follow the global order; original rows are copied byte for byte
+/// through the row map, rows of added spikes are encoded in the file's dtype.
+/// Refuses, writing nothing, when `src` holds a per-spike `.npy` this does not
+/// know (it would fall out of alignment) or no longer matches the session.
+pub(crate) fn write_spike_array_tmps<P: DataProvider>(
+    session: &Session<P>,
+    src: &Path,
+    dst: &Path,
+) -> Result<Vec<String>> {
+    let ci = session.cluster_index();
+    let (n, n_orig) = (ci.n_spikes(), ci.n_orig_rows());
+    let rows: Vec<u32> = ci
+        .spike_pc_indices()
+        .iter()
+        .map_while(|r| r.get())
+        .collect();
+    ensure!(
+        rows.len() == n,
+        "the PC row map is incomplete; cannot rewrite the per-spike arrays"
+    );
+    let times_hdr = read_header(&src.join("spike_times.npy"))?;
+    ensure!(
+        times_hdr.shape.first() == Some(&n_orig),
+        "spike_times.npy no longer has the {n_orig} rows this session opened with (already \
+         rewritten?); reopen the directory"
+    );
+
+    let (pc_w, tf) = (
+        ci.pc_shape().0 * ci.pc_shape().1,
+        ci.has_template_features(),
+    );
+    let attrs: Vec<String> = ci
+        .spike_attribute_names()
+        .into_iter()
+        .map(|(a, _)| a.to_owned())
+        .collect();
+    let mut known = vec![
+        "spike_times.npy".to_owned(),
+        "spike_clusters.npy".to_owned(),
+    ];
+    let flags = [
+        (
+            !ci.spike_templates_global().is_empty(),
+            "spike_templates.npy",
+        ),
+        (!ci.spike_amplitudes_global().is_empty(), "amplitudes.npy"),
+        (pc_w > 0, "pc_features.npy"),
+        (tf, "template_features.npy"),
+        (ci.has_spike_reorder(), "spike_reorder.npy"),
+    ];
+    known.extend(flags.iter().filter(|f| f.0).map(|f| f.1.to_owned()));
+    known.extend(attrs.iter().map(|a| format!("spike_{a}.npy")));
+    if !attrs.iter().any(|a| a == RESCUED) {
+        known.push(format!("spike_{RESCUED}.npy"));
+    }
+    let mut unknown: Vec<String> = std::fs::read_dir(src)
+        .with_context(|| format!("read {}", src.display()))?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let hdr = name
+                .ends_with(".npy")
+                .then(|| read_header(&e.path()).ok())??;
+            (hdr.shape.first() == Some(&n_orig) && !known.contains(&name)).then_some(name)
+        })
+        .collect();
+    unknown.sort();
+    ensure!(
+        unknown.is_empty(),
+        "refusing to save: {unknown:?} hold one row per spike but sorrel does not know how to \
+         insert the added spikes into them (or never loaded them); nothing was written"
+    );
+
+    let mut done: Vec<String> = Vec::new();
+    let result = (|| -> Result<()> {
+        let mut put = |name: &str| {
+            done.push(name.to_owned());
+            dst.join(name)
+        };
+        let u4 = "<u4";
+        write_rows_tmp(
+            &put("spike_times.npy"),
+            "<u8",
+            &[],
+            ci.all_spike_times().iter().map(|t| t.0.to_le_bytes()),
+        )?;
+        write_rows_tmp(
+            &put("spike_clusters.npy"),
+            u4,
+            &[],
+            ci.spike_clusters().iter().map(|c| c.0.to_le_bytes()),
+        )?;
+        if flags[0].0 {
+            let t = ci.spike_templates_global();
+            write_rows_tmp(&put(flags[0].1), u4, &[], t.iter().map(|v| v.to_le_bytes()))?;
+        }
+        if flags[1].0 {
+            let a = ci.spike_amplitudes_global();
+            write_rows_tmp(
+                &put(flags[1].1),
+                "<f4",
+                &[],
+                a.iter().map(|v| v.to_le_bytes()),
+            )?;
+        }
+        if pc_w > 0 {
+            put("pc_features.npy");
+            rewrite_rows(src, dst, "pc_features.npy", &rows, n_orig, |g| {
+                ci.pc_feature_for(g as u32)
+            })?;
+        }
+        if tf {
+            put("template_features.npy");
+            rewrite_rows(src, dst, "template_features.npy", &rows, n_orig, |g| {
+                ci.template_feature_row(g as u32)
+            })?;
+        }
+        const ONE: [f32; 1] = [1.0];
+        for a in &attrs {
+            let name = format!("spike_{a}.npy");
+            put(&name);
+            rewrite_rows(src, dst, &name, &rows, n_orig, |g| {
+                if a == RESCUED {
+                    Some(&ONE[..])
+                } else {
+                    ci.spike_attribute(a, g as u32)
+                }
+            })?;
+        }
+        if !attrs.iter().any(|a| a == RESCUED) {
+            let marks = rows
+                .iter()
+                .map(|&r| u32::from(r as usize >= n_orig).to_le_bytes());
+            write_rows_tmp(&put(&format!("spike_{RESCUED}.npy")), u4, &[], marks)?;
+        }
+        if ci.has_spike_reorder() {
+            // Old value = old row whose time is shown; point at that spike's new index.
+            let old = read_1d_u32(&src.join("spike_reorder.npy"))?;
+            let mut new_of_row = vec![u32::MAX; n_orig];
+            for (g, &r) in rows.iter().enumerate() {
+                if let Some(slot) = new_of_row.get_mut(r as usize) {
+                    *slot = g as u32;
+                }
+            }
+            let reorder = rows.iter().enumerate().map(|(g, &r)| {
+                let to = old
+                    .get(r as usize)
+                    .and_then(|&j| new_of_row.get(j as usize));
+                to.copied()
+                    .filter(|&v| v != u32::MAX)
+                    .unwrap_or(g as u32)
+                    .to_le_bytes()
+            });
+            write_rows_tmp(&put("spike_reorder.npy"), u4, &[], reorder)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        done.iter()
+            .for_each(|n| drop(std::fs::remove_file(with_tmp_suffix(&dst.join(n)))));
+        return Err(e);
+    }
+    Ok(done)
+}
+
+/// One row-addressed array: original rows are copied byte for byte from
+/// `<src>/<name>`, rows of added spikes come from `added(g)`, encoded in the
+/// file's dtype. Writes `<dst>/<name>.tmp`.
+fn rewrite_rows<'a>(
+    src: &Path,
+    dst: &Path,
+    name: &str,
+    rows: &[u32],
+    n_orig: usize,
+    added: impl Fn(usize) -> Option<&'a [f32]>,
+) -> Result<()> {
+    let f = NpyRows::open(&src.join(name))?;
+    ensure!(
+        f.n_rows == n_orig,
+        "{name}: {} rows, expected {n_orig}",
+        f.n_rows
+    );
+    // ponytail: rows are gathered first (a Cow per spike, ~32 B) because
+    // encoding can fail; stream them if 100M-spike sessions need it.
+    let out = rows
+        .iter()
+        .enumerate()
+        .map(|(g, &r)| match (r as usize) < n_orig {
+            true => Ok(Cow::Borrowed(f.row(r as usize))),
+            false => added(g)
+                .with_context(|| format!("{name}: no values for added spike {g}"))
+                .and_then(|v| f.encode(v))
+                .map(Cow::Owned),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    write_rows_tmp(&dst.join(name), &f.descr, &f.tail, out.into_iter()).map(drop)
 }
 
 #[cfg(test)]

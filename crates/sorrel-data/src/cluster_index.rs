@@ -9,6 +9,7 @@
 //! treats those as ground truth that survives every curation decision.
 //! Only the cluster id of each spike changes.
 
+use crate::command::SpikeBatch;
 use sorrel_io::{
     ClusterId, DataProvider, HasAmplitudes, HasPcFeatures, HasSpikeTemplates, HasTemplateWaveforms,
     OptionalRow, SampleIndex,
@@ -104,6 +105,24 @@ pub struct ClusterIndex {
     times_per_cluster: Vec<Vec<SampleIndex>>,
     amps_per_cluster: Vec<Vec<f32>>,
     templates_per_cluster: Vec<Vec<u32>>,
+    /// Ascending global spike indices of each cluster (parallel to the
+    /// buckets above), so identity hashes and snapshots cost O(bucket).
+    indices_per_cluster: Vec<Vec<u32>>,
+
+    /// Feature rows that came from the provider; row `n_orig_rows + j` lives
+    /// in row `j` of `added` (see [`Self::add_spikes`]).
+    n_orig_rows: usize,
+    added: AddedRows,
+}
+
+/// Side buffers for feature rows of spikes inserted by `add_spikes`.
+#[derive(Debug, Default)]
+struct AddedRows {
+    rows: usize,
+    pc: Vec<f32>,
+    template_features: Vec<f32>,
+    /// Parallel to `ClusterIndex::spike_attributes`.
+    attributes: Vec<Vec<f32>>,
 }
 
 impl ClusterIndex {
@@ -132,6 +151,10 @@ impl ClusterIndex {
         use std::collections::BinaryHeap;
         let mut spike_times = Vec::with_capacity(total_spikes);
         let mut spike_clusters = Vec::with_capacity(total_spikes);
+        let mut indices_per_cluster: Vec<Vec<u32>> = times_per_cluster
+            .iter()
+            .map(|b| Vec::with_capacity(b.len()))
+            .collect();
         let mut cursors = vec![0usize; n_clusters];
         let mut heap: BinaryHeap<Reverse<(SampleIndex, u32)>> = times_per_cluster
             .iter()
@@ -139,6 +162,7 @@ impl ClusterIndex {
             .filter_map(|(c, b)| b.first().map(|&t| Reverse((t, c as u32))))
             .collect();
         while let Some(Reverse((t, c))) = heap.pop() {
+            indices_per_cluster[c as usize].push(spike_times.len() as u32);
             spike_times.push(t);
             spike_clusters.push(ClusterId(c));
             let cur = &mut cursors[c as usize];
@@ -166,6 +190,9 @@ impl ClusterIndex {
             times_per_cluster,
             amps_per_cluster: vec![Vec::new(); n_clusters],
             templates_per_cluster: vec![Vec::new(); n_clusters],
+            indices_per_cluster,
+            n_orig_rows: 0,
+            added: AddedRows::default(),
         }
     }
 
@@ -213,6 +240,14 @@ impl ClusterIndex {
         let (tf, k, ind) = provider.template_features();
         self.template_features = (tf, k, std::sync::Arc::from(ind));
         self.spike_attributes = provider.spike_attributes();
+        let stride = self.pc_shape.0 * self.pc_shape.1;
+        self.n_orig_rows = (self.pc_features_flat.len())
+            .checked_div(stride)
+            .unwrap_or(self.spike_pc_indices.len());
+        self.added = AddedRows {
+            attributes: vec![Vec::new(); self.spike_attributes.len()],
+            ..Default::default()
+        };
         self.reordered_times = match provider.spike_reorder() {
             Some(reorder) => {
                 // phy: time of row `i` becomes the time of row `reorder[i]`.
@@ -346,10 +381,44 @@ impl ClusterIndex {
         if stride == 0 {
             return None;
         }
-        let orig = self.spike_pc_indices.get(global_idx as usize)?.get()? as usize;
-        let start = orig * stride;
-        let end = start + stride;
-        self.pc_features_flat.get(start..end)
+        let row = self.spike_pc_indices.get(global_idx as usize)?.get()? as usize;
+        self.row_slice(&self.pc_features_flat, &self.added.pc, row, stride)
+    }
+
+    /// Row `row` of a feature buffer: provider rows come from `orig`, rows
+    /// from `add_spikes` from the matching side buffer.
+    fn row_slice<'a>(
+        &self,
+        orig: &'a [f32],
+        added: &'a [f32],
+        row: usize,
+        width: usize,
+    ) -> Option<&'a [f32]> {
+        match row.checked_sub(self.n_orig_rows) {
+            Some(j) => added.get(j * width..(j + 1) * width),
+            None => orig.get(row * width..(row + 1) * width),
+        }
+    }
+
+    /// Spikes inserted by [`Self::add_spikes`] get feature rows from
+    /// `n_orig_rows()` up; the provider's rows are below it.
+    #[inline]
+    pub fn n_orig_rows(&self) -> usize {
+        self.n_orig_rows
+    }
+
+    /// Per-spike template ids in global order; empty when not seeded.
+    #[inline]
+    pub fn spike_templates_global(&self) -> &[u32] {
+        &self.spike_templates
+    }
+
+    /// Ascending global spike indices currently assigned to `cluster`.
+    #[inline]
+    pub fn global_indices(&self, cluster: ClusterId) -> &[u32] {
+        self.indices_per_cluster
+            .get(cluster.idx())
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Real channel ids of `template`'s PC feature columns, best first
@@ -363,14 +432,20 @@ impl ClusterIndex {
     /// The spike's projection on `template` (phy TemplateFeatureView);
     /// `None` when `template` is not among the spike's `k` nearest.
     pub fn template_feature(&self, global_idx: u32, template: u32) -> Option<f32> {
-        let (flat, k, ind) = &self.template_features;
+        let (_, k, ind) = &self.template_features;
         let own = *self.spike_templates.get(global_idx as usize)? as usize;
         let pos = ind
             .get(own * k..(own + 1) * k)?
             .iter()
             .position(|&t| t == template)?;
+        self.template_feature_row(global_idx)?.get(pos).copied()
+    }
+
+    /// All `k` template-feature values of the spike at `global_idx`.
+    pub fn template_feature_row(&self, global_idx: u32) -> Option<&[f32]> {
+        let (flat, k, _) = &self.template_features;
         let row = self.spike_pc_indices.get(global_idx as usize)?.get()? as usize;
-        flat.get(row * k + pos).copied()
+        self.row_slice(flat, &self.added.template_features, row, *k)
     }
 
     /// Names and column counts of the phylib spike attributes.
@@ -383,9 +458,10 @@ impl ClusterIndex {
 
     /// Attribute `name` of the spike at `global_idx` (1 or 2 values).
     pub fn spike_attribute(&self, name: &str, global_idx: u32) -> Option<&[f32]> {
-        let (_, flat, k) = self.spike_attributes.iter().find(|a| a.0 == name)?;
+        let i = self.spike_attributes.iter().position(|a| a.0 == name)?;
+        let (_, flat, k) = &self.spike_attributes[i];
         let row = self.spike_pc_indices.get(global_idx as usize)?.get()? as usize;
-        flat.get(row * k..(row + 1) * k)
+        self.row_slice(flat, self.added.attributes.get(i)?, row, *k)
     }
 
     /// The spike's time on the time axes: `spike_reorder.npy`'s when
@@ -467,6 +543,7 @@ impl ClusterIndex {
         self.times_per_cluster.push(Vec::new());
         self.amps_per_cluster.push(Vec::new());
         self.templates_per_cluster.push(Vec::new());
+        self.indices_per_cluster.push(Vec::new());
         id
     }
 
@@ -571,6 +648,7 @@ impl ClusterIndex {
             self.times_per_cluster.pop();
             self.amps_per_cluster.pop();
             self.templates_per_cluster.pop();
+            self.indices_per_cluster.pop();
         }
     }
 
@@ -605,19 +683,17 @@ impl ClusterIndex {
             self.times_per_cluster.resize_with(c + 1, Vec::new);
             self.amps_per_cluster.resize_with(c + 1, Vec::new);
             self.templates_per_cluster.resize_with(c + 1, Vec::new);
+            self.indices_per_cluster.resize_with(c + 1, Vec::new);
         }
         self.times_per_cluster[c] = snap.times;
         self.amps_per_cluster[c] = snap.amps;
         self.templates_per_cluster[c] = snap.templates;
+        self.indices_per_cluster[c] = snap.global_indices;
     }
 
     /// Sorted list of global spike indices currently belonging to `cluster`.
     fn global_indices_for(&self, cluster: ClusterId) -> Vec<u32> {
-        self.spike_clusters
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &c)| (c == cluster).then_some(i as u32))
-            .collect()
+        self.global_indices(cluster).to_vec()
     }
 
     /// Rebuild the cached bucket for `cluster` from the global per-spike
@@ -633,9 +709,11 @@ impl ClusterIndex {
 
         let mut times = Vec::new();
         let mut amps: Vec<f32> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
         let mut templates: Vec<u32> = Vec::new();
         for (i, &cl) in self.spike_clusters.iter().enumerate() {
             if cl == cluster {
+                indices.push(i as u32);
                 times.push(self.spike_times[i]);
                 if has_amps {
                     amps.push(self.spike_amplitudes[i]);
@@ -648,7 +726,256 @@ impl ClusterIndex {
         self.times_per_cluster[c] = times;
         self.amps_per_cluster[c] = amps;
         self.templates_per_cluster[c] = templates;
+        self.indices_per_cluster[c] = indices;
     }
+}
+
+/// `AddSpikes` support: stable insertion of new spikes into every global
+/// per-spike array, and its exact inverse.
+impl ClusterIndex {
+    /// Fail-closed gate for [`Self::add_spikes`] (the session runs it before
+    /// journaling): payload lengths, sorted times, valid clusters, loaded
+    /// amplitudes/templates, monotonic existing times, a complete PC row map
+    /// when row-addressed features are loaded, and feature widths that match
+    /// what is loaded.
+    pub fn check_add_spikes(&self, b: &SpikeBatch) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        let (n, m) = (self.n_spikes(), b.times.len());
+        ensure!(m > 0, "AddSpikes: no spikes");
+        ensure!(
+            b.clusters.len() == m && b.templates.len() == m && b.amplitudes.len() == m,
+            "AddSpikes: per-spike vectors must all have {m} entries"
+        );
+        ensure!(
+            b.times.windows(2).all(|w| w[0] <= w[1]),
+            "AddSpikes: times are not sorted"
+        );
+        ensure!(
+            b.clusters
+                .iter()
+                .all(|c| c.idx() < self.times_per_cluster.len()),
+            "AddSpikes: cluster id out of range"
+        );
+        ensure!(
+            self.spike_amplitudes.len() == n && self.spike_templates.len() == n,
+            "AddSpikes: amplitudes and spike templates must be loaded"
+        );
+        ensure!(
+            self.spike_times.windows(2).all(|w| w[0] <= w[1]),
+            "AddSpikes: existing spike times are not monotonic"
+        );
+        ensure!(
+            self.reordered_times.is_empty() || self.reordered_times.len() == n,
+            "AddSpikes: spike_reorder does not cover every spike"
+        );
+        let rows_after = self.n_orig_rows + self.added.rows + m;
+        ensure!(
+            n + m < u32::MAX as usize && rows_after < u32::MAX as usize,
+            "AddSpikes: too many spikes"
+        );
+
+        let stride = self.pc_shape.0 * self.pc_shape.1;
+        let k = self.template_features.1;
+        let n_rows = self.n_orig_rows + self.added.rows;
+        if stride > 0
+            || k > 0
+            || !self.spike_attributes.is_empty()
+            || !self.spike_pc_indices.is_empty()
+        {
+            ensure!(
+                self.spike_pc_indices.len() == n
+                    && self
+                        .spike_pc_indices
+                        .iter()
+                        .all(|r| r.get().is_some_and(|r| (r as usize) < n_rows)),
+                "AddSpikes: the PC row map is incomplete"
+            );
+        }
+        ensure!(
+            stride == 0 || self.pc_features_flat.len() == self.n_orig_rows * stride,
+            "AddSpikes: pc_features does not have one row per original spike"
+        );
+        ensure!(
+            b.pc_features.len() == m * stride,
+            "AddSpikes: pc_features needs {} values",
+            m * stride
+        );
+        ensure!(
+            k == 0 || self.template_features.0.len() == self.n_orig_rows * k,
+            "AddSpikes: template_features does not have one row per original spike"
+        );
+        ensure!(
+            b.template_features.len() == m * k,
+            "AddSpikes: template_features needs {} values",
+            m * k
+        );
+        ensure!(
+            b.attributes.len() == self.spike_attributes.len(),
+            "AddSpikes: needs exactly the loaded attributes"
+        );
+        for ((name, cols, vals), (have, flat, have_cols)) in
+            b.attributes.iter().zip(&self.spike_attributes)
+        {
+            ensure!(
+                name == have
+                    && *cols as usize == *have_cols
+                    && vals.len() == m * have_cols
+                    && flat.len() == self.n_orig_rows * have_cols,
+                "AddSpikes: attribute {have:?} does not match the loaded one"
+            );
+        }
+        Ok(())
+    }
+
+    /// Insert `b` in one stable merge pass (each new spike goes after any
+    /// original with an equal time) into every per-spike global array, park
+    /// its feature rows in the side buffers, and rebuild all buckets once.
+    pub fn add_spikes(&mut self, b: &SpikeBatch) -> anyhow::Result<AddRecord> {
+        self.check_add_spikes(b)?;
+        let (n, m) = (self.n_spikes(), b.times.len());
+        let mut positions = Vec::with_capacity(m);
+        let mut oi = 0;
+        for (j, &t) in b.times.iter().enumerate() {
+            while oi < n && self.spike_times[oi].0 <= t {
+                oi += 1;
+            }
+            positions.push((oi + j) as u32);
+        }
+        let t = |j: usize| SampleIndex(b.times[j]);
+        self.spike_times = splice_at(&self.spike_times, &positions, t);
+        self.spike_clusters = splice_at(&self.spike_clusters, &positions, |j| b.clusters[j]);
+        self.spike_amplitudes = splice_at(&self.spike_amplitudes, &positions, |j| b.amplitudes[j]);
+        self.spike_templates = splice_at(&self.spike_templates, &positions, |j| b.templates[j]);
+        if !self.reordered_times.is_empty() {
+            self.reordered_times = splice_at(&self.reordered_times, &positions, t);
+        }
+        let rows_before = self.added.rows;
+        let extended = !self.spike_pc_indices.is_empty() || self.has_row_features();
+        if extended {
+            let row0 = (self.n_orig_rows + rows_before) as u32;
+            self.spike_pc_indices = splice_at(&self.spike_pc_indices, &positions, |j| {
+                OptionalRow::new(row0 + j as u32)
+            });
+            self.added.rows += m;
+            self.added.pc.extend_from_slice(&b.pc_features);
+            self.added
+                .template_features
+                .extend_from_slice(&b.template_features);
+            for (side, (_, _, vals)) in self.added.attributes.iter_mut().zip(&b.attributes) {
+                side.extend_from_slice(vals);
+            }
+        }
+        self.rebuild_all_buckets();
+        Ok(AddRecord {
+            positions,
+            rows_before,
+            extended,
+        })
+    }
+
+    /// Exact inverse of [`Self::add_spikes`]. Valid only while `record` is
+    /// the most recent add and later edits are undone, which the session's
+    /// LIFO undo stack guarantees.
+    pub fn remove_added(&mut self, record: AddRecord) {
+        let pos = &record.positions;
+        remove_at(&mut self.spike_times, pos);
+        remove_at(&mut self.spike_clusters, pos);
+        remove_at(&mut self.spike_amplitudes, pos);
+        remove_at(&mut self.spike_templates, pos);
+        if !self.reordered_times.is_empty() {
+            remove_at(&mut self.reordered_times, pos);
+        }
+        if record.extended {
+            remove_at(&mut self.spike_pc_indices, pos);
+            let r = record.rows_before;
+            self.added.rows = r;
+            self.added
+                .pc
+                .truncate(r * self.pc_shape.0 * self.pc_shape.1);
+            self.added
+                .template_features
+                .truncate(r * self.template_features.1);
+            for (side, (_, _, cols)) in self.added.attributes.iter_mut().zip(&self.spike_attributes)
+            {
+                side.truncate(r * cols);
+            }
+        }
+        self.rebuild_all_buckets();
+    }
+
+    fn has_row_features(&self) -> bool {
+        self.pc_shape.0 * self.pc_shape.1 > 0
+            || self.template_features.1 > 0
+            || !self.spike_attributes.is_empty()
+    }
+
+    /// Rebuild every bucket in one pass over the global arrays.
+    fn rebuild_all_buckets(&mut self) {
+        let k = self.times_per_cluster.len();
+        let mut times = vec![Vec::new(); k];
+        let mut amps: Vec<Vec<f32>> = vec![Vec::new(); k];
+        let mut templates: Vec<Vec<u32>> = vec![Vec::new(); k];
+        let mut indices: Vec<Vec<u32>> = vec![Vec::new(); k];
+        let has_amps = !self.spike_amplitudes.is_empty();
+        let has_templates = !self.spike_templates.is_empty();
+        for (i, c) in self.spike_clusters.iter().enumerate() {
+            let c = c.idx();
+            times[c].push(self.spike_times[i]);
+            indices[c].push(i as u32);
+            if has_amps {
+                amps[c].push(self.spike_amplitudes[i]);
+            }
+            if has_templates {
+                templates[c].push(self.spike_templates[i]);
+            }
+        }
+        self.times_per_cluster = times;
+        self.amps_per_cluster = amps;
+        self.templates_per_cluster = templates;
+        self.indices_per_cluster = indices;
+    }
+}
+
+/// Reversible record of an `add_spikes`.
+#[derive(Clone, Debug)]
+pub struct AddRecord {
+    /// Final global index of each inserted spike, ascending.
+    positions: Vec<u32>,
+    rows_before: usize,
+    extended: bool,
+}
+
+impl AddRecord {
+    /// Global indices the inserted spikes occupy right after the add.
+    pub fn positions(&self) -> &[u32] {
+        &self.positions
+    }
+}
+
+/// `old` with `new(j)` placed at final index `pos[j]` (ascending).
+fn splice_at<T: Copy>(old: &[T], pos: &[u32], new: impl Fn(usize) -> T) -> Vec<T> {
+    let mut out = Vec::with_capacity(old.len() + pos.len());
+    let (mut j, mut rest) = (0, old.iter());
+    for i in 0..old.len() + pos.len() {
+        if pos.get(j) == Some(&(i as u32)) {
+            out.push(new(j));
+            j += 1;
+        } else {
+            out.push(*rest.next().expect("positions lie within the merged length"));
+        }
+    }
+    out
+}
+
+/// Drop the elements at ascending indices `pos`.
+fn remove_at<T>(v: &mut Vec<T>, pos: &[u32]) {
+    let (mut i, mut j) = (0u32, 0);
+    v.retain(|_| {
+        let drop = pos.get(j) == Some(&i);
+        j += drop as usize;
+        i += 1;
+        !drop
+    });
 }
 
 /// Walk the global time-sorted `spike_clusters` array and emit one item per

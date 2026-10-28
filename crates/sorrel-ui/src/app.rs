@@ -58,6 +58,16 @@ fn describe_command(cmd: &CurationCommand) -> String {
             format!("note on cluster {}: {brief}{dots}", cluster.0)
         }
         CurationCommand::Tag { cluster, .. } => format!("retag cluster {}", cluster.0),
+        CurationCommand::AddSpikes(b) => {
+            let mut clusters = b.clusters.clone();
+            clusters.sort_unstable();
+            clusters.dedup();
+            format!(
+                "add {} spikes to {} clusters",
+                b.times.len(),
+                clusters.len()
+            )
+        }
         CurationCommand::Batch { children } => {
             // A multi-select relabel is journaled as one batch so a single
             // Undo reverts it; say so instead of "batch of N ops".

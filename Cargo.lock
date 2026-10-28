@@ -5720,6 +5720,7 @@ dependencies = [
  "log",
  "serde_json",
  "sorrel-cache",
+ "sorrel-compute",
  "sorrel-data",
  "sorrel-gpu",
  "sorrel-io",

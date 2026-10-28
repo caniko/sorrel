@@ -85,7 +85,7 @@ while never keeping a unit the human had marked noise.
 | `review:merge`                                            | The merge (applied or vetoed) needs a person.                                               |
 | `review:split`                                            | Sorrel's split ranking has a split proposal for this cluster.                               |
 | `review:geometry`                                         | Channel positions look like indices, not µm; every label needs checking.                    |
-| `tuned`                                                   | An Auto unit that absorbed a merge. Set by sorrel.                                          |
+| `tuned`                                                   | An Auto unit that absorbed a merge or gained rescued spikes. Set by sorrel.                 |
 | `split`                                                   | An Auto unit that lost spikes to a split. Set by sorrel; a split child does not inherit it. |
 | `external`                                                | Merged, split or created outside sorrel (phy). Set on first open; origin stays Auto.        |
 

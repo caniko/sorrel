@@ -16,6 +16,7 @@ pub mod lttb;
 pub mod metrics;
 pub mod metrics_iso;
 pub mod quality;
+pub mod rescue;
 pub mod snippets;
 
 pub use binning::{histogram_u64, isi_histogram, isi_histogram_range, psth};

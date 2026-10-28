@@ -17,6 +17,7 @@
 - [Keyboard & Mouse](./usage/keyboard-controls.md)
 - [Saving & QC Export](./usage/saving.md)
 - [Automatic Curation](./usage/auto-curation.md)
+- [Spike rescue](./usage/rescue.md)
 - [Remote Work](./usage/remote.md)
 
 # Architecture

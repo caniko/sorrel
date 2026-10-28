@@ -169,6 +169,7 @@ impl std::fmt::Debug for KilosortOpenParams {
 impl KilosortProvider {
     pub fn open(root: impl AsRef<Path>, overrides: KilosortOpenParams) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
+        roll_forward_pending(&root)?;
 
         // 1. params.py — optional but strongly preferred. If present, it owns
         // sample_rate / n_channels / dtype / offset / dat_path defaults.
@@ -1188,6 +1189,34 @@ fn with_phy_labels(root: &Path, mut tags: Vec<Vec<String>>) -> Vec<Vec<String>> 
         }
     }
     tags
+}
+
+/// Manifest of an in-flight per-spike array rewrite: one `tmp\tfinal` pair of
+/// bare file names per line, written (fsynced) only after every tmp file is.
+pub const REWRITE_PENDING: &str = "sorrel_rewrite.pending";
+
+/// Finish an interrupted rewrite: rename every listed tmp file that still
+/// exists over its final name, then drop the manifest. The manifest only
+/// appears once all tmp files are durable, so this never exposes a mix of old
+/// and new arrays after it returns.
+pub fn roll_forward_pending(root: &Path) -> Result<()> {
+    let manifest = root.join(REWRITE_PENDING);
+    let text = match std::fs::read_to_string(&manifest) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        r => r.with_context(|| format!("read {}", manifest.display()))?,
+    };
+    let bare = |n: &str| Path::new(n).file_name().is_some_and(|f| f == n);
+    for line in text.lines().filter(|l| !l.is_empty()) {
+        let (tmp, fin) = line
+            .split_once('\t')
+            .filter(|(a, b)| bare(a) && bare(b))
+            .with_context(|| format!("{}: malformed line {line:?}", manifest.display()))?;
+        if root.join(tmp).exists() {
+            std::fs::rename(root.join(tmp), root.join(fin))
+                .with_context(|| format!("roll forward {tmp} -> {fin}"))?;
+        }
+    }
+    std::fs::remove_file(&manifest).with_context(|| format!("remove {}", manifest.display()))
 }
 
 /// Tag put on units edited outside sorrel (phy merge/split/new id) when a

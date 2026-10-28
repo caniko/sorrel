@@ -176,6 +176,29 @@ pub enum CurationCommand {
         cluster: ClusterId,
         tags: Vec<String>,
     },
+    /// Insert detected spikes into existing clusters (rescue). Everything is
+    /// precomputed so replay never re-detects. Appended after `Tag`.
+    AddSpikes(SpikeBatch),
+}
+
+/// Payload of [`CurationCommand::AddSpikes`]: `n = times.len()` new spikes.
+/// `times` is non-decreasing; a new spike sorts after originals with an
+/// equal time. Per-spike vectors are parallel to `times`; the feature
+/// vectors are row-major and must be empty exactly when the session has not
+/// loaded that feature (otherwise the apply fails closed).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpikeBatch {
+    pub times: Vec<u64>,
+    pub clusters: Vec<ClusterId>,
+    pub templates: Vec<u32>,
+    pub amplitudes: Vec<f32>,
+    /// `n * (n_pcs * n_channels_per_template)` or empty.
+    pub pc_features: Vec<f32>,
+    /// `n * k` (template features) or empty.
+    pub template_features: Vec<f32>,
+    /// `(name, columns, n * columns values)`, one per loaded `spike_<name>`
+    /// attribute, in the session's order.
+    pub attributes: Vec<(String, u32, Vec<f32>)>,
 }
 
 impl CurationCommand {
@@ -187,6 +210,7 @@ impl CurationCommand {
             Self::Merge { target, .. } => Some(*target),
             Self::Split { cluster, .. } => Some(*cluster),
             Self::Note { cluster, .. } | Self::Tag { cluster, .. } => Some(*cluster),
+            Self::AddSpikes(b) => b.clusters.first().copied(),
             Self::Batch { children } => children.first().and_then(|c| c.primary_cluster()),
             Self::Undo | Self::Redo => None,
         }

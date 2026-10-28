@@ -2,7 +2,7 @@ use crate::cache::amplitudes::{
     CachedAmplitudes, ALGO_VERSION as AMPLITUDES_ALGO_VERSION, KIND as AMPLITUDES_KIND,
 };
 use crate::cache::{isolation, pc_subspace};
-use crate::cluster_index::{ClusterIndex, MergeRecord, SplitRecord};
+use crate::cluster_index::{AddRecord, ClusterIndex, MergeRecord, SplitRecord};
 use crate::command::{CurationCommand, Method, PhyLabelOp, UnitOrigin};
 use crate::feature_subspace::{DEFAULT_CHANNEL_IDX, DEFAULT_D, DEFAULT_MAX_BACKGROUND};
 use crate::journal::Journal;
@@ -75,6 +75,11 @@ enum InverseOp<L: Copy> {
     Tag {
         cluster: ClusterId,
         prev: Vec<String>,
+    },
+    AddSpikes {
+        record: AddRecord,
+        /// Tags of the Auto clusters that gained `tuned`, before the add.
+        prev_tags: Vec<(ClusterId, Vec<String>)>,
     },
 }
 
@@ -869,6 +874,15 @@ impl<P: DataProvider> Session<P> {
             CurationCommand::Redo if self.redo.is_empty() => return Ok(()),
             _ => {}
         }
+        // Fail closed before anything reaches the journal.
+        match &cmd {
+            CurationCommand::Redo => {
+                if let Some(e) = self.redo.last() {
+                    self.check_gate(&e.cmd)?;
+                }
+            }
+            forward => self.check_gate(forward)?,
+        }
         let prev_head = self.journal.head();
         let affected = self.cache_identities_for_command(&cmd);
         self.journal.append(&cmd)?;
@@ -903,14 +917,20 @@ impl<P: DataProvider> Session<P> {
                 let Some(entry) = self.redo.pop() else {
                     bail!("journal contains Redo with empty redo stack");
                 };
-                let inverse = self.apply_forward(&entry.cmd);
+                let inverse = match self.apply_forward(&entry.cmd) {
+                    Ok(inv) => inv,
+                    Err(e) => {
+                        self.redo.push(entry);
+                        return Err(e);
+                    }
+                };
                 self.history.push(HistoryEntry {
                     cmd: entry.cmd,
                     inverse,
                 });
             }
             forward => {
-                let inverse = self.apply_forward(&forward);
+                let inverse = self.apply_forward(&forward)?;
                 self.history.push(HistoryEntry {
                     cmd: forward,
                     inverse,
@@ -925,7 +945,79 @@ impl<P: DataProvider> Session<P> {
     /// inline (rather than as a separate pass) means we read state once
     /// before the mutation and once after — which matters for merge/split
     /// where the cluster_index records the affected snapshots.
-    fn apply_forward(&mut self, cmd: &CurationCommand) -> InverseOp<P::Label>
+    fn apply_forward(&mut self, cmd: &CurationCommand) -> Result<InverseOp<P::Label>>
+    where
+        P: ApplyPhyLabel,
+    {
+        match cmd {
+            CurationCommand::AddSpikes(batch) => {
+                self.check_gate(cmd)?;
+                let record = self.cluster_index.add_spikes(batch)?;
+                // Auto units that gained spikes are tuned; undo restores their tags.
+                let mut touched = batch.clusters.clone();
+                touched.sort_unstable();
+                touched.dedup();
+                let mut prev_tags = Vec::new();
+                for c in touched {
+                    if *self.origin(c) == UnitOrigin::Auto {
+                        let tuned = self.tune_tags(c, self.tags(c).to_vec());
+                        prev_tags.push((c, self.swap_tags(c, tuned)));
+                    }
+                }
+                Ok(InverseOp::AddSpikes { record, prev_tags })
+            }
+            CurationCommand::Batch { children } => {
+                let mut inverses = Vec::with_capacity(children.len());
+                for child in children {
+                    debug_assert!(
+                        !matches!(
+                            child,
+                            CurationCommand::Undo
+                                | CurationCommand::Redo
+                                | CurationCommand::Batch { .. }
+                        ),
+                        "Batch children must be forward, non-nested"
+                    );
+                    match self.apply_forward(child) {
+                        Ok(inv) => inverses.push(inv),
+                        Err(e) => {
+                            // Roll back the children already applied.
+                            for inv in inverses.into_iter().rev() {
+                                self.apply_inverse(inv);
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                Ok(InverseOp::Batch { inverses })
+            }
+            other => Ok(self.apply_simple(other)),
+        }
+    }
+
+    /// Gate for commands that need more than the in-memory state: AddSpikes
+    /// is only valid on a phy-directory provider with no remote record sink
+    /// (a sink would have to carry the payload, and replay must be local).
+    fn check_gate(&self, cmd: &CurationCommand) -> Result<()> {
+        match cmd {
+            CurationCommand::AddSpikes(batch) => {
+                if self.provider.phy_dir().is_none() {
+                    bail!("AddSpikes needs a phy/Kilosort directory provider");
+                }
+                if self.record_sink.is_some() {
+                    bail!("AddSpikes is not supported on a session with a remote record sink");
+                }
+                self.cluster_index.check_add_spikes(batch)
+            }
+            CurationCommand::Batch { children } => {
+                children.iter().try_for_each(|c| self.check_gate(c))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The infallible forward ops (everything but `Batch` and `AddSpikes`).
+    fn apply_simple(&mut self, cmd: &CurationCommand) -> InverseOp<P::Label>
     where
         P: ApplyPhyLabel,
     {
@@ -1034,21 +1126,8 @@ impl<P: DataProvider> Session<P> {
                 cluster: *cluster,
                 prev: self.swap_tags(*cluster, tags.clone()),
             },
-            CurationCommand::Batch { children } => {
-                let mut inverses = Vec::with_capacity(children.len());
-                for child in children {
-                    debug_assert!(
-                        !matches!(
-                            child,
-                            CurationCommand::Undo
-                                | CurationCommand::Redo
-                                | CurationCommand::Batch { .. }
-                        ),
-                        "Batch children must be forward, non-nested"
-                    );
-                    inverses.push(self.apply_forward(child));
-                }
-                InverseOp::Batch { inverses }
+            CurationCommand::Batch { .. } | CurationCommand::AddSpikes(_) => {
+                unreachable!("handled by apply_forward")
             }
             CurationCommand::Undo | CurationCommand::Redo => {
                 debug_assert!(false, "Undo/Redo handled by caller, not apply_forward");
@@ -1100,6 +1179,12 @@ impl<P: DataProvider> Session<P> {
             InverseOp::Tag { cluster, prev } => {
                 self.swap_tags(cluster, prev);
             }
+            InverseOp::AddSpikes { record, prev_tags } => {
+                for (c, tags) in prev_tags {
+                    self.swap_tags(c, tags);
+                }
+                self.cluster_index.remove_added(record)
+            }
             InverseOp::Batch { inverses } => {
                 // Reverse order: undo the last-applied child first so each
                 // step rolls back exactly the state it had overwritten.
@@ -1131,9 +1216,7 @@ impl<P: DataProvider> Session<P> {
 
     fn cache_identities_for_command(&self, cmd: &CurationCommand) -> Vec<CacheClusterIdentity> {
         let clusters = match cmd {
-            CurationCommand::Undo | CurationCommand::Redo => {
-                (0..self.n_clusters()).map(ClusterId).collect()
-            }
+            c if touches_all(c) => (0..self.n_clusters()).map(ClusterId).collect(),
             forward => affected_clusters(forward),
         };
         clusters
@@ -1199,6 +1282,15 @@ impl<P: DataProvider> Session<P> {
     }
 }
 
+/// Commands whose cache effect is not confined to named clusters.
+fn touches_all(cmd: &CurationCommand) -> bool {
+    match cmd {
+        CurationCommand::Undo | CurationCommand::Redo | CurationCommand::AddSpikes(_) => true,
+        CurationCommand::Batch { children } => children.iter().any(touches_all),
+        _ => false,
+    }
+}
+
 fn affected_clusters(cmd: &CurationCommand) -> Vec<ClusterId> {
     let mut out = Vec::new();
     collect_affected_clusters(cmd, &mut out);
@@ -1223,7 +1315,10 @@ fn collect_affected_clusters(cmd: &CurationCommand, out: &mut Vec<ClusterId>) {
             }
         }
         // Tags never touch spikes, so no cache depends on them.
-        CurationCommand::Tag { .. } | CurationCommand::Undo | CurationCommand::Redo => {}
+        CurationCommand::Tag { .. }
+        | CurationCommand::Undo
+        | CurationCommand::Redo
+        | CurationCommand::AddSpikes(_) => {}
     }
 }
 
