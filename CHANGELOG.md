@@ -7,6 +7,55 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Changed (UI)
+
+- **Roomier layout.**
+  - Text is 14 px, captions are at least 11 px, and controls and table rows are 24 px.
+  - The top bar is 36 px and tab bars are 30 px, with 6 px gaps between panes.
+  - The cluster panel opens at 340 px.
+- **Save state is always visible.** A chip next to the title reads
+  "unsaved", "saved" or "save failed". Hovering it shows the save path,
+  whether the undo history was sealed, or the full error.
+  - A Save button joins Undo, Redo and Merge, and Merge names its target
+    ("Merge 2 -> c1").
+  - The save message no longer prints over the toolbar.
+- **Cluster table.**
+  - Numbers are right-aligned monospace.
+  - A selected row keeps its red and orange scores readable and shows its
+    selection colour in a bar at the left edge.
+  - IDs no longer shift when a row is selected.
+  - The tags column appears only when some cluster has tags.
+  - Clicking a row's text now selects the cluster. It used to start a text
+    selection, and the Similar table had the same problem.
+- **New default layout.**
+  - Three tab groups sit along the top: Shape, Compare and Assess.
+  - Below them, a Time group (Raster, Drift, Contam·time, PSTH) sits beside the trace.
+  - Saved per-dataset layouts are kept.
+- **Plot axes sit outside the data.**
+  - Tick labels live in their own margins and units are axis titles, so labels no longer
+    collide with data or clip at pane edges.
+  - Trace channel numbers have a gutter, and the trace has a time axis.
+  - The trace is drawn in neutral grey, so selection markers stand out.
+- **Clearer panes.**
+  - **CCG:** y-axis, ±50 ms ticks, a visible refractory band and a sparse-data note.
+  - **PSTH:** step bars and the per-event breakdown.
+  - **Raster:** selected clusters in their selection colour and the rest in neutral grey.
+  - **Stats:** marks where the selected cluster falls.
+  - **Quality:** every sub-score coloured and the weakest bold.
+  - **Drift:** "no measurable drift" instead of repeated ticks.
+  - **Contam·time:** says when there is too little data.
+  - **Waveforms:** use the cell height and show a scale bar.
+  - **Probe:** drawn to scale with channel labels.
+- **Dialogs.**
+  - **Quit:** the destructive "Quit without saving" is red, and "Save & quit" is the focused default.
+  - **Load error:** shows the full path.
+  - **Loading:** larger, readable loading screen.
+  - **Help:** scrolls instead of clipping.
+- **Contrast.**
+  - Secondary text, unchecked checkboxes, and plot grid and reference lines now meet
+    WCAG AA in both themes (pinned by a unit test).
+  - Light-theme window shadows are soft.
+
 ## [0.2.0] - 2026-10-26
 
 ### Fixed (data integrity)
