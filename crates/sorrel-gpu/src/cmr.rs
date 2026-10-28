@@ -5,7 +5,7 @@
 //! memory. Practical channel-count cap is 512 (Neuropixels = 384) — beyond
 //! that the caller should fall back to CPU.
 
-use crate::{block_on_map, GpuContext};
+use crate::{block_on_map, GpuContext, GpuInitError};
 use bytemuck::{Pod, Zeroable};
 use std::num::NonZeroU64;
 
@@ -31,62 +31,64 @@ pub struct GpuCmr {
 }
 
 impl GpuCmr {
-    pub fn new(ctx: &GpuContext) -> Self {
+    pub fn new(ctx: &GpuContext) -> Result<Self, GpuInitError> {
         let device = &ctx.device;
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("sorrel-gpu.cmr.shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-        });
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("sorrel-gpu.cmr.bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: NonZeroU64::new(PARAMS_SIZE),
+        crate::guarded(device, "CMR", || {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("sorrel-gpu.cmr.shader"),
+                source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            });
+            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("sorrel-gpu.cmr.bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: NonZeroU64::new(PARAMS_SIZE),
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("sorrel-gpu.cmr.layout"),
-            bind_group_layouts: &[Some(&bgl)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("sorrel-gpu.cmr.pipeline"),
-            layout: Some(&layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sorrel-gpu.cmr.params"),
-            size: PARAMS_SIZE,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        Self {
-            ctx: ctx.clone(),
-            pipeline,
-            bgl,
-            params_buf,
-        }
+                ],
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("sorrel-gpu.cmr.layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("sorrel-gpu.cmr.pipeline"),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sorrel-gpu.cmr.params"),
+                size: PARAMS_SIZE,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            Self {
+                ctx: ctx.clone(),
+                pipeline,
+                bgl,
+                params_buf,
+            }
+        })
     }
 
     /// Run CMR in-place on `samples` (time-major, `n_channels` per row).
@@ -215,7 +217,7 @@ mod tests {
     #[test]
     fn matches_cpu_for_odd_channel_count() {
         let Some(ctx) = ctx() else { return };
-        let cmr = GpuCmr::new(&ctx);
+        let cmr = GpuCmr::new(&ctx).unwrap();
         let mut gpu_in: Vec<f32> = (0..(7 * 32))
             .map(|i| ((i * 31) % 197) as f32 - 100.0)
             .collect();
@@ -228,7 +230,7 @@ mod tests {
     #[test]
     fn matches_cpu_for_even_channel_count() {
         let Some(ctx) = ctx() else { return };
-        let cmr = GpuCmr::new(&ctx);
+        let cmr = GpuCmr::new(&ctx).unwrap();
         let mut gpu_in: Vec<f32> = (0..(8 * 64))
             .map(|i| ((i * 11) % 233) as f32 - 100.0)
             .collect();
@@ -241,7 +243,7 @@ mod tests {
     #[test]
     fn matches_cpu_for_neuropixels_channel_count() {
         let Some(ctx) = ctx() else { return };
-        let cmr = GpuCmr::new(&ctx);
+        let cmr = GpuCmr::new(&ctx).unwrap();
         let nc = 384u32;
         let nt = 64usize;
         let mut gpu_in: Vec<f32> = (0..(nc as usize * nt))
@@ -256,7 +258,7 @@ mod tests {
     #[test]
     fn rejects_too_many_channels() {
         let Some(ctx) = ctx() else { return };
-        let cmr = GpuCmr::new(&ctx);
+        let cmr = GpuCmr::new(&ctx).unwrap();
         let mut buf = vec![0.0f32; 1024];
         let r = cmr.run(&mut buf, 1024);
         assert!(matches!(r, Err(GpuCmrError::TooManyChannels(1024))));
@@ -265,7 +267,7 @@ mod tests {
     #[test]
     fn long_window_errors_instead_of_panicking() {
         let Some(ctx) = ctx() else { return };
-        let cmr = GpuCmr::new(&ctx);
+        let cmr = GpuCmr::new(&ctx).unwrap();
         // One workgroup per row: a 5 s window at 30 kHz exceeds the 65535 cap.
         let mut buf = vec![0.0f32; 150_000];
         let r = cmr.run(&mut buf, 1);
@@ -275,7 +277,7 @@ mod tests {
     #[test]
     fn empty_input_is_a_noop() {
         let Some(ctx) = ctx() else { return };
-        let cmr = GpuCmr::new(&ctx);
+        let cmr = GpuCmr::new(&ctx).unwrap();
         let mut buf: Vec<f32> = Vec::new();
         cmr.run(&mut buf, 4).unwrap();
         assert!(buf.is_empty());

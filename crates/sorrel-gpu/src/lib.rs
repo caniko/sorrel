@@ -84,6 +84,7 @@ impl GpuContext {
             })
             .await
             .map_err(|e| GpuInitError::DeviceRequest(e.to_string()))?;
+        log_uncaptured_errors(&device);
         Ok(Self {
             device: Arc::new(device),
             queue: Arc::new(queue),
@@ -146,6 +147,9 @@ pub(crate) fn check_limits(
 pub enum GpuInitError {
     NoAdapter,
     DeviceRequest(String),
+    /// Shader or pipeline creation was rejected (a driver or shader-compiler
+    /// bug, e.g. FXC on D3D12). Callers keep preprocessing on the CPU.
+    Kernel(String),
 }
 
 impl std::fmt::Display for GpuInitError {
@@ -153,11 +157,40 @@ impl std::fmt::Display for GpuInitError {
         match self {
             Self::NoAdapter => write!(f, "no compatible GPU adapter"),
             Self::DeviceRequest(e) => write!(f, "device request failed: {e}"),
+            Self::Kernel(e) => write!(f, "kernel creation failed: {e}"),
         }
     }
 }
 
 impl std::error::Error for GpuInitError {}
+
+/// Log wgpu errors that no error scope caught instead of wgpu's default
+/// handler, which panics. Sorrel installs it on every device it opens and on
+/// eframe's device once the GUI's own pipelines exist; egui-wgpu 0.34 sets no
+/// handler of its own.
+pub fn log_uncaptured_errors(device: &wgpu::Device) {
+    device.on_uncaptured_error(Arc::new(|e| log::error!("wgpu error (not fatal): {e}")));
+}
+
+/// Run `build` (shader module, layouts and pipeline creation) under
+/// Validation and Internal error scopes, so a backend that rejects a kernel
+/// yields `Err` instead of wgpu's fatal uncaptured-error panic. Scopes are
+/// per thread and `build` runs on this one. wgpu keeps the first error.
+pub(crate) fn guarded<T>(
+    device: &wgpu::Device,
+    what: &str,
+    build: impl FnOnce() -> T,
+) -> Result<T, GpuInitError> {
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let out = build();
+    let validation = pollster::block_on(validation.pop());
+    let internal = pollster::block_on(internal.pop());
+    match validation.or(internal) {
+        Some(e) => Err(GpuInitError::Kernel(format!("{what}: {e}"))),
+        None => Ok(out),
+    }
+}
 
 /// Block on a `MapAsync` future. wgpu requires polling the device while a
 /// readback is in flight; this helper does the standard channel dance.
@@ -219,5 +252,38 @@ pub(crate) mod test_support {
 
     fn format_gpu_error(error: GpuInitError) -> String {
         error.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A shader the backend rejects must come back as `Err`, not wgpu's fatal
+    /// uncaptured-error panic (the FXC failure seen under wine).
+    #[test]
+    fn rejected_pipeline_is_an_error_not_a_panic() {
+        let Some(ctx) = crate::test_support::ctx() else {
+            return;
+        };
+        let d = &ctx.device;
+        let bad = crate::guarded(d, "bad", || {
+            let m = d.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("bad"),
+                source: wgpu::ShaderSource::Wgsl("@compute fn main() { nope(); }".into()),
+            });
+            d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("bad"),
+                layout: None,
+                module: &m,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        });
+        assert!(
+            matches!(bad, Err(crate::GpuInitError::Kernel(_))),
+            "{bad:?}"
+        );
+        // The scopes are popped: a good build still succeeds afterwards.
+        assert!(crate::cmr::GpuCmr::new(&ctx).is_ok());
     }
 }

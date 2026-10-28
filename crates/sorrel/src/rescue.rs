@@ -597,7 +597,12 @@ pub fn run<P: DataProvider<Label = PhyLabel>>(
             .ok()
     };
     let mf = gctx.as_ref().map(GpuMatchedFilter::new);
-    let pre = gctx.as_ref().map(GpuTracePreproc::new);
+    // A backend that rejects the preprocessing kernels falls back to the CPU.
+    let pre = gctx.as_ref().and_then(|g| {
+        GpuTracePreproc::new(g)
+            .inspect_err(|e| eprintln!("GPU preprocessing unavailable ({e}); using the CPU"))
+            .ok()
+    });
     let chans_flat: Vec<u32> = units.iter().flat_map(|u| u.chans.iter().copied()).collect();
 
     let mut real: Vec<Vec<Cand>> = (0..n_u).map(|_| vec![]).collect();

@@ -114,6 +114,32 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
     WCAG AA in both themes (pinned by a unit test).
   - Light-theme window shadows are soft.
 
+## [0.2.1] - 2026-10-28
+
+### Fixed
+
+- A GPU backend that rejects a compute kernel no longer kills Sorrel. Kernel
+  creation now runs under wgpu error scopes, so a driver or shader-compiler
+  failure (FXC on D3D12 was the case seen) leaves trace preprocessing on the
+  CPU and logs one warning naming the adapter and backend, instead of
+  panicking at startup. Uncaptured wgpu errors on Sorrel's own devices are
+  logged rather than fatal.
+- `sorrel gpu-check` reports "kernels unavailable" per adapter and carries
+  on with the others instead of panicking. It exits non-zero on a CPU/GPU
+  mismatch, or when no compute-capable adapter can run the kernels.
+
+### Changed (release)
+
+- First release on winget (`winget install Caniko.Sorrel`). The release
+  workflow now submits the manifests through the GitHub API; 0.2.0's
+  submission failed because `wingetcreate` needs .NET, which hosted
+  runners lack under wine.
+- The workspace crates publish to crates.io from CI in dependency order,
+  through simit's trusted publisher, instead of by hand.
+- Every change now runs the Windows build on a real `windows-2025` runner:
+  `gpu-check` on DX12, headless `qc` and `report`, a GUI launch with a
+  screenshot, and a Python wheel install.
+
 ## [0.2.0] - 2026-10-26
 
 ### Fixed (data integrity)
@@ -379,3 +405,6 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   expected to exist on crates.io before this release.
 - Downstream dry-runs can fail until their local path dependencies have been
   published in order. See `RELEASE.md` for the publish sequence.
+
+[Unreleased]: https://github.com/caniko/sorrel/compare/0.2.1...HEAD
+[0.2.1]: https://github.com/caniko/sorrel/compare/0.2.0...0.2.1

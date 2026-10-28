@@ -230,6 +230,11 @@ enum Cmd {
         root: PathBuf,
     },
     /// List GPU adapters and check the compute kernels against the CPU on each
+    ///
+    /// Exits non-zero when a kernel disagrees with the CPU on any adapter, or
+    /// when no adapter can build the kernels at all. An adapter whose driver
+    /// rejects them ("kernels unavailable") is reported and skipped: the GUI
+    /// then preprocesses traces on the CPU.
     GpuCheck,
     /// Headless: matched-filter rescue of spikes a sorter missed from known
     /// units (FDR-controlled, dry run unless --apply), plus a virtual
@@ -1305,7 +1310,11 @@ where
                 TracePipeline::install(rs);
                 RasterPipeline::install(rs);
                 ScatterPipeline::install(rs);
-                app.install_gpu_compute(rs.device.clone().into(), rs.queue.clone().into());
+                app.install_gpu_compute(
+                    rs.device.clone().into(),
+                    rs.queue.clone().into(),
+                    &rs.adapter.get_info(),
+                );
             } else {
                 log::warn!("no wgpu render state available; trace view will not render");
             }

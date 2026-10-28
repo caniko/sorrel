@@ -2,9 +2,10 @@
   pkgs,
   root,
 }: let
+  inherit ((builtins.fromTOML (builtins.readFile (root + "/Cargo.toml"))).workspace.package) version;
   website = pkgs.stdenv.mkDerivation {
     pname = "sorrel-website";
-    version = "0.2.0";
+    inherit version;
     src = pkgs.lib.fileset.toSource {
       inherit root;
       fileset = pkgs.lib.fileset.maybeMissing (root + "/website");
@@ -23,7 +24,7 @@
 
   docs = pkgs.stdenv.mkDerivation {
     pname = "sorrel-docs";
-    version = "0.2.0";
+    inherit version;
     src = pkgs.lib.fileset.toSource {
       inherit root;
       fileset = pkgs.lib.fileset.maybeMissing (root + "/docs");

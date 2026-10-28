@@ -58,6 +58,17 @@ choco install sorrel
 New versions show up once the winget-pkgs PR is merged and Chocolatey
 moderation passes, which can take a few days after the GitHub release.
 
+The window opens on the first backend wgpu likes (Vulkan or DX12). If it
+crashes at startup with a shader error, or stays blank, pick the other one:
+
+```powershell
+$env:WGPU_BACKEND = "vulkan"   # or "dx12", or "gl"
+sorrel <DATA_DIR>
+```
+
+`sorrel gpu-check` shows what each backend can do. Trace filtering falls back
+to the CPU on its own when a backend rejects the compute kernels.
+
 ## With Nix
 
 ```bash

@@ -295,7 +295,11 @@ fn harness_sized(
             TracePipeline::install(rs);
             RasterPipeline::install(rs);
             ScatterPipeline::install(rs);
-            app.install_gpu_compute(rs.device.clone().into(), rs.queue.clone().into());
+            app.install_gpu_compute(
+                rs.device.clone().into(),
+                rs.queue.clone().into(),
+                &rs.adapter.get_info(),
+            );
             app
         })
 }

@@ -10,7 +10,8 @@
     inherit src buildInputs nativeBuildInputs;
     strictDeps = true;
     pname = "sorrel";
-    version = "0.2.0";
+    # One version source: simit release bumps the workspace manifest.
+    version = (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package.version;
   };
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
