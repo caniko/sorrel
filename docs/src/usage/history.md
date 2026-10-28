@@ -55,6 +55,6 @@ The journal is format version 3. Each record is one of:
 
 Sorrel upgrades a version 1 or 2 journal the first time it opens it.
 Undone edits become branches, and the file is rewritten as version 3.
-Older sorrel builds refuse a version 3 journal ("not a sorrel journal")
+Older sorrel builds refuse a version 3 journal ("not a sorrel journal (bad magic)")
 instead of truncating it. Upgrade every sorrel build that opens the same
 sort.

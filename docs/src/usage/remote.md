@@ -26,8 +26,10 @@ guest:  sorrel join "<six words>" --direct MULTIADDR  # or: --relay MULTIADDR
 - The derived cache (`.sorrel/cache`) is not shared; the guest rebuilds it.
 - A guest's **Export phy** writes `<into>_phy` with `params.py` pointing at
   the sparse mirror, so traces only cover what has been fetched. Export on
-  the host for a phy directory with the complete recording; `--copy-raw` on
-  a guest fails rather than writing the gaps.
+  the host for a phy directory with the complete recording. `--copy-raw` on
+  a guest has no separate guard: it reads the trace through the mirror, and
+  the export fails ("came back incomplete") at the first window not fetched
+  yet, rather than writing the gaps.
 
 Only one writer exists while a share is active: the host runs headless and
 only applies what the guest sends. Open the host directory normally after

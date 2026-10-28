@@ -37,20 +37,20 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - `sorrel rescue`: FDR-controlled matched-filter spike rescue for existing
   units, with hybrid-injection recall checks.
 - In-place `AddSpikes`: rescued spikes are journaled as one undoable batch.
+  Save rewrites every per-spike array, with backups in `sorrel_original/`.
 - Home Manager module (`homeManagerModules.default`, `programs.sorrel`), and a
   `sorrel.desktop` menu entry in the Nix packages.
 - `checks.workspace-tests`: every workspace test under nextest in the Nix
   sandbox, the UI snapshot states on pinned lavapipe (`SORREL_REQUIRE_GPU`
   fails instead of skipping). simit qualifies every x86_64-linux flake check
   as an exact installable (`nix-builds.yaml`).
-  Save rewrites every per-spike array, with backups in `sorrel_original/`.
 
 ### Changed
 
 - The curation journal is format v3, a tree of edits with their actor and
   time, head moves and save seals. v1 and v2 journals are upgraded on open,
   their undone commands kept as branches; sorrel 0.2.x refuses a v3 journal
-  ("bad magic") instead of truncating it. Remote protocol v3.
+  ("not a sorrel journal (bad magic)") instead of truncating it. Remote protocol v3.
 - Saving no longer clears the undo history. For phy directories, the first
   save that replaces a file keeps its original in `sorrel_original/` (listed
   in `sorrel_original/ROOT`), and reopening replays the journal onto those

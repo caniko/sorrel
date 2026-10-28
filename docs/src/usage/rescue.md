@@ -107,9 +107,9 @@ Safeguards:
   crash-safe.
 - The save refuses to run if the directory holds an unknown per-spike
   `.npy`, because it cannot reorder that file.
-- Writing phy files elsewhere without the per-spike arrays (`journal replay`)
-  is refused while there are added spikes, because the arrays would no
-  longer match.
+- `sorrel journal replay <DATA_DIR> --out DIR` is refused while there are
+  added spikes. It writes no per-spike arrays, so the files would no longer
+  match. Save the directory itself instead (`--apply --save`).
 
 Undoing the rescue and saving again writes the original arrays back.
 
