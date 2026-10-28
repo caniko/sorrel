@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-28
+
 ### Fixed
 
 - A GPU backend that rejects a compute kernel no longer kills Sorrel. Kernel
@@ -296,3 +298,6 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   expected to exist on crates.io before this release.
 - Downstream dry-runs can fail until their local path dependencies have been
   published in order. See `RELEASE.md` for the publish sequence.
+
+[Unreleased]: https://github.com/caniko/sorrel/compare/0.2.1...HEAD
+[0.2.1]: https://github.com/caniko/sorrel/compare/0.2.0...0.2.1
