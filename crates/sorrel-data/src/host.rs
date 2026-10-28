@@ -113,6 +113,19 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
         cmd: CurationCommand,
         check: impl FnOnce(&Session<P>) -> Result<()>,
     ) -> Result<HostEvent> {
+        self.apply_if_then(actor, cmd, check, |_| ())
+            .map(|(ev, ())| ev)
+    }
+
+    /// [`Self::apply_if`], and `then` reads the session after the edit while
+    /// the write lock is still held (e.g. the remote cursor the edit produced).
+    pub fn apply_if_then<R>(
+        &self,
+        actor: Actor,
+        cmd: CurationCommand,
+        check: impl FnOnce(&Session<P>) -> Result<()>,
+        then: impl FnOnce(&Session<P>) -> R,
+    ) -> Result<(HostEvent, R)> {
         let mut s = self.write();
         check(&s)?;
         let (desc, mut clusters) = match &cmd {
@@ -127,8 +140,10 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
         };
         let (n_before, before) = (s.n_clusters(), s.version());
         s.dispatch_as(actor.clone(), cmd)?;
-        // Splits allocate ids at the tail; an undone split frees them again.
-        clusters.extend((n_before..s.n_clusters()).map(ClusterId));
+        // Splits allocate ids at the tail; an undone split frees them again,
+        // so report the ids between the before and after counts either way.
+        let (lo, hi) = (n_before.min(s.n_clusters()), n_before.max(s.n_clusters()));
+        clusters.extend((lo..hi).map(ClusterId));
         let mut ev = HostEvent {
             node: s.head(),
             actor,
@@ -143,7 +158,8 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
             ev.seq = self.seq.fetch_add(1, Ordering::Relaxed);
             self.publish(&ev);
         }
-        Ok(ev)
+        let r = then(&s);
+        Ok((ev, r))
     }
 
     /// Check out `node` (`None` = the root) as `actor`, then announce it.
@@ -505,6 +521,23 @@ mod tests {
         assert_eq!(root.clusters, [ClusterId(1)], "the relabel");
         let fwd = h.checkout(Actor::Human, a.node).unwrap();
         assert_eq!(fwd.clusters, [ClusterId(1)]);
+    }
+
+    /// Undoing a split names the child id it frees, as the split named it.
+    #[test]
+    fn undo_of_a_split_reports_the_freed_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = host(dir.path());
+        let split = CurationCommand::Split {
+            cluster: ClusterId(0),
+            spike_idx: vec![1],
+            new_cluster: ClusterId(u32::MAX),
+            by: crate::command::Method::Manual,
+        };
+        let done = h.apply(Actor::Human, split).unwrap();
+        assert!(done.clusters.contains(&ClusterId(2)));
+        let undone = h.apply(Actor::Human, CurationCommand::Undo).unwrap();
+        assert!(undone.clusters.contains(&ClusterId(2)), "{undone:?}");
     }
 
     /// The check runs under the apply's write lock: an edit that lands

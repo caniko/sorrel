@@ -52,18 +52,25 @@ impl<P: DataProvider + ApplyPhyLabel> Served for SessionServed<P> {
         let guest = Actor::Remote {
             peer: "guest".into(),
         };
-        // The cursor check and the apply share one write lock, so a host or
-        // MCP edit cannot land in between.
-        self.0
-            .apply_if(guest, cmd, |s| {
-                let here = session_cursor(s);
-                if here != expected {
-                    return Err(HostError::Diverged { host: here }.into());
-                }
-                Ok(())
-            })
+        // The cursor check, the apply and the returned cursor share one write
+        // lock, so a host or MCP edit can neither land in between nor be
+        // folded into the cursor the guest advances to.
+        let (_, cursor) = self
+            .0
+            .apply_if_then(
+                guest,
+                cmd,
+                |s| {
+                    let here = session_cursor(s);
+                    if here != expected {
+                        return Err(HostError::Diverged { host: here }.into());
+                    }
+                    Ok(())
+                },
+                session_cursor,
+            )
             .map_err(|e| e.downcast::<HostError>().unwrap_or_else(failed))?;
-        Ok(self.cursor())
+        Ok(cursor)
     }
 }
 

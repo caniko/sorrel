@@ -368,7 +368,13 @@ impl Journal {
         buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(&payload);
         if let Err(e) = self.write_durably(&buf) {
-            if let Err(t) = self.file.set_len(self.len) {
+            // The cut-back must be durable too, or a crash could resurrect
+            // the record whose edit already returned an error.
+            if let Err(t) = self
+                .file
+                .set_len(self.len)
+                .and_then(|()| self.file.sync_all())
+            {
                 self.broken = true;
                 log::error!(
                     "{}: cannot cut back a failed append: {t}",
