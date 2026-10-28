@@ -6,7 +6,7 @@
 //! the layout the rest of the pipeline (snippet extraction → GPU upload)
 //! wants anyway.
 
-use crate::{block_on_map, GpuContext};
+use crate::{block_on_map, GpuContext, GpuInitError};
 use bytemuck::{Pod, Zeroable};
 use std::num::NonZeroU64;
 
@@ -29,72 +29,74 @@ pub struct GpuMeanSnippet {
 }
 
 impl GpuMeanSnippet {
-    pub fn new(ctx: &GpuContext) -> Self {
+    pub fn new(ctx: &GpuContext) -> Result<Self, GpuInitError> {
         let device = &ctx.device;
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("sorrel-gpu.snippets.shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-        });
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("sorrel-gpu.snippets.bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: NonZeroU64::new(PARAMS_SIZE),
+        crate::guarded(device, "mean-snippet", || {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("sorrel-gpu.snippets.shader"),
+                source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            });
+            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("sorrel-gpu.snippets.bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: NonZeroU64::new(PARAMS_SIZE),
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("sorrel-gpu.snippets.layout"),
-            bind_group_layouts: &[Some(&bgl)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("sorrel-gpu.snippets.pipeline"),
-            layout: Some(&layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sorrel-gpu.snippets.params"),
-            size: PARAMS_SIZE,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        Self {
-            ctx: ctx.clone(),
-            pipeline,
-            bgl,
-            params_buf,
-        }
+                ],
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("sorrel-gpu.snippets.layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("sorrel-gpu.snippets.pipeline"),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sorrel-gpu.snippets.params"),
+                size: PARAMS_SIZE,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            Self {
+                ctx: ctx.clone(),
+                pipeline,
+                bgl,
+                params_buf,
+            }
+        })
     }
 
     /// Compute the column-mean of `snippets` (row-major,
@@ -220,7 +222,7 @@ mod tests {
     #[test]
     fn matches_cpu_mean_snippet() {
         let Some(ctx) = ctx() else { return };
-        let gpu = GpuMeanSnippet::new(&ctx);
+        let gpu = GpuMeanSnippet::new(&ctx).unwrap();
         let snippet_len = 80u32;
         let n_spikes = 257usize;
         let mut flat = Vec::with_capacity(n_spikes * snippet_len as usize);
@@ -243,7 +245,7 @@ mod tests {
     #[test]
     fn empty_returns_empty() {
         let Some(ctx) = ctx() else { return };
-        let gpu = GpuMeanSnippet::new(&ctx);
+        let gpu = GpuMeanSnippet::new(&ctx).unwrap();
         let v = gpu.run(&[], 80).unwrap();
         assert!(v.is_empty());
     }
@@ -251,7 +253,7 @@ mod tests {
     #[test]
     fn single_snippet_equals_input() {
         let Some(ctx) = ctx() else { return };
-        let gpu = GpuMeanSnippet::new(&ctx);
+        let gpu = GpuMeanSnippet::new(&ctx).unwrap();
         let s: Vec<f32> = vec![1.0, -2.0, 3.5, -4.25, 5.125];
         let m = gpu.run(&s, s.len() as u32).unwrap();
         for (a, b) in m.iter().zip(s.iter()) {

@@ -58,8 +58,29 @@
           runner = "ubuntu-24.04";
           workspace = true;
           workspace_strategy = "aggregate";
+          # Publish the workspace crates in dependency order through simit's
+          # trusted publisher (simit-crates-io environment, restricted to trunk).
+          publish_crates = true;
+          publish_strategy = "coordinated";
           with_audit = true;
           with_deny = true;
+          # Run the cross-built sorrel.exe and Windows wheel on real Windows:
+          # wine's shader compiler is not Microsoft's, so DX12 only proves out here.
+          target_smokes = [
+            {
+              id = "windows";
+              nix_build = ".#packages.x86_64-linux.sorrel-windows-smoke";
+              runner = "windows-2025";
+              shell = "pwsh";
+              run = "./release/smoke-windows.ps1";
+              timeout_minutes = 30;
+              env.RUST_LOG = "info";
+              artifacts = {
+                name = "windows-smoke";
+                paths = ["smoke-out/**"];
+              };
+            }
+          ];
           # Public caches only; the private macOS SDK cache is a release concern.
           cache = {
             substituters = [
@@ -144,7 +165,7 @@
           license_url = "https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT";
           archive_pattern = "sorrel-{version}-{arch}-windows.zip";
           # chocolatey isn't in nixpkgs yet, and the dev shell no longer ships simit.
-          nix_tool = "github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=54f5f86d06ea7ab00ec0c9d1314676b65f88a81b";
+          nix_tool = "github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=5f468eda08d14f5ad636ec3e5676757693d25ece";
           api_key_secret = "CHOCOLATEY_API_KEY";
         };
       };
@@ -316,6 +337,16 @@
             version = sorrelVersion;
             packages = self.packages.${system};
           };
+          # What release/smoke-windows.ps1 runs on a windows runner: the release
+          # binary and the Windows wheel, from the release derivations.
+          sorrel-windows-smoke = let
+            wheel = self.packages.${system}.release-bundle.wheels.windows;
+          in
+            pkgs.runCommand "sorrel-windows-smoke-${sorrelVersion}" {} ''
+              mkdir -p $out
+              cp ${self.packages.${system}.sorrel-windows}/bin/sorrel.exe $out/
+              cp ${wheel}/${wheel.file} $out/
+            '';
         };
 
       checks =
