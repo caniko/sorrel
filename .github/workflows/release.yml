@@ -456,28 +456,109 @@ jobs:
           ZIP_NAME="sorrel-${VERSION}-x86_64-windows.zip"; ZIP_URL="https://github.com/caniko/sorrel/releases/download/${TAG}/${ZIP_NAME}"
           test -s "release/${ZIP_NAME}" || publisher_missing winget "missing release/${ZIP_NAME}"
           export ZIP_NAME ZIP_URL VERSION WINGET_PAT PUBLISH_WINGET_STATE
-          case "${PUBLISH_WINGET_STATE:-}" in active-required|inactive-soft) ;; *) echo "::error::winget: winget-pkgs probe was inconclusive (${PUBLISH_WINGET_STATE:-unset}); not guessing between an update and a first submission." >&2; exit 1 ;; esac
-          nix shell nixpkgs#curl nixpkgs#jq nixpkgs#unzip nixpkgs#wineWow64Packages.stable nixpkgs#util-linux -c bash <<'SCRIPT' || publisher_missing winget 'wingetcreate submission failed'
+          case "${PUBLISH_WINGET_STATE:-}" in active-required|inactive-soft) ;; *) echo "::error::winget: winget-pkgs probe was inconclusive (${PUBLISH_WINGET_STATE:-unset}); not guessing between a new version and a first submission." >&2; exit 1 ;; esac
+          nix shell nixpkgs#curl nixpkgs#jq -c bash <<'SCRIPT' || publisher_missing winget 'GitHub API submission failed'
           set -euo pipefail
           tmpdir="$(mktemp -d)"; trap 'rm -rf "$tmpdir"' EXIT
-          export WINEPREFIX="$tmpdir/wine"; export WINEDEBUG=-all; export TERM=xterm
-          release_json="$(curl -fsSL https://api.github.com/repos/microsoft/winget-create/releases/latest)"
-          url="$(printf '%s' "$release_json" | jq -r '.assets[] | select(.name == "wingetcreate.exe") | .browser_download_url' | head -n 1)"
-          curl -fsSL -o "$tmpdir/wingetcreate.exe" "$url"
-          state="${PUBLISH_WINGET_STATE:-}"
-          if [ "$state" = active-required ]; then
-            wine "$tmpdir/wingetcreate.exe" update Caniko.Sorrel --version "$VERSION" --urls "${ZIP_URL}|x64" --token "$WINGET_PAT" --submit
-          else
-            # yaml(): double-quoted YAML scalar; f KEY VALUE writes one field.
-            yaml() { local s="${1//\\/\\\\}"; printf '"%s"' "${s//\"/\\\"}"; }
-            f() { printf '%s: %s\n' "$1" "$(yaml "$2")"; }
-            dir="$tmpdir/"'manifests/c/Caniko/Sorrel'"/$VERSION"; mkdir -p "$dir"
-            sha="$(sha256sum "release/${ZIP_NAME}" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')"
-            { f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'DefaultLocale: en-US'; echo 'ManifestType: version'; echo 'ManifestVersion: 1.10.0'; } > "$dir"/'Caniko.Sorrel'.yaml
-            { f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'InstallerType: zip'; echo 'NestedInstallerType: portable'; echo 'NestedInstallerFiles:'; printf '%s\n' "- RelativeFilePath: $(yaml 'sorrel.exe')" "  PortableCommandAlias: $(yaml 'sorrel')"; echo 'Installers:'; echo '- Architecture: x64'; printf '%s\n' "  InstallerUrl: $(yaml "$ZIP_URL")" "  InstallerSha256: $sha"; echo 'ManifestType: installer'; echo 'ManifestVersion: 1.10.0'; } > "$dir"/'Caniko.Sorrel'.installer.yaml
-            { f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'PackageLocale: en-US'; f Publisher 'Caniko'; f PackageName 'Sorrel'; f License 'MIT OR Apache-2.0'; f LicenseUrl 'https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT'; f ShortDescription 'Native GUI for curating spike-sorted electrophysiology data'; echo 'ManifestType: defaultLocale'; echo 'ManifestVersion: 1.10.0'; } > "$dir"/'Caniko.Sorrel'.locale.en-US.yaml
-            wine "$tmpdir/wingetcreate.exe" submit "$(winepath -w "$dir")" --token "$WINGET_PAT"
+          ID='Caniko.Sorrel'; MANIFEST_DIR='manifests/c/Caniko/Sorrel'; state="${PUBLISH_WINGET_STATE:-}"
+          # yaml(): double-quoted YAML scalar; f KEY VALUE writes one field.
+          yaml() { local s="${1//\\/\\\\}"; printf '"%s"' "${s//\"/\\\"}"; }
+          f() { printf '%s: %s\n' "$1" "$(yaml "$2")"; }
+          dir="$tmpdir/"'manifests/c/Caniko/Sorrel'"/$VERSION"; mkdir -p "$dir"
+          sha="$(sha256sum "release/${ZIP_NAME}" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')"
+          { f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'DefaultLocale: en-US'; echo 'ManifestType: version'; echo 'ManifestVersion: 1.10.0'; } > "$dir"/'Caniko.Sorrel'.yaml
+          { f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'InstallerType: zip'; echo 'NestedInstallerType: portable'; echo 'NestedInstallerFiles:'; printf '%s\n' "- RelativeFilePath: $(yaml 'sorrel.exe')" "  PortableCommandAlias: $(yaml 'sorrel')"; echo 'Installers:'; echo '- Architecture: x64'; printf '%s\n' "  InstallerUrl: $(yaml "$ZIP_URL")" "  InstallerSha256: $sha"; echo 'ManifestType: installer'; echo 'ManifestVersion: 1.10.0'; } > "$dir"/'Caniko.Sorrel'.installer.yaml
+          { f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'PackageLocale: en-US'; f Publisher 'Caniko'; f PackageName 'Sorrel'; f License 'MIT OR Apache-2.0'; f LicenseUrl 'https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT'; f ShortDescription 'Native GUI for curating spike-sorted electrophysiology data'; echo 'ManifestType: defaultLocale'; echo 'ManifestVersion: 1.10.0'; } > "$dir"/'Caniko.Sorrel'.locale.en-US.yaml
+          # Submit the manifests in "$dir" to microsoft/winget-pkgs through the GitHub
+          # REST API as the WINGET_PAT user. Needs curl and jq.
+          # Inputs: ID MANIFEST_DIR VERSION ZIP_URL WINGET_PAT, state (active-required when
+          # the package already exists upstream) and dir (the generated manifest files).
+          UP=microsoft/winget-pkgs
+          umask 077
+          # The token reaches curl through this 0600 header file, never through argv.
+          printf 'Authorization: Bearer %s\n' "$WINGET_PAT" > "$tmpdir/auth"
+          printf '{}' > "$tmpdir/empty.json"
+          code=; last=
+          # api METHOD PATH [BODYFILE]: body lands in $tmpdir/resp, status in $code, non-2xx returns 1.
+          api() {
+            local a=(-sS --retry 3 -o "$tmpdir/resp" -w '%{http_code}' -X "$1"
+              -H "@$tmpdir/auth" -H 'Accept: application/vnd.github+json'
+              -H 'X-GitHub-Api-Version: 2022-11-28' -H 'Content-Type: application/json')
+            [ -z "${3:-}" ] || a+=(--data-binary "@$3")
+            last="$1 $2"
+            code="$(curl "${a[@]}" "https://api.github.com$2")" || code=000
+            case "$code" in 2??) ;; *) return 1 ;; esac
+          }
+          fail() { echo "::error::winget: $last -> HTTP $code: $(jq -r '.message // empty' "$tmpdir/resp" 2>/dev/null)" >&2; exit 1; }
+          must() { api "$@" || fail; }
+          val() { jq -r "$1" "$tmpdir/resp"; }
+
+          # Nothing to do when this version is already upstream.
+          api GET "/repos/$UP/contents/$MANIFEST_DIR/$VERSION" || true
+          case "$code" in
+            200) echo "winget: $ID $VERSION is already published in $UP"; exit 0 ;;
+            404) ;;
+            *) fail ;;
+          esac
+          # New package or new version: the package directory decides.
+          if [ -z "$state" ]; then
+            api GET "/repos/$UP/contents/$MANIFEST_DIR" || true
+            case "$code" in 200) state=active-required ;; 404) state=inactive-soft ;; *) fail ;; esac
           fi
+          if [ "$state" = active-required ]; then kind='New version'; else kind='New package'; fi
+          title="$kind: $ID version $VERSION"
+
+          must GET /user; login="$(val .login)"
+          must GET "/repos/$UP"; base="$(val .default_branch)"
+          branch="$(printf '%s-%s' "$ID" "$VERSION" | tr -c 'A-Za-z0-9._-' '-')"
+          # A rerun with the PR still open is a success.
+          must GET "/repos/$UP/pulls?head=$login:$branch&state=open"
+          pr="$(val '.[0].html_url // empty')"
+          if [ -n "$pr" ]; then echo "winget: PR already open: $pr"; exit 0; fi
+
+          # POST /forks is idempotent; the fork can take a while to appear.
+          must POST "/repos/$UP/forks" "$tmpdir/empty.json"
+          fork="/repos/$login/winget-pkgs"
+          n=0
+          until api GET "$fork"; do
+            n=$((n + 1))
+            [ "$n" -lt 24 ] || { echo "::error::winget: fork $login/winget-pkgs did not appear within 2 minutes" >&2; exit 1; }
+            sleep 5
+          done
+
+          must GET "/repos/$UP/git/ref/heads/$base"; head="$(val .object.sha)"
+          must GET "/repos/$UP/git/commits/$head"; base_tree="$(val .tree.sha)"
+          # A lagging fork may not have the upstream commit yet; sync it first.
+          api GET "$fork/git/commits/$head" || {
+            jq -n --arg b "$base" '{branch: $b}' > "$tmpdir/b"
+            must POST "$fork/merge-upstream" "$tmpdir/b"
+          }
+
+          # One commit holding the three manifests: blobs -> tree on the upstream tree -> commit -> ref.
+          entries='[]'
+          for f in "$dir"/*.yaml; do
+            jq -n --rawfile c "$f" '{content: $c, encoding: "utf-8"}' > "$tmpdir/b"
+            must POST "$fork/git/blobs" "$tmpdir/b"
+            entries="$(jq -c --arg p "$MANIFEST_DIR/$VERSION/${f##*/}" --arg s "$(val .sha)" \
+              '. + [{path: $p, mode: "100644", type: "blob", sha: $s}]' <<<"$entries")"
+          done
+          jq -n --arg b "$base_tree" --argjson e "$entries" '{base_tree: $b, tree: $e}' > "$tmpdir/b"
+          must POST "$fork/git/trees" "$tmpdir/b"; tree="$(val .sha)"
+          jq -n --arg m "$title" --arg t "$tree" --arg p "$head" '{message: $m, tree: $t, parents: [$p]}' > "$tmpdir/b"
+          must POST "$fork/git/commits" "$tmpdir/b"; commit="$(val .sha)"
+          jq -n --arg r "refs/heads/$branch" --arg s "$commit" '{ref: $r, sha: $s}' > "$tmpdir/b"
+          api POST "$fork/git/refs" "$tmpdir/b" || {
+            [ "$code" != 422 ] && fail
+            # The branch survives from an earlier run whose PR was closed: move it.
+            jq -n --arg s "$commit" '{sha: $s, force: true}' > "$tmpdir/b"
+            must PATCH "$fork/git/refs/heads/$branch" "$tmpdir/b"
+          }
+
+          jq -n --arg t "$title" --arg h "$login:$branch" --arg b "$base" \
+            --arg body "Automated submission of $ID $VERSION from $ZIP_URL, generated by simit." \
+            '{title: $t, head: $h, base: $b, body: $body, maintainer_can_modify: true}' > "$tmpdir/b"
+          must POST "/repos/$UP/pulls" "$tmpdir/b"
+          echo "winget: opened $(val .html_url)"
           SCRIPT
       - name: Publish wheels to PyPI
         run: |
@@ -511,7 +592,7 @@ jobs:
             exit 0
           }
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=54f5f86d06ea7ab00ec0c9d1314676b65f88a81b -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=5f468eda08d14f5ad636ec3e5676757693d25ece -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -539,7 +620,7 @@ jobs:
           set -euo pipefail
           . ./release-env
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=54f5f86d06ea7ab00ec0c9d1314676b65f88a81b -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=5f468eda08d14f5ad636ec3e5676757693d25ece -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -588,7 +669,7 @@ jobs:
           if [ -z "${CHOCOLATEY_API_KEY:-}" ]; then publisher_missing chocolatey 'CHOCOLATEY_API_KEY unset'; fi
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
           if [ "${CHOCO_CANDIDATE_CACHE_HIT:-}" != true ]; then echo 'Chocolatey candidate persistence was not verified.' >&2; exit 1; fi
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=54f5f86d06ea7ab00ec0c9d1314676b65f88a81b -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=5f468eda08d14f5ad636ec3e5676757693d25ece -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \

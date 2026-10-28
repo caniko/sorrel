@@ -165,7 +165,7 @@
           license_url = "https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT";
           archive_pattern = "sorrel-{version}-{arch}-windows.zip";
           # chocolatey isn't in nixpkgs yet, and the dev shell no longer ships simit.
-          nix_tool = "github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=54f5f86d06ea7ab00ec0c9d1314676b65f88a81b";
+          nix_tool = "github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=5f468eda08d14f5ad636ec3e5676757693d25ece";
           api_key_secret = "CHOCOLATEY_API_KEY";
         };
       };
