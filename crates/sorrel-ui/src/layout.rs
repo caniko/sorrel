@@ -26,6 +26,7 @@ use egui_tiles::{
     UiResponse,
 };
 use serde::{Deserialize, Serialize};
+use sorrel_data::proposals::Proposal;
 use sorrel_data::{Session, SpikeDepths};
 use sorrel_io::{ClusterId, DataProvider, Events};
 use sorrel_render::{GpuTracePreproc, TracePreproc};
@@ -55,10 +56,11 @@ pub enum Pane {
     TemplateFeatures,
     TraceImage,
     SpikeData,
+    Proposals,
 }
 
 impl Pane {
-    pub const ALL: [Pane; 22] = [
+    pub const ALL: [Pane; 23] = [
         Pane::Trace,
         Pane::Summary,
         Pane::Waveforms,
@@ -81,6 +83,7 @@ impl Pane {
         Pane::TemplateFeatures,
         Pane::TraceImage,
         Pane::SpikeData,
+        Pane::Proposals,
     ];
 
     pub fn title(self) -> &'static str {
@@ -107,6 +110,7 @@ impl Pane {
             Pane::TemplateFeatures => "Tmpl features",
             Pane::TraceImage => "Trace image",
             Pane::SpikeData => "Spike data",
+            Pane::Proposals => "Proposals",
         }
     }
 }
@@ -151,6 +155,7 @@ pub fn default_tree() -> Tree<Pane> {
             Pane::Stats,
             Pane::Rate,
             Pane::SpikeData,
+            Pane::Proposals,
         ],
     );
     let top = tiles.insert_horizontal_tile(vec![shape, compare, assess]);
@@ -264,6 +269,65 @@ pub enum ViewAction {
     AddPane(Pane, TileId),
     /// phy `screenshot`: save this pane's area of the window as a PNG.
     Screenshot(Pane, egui::Rect),
+    /// Proposals card: accept or reject proposal `id`.
+    Decide {
+        id: u64,
+        accept: bool,
+    },
+}
+
+/// One card per waiting proposal: who proposed what and how sure, the
+/// reasons, the clusters (click to select them and see the evidence in the
+/// other panes), and Accept / Reject.
+fn proposals_view(ui: &mut Ui, proposals: &[Proposal], actions: &mut Vec<ViewAction>) {
+    if proposals.is_empty() {
+        ui.weak(
+            "No proposals. With Agent: Propose in the top bar, MCP agents' edits wait here \
+             for you; `propose` always does.",
+        );
+        return;
+    }
+    let theme = crate::theme::Theme::from_ui(ui);
+    for p in proposals {
+        egui::Frame::group(ui.style())
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                theme.caption.gamma_multiply(0.5),
+            ))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new(crate::app::describe_proposal(p)).strong());
+                for r in &p.reasons {
+                    ui.label(format!("• {r}"));
+                }
+                ui.horizontal_wrapped(|ui| {
+                    let clusters = p.clusters();
+                    for &c in &clusters {
+                        if ui
+                            .small_button(format!("c{}", c.0))
+                            .on_hover_text("Select the proposal's clusters")
+                            .clicked()
+                        {
+                            actions
+                                .push(ViewAction::Suggest(SuggestAction::Select(clusters.clone())));
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Accept").clicked() {
+                        actions.push(ViewAction::Decide {
+                            id: p.id,
+                            accept: true,
+                        });
+                    }
+                    if ui.button("Reject").clicked() {
+                        actions.push(ViewAction::Decide {
+                            id: p.id,
+                            accept: false,
+                        });
+                    }
+                });
+            });
+    }
 }
 
 /// Trace-pane state the toolbar and mouse navigation edit in place.
@@ -284,6 +348,8 @@ pub struct TraceControls<'a> {
 pub struct ViewBehavior<'a, P: DataProvider> {
     pub session: &'a Session<P>,
     pub selection: &'a [ClusterId],
+    /// Agent proposals waiting for a decision, oldest first.
+    pub proposals: &'a [Proposal],
     pub label_str: fn(&P::Label) -> &'static str,
     pub channel_positions: &'a [[f32; 2]],
     pub waveform_cache: &'a mut WaveformCache,
@@ -720,6 +786,11 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                 if let Some(act) = action {
                     self.actions.push(ViewAction::Suggest(act));
                 }
+            }
+            Pane::Proposals => {
+                let proposals = self.proposals;
+                let actions = &mut self.actions;
+                scroll(ui, *pane, &mut |ui| proposals_view(ui, proposals, actions));
             }
             Pane::DriftMap => drift_map_view(ui, session, selected, self.depths),
             Pane::ContamTime => contamination_over_time_view(ui, session, selected),

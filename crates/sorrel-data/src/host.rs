@@ -46,6 +46,19 @@ pub struct SessionHost<P: DataProvider> {
     subscribers: Mutex<Vec<(Sender<HostEvent>, Waker)>>,
     policy: Mutex<AgentPolicy>,
     proposals: Mutex<Vec<Proposal>>,
+    agents: Arc<Mutex<Vec<(u64, String)>>>,
+}
+
+/// A connected agent, listed by [`SessionHost::agents`] until dropped.
+pub struct AgentSeat {
+    agents: Arc<Mutex<Vec<(u64, String)>>>,
+    id: u64,
+}
+
+impl Drop for AgentSeat {
+    fn drop(&mut self) {
+        lock(&self.agents).retain(|a| a.0 != self.id);
+    }
 }
 
 impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
@@ -55,6 +68,7 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
             subscribers: Mutex::default(),
             policy: Mutex::default(),
             proposals: Mutex::default(),
+            agents: Arc::default(),
         }
     }
 
@@ -138,6 +152,32 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
         rx
     }
 
+    /// List `name` among the connected agents while the seat lives.
+    /// ponytail: a leaving agent wakes nobody; the list is current at the
+    /// next repaint.
+    pub fn agent_joined(&self, name: String) -> AgentSeat {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        lock(&self.agents).push((id, name));
+        self.wake();
+        AgentSeat {
+            agents: Arc::clone(&self.agents),
+            id,
+        }
+    }
+
+    /// Names of the connected agents, sorted and deduplicated.
+    pub fn agents(&self) -> Vec<String> {
+        let mut names: Vec<String> = lock(&self.agents).iter().map(|a| a.1.clone()).collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn wake(&self) {
+        lock(&self.subscribers).iter().for_each(|(_, wake)| wake());
+    }
+
     pub fn policy(&self) -> AgentPolicy {
         *lock(&self.policy)
     }
@@ -150,7 +190,7 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
     /// changed yet). The caller writes the audit log.
     pub fn propose(&self, p: Proposal) {
         lock(&self.proposals).push(p);
-        lock(&self.subscribers).iter().for_each(|(_, wake)| wake());
+        self.wake();
     }
 
     /// The proposals waiting for a decision, oldest first.
@@ -309,6 +349,11 @@ mod tests {
         assert_eq!(back.version, first.version);
         assert_eq!(rx.try_iter().count(), 3);
         assert_eq!(h.subscribers.lock().unwrap().len(), 1);
+        let seat = h.agent_joined("codex".into());
+        let other = h.agent_joined("codex".into());
+        assert_eq!(h.agents(), ["codex"]);
+        drop((seat, other));
+        assert!(h.agents().is_empty());
         let end = h.apply(Actor::Human, CurationCommand::Redo).unwrap();
         assert_eq!(end.desc, "nothing to redo");
         assert_eq!(rx.try_iter().count(), 0, "a no-op is not announced");

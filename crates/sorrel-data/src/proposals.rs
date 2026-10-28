@@ -79,6 +79,10 @@ pub struct Proposal {
     /// The raw tool arguments the agent sent (`Null` for built-in proposers).
     pub args: Value,
     pub outcome: Outcome,
+    /// The agent's MCP client name: an accepted split is made by
+    /// `LLM:<proposer>`. Absent in older logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposer: Option<String>,
 }
 
 /// Process-unique, increasing id: microseconds since the epoch, bumped past
@@ -119,6 +123,7 @@ impl Proposal {
             created: id / 1_000_000,
             args,
             outcome: Outcome::Pending,
+            proposer: None,
         }
     }
 
@@ -166,7 +171,7 @@ impl Proposal {
                 spike_idx: spike_idx.clone(),
                 new_cluster: ClusterId(u32::MAX),
                 by: match self.source {
-                    Source::Agent => Method::Llm("agent".into()),
+                    Source::Agent => Method::Llm(self.proposer.clone().unwrap_or("agent".into())),
                     s => Method::Algo(s.tag().trim_start_matches("src:").into()),
                 },
             }),

@@ -112,6 +112,8 @@ pub struct Env<'a, F> {
     pub label_str: F,
     ui: Option<Arc<Ui>>,
     events: Option<Receiver<HostEvent>>,
+    /// Listed among the host's agents once `initialize` named the client.
+    seat: Option<crate::host::AgentSeat>,
     qc: Option<(u64, Vec<QcRow>)>,
     suggest: Option<(u64, Vec<MergeCandidate>, Vec<SplitCandidate>)>,
     /// MCP `clientInfo.name` from `initialize`; agent edits are named after it.
@@ -126,6 +128,7 @@ impl<'a, F> Env<'a, F> {
             label_str,
             ui: None,
             events: None,
+            seat: None,
             qc: None,
             suggest: None,
             client: None,
@@ -314,6 +317,9 @@ where
     F: Fn(&P::Label) -> &'static str + Sync,
 {
     env.capture_client(line);
+    if let (Some(name), None) = (&env.client, &env.seat) {
+        env.seat = Some(host.agent_joined(name.clone()));
+    }
     respond(line, |name, args| call_tool(host, env, name, args))
 }
 
@@ -545,11 +551,13 @@ fn no_gui() -> ToolError {
     ToolError::Failed("no GUI is attached to this session".into())
 }
 
-/// Audit `p` as pending and queue it on the host for a human.
-fn queue<P, F>(host: &SessionHost<P>, env: &Env<F>, p: Proposal) -> Result<Value, ToolError>
+/// Audit `p` as pending and queue it on the host for a human, named after
+/// the client that proposed it.
+fn queue<P, F>(host: &SessionHost<P>, env: &Env<F>, mut p: Proposal) -> Result<Value, ToolError>
 where
     P: DataProvider + ApplyPhyLabel,
 {
+    p.proposer = Some(actor_name(&env.agent()).to_owned());
     proposals::append(env.save_dir, &p)
         .map_err(|e| ToolError::Failed(format!("audit log: {e}")))?;
     let id = p.id;
@@ -1345,6 +1353,11 @@ mod tests {
             }
         );
         assert_eq!(p.source, Source::Agent);
+        assert_eq!(
+            p.proposer.as_deref(),
+            Some("agent"),
+            "named after the client"
+        );
         assert_eq!(
             proposals::read_log(dir.path())[0].id,
             p.id,

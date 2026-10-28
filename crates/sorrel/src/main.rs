@@ -1325,8 +1325,7 @@ where
         native_options,
         Box::new(move |cc| {
             let mut app = app;
-            let ctx = cc.egui_ctx.clone();
-            if let Err(e) = app.serve_mcp(move || ctx.request_repaint()) {
+            if let Err(e) = app.serve_mcp() {
                 log::warn!("MCP listener not started: {e:#}");
             }
             if let Some(rs) = cc.wgpu_render_state.as_ref() {

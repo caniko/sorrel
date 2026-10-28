@@ -112,6 +112,7 @@ pub fn similarity_view<P: DataProvider>(
             rows: pane.rows,
             hidden,
             similar: Some(&pane.state.scores),
+            highlight: &[],
         },
     );
     pane.state.drawn = pane.state.key.clone();

@@ -1368,3 +1368,86 @@ fn raster_and_rate_zoomed() {
         h
     });
 }
+
+/// An MCP agent ("codex") connected to the window merges a cluster: the
+/// top bar names it with a lit activity dot, the toast says what it did,
+/// and the touched cluster is selected and highlighted in the table.
+#[test]
+fn agent_edit_toast_and_highlight() {
+    if no_gpu() {
+        return;
+    }
+    use std::io::{BufRead, Write};
+    each_theme(|theme, name| {
+        let root = dataset(&format!("agent-edit-{name}"), 3);
+        let dir = root.clone();
+        let mut h = harness_with(theme, move || {
+            let (session, positions) = open(&dir);
+            let mut app = SorrelApp::new(session, label_str);
+            configure(&mut app, &dir, positions);
+            app.serve_mcp().unwrap();
+            app
+        });
+        settle(&mut h);
+        let (port, token) = sorrel_data::serve::read_mcp_json(&root).unwrap();
+        let mut agent = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut replies = std::io::BufReader::new(agent.try_clone().unwrap());
+        let mut line = String::new();
+        for msg in [
+            format!(r#"{{"token":"{token}"}}"#),
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"codex"}}}"#.into(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"merge","arguments":{"sources":[1],"target":2}}}"#.into(),
+        ] {
+            writeln!(agent, "{msg}").unwrap();
+            replies.read_line(&mut line).unwrap();
+        }
+        assert!(line.contains(r#"\"ok\":true"#), "{line}");
+        snap(&mut h, "agent_edit", name);
+        drop(agent); // after the snapshot: the indicator lists connected agents
+        h
+    });
+}
+
+/// Two agent proposals waiting in the Proposals pane.
+#[test]
+fn proposals_pane() {
+    if no_gpu() {
+        return;
+    }
+    use sorrel_data::proposals::{Action, Proposal, Source};
+    use sorrel_io::ClusterId;
+    each_theme(|theme, name| {
+        let mut h = fixture(&format!("proposals-{name}"), 3, theme);
+        for (action, confidence, reasons) in [
+            (
+                Action::Merge {
+                    clusters: vec![ClusterId(2), ClusterId(1)],
+                },
+                0.9,
+                vec!["CCG dip at 0 ms", "templates nearly identical"],
+            ),
+            (
+                Action::Relabel {
+                    cluster: ClusterId(0),
+                    label: "noise".into(),
+                },
+                0.62,
+                vec!["footprint spread over every channel"],
+            ),
+        ] {
+            let reasons = reasons.into_iter().map(String::from).collect();
+            let mut p = Proposal::new(
+                Source::Agent,
+                action,
+                confidence,
+                reasons,
+                Default::default(),
+            );
+            p.proposer = Some("codex".into());
+            h.state().host().propose(p);
+        }
+        click_tab(&mut h, "Proposals");
+        snap(&mut h, "proposals_pane", name);
+        h
+    });
+}

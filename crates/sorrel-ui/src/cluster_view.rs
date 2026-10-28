@@ -770,6 +770,8 @@ pub struct TableCtx<'a> {
     pub hidden: &'a mut Vec<String>,
     /// SimilarityView: list exactly these clusters and show their scores.
     pub similar: Option<&'a [(ClusterId, f32)]>,
+    /// Clusters another actor just changed: their id cell is tinted.
+    pub highlight: &'a [ClusterId],
 }
 
 /// Right-click header menu: one checkbox per column.
@@ -874,6 +876,7 @@ pub fn cluster_table<P: DataProvider>(
         rows,
         hidden,
         similar,
+        highlight,
     } = ctx;
     let theme = Theme::from_ui(ui);
     if state.metric_names != rows.metric_names {
@@ -1132,6 +1135,13 @@ pub fn cluster_table<P: DataProvider>(
                             match col {
                                 ClusterColumn::Id => {
                                     let cell = ui.max_rect();
+                                    if highlight.contains(&i) {
+                                        ui.painter().rect_filled(
+                                            cell,
+                                            0.0,
+                                            theme.warn.gamma_multiply(0.45),
+                                        );
+                                    }
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = 3.0;
                                         ui.add_space(4.0);

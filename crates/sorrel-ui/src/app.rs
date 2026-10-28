@@ -61,13 +61,52 @@ pub type DepthFn<P> = fn(&Session<P>) -> Option<SpikeDepths>;
 pub type PhyExportFn<P> = Arc<dyn Fn(&Session<P>) -> anyhow::Result<PathBuf> + Send + Sync>;
 
 /// What the window keeps while it serves MCP clients: the listener, the
-/// `select` requests, the selection it publishes, and the host's events.
+/// `select` requests and the selection it publishes.
 struct McpLink {
     _listener: sorrel_data::ListenerHandle,
     select: Receiver<Vec<ClusterId>>,
     selection: sorrel_data::SharedSelection,
-    events: Receiver<HostEvent>,
 }
+
+/// A waker that repaints the window once its context is known.
+fn waker(ctx: &Arc<std::sync::OnceLock<egui::Context>>) -> impl Fn() + Send + Sync + 'static {
+    let ctx = Arc::clone(ctx);
+    move || {
+        if let Some(c) = ctx.get() {
+            c.request_repaint();
+        }
+    }
+}
+
+/// One line for a proposal: who, what, how sure.
+pub(crate) fn describe_proposal(p: &sorrel_data::proposals::Proposal) -> String {
+    use sorrel_data::proposals::Action;
+    let ids = |c: &[ClusterId]| {
+        c.iter()
+            .map(|c| c.0.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let what = match &p.action {
+        Action::Relabel { cluster, label } => format!("relabel {} as {label}", cluster.0),
+        Action::Merge { clusters } => match clusters.split_first() {
+            Some((t, rest)) => format!("merge {} into {}", ids(rest), t.0),
+            None => "merge".into(),
+        },
+        Action::Split { cluster, spike_idx } => {
+            format!("split {} spikes off {}", spike_idx.len(), cluster.0)
+        }
+        Action::Accept { cluster } => format!("keep {} as it is", cluster.0),
+    };
+    let by = p
+        .proposer
+        .clone()
+        .unwrap_or_else(|| p.source.tag().trim_start_matches("src:").to_owned());
+    format!("{by}: {what} ({:.0}%)", p.confidence * 100.0)
+}
+
+/// How long the clusters another actor touched stay highlighted.
+const HIGHLIGHT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Generic eframe app. The whole window is monomorphised against `P`.
 ///
@@ -181,6 +220,13 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     quit_requested: bool,
     /// MCP clients' link to this window (see [`Self::serve_mcp`]).
     mcp: Option<McpLink>,
+    /// The host's events (subscribed at build) and the context their waker
+    /// repaints, known from the first frame.
+    host_events: Receiver<HostEvent>,
+    repaint: Arc<std::sync::OnceLock<egui::Context>>,
+    /// Clusters the last edit by another actor touched, and when: drawn in
+    /// the highlight colour for [`HIGHLIGHT`].
+    highlight: Option<(Vec<ClusterId>, Instant)>,
     /// Last window title sent to the OS; only re-sent when it changes.
     last_title: String,
     /// AA-contrast visuals go in on the first frame (no ctx before then).
@@ -248,6 +294,8 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     fn build(session: Session<P>, label_str: fn(&P::Label) -> &'static str) -> Self {
         let window_len = (session.provider.sample_rate() as u32).max(1) / 10; // 100 ms
         let host = Arc::new(SessionHost::new(session));
+        let repaint = Arc::new(std::sync::OnceLock::<egui::Context>::new());
+        let host_events = host.subscribe(waker(&repaint));
         Self {
             session: Arc::clone(host.session()),
             host,
@@ -310,6 +358,9 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             snippet: None,
             quit_requested: false,
             mcp: None,
+            host_events,
+            repaint,
+            highlight: None,
             last_title: String::new(),
             visuals_installed: false,
         }
@@ -390,13 +441,8 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
 
     /// Serve this window's session to MCP clients (`sorrel mcp <dir>`
     /// attaches): a loopback listener next to the save directory, whose
-    /// `select` moves this selection. `wake` repaints the window after
-    /// every host event, proposal or `select` (e.g. `ctx.request_repaint`).
-    /// Needs `set_save_dir` first.
-    pub fn serve_mcp(
-        &mut self,
-        wake: impl Fn() + Send + Sync + Clone + 'static,
-    ) -> anyhow::Result<()>
+    /// `select` moves this selection. Needs `set_save_dir` first.
+    pub fn serve_mcp(&mut self) -> anyhow::Result<()>
     where
         P: HasGeometry + 'static,
         Session<P>: Send + Sync,
@@ -410,9 +456,8 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         let ui = sorrel_data::Ui {
             selection: Arc::clone(&selection),
             select: tx,
-            wake: Arc::new(wake.clone()),
+            wake: Arc::new(waker(&self.repaint)),
         };
-        let events = self.host.subscribe(wake);
         let listener = sorrel_data::spawn_listener(
             Arc::clone(&self.host),
             &dir,
@@ -424,31 +469,151 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             _listener: listener,
             select,
             selection,
-            events,
         });
         Ok(())
     }
 
-    /// Apply what MCP clients asked for since the last frame and publish
-    /// the selection they read: `select` replaces the selection, and an edit
-    /// by someone else is named in the status toast.
-    fn poll_mcp(&mut self) {
+    /// Show what other actors did since the last frame and apply what MCP
+    /// clients asked for: an edit by an agent (or a remote guest) is named
+    /// in the toast ("codex: merge …"), its clusters are highlighted and
+    /// selected, as a human edit selects its result; `select` replaces the
+    /// selection; the selection is published back for `selection`.
+    fn poll_host(&mut self) {
+        let theirs: Vec<HostEvent> = self
+            .host_events
+            .try_iter()
+            .filter(|e| e.actor != Actor::Human)
+            .collect();
+        if let Some(ev) = theirs.last() {
+            self.status = toast(format!("{}: {}", actor_name(&ev.actor), ev.desc));
+            let live: Vec<ClusterId> = {
+                let s = read(&self.session);
+                theirs
+                    .iter()
+                    .flat_map(|e| e.clusters.iter().copied())
+                    .filter(|&c| !s.spike_times(c).is_empty())
+                    .collect()
+            };
+            if let Some((&first, rest)) = live.split_first() {
+                self.selection.replace(first);
+                rest.iter().for_each(|&c| self.selection.toggle(c));
+            }
+            self.highlight = Some((live, Instant::now()));
+        }
         let Some(link) = &self.mcp else { return };
-        let picks: Vec<Vec<ClusterId>> = link.select.try_iter().collect();
-        let events: Vec<HostEvent> = link.events.try_iter().collect();
-        for ids in picks {
+        for ids in link.select.try_iter() {
             if let Some((&first, rest)) = ids.split_first() {
                 self.selection.replace(first);
                 rest.iter().for_each(|&c| self.selection.toggle(c));
             }
         }
-        if let Some(ev) = events.iter().rev().find(|e| e.actor != Actor::Human) {
-            self.status = toast(format!("{}: {}", actor_name(&ev.actor), ev.desc));
+        *link.selection.lock().unwrap_or_else(|p| p.into_inner()) =
+            self.selection.as_slice().to_vec();
+    }
+
+    /// Top-bar agent strip: an activity dot (lit while the last agent edit
+    /// is highlighted), the connected MCP clients, the pending proposals,
+    /// and the Direct | Propose policy toggle.
+    fn agent_indicator(&mut self, ui: &mut egui::Ui) {
+        let theme = crate::theme::Theme::from_ui(ui);
+        let active = self.highlighted().is_some();
+        let agents = self.host.agents();
+        let (r, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+        let dot = if active { theme.good } else { theme.caption };
+        ui.painter().circle_filled(r.center(), 3.5, dot);
+        let who = if agents.is_empty() {
+            "no agent".to_string()
+        } else {
+            agents.join(", ")
+        };
+        ui.label(who).on_hover_text(if active {
+            "An agent just edited; the touched clusters are highlighted"
+        } else {
+            "MCP clients connected with `sorrel mcp <DATA_DIR>`"
+        });
+        let pending = self.host.proposals().len();
+        if pending > 0
+            && ui
+                .button(egui::RichText::new(format!("{pending} to review")).color(theme.warn))
+                .on_hover_text("Open the Proposals pane")
+                .clicked()
+        {
+            layout::add_pane(&mut self.tree, Pane::Proposals, None);
         }
-        if let Some(link) = &self.mcp {
-            *link.selection.lock().unwrap_or_else(|p| p.into_inner()) =
-                self.selection.as_slice().to_vec();
+        let policy = self.host.policy();
+        for (p, name, tip) in [
+            (
+                AgentPolicy::Direct,
+                "Direct",
+                "MCP agents edit directly; every edit is undoable",
+            ),
+            (
+                AgentPolicy::ProposeOnly,
+                "Propose",
+                "MCP agents only propose; you accept or reject each one",
+            ),
+        ] {
+            if ui
+                .selectable_label(policy == p, name)
+                .on_hover_text(tip)
+                .clicked()
+            {
+                self.host.set_policy(p);
+            }
         }
+    }
+
+    /// Accept (through the host, as a human decision that keeps the
+    /// proposer as the method) or reject proposal `id`, and audit it.
+    fn decide_proposal(&mut self, id: u64, accept: bool) {
+        use sorrel_data::proposals::Action;
+        let Some(p) = self.host.take_proposal(id) else {
+            return;
+        };
+        let cmds = {
+            let s = read(&self.session);
+            match accept {
+                true => p.to_commands(&s),
+                false => p.reject_commands(&s),
+            }
+        };
+        let what = describe_proposal(&p);
+        // Select the result the way the same edit made by hand would.
+        let follow = match &p.action {
+            _ if !accept => None,
+            Action::Merge { clusters } => clusters.first().map(|&t| vec![t]),
+            Action::Split { cluster, .. } => {
+                Some(vec![*cluster, ClusterId(read(&self.session).n_clusters())])
+            }
+            _ => None,
+        };
+        // Accept and relabel-reject can leave nothing to journal.
+        if let Some(batch) = CurationCommand::batch(cmds).filter(|b| !b.clusters().is_empty()) {
+            if !self.commit_with_follow(batch, follow) {
+                // The edit failed (error shown): keep the card.
+                self.host.propose(p);
+                return;
+            }
+        }
+        let outcome = match accept {
+            true => sorrel_data::proposals::Outcome::Accepted,
+            false => sorrel_data::proposals::Outcome::Rejected,
+        };
+        if let Some(dir) = &self.save_dir {
+            if let Err(e) = sorrel_data::proposals::record_outcome(dir, id, outcome) {
+                log::warn!("proposal audit log: {e}");
+            }
+        }
+        let verb = if accept { "accepted" } else { "rejected" };
+        self.status = toast(format!("{verb}: {what}"));
+    }
+
+    /// The highlighted clusters while the highlight lasts.
+    fn highlighted(&self) -> Option<&[ClusterId]> {
+        self.highlight
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < HIGHLIGHT)
+            .map(|(c, _)| c.as_slice())
     }
 
     /// Hand the app the wgpu device/queue from `eframe`'s render state so
@@ -1472,28 +1637,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             }
             if self.mcp.is_some() {
                 ui.separator();
-                let policy = self.host.policy();
-                ui.label("Agent:");
-                for (p, name, tip) in [
-                    (
-                        AgentPolicy::Direct,
-                        "Direct",
-                        "MCP agents edit directly; every edit is undoable",
-                    ),
-                    (
-                        AgentPolicy::ProposeOnly,
-                        "Propose",
-                        "MCP agents only propose; you accept or reject each one",
-                    ),
-                ] {
-                    if ui
-                        .selectable_label(policy == p, name)
-                        .on_hover_text(tip)
-                        .clicked()
-                    {
-                        self.host.set_policy(p);
-                    }
-                }
+                self.agent_indicator(ui);
             }
             let n_sel = self.selection.len();
             let target = self
@@ -1684,6 +1828,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             }
             ViewAction::AddPane(pane, into) => layout::add_pane(&mut self.tree, pane, Some(into)),
             ViewAction::Screenshot(pane, rect) => self.pending_screenshots.push((pane, rect)),
+            ViewAction::Decide { id, accept } => self.decide_proposal(id, accept),
         }
     }
 
@@ -1833,7 +1978,14 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
         if self.show_loading(&ctx, root_ui) {
             return;
         }
-        self.poll_mcp();
+        let _ = self.repaint.set(ctx.clone());
+        self.poll_host();
+        if let Some((_, at)) = &self.highlight {
+            match HIGHLIGHT.checked_sub(at.elapsed()) {
+                Some(left) => ctx.request_repaint_after(left),
+                None => self.highlight = None,
+            }
+        }
 
         // Input. Suppress single-letter intents while a text widget has focus
         // so typing in a filter box doesn't relabel selected clusters; global
@@ -2019,6 +2171,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                     self.label_str,
                 );
                 let selected: Vec<ClusterId> = self.selection.iter().copied().collect();
+                let highlight = self.highlighted().unwrap_or_default().to_vec();
                 let click = cluster_table(
                     ui,
                     &session,
@@ -2029,6 +2182,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                         rows: &self.cluster_rows,
                         hidden: &mut self.view_params.hidden_cols,
                         similar: None,
+                        highlight: &highlight,
                     },
                 );
                 if let Some(click) = click {
@@ -2040,6 +2194,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
             // Every view is a tile; views only read the session and queue
             // side effects as actions, applied once the read lock is gone.
             let selected: Vec<ClusterId> = self.selection.iter().copied().collect();
+            let proposals = self.host.proposals();
             let closed = layout::missing_panes(&self.tree);
             let active_tabs = layout::active_tabs(&self.tree);
             let jobs = JobCtx {
@@ -2106,6 +2261,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                 let mut behavior = ViewBehavior {
                     session: &session,
                     selection: &selected,
+                    proposals: &proposals,
                     label_str: self.label_str,
                     channel_positions: &self.channel_positions,
                     waveform_cache: &mut self.waveform_cache,
@@ -2271,7 +2427,7 @@ mod tests {
     fn mcp_edits_and_selects_reach_the_window() {
         let (mut app, dir) = make_app();
         app.set_save_dir(dir.path().to_path_buf(), false);
-        app.serve_mcp(|| {}).unwrap();
+        app.serve_mcp().unwrap();
         assert!(dir.path().join(".sorrel/mcp.json").exists());
         let agent = Actor::Agent {
             client: "codex".into(),
@@ -2298,14 +2454,73 @@ mod tests {
         let mut line = String::new();
         r.read_line(&mut line).unwrap(); // ack
         r.read_line(&mut line).unwrap(); // select reply
-        app.poll_mcp();
+        app.poll_host();
         assert_eq!(
             app.status.as_ref().map(|s| s.0.as_str()),
             Some("codex: relabel cluster 2 as Noise")
         );
+        assert_eq!(app.highlighted(), Some(&[ClusterId(2)][..]));
+        // The agent's edit selected its cluster; the later `select` won.
         assert_eq!(app.selection.as_slice(), &[ClusterId(1)]);
         let published = app.mcp.as_ref().unwrap().selection.lock().unwrap().clone();
         assert_eq!(published, [ClusterId(1)]);
+    }
+
+    /// Accepting a proposal applies it as a human decision whose split is
+    /// made by the proposing agent, and audits it; rejecting a merge leaves
+    /// the not-merge memory.
+    #[test]
+    fn proposal_cards_accept_and_reject_through_the_host() {
+        use sorrel_data::proposals::{self, Action, Outcome, Proposal, Source};
+        let (mut app, dir) = make_app();
+        app.set_save_dir(dir.path().to_path_buf(), false);
+        let queue = |action, app: &SorrelApp<StubProvider>| {
+            let mut p = Proposal::new(
+                Source::Agent,
+                action,
+                0.8,
+                vec!["x".into()],
+                Default::default(),
+            );
+            p.proposer = Some("codex".into());
+            proposals::append(dir.path(), &p).unwrap();
+            app.host.propose(p.clone());
+            p.id
+        };
+        let split = queue(
+            Action::Split {
+                cluster: ClusterId(0),
+                spike_idx: vec![1],
+            },
+            &app,
+        );
+        let merge = queue(
+            Action::Merge {
+                clusters: vec![ClusterId(1), ClusterId(2)],
+            },
+            &app,
+        );
+        app.apply_view_action(ViewAction::Decide {
+            id: split,
+            accept: true,
+        });
+        app.apply_view_action(ViewAction::Decide {
+            id: merge,
+            accept: false,
+        });
+        assert!(app.host.proposals().is_empty());
+        let s = read(&app.session);
+        assert_eq!(s.n_clusters(), 4);
+        assert_eq!(s.origin_label(ClusterId(3)), "Sorrel[LLM:codex]");
+        assert!(s.tags(ClusterId(1)).iter().any(|t| t == "notmerge:2"));
+        assert_eq!(app.selection.as_slice(), &[ClusterId(0), ClusterId(3)]);
+        drop(s);
+        let log = proposals::read_log(dir.path());
+        let outcome = |id| log.iter().find(|p| p.id == id).unwrap().outcome;
+        assert_eq!(
+            (outcome(split), outcome(merge)),
+            (Outcome::Accepted, Outcome::Rejected)
+        );
     }
 
     fn make_app() -> (SorrelApp<StubProvider>, tempfile::TempDir) {

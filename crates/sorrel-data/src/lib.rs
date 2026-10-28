@@ -33,7 +33,7 @@ pub use diff::{diff_labels, LabelDiff};
 pub use feature_subspace::{
     collect_pc_subspace, PcSubspace, DEFAULT_CHANNEL_IDX, DEFAULT_D, DEFAULT_MAX_BACKGROUND,
 };
-pub use host::{AgentPolicy, HostEvent, SessionHost};
+pub use host::{AgentPolicy, AgentSeat, HostEvent, SessionHost};
 pub use journal::{artifacts_hash, baseline_hash, Journal, Record};
 pub use open::{
     journal_path, open_identity_sealed, open_journal, open_phy, open_sorting_analyzer,
