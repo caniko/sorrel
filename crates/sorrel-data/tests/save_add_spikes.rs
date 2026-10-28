@@ -679,3 +679,128 @@ fn external_edit_to_any_cluster_tsv_fails_closed() {
         drop(open(root));
     }
 }
+
+/// A shared snapshot is not moved aside from under the default journal by an
+/// alternate journal path; the refusal leaves everything in place.
+#[test]
+fn alternate_journal_keeps_the_default_journals_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_fixture(root);
+    let mut s = open_phy(root, KilosortOpenParams::default(), &JournalOpts::default()).unwrap();
+    seed_phy(&mut s).unwrap();
+    s.dispatch(CurationCommand::Relabel {
+        cluster: ClusterId(0),
+        op: PhyLabelOp::SetGood,
+    })
+    .unwrap();
+    save_and_seal(&mut s, root, label_str).unwrap();
+    drop(s);
+
+    let alt = JournalOpts {
+        path: Some(root.join("alt.journal")),
+        discard: false,
+    };
+    let e = open_phy(root, KilosortOpenParams::default(), &alt)
+        .err()
+        .expect("refused");
+    assert!(e.to_string().contains("belongs to"), "{e}");
+    assert!(root.join("sorrel_original/ROOT").exists());
+    assert!(!root.join("alt.journal").exists());
+    // The default journal still opens, clean.
+    let mut s = open_phy(root, KilosortOpenParams::default(), &JournalOpts::default()).unwrap();
+    seed_phy(&mut s).unwrap();
+    assert!(s.is_saved());
+}
+
+/// A note-only save that crashes after its seal but before the manifest
+/// leaves the old sidecar on top: the reopened session must not be clean.
+#[test]
+fn note_only_save_crashed_before_publish_reopens_unsaved() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_fixture(root);
+    let mut s = open(root);
+    s.dispatch(CurationCommand::Relabel {
+        cluster: ClusterId(0),
+        op: PhyLabelOp::SetGood,
+    })
+    .unwrap();
+    save_and_seal(&mut s, root, label_str).unwrap();
+    let pre = snapshot(root);
+    s.dispatch(CurationCommand::Note {
+        cluster: ClusterId(1),
+        text: "only a note".into(),
+    })
+    .unwrap();
+    save_and_seal(&mut s, root, label_str).unwrap();
+    drop(s);
+    let post = snapshot(root);
+    let changed: Vec<&String> = post
+        .iter()
+        .filter(|(k, v)| pre.get(*k) != Some(*v) && k.as_str() != "j.journal")
+        .map(|(k, _)| k)
+        .collect();
+    assert!(
+        changed.iter().any(|k| k.contains("sorrel_annotations")),
+        "{changed:?}"
+    );
+    for name in changed {
+        match pre.get(name) {
+            Some(old) => std::fs::write(root.join(name), old).unwrap(),
+            None => std::fs::remove_file(root.join(name)).unwrap(),
+        }
+        std::fs::write(root.join(format!("{name}.tmp")), &post[name]).unwrap();
+    }
+    let s = open(root);
+    assert_eq!(s.note(ClusterId(1)), "only a note");
+    assert!(!s.is_saved());
+}
+
+/// A phy edit between open and the first save must not be captured as the
+/// root and overwritten: the save fails and writes nothing.
+#[test]
+fn save_refuses_an_external_edit_since_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_fixture(root);
+    let mut s = open(root);
+    s.dispatch(CurationCommand::Relabel {
+        cluster: ClusterId(0),
+        op: PhyLabelOp::SetGood,
+    })
+    .unwrap();
+    let records = s.journal().n_records();
+    write_npy(
+        &root.join("spike_clusters.npy"),
+        "<u4",
+        &[6],
+        &u32s(&[3, 0, 1, 2, 0, 1]),
+    );
+    let edited = snapshot(root);
+    let e = save_and_seal(&mut s, root, label_str).unwrap_err();
+    assert!(e.to_string().contains("changed outside sorrel"), "{e}");
+    assert_eq!(snapshot(root), edited, "nothing written");
+    assert!(!root.join("sorrel_original").exists());
+    assert_eq!(s.journal().n_records(), records, "no seal");
+
+    // Sorrel's own saves keep the check in step: save, save again.
+    let mut s = open_phy(
+        root,
+        KilosortOpenParams::default(),
+        &JournalOpts {
+            path: Some(root.join("j2.journal")),
+            discard: false,
+        },
+    )
+    .unwrap();
+    seed_phy(&mut s).unwrap();
+    for op in [PhyLabelOp::SetGood, PhyLabelOp::SetMua] {
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(2),
+            op,
+        })
+        .unwrap();
+        save_and_seal(&mut s, root, label_str).unwrap();
+    }
+}

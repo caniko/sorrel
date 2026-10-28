@@ -375,6 +375,12 @@ impl<P: DataProvider> Session<P> {
         self.top_artifacts = Some(artifacts);
     }
 
+    /// The artifacts hash of the files as this session last saw them (at
+    /// open, then after each of its own saves); `None` when not tracked.
+    pub fn top_artifacts(&self) -> Option<u64> {
+        self.top_artifacts
+    }
+
     /// Evict cache entries known to have been derived from pre-edit journal
     /// heads. This is intentionally called at save/quit boundaries, not after
     /// each command, so a running session keeps its warm in-memory state.
@@ -1095,10 +1101,15 @@ impl<P: DataProvider> Session<P> {
     }
 
     /// Check out `target` (`None` = the root) as a journaled head move.
+    /// Refused on a remote guest: only `Undo`/`Redo` are forwarded, so a jump
+    /// would leave the host's tree behind.
     pub fn checkout(&mut self, target: Option<u64>) -> Result<()>
     where
         P: ApplyPhyLabel,
     {
+        if self.record_sink.is_some() {
+            bail!("history jumps aren't available on a remote guest yet");
+        }
         self.move_head(target, None)
     }
 
@@ -2510,6 +2521,21 @@ mod tests {
         s.checkout(b).unwrap();
         assert_eq!(shape(&s), b_shape);
         assert!(s.checkout(Some(9)).is_err());
+    }
+
+    /// A remote guest forwards only Undo/Redo, so a node-addressed jump is
+    /// refused (it would diverge from the host) and changes nothing.
+    #[test]
+    fn checkout_is_refused_on_a_remote_guest() {
+        let (mut s, _dir) = fresh_session();
+        s.dispatch(relabel(0, PhyLabelOp::SetGood)).unwrap();
+        s.set_record_sink(|_| {});
+        let (head, n_records) = (s.head(), s.journal().n_records());
+        let e = s.checkout(None).unwrap_err();
+        assert!(e.to_string().contains("remote guest"), "{e}");
+        assert_eq!((s.head(), s.journal().n_records()), (head, n_records));
+        s.dispatch(CurationCommand::Undo).unwrap(); // still forwarded
+        assert_eq!(s.head(), None);
     }
 
     /// The tree, the head and the redo branch come back on reopen, with the

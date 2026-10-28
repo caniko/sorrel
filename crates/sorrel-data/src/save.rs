@@ -344,6 +344,18 @@ where
     F: Fn(&P::Label) -> &'static str,
 {
     let view = RootView::open(root)?;
+    // The files must still be what this session opened (or last saved): a
+    // phy edit since would otherwise be captured as the root and overwritten.
+    if let Some(seen) = session.top_artifacts() {
+        if top_hash(root, &view)? != seen {
+            anyhow::bail!(
+                "{}: spike_clusters.npy or a cluster_*.tsv changed outside sorrel since this \
+                 session opened or last saved (phy?). Nothing was saved; reopen to pick up \
+                 those edits (--discard-journal keeps your history aside).",
+                root.display()
+            );
+        }
+    }
     let rewrite = needs_array_rewrite(session.cluster_index(), &view);
     let sink = Sink::staging();
     let mut arrays = Vec::new();
@@ -400,7 +412,17 @@ where
     }
     publish_staged(root, !arrays.is_empty(), &names)?;
     session.mark_saved();
+    if session.top_artifacts().is_some() {
+        session.set_top_artifacts(top_hash(root, &RootView::open(root)?)?);
+    }
     Ok(())
+}
+
+/// Hash of the top-level artifacts as `open_phy` computes it for the check.
+fn top_hash(root: &Path, view: &RootView) -> Result<u64> {
+    let names = artifact_names(root, view, &[])?;
+    let top = RootView::top(root);
+    artifacts_hash(&names, |n| top.path(n))
 }
 
 /// True when a save must rewrite every per-spike array, not just

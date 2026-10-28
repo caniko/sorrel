@@ -6,10 +6,11 @@
 //! [`AgentPolicy`] and the queue of proposals waiting for a human.
 
 use crate::command::{describe_command, Actor, CurationCommand};
-use crate::proposals::Proposal;
+use crate::proposals::{spike_basis, Action, Proposal};
 use crate::session::{ApplyPhyLabel, Session};
 use anyhow::Result;
 use sorrel_io::{ClusterId, DataProvider};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -27,6 +28,10 @@ pub struct HostEvent {
     pub clusters: Vec<ClusterId>,
     /// `Session::version()` after the change.
     pub version: u64,
+    /// Publication order, unique per host (versions repeat across undo/redo);
+    /// 0 when nothing was published. Lets a connection recognise its own
+    /// events without relying on the (non-unique) actor name.
+    pub seq: u64,
 }
 
 type Waker = Box<dyn Fn() + Send + Sync>;
@@ -47,6 +52,7 @@ pub struct SessionHost<P: DataProvider> {
     policy: Mutex<AgentPolicy>,
     proposals: Mutex<Vec<Proposal>>,
     agents: Arc<Mutex<Vec<(u64, String)>>>,
+    seq: AtomicU64,
 }
 
 /// A connected agent, listed by [`SessionHost::agents`] until dropped.
@@ -69,6 +75,7 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
             policy: Mutex::default(),
             proposals: Mutex::default(),
             agents: Arc::default(),
+            seq: AtomicU64::new(1),
         }
     }
 
@@ -122,16 +129,18 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
         s.dispatch_as(actor.clone(), cmd)?;
         // Splits allocate ids at the tail; an undone split frees them again.
         clusters.extend((n_before..s.n_clusters()).map(ClusterId));
-        let ev = HostEvent {
+        let mut ev = HostEvent {
             node: s.head(),
             actor,
             desc,
             clusters,
             version: s.version(),
+            seq: 0,
         };
         // Published under the write lock, so events leave in version order.
         // An undo at the root (or redo at a leaf) changed nothing: no event.
         if ev.version != before {
+            ev.seq = self.seq.fetch_add(1, Ordering::Relaxed);
             self.publish(&ev);
         }
         Ok(ev)
@@ -180,6 +189,7 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
             },
             clusters,
             version: s.version(),
+            seq: self.seq.fetch_add(1, Ordering::Relaxed),
         };
         self.publish(&ev);
         Ok(ev)
@@ -233,8 +243,12 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
     }
 
     /// Queue `p` for a human and wake the subscribers (no event: nothing
-    /// changed yet). The caller writes the audit log.
-    pub fn propose(&self, p: Proposal) {
+    /// changed yet). The caller writes the audit log. A split records the
+    /// cluster's spikes now, so a later membership change refuses it.
+    pub fn propose(&self, mut p: Proposal) {
+        if let (Action::Split { cluster, .. }, None) = (&p.action, &p.basis) {
+            p.basis = Some(spike_basis(&self.read(), *cluster));
+        }
         lock(&self.proposals).push(p);
         self.wake();
     }

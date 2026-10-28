@@ -78,6 +78,16 @@ fn stale_reason<P: DataProvider>(
     }
     match &p.action {
         Action::Split { cluster, spike_idx } => {
+            // The indices are positions in the membership it was proposed on.
+            if p.basis
+                .as_ref()
+                .is_some_and(|b| *b != sorrel_data::proposals::spike_basis(s, *cluster))
+            {
+                return Some(format!(
+                    "cluster {} changed since it was proposed",
+                    cluster.0
+                ));
+            }
             let n = s.spike_times(*cluster).len();
             spike_idx
                 .iter()
@@ -2648,6 +2658,40 @@ mod tests {
         let log = proposals::read_log(dir.path());
         assert_eq!(log[0].outcome, Outcome::Superseded);
         assert_eq!(read(&app.session).n_clusters(), 3, "nothing applied");
+    }
+
+    /// A split's indices refer to the membership it was proposed on: after a
+    /// merge into that cluster (indices still in range) accepting is refused.
+    #[test]
+    fn split_proposal_is_refused_after_membership_changes() {
+        use sorrel_data::proposals::{self, Action, Outcome, Proposal, Source};
+        let (mut app, dir) = make_app();
+        app.set_save_dir(dir.path().to_path_buf(), false);
+        let p = Proposal::new(
+            Source::Agent,
+            Action::Split {
+                cluster: ClusterId(0),
+                spike_idx: vec![0],
+            },
+            0.8,
+            vec![],
+            Default::default(),
+        );
+        let id = p.id;
+        proposals::append(dir.path(), &p).unwrap();
+        app.host.propose(p);
+        assert!(app.commit(CurationCommand::Merge {
+            sources: vec![ClusterId(1)],
+            target: ClusterId(0),
+        }));
+        let n = read(&app.session).n_clusters();
+        let version = read(&app.session).version();
+        app.apply_view_action(ViewAction::Decide { id, accept: true });
+        assert!(app.error.is_some(), "the refusal is shown");
+        assert_eq!(read(&app.session).version(), version, "nothing applied");
+        assert_eq!(read(&app.session).n_clusters(), n);
+        let log = proposals::read_log(dir.path());
+        assert_eq!(log[0].outcome, Outcome::Superseded);
     }
 
     /// A History click checks out another branch through the host and

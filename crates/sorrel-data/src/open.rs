@@ -98,6 +98,22 @@ pub fn open_phy(
     discard_journal(opts, &path)?;
     let snap = root.join(ROOT_DIR);
     if snap.exists() && (!path.exists() || !snap.join(ROOT_MANIFEST).exists()) {
+        // ponytail: the snapshot does not record its journal, so an alternate
+        // path is refused while the default journal could own it.
+        let default = journal_path(&JournalOpts::default(), root, "sorrel");
+        if opts.path.is_some()
+            && default != path
+            && default.exists()
+            && snap.join(ROOT_MANIFEST).exists()
+        {
+            bail!(
+                "{}: {ROOT_DIR}/ belongs to {}; an alternate journal would set it aside from \
+                 under that journal. Open without --journal, or set that journal aside first \
+                 (--discard-journal without --journal).",
+                root.display(),
+                default.display()
+            );
+        }
         retire_snapshot(root)?;
     }
     // Rolls an interrupted save forward, then reads the root.

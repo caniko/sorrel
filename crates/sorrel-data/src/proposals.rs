@@ -83,6 +83,22 @@ pub struct Proposal {
     /// `LLM:<proposer>`. Absent in older logs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposer: Option<String>,
+    /// For a split: [`spike_basis`] of the cluster when it was proposed,
+    /// since `spike_idx` is a position in that membership. Absent in older
+    /// logs and for other actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<String>,
+}
+
+/// Fingerprint of `cluster`'s spikes (count plus a hash of their global
+/// indices): changes whenever a merge or split changes the membership.
+pub fn spike_basis<P: DataProvider>(session: &Session<P>, cluster: ClusterId) -> String {
+    let globals = crate::proposers::cluster_globals(session, cluster);
+    let mut hasher = blake3::Hasher::new();
+    for g in &globals {
+        hasher.update(&g.to_le_bytes());
+    }
+    format!("{}:{}", globals.len(), hasher.finalize().to_hex())
 }
 
 /// Process-unique, increasing id: microseconds since the epoch, bumped past
@@ -124,6 +140,7 @@ impl Proposal {
             args,
             outcome: Outcome::Pending,
             proposer: None,
+            basis: None,
         }
     }
 

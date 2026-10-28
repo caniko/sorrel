@@ -116,6 +116,10 @@ pub struct Env<'a, F> {
     seat: Option<crate::host::AgentSeat>,
     qc: Option<(u64, Vec<QcRow>)>,
     suggest: Option<(u64, Vec<MergeCandidate>, Vec<SplitCandidate>)>,
+    /// `HostEvent::seq` of this connection's own edits, not yet seen on
+    /// its event stream. Two clients can share a display name, so the
+    /// name alone cannot tell whose edit an event is.
+    own: std::collections::HashSet<u64>,
     /// MCP `clientInfo.name` from `initialize`; agent edits are named after it.
     client: Option<String>,
 }
@@ -132,6 +136,7 @@ impl<'a, F> Env<'a, F> {
             qc: None,
             suggest: None,
             client: None,
+            own: Default::default(),
         }
     }
 
@@ -148,13 +153,13 @@ impl<'a, F> Env<'a, F> {
     }
 
     /// `notifications/message` for every event since the last call that
-    /// another actor caused (this client's own edits are in its replies).
-    pub fn notifications(&self) -> Vec<Value> {
-        let me = self.agent();
+    /// another connection caused (this client's own edits are in its replies).
+    pub fn notifications(&mut self) -> Vec<Value> {
+        let own = &mut self.own;
         self.events
             .iter()
             .flat_map(Receiver::try_iter)
-            .filter(|ev| ev.actor != me)
+            .filter(|ev| !own.remove(&ev.seq))
             .map(|ev| {
                 json!({"jsonrpc": "2.0", "method": "notifications/message", "params": {
                     "level": "info", "logger": "sorrel",
@@ -163,6 +168,14 @@ impl<'a, F> Env<'a, F> {
                              "version": ev.version}}})
             })
             .collect()
+    }
+
+    /// Remember `ev` as this connection's own (it is in the reply already).
+    fn mine(&mut self, ev: HostEvent) -> HostEvent {
+        if self.events.is_some() && ev.seq != 0 {
+            self.own.insert(ev.seq);
+        }
+        ev
     }
 
     fn agent(&self) -> Actor {
@@ -457,7 +470,7 @@ where
             if !tags.iter().any(|t| t == "src:agent") {
                 tags.push("src:agent".into());
             }
-            ok(host.apply(agent, CurationCommand::Tag { cluster, tags })?)
+            ok(env.mine(host.apply(agent, CurationCommand::Tag { cluster, tags })?))
         }
         "relabel" => {
             let cluster = check(&host.read(), arg_u32(args, "cluster")?)?;
@@ -465,7 +478,7 @@ where
             let Some(op) = proposals::parse_label(label) else {
                 return fail(format!("unknown label {label:?}"));
             };
-            ok(host.apply(agent, CurationCommand::Relabel { cluster, op })?)
+            ok(env.mine(host.apply(agent, CurationCommand::Relabel { cluster, op })?))
         }
         "merge" => {
             let (sources, target) = {
@@ -479,7 +492,7 @@ where
             if sources.contains(&target) {
                 return fail(format!("target {} is also listed in sources", target.0));
             }
-            ok(host.apply(agent, CurationCommand::Merge { sources, target })?)
+            ok(env.mine(host.apply(agent, CurationCommand::Merge { sources, target })?))
         }
         "split" => {
             let (cluster, spike_idx) = {
@@ -487,7 +500,7 @@ where
                 let cluster = check(&s, arg_u32(args, "cluster")?)?;
                 (cluster, split_indices(&s, cluster, args)?)
             };
-            let ev = host.apply(
+            let ev = env.mine(host.apply(
                 agent.clone(),
                 CurationCommand::Split {
                     cluster,
@@ -495,11 +508,11 @@ where
                     new_cluster: ClusterId(u32::MAX),
                     by: Method::Llm(actor_name(&agent).to_owned()),
                 },
-            )?;
+            )?);
             let new_cluster = ev.clusters.last().map(|c| c.0);
             text(json!({"ok": true, "new_cluster": new_cluster, "version": ev.version}))
         }
-        "undo" => ok(host.apply(agent, CurationCommand::Undo)?),
+        "undo" => ok(env.mine(host.apply(agent, CurationCommand::Undo)?)),
         "save" => {
             save_session(
                 &mut host.write(),
@@ -1526,6 +1539,32 @@ mod tests {
         assert_eq!(n[0]["method"], "notifications/message");
         assert_eq!(n[0]["params"]["data"]["actor"], "you");
         assert_eq!(n[0]["params"]["data"]["clusters"], json!([1]));
+    }
+
+    /// Two connections with the same client name (or both defaulting to
+    /// "agent") still see each other's edits, and only their own are quiet.
+    #[test]
+    fn same_named_connections_notify_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SessionHost::new(mock_session(dir.path()));
+        let mut a = Env::new(dir.path(), false, label).subscribe(&h);
+        let mut b = Env::new(dir.path(), false, label).subscribe(&h);
+        handle_line(
+            &h,
+            &mut a,
+            &call(1, "relabel", json!({"cluster": 0, "label": "good"})),
+        );
+        assert!(a.notifications().is_empty(), "own edit");
+        let n = b.notifications();
+        assert_eq!(n.len(), 1, "b hears a's edit");
+        assert_eq!(n[0]["params"]["data"]["actor"], "agent");
+        handle_line(
+            &h,
+            &mut b,
+            &call(2, "relabel", json!({"cluster": 1, "label": "noise"})),
+        );
+        assert!(b.notifications().is_empty(), "own edit");
+        assert_eq!(a.notifications().len(), 1, "a hears b's edit");
     }
 
     #[test]
