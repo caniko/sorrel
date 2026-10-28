@@ -12,7 +12,7 @@
 //! Sessions come back **unseeded**: run [`seed_phy`] / `replay_journal`
 //! (or hand the closure to the GUI loader) before using them.
 
-use crate::journal::{artifacts_hash, baseline_hash, Journal};
+use crate::journal::{artifact_names, artifacts_hash, baseline_hash, lock_journal, Journal};
 use crate::session::Session;
 use anyhow::{bail, Context, Result};
 use sorrel_io::kilosort::{KilosortOpenParams, KilosortProvider, ROOT_DIR, ROOT_MANIFEST};
@@ -59,8 +59,20 @@ pub fn open_journal(
     baseline: u64,
     n_clusters: u32,
 ) -> Result<Journal> {
+    // Locked first, so a live writer's journal is never set aside under it.
+    let lock = lock_journal(path)?;
+    open_journal_locked(lock, opts, path, baseline, n_clusters)
+}
+
+fn open_journal_locked(
+    lock: std::fs::File,
+    opts: &JournalOpts,
+    path: &Path,
+    baseline: u64,
+    n_clusters: u32,
+) -> Result<Journal> {
     discard_journal(opts, path)?;
-    Journal::open_or_create(path, baseline, n_clusters).with_context(|| {
+    Journal::open_locked(lock, path, baseline, n_clusters).with_context(|| {
         format!(
             "journal {} was sealed against different data (or by an older sorrel without a \
              seal). If that curation is already saved, discard the journal (--discard-journal); to \
@@ -81,6 +93,8 @@ pub fn open_phy(
     opts: &JournalOpts,
 ) -> Result<Session<KilosortProvider>> {
     let path = journal_path(opts, root, "sorrel");
+    // Held from here (before anything is set aside) until the session drops.
+    let lock = lock_journal(&path)?;
     discard_journal(opts, &path)?;
     let snap = root.join(ROOT_DIR);
     if snap.exists() && (!path.exists() || !snap.join(ROOT_MANIFEST).exists()) {
@@ -94,18 +108,16 @@ pub fn open_phy(
         &std::fs::read(&clusters_path)
             .with_context(|| format!("read {}", clusters_path.display()))?,
     );
-    let journal = open_journal(opts, &path, baseline, provider.n_clusters())?;
-    let top = artifacts_hash(
-        &root.join("spike_clusters.npy"),
-        &root.join("cluster_group.tsv"),
-    )?;
-    let at_root = artifacts_hash(
-        &view.path("spike_clusters.npy"),
-        &view.path("cluster_group.tsv"),
-    )?;
+    let journal = open_journal_locked(lock, opts, &path, baseline, provider.n_clusters())?;
+    // Every cluster_*.tsv counts: a phy edit to a custom label file is as
+    // real as one to cluster_group.tsv.
+    let names = artifact_names(root, &view, &[])?;
+    let top_view = RootView::top(root);
+    let top = artifacts_hash(&names, |n| top_view.path(n))?;
+    let at_root = artifacts_hash(&names, |n| view.path(n))?;
     if top != at_root && !journal.seals()?.iter().any(|s| s.1 == top) {
         bail!(
-            "{}: spike_clusters.npy or cluster_group.tsv changed outside sorrel since its last \
+            "{}: spike_clusters.npy or a cluster_*.tsv changed outside sorrel since its last \
              save (phy?). The next sorrel save would overwrite that work, so this journal is \
              not opened. To curate from the files as they are now, reopen with \
              --discard-journal: the journal and {ROOT_DIR}/ are set aside, not deleted.",

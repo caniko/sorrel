@@ -375,11 +375,9 @@ fn save_and_seal_keeps_history_and_journals_the_artifacts_hash() {
     let journal = Journal::open_or_create(&journal_path, 0xFEED, 3).unwrap();
     let recs = journal.replay().unwrap();
     assert_eq!(recs.len(), 3, "two edits and a seal");
-    let on_disk = artifacts_hash(
-        &root.join("spike_clusters.npy"),
-        &root.join("cluster_group.tsv"),
-    )
-    .unwrap();
+    let view = sorrel_io::RootView::top(&root);
+    let names = sorrel_data::journal::artifact_names(&root, &view, &[]).unwrap();
+    let on_disk = artifacts_hash(&names, |n| view.path(n)).unwrap();
     assert_eq!(journal.seals().unwrap(), vec![(Some(1), on_disk)]);
     assert!(!root.join("spike_clusters.npy.tmp").exists());
 }

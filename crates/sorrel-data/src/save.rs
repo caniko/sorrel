@@ -18,7 +18,7 @@
 
 use crate::cluster_index::ClusterIndex;
 use crate::curation_json::write_curation_json;
-use crate::journal::artifacts_hash;
+use crate::journal::{artifact_names, artifacts_hash};
 use crate::session::{ApplyPhyLabel, Session};
 use anyhow::{ensure, Context, Result};
 use sorrel_io::kilosort::{ROOT_DIR, ROOT_MANIFEST};
@@ -367,14 +367,31 @@ where
             &root.join("curation.json"),
             serde_json::to_vec_pretty(&doc)?,
         )?;
-        artifacts_hash(
-            &with_tmp_suffix(&root.join("spike_clusters.npy")),
-            &with_tmp_suffix(&root.join("cluster_group.tsv")),
-        )
+        // What the files will be once published: staged names resolve to
+        // their tmps, any other cluster_*.tsv to the file at the root.
+        let staged = sink.names();
+        let names = artifact_names(root, &view, &staged)?;
+        artifacts_hash(&names, |n| match staged.iter().any(|s| s == n) {
+            true => with_tmp_suffix(&root.join(n)),
+            false => root.join(n),
+        })
     })();
     let names = sink.names();
     let sealed = staged.and_then(|hash| {
-        capture_root(root, &names, &arrays)?;
+        // Every cluster_*.tsv is captured, so a phy edit to one the save does
+        // not rewrite is still caught by the next open.
+        let mut capture = names.clone();
+        capture.extend(artifact_names(root, &view, &names)?);
+        capture.sort();
+        capture.dedup();
+        // Hard links only for arrays a rescue rewrites: phy rewrites
+        // spike_clusters.npy in place, which would change a link too.
+        let link: Vec<String> = arrays
+            .iter()
+            .filter(|n| *n != "spike_clusters.npy")
+            .cloned()
+            .collect();
+        capture_root(root, &capture, &link)?;
         session.seal(hash)
     });
     if let Err(e) = sealed {
@@ -409,6 +426,7 @@ fn capture_root(root: &Path, names: &[String], link: &[String]) -> Result<()> {
     }
     let snap = root.join(ROOT_DIR);
     std::fs::create_dir_all(&snap).with_context(|| format!("create {}", snap.display()))?;
+    sync_dir(root);
     let state = |present: bool| if present { "present" } else { "absent" };
     let mut text: String = view
         .captured()

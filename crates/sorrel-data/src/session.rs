@@ -7,6 +7,8 @@ use crate::command::{Actor, CurationCommand, Method, PhyLabelOp, UnitOrigin};
 use crate::feature_subspace::{DEFAULT_CHANNEL_IDX, DEFAULT_D, DEFAULT_MAX_BACKGROUND};
 use crate::journal::{record_hash, Journal, Record};
 use crate::quality_ext::DEFAULT_K_NN;
+#[cfg(test)]
+use anyhow::ensure;
 use anyhow::{bail, Result};
 use sorrel_cache::{CacheKey, CacheStore, Fingerprint};
 use sorrel_io::{
@@ -164,6 +166,9 @@ pub struct Session<P: DataProvider> {
     /// durable and before the in-memory state moves. Used to stream records
     /// to a remote host; `None` for ordinary local sessions.
     record_sink: Option<RecordSink>,
+    /// Test seam: make every forward apply fail.
+    #[cfg(test)]
+    fail_apply: bool,
 }
 
 impl<P: DataProvider> Session<P> {
@@ -201,6 +206,8 @@ impl<P: DataProvider> Session<P> {
             top_artifacts: None,
             cache_invalidations: VecDeque::new(),
             record_sink: None,
+            #[cfg(test)]
+            fail_apply: false,
         }
     }
 
@@ -960,19 +967,29 @@ impl<P: DataProvider> Session<P> {
 
     /// Rebuild the action tree from the journal and check out its head:
     /// the records only build the tree, then the path from the root to the
-    /// head is applied once. Bad records (a node whose parent is not the
-    /// head, a move to an unknown node) make replay fail.
+    /// head is applied once. Bad records (a node whose parent is not an
+    /// earlier node, a move to an unknown node) make replay fail.
+    ///
+    /// A node's `parent` is explicit, so a node that is not a child of the
+    /// current head (its failed predecessor's head fixup never reached the
+    /// journal) simply moves the head to its parent. If the final node
+    /// cannot be applied either (a crash before that fixup), it is dropped
+    /// from the redo path and the head fixup is journaled now.
     pub fn replay_journal(&mut self) -> Result<()>
     where
         P: ApplyPhyLabel,
     {
         let mut target = self.head;
+        // `(id, redo target of its parent before it)` while the last record is a node.
+        let mut last_node = None;
         for rec in self.journal.replay()? {
+            last_node = None;
             match rec {
                 Record::Node { id, parent, .. } => {
-                    if id != self.nodes.len() as u64 || parent != target {
-                        bail!("journal node {id} is not a child of the head {target:?}");
+                    if id != self.nodes.len() as u64 || parent.is_some_and(|p| p >= id) {
+                        bail!("journal node {id} has parent {parent:?} outside the tree");
                     }
+                    last_node = Some((id, self.last_child[slot(parent)]));
                     self.push_node(rec);
                     target = Some(id);
                 }
@@ -986,7 +1003,16 @@ impl<P: DataProvider> Session<P> {
                 Record::Seal { node, artifacts } => self.seals.push((node, artifacts)),
             }
         }
-        self.move_to(target)?;
+        if let Err(e) = self.move_to(target) {
+            let Some((id, redo)) = last_node else {
+                return Err(e);
+            };
+            log::warn!("journal node {id} does not apply ({e:#}); dropping it from the head");
+            let parent = self.nodes[id as usize].parent;
+            self.last_child[slot(parent)] = redo;
+            self.move_to(parent)?;
+            self.journal.append(&Record::Head { node: self.head })?;
+        }
         // The saved state: the newest seal of the files on disk, else the
         // root; without that hash (non-phy backends) the session opens clean.
         self.saved = match self.top_artifacts {
@@ -1098,13 +1124,19 @@ impl<P: DataProvider> Session<P> {
             sink(cmd);
         }
         let moved = self.move_to(target);
-        if moved.is_err() {
-            // Record where the head really is (best effort; replay of the
-            // failed move would stop at the same node).
-            let _ = self.journal.append(&Record::Head { node: self.head });
-        }
+        let moved = moved.map_err(|e| self.fix_journal_head(e));
         self.record_cache_invalidation(prev, self.version(), n_before, affected);
         moved
+    }
+
+    /// After a failed apply, journal where the head really is, so replay does
+    /// not end on the failed node. Returns `e`; if the fixup cannot be written
+    /// either, that is added to it (replay copes: see [`Self::replay_journal`]).
+    fn fix_journal_head(&mut self, e: anyhow::Error) -> anyhow::Error {
+        match self.journal.append(&Record::Head { node: self.head }) {
+            Ok(()) => e,
+            Err(j) => anyhow::anyhow!("{e:#}; and the journal head could not be corrected: {j:#}"),
+        }
     }
 
     /// Durably journal then apply, as a human edit (see [`Self::dispatch_as`]).
@@ -1159,6 +1191,7 @@ impl<P: DataProvider> Session<P> {
         if let (Some(sink), Record::Node { cmd, .. }) = (&mut self.record_sink, &rec) {
             sink(cmd);
         }
+        let redo_target = self.last_child[slot(self.head)];
         self.push_node(rec);
         let cmd = std::mem::replace(&mut self.nodes[id as usize].cmd, CurationCommand::Undo);
         let applied = self.apply_forward(&cmd);
@@ -1166,9 +1199,10 @@ impl<P: DataProvider> Session<P> {
         match applied {
             Ok(inv) => self.nodes[id as usize].inverse = Some(inv),
             Err(e) => {
-                // The node stays in the tree, off the head's path.
-                let _ = self.journal.append(&Record::Head { node: self.head });
-                return Err(e);
+                // The node stays in the tree, off the head's path, and is
+                // never where Redo goes.
+                self.last_child[slot(self.head)] = redo_target;
+                return Err(self.fix_journal_head(e));
             }
         }
         self.head = Some(id);
@@ -1184,9 +1218,11 @@ impl<P: DataProvider> Session<P> {
     where
         P: ApplyPhyLabel,
     {
+        #[cfg(test)]
+        ensure!(!self.fail_apply, "injected apply failure");
         match cmd {
             CurationCommand::AddSpikes(batch) => {
-                self.check_gate(cmd)?;
+                self.check_add_spikes_gate(cmd)?;
                 let record = self.cluster_index.add_spikes(batch)?;
                 // Auto units that gained spikes are tuned; undo restores their tags.
                 let mut touched = batch.clusters.clone();
@@ -1230,10 +1266,25 @@ impl<P: DataProvider> Session<P> {
         }
     }
 
-    /// Gate for commands that need more than the in-memory state: AddSpikes
-    /// is only valid on a phy-directory provider with no remote record sink
-    /// (a sink would have to carry the payload, and replay must be local).
+    /// Fail closed before a live command reaches the journal: cluster ids and
+    /// split indices must be valid ([`Self::check_ids`]) and AddSpikes must
+    /// pass its provider gate.
     fn check_gate(&self, cmd: &CurationCommand) -> Result<()> {
+        // A batch may address ids its own splits allocate.
+        let splits = match cmd {
+            CurationCommand::Batch { children } => children
+                .iter()
+                .filter(|c| matches!(c, CurationCommand::Split { .. }))
+                .count(),
+            _ => 0,
+        };
+        self.check_ids(cmd, self.n_clusters() as usize + splits)?;
+        self.check_add_spikes_gate(cmd)
+    }
+
+    /// AddSpikes is only valid on a phy-directory provider with no remote
+    /// record sink (a sink would have to carry the payload).
+    fn check_add_spikes_gate(&self, cmd: &CurationCommand) -> Result<()> {
         match cmd {
             CurationCommand::AddSpikes(batch) => {
                 if self.provider.phy_dir().is_none() {
@@ -1244,8 +1295,55 @@ impl<P: DataProvider> Session<P> {
                 }
                 self.cluster_index.check_add_spikes(batch)
             }
+            CurationCommand::Batch { children } => children
+                .iter()
+                .try_for_each(|c| self.check_add_spikes_gate(c)),
+            _ => Ok(()),
+        }
+    }
+
+    /// Refuse cluster ids at or past `limit` and splits that are not a proper
+    /// subset of their cluster's spikes, for every caller (GUI, MCP, guests,
+    /// imports) before anything is journaled. Replay does not run this, so old
+    /// journals with such no-op records still open.
+    fn check_ids(&self, cmd: &CurationCommand, limit: usize) -> Result<()> {
+        let id = |c: &ClusterId| {
+            if c.idx() < limit {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("cluster {} does not exist", c.0))
+            }
+        };
+        match cmd {
+            CurationCommand::Relabel { cluster, .. }
+            | CurationCommand::Note { cluster, .. }
+            | CurationCommand::Tag { cluster, .. } => id(cluster),
+            CurationCommand::Merge { sources, target } => {
+                sources.iter().chain([target]).try_for_each(id)
+            }
+            CurationCommand::Split {
+                cluster, spike_idx, ..
+            } => {
+                id(cluster)?;
+                // Ids a batch's own splits allocate are not known yet: skip.
+                let n = match cluster.0 < self.n_clusters() {
+                    true => self.spike_times(*cluster).len(),
+                    false => return Ok(()),
+                };
+                let mut idx = spike_idx.clone();
+                idx.sort_unstable();
+                idx.dedup();
+                if idx.is_empty() || idx.len() >= n || idx.last().is_some_and(|&i| i as usize >= n)
+                {
+                    bail!(
+                        "a split must move some but not all of cluster {}'s {n} spikes",
+                        cluster.0
+                    );
+                }
+                Ok(())
+            }
             CurationCommand::Batch { children } => {
-                children.iter().try_for_each(|c| self.check_gate(c))
+                children.iter().try_for_each(|c| self.check_ids(c, limit))
             }
             _ => Ok(()),
         }
@@ -1943,6 +2041,44 @@ mod tests {
         assert_eq!(s.parents(ClusterId(2)), [ClusterId(1)]);
     }
 
+    /// Bad ids and improper splits are refused before the journal for every
+    /// caller; a batch may still address the id its own split allocates.
+    #[test]
+    fn dispatch_refuses_unknown_clusters_and_improper_splits() {
+        let (mut s, _d) = fresh_session();
+        let split = |c: u32, idx: Vec<u32>| CurationCommand::Split {
+            cluster: ClusterId(c),
+            spike_idx: idx,
+            new_cluster: ClusterId(0),
+            by: Method::Manual,
+        };
+        let relabel = |c: u32| CurationCommand::Relabel {
+            cluster: ClusterId(c),
+            op: PhyLabelOp::SetGood,
+        };
+        let before = s.version();
+        for bad in [
+            split(9, vec![0]),
+            split(0, vec![]),
+            split(0, vec![0, 1, 2]),
+            split(0, vec![7]),
+            relabel(9),
+            CurationCommand::Merge {
+                sources: vec![ClusterId(9)],
+                target: ClusterId(0),
+            },
+        ] {
+            assert!(s.dispatch(bad.clone()).is_err(), "{bad:?} was accepted");
+        }
+        assert_eq!(s.version(), before, "nothing reached the journal");
+        // Cluster 3 is the id the batch's own split allocates.
+        s.dispatch(CurationCommand::Batch {
+            children: vec![split(0, vec![0]), relabel(3)],
+        })
+        .unwrap();
+        assert_eq!(s.spike_times(ClusterId(3)).len(), 1);
+    }
+
     #[test]
     fn origin_parents_notes_and_markers_follow_undo_redo_and_replay() {
         let (mut s, d) = fresh_session();
@@ -2001,6 +2137,7 @@ mod tests {
         assert_eq!(state(&s), done);
 
         // Replaying the journal on a fresh session reproduces the state.
+        drop(s); // one writer per journal
         let provider = MockProvider {
             spikes: vec![
                 vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
@@ -2531,5 +2668,75 @@ mod tests {
         check(&s);
         s.dispatch(CurationCommand::Undo).unwrap();
         check(&s);
+    }
+
+    /// A failed apply is never the redo target, and when the journal cannot
+    /// take the head fixup either, the error says so and later edits still
+    /// replay (the journal's tail names the failed node as head).
+    #[test]
+    fn failed_apply_is_not_a_redo_target_and_propagates_the_fixup_error() {
+        let (mut s, dir) = fresh_session();
+        s.dispatch(relabel(0, PhyLabelOp::SetMua)).unwrap();
+        s.dispatch(CurationCommand::Undo).unwrap();
+        assert_eq!(s.redo_len(), 1);
+        s.dispatch(CurationCommand::Redo).unwrap();
+        // Fails, and its fixup is journaled: Redo must not enter it.
+        s.fail_apply = true;
+        assert!(s.dispatch(relabel(1, PhyLabelOp::SetNoise)).is_err());
+        s.fail_apply = false;
+        assert_eq!((s.history_len(), s.redo_len()), (1, 0));
+        s.dispatch(CurationCommand::Redo).unwrap();
+        assert_eq!(s.label(ClusterId(1)), Some(MockLabel::Unsorted));
+
+        // Same failure with a journal that rejects the fixup append.
+        s.fail_apply = true;
+        s.journal.fail_after = Some(1);
+        let err = s.dispatch(relabel(1, PhyLabelOp::SetNoise)).unwrap_err();
+        assert!(format!("{err:#}").contains("journal head could not be corrected"));
+        s.fail_apply = false;
+        // The next edit's parent is the old head, not the failed node.
+        s.dispatch(relabel(2, PhyLabelOp::SetGood)).unwrap();
+        drop(s);
+        let s = reopen(dir.path());
+        assert_eq!(s.label(ClusterId(2)), Some(MockLabel::Good));
+        assert_eq!(s.label(ClusterId(1)), Some(MockLabel::Unsorted));
+        assert_eq!(s.label(ClusterId(0)), Some(MockLabel::Mua));
+    }
+
+    /// A crash between a failed node and its head fixup leaves the failed
+    /// node as the journal's head: reopening drops it (and journals the
+    /// fixup) instead of failing, and Redo does not walk into it.
+    #[test]
+    fn reopen_after_a_crash_before_the_head_fixup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.sqlite");
+        let node = |id, parent, cmd| Record::Node {
+            id,
+            parent,
+            actor: Actor::Human,
+            ts_ms: 0,
+            cmd,
+        };
+        {
+            let mut j = Journal::open(&path).unwrap();
+            j.append(&node(0, None, relabel(0, PhyLabelOp::SetMua)))
+                .unwrap();
+            // AddSpikes cannot apply on a provider without a phy directory.
+            let bad = CurationCommand::AddSpikes(Default::default());
+            j.append(&node(1, Some(0), bad)).unwrap();
+        }
+        let mut s = reopen(dir.path());
+        assert_eq!(s.label(ClusterId(0)), Some(MockLabel::Mua));
+        assert_eq!((s.history_len(), s.redo_len()), (1, 0));
+        s.dispatch(CurationCommand::Redo).unwrap(); // nothing to redo
+                                                    // The fixup is durable: a second reopen needs no repair.
+        drop(s);
+        let j = Journal::open(&path).unwrap();
+        assert!(matches!(
+            j.replay().unwrap().last(),
+            Some(Record::Head { node: Some(0) })
+        ));
+        drop(j);
+        assert_eq!(reopen(dir.path()).history_len(), 1);
     }
 }

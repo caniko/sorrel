@@ -32,15 +32,23 @@
 //! to [`Record`] or the types it carries needs a new version for the same
 //! reason: [`Journal::replay_at`] truncates at the first undecodable record.
 //!
-//! Crash-safety contract: every `append` flushes + fsync's the file before
-//! returning, so a power loss never produces a half-written record. On
-//! reopen, replay reads records until either EOF or a partial trailing
-//! record (whose length doesn't match the remaining bytes) — that one is
-//! skipped and the file is truncated to the last fully-committed record.
+//! Crash-safety contract: every `append` writes the record in one
+//! `write_all` and fsync's the file before returning; a failed write is cut
+//! back to the last committed record. On reopen, replay reads records until
+//! either EOF or a partial trailing record (whose length doesn't match the
+//! remaining bytes) — that one is skipped and the file is truncated to the
+//! last fully-committed record.
+//!
+//! Single writer: [`Journal::open_or_create`] takes an exclusive advisory
+//! lock on `<journal>.lock` for the life of the `Journal` (fails with
+//! [`JournalBusy`]), and only that owner ever truncates. Anyone else (a
+//! remote tail, `journal dump`) reads with [`Journal::read_only_records`],
+//! which never modifies the file.
 
 use crate::command::{Actor, CurationCommand};
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
+use sorrel_io::RootView;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -62,18 +70,50 @@ pub fn baseline_hash(spike_clusters_bytes: &[u8]) -> u64 {
     xxh3_64(spike_clusters_bytes)
 }
 
-/// Hash of the two files phy itself writes on save (`spike_clusters.npy`
-/// and `cluster_group.tsv`, the latter possibly missing). A [`Record::Seal`]
-/// carries it, so an open can tell sorrel's own saves from an external edit.
-pub fn artifacts_hash(spike_clusters: &Path, cluster_group: &Path) -> Result<u64> {
+/// True for the files phy writes on save that sorrel seals:
+/// `spike_clusters.npy` and every `cluster_*.tsv` (`cluster_group.tsv`,
+/// custom labels, sorrel's sidecars, metrics).
+fn is_artifact(name: &str) -> bool {
+    name == "spike_clusters.npy" || (name.starts_with("cluster_") && name.ends_with(".tsv"))
+}
+
+/// Sorted names [`artifacts_hash`] covers for `root`: the two core files,
+/// every top-level `cluster_*.tsv` on disk or captured in the root snapshot
+/// (`view`), and the `staged` names of a save about to publish. The same
+/// set must be used for the on-disk, root and staged hashes to be comparable.
+pub fn artifact_names(root: &Path, view: &RootView, staged: &[String]) -> Result<Vec<String>> {
+    let mut names: std::collections::BTreeSet<String> = ["spike_clusters.npy", "cluster_group.tsv"]
+        .map(String::from)
+        .into();
+    for e in std::fs::read_dir(root).with_context(|| format!("list {}", root.display()))? {
+        names.extend(e?.file_name().into_string().ok().filter(|n| is_artifact(n)));
+    }
+    let captured = view.captured().map(|c| c.0);
+    names.extend(
+        captured
+            .chain(staged.iter().map(String::as_str))
+            .filter(|n| is_artifact(n))
+            .map(String::from),
+    );
+    Ok(names.into_iter().collect())
+}
+
+/// Hash of `names` (see [`artifact_names`]) as `path_of` resolves them. A
+/// [`Record::Seal`] carries it, so an open can tell sorrel's own saves from an
+/// external edit. Only `spike_clusters.npy` must exist; any other missing
+/// file hashes as absent.
+pub fn artifacts_hash(names: &[String], path_of: impl Fn(&str) -> PathBuf) -> Result<u64> {
     let mut h = xxhash_rust::xxh3::Xxh3::new();
-    for (i, p) in [spike_clusters, cluster_group].into_iter().enumerate() {
-        match std::fs::read(p) {
+    for n in names {
+        let p = path_of(n);
+        h.update(&(n.len() as u64).to_le_bytes());
+        h.update(n.as_bytes());
+        match std::fs::read(&p) {
             Ok(b) => {
                 h.update(&(b.len() as u64).to_le_bytes());
                 h.update(&b);
             }
-            Err(e) if i == 1 && e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if n != "spike_clusters.npy" && e.kind() == std::io::ErrorKind::NotFound => {
                 h.update(&u64::MAX.to_le_bytes())
             }
             Err(e) => return Err(e).with_context(|| format!("hash {}", p.display())),
@@ -121,12 +161,81 @@ pub fn record_hash(parent_key: u64, rec: &Record) -> u64 {
 #[derive(Debug)]
 pub struct Journal {
     path: PathBuf,
-    writer: BufWriter<File>,
+    file: File,
+    /// Byte offset after the last committed record: where a failed append
+    /// is cut back to.
+    len: u64,
+    /// A failed append could not be cut back; the file may hold garbage.
+    broken: bool,
     baseline: u64,
     n_clusters_at_baseline: u32,
     /// Fully committed records on disk, kept in memory so it never touches
     /// the file. Monotonic, so it doubles as a sync cursor.
     n_records: u64,
+    /// Exclusive advisory lock on `<journal>.lock`; released on drop.
+    _lock: File,
+    /// Test seam: fail (after writing half) the append after this many more.
+    #[cfg(test)]
+    pub(crate) fail_after: Option<usize>,
+}
+
+/// Another process (or `Journal`) holds the journal's writer lock.
+#[derive(Debug, thiserror::Error)]
+#[error("journal {} is already open{}", .path.display(), .pid.map_or(String::new(), |p| format!(" by pid {p}")))]
+pub struct JournalBusy {
+    pub path: PathBuf,
+    /// Pid recorded in `<journal>.lock` by the owner, when readable.
+    pub pid: Option<u32>,
+}
+
+fn lock_path(journal: &Path) -> PathBuf {
+    let mut p = journal.as_os_str().to_owned();
+    p.push(".lock");
+    p.into()
+}
+
+/// Take the exclusive writer lock for `journal` (`<journal>.lock`, kept
+/// across renames of the journal itself). Fails with [`JournalBusy`].
+/// ponytail: the lock file is left behind on drop (deleting it races a
+/// concurrent opener); advisory locks, so only sorrel's own opens honour it.
+pub(crate) fn lock_journal(journal: &Path) -> Result<File> {
+    let lp = lock_path(journal);
+    let mut f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lp)
+        .with_context(|| format!("open {}", lp.display()))?;
+    let locked = f.try_lock();
+    match locked {
+        Ok(()) => {
+            f.set_len(0)?;
+            // Best effort: the pid is only for the busy message.
+            let _ = write!(f, "{}", std::process::id()).and_then(|()| f.flush());
+            Ok(f)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let pid = std::fs::read_to_string(&lp)
+                .ok()
+                .and_then(|s| s.trim().parse().ok());
+            Err(JournalBusy {
+                path: journal.to_path_buf(),
+                pid,
+            }
+            .into())
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("lock {}", lp.display()))
+        }
+    }
+}
+
+/// Best effort (a directory cannot be opened on Windows).
+fn sync_dir(path: &Path) {
+    if let Some(dir) = path.parent() {
+        let _ = File::open(dir).and_then(|d| d.sync_all());
+    }
 }
 
 impl Journal {
@@ -143,33 +252,69 @@ impl Journal {
     /// is checked against `expected_baseline`; mismatch returns an error
     /// so the caller can decide whether to discard, fail loudly, or
     /// reset. A v1/v2 file is upgraded to v3 first.
+    ///
+    /// Takes the exclusive writer lock first, held until the `Journal` is
+    /// dropped; a second opener gets a [`JournalBusy`] error. A new journal
+    /// is created as tmp + fsync + rename + directory fsync, so a crash
+    /// never leaves a partial header under the real name.
     pub fn open_or_create(path: &Path, expected_baseline: u64, n_clusters: u32) -> Result<Self> {
-        if path.exists() {
-            return Self::open_existing(path, expected_baseline);
-        }
-        let mut f =
-            File::create(path).with_context(|| format!("create journal {}", path.display()))?;
-        f.write_all(&header(expected_baseline, n_clusters))?;
-        f.sync_all()?;
-        Self::reopen(path, expected_baseline, n_clusters, 0)
+        let lock = lock_journal(path)?;
+        Self::open_locked(lock, path, expected_baseline, n_clusters)
     }
 
-    fn reopen(path: &Path, baseline: u64, n_clusters: u32, n_records: u64) -> Result<Self> {
-        let f = OpenOptions::new()
+    /// [`Self::open_or_create`] with the lock already taken (so a caller can
+    /// hold it across moving the old journal aside).
+    pub(crate) fn open_locked(
+        lock: File,
+        path: &Path,
+        expected_baseline: u64,
+        n_clusters: u32,
+    ) -> Result<Self> {
+        if path.exists() {
+            return Self::open_existing(lock, path, expected_baseline);
+        }
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".new");
+        let tmp = PathBuf::from(tmp);
+        {
+            let mut f =
+                File::create(&tmp).with_context(|| format!("create journal {}", tmp.display()))?;
+            f.write_all(&header(expected_baseline, n_clusters))?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("create journal {}", path.display()))?;
+        sync_dir(path);
+        Self::reopen(lock, path, expected_baseline, n_clusters, 0)
+    }
+
+    fn reopen(
+        lock: File,
+        path: &Path,
+        baseline: u64,
+        n_clusters: u32,
+        n_records: u64,
+    ) -> Result<Self> {
+        let file = OpenOptions::new()
             .append(true)
             .open(path)
             .with_context(|| format!("reopen journal {}", path.display()))?;
         Ok(Self {
             path: path.to_path_buf(),
-            writer: BufWriter::new(f),
+            len: file.metadata()?.len(),
+            file,
+            broken: false,
             baseline,
             n_clusters_at_baseline: n_clusters,
             n_records,
+            _lock: lock,
+            #[cfg(test)]
+            fail_after: None,
         })
     }
 
-    fn open_existing(path: &Path, expected_baseline: u64) -> Result<Self> {
-        let (legacy, baseline, n_clusters) = read_header(path)?;
+    fn open_existing(lock: File, path: &Path, expected_baseline: u64) -> Result<Self> {
+        let (legacy, baseline, n_clusters, version) = read_header(path)?;
         if baseline != expected_baseline {
             bail!(
                 "{}: spike_clusters.npy has changed since this journal was sealed \
@@ -181,12 +326,13 @@ impl Journal {
             );
         }
         if legacy {
-            upgrade_legacy(path, baseline, n_clusters)?;
+            upgrade_legacy(path, baseline, n_clusters, version)?;
         }
         // Counting records also truncates any partial trailing record, so
-        // the appender below starts at a clean boundary.
-        let n_records = Self::replay_at(path)?.len() as u64;
-        Self::reopen(path, baseline, n_clusters, n_records)
+        // the appender below starts at a clean boundary. We hold the lock,
+        // so this is the only place a journal is ever truncated.
+        let n_records = read_records::<Record>(path, true, false)?.len() as u64;
+        Self::reopen(lock, path, baseline, n_clusters, n_records)
     }
 
     pub fn baseline(&self) -> u64 {
@@ -206,24 +352,54 @@ impl Journal {
         &self.path
     }
 
-    /// Append one record. Buffers, flushes, and fsync's so the call only
-    /// returns after the bytes are durable.
+    /// Append one record: prefix and payload in one `write_all`, then
+    /// fsync, so the call only returns after the bytes are durable. On any
+    /// write or fsync error the file is cut back to the last committed
+    /// record, so later appends and readers see a clean journal.
     pub fn append(&mut self, rec: &Record) -> Result<()> {
+        ensure!(
+            !self.broken,
+            "{}: a failed write could not be undone; reopen the journal",
+            self.path.display()
+        );
         let payload = rmp_serde::to_vec(rec)?;
         let len = u32::try_from(payload.len()).context("journal record exceeds u32::MAX bytes")?;
-        self.writer.write_all(&len.to_le_bytes())?;
-        self.writer.write_all(&payload)?;
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all().context("fsync journal")?;
+        let mut buf = Vec::with_capacity(4 + payload.len());
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(&payload);
+        if let Err(e) = self.write_durably(&buf) {
+            if let Err(t) = self.file.set_len(self.len) {
+                self.broken = true;
+                log::error!(
+                    "{}: cannot cut back a failed append: {t}",
+                    self.path.display()
+                );
+            }
+            return Err(e);
+        }
+        self.len += buf.len() as u64;
         self.n_records += 1;
         Ok(())
     }
 
-    /// Replay every fully-committed record in insertion order.
-    /// Truncates a partial trailing record if one is present (crash
-    /// recovery — the partial record was never durable).
+    fn write_durably(&mut self, buf: &[u8]) -> Result<()> {
+        #[cfg(test)]
+        if let Some(n) = self.fail_after.as_mut() {
+            if *n == 0 {
+                self.fail_after = None;
+                self.file.write_all(&buf[..buf.len() / 2])?;
+                bail!("injected write failure");
+            }
+            *n -= 1;
+        }
+        self.file.write_all(buf).context("write journal")?;
+        self.file.sync_all().context("fsync journal")
+    }
+
+    /// Every fully-committed record in insertion order. Never modifies the
+    /// file (the owner's tail is always clean; see [`Self::append`]).
     pub fn replay(&self) -> Result<Vec<Record>> {
-        Self::replay_at(&self.path)
+        Self::read_only_records(&self.path)
     }
 
     /// The `artifacts` hash of every [`Record::Seal`], oldest first, with
@@ -239,17 +415,24 @@ impl Journal {
             .collect())
     }
 
-    /// [`Journal::replay`] for a journal file that is not open. Used when
-    /// opening (to count committed records) and by headless inspection.
-    /// Refuses a file that is not v3 rather than truncating it.
-    pub fn replay_at(path: &Path) -> Result<Vec<Record>> {
-        let (legacy, _, _) = read_header(path)?;
+    /// Records of a journal file read by a non-owner (a remote tail,
+    /// `journal dump`, a guest comparing logs): everything up to the last
+    /// complete, decodable record, never modifying the file or taking the
+    /// lock, so it is safe against a live writer. Refuses a pre-v3 file.
+    pub fn read_only_records(path: &Path) -> Result<Vec<Record>> {
+        let (legacy, ..) = read_header(path)?;
         ensure!(
             !legacy,
             "{}: pre-v3 journal; open the dataset once to upgrade it",
             path.display()
         );
-        read_records(path, true)
+        read_records(path, false, false)
+    }
+
+    /// Alias of [`Self::read_only_records`]; it used to truncate a torn tail,
+    /// which only the lock-holding owner may do (see [`Self::open_or_create`]).
+    pub fn replay_at(path: &Path) -> Result<Vec<Record>> {
+        Self::read_only_records(path)
     }
 }
 
@@ -264,9 +447,9 @@ fn header(baseline: u64, n_clusters: u32) -> Vec<u8> {
     h
 }
 
-/// `(legacy, baseline, n_clusters)` from a journal header; refuses unknown
-/// magic and versions.
-fn read_header(path: &Path) -> Result<(bool, u64, u32)> {
+/// `(legacy, baseline, n_clusters, version)` from a journal header; refuses
+/// unknown magic and versions.
+fn read_header(path: &Path) -> Result<(bool, u64, u32, u32)> {
     let mut f = File::open(path).with_context(|| format!("open journal {}", path.display()))?;
     let mut header = [0u8; HEADER_SIZE as usize];
     f.read_exact(&mut header)
@@ -285,12 +468,18 @@ fn read_header(path: &Path) -> Result<(bool, u64, u32)> {
     };
     let baseline = u64::from_le_bytes(header[16..24].try_into().unwrap());
     let n_clusters = u32::from_le_bytes(header[24..28].try_into().unwrap());
-    Ok((legacy, baseline, n_clusters))
+    Ok((legacy, baseline, n_clusters, version))
 }
 
 /// Decode every committed record after the header; with `truncate`, cut
 /// the file back to the last good record (a partial or undecodable tail).
-fn read_records<T: serde::de::DeserializeOwned>(path: &Path, truncate: bool) -> Result<Vec<T>> {
+/// With `strict`, a complete record that does not decode is an error rather
+/// than the end of the log (a partial trailing record still just ends it).
+fn read_records<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    truncate: bool,
+    strict: bool,
+) -> Result<Vec<T>> {
     let mut f = File::open(path).with_context(|| format!("open journal {}", path.display()))?;
     let total = f.metadata()?.len();
     if total < HEADER_SIZE {
@@ -327,6 +516,12 @@ fn read_records<T: serde::de::DeserializeOwned>(path: &Path, truncate: bool) -> 
                 last_good_pos = f.stream_position()?;
             }
             Err(e) => {
+                ensure!(
+                    !strict,
+                    "{}: record at offset {pos} does not decode ({e}); refusing to drop it \
+                     and everything after it",
+                    path.display()
+                );
                 log::warn!(
                     "{}: skipping malformed record at offset {pos}: {e}",
                     path.display(),
@@ -349,10 +544,22 @@ fn read_records<T: serde::de::DeserializeOwned>(path: &Path, truncate: bool) -> 
 }
 
 /// Rewrite a v1/v2 journal as v3 in place: decoded, [`fold_legacy`]ed,
-/// written to `<path>.tmp`, fsynced and renamed over the original.
-fn upgrade_legacy(path: &Path, baseline: u64, n_clusters: u32) -> Result<()> {
-    let records = fold_legacy(read_records(path, false)?)
+/// written to `<path>.tmp`, fsynced and renamed over the original. Refuses
+/// (touching nothing) when a record does not decode, and keeps the original
+/// as `<path>.v<N>.bak`.
+/// ponytail: a corrupt length prefix that points past EOF reads as a torn
+/// tail and is dropped (the .bak keeps it); decode the rest to catch that.
+fn upgrade_legacy(path: &Path, baseline: u64, n_clusters: u32, version: u32) -> Result<()> {
+    let records = fold_legacy(read_records(path, false, true)?)
         .with_context(|| format!("upgrade journal {}", path.display()))?;
+    let mut bak = path.as_os_str().to_owned();
+    bak.push(format!(".v{version}.bak"));
+    let bak = PathBuf::from(bak);
+    // A hard link keeps the original inode; no window without a journal.
+    let _ = std::fs::remove_file(&bak);
+    std::fs::hard_link(path, &bak)
+        .or_else(|_| std::fs::copy(path, &bak).map(drop))
+        .with_context(|| format!("back up {} to {}", path.display(), bak.display()))?;
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
@@ -369,11 +576,12 @@ fn upgrade_legacy(path: &Path, baseline: u64, n_clusters: u32) -> Result<()> {
         f.into_inner()?.sync_all()?;
     }
     std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
-    if let Some(dir) = path.parent() {
-        // ponytail: best effort (a directory cannot be opened on Windows).
-        let _ = File::open(dir).and_then(|d| d.sync_all());
-    }
-    log::info!("upgraded journal {} to v3", path.display());
+    sync_dir(path);
+    log::info!(
+        "upgraded journal {} to v3 (original kept as {})",
+        path.display(),
+        bak.display()
+    );
     Ok(())
 }
 
@@ -647,17 +855,168 @@ mod tests {
     }
 
     #[test]
-    fn artifacts_hash_covers_both_files() {
+    fn artifacts_hash_covers_every_cluster_tsv() {
         let dir = tempfile::tempdir().unwrap();
-        let (sc, cg) = (dir.path().join("sc"), dir.path().join("cg"));
-        std::fs::write(&sc, b"ab").unwrap();
-        let missing = artifacts_hash(&sc, &cg).unwrap();
-        std::fs::write(&cg, b"").unwrap();
-        let empty = artifacts_hash(&sc, &cg).unwrap();
-        std::fs::write(&cg, b"x").unwrap();
-        let x = artifacts_hash(&sc, &cg).unwrap();
+        let d = dir.path();
+        let hash = || {
+            let names = artifact_names(d, &RootView::top(d), &[]).unwrap();
+            artifacts_hash(&names, |n| d.join(n))
+        };
+        std::fs::write(d.join("spike_clusters.npy"), b"ab").unwrap();
+        let missing = hash().unwrap();
+        std::fs::write(d.join("cluster_group.tsv"), b"").unwrap();
+        let empty = hash().unwrap();
+        std::fs::write(d.join("cluster_group.tsv"), b"x").unwrap();
+        let x = hash().unwrap();
         assert!(missing != empty && empty != x);
-        std::fs::remove_file(&sc).unwrap();
-        assert!(artifacts_hash(&sc, &cg).is_err());
+        // A custom label file, created then edited, counts too; other files do not.
+        std::fs::write(d.join("cluster_mylabel.tsv"), b"a").unwrap();
+        let custom = hash().unwrap();
+        std::fs::write(d.join("cluster_mylabel.tsv"), b"b").unwrap();
+        assert!(custom != x && hash().unwrap() != custom);
+        std::fs::write(d.join("notes.txt"), b"b").unwrap();
+        let before = hash().unwrap();
+        std::fs::write(d.join("notes.txt"), b"c").unwrap();
+        assert_eq!(hash().unwrap(), before);
+        std::fs::remove_file(d.join("spike_clusters.npy")).unwrap();
+        assert!(hash().is_err());
+    }
+
+    #[test]
+    fn second_opener_gets_journal_busy_until_the_first_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("j.sorrel");
+        let j = Journal::open_or_create(&p, 1, 3).unwrap();
+        let err = Journal::open_or_create(&p, 1, 3).unwrap_err();
+        let busy = err.downcast_ref::<JournalBusy>().expect("typed error");
+        assert_eq!(busy.pid, Some(std::process::id()));
+        assert!(err.to_string().contains("already open by pid"));
+        drop(j);
+        Journal::open_or_create(&p, 1, 3).unwrap();
+    }
+
+    /// A non-owner never truncates: a torn tail (here, a record cut short
+    /// the way a reader racing a large append sees it) stays as it is.
+    #[test]
+    fn read_only_records_never_modifies_a_torn_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("j.sorrel");
+        let mut j = Journal::open_or_create(&p, 1, 3).unwrap();
+        j.append(&node(0, None, 0)).unwrap();
+        let mut f = OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(&100u32.to_le_bytes()).unwrap();
+        f.write_all(b"abc").unwrap();
+        let torn = std::fs::read(&p).unwrap();
+        assert_eq!(Journal::read_only_records(&p).unwrap().len(), 1);
+        assert_eq!(Journal::replay_at(&p).unwrap().len(), 1);
+        assert_eq!(std::fs::read(&p).unwrap(), torn, "file untouched");
+    }
+
+    /// A reader polling a live journal while big records are appended never
+    /// shortens the file, and the writer's journal stays fully readable.
+    #[test]
+    fn concurrent_reader_never_tears_large_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("j.sorrel");
+        let mut j = Journal::open_or_create(&p, 1, 3).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (p, stop) = (p.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut last = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let n = Journal::read_only_records(&p).unwrap().len();
+                    assert!(n >= last, "records vanished: {n} < {last}");
+                    last = n;
+                }
+            })
+        };
+        let big = |id| Record::Node {
+            id,
+            parent: id.checked_sub(1),
+            actor: Actor::Human,
+            ts_ms: 0,
+            cmd: CurationCommand::Note {
+                cluster: sorrel_io::ClusterId(0),
+                text: "x".repeat(2 << 20),
+            },
+        };
+        for id in 0..8 {
+            j.append(&big(id)).unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
+        assert_eq!(Journal::read_only_records(&p).unwrap().len(), 8);
+    }
+
+    /// A write that dies half way (ENOSPC) is cut back to the last committed
+    /// record; later appends and readers see a clean journal.
+    #[test]
+    fn failed_append_is_cut_back_and_later_appends_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("j.sorrel");
+        let mut j = Journal::open_or_create(&p, 1, 3).unwrap();
+        j.append(&node(0, None, 0)).unwrap();
+        let good = std::fs::metadata(&p).unwrap().len();
+        j.fail_after = Some(0);
+        assert!(j.append(&node(1, Some(0), 1)).is_err());
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), good);
+        assert_eq!(j.n_records(), 1);
+        j.append(&node(1, Some(0), 2)).unwrap();
+        assert_eq!(Journal::read_only_records(&p).unwrap().len(), 2);
+        drop(j);
+        assert_eq!(Journal::open_or_create(&p, 1, 3).unwrap().n_records(), 2);
+    }
+
+    /// An undecodable middle record refuses the upgrade and touches nothing.
+    #[test]
+    fn upgrade_refuses_a_corrupt_middle_record_and_keeps_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("j.sorrel");
+        let a = cmd(0, PhyLabelOp::SetGood);
+        write_legacy(&p, 2, 9, &[a.clone(), a.clone(), a]);
+        // Corrupt the second record's payload.
+        let mut bytes = std::fs::read(&p).unwrap();
+        let first = u32::from_le_bytes(bytes[32..36].try_into().unwrap()) as usize;
+        let second = 32 + 4 + first + 4;
+        bytes[second..second + 3].fill(0xc1); // 0xc1 is never valid MessagePack
+        std::fs::write(&p, &bytes).unwrap();
+        let err = Journal::open_or_create(&p, 9, 3).unwrap_err();
+        assert!(format!("{err:#}").contains("does not decode"), "{err:#}");
+        assert_eq!(std::fs::read(&p).unwrap(), bytes);
+        assert!(!dir.path().join("j.sorrel.v2.bak").exists());
+    }
+
+    #[test]
+    fn upgrade_keeps_the_original_as_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("j.sorrel");
+        write_legacy(&p, 2, 9, &[cmd(0, PhyLabelOp::SetGood)]);
+        let before = std::fs::read(&p).unwrap();
+        drop(Journal::open_or_create(&p, 9, 3).unwrap());
+        assert_eq!(
+            std::fs::read(dir.path().join("j.sorrel.v2.bak")).unwrap(),
+            before
+        );
+    }
+
+    /// A crashed create leaves only `<journal>.new`; the real name never
+    /// holds a partial header, and the next open starts clean.
+    #[test]
+    fn crashed_create_never_shows_a_partial_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("j.sorrel");
+        let new = dir.path().join("j.sorrel.new");
+        // The header is built under the `.new` name: if that cannot be made,
+        // nothing appears under the real one.
+        std::fs::create_dir(&new).unwrap();
+        assert!(Journal::open_or_create(&p, 1, 3).is_err());
+        assert!(!p.exists());
+        std::fs::remove_dir(&new).unwrap();
+        std::fs::write(&new, &header(1, 3)[..10]).unwrap();
+        assert!(!p.exists());
+        let j = Journal::open_or_create(&p, 1, 3).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), HEADER_SIZE);
+        assert_eq!(j.n_records(), 0);
     }
 }

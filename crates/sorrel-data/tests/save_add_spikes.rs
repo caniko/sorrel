@@ -220,6 +220,7 @@ fn save_and_reseal_rewrites_every_array_aligned() {
     };
     assert_eq!(times(1), [50, 200]);
     assert_eq!(times(2), [100]);
+    drop(s);
     let mut s2 = open(root);
     assert!(s2.is_saved());
     assert_eq!(s2.cluster_index().n_spikes(), 8);
@@ -230,6 +231,7 @@ fn save_and_reseal_rewrites_every_array_aligned() {
     assert_eq!(u32f("spike_times.npy"), [10, 30, 50, 100, 150, 200]);
     assert_eq!(u32f("spike_clusters.npy"), [0, 0, 1, 2, 0, 1]);
     assert_eq!(u32f("spike_sorrel_rescued.npy"), [0; 6]);
+    drop(s2);
     assert_eq!(open(root).cluster_index().n_spikes(), 6);
 }
 
@@ -360,6 +362,7 @@ fn cleared_custom_label_is_blanked_not_restored() {
     let mut s = open(root);
     set(&mut s, "great");
     save_and_seal(&mut s, root, label_str).unwrap();
+    drop(s);
     let mut s = open(root);
     assert_eq!(s.custom_label(ClusterId(1), "quality"), Some("great"));
 
@@ -368,6 +371,7 @@ fn cleared_custom_label_is_blanked_not_restored() {
     // The user's file is kept, header only.
     let tsv = std::fs::read_to_string(root.join("cluster_quality.tsv")).unwrap();
     assert_eq!(tsv, "cluster_id\tquality\n");
+    drop(s);
     let s = open(root);
     assert_eq!(s.custom_label(ClusterId(1), "quality"), None);
     assert!(s.custom_label_keys().is_empty());
@@ -610,4 +614,68 @@ fn crash_before_manifest_keeps_the_old_state_and_journal() {
     drop(s);
     let s = open(root);
     assert_eq!(s.cluster_index().n_spikes(), 8);
+}
+
+/// A save that fails after the root was captured must leave the snapshot
+/// independent of the top-level files: phy rewrites `spike_clusters.npy` in
+/// place, which would also change a hard link. Only rescue arrays may link.
+#[test]
+fn failed_save_then_in_place_rewrite_keeps_the_root_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_fixture(root);
+    let original = std::fs::read(root.join("spike_clusters.npy")).unwrap();
+    let mut s = open(root);
+    add_two(&mut s);
+    // Fails the publish (after capture and seal) by blocking its manifest tmp.
+    std::fs::create_dir(root.join("sorrel_rewrite.pending.tmp")).unwrap();
+    assert!(save_and_seal(&mut s, root, label_str).is_err());
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.join("spike_clusters.npy"))
+        .unwrap();
+    f.write_all(&[0xff; 16]).unwrap();
+    drop(f);
+    let snap = root.join("sorrel_original/spike_clusters.npy");
+    assert_eq!(std::fs::read(snap).unwrap(), original);
+}
+
+/// A phy edit to any top-level `cluster_*.tsv` after a sorrel save, one sorrel
+/// wrote (a custom label) or one it only found (a metric), fails the open
+/// closed; a normal save then reopen is fine.
+#[test]
+fn external_edit_to_any_cluster_tsv_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_fixture(root);
+    std::fs::write(
+        root.join("cluster_ContamPct.tsv"),
+        "cluster_id\tContamPct\n0\t1.5\n",
+    )
+    .unwrap();
+    let mut s = open(root);
+    let cmd = s
+        .set_label_command(ClusterId(1), "quality", "great")
+        .unwrap();
+    s.dispatch(cmd).unwrap();
+    save_and_seal(&mut s, root, label_str).unwrap();
+    drop(s);
+    drop(open(root)); // sorrel's own save opens
+
+    let opts = JournalOpts {
+        path: Some(root.join("j.journal")),
+        discard: false,
+    };
+    for name in ["cluster_quality.tsv", "cluster_ContamPct.tsv"] {
+        let path = root.join(name);
+        let good = std::fs::read(&path).unwrap();
+        let mut edited = good.clone();
+        edited.extend_from_slice(b"2\t9\n");
+        std::fs::write(&path, edited).unwrap();
+        let err = open_phy(root, KilosortOpenParams::default(), &opts).err();
+        let err = format!("{:#}", err.unwrap_or_else(|| panic!("{name}: opened")));
+        assert!(err.contains("changed outside sorrel"), "{name}: {err}");
+        std::fs::write(&path, good).unwrap();
+        drop(open(root));
+    }
 }
