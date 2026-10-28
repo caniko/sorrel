@@ -613,6 +613,9 @@ fn load_error() {
                 anyhow::bail!("spike_clusters.npy has 12 rows but spike_times.npy has 10")
             });
             configure(&mut app, &root, positions);
+            // The panel prints the path: pin it so the snapshot is the same on
+            // every machine (the stub loader never reads it).
+            app.set_save_dir(PathBuf::from("/data/synthetic-probe"), true);
             app
         });
         snap(&mut h, "load_error", name);
