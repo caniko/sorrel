@@ -1010,9 +1010,9 @@ fn tag_split_candidates<P: DataProvider>(
 }
 
 /// The SpikeInterface pipeline, embedded so an installed binary carries it.
-const AUTO_SCRIPT: &str = include_str!("../../../scripts/sorrel_auto.py");
+const AUTO_SCRIPT: &str = include_str!("sorrel_auto.py");
 
-/// Run `scripts/sorrel_auto.py` into `out`: with `uv run --script` when uv is
+/// Run the embedded `sorrel_auto.py` into `out`: with `uv run --script` when uv is
 /// on PATH (its PEP 723 header pins the dependencies), else with
 /// `$SORREL_PYTHON` / `python3`, which must already have them installed.
 fn run_auto_sidecar(open: &OpenArgs, out: &Path, flags: &[String]) -> Result<()> {

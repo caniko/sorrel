@@ -154,8 +154,11 @@ jobs:
         run: nix develop -c cargo test --locked -p sorrel --all-targets
       - name: Clippy sorrel
         run: nix develop -c cargo clippy --locked -p sorrel --all-targets -- -D warnings
-      - name: Package coordinated release set
-        run: nix develop -c cargo package --locked --allow-dirty --no-verify -p sorrel-cache -p sorrel-io -p sorrel-compute -p sorrel-data -p sorrel-gpu -p sorrel-remote -p sorrel-render -p sorrel-ui -p sorrel --target-dir "$RUNNER_TEMP/simit-package-target"
+      - name: Verify and package coordinated release set
+        run: |
+          set -euo pipefail
+          nix develop -c cargo --version | awk '{split($2, v, "."); exit !(v[1] > 1 || v[2] >= 89)}' || { echo 'Verifying a coordinated release set needs cargo >= 1.89 (temporary local registry overlay); pin a newer toolchain' >&2; exit 1; }
+          nix develop -c cargo package --locked --allow-dirty -p sorrel-cache -p sorrel-io -p sorrel-compute -p sorrel-data -p sorrel-gpu -p sorrel-remote -p sorrel-render -p sorrel-ui -p sorrel --target-dir "$RUNNER_TEMP/simit-package-target"
       - name: Build immutable archive sorrel-cache
         run: |
           set -euo pipefail

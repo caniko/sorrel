@@ -172,7 +172,7 @@
           license_url = "https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT";
           archive_pattern = "sorrel-{version}-{arch}-windows.zip";
           # chocolatey isn't in nixpkgs yet, and the dev shell no longer ships simit.
-          nix_tool = "github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=78b775803103ae960faf475ad46070d771fddc91";
+          nix_tool = "github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=1d8192eca49cfa493d49d6bc91ea3c836203f6cb";
           api_key_secret = "CHOCOLATEY_API_KEY";
         };
       };
@@ -202,7 +202,7 @@
         # BIP-39 list embedded by sorrel-remote's pairing codes.
         || pkgs.lib.hasSuffix "sorrel-remote/wordlist.txt" path
         # SpikeInterface sidecar `sorrel auto` embeds with include_str!.
-        || pkgs.lib.hasSuffix "scripts/sorrel_auto.py" path;
+        || pkgs.lib.hasSuffix "crates/sorrel/src/sorrel_auto.py" path;
       src = pkgs.lib.cleanSourceWith {
         src = ./.;
         filter = srcFilter;
