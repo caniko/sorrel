@@ -61,7 +61,8 @@ next table row. Moving a similar cluster steps to the next similar one.
 | `Esc`            | Close a dialog, the snippet bar or the help, or clear the lasso.             |
 
 Snippets: `:g` merge, `:k` split, `:c 3 7 10-12` select, `:l name value`
-custom label (`:l group good` moves the selection), `:tg 12.5` trace to
+custom label (`:l group good` moves the selection), `:note text` unit note
+(`:note` alone clears it), `:tg 12.5` trace to
 12.5 s, `:ts 0.2` 200 ms trace window.
 
 Plain-key shortcuts never fire while a text field has focus. `Ctrl` chords,
