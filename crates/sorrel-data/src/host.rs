@@ -6,7 +6,7 @@
 //! [`AgentPolicy`] and the queue of proposals waiting for a human.
 
 use crate::command::{describe_command, Actor, CurationCommand};
-use crate::proposals::{spike_basis, Action, Proposal};
+use crate::proposals::{spike_basis, Action, Outcome, Proposal};
 use crate::session::{ApplyPhyLabel, Session};
 use anyhow::Result;
 use sorrel_io::{ClusterId, DataProvider};
@@ -250,6 +250,21 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
             p.basis = Some(spike_basis(&self.read(), *cluster));
         }
         lock(&self.proposals).push(p);
+        self.wake();
+    }
+
+    /// Requeue the proposals `save_dir`'s audit log still has as `Pending`
+    /// (a previous run exited before a human decided), keeping a split's
+    /// recorded basis so a changed membership still refuses it. Ids already
+    /// queued are skipped, so calling this twice is harmless.
+    pub fn restore_proposals(&self, save_dir: &std::path::Path) {
+        let mut q = lock(&self.proposals);
+        for p in crate::proposals::read_log(save_dir) {
+            if p.outcome == Outcome::Pending && !q.iter().any(|k| k.id == p.id) {
+                q.push(p);
+            }
+        }
+        drop(q);
         self.wake();
     }
 
@@ -509,5 +524,42 @@ mod tests {
         assert_eq!(h.read().label(ClusterId(1)), Some(0), "nothing applied");
         h.apply_if(Actor::Human, relabel(1, PhyLabelOp::SetNoise), |_| Ok(()))
             .unwrap();
+    }
+
+    /// A proposal still `Pending` in the audit log when the host closed
+    /// comes back as a card (split basis intact) on the next open; a decided
+    /// one does not, and restoring twice does not duplicate.
+    #[test]
+    fn pending_proposals_survive_a_restart() {
+        use crate::proposals::{self, Source};
+        let dir = tempfile::tempdir().unwrap();
+        let new = |action| Proposal::new(Source::Agent, action, 0.5, vec![], Default::default());
+        let mut split = new(Action::Split {
+            cluster: ClusterId(0),
+            spike_idx: vec![0],
+        });
+        let accept = new(Action::Accept {
+            cluster: ClusterId(1),
+        });
+        let (split_id, accept_id) = (split.id, accept.id);
+        let first = host(dir.path());
+        // The proposer stamps the basis when it parses, before the audit line.
+        split.basis = Some(spike_basis(&first.read(), ClusterId(0)));
+        for p in [split, accept] {
+            proposals::append(dir.path(), &p).unwrap();
+            first.propose(p);
+        }
+        proposals::record_outcome(dir.path(), accept_id, Outcome::Rejected).unwrap();
+        let basis = first.proposals()[0].basis.clone();
+        assert!(basis.is_some());
+        drop(first);
+
+        let second = host(dir.path());
+        assert!(second.proposals().is_empty(), "a new host starts empty");
+        second.restore_proposals(dir.path());
+        second.restore_proposals(dir.path());
+        let back = second.proposals();
+        assert_eq!(back.len(), 1, "only the undecided one, once");
+        assert_eq!((back[0].id, back[0].basis.clone()), (split_id, basis));
     }
 }

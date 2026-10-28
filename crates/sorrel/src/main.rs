@@ -1181,7 +1181,7 @@ fn busy_hint(e: anyhow::Error) -> anyhow::Error {
     match e.downcast_ref::<sorrel_data::journal::JournalBusy>() {
         Some(b) => anyhow::anyhow!(
             "{b}: another sorrel owns this dataset but its MCP listener is not \
-             reachable (no usable .sorrel/mcp.json). Close it, or run `sorrel mcp` \
+             reachable (no usable MCP token file). Close it, or run `sorrel mcp` \
              once its host (the GUI or `sorrel --headless`) is up"
         ),
         None => e,
@@ -1527,7 +1527,7 @@ mod tests {
         let busy = Journal::open_or_create(&path, 0, 1).unwrap_err();
         let msg = busy_hint(busy.context("open journal")).to_string();
         assert!(
-            msg.contains("already open") && msg.contains("mcp.json"),
+            msg.contains("already open") && msg.contains("MCP token file"),
             "{msg}"
         );
         let other = busy_hint(anyhow::anyhow!("disk full"));

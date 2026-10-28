@@ -30,7 +30,9 @@ A Claude Code MCP entry looks like this:
 
 A running host listens on `127.0.0.1` on a random port. It writes the port
 and a token to `<DATA_DIR>/.sorrel/mcp.json` (mode 0600), and deletes the
-file when it exits. A client must send the token first. Only processes that
+file when it exits. On Windows the file is kept outside the dataset, in
+`%LOCALAPPDATA%\sorrel\mcp\<hash of the dataset path>.json`, which only your
+account can read. A client must send the token first. Only processes that
 can read that file can connect.
 
 The client's `clientInfo.name` from `initialize` names the agent. The agent

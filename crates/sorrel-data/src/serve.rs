@@ -10,7 +10,8 @@
 //! - **stdio** ([`serve`]): `sorrel mcp <dir>` when no host is running.
 //! - **loopback TCP** ([`spawn_listener`]): a running host (`sorrel <dir>`,
 //!   `sorrel --headless <dir>`) listens on `127.0.0.1`, behind a token in
-//!   `<dir>/.sorrel/mcp.json`; `sorrel mcp <dir>` bridges stdio to it
+//!   `<dir>/.sorrel/mcp.json` (on Windows in a per-user directory, see
+//!   `mcp_json_path`); `sorrel mcp <dir>` bridges stdio to it
 //!   ([`attach`]).
 //!
 //! Edit tools apply as `Actor::Agent` (tagged `src:agent`, journaled and
@@ -685,13 +686,21 @@ fn parse_proposal<P: DataProvider>(
         .and_then(|a| a.iter().map(|v| v.as_str().map(str::to_owned)).collect())
         .filter(|r: &Vec<String>| r.len() <= 3)
         .ok_or_else(|| ToolError::Failed("reasons must be at most 3 strings".into()))?;
-    Ok(Proposal::new(
+    // Stamp a split's basis against the same session its indices were
+    // validated on, so it reaches the audit log and survives a restart.
+    let basis = match &action {
+        Action::Split { cluster, .. } => Some(proposals::spike_basis(session, *cluster)),
+        _ => None,
+    };
+    let mut p = Proposal::new(
         Source::Agent,
         action,
         confidence as f32,
         reasons,
         args.clone(),
-    ))
+    );
+    p.basis = basis;
+    Ok(p)
 }
 
 /// Suggester output for every pair/cluster (not only the top K), cached per
@@ -925,6 +934,7 @@ fn write_json(out: &mut impl Write, v: &Value) -> Result<()> {
 
 // --- GUI listener and stdio bridge ------------------------------------
 
+#[cfg(not(windows))]
 const MCP_JSON: &str = ".sorrel/mcp.json";
 
 /// A fresh 128-bit hex token. std-only: `RandomState` keys come from the OS
@@ -946,20 +956,48 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// `<save_dir>/.sorrel/mcp.json` = `{port, token, pid, nonce}`, mode 0600,
-/// written atomically (tmp + rename) so a client never reads half of it.
-/// `pid` and `nonce` identify the writer: only it removes the file.
+/// Where the listener file for `save_dir` lives; `attach` and the listener
+/// both go through here. Unix: `<save_dir>/.sorrel/mcp.json` (mode 0600).
+/// Windows: a file inherits the dataset directory's ACL, which other
+/// accounts may read, so it goes under `%LOCALAPPDATA%\sorrel\mcp\`
+/// (user-private by default), named by a hash of the canonical dataset path.
+fn mcp_json_path(save_dir: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(not(windows))]
+    return Ok(save_dir.join(MCP_JSON));
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .ok_or_else(|| std::io::Error::other("LOCALAPPDATA is not set"))?;
+        let canon = save_dir
+            .canonicalize()
+            .unwrap_or_else(|_| save_dir.to_owned());
+        let key = blake3::hash(canon.to_string_lossy().to_lowercase().as_bytes());
+        Ok(PathBuf::from(base)
+            .join("sorrel")
+            .join("mcp")
+            .join(format!("{}.json", &key.to_hex()[..32])))
+    }
+}
+
+/// `{port, token, pid, nonce}` (see [`mcp_json_path`]), written atomically
+/// (tmp + rename) so a client never reads half of it. `pid` and `nonce`
+/// identify the writer: only it removes the file.
 fn write_mcp_json(
     save_dir: &Path,
     port: u16,
     token: &str,
     nonce: &str,
 ) -> std::io::Result<PathBuf> {
-    let path = save_dir.join(MCP_JSON);
+    let path = mcp_json_path(save_dir)?;
     std::fs::create_dir_all(path.parent().expect("has parent"))?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    // `create_new` (O_EXCL) never follows a symlink pre-placed at `tmp`.
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
     let mut f = opts.open(&tmp)?;
@@ -1092,8 +1130,8 @@ where
 
 /// `{port, token}` of a running host's listener in `save_dir`, if any.
 pub fn read_mcp_json(save_dir: &Path) -> Option<(u16, String)> {
-    let v: Value =
-        serde_json::from_str(&std::fs::read_to_string(save_dir.join(MCP_JSON)).ok()?).ok()?;
+    let text = std::fs::read_to_string(mcp_json_path(save_dir).ok()?).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
     Some((
         u16::try_from(v["port"].as_u64()?).ok()?,
         v["token"].as_str()?.to_owned(),
@@ -1382,6 +1420,30 @@ mod tests {
     }
 
     #[test]
+    fn split_proposal_logs_its_basis() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SessionHost::new(mock_session(dir.path()));
+        let mut env = Env::new(dir.path(), false, label);
+        let r = handle_line(
+            &h,
+            &mut env,
+            &call(
+                1,
+                "propose",
+                json!({"action": "split", "clusters": [0], "spike_idx": [0], "confidence": 0.5, "reasons": []}),
+            ),
+        )
+        .unwrap();
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let want = proposals::spike_basis(&h.read(), ClusterId(0));
+        // The audit line (what a restart restores) carries the basis.
+        assert_eq!(
+            proposals::read_log(dir.path())[0].basis.as_deref(),
+            Some(&*want)
+        );
+    }
+
+    #[test]
     fn propose_queues_on_the_host_and_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let h = SessionHost::new(mock_session(dir.path()));
@@ -1658,6 +1720,45 @@ mod tests {
         assert_eq!(s.origin_label(ClusterId(n - 1)), "Sorrel[LLM:codex]");
     }
 
+    /// The listener writes where `attach` reads, and the path is a pure
+    /// function of the dataset directory.
+    #[test]
+    fn token_file_path_is_shared_by_writer_and_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = mcp_json_path(dir.path()).unwrap();
+        assert_eq!(path, mcp_json_path(dir.path()).unwrap());
+        assert_eq!(write_mcp_json(dir.path(), 1, "t", "n").unwrap(), path);
+        assert_eq!(read_mcp_json(dir.path()), Some((1, "t".to_owned())));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Off the dataset directory on Windows, so another account that can
+    /// read the dataset cannot read the token.
+    #[cfg(windows)]
+    #[test]
+    fn windows_token_file_is_outside_the_dataset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = mcp_json_path(dir.path()).unwrap();
+        assert!(!path.starts_with(dir.path()));
+        assert!(path.starts_with(std::env::var_os("LOCALAPPDATA").unwrap()));
+    }
+
+    /// A symlink pre-placed at the tmp path is replaced, not written through.
+    #[cfg(unix)]
+    #[test]
+    fn write_does_not_follow_a_preplaced_tmp_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let path = mcp_json_path(dir.path()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        write_mcp_json(dir.path(), 1, "t", "n").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(read_mcp_json(dir.path()).unwrap().1, "t");
+    }
+
     #[test]
     fn loopback_listener_round_trip_and_bad_token() {
         let dir = tempfile::tempdir().unwrap();
@@ -1673,7 +1774,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.path().join(MCP_JSON))
+            let mode = std::fs::metadata(mcp_json_path(dir.path()).unwrap())
                 .unwrap()
                 .permissions()
                 .mode();
@@ -1711,7 +1812,7 @@ mod tests {
         assert_eq!(h.read().label(ClusterId(0)), Some(1), "relabelled");
 
         drop(handle);
-        assert!(!dir.path().join(MCP_JSON).exists());
+        assert!(!mcp_json_path(dir.path()).unwrap().exists());
         let mut out = Vec::new();
         assert!(
             !attach(dir.path(), Cursor::new(""), &mut out).unwrap(),
@@ -1787,7 +1888,7 @@ mod tests {
         drop(first);
         assert_eq!(read_mcp_json(shared.path()).unwrap().0, second.port());
         drop(second);
-        assert!(!shared.path().join(MCP_JSON).exists());
+        assert!(!mcp_json_path(shared.path()).unwrap().exists());
     }
 
     /// A second host on a directory whose journal is already open fails

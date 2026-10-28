@@ -1281,15 +1281,7 @@ impl<P: DataProvider> Session<P> {
     /// split indices must be valid ([`Self::check_ids`]) and AddSpikes must
     /// pass its provider gate.
     fn check_gate(&self, cmd: &CurationCommand) -> Result<()> {
-        // A batch may address ids its own splits allocate.
-        let splits = match cmd {
-            CurationCommand::Batch { children } => children
-                .iter()
-                .filter(|c| matches!(c, CurationCommand::Split { .. }))
-                .count(),
-            _ => 0,
-        };
-        self.check_ids(cmd, self.n_clusters() as usize + splits)?;
+        self.check_ids(cmd, self.n_clusters() as usize)?;
         self.check_add_spikes_gate(cmd)
     }
 
@@ -1353,8 +1345,17 @@ impl<P: DataProvider> Session<P> {
                 }
                 Ok(())
             }
+            // In batch order: a child may address only ids that existed or
+            // that an earlier split in the batch allocated.
             CurationCommand::Batch { children } => {
-                children.iter().try_for_each(|c| self.check_ids(c, limit))
+                let mut limit = limit;
+                for c in children {
+                    self.check_ids(c, limit)?;
+                    if matches!(c, CurationCommand::Split { .. }) {
+                        limit += 1;
+                    }
+                }
+                Ok(())
             }
             _ => Ok(()),
         }
@@ -2077,6 +2078,10 @@ mod tests {
             CurationCommand::Merge {
                 sources: vec![ClusterId(9)],
                 target: ClusterId(0),
+            },
+            // Id 3 only exists after the split that comes later in the batch.
+            CurationCommand::Batch {
+                children: vec![relabel(3), split(0, vec![0])],
             },
         ] {
             assert!(s.dispatch(bad.clone()).is_err(), "{bad:?} was accepted");

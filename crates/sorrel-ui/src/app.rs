@@ -271,6 +271,9 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     quit_requested: bool,
     /// MCP clients' link to this window (see [`Self::serve_mcp`]).
     mcp: Option<McpLink>,
+    /// `serve_mcp` asked while the loader still owned the session: started
+    /// once loading succeeds, never if it fails.
+    mcp_after_load: Option<fn(&mut Self) -> anyhow::Result<()>>,
     /// The host's events (subscribed at build) and the context their waker
     /// repaints, known from the first frame.
     host_events: Receiver<HostEvent>,
@@ -412,6 +415,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             snippet: None,
             quit_requested: false,
             mcp: None,
+            mcp_after_load: None,
             host_events,
             repaint,
             highlight: None,
@@ -507,6 +511,11 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             .save_dir
             .clone()
             .ok_or_else(|| anyhow::anyhow!("MCP needs a save directory"))?;
+        // A client must never edit a bare or half-replayed session.
+        if self.loading.is_some() {
+            self.mcp_after_load = Some(Self::serve_mcp);
+            return Ok(());
+        }
         let (tx, select) = std::sync::mpsc::channel();
         let selection = sorrel_data::SharedSelection::default();
         let ui = sorrel_data::Ui {
@@ -647,19 +656,21 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         // Accept and relabel-reject can leave nothing to journal. A proposal
         // that no longer fits the clusters (or whose edit fails) is audited
         // as superseded and its card dropped; the error says why.
-        let stale = if accept {
-            stale_reason(&p, &read(&self.session))
-        } else {
-            None
+        // The staleness check runs under the write lock of the apply itself.
+        let still_fits = |s: &Session<P>| match accept.then(|| stale_reason(&p, s)).flatten() {
+            Some(why) => Err(anyhow::anyhow!("proposal no longer applies ({why})")),
+            None => Ok(()),
         };
-        if let Some(why) = &stale {
-            self.error = Some(format!("proposal no longer applies ({why}): {what}"));
-        }
-        let applied = stale.is_none()
-            && match CurationCommand::batch(cmds).filter(|b| !b.clusters().is_empty()) {
-                Some(batch) => self.commit_with_follow(batch, follow),
-                None => true,
-            };
+        let applied = match CurationCommand::batch(cmds).filter(|b| !b.clusters().is_empty()) {
+            Some(batch) => self.commit_with_follow_if(batch, follow, still_fits),
+            None => match still_fits(&read(&self.session)) {
+                Ok(()) => true,
+                Err(e) => {
+                    self.error = Some(format!("{e}: {what}"));
+                    false
+                }
+            },
+        };
         let outcome = match (applied, accept) {
             (false, _) => sorrel_data::proposals::Outcome::Superseded,
             (true, true) => sorrel_data::proposals::Outcome::Accepted,
@@ -733,6 +744,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             Ok(events) => self.events = events.map(Arc::new),
             Err(e) => log::warn!("ignoring events file in {}: {e}", dir.display()),
         }
+        self.host.restore_proposals(&dir);
         self.save_dir = Some(dir);
         self.reseal_on_save = reseal;
         if self.loading.is_some() {
@@ -1056,12 +1068,23 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     /// Every view cache is keyed on `Session::version()`, so nothing needs
     /// invalidating by hand here: the next frame rebuilds what changed.
     fn commit_with_follow(&mut self, cmd: CurationCommand, follow: Follow) -> bool {
+        self.commit_with_follow_if(cmd, follow, |_| Ok(()))
+    }
+
+    /// [`Self::commit_with_follow`], but `check` runs under the host's write
+    /// lock, so no MCP edit can land between the check and the apply.
+    fn commit_with_follow_if(
+        &mut self,
+        cmd: CurationCommand,
+        follow: Follow,
+        check: impl FnOnce(&Session<P>) -> anyhow::Result<()>,
+    ) -> bool {
         let desc = describe_command(&cmd);
         self.cancel_jobs();
         // Every GUI edit is a human decision: the host clears the touched
         // clusters' `review:*` tags (from `sorrel auto`), so the review
         // queue drains.
-        let ev = match self.host.apply(Actor::Human, cmd) {
+        let ev = match self.host.apply_if(Actor::Human, cmd, check) {
             Ok(ev) => ev,
             Err(e) => {
                 self.error = Some(format!("{desc} failed: {e}"));
@@ -1994,14 +2017,21 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 Ok(Ok(())) => {
                     self.loading = None;
                     self.finish_loading();
+                    if let Some(start) = self.mcp_after_load.take() {
+                        if let Err(e) = start(self) {
+                            log::warn!("MCP listener not started: {e:#}");
+                        }
+                    }
                     return false;
                 }
                 Ok(Err(e)) => {
                     self.loading = None;
+                    self.mcp_after_load = None;
                     self.load_error = Some(e.to_string());
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.loading = None;
+                    self.mcp_after_load = None;
                     self.load_error = Some("loader thread exited without a result".into());
                 }
                 Err(TryRecvError::Empty) => {
@@ -2516,7 +2546,7 @@ mod tests {
         let (mut app, dir) = make_app();
         app.set_save_dir(dir.path().to_path_buf(), false);
         app.serve_mcp().unwrap();
-        assert!(dir.path().join(".sorrel/mcp.json").exists());
+        assert!(sorrel_data::serve::read_mcp_json(dir.path()).is_some());
         let agent = Actor::Agent {
             client: "codex".into(),
         };
@@ -2692,6 +2722,109 @@ mod tests {
         assert_eq!(read(&app.session).n_clusters(), n);
         let log = proposals::read_log(dir.path());
         assert_eq!(log[0].outcome, Outcome::Superseded);
+    }
+
+    /// Accepting checks the proposal's basis under the write lock of the
+    /// apply (no MCP edit can land in between), and a refusal there audits
+    /// the proposal as superseded.
+    #[test]
+    fn proposal_accept_checks_under_the_write_lock() {
+        use sorrel_data::proposals::{self, Action, Outcome, Proposal, Source};
+        let (mut app, dir) = make_app();
+        app.set_save_dir(dir.path().to_path_buf(), false);
+        let host = Arc::clone(&app.host);
+        let ran = std::cell::Cell::new(false);
+        let cmd = CurationCommand::Relabel {
+            cluster: ClusterId(1),
+            op: PhyLabelOp::SetGood,
+        };
+        assert!(
+            app.commit_with_follow_if(cmd, Box::new(|_| Vec::new()), |_| {
+                ran.set(true);
+                assert!(host.session().try_read().is_err(), "write lock is held");
+                Ok(())
+            })
+        );
+        assert!(ran.get());
+        let p = Proposal::new(
+            Source::Agent,
+            Action::Split {
+                cluster: ClusterId(0),
+                spike_idx: vec![0],
+            },
+            0.8,
+            vec![],
+            Default::default(),
+        );
+        let id = p.id;
+        proposals::append(dir.path(), &p).unwrap();
+        app.host.propose(p);
+        // The basis stamped at queue time no longer matches by accept time.
+        assert!(app.commit(CurationCommand::Merge {
+            sources: vec![ClusterId(1)],
+            target: ClusterId(0),
+        }));
+        app.apply_view_action(ViewAction::Decide { id, accept: true });
+        assert!(app.error.is_some());
+        let log = proposals::read_log(dir.path());
+        assert_eq!(log[0].outcome, Outcome::Superseded);
+    }
+
+    /// `serve_mcp` while the loader owns the session binds nothing; the
+    /// listener starts when loading succeeds and never when it fails.
+    #[test]
+    fn mcp_listener_waits_for_a_successful_load() {
+        for ok in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (go, wait) = std::sync::mpsc::channel::<()>();
+            let mut app = SorrelApp::with_loader(stub_session(dir.path()), label_str, move |_| {
+                wait.recv().ok();
+                anyhow::ensure!(ok, "load failed");
+                Ok(())
+            });
+            app.set_save_dir(dir.path().to_path_buf(), false);
+            app.serve_mcp().unwrap();
+            assert!(app.mcp.is_none());
+            assert!(sorrel_data::serve::read_mcp_json(dir.path()).is_none());
+            go.send(()).unwrap();
+            let ctx = egui::Context::default();
+            while app.loading.is_some() {
+                let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    app.show_loading(&ctx, ui);
+                });
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(app.mcp.is_some(), ok);
+            assert_eq!(sorrel_data::serve::read_mcp_json(dir.path()).is_some(), ok);
+        }
+    }
+
+    /// A proposal still pending in the audit log is a card again when the
+    /// window opens the dataset; a decided one is not.
+    #[test]
+    fn pending_proposals_come_back_when_the_dataset_opens() {
+        use sorrel_data::proposals::{self, Action, Outcome, Proposal, Source};
+        let (app, dir) = make_app();
+        let new = |c| {
+            let p = Proposal::new(
+                Source::Agent,
+                Action::Accept {
+                    cluster: ClusterId(c),
+                },
+                0.8,
+                vec![],
+                Default::default(),
+            );
+            proposals::append(dir.path(), &p).unwrap();
+            p.id
+        };
+        let (pending, decided) = (new(0), new(1));
+        proposals::record_outcome(dir.path(), decided, Outcome::Accepted).unwrap();
+        drop(app);
+        let (mut app, _d) = make_app();
+        app.set_save_dir(dir.path().to_path_buf(), false);
+        let ids: Vec<u64> = app.host.proposals().iter().map(|p| p.id).collect();
+        assert_eq!(ids, [pending]);
     }
 
     /// A History click checks out another branch through the host and
