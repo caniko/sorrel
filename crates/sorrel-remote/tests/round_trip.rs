@@ -65,7 +65,10 @@ fn write_fixture(root: &Path) {
 
 fn open_host(root: &Path) -> (Box<dyn Served>, DatSource, u64) {
     let p = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
-    let baseline = baseline_hash(&std::fs::read(root.join("spike_clusters.npy")).unwrap());
+    let sc = sorrel_io::RootView::open(root)
+        .unwrap()
+        .path("spike_clusters.npy");
+    let baseline = baseline_hash(&std::fs::read(sc).unwrap());
     let j =
         Journal::open_or_create(&root.join("sorrel.journal"), baseline, p.n_clusters()).unwrap();
     let dat = DatSource {
@@ -235,6 +238,62 @@ fn direct_mode_round_trip() {
     )
     .unwrap();
     exercise(joined, host_dir.path(), guest_dir.path(), baseline);
+}
+
+/// A directory the host already saved in sorrel joins: `sorrel_original/`
+/// travels with the other files, and the guest replays the host's journal
+/// onto it, ending at the saved merge. Its own pairing code: tests run in
+/// parallel, and a shared code would pair with another test's host.
+#[test]
+fn join_after_the_host_saved() {
+    let (host_dir, guest_dir) = dirs();
+    let root = host_dir.path();
+    {
+        let (served, ..) = open_host(root);
+        drop(served);
+        let p = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
+        let sc = sorrel_io::RootView::open(root)
+            .unwrap()
+            .path("spike_clusters.npy");
+        let j = Journal::open_or_create(
+            &root.join("sorrel.journal"),
+            baseline_hash(&std::fs::read(sc).unwrap()),
+            p.n_clusters(),
+        )
+        .unwrap();
+        let mut s = Session::new(p, j);
+        s.replay_journal().unwrap();
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(1)],
+            target: ClusterId(0),
+        })
+        .unwrap();
+        sorrel_data::save_and_seal(&mut s, root, |l| l.as_str()).unwrap();
+    }
+    assert!(root.join("sorrel_original/ROOT").exists());
+    let code = PairingCode::parse("absorb abstract absurd abuse access accident").unwrap();
+    let pairing = Pairing::derive(&code).unwrap();
+    let (served, dat, _) = open_host(root);
+    let mode = Mode::Direct {
+        port: 0,
+        dial: None,
+    };
+    let serving = rt()
+        .block_on(serve(served, root.to_path_buf(), dat, &mode, &pairing))
+        .unwrap();
+    let addr = host_listen_addr(&serving);
+    let joined = join(
+        &code,
+        &Mode::Direct {
+            port: 0,
+            dial: Some(addr),
+        },
+        guest_dir.path(),
+    )
+    .unwrap();
+    let s = &joined.session;
+    assert_eq!(s.history_len(), 1);
+    assert!(s.spike_times(ClusterId(1)).is_empty(), "merged away");
 }
 
 #[test]

@@ -110,7 +110,10 @@ pub fn join(code: &PairingCode, mode: &Mode, into: &Path) -> Result<Joined> {
             }
             println!("journal: pushed {} records to host", local_n - host_n);
         }
-        let local_baseline = baseline_hash(&std::fs::read(into.join("spike_clusters.npy"))?);
+        // The journal is sealed against the sort as loaded, which a saved
+        // directory keeps in `sorrel_original/` (synced like any other file).
+        let root_clusters = sorrel_io::RootView::open(into)?.path("spike_clusters.npy");
+        let local_baseline = baseline_hash(&std::fs::read(root_clusters)?);
         if local_baseline != info.cursor.baseline {
             bail!(
                 "spike_clusters.npy hash differs from the host journal baseline; download corrupt?"
