@@ -15,6 +15,7 @@ use crate::npy::{
 use crate::params::PhyParams;
 use crate::provider::{
     ChannelId, ClusterId, DataProvider, RawFile, SampleIndex, TraceDtype, TraceSamples, TraceSlice,
+    UnitAnnotation,
 };
 use anyhow::{bail, Context, Result};
 use memmap2::Mmap;
@@ -75,6 +76,9 @@ pub struct KilosortProvider {
     templates_per_cluster: Vec<Vec<u32>>,
     initial_labels: Vec<PhyLabel>,
     initial_tags: Vec<Vec<String>>,
+    initial_annotations: Vec<UnitAnnotation>,
+    /// Sorter pinned by an `Auto[<sorter>]` row in the annotations sidecar.
+    pinned_sorter: Option<String>,
 
     // Probe geometry. Empty when the corresponding `.npy` file is absent.
     channel_positions: Vec<[f32; 2]>,
@@ -263,7 +267,9 @@ impl KilosortProvider {
             .unwrap_or_else(|| load_cluster_groups(&root.join("cluster_KSLabel.tsv"), n_clusters))
         };
 
-        let initial_tags = with_phy_labels(&root, read_tags_tsv(&root.join(TAGS_TSV)));
+        let mut initial_tags = with_phy_labels(&root, read_tags_tsv(&root.join(TAGS_TSV)));
+        let initial_annotations = read_annotations_tsv(&root.join(ANNOTATIONS_TSV));
+        let pinned_sorter = pinned_sorter(&initial_annotations);
 
         // 2.5. Probe geometry. All optional; absence is fine.
         let channel_positions = read_optional_positions(&root.join("channel_positions.npy"))?;
@@ -290,6 +296,34 @@ impl KilosortProvider {
         // TemplateView and SimilarityView gracefully degrade when absent.
         let (template_waveforms, template_shape) =
             read_optional_templates(&root.join("templates.npy"))?;
+
+        // First open of a folder sorrel has not saved yet: tag units edited
+        // outside sorrel (phy). Verified that a FRESH sort never trips either
+        // rule: Kilosort 2.5 `utils/rezToPhy.m` L14-16 and KS3 `rezToPhy2.m`
+        // L17-19 drop the 5th st3 column, so spike_clusters == spike_templates
+        // (L135-139 / L142-146) and templates.npy has one row per id; Kilosort4
+        // `kilosort/io.py` L365-366 writes spike_templates.npy = spike_clusters
+        // and templates.npy has one row per (compacted) cluster
+        // (`template_matching.py` L338-342); SpikeInterface `to_phy.py`
+        // L181-182 writes the same labels to both. Hence: an id beyond the
+        // templates, or a spike whose template differs from its cluster, was
+        // merged, split or created in phy. Origin stays Auto.
+        // ponytail: needs spike_templates.npy; a sorter that writes a distinct
+        // spike_clusters on purpose would need its own exemption here.
+        if initial_annotations.is_empty() && templates_full.is_some() {
+            if initial_tags.len() < n_clusters {
+                initial_tags.resize_with(n_clusters, Vec::new);
+            }
+            for (c, tpls) in templates_per_cluster.iter().enumerate() {
+                let created = template_shape.0 > 0 && c >= template_shape.0;
+                if !tpls.is_empty()
+                    && (created || tpls.iter().any(|&t| t as usize != c))
+                    && !initial_tags[c].iter().any(|t| t == TAG_EXTERNAL)
+                {
+                    initial_tags[c].push(TAG_EXTERNAL.to_owned());
+                }
+            }
+        }
         let similar_templates =
             read_optional_similar_templates(&root.join("similar_templates.npy"), template_shape.0)?;
 
@@ -384,6 +418,8 @@ impl KilosortProvider {
             templates_per_cluster,
             initial_labels,
             initial_tags,
+            initial_annotations,
+            pinned_sorter,
             channel_positions,
             channel_shanks,
             channel_map,
@@ -498,6 +534,14 @@ impl DataProvider for KilosortProvider {
 
     fn initial_tags(&self) -> Vec<Vec<String>> {
         self.initial_tags.clone()
+    }
+
+    fn initial_annotations(&self) -> Vec<UnitAnnotation> {
+        self.initial_annotations.clone()
+    }
+
+    fn sorter(&self) -> Option<String> {
+        self.pinned_sorter.clone()
     }
 
     fn identity_bytes(&self) -> Vec<u8> {
@@ -655,10 +699,7 @@ fn load_quality_metrics(root: &Path, n_clusters: usize) -> crate::extras::Qualit
                 continue;
             };
             // Label/annotation sidecars are not numeric metrics.
-            if matches!(
-                stripped,
-                "group" | "groups" | "KSLabel" | "purity" | "info" | "sorrel_tags"
-            ) {
+            if RESERVED_COLUMNS.contains(&stripped) {
                 continue;
             }
             if metrics.contains(stripped) {
@@ -1114,10 +1155,7 @@ fn with_phy_labels(root: &Path, mut tags: Vec<Vec<String>>) -> Vec<Vec<String>> 
         else {
             continue;
         };
-        if matches!(
-            key,
-            "group" | "groups" | "KSLabel" | "purity" | "info" | "sorrel_tags"
-        ) {
+        if RESERVED_COLUMNS.contains(&key) {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -1152,9 +1190,110 @@ fn with_phy_labels(root: &Path, mut tags: Vec<Vec<String>>) -> Vec<Vec<String>> 
     tags
 }
 
+/// Tag put on units edited outside sorrel (phy merge/split/new id) when a
+/// folder is first opened without [`ANNOTATIONS_TSV`].
+pub const TAG_EXTERNAL: &str = "external";
+
 /// Sorrel's tag sidecar in a phy directory: `cluster_id\tsorrel_tags` with
 /// comma-joined tags, which phy shows as an ordinary column.
 pub const TAGS_TSV: &str = "cluster_sorrel_tags.tsv";
+
+/// Sorrel's origin/lineage/note sidecar in a phy directory:
+/// `cluster_id\tsorrel_origin\tsorrel_parents\tsorrel_note`, one row per
+/// non-empty unit, parents comma-joined, the note [`escape_note`]d.
+pub const ANNOTATIONS_TSV: &str = "cluster_sorrel_annotations.tsv";
+
+/// Names that are not user label keys or numeric metrics: phy's own label
+/// files, sorrel's sidecars (file keys and their column names) and the
+/// built-in table columns. Shared by the metric loader, `with_phy_labels` and
+/// the session's label-name check.
+pub const RESERVED_COLUMNS: &[&str] = &[
+    "group",
+    "groups",
+    "KSLabel",
+    "purity",
+    "info",
+    "sorrel_tags",
+    "sorrel_annotations",
+    "sorrel_origin",
+    "sorrel_parents",
+    "sorrel_note",
+    "id",
+    "n_spikes",
+];
+
+/// Escape `\`, tab, newline and CR so a note fits one TSV cell.
+pub fn escape_note(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Inverse of [`escape_note`]; an unknown escape keeps its character.
+pub fn unescape_note(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some(o) => out.push(o),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Parse [`ANNOTATIONS_TSV`] into a per-cluster vector indexed by cluster id
+/// (empty when the file is absent or unreadable).
+pub fn read_annotations_tsv(path: &Path) -> Vec<UnitAnnotation> {
+    let mut out: Vec<UnitAnnotation> = Vec::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    for line in text.lines().skip(1) {
+        let mut cols = line.splitn(4, '\t');
+        let Some(Ok(id)) = cols.next().map(|c| c.trim().parse::<usize>()) else {
+            continue;
+        };
+        if out.len() <= id {
+            out.resize_with(id + 1, UnitAnnotation::default);
+        }
+        out[id] = UnitAnnotation {
+            origin: unescape_note(cols.next().unwrap_or("").trim()),
+            parents: cols
+                .next()
+                .unwrap_or("")
+                .split(',')
+                .filter_map(|p| p.trim().parse().ok().map(ClusterId))
+                .collect(),
+            note: unescape_note(cols.next().unwrap_or("")),
+        };
+    }
+    out
+}
+
+/// The sorter name an `Auto[<sorter>]` row pins (first one wins). A saved
+/// `Auto[unknown]` pins nothing, so a later `--sorter` or detection can fill it.
+fn pinned_sorter(rows: &[UnitAnnotation]) -> Option<String> {
+    rows.iter().find_map(|r| {
+        let inner = r.origin.strip_prefix("Auto[")?.strip_suffix(']')?;
+        (!inner.is_empty() && inner != "unknown").then(|| inner.to_string())
+    })
+}
 
 /// A tag must survive the comma-joined TSV column and curation.json.
 pub fn valid_tag(tag: &str) -> bool {
@@ -1200,6 +1339,45 @@ pub fn spike_counts<P: DataProvider>(p: &P) -> HashMap<ClusterId, usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn annotations_tsv_reads_escaped_notes_parents_and_pins_sorter() {
+        let nasty = "a\tb\nc\\d\\n \r";
+        assert_eq!(unescape_note(&escape_note(nasty)), nasty);
+        assert!(!escape_note(nasty).contains(['\t', '\n', '\r']));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(ANNOTATIONS_TSV);
+        let text = format!(
+            "cluster_id\tsorrel_origin\tsorrel_parents\tsorrel_note\n\
+             0\tAuto[kilosort4]\t\t\n\
+             3\tSorrel[Algo:gmm]\t0, 2\t{}\n",
+            escape_note(nasty)
+        );
+        std::fs::write(&p, text).unwrap();
+        let rows = read_annotations_tsv(&p);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[1], UnitAnnotation::default());
+        assert_eq!(rows[3].origin, "Sorrel[Algo:gmm]");
+        assert_eq!(rows[3].parents, [ClusterId(0), ClusterId(2)]);
+        assert_eq!(rows[3].note, nasty);
+        assert_eq!(pinned_sorter(&rows).as_deref(), Some("kilosort4"));
+        assert!(read_annotations_tsv(&dir.path().join("nope.tsv")).is_empty());
+        // An escaped origin cannot inject rows; `Auto[unknown]` pins nothing.
+        let evil = "Sorrel[LLM:x\n5\tAuto[evil]]";
+        std::fs::write(
+            &p,
+            format!(
+                "cluster_id\tsorrel_origin\tsorrel_parents\tsorrel_note\n\
+                 0\tAuto[unknown]\t\t\n1\t{}\t\t\n",
+                escape_note(evil)
+            ),
+        )
+        .unwrap();
+        let rows = read_annotations_tsv(&p);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].origin, evil);
+        assert_eq!(pinned_sorter(&rows), None);
+    }
 
     #[test]
     fn phy_label_tsvs_become_tags_and_metrics_do_not() {
@@ -1268,5 +1446,79 @@ mod tests {
         let p = dir.path().join("absent.tsv");
         let labels = load_cluster_groups(&p, 3);
         assert_eq!(labels, vec![PhyLabel::Unsorted; 3]);
+    }
+
+    /// One spike per entry of `clusters`/`templates`; `n_templates` rows in
+    /// templates.npy. Returns the tags a first open yields.
+    fn external_tags(
+        clusters: &[u32],
+        templates: &[u32],
+        n_templates: usize,
+        annotations: bool,
+    ) -> Vec<Vec<String>> {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        let times: Vec<u64> = (0..clusters.len() as u64).map(|i| i * 10).collect();
+        crate::npy::write_1d_u64_atomic(&r.join("spike_times.npy"), &times).unwrap();
+        crate::npy::write_1d_u32_atomic(&r.join("spike_clusters.npy"), clusters).unwrap();
+        crate::npy::write_1d_u32_atomic(&r.join("spike_templates.npy"), templates).unwrap();
+        crate::npy::write_f32_atomic(
+            &r.join("templates.npy"),
+            &[n_templates, 1, 1],
+            &vec![0.0; n_templates],
+        )
+        .unwrap();
+        std::fs::write(r.join("recording.dat"), vec![0u8; 64]).unwrap();
+        std::fs::write(
+            r.join("params.py"),
+            "n_channels_dat = 1\nsample_rate = 1000.\n",
+        )
+        .unwrap();
+        if annotations {
+            std::fs::write(
+                r.join(ANNOTATIONS_TSV),
+                "cluster_id\tsorrel_origin\tsorrel_parents\tsorrel_note\n0\tAuto\t\t\n",
+            )
+            .unwrap();
+        }
+        let p = KilosortProvider::open(r, KilosortOpenParams::default()).unwrap();
+        let mut tags = p.initial_tags();
+        tags.resize_with(
+            clusters.iter().max().map_or(0, |m| *m as usize + 1),
+            Vec::new,
+        );
+        tags
+    }
+
+    fn external(tags: &[Vec<String>]) -> Vec<usize> {
+        (0..tags.len())
+            .filter(|&c| tags[c].iter().any(|t| t == TAG_EXTERNAL))
+            .collect()
+    }
+
+    #[test]
+    fn external_tag_fresh_layout_is_untouched() {
+        let tags = external_tags(&[0, 1, 2, 1], &[0, 1, 2, 1], 3, false);
+        assert!(external(&tags).is_empty());
+    }
+
+    #[test]
+    fn external_tag_marks_phy_merge() {
+        // Cluster 1 holds spikes of templates 1 and 2 (phy merge; 2 is empty).
+        let tags = external_tags(&[0, 1, 1, 1], &[0, 1, 2, 1], 3, false);
+        assert_eq!(external(&tags), vec![1]);
+    }
+
+    #[test]
+    fn external_tag_marks_id_beyond_templates() {
+        // Cluster 3 was created in phy (split): template 1 but only 3 templates.
+        let tags = external_tags(&[0, 1, 3, 3], &[0, 1, 1, 1], 3, false);
+        assert_eq!(external(&tags), vec![3]);
+    }
+
+    #[test]
+    fn external_tag_skipped_once_annotations_exist() {
+        let tags = external_tags(&[0, 1, 1, 1], &[0, 1, 2, 1], 3, true);
+        assert!(external(&tags).is_empty());
     }
 }

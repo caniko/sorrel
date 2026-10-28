@@ -3,7 +3,7 @@
 //! accepts. Every proposal and every decision lands in an append-only JSONL
 //! audit log, `<save_dir>/.sorrel/proposals.jsonl`.
 
-use crate::command::{CurationCommand, PhyLabelOp};
+use crate::command::{CurationCommand, Method, PhyLabelOp};
 use crate::session::Session;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -165,6 +165,10 @@ impl Proposal {
                 cluster: *cluster,
                 spike_idx: spike_idx.clone(),
                 new_cluster: ClusterId(u32::MAX),
+                by: match self.source {
+                    Source::Agent => Method::Llm("agent".into()),
+                    s => Method::Algo(s.tag().trim_start_matches("src:").into()),
+                },
             }),
             Action::Accept { .. } => {}
         }

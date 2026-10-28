@@ -29,10 +29,11 @@ use std::path::{Path, PathBuf};
 /// journal, `curation.json`, `.phy/`) stays behind.
 const COPIED_EXTENSIONS: [&str; 3] = ["npy", "tsv", "csv"];
 /// Rewritten from the session rather than copied.
-const REWRITTEN: [&str; 3] = [
+const REWRITTEN: [&str; 4] = [
     "spike_clusters.npy",
     "cluster_group.tsv",
     sorrel_io::kilosort::TAGS_TSV,
+    sorrel_io::kilosort::ANNOTATIONS_TSV,
 ];
 
 /// Template window around each spike (SpikeInterface's defaults).

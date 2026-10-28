@@ -26,7 +26,7 @@ pub mod suggest;
 
 pub use cache::correlograms::{acg_or_compute, ccg_or_compute};
 pub use cluster_index::{ClusterIndex, MergeRecord, SplitRecord};
-pub use command::{CurationCommand, PhyLabelOp};
+pub use command::{CurationCommand, Method, PhyLabelOp, UnitOrigin};
 pub use curation_json::write_curation_json;
 pub use diff::{diff_labels, LabelDiff};
 pub use feature_subspace::{

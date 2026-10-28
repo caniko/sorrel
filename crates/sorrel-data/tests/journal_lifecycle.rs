@@ -285,6 +285,7 @@ fn journal_history_records_split_descendants() {
             cluster: ClusterId(0),
             spike_idx: vec![1],
             new_cluster: ClusterId(0), // ignored — auto-allocated
+            by: sorrel_data::command::Method::Manual,
         })
         .unwrap();
     let n_post = session.n_clusters();

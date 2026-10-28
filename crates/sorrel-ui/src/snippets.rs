@@ -14,6 +14,8 @@ pub enum Snippet {
     /// `:l name value` set label `name` on the selection (`group` is the
     /// good/mua/noise/unsorted label).
     Label { name: String, value: String },
+    /// `:note text` set the note of every selected cluster (empty clears).
+    Note(String),
     /// `:f expr` filter the cluster table.
     Filter(String),
     /// `:s column` sort the cluster table.
@@ -62,6 +64,7 @@ pub fn parse(text: &str) -> Result<Snippet, String> {
                 value: value.trim().to_string(),
             }
         }
+        "note" => Snippet::Note(rest.to_string()),
         "f" => Snippet::Filter(rest.to_string()),
         "s" if !rest.is_empty() => Snippet::Sort(rest.to_string()),
         "tg" => Snippet::TraceGoto(number("a time in seconds")?),
@@ -149,6 +152,11 @@ mod tests {
             parse(":f n_spikes > 1000 && depth < 500"),
             Ok(Snippet::Filter("n_spikes > 1000 && depth < 500".into()))
         );
+        assert_eq!(
+            parse(":note  needs a look "),
+            Ok(Snippet::Note("needs a look".into()))
+        );
+        assert_eq!(parse(":note"), Ok(Snippet::Note(String::new())));
         assert_eq!(parse(":s n_spikes"), Ok(Snippet::Sort("n_spikes".into())));
         assert_eq!(parse(":tg 12.5"), Ok(Snippet::TraceGoto(12.5)));
         assert_eq!(parse(":cf group"), Ok(Snippet::ColourField("group".into())));

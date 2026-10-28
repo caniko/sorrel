@@ -85,6 +85,8 @@ where
         write_atomic(&tags_path, &tags_text)?;
     }
 
+    write_annotations_tsv(session, root)?;
+
     // phy custom labels: one `cluster_<key>.tsv` per key, as phy writes them.
     for key in session.custom_label_keys() {
         let mut text = format!("cluster_id\t{key}\n");
@@ -96,6 +98,28 @@ where
         write_atomic(&root.join(format!("cluster_{key}.tsv")), &text)?;
     }
     write_cluster_info(session, root, &label_str)
+}
+
+/// `cluster_sorrel_annotations.tsv`: origin, direct parents and note for every
+/// non-empty unit, so a resealed (emptied) journal loses nothing. An
+/// `Auto[<sorter>]` row also pins the sorter name for the next open.
+fn write_annotations_tsv<P: DataProvider>(session: &Session<P>, root: &Path) -> Result<()> {
+    let mut text = String::from("cluster_id\tsorrel_origin\tsorrel_parents\tsorrel_note\n");
+    for c in (0..session.n_clusters()).map(sorrel_io::ClusterId) {
+        if session.spike_times(c).is_empty() {
+            continue;
+        }
+        let parents: Vec<String> = session.parents(c).iter().map(|p| p.to_string()).collect();
+        // Origins carry untrusted names (MCP clientInfo, sorrel-py `by=`),
+        // so they are escaped like notes.
+        text.push_str(&format!(
+            "{c}\t{}\t{}\t{}\n",
+            sorrel_io::kilosort::escape_note(&session.origin_label(c)),
+            parents.join(","),
+            sorrel_io::kilosort::escape_note(session.note(c))
+        ));
+    }
+    write_atomic(&root.join(sorrel_io::kilosort::ANNOTATIONS_TSV), &text)
 }
 
 /// phy's `cluster_info.tsv`: one row per non-empty cluster with the columns
@@ -346,6 +370,7 @@ mod tests {
             cluster: ClusterId(0),
             spike_idx: vec![1],
             new_cluster: ClusterId(u32::MAX),
+            by: crate::command::Method::Manual,
         })
         .unwrap();
 
@@ -357,10 +382,11 @@ mod tests {
         assert_eq!(doc["format_version"], "2");
         assert_eq!(doc["unit_ids"], serde_json::json!([0, 1, 2]));
         assert_eq!(doc["label_definitions"]["quality"]["exclusive"], true);
-        assert_eq!(
-            doc["manual_labels"],
-            serde_json::json!([{ "unit_id": 0, "labels": { "quality": ["good"] } }])
-        );
+        // Every unit carries its exclusive origin label.
+        assert_eq!(doc["label_definitions"]["origin"]["exclusive"], true);
+        let first = &doc["manual_labels"][0]["labels"];
+        assert_eq!(first["quality"], serde_json::json!(["good"]));
+        assert_eq!(first["origin"], serde_json::json!(["Auto[unknown]"]));
         assert_eq!(doc["merges"][0]["unit_ids"], serde_json::json!([1, 2]));
         assert_eq!(doc["merges"][0]["new_unit_id"], 2);
         assert_eq!(doc["splits"][0]["unit_id"], 0);
@@ -404,12 +430,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            doc["manual_labels"],
-            serde_json::json!([{ "unit_id": 1, "labels": { "tags": ["src:unitrefine", "review:low-conf"] } }])
+            doc["manual_labels"][1],
+            serde_json::json!({ "unit_id": 1, "labels": {
+                "origin": ["Auto[unknown]"],
+                "tags": ["src:unitrefine", "review:low-conf"]
+            } })
         );
         assert_eq!(doc["label_definitions"]["tags"]["exclusive"], false);
         let imported = sorrel_io::read_curation(&dir.path().join("curation.json")).unwrap();
-        assert_eq!(imported.labels[0].2, ["src:unitrefine", "review:low-conf"]);
+        assert_eq!(imported.labels[1].2, ["src:unitrefine", "review:low-conf"]);
 
         // Clearing every tag rewrites the sidecar rather than leaving it stale.
         s.dispatch(CurationCommand::Tag {
@@ -478,7 +507,8 @@ mod tests {
                 if *target == ClusterId(1) && sources == &[ClusterId(2)]
         ));
         s.dispatch(CurationCommand::batch(cmds).unwrap()).unwrap();
-        assert_eq!(s.tags(ClusterId(1)), ["merged:consensus"]);
+        // The Auto merge target also gains the session's `tuned` marker.
+        assert_eq!(s.tags(ClusterId(1)), ["merged:consensus", "tuned"]);
         assert!(s.spike_times(ClusterId(2)).is_empty());
         // Re-importing the same document is a no-op, merge included.
         let current = |c: ClusterId| label_str(&s.label(c).unwrap_or_default());
@@ -505,6 +535,32 @@ mod tests {
             merges: vec![vec![0, 1], vec![1, 2]],
         };
         assert!(import_commands(&s, &twice, current).is_err());
+    }
+
+    #[test]
+    fn import_never_grants_session_markers() {
+        use crate::curation_json::import_commands;
+        use sorrel_io::CurationImport;
+        let (mut s, _d) = fresh_session();
+        let doc = CurationImport {
+            labels: vec![
+                (
+                    0,
+                    None,
+                    vec!["agree".into(), "tuned".into(), "external".into()],
+                ),
+                (1, None, vec!["tuned".into()]),
+            ],
+            merges: vec![],
+        };
+        let current = |c: ClusterId| label_str(&s.label(c).unwrap_or_default());
+        let cmds = import_commands(&s, &doc, current).unwrap();
+        s.dispatch(CurationCommand::batch(cmds).unwrap()).unwrap();
+        assert_eq!(s.tags(ClusterId(0)), ["agree"]);
+        assert!(s.tags(ClusterId(1)).is_empty());
+        // Re-importing the same document is a no-op.
+        let current = |c: ClusterId| label_str(&s.label(c).unwrap_or_default());
+        assert!(import_commands(&s, &doc, current).unwrap().is_empty());
     }
 
     #[test]
@@ -575,6 +631,7 @@ mod tests {
             cluster: ClusterId(0),
             spike_idx: vec![1],
             new_cluster: ClusterId(0), // ignored: auto-allocated
+            by: crate::command::Method::Manual,
         })
         .unwrap();
 

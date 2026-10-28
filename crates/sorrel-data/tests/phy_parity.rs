@@ -143,6 +143,7 @@ fn phy_clustering_total_spike_count_is_preserved() {
         cluster: ClusterId(5),
         spike_idx: vec![0, 1],
         new_cluster: ClusterId(0),
+        by: sorrel_data::command::Method::Manual,
     })
     .unwrap();
     let total_post2: usize = (0..s.n_clusters())
@@ -167,6 +168,7 @@ fn phy_clustering_undo_redo_round_trips_split() {
         cluster: ClusterId(2),
         spike_idx: vec![0],
         new_cluster: ClusterId(0), // ignored
+        by: sorrel_data::command::Method::Manual,
     })
     .unwrap();
     let after_split: Vec<Vec<SampleIndex>> = (0..s.n_clusters())

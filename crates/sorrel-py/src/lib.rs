@@ -20,7 +20,7 @@ use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::{
     collect_qc_rows, curation_json, open_phy, open_sorting_analyzer, rank_merge_candidates,
     rank_split_candidates, save_and_reseal_journal, save_to_phy, seed_phy, CurationCommand,
-    JournalOpts, PhyLabelOp, SuggestConfig,
+    JournalOpts, Method, PhyLabelOp, SuggestConfig,
 };
 use sorrel_io::kilosort::{KilosortOpenParams, KilosortProvider, PhyLabel};
 use sorrel_io::{detect_backend, Backend, ClusterId, DataProvider, SortingAnalyzerProvider};
@@ -149,6 +149,26 @@ impl Session {
         with_session!(self, s => s.spike_times(ClusterId(cluster)).iter().map(|t| t.0).collect())
     }
 
+    /// Origin of `cluster` as text: `Auto[<sorter>]` or `Sorrel[LLM:x]`.
+    fn origin(&self, cluster: u32) -> String {
+        with_session!(self, s => s.origin_label(ClusterId(cluster)))
+    }
+
+    /// Direct parents of `cluster` (the split source or the merged-in units).
+    fn parents(&self, cluster: u32) -> Vec<u32> {
+        with_session!(self, s => s.parents(ClusterId(cluster)).iter().map(|p| p.0).collect())
+    }
+
+    /// Free-text note of `cluster` (empty when none).
+    fn note(&self, cluster: u32) -> String {
+        with_session!(self, s => s.note(ClusterId(cluster)).to_string())
+    }
+
+    /// The sorter named in `Auto[<sorter>]`.
+    fn sorter(&self) -> String {
+        with_session!(self, s => s.sorter().to_string())
+    }
+
     /// `cluster_qc.tsv` rows as a JSON array of objects.
     fn qc_json(&self) -> String {
         let rows: Vec<serde_json::Value> =
@@ -189,12 +209,16 @@ impl Session {
     }
 
     /// Move `spike_idx` (positions in the cluster's time-sorted spikes)
-    /// into a new cluster; returns the new cluster id.
-    fn split(&mut self, cluster: u32, spike_idx: Vec<u32>) -> PyResult<u32> {
+    /// into a new cluster made by `by` (`manual`, `algo:<name>`, `llm:<name>`);
+    /// returns the new cluster id.
+    #[pyo3(signature = (cluster, spike_idx, by="algo:python"))]
+    fn split(&mut self, cluster: u32, spike_idx: Vec<u32>, by: &str) -> PyResult<u32> {
+        let by = by.parse::<Method>().map_err(PyValueError::new_err)?;
         let cmd = CurationCommand::Split {
             cluster: ClusterId(cluster),
             spike_idx,
             new_cluster: ClusterId(u32::MAX),
+            by,
         };
         with_session!(mut self, s => dispatch(s, cmd))?;
         Ok(self.n_clusters() - 1)

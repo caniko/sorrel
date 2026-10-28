@@ -11,18 +11,22 @@
 //!
 //! Field names follow `spikeinterface/curation/curation_model.py`:
 //! `format_version`, `unit_ids`, `label_definitions`, `manual_labels`,
-//! `merges`, `splits`, `removed`. Notes have no slot and are dropped.
+//! `merges`, `splits`, `removed`. Notes have no slot and are dropped; the
+//! unit origin travels as an exclusive `origin` label.
 //! `apply_curation` applies merges before splits, so a split recorded
 //! after a merge into the same unit indexes the merged, time-sorted spike
 //! train — the same order sorrel's buckets keep.
 
-use crate::command::CurationCommand;
-use crate::session::Session;
+use crate::command::{CurationCommand, Method, UnitOrigin};
+use crate::session::{Session, TAG_SPLIT, TAG_TUNED};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use sorrel_io::curation_json::{QUALITY_KEY, TAGS_KEY};
 use sorrel_io::DataProvider;
 use std::path::Path;
+
+/// Exclusive label holding each unit's origin (`Auto[ks4]`, `Sorrel[Manual]`).
+const ORIGIN_KEY: &str = "origin";
 
 /// Write `curation.json` describing `session` to `path` (atomically).
 pub fn write_curation_json<P, F>(session: &Session<P>, path: &Path, label_str: F) -> Result<()>
@@ -75,10 +79,19 @@ where
     let unit_ids: Vec<u32> = (0..n_units).map(|c| uid(sorrel_io::ClusterId(c))).collect();
 
     let mut tag_options = std::collections::BTreeSet::new();
+    // Every unit has exactly one origin; SpikeInterface needs each used value
+    // listed and at least two options.
+    let mut origin_options = std::collections::BTreeSet::from([
+        UnitOrigin::Auto.label(session.sorter()),
+        UnitOrigin::Sorrel(Method::Manual).label(session.sorter()),
+    ]);
     let manual_labels: Vec<Value> = (0..n_units)
         .filter_map(|i| {
             let c = sorrel_io::ClusterId(i);
             let mut sets = serde_json::Map::new();
+            let origin = session.origin_label(c);
+            origin_options.insert(origin.clone());
+            sets.insert(ORIGIN_KEY.into(), json!([origin]));
             if let Some(s) = session.label(c).map(|l| label_str(&l)) {
                 if !s.is_empty() && s != "unsorted" {
                     sets.insert(QUALITY_KEY.into(), json!([s]));
@@ -93,7 +106,8 @@ where
         })
         .collect();
     let mut label_definitions = json!({
-        QUALITY_KEY: { "label_options": ["good", "mua", "noise"], "exclusive": true }
+        QUALITY_KEY: { "label_options": ["good", "mua", "noise"], "exclusive": true },
+        ORIGIN_KEY: { "label_options": origin_options, "exclusive": true },
     });
     // SpikeInterface needs every used value listed and at least two options.
     if !tag_options.is_empty() {
@@ -114,6 +128,7 @@ where
             cluster,
             spike_idx,
             new_cluster,
+            ..
         } => splits.push(json!({
             "unit_id": uid(*cluster),
             "mode": "indices",
@@ -186,10 +201,23 @@ pub fn import_commands<P: DataProvider>(
         if let Some(bad) = tags.iter().find(|t| !valid_tag(t)) {
             bail!("unit {uid}: invalid tag {bad:?} (empty, or contains a comma/tab/newline)");
         }
-        if session.tags(c) != tags.as_slice() {
+        // Session markers are not review state: ignore them when comparing
+        // (re-import stays a no-op), never take them from the file, and keep
+        // the unit's own on retag.
+        let is_marker = |t: &String| {
+            matches!(
+                t.as_str(),
+                TAG_TUNED | TAG_SPLIT | sorrel_io::kilosort::TAG_EXTERNAL
+            )
+        };
+        let current: Vec<&String> = session.tags(c).iter().filter(|t| !is_marker(t)).collect();
+        let wanted: Vec<&String> = tags.iter().filter(|t| !is_marker(t)).collect();
+        if current != wanted {
+            let mut merged: Vec<String> = wanted.into_iter().cloned().collect();
+            merged.extend(session.tags(c).iter().filter(|t| is_marker(t)).cloned());
             out.push(CurationCommand::Tag {
                 cluster: c,
-                tags: tags.clone(),
+                tags: merged,
             });
         }
     }

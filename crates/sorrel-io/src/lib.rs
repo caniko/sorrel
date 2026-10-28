@@ -23,7 +23,7 @@ pub mod spikeglx;
 
 pub use cbin::CbinReader;
 pub use curation_json::{read_curation, read_curation_labels, CurationImport};
-pub use detect::{detect_backend, Backend};
+pub use detect::{detect_backend, detect_sorter, Backend};
 pub use events::Events;
 pub use extras::{
     HasAmplitudes, HasGeometry, HasPcFeatures, HasQualityMetrics, HasSpikeTemplates,
@@ -36,7 +36,7 @@ pub use params::PhyParams;
 pub use probeinterface::ProbeGeometry;
 pub use provider::{
     ChannelId, ClusterId, DataProvider, OptionalRow, RawFile, SampleIndex, TraceDtype,
-    TraceSamples, TraceSlice,
+    TraceSamples, TraceSlice, UnitAnnotation,
 };
 pub use sorting_analyzer::SortingAnalyzerProvider;
 pub use spikeglx::SpikeGlxMeta;

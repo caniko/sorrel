@@ -16,7 +16,7 @@
 //! Plots come back as SVG resources (see `report`); PNG needs a GPU
 //! surface and is deliberately out of scope.
 
-use crate::command::CurationCommand;
+use crate::command::{CurationCommand, Method};
 use crate::proposals::{self, Action, Outcome, Proposal, Source};
 use crate::qc_export::{collect_qc_rows, QcRow};
 use crate::report::render_cluster_svgs;
@@ -121,6 +121,8 @@ pub struct Env<'a, F> {
     pub label_str: F,
     qc: Option<(u64, Vec<QcRow>)>,
     suggest: Option<(u64, Vec<MergeCandidate>, Vec<SplitCandidate>)>,
+    /// MCP `clientInfo.name` from `initialize`; headless splits are named after it.
+    client: Option<String>,
 }
 
 impl<'a, F> Env<'a, F> {
@@ -131,6 +133,21 @@ impl<'a, F> Env<'a, F> {
             label_str,
             qc: None,
             suggest: None,
+            client: None,
+        }
+    }
+
+    fn capture_client(&mut self, line: &str) {
+        let Ok(req) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        if req["method"] == "initialize" {
+            if let Some(name) = req
+                .pointer("/params/clientInfo/name")
+                .and_then(Value::as_str)
+            {
+                self.client = Some(name.to_string());
+            }
         }
     }
 }
@@ -254,9 +271,12 @@ where
     F: Fn(&P::Label) -> &'static str + Sync,
 {
     match mode {
-        Mode::Headless => respond(line, false, |name, args| {
-            call_tool(session, env, name, args)
-        }),
+        Mode::Headless => {
+            env.capture_client(line);
+            respond(line, false, |name, args| {
+                call_tool(session, env, name, args)
+            })
+        }
         Mode::Attached(a) => handle_line_attached(session, env, a, line),
     }
 }
@@ -460,6 +480,7 @@ where
                     cluster,
                     spike_idx,
                     new_cluster: ClusterId(u32::MAX),
+                    by: Method::Llm(env.client.clone().unwrap_or_else(|| "agent".into())),
                 },
             ))?;
             let new_cluster = session.n_clusters() - 1;
@@ -676,7 +697,10 @@ where
                     let label = label_str(&session.label(c)?);
                     (want.is_none_or(|w| w == label)).then(|| {
                         json!({"cluster": c.0, "n_spikes": session.spike_times(c).len(),
-                               "label": label, "tags": session.tags(c)})
+                               "label": label, "tags": session.tags(c),
+                               "origin": session.origin_label(c),
+                               "parents": session.parents(c).iter().map(|p| p.0).collect::<Vec<_>>(),
+                               "note": session.note(c)})
                     })
                 })
                 .collect();
@@ -1295,7 +1319,7 @@ mod tests {
         );
         assert_eq!(
             text(1),
-            json!([{"cluster": 1, "n_spikes": 1, "label": "unsorted", "tags": ["review:merge", "src:bombcell", "src:agent"]}])
+            json!([{"cluster": 1, "n_spikes": 1, "label": "unsorted", "tags": ["review:merge", "src:bombcell", "src:agent"], "origin": "Auto[unknown]", "parents": [], "note": ""}])
         );
         assert_eq!(
             replies[2]["result"]["isError"], true,
@@ -1457,6 +1481,32 @@ mod tests {
         s.dispatch(CurationCommand::Undo).unwrap();
         s.dispatch(CurationCommand::Undo).unwrap();
         assert!(s.tags(ClusterId(0)).is_empty());
+    }
+
+    #[test]
+    fn headless_split_origin_names_the_mcp_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = mock_session(dir.path());
+        let mut env = Env::new(dir.path(), false, label);
+        let mut run = |line: String| handle_line(&mut s, &mut env, &Mode::Headless, &line).unwrap();
+        // No clientInfo yet: the split is attributed to "agent".
+        assert_eq!(
+            run(call(1, "split", json!({"cluster": 0, "spike_idx": [0]})))["result"]["isError"],
+            false
+        );
+        run(rpc(
+            2,
+            "initialize",
+            json!({"clientInfo": {"name": "codex"}}),
+        ));
+        assert_eq!(
+            run(call(3, "split", json!({"cluster": 0, "spike_idx": [0]})))["result"]["isError"],
+            false
+        );
+        drop(run);
+        let n = s.n_clusters();
+        assert_eq!(s.origin_label(ClusterId(n - 2)), "Sorrel[LLM:agent]");
+        assert_eq!(s.origin_label(ClusterId(n - 1)), "Sorrel[LLM:codex]");
     }
 
     #[test]

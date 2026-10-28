@@ -49,7 +49,14 @@ fn describe_command(cmd: &CurationCommand) -> String {
         } => {
             format!("split cluster {} ({} spikes)", cluster.0, spike_idx.len())
         }
-        CurationCommand::Note { cluster, .. } => format!("note on cluster {}", cluster.0),
+        CurationCommand::Note { cluster, text } if text.is_empty() => {
+            format!("clear note on cluster {}", cluster.0)
+        }
+        CurationCommand::Note { cluster, text } => {
+            let brief: String = text.chars().take(24).collect();
+            let dots = if text.chars().count() > 24 { "…" } else { "" };
+            format!("note on cluster {}: {brief}{dots}", cluster.0)
+        }
         CurationCommand::Tag { cluster, .. } => format!("retag cluster {}", cluster.0),
         CurationCommand::Batch { children } => {
             // A multi-select relabel is journaled as one batch so a single
@@ -601,7 +608,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     egui::TextEdit::singleline(text)
                         .desired_width(f32::INFINITY)
                         .font(egui::TextStyle::Monospace)
-                        .hint_text(":c 3 7 · :g · :l group good · :tg 12.5"),
+                        .hint_text(":c 3 7 · :g · :l group good · :note text · :tg 12.5"),
                 );
                 resp.request_focus();
                 resp
@@ -667,6 +674,28 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     }
                 };
                 self.commit(cmd);
+            }
+            Snippet::Note(text) => {
+                // One note on every selected cluster, one undo step.
+                let mut cmds: Vec<CurationCommand> = self
+                    .selection
+                    .iter()
+                    .map(|&cluster| CurationCommand::Note {
+                        cluster,
+                        text: text.clone(),
+                    })
+                    .collect();
+                match cmds.len() {
+                    0 => {}
+                    1 => {
+                        self.commit(cmds.remove(0));
+                    }
+                    _ => {
+                        if let Some(b) = CurationCommand::batch(cmds) {
+                            self.commit(b);
+                        }
+                    }
+                }
             }
             Snippet::Filter(expr) => self.table_state.set_filter(&expr),
             Snippet::Sort(col) => {
@@ -785,6 +814,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 cluster,
                 spike_idx,
                 new_cluster: ClusterId(0), // schema field; ClusterIndex auto-allocates
+                by: sorrel_data::command::Method::Manual,
             });
         }
         let cmd = match cmds.len() {
@@ -1639,6 +1669,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     cluster,
                     spike_idx,
                     new_cluster: ClusterId(0),
+                    by: sorrel_data::command::Method::Algo("gmm".into()),
                 });
             }
             SuggestAction::ApplyHighConfidenceMerges { threshold } => {

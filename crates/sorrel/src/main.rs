@@ -19,7 +19,7 @@ use sorrel_io::kilosort::{read_cluster_group_tsv, KilosortOpenParams, PhyLabel};
 use sorrel_io::open_ephys::OebinMeta;
 use sorrel_io::spikeglx::SpikeGlxMeta;
 use sorrel_io::{
-    DataProvider, Events, HasGeometry, HasQualityMetrics, KilosortProvider,
+    detect_sorter, DataProvider, Events, HasGeometry, HasQualityMetrics, KilosortProvider,
     SortingAnalyzerProvider, TraceDtype,
 };
 use sorrel_ui::{RasterPipeline, ScatterPipeline, SorrelApp, TracePipeline};
@@ -280,6 +280,9 @@ struct OpenArgs {
     /// Header bytes to skip in the dat (overrides params.py:offset)
     #[arg(long, value_name = "BYTES")]
     offset: Option<u64>,
+    /// Sorter name shown as Auto[NAME]; overrides detection
+    #[arg(long, value_name = "NAME")]
+    sorter: Option<String>,
     /// Curation journal (default: <DATA_DIR>/sorrel.journal)
     #[arg(long, value_name = "PATH")]
     journal: Option<PathBuf>,
@@ -512,7 +515,7 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
             let baseline = baseline_hash(&provider.identity_bytes());
             let journal_path = journal_path(open, &root, "sorrel");
             let journal = open_journal(open, &journal_path, baseline, provider.n_clusters())?;
-            let session = Session::new(provider, journal);
+            let session = new_session(provider, journal, open, sorrel_io::Backend::SortingAnalyzer);
             let metrics = session.provider.quality_metrics().clone();
             let positions = session.provider.channel_positions().to_vec();
             let shanks = session.provider.channel_shanks().to_vec();
@@ -533,7 +536,8 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
         Backend::Nwb => {
             let path = open.root().to_path_buf();
             let provider = sorrel_io::NwbProvider::open(&path)?;
-            let (session, ctx) = open_file_backed(open, provider, &path, "nwb")?;
+            let (session, ctx) =
+                open_file_backed(open, provider, &path, "nwb", sorrel_io::Backend::Nwb)?;
             v.visit(session, Box::new(|s| s.replay_journal()), ctx)
         }
         #[cfg(feature = "hdf5")]
@@ -545,7 +549,8 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
                     dat_path: open.dat.clone(),
                 },
             )?;
-            let (session, ctx) = open_file_backed(open, provider, &path, "rez")?;
+            let (session, ctx) =
+                open_file_backed(open, provider, &path, "rez", sorrel_io::Backend::Ks4Rez)?;
             v.visit(
                 session,
                 Box::new(|s| {
@@ -556,6 +561,21 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
             )
         }
     }
+}
+
+/// Wrap `Session::new` and name the sorter: `--sorter`, else the saved pin, else detected from the data.
+fn new_session<P: DataProvider>(
+    provider: P,
+    journal: Journal,
+    open: &OpenArgs,
+    backend: sorrel_io::Backend,
+) -> Session<P> {
+    let mut session = Session::new(provider, journal);
+    match &open.sorter {
+        Some(flag) => session.set_sorter(flag.clone()),
+        None => session.fill_detected_sorter(detect_sorter(open.root(), backend)),
+    }
+    session
 }
 
 /// Open a phy directory with explicit `params`, sealed against the saved
@@ -575,7 +595,7 @@ fn open_kilosort(
     );
     let journal_path = journal_path(open, &root, "sorrel");
     let journal = open_journal(open, &journal_path, baseline, provider.n_clusters())?;
-    let session = Session::new(provider, journal);
+    let session = new_session(provider, journal, open, sorrel_io::Backend::Kilosort);
     let metrics = session.provider.quality_metrics().clone();
     let positions = session.provider.channel_positions().to_vec();
     let shanks = session.provider.channel_shanks().to_vec();
@@ -685,6 +705,7 @@ fn open_file_backed<P>(
     provider: P,
     path: &Path,
     fallback_stem: &str,
+    backend: sorrel_io::Backend,
 ) -> Result<(Session<P>, OpenCtx<P>)>
 where
     P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
@@ -699,7 +720,7 @@ where
     let journal_path = journal_path(open, &parent, &stem);
     let baseline = baseline_hash(&provider.identity_bytes());
     let journal = open_journal(open, &journal_path, baseline, provider.n_clusters())?;
-    let session = Session::new(provider, journal);
+    let session = new_session(provider, journal, open, backend);
     let positions = session.provider.channel_positions().to_vec();
     let shanks = session.provider.channel_shanks().to_vec();
     Ok((
