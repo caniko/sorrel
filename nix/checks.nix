@@ -5,6 +5,7 @@
   cargoArtifacts,
   runtimeLibs,
   sorrel,
+  testSrc,
   hmModule,
 }: let
   inherit (pkgs) lib;
@@ -42,7 +43,12 @@ in
     workspace-tests = craneLib.cargoNextest (commonArgs
       // {
         inherit cargoArtifacts;
-        cargoNextestExtraArgs = "--workspace --no-fail-fast";
+        src = testSrc;
+        # ponytail: the sandbox has no /etc/resolv.conf and libp2p's
+        # with_websocket always builds its DNS transport from it, so the
+        # remote round trips run only in ci.yaml's cargo lane. Hand-building
+        # the websocket transport (swarm.rs, relay.rs) would bring them here.
+        cargoNextestExtraArgs = "--workspace --no-fail-fast -E 'not (package(sorrel-remote) & binary(round_trip))'";
         SORREL_LAVAPIPE_ICD = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.uname.processor}.json";
         SORREL_REQUIRE_GPU = "1";
         LD_LIBRARY_PATH = lib.makeLibraryPath runtimeLibs;

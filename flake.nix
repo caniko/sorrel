@@ -196,15 +196,24 @@
       };
       cargoConfig = harbor-rs.lib.mkCargoConfig {inherit pkgs;};
 
+      srcFilter = path: type:
+        (craneLib.filterCargoSources path type)
+        || pkgs.lib.hasSuffix ".wgsl" path
+        # BIP-39 list embedded by sorrel-remote's pairing codes.
+        || pkgs.lib.hasSuffix "sorrel-remote/wordlist.txt" path
+        # SpikeInterface sidecar `sorrel auto` embeds with include_str!.
+        || pkgs.lib.hasSuffix "scripts/sorrel_auto.py" path;
       src = pkgs.lib.cleanSourceWith {
         src = ./.;
+        filter = srcFilter;
+      };
+      # The tests also read the UI snapshot PNGs and the committed phy fixture.
+      testSrc = pkgs.lib.cleanSourceWith {
+        src = ./.;
         filter = path: type:
-          (craneLib.filterCargoSources path type)
-          || pkgs.lib.hasSuffix ".wgsl" path
-          # BIP-39 list embedded by sorrel-remote's pairing codes.
-          || pkgs.lib.hasSuffix "sorrel-remote/wordlist.txt" path
-          # SpikeInterface sidecar `sorrel auto` embeds with include_str!.
-          || pkgs.lib.hasSuffix "scripts/sorrel_auto.py" path;
+          srcFilter path type
+          || pkgs.lib.hasInfix "/tests/snapshots/" path
+          || pkgs.lib.hasInfix "/release/fixtures/" path;
       };
       treefmtEval = treefmt-nix.lib.evalModule pkgs (import ./nix/treefmt.nix {rustfmtPackage = rustToolchain;});
       pre-commit-check = git-hooks.lib.${system}.run {
@@ -358,7 +367,7 @@
 
       checks =
         (import ./nix/checks.nix {
-          inherit pkgs craneLib commonArgs cargoArtifacts sorrel;
+          inherit pkgs craneLib commonArgs cargoArtifacts sorrel testSrc;
           inherit (deps) runtimeLibs;
           hmModule = self.homeManagerModules.default;
         })
