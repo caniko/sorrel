@@ -67,7 +67,7 @@ pub fn collect_pc_subspace<P: DataProvider>(
         cluster_spike_fingerprint(session, cluster);
     let cache_key = pc_subspace::key(pc_subspace::KeyParts {
         session_identity: &session.provider.identity_bytes(),
-        journal_head: session.journal_head(),
+        n_spikes_total: session.spike_clusters_global().len() as u64,
         cluster,
         cluster_spike_count,
         cluster_spike_fingerprint,

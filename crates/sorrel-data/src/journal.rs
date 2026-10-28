@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! magic        | 8 bytes  | b"SORREL\x00\x02"
-//! version      | u32 LE   | 1
+//! version      | u32 LE   | 2 (v1 is read and upgraded in place on open)
 //! flags        | u32 LE   | reserved (0)
 //! baseline     | u64 LE   | xxh3-64 hash of spike_clusters.npy at last seal
 //! n_clusters_0 | u32 LE   | n_clusters at baseline (sanity)
@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 /// Magic header. Bumping the trailing byte invalidates older files.
 pub const MAGIC: &[u8; 8] = b"SORREL\x00\x02";
 /// On-disk format version.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 /// Header byte size: magic (8) + version (4) + flags (4) + baseline (8)
 /// + n_clusters_0 (4) + reserved (4) = 32 bytes.
 pub const HEADER_SIZE: u64 = 32;
@@ -111,7 +111,7 @@ impl Journal {
             bail!("{}: not a sorrel journal (bad magic)", path.display());
         }
         let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
-        if version != FORMAT_VERSION {
+        if !(1..=FORMAT_VERSION).contains(&version) {
             bail!(
                 "{}: unsupported journal version {} (this build expects {})",
                 path.display(),
@@ -130,6 +130,18 @@ impl Journal {
                 baseline,
                 expected_baseline
             );
+        }
+        if version < FORMAT_VERSION {
+            // Stamp the new version before the first append: an older binary
+            // then refuses the file instead of truncating records it cannot
+            // decode (`replay_at` drops everything from the first bad one).
+            let mut h = OpenOptions::new()
+                .write(true)
+                .open(path)
+                .with_context(|| format!("upgrade journal {}", path.display()))?;
+            h.seek(SeekFrom::Start(8))?;
+            h.write_all(&FORMAT_VERSION.to_le_bytes())?;
+            h.sync_all()?;
         }
         let f = OpenOptions::new()
             .append(true)
@@ -419,6 +431,7 @@ mod tests {
             cluster: ClusterId(4),
             spike_idx: vec![0, 1, 5, 8],
             new_cluster: ClusterId(99),
+            by: crate::command::Method::Manual,
         })
         .unwrap();
         j.append(&CurationCommand::Note {
@@ -437,6 +450,55 @@ mod tests {
         assert!(matches!(ops[3], CurationCommand::Note { .. }));
         assert!(matches!(ops[4], CurationCommand::Undo));
         assert!(matches!(ops[5], CurationCommand::Redo));
+    }
+
+    /// A hand-built v1 file holding an old-shape (no `by`) Split replays, and
+    /// opening it stamps v2 into the header before any append.
+    #[test]
+    fn v1_journal_replays_and_is_upgraded_on_open() {
+        use sorrel_io::ClusterId;
+        #[derive(serde::Serialize)]
+        enum Old {
+            Split {
+                cluster: ClusterId,
+                spike_idx: Vec<u32>,
+                new_cluster: ClusterId,
+            },
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("j.sorrel");
+        drop(Journal::open_or_create(&p, 7, 3).unwrap());
+        let mut bytes = std::fs::read(&p).unwrap();
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let rec = rmp_serde::to_vec(&Old::Split {
+            cluster: ClusterId(0),
+            spike_idx: vec![1],
+            new_cluster: ClusterId(3),
+        })
+        .unwrap();
+        bytes.extend((rec.len() as u32).to_le_bytes());
+        bytes.extend(rec);
+        std::fs::write(&p, &bytes).unwrap();
+
+        let mut j = Journal::open_or_create(&p, 7, 3).unwrap();
+        assert_eq!(j.n_records(), 1);
+        let hdr = std::fs::read(&p).unwrap();
+        assert_eq!(u32::from_le_bytes(hdr[8..12].try_into().unwrap()), 2);
+        j.append(&cmd(0, PhyLabelOp::SetGood)).unwrap();
+        let ops = j.replay().unwrap();
+        assert!(matches!(
+            &ops[0],
+            CurationCommand::Split {
+                by: crate::command::Method::Manual,
+                ..
+            }
+        ));
+        assert_eq!(ops.len(), 2);
+        // Future versions are still refused.
+        let mut f = OpenOptions::new().write(true).open(&p).unwrap();
+        f.seek(SeekFrom::Start(8)).unwrap();
+        f.write_all(&3u32.to_le_bytes()).unwrap();
+        assert!(Journal::open_or_create(&p, 7, 3).is_err());
     }
 
     #[test]

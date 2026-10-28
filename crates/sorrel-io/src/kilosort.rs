@@ -15,6 +15,7 @@ use crate::npy::{
 use crate::params::PhyParams;
 use crate::provider::{
     ChannelId, ClusterId, DataProvider, RawFile, SampleIndex, TraceDtype, TraceSamples, TraceSlice,
+    UnitAnnotation,
 };
 use anyhow::{bail, Context, Result};
 use memmap2::Mmap;
@@ -75,6 +76,9 @@ pub struct KilosortProvider {
     templates_per_cluster: Vec<Vec<u32>>,
     initial_labels: Vec<PhyLabel>,
     initial_tags: Vec<Vec<String>>,
+    initial_annotations: Vec<UnitAnnotation>,
+    /// Sorter pinned by an `Auto[<sorter>]` row in the annotations sidecar.
+    pinned_sorter: Option<String>,
 
     // Probe geometry. Empty when the corresponding `.npy` file is absent.
     channel_positions: Vec<[f32; 2]>,
@@ -86,6 +90,11 @@ pub struct KilosortProvider {
     pc_features: std::sync::Arc<[f32]>,
     pc_shape: (usize, usize), // (n_pcs, n_channels_per_template)
     pc_feature_ind: Vec<u32>, // (n_templates * n_channels_per_template) flat
+    /// `template_features.npy` flat, its width `k`, and `template_feature_ind.npy`.
+    template_features: (std::sync::Arc<[f32]>, usize, Vec<u32>),
+    /// phylib spike attributes and `spike_reorder.npy`.
+    spike_attributes: Vec<(String, std::sync::Arc<[f32]>, usize)>,
+    spike_reorder: Option<std::sync::Arc<[u32]>>,
     /// Per-cluster, time-sorted, original NPY row indices into pc_features.
     /// Doubles as the row index into `amplitudes.npy`/`spike_times.npy`/etc.
     pc_indices_per_cluster: Vec<Vec<u32>>,
@@ -160,6 +169,7 @@ impl std::fmt::Debug for KilosortOpenParams {
 impl KilosortProvider {
     pub fn open(root: impl AsRef<Path>, overrides: KilosortOpenParams) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
+        roll_forward_pending(&root)?;
 
         // 1. params.py — optional but strongly preferred. If present, it owns
         // sample_rate / n_channels / dtype / offset / dat_path defaults.
@@ -258,7 +268,9 @@ impl KilosortProvider {
             .unwrap_or_else(|| load_cluster_groups(&root.join("cluster_KSLabel.tsv"), n_clusters))
         };
 
-        let initial_tags = read_tags_tsv(&root.join(TAGS_TSV));
+        let mut initial_tags = with_phy_labels(&root, read_tags_tsv(&root.join(TAGS_TSV)));
+        let initial_annotations = read_annotations_tsv(&root.join(ANNOTATIONS_TSV));
+        let pinned_sorter = pinned_sorter(&initial_annotations);
 
         // 2.5. Probe geometry. All optional; absence is fine.
         let channel_positions = read_optional_positions(&root.join("channel_positions.npy"))?;
@@ -274,11 +286,45 @@ impl KilosortProvider {
         // neither — having pc_features without pc_feature_ind makes the
         // shape unusable.
         let (pc_features, pc_shape, pc_feature_ind) = read_optional_pc_features(&root, n_spikes)?;
+        let template_features = read_optional_template_features(&root, n_spikes)?;
+        let spike_attributes = read_spike_attributes(&root, n_spikes);
+        let spike_reorder = read_1d_u32(&root.join("spike_reorder.npy"))
+            .ok()
+            .filter(|r| r.len() == n_spikes && r.iter().all(|&i| (i as usize) < n_spikes))
+            .map(std::sync::Arc::from);
 
         // 2.7. Template waveforms + similarity matrix. Both optional; the
         // TemplateView and SimilarityView gracefully degrade when absent.
         let (template_waveforms, template_shape) =
             read_optional_templates(&root.join("templates.npy"))?;
+
+        // First open of a folder sorrel has not saved yet: tag units edited
+        // outside sorrel (phy). Verified that a FRESH sort never trips either
+        // rule: Kilosort 2.5 `utils/rezToPhy.m` L14-16 and KS3 `rezToPhy2.m`
+        // L17-19 drop the 5th st3 column, so spike_clusters == spike_templates
+        // (L135-139 / L142-146) and templates.npy has one row per id; Kilosort4
+        // `kilosort/io.py` L365-366 writes spike_templates.npy = spike_clusters
+        // and templates.npy has one row per (compacted) cluster
+        // (`template_matching.py` L338-342); SpikeInterface `to_phy.py`
+        // L181-182 writes the same labels to both. Hence: an id beyond the
+        // templates, or a spike whose template differs from its cluster, was
+        // merged, split or created in phy. Origin stays Auto.
+        // ponytail: needs spike_templates.npy; a sorter that writes a distinct
+        // spike_clusters on purpose would need its own exemption here.
+        if initial_annotations.is_empty() && templates_full.is_some() {
+            if initial_tags.len() < n_clusters {
+                initial_tags.resize_with(n_clusters, Vec::new);
+            }
+            for (c, tpls) in templates_per_cluster.iter().enumerate() {
+                let created = template_shape.0 > 0 && c >= template_shape.0;
+                if !tpls.is_empty()
+                    && (created || tpls.iter().any(|&t| t as usize != c))
+                    && !initial_tags[c].iter().any(|t| t == TAG_EXTERNAL)
+                {
+                    initial_tags[c].push(TAG_EXTERNAL.to_owned());
+                }
+            }
+        }
         let similar_templates =
             read_optional_similar_templates(&root.join("similar_templates.npy"), template_shape.0)?;
 
@@ -373,12 +419,17 @@ impl KilosortProvider {
             templates_per_cluster,
             initial_labels,
             initial_tags,
+            initial_annotations,
+            pinned_sorter,
             channel_positions,
             channel_shanks,
             channel_map,
             pc_features: pc_features.into(),
             pc_shape,
             pc_feature_ind,
+            template_features,
+            spike_attributes,
+            spike_reorder,
             pc_indices_per_cluster,
             template_waveforms: template_waveforms.into(),
             template_shape,
@@ -486,6 +537,14 @@ impl DataProvider for KilosortProvider {
         self.initial_tags.clone()
     }
 
+    fn initial_annotations(&self) -> Vec<UnitAnnotation> {
+        self.initial_annotations.clone()
+    }
+
+    fn sorter(&self) -> Option<String> {
+        self.pinned_sorter.clone()
+    }
+
     fn identity_bytes(&self) -> Vec<u8> {
         self.identity_bytes.clone()
     }
@@ -578,6 +637,16 @@ impl HasPcFeatures for KilosortProvider {
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
+    fn template_features(&self) -> (std::sync::Arc<[f32]>, usize, &[u32]) {
+        let (flat, k, ind) = &self.template_features;
+        (flat.clone(), *k, ind)
+    }
+    fn spike_attributes(&self) -> Vec<(String, std::sync::Arc<[f32]>, usize)> {
+        self.spike_attributes.clone()
+    }
+    fn spike_reorder(&self) -> Option<std::sync::Arc<[u32]>> {
+        self.spike_reorder.clone()
+    }
 }
 
 impl crate::extras::HasTemplateWaveforms for KilosortProvider {
@@ -631,10 +700,7 @@ fn load_quality_metrics(root: &Path, n_clusters: usize) -> crate::extras::Qualit
                 continue;
             };
             // Label/annotation sidecars are not numeric metrics.
-            if matches!(
-                stripped,
-                "group" | "groups" | "KSLabel" | "purity" | "info" | "sorrel_tags"
-            ) {
+            if RESERVED_COLUMNS.contains(&stripped) {
                 continue;
             }
             if metrics.contains(stripped) {
@@ -777,6 +843,83 @@ fn read_optional_u32_1d(path: &Path, expected_len: usize) -> Result<Option<Vec<u
 /// Read `pc_features.npy` and `pc_feature_ind.npy` together when both are
 /// present. Returns `(flat, (n_pcs, n_chans_per_template), feature_ind_flat)`
 /// with empty defaults when either file is absent.
+/// phylib `_load_spike_attributes`: every `spike_<name>.npy` except the
+/// known per-spike files, with `n_spikes` rows; at most 2 columns are kept
+/// (phy plots 1-D as time vs value and 2-D as x vs y). Unreadable or
+/// mis-sized files are skipped with a warning, as phylib does.
+fn read_spike_attributes(root: &Path, n_spikes: usize) -> Vec<SpikeAttribute> {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<SpikeAttribute> = rd
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let name = path
+                .file_name()?
+                .to_str()?
+                .strip_prefix("spike_")?
+                .strip_suffix(".npy")?
+                .to_string();
+            if matches!(
+                name.as_str(),
+                "clusters" | "templates" | "samples" | "times" | "amplitudes" | "reorder"
+            ) {
+                return None;
+            }
+            let read = read_npy_f32_flat(&path).or_else(|_| {
+                read_npy_u32_flat(&path)
+                    .map(|(v, s)| (v.into_iter().map(|x| x as f32).collect(), s))
+            });
+            match read {
+                Ok((flat, shape)) if shape.first() == Some(&n_spikes) => {
+                    // Full row width: a rewrite re-encodes added spikes
+                    // against the file's whole row shape.
+                    let cols: usize = shape[1..].iter().product::<usize>().max(1);
+                    Some((name, std::sync::Arc::from(flat), cols))
+                }
+                Ok((_, shape)) => {
+                    log::warn!(
+                        "{}: shape {shape:?} does not match {n_spikes} spikes",
+                        path.display()
+                    );
+                    None
+                }
+                Err(e) => {
+                    log::warn!("{}: {e}", path.display());
+                    None
+                }
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// `(name, row-major values, columns)` of one phylib spike attribute.
+type SpikeAttribute = (String, std::sync::Arc<[f32]>, usize);
+
+/// `template_features.npy` + `template_feature_ind.npy`: both or neither,
+/// with matching widths. Absent files give an empty triple.
+fn read_optional_template_features(
+    root: &Path,
+    n_spikes: usize,
+) -> Result<(std::sync::Arc<[f32]>, usize, Vec<u32>)> {
+    let (feat, ind) = (
+        root.join("template_features.npy"),
+        root.join("template_feature_ind.npy"),
+    );
+    if !feat.exists() || !ind.exists() {
+        return Ok((std::sync::Arc::from([]), 0, Vec::new()));
+    }
+    let (flat, shape) = read_npy_f32_flat(&feat)?;
+    let (ind_flat, ind_shape) = read_npy_u32_flat(&ind)?;
+    match (shape.as_slice(), ind_shape.as_slice()) {
+        ([n, k], [_, k2]) if *n == n_spikes && k == k2 => Ok((flat.into(), *k, ind_flat)),
+        _ => bail!("template_features.npy {shape:?} and template_feature_ind.npy {ind_shape:?} do not match {n_spikes} spikes"),
+    }
+}
+
 type PcFeatures = (Vec<f32>, (usize, usize), Vec<u32>);
 
 fn read_optional_pc_features(root: &Path, n_spikes: usize) -> Result<PcFeatures> {
@@ -994,9 +1137,211 @@ pub fn read_cluster_group_tsv(path: &Path) -> Option<Vec<(u32, PhyLabel)>> {
     )
 }
 
+/// `(key, rows)` of every `cluster_<key>.tsv` that [`with_phy_labels`] reads
+/// as a label file: a non-reserved key whose non-empty values are not all
+/// numeric. Sorted by file name.
+fn phy_label_files(root: &Path) -> Vec<(String, Vec<(usize, String)>)> {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut files: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    files.sort();
+    let mut out = Vec::new();
+    for path in files {
+        let Some(key) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("cluster_")?.strip_suffix(".tsv"))
+        else {
+            continue;
+        };
+        if RESERVED_COLUMNS.contains(&key) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let rows: Vec<(usize, String)> = text
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let (id, v) = l.split_once('\t')?;
+                Some((id.trim().parse().ok()?, v.trim().to_owned()))
+            })
+            .filter(|(_, v)| !v.is_empty())
+            .collect();
+        if rows.iter().all(|(_, v)| v.parse::<f32>().is_ok()) {
+            continue;
+        }
+        out.push((key.to_owned(), rows));
+    }
+    out
+}
+
+/// Keys of the `cluster_<key>.tsv` files a directory open turns into custom
+/// labels. The saver blanks the ones whose label the session has cleared.
+pub fn phy_label_keys(root: &Path) -> Vec<String> {
+    phy_label_files(root).into_iter().map(|f| f.0).collect()
+}
+
+/// phy custom labels (`:l name value` writes `cluster_<name>.tsv`) as
+/// `name=value` tags, from every `cluster_*.tsv` with a non-numeric value
+/// (all-numeric files load as metrics). A cluster that already has a
+/// `name=` tag from the sorrel sidecar keeps it.
+fn with_phy_labels(root: &Path, mut tags: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    for (key, rows) in phy_label_files(root) {
+        let prefix = format!("{key}=");
+        for (id, v) in rows {
+            let tag = format!("{prefix}{v}");
+            if !valid_tag(&tag) {
+                continue;
+            }
+            if tags.len() <= id {
+                tags.resize_with(id + 1, Vec::new);
+            }
+            if !tags[id].iter().any(|t| t.starts_with(&prefix)) {
+                tags[id].push(tag);
+            }
+        }
+    }
+    tags
+}
+
+/// Manifest of an in-flight per-spike array rewrite: one `tmp\tfinal` pair of
+/// bare file names per line, written (fsynced) only after every tmp file is.
+pub const REWRITE_PENDING: &str = "sorrel_rewrite.pending";
+
+/// Finish an interrupted rewrite: rename every listed tmp file that still
+/// exists over its final name, then drop the manifest. The manifest only
+/// appears once all tmp files are durable, so this never exposes a mix of old
+/// and new arrays after it returns.
+pub fn roll_forward_pending(root: &Path) -> Result<()> {
+    let manifest = root.join(REWRITE_PENDING);
+    let text = match std::fs::read_to_string(&manifest) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        r => r.with_context(|| format!("read {}", manifest.display()))?,
+    };
+    let bare = |n: &str| Path::new(n).file_name().is_some_and(|f| f == n);
+    for line in text.lines().filter(|l| !l.is_empty()) {
+        let (tmp, fin) = line
+            .split_once('\t')
+            .filter(|(a, b)| bare(a) && bare(b))
+            .with_context(|| format!("{}: malformed line {line:?}", manifest.display()))?;
+        if root.join(tmp).exists() {
+            std::fs::rename(root.join(tmp), root.join(fin))
+                .with_context(|| format!("roll forward {tmp} -> {fin}"))?;
+        }
+    }
+    // Renames durable before the manifest (the only record of them) goes.
+    // ponytail: best effort (a directory cannot be opened on Windows).
+    let _ = std::fs::File::open(root).and_then(|d| d.sync_all());
+    std::fs::remove_file(&manifest).with_context(|| format!("remove {}", manifest.display()))
+}
+
+/// Tag put on units edited outside sorrel (phy merge/split/new id) when a
+/// folder is first opened without [`ANNOTATIONS_TSV`].
+pub const TAG_EXTERNAL: &str = "external";
+
 /// Sorrel's tag sidecar in a phy directory: `cluster_id\tsorrel_tags` with
 /// comma-joined tags, which phy shows as an ordinary column.
 pub const TAGS_TSV: &str = "cluster_sorrel_tags.tsv";
+
+/// Sorrel's origin/lineage/note sidecar in a phy directory:
+/// `cluster_id\tsorrel_origin\tsorrel_parents\tsorrel_note`, one row per
+/// non-empty unit, parents comma-joined, the note [`escape_note`]d.
+pub const ANNOTATIONS_TSV: &str = "cluster_sorrel_annotations.tsv";
+
+/// Names that are not user label keys or numeric metrics: phy's own label
+/// files, sorrel's sidecars (file keys and their column names) and the
+/// built-in table columns. Shared by the metric loader, `with_phy_labels` and
+/// the session's label-name check.
+pub const RESERVED_COLUMNS: &[&str] = &[
+    "group",
+    "groups",
+    "KSLabel",
+    "purity",
+    "info",
+    "sorrel_tags",
+    "sorrel_annotations",
+    "sorrel_origin",
+    "sorrel_parents",
+    "sorrel_note",
+    "id",
+    "n_spikes",
+];
+
+/// Escape `\`, tab, newline and CR so a note fits one TSV cell.
+pub fn escape_note(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Inverse of [`escape_note`]; an unknown escape keeps its character.
+pub fn unescape_note(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some(o) => out.push(o),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Parse [`ANNOTATIONS_TSV`] into a per-cluster vector indexed by cluster id
+/// (empty when the file is absent or unreadable).
+pub fn read_annotations_tsv(path: &Path) -> Vec<UnitAnnotation> {
+    let mut out: Vec<UnitAnnotation> = Vec::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    for line in text.lines().skip(1) {
+        let mut cols = line.splitn(4, '\t');
+        let Some(Ok(id)) = cols.next().map(|c| c.trim().parse::<usize>()) else {
+            continue;
+        };
+        if out.len() <= id {
+            out.resize_with(id + 1, UnitAnnotation::default);
+        }
+        out[id] = UnitAnnotation {
+            origin: unescape_note(cols.next().unwrap_or("").trim()),
+            parents: cols
+                .next()
+                .unwrap_or("")
+                .split(',')
+                .filter_map(|p| p.trim().parse().ok().map(ClusterId))
+                .collect(),
+            note: unescape_note(cols.next().unwrap_or("")),
+        };
+    }
+    out
+}
+
+/// The sorter name an `Auto[<sorter>]` row pins (first one wins). A saved
+/// `Auto[unknown]` pins nothing, so a later `--sorter` or detection can fill it.
+fn pinned_sorter(rows: &[UnitAnnotation]) -> Option<String> {
+    rows.iter().find_map(|r| {
+        let inner = r.origin.strip_prefix("Auto[")?.strip_suffix(']')?;
+        (!inner.is_empty() && inner != "unknown").then(|| inner.to_string())
+    })
+}
 
 /// A tag must survive the comma-joined TSV column and curation.json.
 pub fn valid_tag(tag: &str) -> bool {
@@ -1042,6 +1387,62 @@ pub fn spike_counts<P: DataProvider>(p: &P) -> HashMap<ClusterId, usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn annotations_tsv_reads_escaped_notes_parents_and_pins_sorter() {
+        let nasty = "a\tb\nc\\d\\n \r";
+        assert_eq!(unescape_note(&escape_note(nasty)), nasty);
+        assert!(!escape_note(nasty).contains(['\t', '\n', '\r']));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(ANNOTATIONS_TSV);
+        let text = format!(
+            "cluster_id\tsorrel_origin\tsorrel_parents\tsorrel_note\n\
+             0\tAuto[kilosort4]\t\t\n\
+             3\tSorrel[Algo:gmm]\t0, 2\t{}\n",
+            escape_note(nasty)
+        );
+        std::fs::write(&p, text).unwrap();
+        let rows = read_annotations_tsv(&p);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[1], UnitAnnotation::default());
+        assert_eq!(rows[3].origin, "Sorrel[Algo:gmm]");
+        assert_eq!(rows[3].parents, [ClusterId(0), ClusterId(2)]);
+        assert_eq!(rows[3].note, nasty);
+        assert_eq!(pinned_sorter(&rows).as_deref(), Some("kilosort4"));
+        assert!(read_annotations_tsv(&dir.path().join("nope.tsv")).is_empty());
+        // An escaped origin cannot inject rows; `Auto[unknown]` pins nothing.
+        let evil = "Sorrel[LLM:x\n5\tAuto[evil]]";
+        std::fs::write(
+            &p,
+            format!(
+                "cluster_id\tsorrel_origin\tsorrel_parents\tsorrel_note\n\
+                 0\tAuto[unknown]\t\t\n1\t{}\t\t\n",
+                escape_note(evil)
+            ),
+        )
+        .unwrap();
+        let rows = read_annotations_tsv(&p);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].origin, evil);
+        assert_eq!(pinned_sorter(&rows), None);
+    }
+
+    #[test]
+    fn phy_label_tsvs_become_tags_and_metrics_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = |name: &str, text: &str| std::fs::write(dir.path().join(name), text).unwrap();
+        w(
+            "cluster_quality.tsv",
+            "cluster_id\tquality\n0\tgreat\n2\tbad\n",
+        );
+        w("cluster_ContamPct.tsv", "cluster_id\tContamPct\n0\t1.5\n");
+        w("cluster_group.tsv", "cluster_id\tgroup\n0\tgood\n");
+        // The sorrel sidecar already holds quality for cluster 2.
+        let tags = with_phy_labels(dir.path(), vec![vec![], vec![], vec!["quality=ok".into()]]);
+        assert_eq!(tags[0], ["quality=great"]);
+        assert!(tags[1].is_empty());
+        assert_eq!(tags[2], ["quality=ok"]);
+    }
 
     #[test]
     fn parse_tsv_value_recognises_known_groups() {
@@ -1093,5 +1494,79 @@ mod tests {
         let p = dir.path().join("absent.tsv");
         let labels = load_cluster_groups(&p, 3);
         assert_eq!(labels, vec![PhyLabel::Unsorted; 3]);
+    }
+
+    /// One spike per entry of `clusters`/`templates`; `n_templates` rows in
+    /// templates.npy. Returns the tags a first open yields.
+    fn external_tags(
+        clusters: &[u32],
+        templates: &[u32],
+        n_templates: usize,
+        annotations: bool,
+    ) -> Vec<Vec<String>> {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        let times: Vec<u64> = (0..clusters.len() as u64).map(|i| i * 10).collect();
+        crate::npy::write_1d_u64_atomic(&r.join("spike_times.npy"), &times).unwrap();
+        crate::npy::write_1d_u32_atomic(&r.join("spike_clusters.npy"), clusters).unwrap();
+        crate::npy::write_1d_u32_atomic(&r.join("spike_templates.npy"), templates).unwrap();
+        crate::npy::write_f32_atomic(
+            &r.join("templates.npy"),
+            &[n_templates, 1, 1],
+            &vec![0.0; n_templates],
+        )
+        .unwrap();
+        std::fs::write(r.join("recording.dat"), vec![0u8; 64]).unwrap();
+        std::fs::write(
+            r.join("params.py"),
+            "n_channels_dat = 1\nsample_rate = 1000.\n",
+        )
+        .unwrap();
+        if annotations {
+            std::fs::write(
+                r.join(ANNOTATIONS_TSV),
+                "cluster_id\tsorrel_origin\tsorrel_parents\tsorrel_note\n0\tAuto\t\t\n",
+            )
+            .unwrap();
+        }
+        let p = KilosortProvider::open(r, KilosortOpenParams::default()).unwrap();
+        let mut tags = p.initial_tags();
+        tags.resize_with(
+            clusters.iter().max().map_or(0, |m| *m as usize + 1),
+            Vec::new,
+        );
+        tags
+    }
+
+    fn external(tags: &[Vec<String>]) -> Vec<usize> {
+        (0..tags.len())
+            .filter(|&c| tags[c].iter().any(|t| t == TAG_EXTERNAL))
+            .collect()
+    }
+
+    #[test]
+    fn external_tag_fresh_layout_is_untouched() {
+        let tags = external_tags(&[0, 1, 2, 1], &[0, 1, 2, 1], 3, false);
+        assert!(external(&tags).is_empty());
+    }
+
+    #[test]
+    fn external_tag_marks_phy_merge() {
+        // Cluster 1 holds spikes of templates 1 and 2 (phy merge; 2 is empty).
+        let tags = external_tags(&[0, 1, 1, 1], &[0, 1, 2, 1], 3, false);
+        assert_eq!(external(&tags), vec![1]);
+    }
+
+    #[test]
+    fn external_tag_marks_id_beyond_templates() {
+        // Cluster 3 was created in phy (split): template 1 but only 3 templates.
+        let tags = external_tags(&[0, 1, 3, 3], &[0, 1, 1, 1], 3, false);
+        assert_eq!(external(&tags), vec![3]);
+    }
+
+    #[test]
+    fn external_tag_skipped_once_annotations_exist() {
+        let tags = external_tags(&[0, 1, 1, 1], &[0, 1, 2, 1], 3, true);
+        assert!(external(&tags).is_empty());
     }
 }

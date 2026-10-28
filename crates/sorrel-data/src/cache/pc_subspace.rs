@@ -3,7 +3,8 @@ use sorrel_cache::{CacheKey, Fingerprint};
 use sorrel_io::ClusterId;
 
 pub const KIND: &str = "pc_subspace";
-pub const ALGO_VERSION: u32 = 1;
+// v2: key carries the total spike count instead of the journal head.
+pub const ALGO_VERSION: u32 = 2;
 
 #[derive(Archive, Serialize, Deserialize, Debug, PartialEq)]
 pub struct CachedPcSubspace {
@@ -15,7 +16,10 @@ pub struct CachedPcSubspace {
 
 pub struct KeyParts<'a> {
     pub session_identity: &'a [u8],
-    pub journal_head: u64,
+    /// Total spikes in the session. The background rows are every other spike
+    /// sub-sampled by this count, so (cluster fingerprint, total) fixes them;
+    /// other clusters' labels never matter.
+    pub n_spikes_total: u64,
     pub cluster: ClusterId,
     pub cluster_spike_count: usize,
     pub cluster_spike_fingerprint: [u8; 32],
@@ -31,7 +35,7 @@ pub fn key(parts: KeyParts<'_>) -> CacheKey {
 fn key_with_algo_version(algo_version: u32, parts: KeyParts<'_>) -> CacheKey {
     let fingerprint = Fingerprint::builder()
         .add_provider_identity(parts.session_identity)
-        .add_journal_head(parts.journal_head)
+        .add_param_bytes("n_spikes_total", &parts.n_spikes_total.to_le_bytes())
         .add_algo_version(algo_version)
         .add_param_bytes("cluster_id", &parts.cluster.0.to_le_bytes())
         .add_param_bytes(
@@ -62,7 +66,7 @@ mod tests {
             algo_version,
             KeyParts {
                 session_identity: b"provider-identity",
-                journal_head: 17,
+                n_spikes_total: 17,
                 cluster: ClusterId(3),
                 cluster_spike_count: 2,
                 cluster_spike_fingerprint: [0x5a; 32],

@@ -7,6 +7,119 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Unit origin: every unit is `Auto[<sorter>]` or `Sorrel[Manual]`,
+  `Sorrel[Algo:<name>]` or `Sorrel[LLM:<name>]`, with direct parents and a
+  free-text note (`:note`). Auto units edited in sorrel are tagged `tuned` or
+  `split`; units phy already edited are tagged `external`. Saved in
+  `cluster_sorrel_annotations.tsv` and as a curation.json `origin` label.
+  `--sorter NAME` overrides the detected sorter name.
+- `sorrel rescue`: FDR-controlled matched-filter spike rescue for existing
+  units, with hybrid-injection recall checks.
+- In-place `AddSpikes`: rescued spikes are journaled as one undoable batch.
+- Home Manager module (`homeManagerModules.default`, `programs.sorrel`), and a
+  `sorrel.desktop` menu entry in the Nix packages.
+- `checks.workspace-tests`: every workspace test under nextest in the Nix
+  sandbox, the UI snapshot states on pinned lavapipe (`SORREL_REQUIRE_GPU`
+  fails instead of skipping). simit qualifies every x86_64-linux flake check
+  as an exact installable (`nix-builds.yaml`).
+  Save rewrites every per-spike array, with backups in `sorrel_original/`.
+
+### Changed
+
+- The curation journal is format v2 (`Split` records how the unit was made,
+  plus `AddSpikes`). v1 journals are upgraded on open; sorrel 0.2.x refuses
+  a v2 journal instead of truncating it. Remote protocol v2.
+- Suggestions are memoised per cluster. Re-ranking after an edit takes
+  137 ms instead of 807 ms on 1000 clusters and 2M spikes (about 5.7×).
+- Merge suggestions include drift-fragment pairs: nearby peak channels with
+  complementary firing over time.
+- Split suggestions ignore amplitude bimodality that bursting explains
+  (reason `burst_explained`).
+- Per-cluster cache keys no longer include the journal head, so caches
+  survive unrelated edits.
+
+### Fixed
+
+- The cluster table's "amp" column is mean spike amplitude × template
+  peak-to-peak, as in phy. It used to show the template peak alone, which
+  is the same for every cluster on unit-norm Kilosort templates.
+
+### Changed (UI)
+
+- **phy-parity views fit their panes.**
+  - CCG, ISI, Waveforms and Scatter keep their main control on one row and
+    put the rest in a ⚙ popover, so toolbars no longer wrap or overlap.
+  - **Cluster table:**
+    - The default columns (ID, ch, fr, n, qual, label) fit the panel, which
+      opens at 22% of the window.
+    - depth, sh, amp, isi, tags, origin and note are opt-in from the header
+      menu.
+    - Only the label cell is coloured, and descending sorts show ▼.
+  - **Similar:** drops the repeated filter block.
+  - **Features:**
+    - Selected clusters are drawn over dimmed background spikes.
+    - The grid adapts to the pane width, with square cells and readable
+      labels.
+    - Axes fit the spikes shown.
+  - **Waveforms:** overlays the selected clusters by default, with a colour
+    legend. "overlap" (`o`) switches to phy's side-by-side layout.
+  - **CCG:** cells keep a 120 px minimum and scroll; axes sit on the outer
+    edges; chips are readable.
+  - **ISI:** overlays every selected cluster in one plot, with a shaded
+    refractory band and per-cluster "<1 ms" chips.
+  - **Scatter:** fills its pane, rings the selection, and labels axes with
+    units.
+  - The third selection colour is purple instead of red, so a selected
+    cluster no longer looks like an error.
+- **Roomier layout.**
+  - Text is 14 px, captions are at least 11 px, and controls and table rows are 24 px.
+  - The top bar is 36 px and tab bars are 30 px, with 6 px gaps between panes.
+  - The cluster panel opens at 340 px.
+- **Save state is always visible.** A chip next to the title reads
+  "unsaved", "saved" or "save failed". Hovering it shows the save path,
+  whether the undo history was sealed, or the full error.
+  - A Save button joins Undo, Redo and Merge, and Merge names its target
+    ("Merge 2 -> c1").
+  - The save message no longer prints over the toolbar.
+- **Cluster table.**
+  - Numbers are right-aligned monospace.
+  - A selected row keeps its red and orange scores readable and shows its
+    selection colour in a bar at the left edge.
+  - IDs no longer shift when a row is selected.
+  - The tags column appears only when some cluster has tags.
+  - Clicking a row's text now selects the cluster. It used to start a text
+    selection, and the Similar table had the same problem.
+- **New default layout.**
+  - Three tab groups sit along the top: Shape, Compare and Assess.
+  - Below them, a Time group (Raster, Drift, Contam·time, PSTH) sits beside the trace.
+  - Saved per-dataset layouts are kept.
+- **Plot axes sit outside the data.**
+  - Tick labels live in their own margins and units are axis titles, so labels no longer
+    collide with data or clip at pane edges.
+  - Trace channel numbers have a gutter, and the trace has a time axis.
+  - The trace is drawn in neutral grey, so selection markers stand out.
+- **Clearer panes.**
+  - **CCG:** y-axis, ±50 ms ticks, a visible refractory band and a sparse-data note.
+  - **PSTH:** step bars and the per-event breakdown.
+  - **Raster:** selected clusters in their selection colour and the rest in neutral grey.
+  - **Stats:** marks where the selected cluster falls.
+  - **Quality:** every sub-score coloured and the weakest bold.
+  - **Drift:** "no measurable drift" instead of repeated ticks.
+  - **Contam·time:** says when there is too little data.
+  - **Waveforms:** use the cell height and show a scale bar.
+  - **Probe:** drawn to scale with channel labels.
+- **Dialogs.**
+  - **Quit:** the destructive "Quit without saving" is red, and "Save & quit" is the focused default.
+  - **Load error:** shows the full path.
+  - **Loading:** larger, readable loading screen.
+  - **Help:** scrolls instead of clipping.
+- **Contrast.**
+  - Secondary text, unchecked checkboxes, and plot grid and reference lines now meet
+    WCAG AA in both themes (pinned by a unit test).
+  - Light-theme window shadows are soft.
+
 ## [0.2.1] - 2026-10-28
 
 ### Fixed

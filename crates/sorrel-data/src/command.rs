@@ -12,6 +12,121 @@ pub enum PhyLabelOp {
     SetNoise = 3,
 }
 
+/// How a unit created inside sorrel was made. Closed: exactly three.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum Method {
+    Manual,
+    Algo(String),
+    Llm(String),
+}
+
+impl Method {
+    /// Method assumed for journal records written before `Split.by` existed.
+    // ponytail: legacy splits made by `sorrel serve` also decode as Manual;
+    // that path is days old, so no per-record migration.
+    pub fn legacy() -> Self {
+        Self::Manual
+    }
+}
+
+impl std::fmt::Display for Method {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Manual => f.write_str("Manual"),
+            Self::Algo(n) => write!(f, "Algo:{n}"),
+            Self::Llm(n) => write!(f, "LLM:{n}"),
+        }
+    }
+}
+
+impl std::str::FromStr for Method {
+    type Err = String;
+    /// `manual`, `algo:<name>`, `llm:<name>`; keywords are case-insensitive,
+    /// the name keeps its case.
+    fn from_str(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("manual") {
+            return Ok(Self::Manual);
+        }
+        let (kind, name) = s.split_once(':').ok_or_else(|| {
+            format!("unknown method {s:?}; want manual, algo:<name> or llm:<name>")
+        })?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(format!("method {s:?} needs a name after ':'"));
+        }
+        match kind.trim().to_ascii_lowercase().as_str() {
+            "algo" => Ok(Self::Algo(name.to_string())),
+            "llm" => Ok(Self::Llm(name.to_string())),
+            _ => Err(format!("unknown method kind {kind:?}; want algo or llm")),
+        }
+    }
+}
+
+/// Where a unit came from: straight out of the sorter, or created in sorrel.
+/// Exclusive; there is no "unknown" state.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum UnitOrigin {
+    #[default]
+    Auto,
+    Sorrel(Method),
+}
+
+impl UnitOrigin {
+    /// `Auto[<sorter>]` or `Sorrel[Manual|Algo:x|LLM:x]`.
+    pub fn label(&self, sorter: &str) -> String {
+        match self {
+            Self::Auto => format!("Auto[{sorter}]"),
+            Self::Sorrel(m) => format!("Sorrel[{m}]"),
+        }
+    }
+
+    /// The one parser for origin text (TSV, sorrel-py `by=`, MCP). Accepts
+    /// `Auto`, `Auto[<sorter>]`, `Sorrel[<method>]` and a bare `<method>`,
+    /// case-insensitive on keywords. The second value is the sorter name an
+    /// `Auto[x]` pins.
+    pub fn parse(s: &str) -> Result<(Self, Option<String>), String> {
+        let s = s.trim();
+        let lower = s.to_ascii_lowercase();
+        let inner = |prefix: &str| {
+            s[prefix.len()..]
+                .strip_prefix('[')
+                .and_then(|r| r.strip_suffix(']'))
+                .map(str::trim)
+        };
+        if lower == "auto" {
+            Ok((Self::Auto, None))
+        } else if lower.starts_with("auto[") {
+            let sorter = inner("auto").filter(|n| !n.is_empty());
+            let sorter = sorter.ok_or_else(|| format!("bad origin {s:?}"))?;
+            Ok((Self::Auto, Some(sorter.to_string())))
+        } else if lower.starts_with("sorrel[") {
+            let m = inner("sorrel").ok_or_else(|| format!("bad origin {s:?}"))?;
+            Ok((Self::Sorrel(m.parse()?), None))
+        } else {
+            Ok((Self::Sorrel(s.parse()?), None))
+        }
+    }
+}
+
+impl std::fmt::Display for UnitOrigin {
+    /// Without a sorter name: `Auto` or `Sorrel[..]`. Use [`UnitOrigin::label`]
+    /// to render `Auto[<sorter>]`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("Auto"),
+            Self::Sorrel(_) => f.write_str(&self.label("")),
+        }
+    }
+}
+
+impl std::str::FromStr for UnitOrigin {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        Self::parse(s).map(|(o, _)| o)
+    }
+}
+
 /// Strongly-typed curation operations. Concrete enum -> no `Box<dyn Trait>`,
 /// no per-op heap allocation, perfectly packed history.
 ///
@@ -33,6 +148,12 @@ pub enum CurationCommand {
         /// Spike indices (into the cluster's local spike list) that move out.
         spike_idx: Vec<u32>,
         new_cluster: ClusterId,
+        /// Who made the split; the new unit's origin is `Sorrel(by)`. Trailing
+        /// with a serde default: rmp-serde writes structs as positional arrays
+        /// and a missing trailing element takes the default, so v1 records
+        /// still decode.
+        #[serde(default = "Method::legacy")]
+        by: Method,
     },
     Note {
         cluster: ClusterId,
@@ -50,11 +171,34 @@ pub enum CurationCommand {
     Redo,
     /// Replace the cluster's tag set (provenance and review markers such as
     /// `src:unitrefine` or `review:merge`). Appended last so older journals
-    /// keep their variant indices.
+    /// keep decoding (rmp-serde encodes variant names, not indices).
     Tag {
         cluster: ClusterId,
         tags: Vec<String>,
     },
+    /// Insert detected spikes into existing clusters (rescue). Everything is
+    /// precomputed so replay never re-detects. Appended after `Tag`.
+    AddSpikes(SpikeBatch),
+}
+
+/// Payload of [`CurationCommand::AddSpikes`]: `n = times.len()` new spikes.
+/// `times` is non-decreasing; a new spike sorts after originals with an
+/// equal time. Per-spike vectors are parallel to `times`; the feature
+/// vectors are row-major and must be empty exactly when the session has not
+/// loaded that feature (otherwise the apply fails closed).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpikeBatch {
+    pub times: Vec<u64>,
+    pub clusters: Vec<ClusterId>,
+    pub templates: Vec<u32>,
+    pub amplitudes: Vec<f32>,
+    /// `n * (n_pcs * n_channels_per_template)` or empty.
+    pub pc_features: Vec<f32>,
+    /// `n * k` (template features) or empty.
+    pub template_features: Vec<f32>,
+    /// `(name, columns, n * columns values)`, one per loaded `spike_<name>`
+    /// attribute, in the session's order.
+    pub attributes: Vec<(String, u32, Vec<f32>)>,
 }
 
 impl CurationCommand {
@@ -66,6 +210,7 @@ impl CurationCommand {
             Self::Merge { target, .. } => Some(*target),
             Self::Split { cluster, .. } => Some(*cluster),
             Self::Note { cluster, .. } | Self::Tag { cluster, .. } => Some(*cluster),
+            Self::AddSpikes(b) => b.clusters.first().copied(),
             Self::Batch { children } => children.first().and_then(|c| c.primary_cluster()),
             Self::Undo | Self::Redo => None,
         }
@@ -116,7 +261,8 @@ mod tests {
             CurationCommand::Split {
                 cluster: ClusterId(4),
                 spike_idx: vec![],
-                new_cluster: ClusterId(5)
+                new_cluster: ClusterId(5),
+                by: Method::Manual
             }
             .primary_cluster(),
             Some(ClusterId(4))
@@ -163,6 +309,89 @@ mod tests {
                 assert_eq!(op, PhyLabelOp::SetMua);
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    /// A pre-`by` Split record (positional array of three) still decodes, with
+    /// `by` defaulting to Manual; a new one round-trips its method.
+    #[test]
+    fn legacy_split_record_decodes_with_default_method() {
+        #[derive(Serialize)]
+        enum Old {
+            Split {
+                cluster: ClusterId,
+                spike_idx: Vec<u32>,
+                new_cluster: ClusterId,
+            },
+        }
+        let bytes = rmp_serde::to_vec(&Old::Split {
+            cluster: ClusterId(1),
+            spike_idx: vec![2, 3],
+            new_cluster: ClusterId(9),
+        })
+        .unwrap();
+        match rmp_serde::from_slice::<CurationCommand>(&bytes).unwrap() {
+            CurationCommand::Split {
+                cluster,
+                spike_idx,
+                new_cluster,
+                by,
+            } => {
+                assert_eq!((cluster, new_cluster), (ClusterId(1), ClusterId(9)));
+                assert_eq!(spike_idx, vec![2, 3]);
+                assert_eq!(by, Method::Manual);
+            }
+            other => panic!("wrong variant {other:?}"),
+        }
+        let new = CurationCommand::Split {
+            cluster: ClusterId(1),
+            spike_idx: vec![],
+            new_cluster: ClusterId(2),
+            by: Method::Llm("x".into()),
+        };
+        let back: CurationCommand =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&new).unwrap()).unwrap();
+        assert!(matches!(back, CurationCommand::Split { by: Method::Llm(n), .. } if n == "x"));
+    }
+
+    #[test]
+    fn origin_text_parses_and_renders() {
+        let algo = Method::Algo("gmm".into());
+        assert_eq!(
+            UnitOrigin::Sorrel(algo.clone()).label("ks4"),
+            "Sorrel[Algo:gmm]"
+        );
+        assert_eq!(UnitOrigin::Auto.label("ks4"), "Auto[ks4]");
+        assert_eq!(
+            UnitOrigin::Sorrel(Method::Llm("x".into())).to_string(),
+            "Sorrel[LLM:x]"
+        );
+        assert_eq!("MANUAL".parse(), Ok(Method::Manual));
+        assert_eq!("Algo:python".parse(), Ok(Method::Algo("python".into())));
+        assert_eq!(
+            "llm:claude-code".parse(),
+            Ok(Method::Llm("claude-code".into()))
+        );
+        assert_eq!(
+            UnitOrigin::parse("Auto[kilosort4]"),
+            Ok((UnitOrigin::Auto, Some("kilosort4".into())))
+        );
+        assert_eq!("sorrel[algo:gmm]".parse(), Ok(UnitOrigin::Sorrel(algo)));
+        assert_eq!(
+            "Sorrel[Manual]".parse(),
+            Ok(UnitOrigin::Sorrel(Method::Manual))
+        );
+        assert_eq!("manual".parse(), Ok(UnitOrigin::Sorrel(Method::Manual)));
+        for bad in [
+            "",
+            "algo",
+            "algo:",
+            "bogus:x",
+            "Auto[]",
+            "Sorrel[Manual",
+            "Sorrel[]",
+        ] {
+            assert!(UnitOrigin::parse(bad).is_err(), "{bad:?}");
         }
     }
 

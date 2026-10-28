@@ -14,8 +14,10 @@
   programs.prettier = {
     enable = true;
     package = pkgs.prettier;
+    # simit-generated workflows; simit's --check owns their drift.
     excludes = [
       ".crow/**"
+      ".github/workflows/**"
     ];
     includes = [
       "*.md"

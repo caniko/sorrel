@@ -19,9 +19,10 @@ use crate::cluster_index::ClusterIndex;
 use crate::curation_json::write_curation_json;
 use crate::journal::{baseline_hash, Journal};
 use crate::session::Session;
-use anyhow::{Context, Result};
-use sorrel_io::npy::write_1d_u32_atomic;
+use anyhow::{ensure, Context, Result};
+use sorrel_io::npy::{read_1d_u32, read_header, write_1d_u32_atomic, write_rows_tmp, NpyRows};
 use sorrel_io::DataProvider;
+use std::borrow::Cow;
 use std::path::Path;
 
 /// Write `spike_clusters.npy`, `cluster_group.tsv` and `curation.json` into
@@ -37,6 +38,19 @@ use std::path::Path;
 /// then commits the journal so future opens treat the saved state as
 /// canonical.
 pub fn save_to_phy<P, F>(session: &Session<P>, root: &Path, label_str: F) -> Result<()>
+where
+    P: DataProvider,
+    F: Fn(&P::Label) -> &'static str,
+{
+    ensure!(
+        !has_added_spikes(session.cluster_index()),
+        "this session added spikes: save with reseal (save_and_reseal_journal); a plain save \
+         would leave them only in the journal and the next replay would add them twice"
+    );
+    write_curation(session, root, label_str)
+}
+
+fn write_curation<P, F>(session: &Session<P>, root: &Path, label_str: F) -> Result<()>
 where
     P: DataProvider,
     F: Fn(&P::Label) -> &'static str,
@@ -59,7 +73,64 @@ where
     let path = root.join("spike_clusters.npy");
     write_1d_u32_atomic(&path, &clusters_in_row_order(session.cluster_index()))
         .with_context(|| format!("write {}", path.display()))?;
+    stage_assignments(session, root, &label_str, &Sink::direct())
+}
 
+/// Where a save's small files go: written and renamed one by one
+/// ([`Sink::direct`]), or left as fsynced `<name>.tmp` for one manifest
+/// roll-forward ([`Sink::staging`]), which records their final names.
+struct Sink(Option<std::cell::RefCell<Vec<String>>>);
+
+impl Sink {
+    fn direct() -> Self {
+        Self(None)
+    }
+    fn staging() -> Self {
+        Self(Some(Default::default()))
+    }
+    /// Remember `name` as staged (before writing it, so a failed write's
+    /// partial tmp is cleaned up too).
+    fn note(&self, name: &str) {
+        if let Some(v) = &self.0 {
+            v.borrow_mut().push(name.to_owned());
+        }
+    }
+    fn names(&self) -> Vec<String> {
+        self.0
+            .as_ref()
+            .map(|v| v.borrow().clone())
+            .unwrap_or_default()
+    }
+    fn write(&self, path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
+        use std::io::Write;
+        if let Some(n) = path.file_name().and_then(|n| n.to_str()) {
+            self.note(n);
+        }
+        let tmp = with_tmp_suffix(path);
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("write {}", tmp.display()))?;
+        f.write_all(bytes.as_ref())
+            .and_then(|()| f.sync_all())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        if self.0.is_some() {
+            return Ok(());
+        }
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
+    }
+}
+
+/// Everything [`write_phy_assignments`] writes except `spike_clusters.npy`.
+fn stage_assignments<P, F>(
+    session: &Session<P>,
+    root: &Path,
+    label_str: &F,
+    sink: &Sink,
+) -> Result<()>
+where
+    P: DataProvider,
+    F: Fn(&P::Label) -> &'static str,
+{
     let tsv_path = root.join("cluster_group.tsv");
     let mut text = String::from("cluster_id\tgroup\n");
     for (i, lbl) in session.labels().iter().enumerate() {
@@ -68,7 +139,7 @@ where
             text.push_str(&format!("{i}\t{s}\n"));
         }
     }
-    write_atomic(&tsv_path, &text)?;
+    sink.write(&tsv_path, &text)?;
 
     // Tags: written whenever a cluster has any, or to clear a stale sidecar.
     let tags_path = root.join(sorrel_io::kilosort::TAGS_TSV);
@@ -82,16 +153,127 @@ where
         }
     }
     if any || tags_path.exists() {
-        write_atomic(&tags_path, &tags_text)?;
+        sink.write(&tags_path, &tags_text)?;
     }
-    Ok(())
+
+    write_annotations_tsv(session, root, sink)?;
+
+    // phy custom labels: one `cluster_<key>.tsv` per key, as phy writes them.
+    let keys = session.custom_label_keys();
+    for key in &keys {
+        let mut text = format!("cluster_id\t{key}\n");
+        for c in (0..session.n_clusters()).map(sorrel_io::ClusterId) {
+            if let Some(v) = session.custom_label(c, key) {
+                text.push_str(&format!("{c}\t{v}\n"));
+            }
+        }
+        sink.write(&root.join(format!("cluster_{key}.tsv")), &text)?;
+    }
+    // A key whose last value was cleared is no longer listed, but its old
+    // file would restore the value on reopen: blank it (header only) rather
+    // than delete a file that is the user's.
+    for key in sorrel_io::kilosort::phy_label_keys(root) {
+        if !keys.contains(&key) {
+            let text = format!("cluster_id\t{key}\n");
+            sink.write(&root.join(format!("cluster_{key}.tsv")), &text)?;
+        }
+    }
+    write_cluster_info(session, root, label_str, sink)
 }
 
-fn write_atomic(path: &Path, text: &str) -> Result<()> {
-    let tmp = with_tmp_suffix(path);
-    std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
+/// `cluster_sorrel_annotations.tsv`: origin, direct parents and note for every
+/// non-empty unit, so a resealed (emptied) journal loses nothing. An
+/// `Auto[<sorter>]` row also pins the sorter name for the next open.
+fn write_annotations_tsv<P: DataProvider>(
+    session: &Session<P>,
+    root: &Path,
+    sink: &Sink,
+) -> Result<()> {
+    let mut text = String::from("cluster_id\tsorrel_origin\tsorrel_parents\tsorrel_note\n");
+    for c in (0..session.n_clusters()).map(sorrel_io::ClusterId) {
+        if session.spike_times(c).is_empty() {
+            continue;
+        }
+        let parents: Vec<String> = session.parents(c).iter().map(|p| p.to_string()).collect();
+        // Origins carry untrusted names (MCP clientInfo, sorrel-py `by=`),
+        // so they are escaped like notes.
+        text.push_str(&format!(
+            "{c}\t{}\t{}\t{}\n",
+            sorrel_io::kilosort::escape_note(&session.origin_label(c)),
+            parents.join(","),
+            sorrel_io::kilosort::escape_note(session.note(c))
+        ));
+    }
+    sink.write(&root.join(sorrel_io::kilosort::ANNOTATIONS_TSV), &text)
+}
+
+/// phy's `cluster_info.tsv`: one row per non-empty cluster with the columns
+/// phy's cluster view shows (`cluster_id`, `ch`, `fr`, `amp`, `n_spikes`,
+/// `group`, custom labels), rewritten on every save. `depth` needs probe
+/// geometry, which the session does not hold, so it is left out.
+fn write_cluster_info<P, F>(
+    session: &Session<P>,
+    root: &Path,
+    label_str: &F,
+    sink: &Sink,
+) -> Result<()>
+where
+    P: DataProvider,
+    F: Fn(&P::Label) -> &'static str,
+{
+    let keys = session.custom_label_keys();
+    let duration =
+        session.provider.n_samples().0 as f64 / session.provider.sample_rate().max(1.0) as f64;
+    let mut text = String::from("cluster_id\tch\tfr\tamp\tn_spikes\tgroup");
+    for k in &keys {
+        text.push('\t');
+        text.push_str(k);
+    }
+    text.push('\n');
+    for c in (0..session.n_clusters()).map(sorrel_io::ClusterId) {
+        let n = session.spike_times(c).len();
+        if n == 0 {
+            continue;
+        }
+        // Peak channel of the primary template.
+        let ch = session
+            .primary_template(c)
+            .and_then(|t| session.template_waveform(t))
+            .map(|w| {
+                let (_, ns, nc) = session.template_shape();
+                let ptp = |ch: usize| {
+                    let col = (0..ns).filter_map(|s| w.get(s * nc + ch));
+                    let (lo, hi) =
+                        col.fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+                    hi - lo
+                };
+                let peak = (0..nc)
+                    .max_by(|&a, &b| ptp(a).total_cmp(&ptp(b)))
+                    .unwrap_or(0);
+                peak.to_string()
+            })
+            .unwrap_or_default();
+        let amps = session.spike_amplitudes(c);
+        let amp = if amps.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{:.3}",
+                amps.iter().map(|&a| a as f64).sum::<f64>() / amps.len() as f64
+            )
+        };
+        let group = session.label(c).map_or("", |l| label_str(&l));
+        text.push_str(&format!(
+            "{c}\t{ch}\t{:.3}\t{amp}\t{n}\t{group}",
+            n as f64 / duration.max(f64::MIN_POSITIVE)
+        ));
+        for k in &keys {
+            text.push('\t');
+            text.push_str(session.custom_label(c, k).unwrap_or(""));
+        }
+        text.push('\n');
+    }
+    sink.write(&root.join("cluster_info.tsv"), &text)
 }
 
 /// The per-spike cluster ids in the backend's original row order (the order
@@ -107,7 +289,8 @@ fn clusters_in_row_order(index: &ClusterIndex) -> Vec<u32> {
     let clusters = index.spike_clusters();
     let rows = index.spike_pc_indices();
     let time_order = || clusters.iter().map(|c| c.0).collect::<Vec<u32>>();
-    if rows.len() != clusters.len() {
+    // After an AddSpikes rewrite every file is in global (time) order.
+    if rows.len() != clusters.len() || has_added_spikes(index) {
         return time_order();
     }
     // Cluster ids never reach u32::MAX (split placeholders are resolved
@@ -137,31 +320,359 @@ where
     P: DataProvider,
     F: Fn(&P::Label) -> &'static str,
 {
-    save_to_phy(session, root, &label_str)?;
-
-    // Hash the bytes we just wrote (post-rename, post-fsync).
-    let bytes = std::fs::read(root.join("spike_clusters.npy"))
-        .context("hash freshly-written spike_clusters.npy")?;
-    let new_baseline = baseline_hash(&bytes);
+    let added = has_added_spikes(session.cluster_index());
     let n_clusters = session.n_clusters();
-    let journal = Journal::truncate(journal_path, new_baseline, n_clusters)?;
-    // The artifacts now carry every merge and split, so the interchange
-    // document must not repeat them: rewrite it as labels only. The session
-    // still holds the old history until the caller swaps in `journal`.
-    let labels_only = crate::curation_json::curation_document_sealed(session, label_str);
-    let json_path = root.join("curation.json");
-    let tmp = json_path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&labels_only)?)
-        .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &json_path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), json_path.display()))?;
-    Ok(journal)
+    // The journal can join the atomic publish only when it lives in `root`
+    // (the default). ponytail: an external journal is resealed after the
+    // artifacts, so a crash in between leaves it stale (`open_phy` then asks
+    // for `--discard-journal`); fixing that needs a journal-side two-phase seal.
+    let journal_name = journal_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|_| same_dir(journal_path.parent(), root))
+        .map(str::to_owned);
+
+    // Stage every output as an fsynced `<name>.tmp`; nothing is visible yet.
+    let sink = Sink::staging();
+    let mut backup = Vec::new();
+    let staged = (|| -> Result<u64> {
+        if added {
+            // Also stages spike_clusters.npy (global order = the index order).
+            backup = write_spike_array_tmps(session, root, root)?;
+            backup.iter().for_each(|n| sink.note(n));
+        } else {
+            let path = root.join("spike_clusters.npy");
+            sink.note("spike_clusters.npy");
+            let rows = clusters_in_row_order(session.cluster_index());
+            write_rows_tmp(&path, "<u4", &[], rows.iter().map(|c| c.to_le_bytes()))
+                .with_context(|| format!("write {}", path.display()))?;
+        }
+        stage_assignments(session, root, &label_str, &sink)?;
+        // The artifacts carry every merge and split, so the interchange
+        // document must not repeat them: labels only. The session still holds
+        // the old history until the caller swaps in the new journal.
+        let doc = crate::curation_json::curation_document_sealed(session, &label_str);
+        sink.write(
+            &root.join("curation.json"),
+            serde_json::to_vec_pretty(&doc)?,
+        )?;
+        // Seal against the bytes that will be renamed into place.
+        let tmp = with_tmp_suffix(&root.join("spike_clusters.npy"));
+        let bytes = std::fs::read(&tmp).with_context(|| format!("hash {}", tmp.display()))?;
+        let baseline = baseline_hash(&bytes);
+        if let Some(name) = &journal_name {
+            sink.note(name);
+            Journal::truncate(&with_tmp_suffix(&root.join(name)), baseline, n_clusters)?;
+        }
+        Ok(baseline)
+    })();
+    let baseline = match staged {
+        Ok(b) => b,
+        Err(e) => {
+            discard_staged(root, &sink.names());
+            return Err(e);
+        }
+    };
+    // One roll-forward publishes everything (journal last); an interruption
+    // anywhere is completed by the next open.
+    publish_staged(root, &backup, &sink.names())?;
+    match journal_name {
+        Some(_) => Journal::open_or_create(journal_path, baseline, n_clusters),
+        None => Journal::truncate(journal_path, baseline, n_clusters),
+    }
+}
+
+fn same_dir(a: Option<&Path>, b: &Path) -> bool {
+    let a = a
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
+}
+
+fn discard_staged(root: &Path, names: &[String]) {
+    for n in names {
+        let _ = std::fs::remove_file(with_tmp_suffix(&root.join(n)));
+    }
 }
 
 fn with_tmp_suffix(path: &Path) -> std::path::PathBuf {
     let mut p = path.as_os_str().to_owned();
     p.push(".tmp");
     p.into()
+}
+
+/// Original files of a rewrite are hard-linked (or copied) here, once.
+const BACKUP_DIR: &str = "sorrel_original";
+/// Attribute marking spikes inserted by `AddSpikes` (u32 0/1).
+const RESCUED: &str = "sorrel_rescued";
+
+/// True when the session holds spikes no file has yet: feature rows past the
+/// provider's (see `ClusterIndex::add_spikes`).
+pub(crate) fn has_added_spikes(index: &ClusterIndex) -> bool {
+    let n = index.n_orig_rows();
+    index
+        .spike_pc_indices()
+        .iter()
+        .any(|r| r.get().is_some_and(|r| r as usize >= n))
+}
+
+/// Publish staged `<name>.tmp` files crash-safely: originals of `backup` go to
+/// `sorrel_original/` first (never overwritten) and phy's `.phy/` cache, now
+/// stale, to `.phy.sorrel-stale` (both only when `backup` is non-empty); a
+/// manifest naming the tmps is fsynced and renamed into place; the renames
+/// are then rolled out by [`sorrel_io::kilosort::roll_forward_pending`], the
+/// same routine `KilosortProvider::open` runs after an interruption. A crash
+/// before the manifest leaves the old state; after it, the next open finishes
+/// the whole save.
+///
+/// After an `AddSpikes` rewrite the session's own index keeps the old row
+/// numbering: reopen the directory afterwards (a second rewrite from the same
+/// session is refused).
+fn publish_staged(root: &Path, backup: &[String], names: &[String]) -> Result<()> {
+    use sorrel_io::kilosort::{roll_forward_pending, REWRITE_PENDING};
+    use std::io::Write;
+    let prepare = || -> Result<()> {
+        if !backup.is_empty() {
+            let bak = root.join(BACKUP_DIR);
+            std::fs::create_dir_all(&bak).with_context(|| format!("create {}", bak.display()))?;
+            for n in backup {
+                let (from, to) = (root.join(n), bak.join(n));
+                if from.exists() && !to.exists() && std::fs::hard_link(&from, &to).is_err() {
+                    std::fs::copy(&from, &to).with_context(|| format!("back up {n}"))?;
+                }
+            }
+            let phy = root.join(".phy");
+            if phy.exists() {
+                let stale = root.join(".phy.sorrel-stale");
+                let _ = std::fs::remove_dir_all(&stale);
+                std::fs::rename(&phy, &stale).context("move aside stale .phy cache")?;
+            }
+        }
+        // The tmps' directory entries are durable before the manifest names them.
+        sync_dir(root);
+        // Manifest via tmp + rename so a torn one is never seen.
+        let manifest = root.join(REWRITE_PENDING);
+        let tmp = with_tmp_suffix(&manifest);
+        let text: String = names.iter().map(|n| format!("{n}.tmp\t{n}\n")).collect();
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &manifest).context("publish rewrite manifest")?;
+        sync_dir(root);
+        Ok(())
+    };
+    if let Err(e) = prepare() {
+        discard_staged(root, names);
+        return Err(e);
+    }
+    roll_forward_pending(root)?;
+    sync_dir(root);
+    Ok(())
+}
+
+/// ponytail: best effort (a directory cannot be opened on Windows).
+fn sync_dir(root: &Path) {
+    let _ = std::fs::File::open(root).and_then(|d| d.sync_all());
+}
+
+/// Write every per-spike array of `session` as `<dst>/<name>.tmp` (fsynced,
+/// not renamed), reading the originals from `src`, and return the names.
+/// Rows follow the global order; original rows are copied byte for byte
+/// through the row map, rows of added spikes are encoded in the file's dtype.
+/// Refuses, writing nothing, when `src` holds a per-spike `.npy` this does not
+/// know (it would fall out of alignment) or no longer matches the session.
+pub(crate) fn write_spike_array_tmps<P: DataProvider>(
+    session: &Session<P>,
+    src: &Path,
+    dst: &Path,
+) -> Result<Vec<String>> {
+    let ci = session.cluster_index();
+    let (n, n_orig) = (ci.n_spikes(), ci.n_orig_rows());
+    let rows: Vec<u32> = ci
+        .spike_pc_indices()
+        .iter()
+        .map_while(|r| r.get())
+        .collect();
+    ensure!(
+        rows.len() == n,
+        "the PC row map is incomplete; cannot rewrite the per-spike arrays"
+    );
+    let times_hdr = read_header(&src.join("spike_times.npy"))?;
+    ensure!(
+        times_hdr.shape.first() == Some(&n_orig),
+        "spike_times.npy no longer has the {n_orig} rows this session opened with (already \
+         rewritten?); reopen the directory"
+    );
+
+    let (pc_w, tf) = (
+        ci.pc_shape().0 * ci.pc_shape().1,
+        ci.has_template_features(),
+    );
+    let attrs: Vec<String> = ci
+        .spike_attribute_names()
+        .into_iter()
+        .map(|(a, _)| a.to_owned())
+        .collect();
+    let mut known = vec![
+        "spike_times.npy".to_owned(),
+        "spike_clusters.npy".to_owned(),
+    ];
+    let flags = [
+        (
+            !ci.spike_templates_global().is_empty(),
+            "spike_templates.npy",
+        ),
+        (!ci.spike_amplitudes_global().is_empty(), "amplitudes.npy"),
+        (pc_w > 0, "pc_features.npy"),
+        (tf, "template_features.npy"),
+        (ci.has_spike_reorder(), "spike_reorder.npy"),
+    ];
+    known.extend(flags.iter().filter(|f| f.0).map(|f| f.1.to_owned()));
+    known.extend(attrs.iter().map(|a| format!("spike_{a}.npy")));
+    if !attrs.iter().any(|a| a == RESCUED) {
+        known.push(format!("spike_{RESCUED}.npy"));
+    }
+    let mut unknown: Vec<String> = std::fs::read_dir(src)
+        .with_context(|| format!("read {}", src.display()))?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let hdr = name
+                .ends_with(".npy")
+                .then(|| read_header(&e.path()).ok())??;
+            (hdr.shape.first() == Some(&n_orig) && !known.contains(&name)).then_some(name)
+        })
+        .collect();
+    unknown.sort();
+    ensure!(
+        unknown.is_empty(),
+        "refusing to save: {unknown:?} hold one row per spike but sorrel does not know how to \
+         insert the added spikes into them (or never loaded them); nothing was written"
+    );
+
+    let mut done: Vec<String> = Vec::new();
+    let result = (|| -> Result<()> {
+        let mut put = |name: &str| {
+            done.push(name.to_owned());
+            dst.join(name)
+        };
+        let u4 = "<u4";
+        write_rows_tmp(
+            &put("spike_times.npy"),
+            "<u8",
+            &[],
+            ci.all_spike_times().iter().map(|t| t.0.to_le_bytes()),
+        )?;
+        write_rows_tmp(
+            &put("spike_clusters.npy"),
+            u4,
+            &[],
+            ci.spike_clusters().iter().map(|c| c.0.to_le_bytes()),
+        )?;
+        if flags[0].0 {
+            let t = ci.spike_templates_global();
+            write_rows_tmp(&put(flags[0].1), u4, &[], t.iter().map(|v| v.to_le_bytes()))?;
+        }
+        if flags[1].0 {
+            let a = ci.spike_amplitudes_global();
+            write_rows_tmp(
+                &put(flags[1].1),
+                "<f4",
+                &[],
+                a.iter().map(|v| v.to_le_bytes()),
+            )?;
+        }
+        if pc_w > 0 {
+            put("pc_features.npy");
+            rewrite_rows(src, dst, "pc_features.npy", &rows, n_orig, |g| {
+                ci.pc_feature_for(g as u32)
+            })?;
+        }
+        if tf {
+            put("template_features.npy");
+            rewrite_rows(src, dst, "template_features.npy", &rows, n_orig, |g| {
+                ci.template_feature_row(g as u32)
+            })?;
+        }
+        const ONE: [f32; 1] = [1.0];
+        for a in &attrs {
+            let name = format!("spike_{a}.npy");
+            put(&name);
+            rewrite_rows(src, dst, &name, &rows, n_orig, |g| {
+                if a == RESCUED {
+                    Some(&ONE[..])
+                } else {
+                    ci.spike_attribute(a, g as u32)
+                }
+            })?;
+        }
+        if !attrs.iter().any(|a| a == RESCUED) {
+            let marks = rows
+                .iter()
+                .map(|&r| u32::from(r as usize >= n_orig).to_le_bytes());
+            write_rows_tmp(&put(&format!("spike_{RESCUED}.npy")), u4, &[], marks)?;
+        }
+        if ci.has_spike_reorder() {
+            // Old value = old row whose time is shown; point at that spike's new index.
+            let old = read_1d_u32(&src.join("spike_reorder.npy"))?;
+            let mut new_of_row = vec![u32::MAX; n_orig];
+            for (g, &r) in rows.iter().enumerate() {
+                if let Some(slot) = new_of_row.get_mut(r as usize) {
+                    *slot = g as u32;
+                }
+            }
+            let reorder = rows.iter().enumerate().map(|(g, &r)| {
+                let to = old
+                    .get(r as usize)
+                    .and_then(|&j| new_of_row.get(j as usize));
+                to.copied()
+                    .filter(|&v| v != u32::MAX)
+                    .unwrap_or(g as u32)
+                    .to_le_bytes()
+            });
+            write_rows_tmp(&put("spike_reorder.npy"), u4, &[], reorder)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        done.iter()
+            .for_each(|n| drop(std::fs::remove_file(with_tmp_suffix(&dst.join(n)))));
+        return Err(e);
+    }
+    Ok(done)
+}
+
+/// One row-addressed array: original rows are copied byte for byte from
+/// `<src>/<name>`, rows of added spikes come from `added(g)`, encoded in the
+/// file's dtype. Writes `<dst>/<name>.tmp`.
+fn rewrite_rows<'a>(
+    src: &Path,
+    dst: &Path,
+    name: &str,
+    rows: &[u32],
+    n_orig: usize,
+    added: impl Fn(usize) -> Option<&'a [f32]>,
+) -> Result<()> {
+    let f = NpyRows::open(&src.join(name))?;
+    ensure!(
+        f.n_rows == n_orig,
+        "{name}: {} rows, expected {n_orig}",
+        f.n_rows
+    );
+    // ponytail: rows are gathered first (a Cow per spike, ~32 B) because
+    // encoding can fail; stream them if 100M-spike sessions need it.
+    let out = rows
+        .iter()
+        .enumerate()
+        .map(|(g, &r)| match (r as usize) < n_orig {
+            true => Ok(Cow::Borrowed(f.row(r as usize))),
+            false => added(g)
+                .with_context(|| format!("{name}: no values for added spike {g}"))
+                .and_then(|v| f.encode(v))
+                .map(Cow::Owned),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    write_rows_tmp(&dst.join(name), &f.descr, &f.tail, out.into_iter()).map(drop)
 }
 
 #[cfg(test)]
@@ -271,6 +782,7 @@ mod tests {
             cluster: ClusterId(0),
             spike_idx: vec![1],
             new_cluster: ClusterId(u32::MAX),
+            by: crate::command::Method::Manual,
         })
         .unwrap();
 
@@ -282,10 +794,11 @@ mod tests {
         assert_eq!(doc["format_version"], "2");
         assert_eq!(doc["unit_ids"], serde_json::json!([0, 1, 2]));
         assert_eq!(doc["label_definitions"]["quality"]["exclusive"], true);
-        assert_eq!(
-            doc["manual_labels"],
-            serde_json::json!([{ "unit_id": 0, "labels": { "quality": ["good"] } }])
-        );
+        // Every unit carries its exclusive origin label.
+        assert_eq!(doc["label_definitions"]["origin"]["exclusive"], true);
+        let first = &doc["manual_labels"][0]["labels"];
+        assert_eq!(first["quality"], serde_json::json!(["good"]));
+        assert_eq!(first["origin"], serde_json::json!(["Auto[unknown]"]));
         assert_eq!(doc["merges"][0]["unit_ids"], serde_json::json!([1, 2]));
         assert_eq!(doc["merges"][0]["new_unit_id"], 2);
         assert_eq!(doc["splits"][0]["unit_id"], 0);
@@ -329,12 +842,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            doc["manual_labels"],
-            serde_json::json!([{ "unit_id": 1, "labels": { "tags": ["src:unitrefine", "review:low-conf"] } }])
+            doc["manual_labels"][1],
+            serde_json::json!({ "unit_id": 1, "labels": {
+                "origin": ["Auto[unknown]"],
+                "tags": ["src:unitrefine", "review:low-conf"]
+            } })
         );
         assert_eq!(doc["label_definitions"]["tags"]["exclusive"], false);
         let imported = sorrel_io::read_curation(&dir.path().join("curation.json")).unwrap();
-        assert_eq!(imported.labels[0].2, ["src:unitrefine", "review:low-conf"]);
+        assert_eq!(imported.labels[1].2, ["src:unitrefine", "review:low-conf"]);
 
         // Clearing every tag rewrites the sidecar rather than leaving it stale.
         s.dispatch(CurationCommand::Tag {
@@ -346,6 +862,38 @@ mod tests {
         assert!(sorrel_io::kilosort::read_tags_tsv(&tsv)
             .iter()
             .all(Vec::is_empty));
+    }
+
+    #[test]
+    fn custom_labels_write_phy_tsvs_and_undo() {
+        let (mut s, dir) = fresh_session();
+        let cmd = s
+            .set_label_command(ClusterId(1), "quality", "great")
+            .unwrap();
+        s.dispatch(cmd).unwrap();
+        let cmd = s.set_label_command(ClusterId(1), "quality", "ok").unwrap();
+        s.dispatch(cmd).unwrap();
+        assert_eq!(
+            s.custom_label(ClusterId(1), "quality"),
+            Some("ok"),
+            "one value per key"
+        );
+        assert!(s.set_label_command(ClusterId(1), "group", "x").is_err());
+        assert!(s.set_label_command(ClusterId(1), "q", "a,b").is_err());
+        save_to_phy(&s, dir.path(), label_str).unwrap();
+
+        let tsv = std::fs::read_to_string(dir.path().join("cluster_quality.tsv")).unwrap();
+        assert_eq!(tsv, "cluster_id\tquality\n1\tok\n");
+        let info = std::fs::read_to_string(dir.path().join("cluster_info.tsv")).unwrap();
+        let mut lines = info.lines();
+        assert_eq!(
+            lines.next(),
+            Some("cluster_id\tch\tfr\tamp\tn_spikes\tgroup\tquality")
+        );
+        assert!(lines.any(|l| l.starts_with("1\t") && l.ends_with("\tok")));
+
+        s.dispatch(CurationCommand::Undo).unwrap();
+        assert_eq!(s.custom_label(ClusterId(1), "quality"), Some("great"));
     }
 
     #[test]
@@ -371,7 +919,8 @@ mod tests {
                 if *target == ClusterId(1) && sources == &[ClusterId(2)]
         ));
         s.dispatch(CurationCommand::batch(cmds).unwrap()).unwrap();
-        assert_eq!(s.tags(ClusterId(1)), ["merged:consensus"]);
+        // The Auto merge target also gains the session's `tuned` marker.
+        assert_eq!(s.tags(ClusterId(1)), ["merged:consensus", "tuned"]);
         assert!(s.spike_times(ClusterId(2)).is_empty());
         // Re-importing the same document is a no-op, merge included.
         let current = |c: ClusterId| label_str(&s.label(c).unwrap_or_default());
@@ -398,6 +947,32 @@ mod tests {
             merges: vec![vec![0, 1], vec![1, 2]],
         };
         assert!(import_commands(&s, &twice, current).is_err());
+    }
+
+    #[test]
+    fn import_never_grants_session_markers() {
+        use crate::curation_json::import_commands;
+        use sorrel_io::CurationImport;
+        let (mut s, _d) = fresh_session();
+        let doc = CurationImport {
+            labels: vec![
+                (
+                    0,
+                    None,
+                    vec!["agree".into(), "tuned".into(), "external".into()],
+                ),
+                (1, None, vec!["tuned".into()]),
+            ],
+            merges: vec![],
+        };
+        let current = |c: ClusterId| label_str(&s.label(c).unwrap_or_default());
+        let cmds = import_commands(&s, &doc, current).unwrap();
+        s.dispatch(CurationCommand::batch(cmds).unwrap()).unwrap();
+        assert_eq!(s.tags(ClusterId(0)), ["agree"]);
+        assert!(s.tags(ClusterId(1)).is_empty());
+        // Re-importing the same document is a no-op.
+        let current = |c: ClusterId| label_str(&s.label(c).unwrap_or_default());
+        assert!(import_commands(&s, &doc, current).unwrap().is_empty());
     }
 
     #[test]
@@ -468,6 +1043,7 @@ mod tests {
             cluster: ClusterId(0),
             spike_idx: vec![1],
             new_cluster: ClusterId(0), // ignored: auto-allocated
+            by: crate::command::Method::Manual,
         })
         .unwrap();
 

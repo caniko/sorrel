@@ -2,8 +2,8 @@ use crate::cache::amplitudes::{
     CachedAmplitudes, ALGO_VERSION as AMPLITUDES_ALGO_VERSION, KIND as AMPLITUDES_KIND,
 };
 use crate::cache::{isolation, pc_subspace};
-use crate::cluster_index::{ClusterIndex, MergeRecord, SplitRecord};
-use crate::command::{CurationCommand, PhyLabelOp};
+use crate::cluster_index::{AddRecord, ClusterIndex, MergeRecord, SplitRecord};
+use crate::command::{CurationCommand, Method, PhyLabelOp, UnitOrigin};
 use crate::feature_subspace::{DEFAULT_CHANNEL_IDX, DEFAULT_D, DEFAULT_MAX_BACKGROUND};
 use crate::journal::Journal;
 use crate::quality_ext::DEFAULT_K_NN;
@@ -17,6 +17,21 @@ use std::collections::VecDeque;
 use std::path::Path;
 
 const MAX_CACHE_INVALIDATIONS: usize = 1024;
+
+/// Tags the session sets on an Auto unit that absorbed a merge / lost spikes
+/// to a split. A split child does not inherit them.
+pub(crate) const TAG_TUNED: &str = "tuned";
+pub(crate) const TAG_SPLIT: &str = "split";
+
+static AUTO: UnitOrigin = UnitOrigin::Auto;
+
+/// Set `v[i]` (grown on demand with defaults), returning the previous value.
+fn set_slot<T: Default>(v: &mut Vec<T>, c: ClusterId, val: T) -> T {
+    if v.len() <= c.idx() {
+        v.resize_with(c.idx() + 1, T::default);
+    }
+    std::mem::replace(&mut v[c.idx()], val)
+}
 
 /// Internal inverse-operation record. Lives only in memory, never journaled —
 /// the journal stores only the user-visible `CurationCommand`. The inverse
@@ -34,11 +49,21 @@ enum InverseOp<L: Copy> {
         labels: Vec<(ClusterId, L)>,
         /// Target and its tag set before the sources' tags were unioned in.
         target_tags: (ClusterId, Vec<String>),
+        /// The target's parents before the sources were appended.
+        target_parents: Vec<ClusterId>,
+        /// The target's note before the sources' notes were appended.
+        target_note: String,
         /// Reversible record of the spike-table rewrite.
         record: MergeRecord,
     },
     Split {
         record: SplitRecord,
+        /// The split parent's tags before it gained `split`.
+        parent_tags: Vec<String>,
+    },
+    Note {
+        cluster: ClusterId,
+        prev: String,
     },
     /// Inverse of a [`CurationCommand::Batch`] — stores per-child inverses
     /// in the order they were *applied*, so undo runs them in reverse and
@@ -50,6 +75,11 @@ enum InverseOp<L: Copy> {
     Tag {
         cluster: ClusterId,
         prev: Vec<String>,
+    },
+    AddSpikes {
+        record: AddRecord,
+        /// Tags of the Auto clusters that gained `tuned`, before the add.
+        prev_tags: Vec<(ClusterId, Vec<String>)>,
     },
 }
 
@@ -70,6 +100,8 @@ struct CacheClusterIdentity {
 struct CacheInvalidation {
     prev_head: u64,
     new_head: u64,
+    /// Total spike count before the edit (part of the pc-subspace key).
+    n_spikes: u64,
     clusters: Vec<CacheClusterIdentity>,
 }
 
@@ -91,6 +123,13 @@ pub struct Session<P: DataProvider> {
     /// Provenance/review tags per cluster, indexed by `ClusterId`; grown on
     /// demand, so a missing slot means no tags.
     tags: Vec<Vec<String>>,
+    /// Origin, direct parents and note per cluster, indexed like `tags`; a
+    /// missing slot means `Auto`, no parents, no note.
+    origins: Vec<UnitOrigin>,
+    parents: Vec<Vec<ClusterId>>,
+    notes: Vec<String>,
+    /// Sorter name rendered in `Auto[<sorter>]`; `"unknown"` until set.
+    sorter: String,
     cluster_index: ClusterIndex,
     journal: Journal,
     history: Vec<HistoryEntry<P::Label>>,
@@ -106,11 +145,27 @@ impl<P: DataProvider> Session<P> {
     pub fn new(provider: P, journal: Journal) -> Self {
         let labels = provider.initial_labels();
         let tags = provider.initial_tags();
+        let mut origins = Vec::new();
+        let mut parents = Vec::new();
+        let mut notes = Vec::new();
+        for (i, a) in provider.initial_annotations().into_iter().enumerate() {
+            let c = ClusterId(i as u32);
+            // An unparseable origin degrades to Auto rather than refusing to open.
+            let (origin, _) = UnitOrigin::parse(&a.origin).unwrap_or((UnitOrigin::Auto, None));
+            set_slot(&mut origins, c, origin);
+            set_slot(&mut parents, c, a.parents);
+            set_slot(&mut notes, c, a.note);
+        }
+        let sorter = provider.sorter().unwrap_or_else(|| "unknown".into());
         let cluster_index = ClusterIndex::from_provider(&provider);
         Self {
             provider,
             labels,
             tags,
+            origins,
+            parents,
+            notes,
+            sorter,
             cluster_index,
             journal,
             history: Vec::new(),
@@ -209,10 +264,6 @@ impl<P: DataProvider> Session<P> {
         self.journal.path().parent()
     }
 
-    pub(crate) fn journal_head(&self) -> u64 {
-        self.journal.head()
-    }
-
     /// Monotonic version of the replay-visible curation state: changes on
     /// every journaled command (including undo/redo) and on reseal. Use it
     /// as the cache key for anything derived from curation state; the
@@ -266,7 +317,7 @@ impl<P: DataProvider> Session<P> {
                 }
                 let subspace_key = pc_subspace::key(pc_subspace::KeyParts {
                     session_identity: &provider_identity,
-                    journal_head: entry.prev_head,
+                    n_spikes_total: entry.n_spikes,
                     cluster: cluster.cluster,
                     cluster_spike_count: cluster.spike_count,
                     cluster_spike_fingerprint: cluster.cluster_spike_fingerprint,
@@ -360,6 +411,101 @@ impl<P: DataProvider> Session<P> {
         self.cluster_index.pc_shape()
     }
 
+    /// PC `pc` of the spike at `global_idx` on real channel `channel`;
+    /// `None` when the spike's template has no feature on that channel.
+    pub fn pc_feature(&self, global_idx: u32, channel: u32, pc: usize) -> Option<f32> {
+        self.cluster_index.pc_feature(global_idx, channel, pc)
+    }
+
+    /// FeatureView channels for `selection` (phy `FeatureView._get_channel_ids`):
+    /// the first cluster's PC channels ranked by template amplitude, with the
+    /// channels every other selected cluster also has moved to the front.
+    pub fn best_channels(&self, selection: &[ClusterId]) -> Vec<u32> {
+        let Some((&first, rest)) = selection.split_first() else {
+            return Vec::new();
+        };
+        let ranked = |c: ClusterId| -> Vec<u32> {
+            let Some(t) = self.primary_template(c) else {
+                return Vec::new();
+            };
+            let mut chans = self.cluster_index.pc_channels(t).to_vec();
+            if let Some(w) = self.template_waveform(t) {
+                let (_, n_samples, n_chans) = self.template_shape();
+                let ptp = |ch: u32| {
+                    let col = (0..n_samples).filter_map(|s| w.get(s * n_chans + ch as usize));
+                    let (lo, hi) =
+                        col.fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+                    (hi - lo).max(0.0)
+                };
+                chans.sort_by(|&a, &b| ptp(b).total_cmp(&ptp(a)));
+            }
+            chans
+        };
+        let mut best = ranked(first);
+        let others: Vec<Vec<u32>> = rest.iter().map(|&c| ranked(c)).collect();
+        // Stable sort: shared channels first, amplitude order kept within each part.
+        best.sort_by_key(|ch| !others.iter().all(|o| o.contains(ch)));
+        best
+    }
+
+    /// phy's cluster similarity (SimilarityView and the `space` wizard):
+    /// for every non-empty cluster other than `reference` and `exclude`, the
+    /// max of `similar_templates` over all template pairs of the two
+    /// clusters, highest first (ties by id). A merged cluster owns the union
+    /// of its sources' templates. Without the matrix it falls back to the
+    /// cosine of the flattened template waveforms under the same max rule,
+    /// and is empty when neither is loaded.
+    pub fn similar_clusters(
+        &self,
+        reference: ClusterId,
+        exclude: &[ClusterId],
+    ) -> Vec<(ClusterId, f32)> {
+        use rayon::prelude::*;
+        let templates_of = |c: ClusterId| {
+            let mut t = self.spike_templates(c).to_vec();
+            t.sort_unstable();
+            t.dedup();
+            t
+        };
+        let mine = templates_of(reference);
+        let (n_t, _, _) = self.template_shape();
+        let sim = self.similar_templates();
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (norm(a) * norm(b)).max(f32::MIN_POSITIVE)
+        };
+        let have_matrix = n_t > 0 && sim.len() == n_t * n_t;
+        let pair = |a: u32, b: u32| -> Option<f32> {
+            if have_matrix {
+                let (a, b) = (a as usize, b as usize);
+                (a < n_t && b < n_t).then(|| sim[a * n_t + b])
+            } else {
+                // ponytail: recomputes both norms per pair; cache per-template
+                // norms if clusters ever span hundreds of templates.
+                Some(cosine(
+                    self.template_waveform(a)?,
+                    self.template_waveform(b)?,
+                ))
+            }
+        };
+        let score = |c: ClusterId| -> Option<f32> {
+            let theirs = templates_of(c);
+            mine.iter()
+                .flat_map(|&a| theirs.iter().map(move |&b| (a, b)))
+                .filter_map(|(a, b)| pair(a, b))
+                .reduce(f32::max)
+        };
+        let mut out: Vec<(ClusterId, f32)> = (0..self.n_clusters())
+            .into_par_iter()
+            .map(ClusterId)
+            .filter(|&c| c != reference && !exclude.contains(&c) && !self.spike_times(c).is_empty())
+            .filter_map(|c| score(c).filter(|v| v.is_finite()).map(|v| (c, v)))
+            .collect();
+        out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        out
+    }
+
     #[inline]
     pub fn labels(&self) -> &[P::Label] {
         &self.labels
@@ -373,6 +519,140 @@ impl<P: DataProvider> Session<P> {
     /// Provenance/review tags of `cluster` (empty when it has none).
     pub fn tags(&self, cluster: ClusterId) -> &[String] {
         self.tags.get(cluster.idx()).map_or(&[], Vec::as_slice)
+    }
+
+    /// Where `cluster` came from (`Auto` for anything the sorter produced).
+    pub fn origin(&self, cluster: ClusterId) -> &UnitOrigin {
+        self.origins.get(cluster.idx()).unwrap_or(&AUTO)
+    }
+
+    /// [`Session::origin`] as text: `Auto[<sorter>]` or `Sorrel[Algo:gmm]`.
+    pub fn origin_label(&self, cluster: ClusterId) -> String {
+        self.origin(cluster).label(&self.sorter)
+    }
+
+    /// Direct parents of `cluster` (the unit it was split from, or the units
+    /// merged into it); walk transitively for the full lineage.
+    pub fn parents(&self, cluster: ClusterId) -> &[ClusterId] {
+        self.parents.get(cluster.idx()).map_or(&[], Vec::as_slice)
+    }
+
+    /// Free-text note of `cluster` (empty when none).
+    pub fn note(&self, cluster: ClusterId) -> &str {
+        self.notes.get(cluster.idx()).map_or("", String::as_str)
+    }
+
+    /// The sorter named in `Auto[<sorter>]`; `"unknown"` if nothing set it.
+    pub fn sorter(&self) -> &str {
+        &self.sorter
+    }
+
+    /// Set the sorter name explicitly (`--sorter`); overrides a saved pin.
+    pub fn set_sorter(&mut self, name: impl Into<String>) {
+        self.sorter = name.into();
+    }
+
+    /// Fill in a detected sorter name (`unknown` when `None`), unless the
+    /// saved annotations pinned one: detection never overrides a pin.
+    pub fn fill_detected_sorter(&mut self, detected: Option<String>) {
+        if self.provider.sorter().is_none() {
+            self.sorter = detected.unwrap_or_else(|| "unknown".into());
+        }
+    }
+
+    /// `tags` plus `tuned` when `cluster` is an Auto unit (it was edited but
+    /// kept its identity), sorted and deduplicated. Callers that change an
+    /// Auto unit's spikes in place use it for the new tag set.
+    fn tune_tags(&self, cluster: ClusterId, mut tags: Vec<String>) -> Vec<String> {
+        if *self.origin(cluster) == UnitOrigin::Auto {
+            tags.push(TAG_TUNED.to_string());
+        }
+        tags.sort_unstable();
+        tags.dedup();
+        tags
+    }
+
+    /// phy `split_init` for one cluster: the `Split`s that give each of its
+    /// original templates (beyond the most common one, which stays) a
+    /// cluster of its own. Indices are local to the bucket as it shrinks,
+    /// so the commands apply in order, e.g. as one batch.
+    pub fn split_by_template_commands(&self, cluster: ClusterId) -> Vec<CurationCommand> {
+        let mut rest = self.spike_templates(cluster).to_vec();
+        let Some(keep) = self.primary_template(cluster) else {
+            return Vec::new();
+        };
+        let mut others: Vec<u32> = rest.iter().copied().filter(|&t| t != keep).collect();
+        others.sort_unstable();
+        others.dedup();
+        others
+            .into_iter()
+            .map(|t| {
+                let spike_idx: Vec<u32> = (0..rest.len() as u32)
+                    .filter(|&i| rest[i as usize] == t)
+                    .collect();
+                rest.retain(|&x| x != t);
+                CurationCommand::Split {
+                    cluster,
+                    spike_idx,
+                    new_cluster: ClusterId(0),
+                    by: Method::Algo("split_init".into()),
+                }
+            })
+            .collect()
+    }
+
+    /// phy custom label `key` of `cluster` (`:l key value`), stored as a
+    /// `key=value` tag so it journals, undoes and follows merges and
+    /// splits like any tag. After a merge the target's value wins.
+    pub fn custom_label(&self, cluster: ClusterId, key: &str) -> Option<&str> {
+        self.tags(cluster)
+            .iter()
+            .find_map(|t| t.strip_prefix(key)?.strip_prefix('='))
+    }
+
+    /// Every custom label key in use, sorted.
+    pub fn custom_label_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|t| t.split_once('=').map(|(k, _)| k.to_string()))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// The tag edit that sets custom label `key` to `value` on `cluster`
+    /// (an empty value clears it). Keys are phy column names: letters,
+    /// digits and `_`, and not one of phy's own label files.
+    pub fn set_label_command(
+        &self,
+        cluster: ClusterId,
+        key: &str,
+        value: &str,
+    ) -> Result<CurationCommand, String> {
+        if key.is_empty()
+            || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || sorrel_io::kilosort::RESERVED_COLUMNS.contains(&key)
+        {
+            return Err(format!("{key:?} cannot be a label name"));
+        }
+        let prefix = format!("{key}=");
+        let mut tags: Vec<String> = self
+            .tags(cluster)
+            .iter()
+            .filter(|t| !t.starts_with(&prefix))
+            .cloned()
+            .collect();
+        if !value.is_empty() {
+            let tag = format!("{prefix}{value}");
+            if !sorrel_io::kilosort::valid_tag(&tag) {
+                return Err("label values cannot contain commas, tabs or newlines".into());
+            }
+            tags.push(tag);
+        }
+        Ok(CurationCommand::Tag { cluster, tags })
     }
 
     /// `cmd` as a human decision: preceded by retags that drop the touched
@@ -521,13 +801,17 @@ impl<P: DataProvider> Session<P> {
             match (cmd, inv) {
                 (
                     CurationCommand::Split {
-                        cluster, spike_idx, ..
+                        cluster,
+                        spike_idx,
+                        by,
+                        ..
                     },
-                    InverseOp::Split { record },
+                    InverseOp::Split { record, .. },
                 ) => CurationCommand::Split {
                     cluster: *cluster,
                     spike_idx: spike_idx.clone(),
                     new_cluster: record.new_cluster,
+                    by: by.clone(),
                 },
                 (CurationCommand::Batch { children }, InverseOp::Batch { inverses }) => {
                     CurationCommand::Batch {
@@ -578,15 +862,25 @@ impl<P: DataProvider> Session<P> {
             CurationCommand::Redo if self.redo.is_empty() => return Ok(()),
             _ => {}
         }
+        // Fail closed before anything reaches the journal.
+        match &cmd {
+            CurationCommand::Redo => {
+                if let Some(e) = self.redo.last() {
+                    self.check_gate(&e.cmd)?;
+                }
+            }
+            forward => self.check_gate(forward)?,
+        }
         let prev_head = self.journal.head();
         let affected = self.cache_identities_for_command(&cmd);
+        let n_before = self.cluster_index.n_spikes() as u64;
         self.journal.append(&cmd)?;
         if let Some(sink) = &mut self.record_sink {
             sink(&cmd);
         }
         let new_head = self.journal.head();
         self.apply_record(cmd)?;
-        self.record_cache_invalidation(prev_head, new_head, affected);
+        self.record_cache_invalidation(prev_head, new_head, n_before, affected);
         Ok(())
     }
 
@@ -612,14 +906,20 @@ impl<P: DataProvider> Session<P> {
                 let Some(entry) = self.redo.pop() else {
                     bail!("journal contains Redo with empty redo stack");
                 };
-                let inverse = self.apply_forward(&entry.cmd);
+                let inverse = match self.apply_forward(&entry.cmd) {
+                    Ok(inv) => inv,
+                    Err(e) => {
+                        self.redo.push(entry);
+                        return Err(e);
+                    }
+                };
                 self.history.push(HistoryEntry {
                     cmd: entry.cmd,
                     inverse,
                 });
             }
             forward => {
-                let inverse = self.apply_forward(&forward);
+                let inverse = self.apply_forward(&forward)?;
                 self.history.push(HistoryEntry {
                     cmd: forward,
                     inverse,
@@ -634,7 +934,79 @@ impl<P: DataProvider> Session<P> {
     /// inline (rather than as a separate pass) means we read state once
     /// before the mutation and once after — which matters for merge/split
     /// where the cluster_index records the affected snapshots.
-    fn apply_forward(&mut self, cmd: &CurationCommand) -> InverseOp<P::Label>
+    fn apply_forward(&mut self, cmd: &CurationCommand) -> Result<InverseOp<P::Label>>
+    where
+        P: ApplyPhyLabel,
+    {
+        match cmd {
+            CurationCommand::AddSpikes(batch) => {
+                self.check_gate(cmd)?;
+                let record = self.cluster_index.add_spikes(batch)?;
+                // Auto units that gained spikes are tuned; undo restores their tags.
+                let mut touched = batch.clusters.clone();
+                touched.sort_unstable();
+                touched.dedup();
+                let mut prev_tags = Vec::new();
+                for c in touched {
+                    if *self.origin(c) == UnitOrigin::Auto {
+                        let tuned = self.tune_tags(c, self.tags(c).to_vec());
+                        prev_tags.push((c, self.swap_tags(c, tuned)));
+                    }
+                }
+                Ok(InverseOp::AddSpikes { record, prev_tags })
+            }
+            CurationCommand::Batch { children } => {
+                let mut inverses = Vec::with_capacity(children.len());
+                for child in children {
+                    debug_assert!(
+                        !matches!(
+                            child,
+                            CurationCommand::Undo
+                                | CurationCommand::Redo
+                                | CurationCommand::Batch { .. }
+                        ),
+                        "Batch children must be forward, non-nested"
+                    );
+                    match self.apply_forward(child) {
+                        Ok(inv) => inverses.push(inv),
+                        Err(e) => {
+                            // Roll back the children already applied.
+                            for inv in inverses.into_iter().rev() {
+                                self.apply_inverse(inv);
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                Ok(InverseOp::Batch { inverses })
+            }
+            other => Ok(self.apply_simple(other)),
+        }
+    }
+
+    /// Gate for commands that need more than the in-memory state: AddSpikes
+    /// is only valid on a phy-directory provider with no remote record sink
+    /// (a sink would have to carry the payload, and replay must be local).
+    fn check_gate(&self, cmd: &CurationCommand) -> Result<()> {
+        match cmd {
+            CurationCommand::AddSpikes(batch) => {
+                if self.provider.phy_dir().is_none() {
+                    bail!("AddSpikes needs a phy/Kilosort directory provider");
+                }
+                if self.record_sink.is_some() {
+                    bail!("AddSpikes is not supported on a session with a remote record sink");
+                }
+                self.cluster_index.check_add_spikes(batch)
+            }
+            CurationCommand::Batch { children } => {
+                children.iter().try_for_each(|c| self.check_gate(c))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The infallible forward ops (everything but `Batch` and `AddSpikes`).
+    fn apply_simple(&mut self, cmd: &CurationCommand) -> InverseOp<P::Label>
     where
         P: ApplyPhyLabel,
     {
@@ -662,11 +1034,39 @@ impl<P: DataProvider> Session<P> {
                 }
                 union.sort_unstable();
                 union.dedup();
+                let union = self.tune_tags(*target, union);
                 let target_tags = (*target, self.swap_tags(*target, union));
+                // Direct lineage: the sources join the target's parents.
+                let mut parents = self.parents(*target).to_vec();
+                for s in sources {
+                    if !parents.contains(s) {
+                        parents.push(*s);
+                    }
+                }
+                let target_parents = set_slot(&mut self.parents, *target, parents);
+                // Source notes survive as `#<id>: <note>` lines on the target.
+                // A line the target already has is skipped, so replay stays clean.
+                let mut note = self.note(*target).to_string();
+                for &s in sources {
+                    let text = self.note(s);
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let line = format!("#{}: {text}", s.0);
+                    if !format!("\n{note}\n").contains(&format!("\n{line}\n")) {
+                        if !note.is_empty() {
+                            note.push('\n');
+                        }
+                        note.push_str(&line);
+                    }
+                }
+                let target_note = set_slot(&mut self.notes, *target, note);
                 let record = self.cluster_index.merge(sources, *target);
                 InverseOp::Merge {
                     labels,
                     target_tags,
+                    target_parents,
+                    target_note,
                     record,
                 }
             }
@@ -674,6 +1074,7 @@ impl<P: DataProvider> Session<P> {
                 cluster,
                 spike_idx,
                 new_cluster: _,
+                by,
             } => {
                 // We auto-allocate a fresh cluster id rather than honouring
                 // the requested `new_cluster` field — the on-disk schema
@@ -681,31 +1082,41 @@ impl<P: DataProvider> Session<P> {
                 // physical id is determined by the index that performs the
                 // mutation, which guarantees no collision after replay.
                 let record = self.cluster_index.split(*cluster, spike_idx);
-                // The split-off child inherits the parent's provenance.
-                let inherited = self.tags(*cluster).to_vec();
-                self.swap_tags(record.new_cluster, inherited);
-                InverseOp::Split { record }
+                // The child inherits the parent's provenance but not its
+                // tuned/split markers; it is a sorrel unit with one parent.
+                let parent_tags = self.tags(*cluster).to_vec();
+                let inherited = parent_tags
+                    .iter()
+                    .filter(|t| !matches!(t.as_str(), TAG_TUNED | TAG_SPLIT))
+                    .cloned()
+                    .collect();
+                let child = record.new_cluster;
+                self.swap_tags(child, inherited);
+                set_slot(&mut self.origins, child, UnitOrigin::Sorrel(by.clone()));
+                set_slot(&mut self.parents, child, vec![*cluster]);
+                set_slot(&mut self.notes, child, String::new());
+                if *self.origin(*cluster) == UnitOrigin::Auto {
+                    let mut marked = parent_tags.clone();
+                    marked.push(TAG_SPLIT.to_string());
+                    marked.sort_unstable();
+                    marked.dedup();
+                    self.swap_tags(*cluster, marked);
+                }
+                InverseOp::Split {
+                    record,
+                    parent_tags,
+                }
             }
-            CurationCommand::Note { .. } => InverseOp::None,
+            CurationCommand::Note { cluster, text } => InverseOp::Note {
+                cluster: *cluster,
+                prev: set_slot(&mut self.notes, *cluster, text.clone()),
+            },
             CurationCommand::Tag { cluster, tags } => InverseOp::Tag {
                 cluster: *cluster,
                 prev: self.swap_tags(*cluster, tags.clone()),
             },
-            CurationCommand::Batch { children } => {
-                let mut inverses = Vec::with_capacity(children.len());
-                for child in children {
-                    debug_assert!(
-                        !matches!(
-                            child,
-                            CurationCommand::Undo
-                                | CurationCommand::Redo
-                                | CurationCommand::Batch { .. }
-                        ),
-                        "Batch children must be forward, non-nested"
-                    );
-                    inverses.push(self.apply_forward(child));
-                }
-                InverseOp::Batch { inverses }
+            CurationCommand::Batch { .. } | CurationCommand::AddSpikes(_) => {
+                unreachable!("handled by apply_forward")
             }
             CurationCommand::Undo | CurationCommand::Redo => {
                 debug_assert!(false, "Undo/Redo handled by caller, not apply_forward");
@@ -725,9 +1136,13 @@ impl<P: DataProvider> Session<P> {
             InverseOp::Merge {
                 labels,
                 target_tags,
+                target_parents,
+                target_note,
                 record,
             } => {
                 self.swap_tags(target_tags.0, target_tags.1);
+                set_slot(&mut self.parents, target_tags.0, target_parents);
+                set_slot(&mut self.notes, target_tags.0, target_note);
                 self.cluster_index.unmerge(record);
                 for (c, l) in labels {
                     if let Some(slot) = self.labels.get_mut(c.idx()) {
@@ -735,12 +1150,29 @@ impl<P: DataProvider> Session<P> {
                     }
                 }
             }
-            InverseOp::Split { record } => {
-                self.swap_tags(record.new_cluster, Vec::new());
+            InverseOp::Split {
+                record,
+                parent_tags,
+            } => {
+                let child = record.new_cluster;
+                self.swap_tags(child, Vec::new());
+                set_slot(&mut self.origins, child, UnitOrigin::Auto);
+                set_slot(&mut self.parents, child, Vec::new());
+                set_slot(&mut self.notes, child, String::new());
+                self.swap_tags(record.source, parent_tags);
                 self.cluster_index.unsplit(record);
+            }
+            InverseOp::Note { cluster, prev } => {
+                set_slot(&mut self.notes, cluster, prev);
             }
             InverseOp::Tag { cluster, prev } => {
                 self.swap_tags(cluster, prev);
+            }
+            InverseOp::AddSpikes { record, prev_tags } => {
+                for (c, tags) in prev_tags {
+                    self.swap_tags(c, tags);
+                }
+                self.cluster_index.remove_added(record)
             }
             InverseOp::Batch { inverses } => {
                 // Reverse order: undo the last-applied child first so each
@@ -756,6 +1188,7 @@ impl<P: DataProvider> Session<P> {
         &mut self,
         prev_head: u64,
         new_head: u64,
+        n_spikes: u64,
         clusters: Vec<CacheClusterIdentity>,
     ) {
         if prev_head == new_head {
@@ -767,15 +1200,14 @@ impl<P: DataProvider> Session<P> {
         self.cache_invalidations.push_back(CacheInvalidation {
             prev_head,
             new_head,
+            n_spikes,
             clusters,
         });
     }
 
     fn cache_identities_for_command(&self, cmd: &CurationCommand) -> Vec<CacheClusterIdentity> {
         let clusters = match cmd {
-            CurationCommand::Undo | CurationCommand::Redo => {
-                (0..self.n_clusters()).map(ClusterId).collect()
-            }
+            c if touches_all(c) => (0..self.n_clusters()).map(ClusterId).collect(),
             forward => affected_clusters(forward),
         };
         clusters
@@ -788,18 +1220,64 @@ impl<P: DataProvider> Session<P> {
     fn cache_identity(&self, cluster: ClusterId) -> CacheClusterIdentity {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"sorrel-pc-subspace-cluster-spikes-v1");
-        let mut count = 0usize;
-        for (global_idx, &assigned) in self.spike_clusters_global().iter().enumerate() {
-            if assigned == cluster {
-                count += 1;
-                hasher.update(&(global_idx as u64).to_le_bytes());
-            }
+        // The cluster's own bucket of global indices, ascending.
+        let indices = self.cluster_index.global_indices(cluster);
+        for &global_idx in indices {
+            hasher.update(&(global_idx as u64).to_le_bytes());
         }
+        let count = indices.len();
         CacheClusterIdentity {
             cluster,
             spike_count: count,
             cluster_spike_fingerprint: *hasher.finalize().as_bytes(),
         }
+    }
+}
+
+/// Review-queue ordering (see [`crate::proposers::attention_with`]).
+impl<P: DataProvider> Session<P> {
+    /// `(score, reasons)` of how much `cluster` needs a human. Ranks every
+    /// merge/split to find this cluster's share, so use
+    /// [`Self::attention_all`] (or `proposers::attention_all` with
+    /// suggestions you already hold) when scoring more than one.
+    pub fn attention(&self, cluster: ClusterId) -> (f32, Vec<&'static str>) {
+        let (merges, splits) = self.all_suggestions();
+        let globals = crate::proposers::cluster_globals(self, cluster);
+        crate::proposers::attention_with(self, cluster, &globals, &merges, &splits)
+    }
+
+    /// Attention of every non-empty cluster, highest first; suggestions are
+    /// computed once.
+    pub fn attention_all(&self) -> Vec<(ClusterId, f32, Vec<&'static str>)> {
+        let (merges, splits) = self.all_suggestions();
+        crate::proposers::attention_all(self, &merges, &splits)
+    }
+
+    /// Untruncated merge and split suggestions (default thresholds).
+    fn all_suggestions(
+        &self,
+    ) -> (
+        Vec<crate::suggest::MergeCandidate>,
+        Vec<crate::suggest::SplitCandidate>,
+    ) {
+        let cfg = crate::suggest::SuggestConfig {
+            top_merges: usize::MAX,
+            top_splits: usize::MAX,
+            ..Default::default()
+        };
+        (
+            crate::suggest::rank_merge_candidates(self, &cfg),
+            crate::suggest::rank_split_candidates(self, &cfg),
+        )
+    }
+}
+
+/// Commands whose cache effect is not confined to named clusters.
+fn touches_all(cmd: &CurationCommand) -> bool {
+    match cmd {
+        CurationCommand::Undo | CurationCommand::Redo | CurationCommand::AddSpikes(_) => true,
+        CurationCommand::Batch { children } => children.iter().any(touches_all),
+        _ => false,
     }
 }
 
@@ -827,7 +1305,10 @@ fn collect_affected_clusters(cmd: &CurationCommand, out: &mut Vec<ClusterId>) {
             }
         }
         // Tags never touch spikes, so no cache depends on them.
-        CurationCommand::Tag { .. } | CurationCommand::Undo | CurationCommand::Redo => {}
+        CurationCommand::Tag { .. }
+        | CurationCommand::Undo
+        | CurationCommand::Redo
+        | CurationCommand::AddSpikes(_) => {}
     }
 }
 
@@ -997,6 +1478,15 @@ mod tests {
     }
 
     #[test]
+    fn set_label_command_rejects_reserved_sidecar_names() {
+        let (s, _d) = fresh_session();
+        for k in ["sorrel_annotations", "sorrel_origin", "group", "id"] {
+            assert!(s.set_label_command(ClusterId(0), k, "x").is_err(), "{k}");
+        }
+        assert!(s.set_label_command(ClusterId(0), "my_label", "x").is_ok());
+    }
+
+    #[test]
     fn new_session_seeds_labels_and_buckets_from_provider() {
         let (s, _d) = fresh_session();
         assert_eq!(s.labels().len(), 3);
@@ -1134,6 +1624,7 @@ mod tests {
             cluster: ClusterId(0),
             spike_idx: vec![1],
             new_cluster: ClusterId(99), // ignored: id auto-allocated
+            by: Method::Manual,
         })
         .unwrap();
         assert_eq!(s.n_clusters(), n_before + 1);
@@ -1153,6 +1644,7 @@ mod tests {
             cluster: ClusterId(0),
             spike_idx: vec![0, 2],
             new_cluster: ClusterId(0),
+            by: Method::Manual,
         })
         .unwrap();
         s.dispatch(CurationCommand::Undo).unwrap();
@@ -1170,6 +1662,105 @@ mod tests {
         .unwrap();
         assert_eq!(s.label(ClusterId(0)), Some(MockLabel::Unsorted));
         assert_eq!(s.history_len(), 1);
+    }
+
+    #[test]
+    fn merge_appends_source_notes_and_undo_redo_restores_them() {
+        let (mut s, _d) = fresh_session();
+        s.dispatch(CurationCommand::Note {
+            cluster: ClusterId(1),
+            text: "one".into(),
+        })
+        .unwrap();
+        s.dispatch(CurationCommand::Note {
+            cluster: ClusterId(2),
+            text: "two".into(),
+        })
+        .unwrap();
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(1)],
+            target: ClusterId(2),
+        })
+        .unwrap();
+        assert_eq!(s.note(ClusterId(2)), "two\n#1: one");
+        assert_eq!(s.note(ClusterId(1)), "one", "source keeps its own note");
+        s.dispatch(CurationCommand::Undo).unwrap();
+        assert_eq!(s.note(ClusterId(2)), "two");
+        s.dispatch(CurationCommand::Redo).unwrap();
+        assert_eq!(s.note(ClusterId(2)), "two\n#1: one", "redo appends once");
+    }
+
+    #[test]
+    fn origin_parents_notes_and_markers_follow_undo_redo_and_replay() {
+        let (mut s, d) = fresh_session();
+        let tags = |s: &Session<MockProvider>, c: u32| s.tags(ClusterId(c)).to_vec();
+        let state = |s: &Session<MockProvider>| {
+            (0..5)
+                .map(|c| {
+                    let c = ClusterId(c);
+                    (
+                        s.origin_label(c),
+                        s.parents(c).to_vec(),
+                        s.note(c).to_string(),
+                        s.tags(c).to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let pristine = state(&s);
+        assert_eq!(s.sorter(), "unknown");
+        assert_eq!(s.origin_label(ClusterId(0)), "Auto[unknown]");
+
+        s.dispatch(CurationCommand::Note {
+            cluster: ClusterId(0),
+            text: "hello".into(),
+        })
+        .unwrap();
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(1)],
+            target: ClusterId(2),
+        })
+        .unwrap();
+        s.dispatch(CurationCommand::Split {
+            cluster: ClusterId(2),
+            spike_idx: vec![0],
+            new_cluster: ClusterId(0),
+            by: Method::Algo("gmm".into()),
+        })
+        .unwrap();
+        let child = ClusterId(3);
+        assert_eq!(s.note(ClusterId(0)), "hello");
+        assert_eq!(s.parents(ClusterId(2)), [ClusterId(1)]);
+        assert_eq!(s.origin(ClusterId(2)), &UnitOrigin::Auto);
+        assert_eq!(tags(&s, 2), ["split", "tuned"]);
+        assert_eq!(s.origin_label(child), "Sorrel[Algo:gmm]");
+        assert_eq!(s.parents(child), [ClusterId(2)]);
+        assert!(s.tags(child).is_empty(), "child drops tuned/split");
+        let done = state(&s);
+
+        for _ in 0..3 {
+            s.dispatch(CurationCommand::Undo).unwrap();
+        }
+        assert_eq!(state(&s), pristine);
+        for _ in 0..3 {
+            s.dispatch(CurationCommand::Redo).unwrap();
+        }
+        assert_eq!(state(&s), done);
+
+        // Replaying the journal on a fresh session reproduces the state.
+        let provider = MockProvider {
+            spikes: vec![
+                vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
+                vec![SampleIndex(20), SampleIndex(200)],
+                vec![SampleIndex(100)],
+            ],
+            labels: vec![MockLabel::Unsorted; 3],
+            trace: vec![],
+            n_channels: 1,
+        };
+        let mut r = Session::new(provider, Journal::open(&d.path().join("j.sqlite")).unwrap());
+        r.replay_journal().unwrap();
+        assert_eq!(state(&r), done);
     }
 
     #[test]
@@ -1192,7 +1783,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             s.tags(ClusterId(2)),
-            ["agree", "review:merge", "src:bombcell"]
+            ["agree", "review:merge", "src:bombcell", "tuned"]
         );
         s.dispatch(CurationCommand::Undo).unwrap();
         assert_eq!(s.tags(ClusterId(2)), ["review:merge"]);
@@ -1203,6 +1794,7 @@ mod tests {
             cluster: ClusterId(0),
             spike_idx: vec![1],
             new_cluster: child,
+            by: Method::Manual,
         })
         .unwrap();
         assert_eq!(s.tags(child), ["src:bombcell", "agree"]);
@@ -1484,11 +2076,10 @@ mod tests {
     fn merge_then_cache_invalidation_evicts_pre_merge_cluster_archive() {
         let (mut s, dir) = fresh_session();
         let store = CacheStore::open(dir.path()).unwrap();
-        let old_head = s.journal_head();
         let old_identity = s.cache_identity(ClusterId(0));
         let old_key = pc_subspace::key(pc_subspace::KeyParts {
             session_identity: &s.provider.identity_bytes(),
-            journal_head: old_head,
+            n_spikes_total: s.cluster_index.n_spikes() as u64,
             cluster: old_identity.cluster,
             cluster_spike_count: old_identity.spike_count,
             cluster_spike_fingerprint: old_identity.cluster_spike_fingerprint,
@@ -1530,5 +2121,50 @@ mod tests {
             "pre-merge archive should not survive save/next-open invalidation"
         );
         assert!(!old_path.exists());
+    }
+
+    /// The bucket-based identity must hash exactly what the old full scan
+    /// did, or existing cache entries would silently stop matching.
+    #[test]
+    fn cache_identity_matches_the_full_scan_after_merge_and_split() {
+        let reference = |s: &Session<MockProvider>, cluster: ClusterId| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"sorrel-pc-subspace-cluster-spikes-v1");
+            let mut count = 0usize;
+            for (g, &c) in s.spike_clusters_global().iter().enumerate() {
+                if c == cluster {
+                    count += 1;
+                    hasher.update(&(g as u64).to_le_bytes());
+                }
+            }
+            (count, *hasher.finalize().as_bytes())
+        };
+        let (mut s, _d) = fresh_session();
+        let check = |s: &Session<MockProvider>| {
+            for c in (0..s.n_clusters()).map(ClusterId) {
+                let id = s.cache_identity(c);
+                assert_eq!(
+                    (id.spike_count, id.cluster_spike_fingerprint),
+                    reference(s, c)
+                );
+            }
+        };
+        check(&s);
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(0)],
+            target: ClusterId(2),
+        })
+        .unwrap();
+        check(&s);
+        s.dispatch(CurationCommand::Split {
+            cluster: ClusterId(2),
+            spike_idx: vec![1, 3],
+            new_cluster: ClusterId(0),
+            by: crate::command::Method::Manual,
+        })
+        .unwrap();
+        check(&s);
+        s.dispatch(CurationCommand::Undo).unwrap();
+        check(&s);
     }
 }

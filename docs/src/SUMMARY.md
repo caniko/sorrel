@@ -17,6 +17,7 @@
 - [Keyboard & Mouse](./usage/keyboard-controls.md)
 - [Saving & QC Export](./usage/saving.md)
 - [Automatic Curation](./usage/auto-curation.md)
+- [Spike rescue](./usage/rescue.md)
 - [Remote Work](./usage/remote.md)
 
 # Architecture
@@ -30,3 +31,5 @@
 
 - [Sorrel improvement research](./reference/sorrel-improvement-research.md)
 - [Sorrel scientific correctness research](./reference/sorrel-science-research.md)
+- [phy parity](./reference/phy-parity.md)
+- [Clustering brainstorm](./reference/clustering-brainstorm.md)

@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use sorrel_data::CurationCommand;
 use sorrel_io::TraceDtype;
 
-pub const PROTO_VERSION: u32 = 1;
+/// v2: `CurationCommand::Split` carries `by` (how the new unit was made).
+pub const PROTO_VERSION: u32 = 2;
 /// Largest byte range a single `FetchFile` / `FetchTrace` may ask for.
 pub const CHUNK: u64 = 1 << 20;
 

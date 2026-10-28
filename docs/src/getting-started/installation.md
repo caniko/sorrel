@@ -82,6 +82,23 @@ nix build .#sorrelHdf5    # with HDF5 features
 - `.#docs` — this mdBook documentation.
 - `.#site` — combined static site, with the docs mounted under `/docs/`.
 
+The Nix packages ship a `sorrel.desktop` menu entry.
+
+### Home Manager
+
+Add the flake as an input and enable the module:
+
+```nix
+{
+  inputs.sorrel.url = "github:caniko/sorrel";
+  # in your Home Manager configuration:
+  imports = [inputs.sorrel.homeManagerModules.default];
+  programs.sorrel.enable = true;
+  # NWB/HDF5 support:
+  # programs.sorrel.package = inputs.sorrel.packages.${system}.sorrelHdf5;
+}
+```
+
 ## GPU drivers
 
 Sorrel draws through wgpu, so it runs on Intel, AMD and NVIDIA GPUs alike.

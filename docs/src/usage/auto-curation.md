@@ -68,28 +68,96 @@ while never keeping a unit the human had marked noise.
 
 ## Tags
 
-| Tag                                                       | Meaning                                                                         |
-| --------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| `src:bombcell`, `src:unitrefine`                          | That classifier contributed to the label.                                       |
-| `src:llm`                                                 | Claude decided the label or the merge.                                          |
-| `src:spikeinterface`                                      | Set by SpikeInterface cleanup (`redundant`).                                    |
-| `src:sorrel`                                              | Set by sorrel's own ranking (`review:split`).                                   |
-| `src:human`                                               | Someone edited the cluster in the GUI after the run.                            |
-| `agree` / `disagree`                                      | Whether Bombcell and UnitRefine gave the same label.                            |
-| `conf:high` / `conf:mid` / `conf:low`                     | UnitRefine probability ≥ 0.85, in between, or < 0.6.                            |
-| `bc:<metric>`                                             | A Bombcell threshold the unit failed, e.g. `bc:snr`, `bc:sliding_rp_violation`. |
-| `non-somatic`, `redundant`                                | Bombcell's non-somatic waveform call; a near-duplicate spike train.             |
-| `merged:similarity_correlograms`, `merged:slay`           | The merge preset(s) that proposed the merge.                                    |
-| `merged:consensus`                                        | Both presets agreed on the merge.                                               |
-| `review:disagree`, `review:low-conf`, `review:llm-unsure` | The label needs a person.                                                       |
-| `review:merge`                                            | The merge (applied or vetoed) needs a person.                                   |
-| `review:split`                                            | Sorrel's split ranking has a split proposal for this cluster.                   |
-| `review:geometry`                                         | Channel positions look like indices, not µm; every label needs checking.        |
+| Tag                                                       | Meaning                                                                                     |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `src:bombcell`, `src:unitrefine`                          | That classifier contributed to the label.                                                   |
+| `src:llm`                                                 | Claude decided the label or the merge.                                                      |
+| `src:spikeinterface`                                      | Set by SpikeInterface cleanup (`redundant`).                                                |
+| `src:sorrel`                                              | Set by sorrel's own ranking (`review:split`).                                               |
+| `src:human`                                               | Someone edited the cluster in the GUI after the run.                                        |
+| `agree` / `disagree`                                      | Whether Bombcell and UnitRefine gave the same label.                                        |
+| `conf:high` / `conf:mid` / `conf:low`                     | UnitRefine probability ≥ 0.85, in between, or < 0.6.                                        |
+| `bc:<metric>`                                             | A Bombcell threshold the unit failed, e.g. `bc:snr`, `bc:sliding_rp_violation`.             |
+| `non-somatic`, `redundant`                                | Bombcell's non-somatic waveform call; a near-duplicate spike train.                         |
+| `merged:similarity_correlograms`, `merged:slay`           | The merge preset(s) that proposed the merge.                                                |
+| `merged:consensus`                                        | Both presets agreed on the merge.                                                           |
+| `review:disagree`, `review:low-conf`, `review:llm-unsure` | The label needs a person.                                                                   |
+| `review:merge`                                            | The merge (applied or vetoed) needs a person.                                               |
+| `review:split`                                            | Sorrel's split ranking has a split proposal for this cluster.                               |
+| `review:geometry`                                         | Channel positions look like indices, not µm; every label needs checking.                    |
+| `tuned`                                                   | An Auto unit that absorbed a merge or gained rescued spikes. Set by sorrel.                 |
+| `split`                                                   | An Auto unit that lost spikes to a split. Set by sorrel; a split child does not inherit it. |
+| `external`                                                | Merged, split or created outside sorrel (phy). Set on first open; origin stays Auto.        |
 
 Tags are saved in `cluster_sorrel_tags.tsv`, which phy shows as an ordinary
 column, and in the `tags` category of `curation.json`. Any GUI edit to a
 tagged cluster (relabel, merge, split) removes its `review:*` tags and adds
 `src:human` in the same undoable step.
+
+## Unit origin, lineage and notes
+
+Every unit has exactly one origin:
+
+- `Auto[<sorter>]`: the unit came straight out of the sorter. The sorter name
+  is `--sorter NAME` when given, else the one pinned in the saved
+  annotations, else detected from the directory (see below).
+- `Sorrel[Manual]`, `Sorrel[Algo:<name>]` or `Sorrel[LLM:<client>]`: the unit
+  was created inside sorrel.
+
+Only a split creates a unit, so only a split gives a `Sorrel[...]` origin. A
+merge keeps the target's id and origin, and the sources disappear. A split
+child's origin is the method that made the split:
+
+| Made by                         | Origin                                          |
+| ------------------------------- | ----------------------------------------------- |
+| Lasso split in the GUI          | `Sorrel[Manual]`                                |
+| split_init                      | `Sorrel[Algo:split_init]`                       |
+| Suggest, GMM split              | `Sorrel[Algo:gmm]`                              |
+| Accepted proposal, agent        | `Sorrel[LLM:agent]`                             |
+| Accepted proposal, other source | `Sorrel[Algo:<source>]`, e.g. `Algo:kmeans`     |
+| `sorrel serve` split (MCP)      | `Sorrel[LLM:<MCP client name>]`                 |
+| sorrel-py `split(..., by=...)`  | the given method; default `Sorrel[Algo:python]` |
+| Tests and fixtures              | `Sorrel[Manual]`                                |
+
+Lineage is stored as direct parents only. A split child's parent is the unit it
+was cut from. A merge target's parents are the units merged into it. To see the
+full history, follow the parents recursively.
+
+A note is free text on a unit, set with the snippet `:note <text>` on the
+selected clusters. `:note` with no text clears it. Notes are journaled and
+undo like other edits.
+
+Origins, parents and notes are saved in `cluster_sorrel_annotations.tsv` with
+the columns `cluster_id`, `sorrel_origin`, `sorrel_parents` and `sorrel_note`.
+It has a row for every non-empty unit, so the data survives a save and a
+reseal, and phy shows the columns. Notes are escaped so each fits one cell.
+
+In `curation.json`, the exclusive `origin` label holds each unit's origin, for
+example `Auto[kilosort4]`. Notes are not exported.
+
+The sorter name is detected in this order; the first match wins:
+
+1. `sorter_name` in `spikeinterface_log.json`, in the directory or its parent.
+2. `ops.npy`: `kilosort4`.
+3. `rez.mat` or `cluster_KSLabel.tsv`: `kilosort`.
+4. A SortingAnalyzer folder: the `sorter_name` in `sorting/annotations.json`,
+   else `spikeinterface`.
+5. A `.nwb` file: `nwb`.
+6. Nothing matches: `unknown`.
+
+Override the detected name with `--sorter NAME`, which is a calibration knob.
+Precedence: `--sorter`, then the name pinned by a saved `Auto[<sorter>]` row,
+then detection. Re-detection never changes a saved name; `--sorter` does, and
+the next save pins the new name. A saved `Auto[unknown]` pins nothing.
+
+The journal is format version 2. This build reads version 1 journals and
+upgrades them on open. Older builds refuse a version 2 journal with
+"unsupported journal version" rather than truncating it. Upgrade every sorrel
+build that opens the same sort.
+
+`origin` is not the same as the `src:*` tags. The origin says where a unit came
+from. The `src:*` tags say who labelled or reviewed it, for example `src:llm`
+or `src:human`. The two are independent, and the `src:*` tags are unchanged.
 
 ## Reviewing
 

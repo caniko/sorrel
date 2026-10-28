@@ -4,15 +4,6 @@
   inputs = {
     harbor-rs.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk";
 
-    # No nixpkgs/rust-overlay/crane follows: simit must keep its own locked
-    # toolchain so the dev shell hits the closure simit's trunk prebuild
-    # publishes to the canix Attic cache instead of compiling it.
-    simit = {
-      url = "git+https://github.com/caniko/simit.git?ref=trunk";
-      inputs.flake-utils.follows = "flake-utils";
-      inputs.plinth.follows = "plinth";
-    };
-
     # Pinned SDK used by harbor-rs's reproducible osxcross builder.
     harbor-macos-sdk-pin.url = "git+https://github.com/caniko/harbor-macos-sdk-pin.git?ref=trunk";
 
@@ -26,17 +17,12 @@
     flake-utils.url = "github:numtide/flake-utils";
     treefmt-nix.follows = "harbor-rs/treefmt-nix";
     git-hooks.follows = "harbor-rs/git-hooks";
-    plinth = {
-      url = "git+https://github.com/caniko/plinth.git?ref=trunk";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
   outputs = {
     self,
     nixpkgs,
     harbor-rs,
-    simit,
     harbor-macos-sdk-pin,
     nix-appimage,
     flake-utils,
@@ -46,10 +32,20 @@
     ...
   }:
     {
+      homeManagerModules.default = import ./nix/hm-module.nix self;
+
       # This is the sole simit project configuration source.  Keep CI and
       # release policy next to the flake outputs it describes; simit.toml is
       # intentionally not used.
-      simitConfig = {
+      simitConfig = let
+        qualification = map (check: ".#checks.x86_64-linux.${check}") [
+          "clippy"
+          "default"
+          "formatting"
+          "hm-module"
+          "workspace-tests"
+        ];
+      in {
         flake.mode = "custom";
         ci = {
           platform = "github";
@@ -96,6 +92,17 @@
             repo = "caniko/sorrel";
             site_output = ".#site";
             source_branch = "trunk";
+          };
+          # Exact-installable qualification of every x86_64-linux flake check,
+          # the lavapipe UI snapshot states included (checks.workspace-tests).
+          nix_builds = qualification;
+          nix_build = {
+            check_systems = ["x86_64-linux"];
+            groups.checks = qualification;
+            capture_results = true;
+            timeout_minutes = 120;
+            # The simit that generated the workflows; vars.SIMIT_CI_ENGINE_REVISION overrides.
+            engine_revision = "78b775803103ae960faf475ad46070d771fddc91";
           };
         };
         # Linux closures only: the darwin build depends on the private macOS
@@ -189,15 +196,24 @@
       };
       cargoConfig = harbor-rs.lib.mkCargoConfig {inherit pkgs;};
 
+      srcFilter = path: type:
+        (craneLib.filterCargoSources path type)
+        || pkgs.lib.hasSuffix ".wgsl" path
+        # BIP-39 list embedded by sorrel-remote's pairing codes.
+        || pkgs.lib.hasSuffix "sorrel-remote/wordlist.txt" path
+        # SpikeInterface sidecar `sorrel auto` embeds with include_str!.
+        || pkgs.lib.hasSuffix "scripts/sorrel_auto.py" path;
       src = pkgs.lib.cleanSourceWith {
         src = ./.;
+        filter = srcFilter;
+      };
+      # The tests also read the UI snapshot PNGs and the committed phy fixture.
+      testSrc = pkgs.lib.cleanSourceWith {
+        src = ./.;
         filter = path: type:
-          (craneLib.filterCargoSources path type)
-          || pkgs.lib.hasSuffix ".wgsl" path
-          # BIP-39 list embedded by sorrel-remote's pairing codes.
-          || pkgs.lib.hasSuffix "sorrel-remote/wordlist.txt" path
-          # SpikeInterface sidecar `sorrel auto` embeds with include_str!.
-          || pkgs.lib.hasSuffix "scripts/sorrel_auto.py" path;
+          srcFilter path type
+          || pkgs.lib.hasInfix "/tests/snapshots/" path
+          || pkgs.lib.hasInfix "/release/fixtures/" path;
       };
       treefmtEval = treefmt-nix.lib.evalModule pkgs (import ./nix/treefmt.nix {rustfmtPackage = rustToolchain;});
       pre-commit-check = git-hooks.lib.${system}.run {
@@ -351,7 +367,9 @@
 
       checks =
         (import ./nix/checks.nix {
-          inherit craneLib commonArgs cargoArtifacts sorrel;
+          inherit pkgs craneLib commonArgs cargoArtifacts sorrel testSrc;
+          inherit (deps) runtimeLibs;
+          hmModule = self.homeManagerModules.default;
         })
         // {
           formatting = treefmtEval.config.build.check self;
@@ -359,7 +377,6 @@
 
       devShells = import ./nix/devshell.nix {
         inherit pkgs harbor-rs craneLib cross cargoConfig deps;
-        simit = simit.packages.${system}.default;
         checks = self.checks.${system};
         preCommitEnabledPackages = pre-commit-check.enabledPackages;
         inherit (pre-commit-check) shellHook;

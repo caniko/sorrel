@@ -143,6 +143,7 @@ fn phy_clustering_total_spike_count_is_preserved() {
         cluster: ClusterId(5),
         spike_idx: vec![0, 1],
         new_cluster: ClusterId(0),
+        by: sorrel_data::command::Method::Manual,
     })
     .unwrap();
     let total_post2: usize = (0..s.n_clusters())
@@ -167,6 +168,7 @@ fn phy_clustering_undo_redo_round_trips_split() {
         cluster: ClusterId(2),
         spike_idx: vec![0],
         new_cluster: ClusterId(0), // ignored
+        by: sorrel_data::command::Method::Manual,
     })
     .unwrap();
     let after_split: Vec<Vec<SampleIndex>> = (0..s.n_clusters())
@@ -559,4 +561,343 @@ fn phy_relabel_on_out_of_range_cluster_is_a_noop() {
         // All defaulted to 0 (Unsorted) initially.
         assert_eq!(s.label(i), Some(0u8));
     }
+}
+
+// ---- Ported from phy/cluster/views/feature.py ---------------------------
+
+/// phy: the FeatureView reads features by *real* channel through
+/// `pc_feature_ind[spike_template]`, skips spikes whose template lacks the
+/// channel, and orders the grid's channels with those shared by every
+/// selected cluster first (`FeatureView._get_channel_ids`).
+#[test]
+fn phy_feature_view_channels_and_lookup() {
+    use sorrel_io::{HasPcFeatures, HasSpikeTemplates};
+    struct Stub {
+        inner: StubProvider,
+        pc: Vec<f32>,
+    }
+    impl DataProvider for Stub {
+        type Label = u8;
+        fn sample_rate(&self) -> f32 {
+            self.inner.sample_rate()
+        }
+        fn n_channels(&self) -> u32 {
+            16
+        }
+        fn n_samples(&self) -> SampleIndex {
+            self.inner.n_samples()
+        }
+        fn n_clusters(&self) -> u32 {
+            self.inner.n_clusters()
+        }
+        fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
+            self.inner.spike_times(c)
+        }
+        fn trace(&self, s: SampleIndex, l: u32) -> TraceSlice<'_> {
+            self.inner.trace(s, l)
+        }
+        fn initial_labels(&self) -> Vec<u8> {
+            self.inner.initial_labels()
+        }
+    }
+    impl HasSpikeTemplates for Stub {
+        fn spike_templates(&self, c: ClusterId) -> &[u32] {
+            [&[0u32][..], &[1u32][..]][c.idx()]
+        }
+    }
+    impl HasPcFeatures for Stub {
+        fn pc_features(&self) -> &[f32] {
+            &self.pc
+        }
+        fn pc_shape(&self) -> (usize, usize) {
+            (2, 3)
+        }
+        fn pc_feature_ind(&self) -> &[u32] {
+            &[5, 2, 7, 7, 9, 5]
+        }
+        fn spike_pc_indices(&self, c: ClusterId) -> &[u32] {
+            [&[0u32][..], &[1u32][..]][c.idx()]
+        }
+    }
+
+    // Row r, PC p, column k holds 100r + 10p + k.
+    let pc = (0..2)
+        .flat_map(|r| (0..2).flat_map(move |p| (0..3).map(move |k| (100 * r + 10 * p + k) as f32)))
+        .collect();
+    let stub = Stub {
+        inner: StubProvider {
+            spikes: vec![vec![SampleIndex(10)], vec![SampleIndex(20)]],
+        },
+        pc,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(&dir.path().join("j.sqlite")).unwrap();
+    let mut s = Session::new(stub, journal);
+    s.seed_templates();
+    s.seed_pc_features();
+
+    // Spike 1 (template 1, channels [7, 9, 5]): channel 5 is column 2.
+    assert_eq!(s.pc_feature(1, 5, 1), Some(112.0));
+    assert_eq!(s.pc_feature(0, 2, 0), Some(1.0));
+    assert_eq!(s.pc_feature(1, 2, 0), None, "template 1 has no channel 2");
+
+    let (c0, c1) = (ClusterId(0), ClusterId(1));
+    assert_eq!(s.best_channels(&[c0]), vec![5, 2, 7]);
+    assert_eq!(s.best_channels(&[c0, c1]), vec![5, 7, 2]);
+    assert_eq!(s.best_channels(&[c1, c0]), vec![7, 5, 9]);
+}
+
+// ---- Ported from phy/apps/template/gui.py (`similarity`) -----------------
+
+/// phy: a cluster's similarity to another is the max of
+/// `similar_templates` over both clusters' templates, so a merged cluster
+/// keeps every template's neighbours. Highest first, self and empty
+/// clusters excluded.
+#[test]
+fn phy_cluster_similarity_is_max_over_templates() {
+    use sorrel_io::{HasSpikeTemplates, HasTemplateWaveforms};
+    struct Stub {
+        inner: StubProvider,
+        templates: Vec<Vec<u32>>,
+        sim: Vec<f32>,
+        waves: Vec<f32>,
+    }
+    impl DataProvider for Stub {
+        type Label = u8;
+        fn sample_rate(&self) -> f32 {
+            self.inner.sample_rate()
+        }
+        fn n_channels(&self) -> u32 {
+            1
+        }
+        fn n_samples(&self) -> SampleIndex {
+            self.inner.n_samples()
+        }
+        fn n_clusters(&self) -> u32 {
+            self.inner.n_clusters()
+        }
+        fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
+            self.inner.spike_times(c)
+        }
+        fn trace(&self, s: SampleIndex, l: u32) -> TraceSlice<'_> {
+            self.inner.trace(s, l)
+        }
+        fn initial_labels(&self) -> Vec<u8> {
+            self.inner.initial_labels()
+        }
+    }
+    impl ApplyPhyLabel for Stub {
+        fn label_from_op(op: PhyLabelOp) -> u8 {
+            StubProvider::label_from_op(op)
+        }
+    }
+    impl HasSpikeTemplates for Stub {
+        fn spike_templates(&self, c: ClusterId) -> &[u32] {
+            &self.templates[c.idx()]
+        }
+    }
+    impl HasTemplateWaveforms for Stub {
+        fn template_waveforms(&self) -> &[f32] {
+            &self.waves
+        }
+        fn template_shape(&self) -> (usize, usize, usize) {
+            (4, 2, 1)
+        }
+        fn similar_templates(&self) -> &[f32] {
+            &self.sim
+        }
+    }
+    let t = SampleIndex;
+    let (c0, c1, c2) = (ClusterId(0), ClusterId(1), ClusterId(2));
+    let build = |sim: Vec<f32>, waves: Vec<f32>| {
+        let stub = Stub {
+            inner: StubProvider {
+                // Cluster 1 holds templates 1 and 2; cluster 3 is empty.
+                spikes: vec![vec![t(10)], vec![t(20), t(30)], vec![t(40)], vec![]],
+            },
+            templates: vec![vec![0], vec![1, 2], vec![3], vec![]],
+            sim,
+            waves,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("j.sqlite")).unwrap();
+        let mut s = Session::new(stub, journal);
+        s.seed_templates();
+        s.seed_template_waveforms();
+        (s, dir)
+    };
+    #[rustfmt::skip]
+    let sim = vec![
+        1.0, 0.2, 0.9, 0.5,
+        0.2, 1.0, 0.1, 0.3,
+        0.9, 0.1, 1.0, 0.4,
+        0.5, 0.3, 0.4, 1.0,
+    ];
+    let (mut s, _d) = build(sim.clone(), vec![1.0; 8]);
+    // Cluster 1's templates {1, 2} both count: max(0.2, 0.9) = 0.9.
+    assert_eq!(s.similar_clusters(c0, &[]), vec![(c1, 0.9), (c2, 0.5)]);
+    assert_eq!(s.similar_clusters(c2, &[]), vec![(c0, 0.5), (c1, 0.4)]);
+    // `reference` and `exclude` are dropped; the empty cluster 3 never shows.
+    assert_eq!(s.similar_clusters(c0, &[c1]), vec![(c2, 0.5)]);
+    assert!(s.similar_clusters(c0, &[c1, c2]).is_empty());
+
+    // Merge cluster 1 into 2: the survivor owns templates {2, 3}, so its
+    // score against cluster 0 is max(0.9, 0.5) and the emptied source is gone.
+    s.dispatch(CurationCommand::Merge {
+        sources: vec![c1],
+        target: c2,
+    })
+    .unwrap();
+    assert_eq!(s.similar_clusters(c0, &[]), vec![(c2, 0.9)]);
+    assert_eq!(s.similar_clusters(c2, &[]), vec![(c0, 0.9)]);
+
+    // No matrix: cosine of the flattened waveforms, still max over all of a
+    // cluster's templates (primary-only would score cluster 1 as cos(t0, t1)=0).
+    #[rustfmt::skip]
+    let waves = vec![
+        1.0, 0.0, // t0
+        0.0, 1.0, // t1
+        1.0, 1.0, // t2
+        1.0, -2.0, // t3
+    ];
+    let (s, _d) = build(Vec::new(), waves);
+    let got = s.similar_clusters(c0, &[]);
+    assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![c1, c2]);
+    assert!((got[0].1 - 0.5f32.sqrt()).abs() < 1e-6, "cos(t0, t2)");
+    assert!((got[1].1 - 5f32.sqrt().recip()).abs() < 1e-6, "cos(t0, t3)");
+    // Nothing loaded at all: empty, not an error.
+    let (s, _d) = build(Vec::new(), Vec::new());
+    assert!(s.similar_clusters(c0, &[]).is_empty());
+}
+
+/// phy `split_init`: a cluster that merged several templates splits back
+/// into one cluster per template, the most common template staying put.
+#[test]
+fn phy_split_init_restores_one_cluster_per_template() {
+    use sorrel_io::HasSpikeTemplates;
+    struct Stub {
+        inner: StubProvider,
+    }
+    impl DataProvider for Stub {
+        type Label = u8;
+        fn sample_rate(&self) -> f32 {
+            self.inner.sample_rate()
+        }
+        fn n_channels(&self) -> u32 {
+            1
+        }
+        fn n_samples(&self) -> SampleIndex {
+            self.inner.n_samples()
+        }
+        fn n_clusters(&self) -> u32 {
+            self.inner.n_clusters()
+        }
+        fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
+            self.inner.spike_times(c)
+        }
+        fn trace(&self, s: SampleIndex, l: u32) -> TraceSlice<'_> {
+            self.inner.trace(s, l)
+        }
+        fn initial_labels(&self) -> Vec<u8> {
+            self.inner.initial_labels()
+        }
+    }
+    impl HasSpikeTemplates for Stub {
+        fn spike_templates(&self, _: ClusterId) -> &[u32] {
+            &[4, 7, 4, 9, 7, 4]
+        }
+    }
+    impl ApplyPhyLabel for Stub {
+        fn label_from_op(op: PhyLabelOp) -> u8 {
+            StubProvider::label_from_op(op)
+        }
+    }
+    let t = SampleIndex;
+    let stub = Stub {
+        inner: StubProvider {
+            spikes: vec![vec![t(1), t(2), t(3), t(4), t(5), t(6)]],
+        },
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(&dir.path().join("j.sqlite")).unwrap();
+    let mut s = Session::new(stub, journal);
+    s.seed_templates();
+    let cmds = s.split_by_template_commands(ClusterId(0));
+    assert_eq!(cmds.len(), 2);
+    s.dispatch(CurationCommand::batch(cmds).unwrap()).unwrap();
+    let per: Vec<Vec<u32>> = (0..s.n_clusters())
+        .map(|c| s.spike_templates(ClusterId(c)).to_vec())
+        .collect();
+    assert_eq!(per, vec![vec![4, 4, 4], vec![7, 7], vec![9]]);
+    s.dispatch(CurationCommand::Undo).unwrap();
+    assert_eq!(s.spike_templates(ClusterId(0)), [4, 7, 4, 9, 7, 4]);
+}
+
+/// phylib: `spike_<name>.npy` rows are spike attributes, and with
+/// `spike_reorder.npy` on, row `i` is drawn at row `reorder[i]`'s time.
+#[test]
+fn phy_spike_attributes_and_reorder() {
+    use sorrel_io::HasPcFeatures;
+    use std::sync::Arc;
+    struct Stub {
+        inner: StubProvider,
+    }
+    impl DataProvider for Stub {
+        type Label = u8;
+        fn sample_rate(&self) -> f32 {
+            self.inner.sample_rate()
+        }
+        fn n_channels(&self) -> u32 {
+            1
+        }
+        fn n_samples(&self) -> SampleIndex {
+            self.inner.n_samples()
+        }
+        fn n_clusters(&self) -> u32 {
+            self.inner.n_clusters()
+        }
+        fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
+            self.inner.spike_times(c)
+        }
+        fn trace(&self, s: SampleIndex, l: u32) -> TraceSlice<'_> {
+            self.inner.trace(s, l)
+        }
+        fn initial_labels(&self) -> Vec<u8> {
+            self.inner.initial_labels()
+        }
+    }
+    impl HasPcFeatures for Stub {
+        fn pc_features(&self) -> &[f32] {
+            &[]
+        }
+        fn pc_shape(&self) -> (usize, usize) {
+            (0, 0)
+        }
+        fn pc_feature_ind(&self) -> &[u32] {
+            &[]
+        }
+        fn spike_pc_indices(&self, _: ClusterId) -> &[u32] {
+            &[0, 1, 2]
+        }
+        fn spike_attributes(&self) -> Vec<(String, Arc<[f32]>, usize)> {
+            vec![("depth".into(), Arc::from([5.0, 6.0, 7.0]), 1)]
+        }
+        fn spike_reorder(&self) -> Option<Arc<[u32]>> {
+            Some(Arc::from([2, 0, 1]))
+        }
+    }
+    let t = SampleIndex;
+    let stub = Stub {
+        inner: StubProvider {
+            spikes: vec![vec![t(10), t(20), t(30)]],
+        },
+    };
+    let mut ci = ClusterIndex::from_provider(&stub);
+    ci.seed_pc_features(&stub);
+    assert_eq!(ci.spike_attribute_names(), vec![("depth", 1)]);
+    assert_eq!(ci.spike_attribute("depth", 1), Some(&[6.0][..]));
+    assert!(ci.has_spike_reorder());
+    let shown: Vec<u64> = (0..3).map(|g| ci.display_time(g, true).0).collect();
+    assert_eq!(shown, vec![30, 10, 20]);
+    assert_eq!(ci.display_time(0, false), t(10));
 }

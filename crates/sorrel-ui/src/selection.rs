@@ -33,6 +33,9 @@ use sorrel_io::ClusterId;
 pub struct SelectionSet {
     items: Vec<ClusterId>,
     anchor: Option<ClusterId>,
+    /// `items[..n_best]` came from the cluster table (phy's "best"), the
+    /// rest from the Similar pane. Table edits drop the similar part.
+    n_best: usize,
 }
 
 impl SelectionSet {
@@ -45,7 +48,57 @@ impl SelectionSet {
         Self {
             items: vec![c],
             anchor: Some(c),
+            n_best: 1,
         }
+    }
+
+    /// Clusters picked in the cluster table (phy's "best").
+    pub fn best(&self) -> &[ClusterId] {
+        &self.items[..self.n_best]
+    }
+
+    /// Clusters picked in the Similar pane; views show them after `best`.
+    pub fn similar(&self) -> &[ClusterId] {
+        &self.items[self.n_best..]
+    }
+
+    /// Replace the similar part, skipping ids already among the best.
+    pub fn set_similar(&mut self, ids: &[ClusterId]) {
+        self.items.truncate(self.n_best);
+        for &c in ids {
+            if !self.items.contains(&c) {
+                self.items.push(c);
+            }
+        }
+    }
+
+    /// Add or remove one similar cluster (Ctrl+click in the Similar pane).
+    pub fn toggle_similar(&mut self, c: ClusterId) {
+        match self.items[self.n_best..].iter().position(|&x| x == c) {
+            Some(i) => {
+                self.items.remove(self.n_best + i);
+            }
+            None if !self.items.contains(&c) => self.items.push(c),
+            None => {}
+        }
+    }
+
+    /// phy `next` / `previous` (Space / Shift+Space): move the single
+    /// similar cluster `delta` steps through `order` (the similar list,
+    /// already filtered), starting at its first entry. Clamps at the ends.
+    pub fn step_similar(&mut self, delta: i32, order: &[ClusterId]) {
+        if order.is_empty() {
+            return;
+        }
+        let next = match self
+            .similar()
+            .last()
+            .and_then(|c| order.iter().position(|x| x == c))
+        {
+            Some(i) => (i as i64 + delta as i64).clamp(0, order.len() as i64 - 1) as usize,
+            None => 0,
+        };
+        self.set_similar(&[order[next]]);
     }
 
     #[inline]
@@ -83,6 +136,7 @@ impl SelectionSet {
     pub fn clear(&mut self) {
         self.items.clear();
         self.anchor = None;
+        self.n_best = 0;
     }
 
     /// Replace the selection with a single cluster id (the most common
@@ -91,12 +145,14 @@ impl SelectionSet {
         self.items.clear();
         self.items.push(c);
         self.anchor = Some(c);
+        self.n_best = 1;
     }
 
     /// Toggle membership of `c`. When added, becomes the new anchor;
     /// when removed, the anchor is left alone unless we just removed it,
     /// in which case the new anchor is the last remaining item (or `None`).
     pub fn toggle(&mut self, c: ClusterId) {
+        self.items.truncate(self.n_best);
         if let Some(pos) = self.items.iter().position(|&x| x == c) {
             self.items.remove(pos);
             if self.anchor == Some(c) {
@@ -106,6 +162,7 @@ impl SelectionSet {
             self.items.push(c);
             self.anchor = Some(c);
         }
+        self.n_best = self.items.len();
     }
 
     /// Replace the selection with the inclusive range between the current
@@ -135,6 +192,7 @@ impl SelectionSet {
         }
         // Anchor is preserved so consecutive extend_to operations all pivot
         // around the original click — same as phy.
+        self.n_best = self.items.len();
     }
 
     /// Move the anchor by `delta` rows of `order` (clamped to its bounds)
@@ -193,6 +251,35 @@ mod tests {
         s.replace(ClusterId(1));
         s.extend_to(ClusterId(3), &order);
         assert_eq!(s.as_slice(), &[ClusterId(1), ClusterId(2), ClusterId(3)]);
+    }
+
+    #[test]
+    fn similar_part_steps_and_resets_like_phy_wizard() {
+        let similar = [ClusterId(5), ClusterId(8), ClusterId(2)];
+        let mut s = SelectionSet::single(ClusterId(1));
+        s.step_similar(1, &similar);
+        assert_eq!(
+            s.as_slice(),
+            &[ClusterId(1), ClusterId(5)],
+            "space starts at the top"
+        );
+        s.step_similar(1, &similar);
+        s.step_similar(1, &similar);
+        s.step_similar(1, &similar);
+        assert_eq!(s.similar(), &[ClusterId(2)], "clamps at the end");
+        s.step_similar(-1, &similar);
+        assert_eq!(s.best(), &[ClusterId(1)]);
+        assert_eq!(s.similar(), &[ClusterId(8)]);
+        s.toggle_similar(ClusterId(5));
+        assert_eq!(s.as_slice(), &[ClusterId(1), ClusterId(8), ClusterId(5)]);
+        // Any cluster-table edit drops the similar part.
+        s.toggle(ClusterId(3));
+        assert_eq!(s.as_slice(), &[ClusterId(1), ClusterId(3)]);
+        assert!(s.similar().is_empty());
+        s.set_similar(&[ClusterId(3), ClusterId(9)]);
+        assert_eq!(s.similar(), &[ClusterId(9)], "best ids are not repeated");
+        s.replace(ClusterId(4));
+        assert_eq!(s.as_slice(), &[ClusterId(4)]);
     }
 
     #[test]

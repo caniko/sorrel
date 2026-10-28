@@ -70,6 +70,27 @@ pub trait HasPcFeatures: DataProvider {
     /// `pc_features` — equivalently, indices into `spike_times.npy` and
     /// `amplitudes.npy`. Returns an empty slice for clusters out of range.
     fn spike_pc_indices(&self, cluster: ClusterId) -> &[u32];
+
+    /// phy's `template_features.npy` `(n_spikes, k)` flat, `k`, and
+    /// `template_feature_ind.npy` `(n_templates, k)` flat: each spike's
+    /// projection on the `k` templates nearest its own (TemplateFeatureView).
+    /// Rows follow [`Self::spike_pc_indices`]. Empty when absent.
+    fn template_features(&self) -> (std::sync::Arc<[f32]>, usize, &[u32]) {
+        (std::sync::Arc::from([]), 0, &[])
+    }
+
+    /// phylib spike attributes: every other `spike_<name>.npy` with one row
+    /// per spike, as `(name, row-major values, columns)` (phy's Spike*View).
+    /// Rows follow [`Self::spike_pc_indices`].
+    fn spike_attributes(&self) -> Vec<(String, std::sync::Arc<[f32]>, usize)> {
+        Vec::new()
+    }
+
+    /// phylib `spike_reorder.npy`: for each row, the row whose time the
+    /// Amplitude and Feature time axes show while reordering is on.
+    fn spike_reorder(&self) -> Option<std::sync::Arc<[u32]>> {
+        None
+    }
 }
 
 /// Backing for the TemplateView and SimilarityView.

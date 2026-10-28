@@ -1,6 +1,16 @@
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 
+/// One saved row of the annotations sidecar, as text: the origin label is
+/// parsed by the session (`sorrel_data::UnitOrigin::parse`), which owns the
+/// type. Empty `origin` means `Auto`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnitAnnotation {
+    pub origin: String,
+    pub parents: Vec<ClusterId>,
+    pub note: String,
+}
+
 #[repr(transparent)]
 #[derive(
     Copy,
@@ -438,6 +448,20 @@ pub trait DataProvider: Send + Sync + 'static {
     /// Missing slots mean no tags.
     fn initial_tags(&self) -> Vec<Vec<String>> {
         Vec::new()
+    }
+
+    /// Saved unit origin/lineage/notes per cluster (phy:
+    /// `cluster_sorrel_annotations.tsv`), indexed by cluster id. Missing slots
+    /// mean `Auto`, no parents, no note.
+    fn initial_annotations(&self) -> Vec<UnitAnnotation> {
+        Vec::new()
+    }
+
+    /// The sorter that produced this sorting, when the backend pinned it (an
+    /// `Auto[<sorter>]` row in the annotations sidecar). `None` leaves the
+    /// session to fall back to detection or `"unknown"`.
+    fn sorter(&self) -> Option<String> {
+        None
     }
 
     /// The backend's own identifier for a cluster, as written to interchange

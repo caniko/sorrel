@@ -14,7 +14,7 @@
 //! `recording.dat` instead. It is written last, so an interrupted export
 //! never looks complete to phy.
 
-use crate::save::write_phy_assignments;
+use crate::save::{has_added_spikes, write_phy_assignments, write_spike_array_tmps};
 use crate::session::Session;
 use anyhow::{bail, ensure, Context, Result};
 use rayon::prelude::*;
@@ -29,10 +29,11 @@ use std::path::{Path, PathBuf};
 /// journal, `curation.json`, `.phy/`) stays behind.
 const COPIED_EXTENSIONS: [&str; 3] = ["npy", "tsv", "csv"];
 /// Rewritten from the session rather than copied.
-const REWRITTEN: [&str; 3] = [
+const REWRITTEN: [&str; 4] = [
     "spike_clusters.npy",
     "cluster_group.tsv",
     sorrel_io::kilosort::TAGS_TSV,
+    sorrel_io::kilosort::ANNOTATIONS_TSV,
 ];
 
 /// Template window around each spike (SpikeInterface's defaults).
@@ -76,7 +77,20 @@ where
     }
 
     match provider.phy_dir() {
-        Some(src) => copy_phy_files(src, out)?,
+        Some(src) => {
+            // Added spikes: the per-spike arrays are rewritten, not copied.
+            let rewritten = if has_added_spikes(session.cluster_index()) {
+                write_spike_array_tmps(session, src, out)?
+            } else {
+                Vec::new()
+            };
+            copy_phy_files(src, out, &rewritten)?;
+            for n in &rewritten {
+                let (from, to) = (out.join(format!("{n}.tmp")), out.join(n));
+                std::fs::rename(&from, &to)
+                    .with_context(|| format!("rename {} -> {}", from.display(), to.display()))?;
+            }
+        }
         None => write_arrays(session, out)?,
     }
     write_phy_assignments(session, out, label_str)?;
@@ -107,7 +121,7 @@ where
 }
 
 /// Copy the phy files of `src` (top level only) into `out`.
-fn copy_phy_files(src: &Path, out: &Path) -> Result<()> {
+fn copy_phy_files(src: &Path, out: &Path, skip: &[String]) -> Result<()> {
     for entry in std::fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
         let entry = entry?;
         let name = entry.file_name();
@@ -115,7 +129,8 @@ fn copy_phy_files(src: &Path, out: &Path) -> Result<()> {
         let ext = Path::new(name).extension().and_then(|e| e.to_str());
         let wanted = ext.is_some_and(|e| COPIED_EXTENSIONS.contains(&e))
             && !name.starts_with('.')
-            && !REWRITTEN.contains(&name);
+            && !REWRITTEN.contains(&name)
+            && !skip.iter().any(|s| s == name);
         if wanted && entry.file_type()?.is_file() {
             let from = entry.path();
             atomically(&out.join(name), |tmp| std::fs::copy(&from, tmp).map(drop))?;

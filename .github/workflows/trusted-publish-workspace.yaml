@@ -863,6 +863,7 @@ jobs:
   verify-sorrel:
     needs:
       - publish-sorrel-cache
+      - publish-sorrel-compute
       - publish-sorrel-data
       - publish-sorrel-gpu
       - publish-sorrel-io

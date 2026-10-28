@@ -41,15 +41,7 @@
 
   x86_64 = portable "x86_64-unknown-linux-gnu";
 
-  desktop = pkgs.writeText "sorrel.desktop" ''
-    [Desktop Entry]
-    Type=Application
-    Name=Sorrel
-    Comment=Spike-sorting curation
-    Exec=sorrel
-    Terminal=false
-    Categories=Science;
-  '';
+  desktop = import ./desktop.nix {inherit pkgs;};
 
   # A plain type-2 AppImage whose AppRun is the portable binary itself: no
   # bundled Nix closure, so the host's GPU driver stack is used as-is.

@@ -14,7 +14,7 @@ use crate::journal::{baseline_hash, Journal};
 use crate::session::Session;
 use anyhow::{Context, Result};
 use sorrel_io::kilosort::{KilosortOpenParams, KilosortProvider};
-use sorrel_io::{DataProvider, SortingAnalyzerProvider};
+use sorrel_io::{detect_sorter, Backend, DataProvider, SortingAnalyzerProvider};
 use std::path::{Path, PathBuf};
 
 /// Where the journal lives and whether to throw an existing one away.
@@ -89,7 +89,9 @@ pub fn open_phy(
         baseline,
         provider.n_clusters(),
     )?;
-    Ok(Session::new(provider, journal))
+    let mut session = Session::new(provider, journal);
+    session.fill_detected_sorter(detect_sorter(root, Backend::Kilosort));
+    Ok(session)
 }
 
 /// Pull the optional per-spike arrays into the index and replay the journal.
@@ -107,7 +109,9 @@ pub fn open_sorting_analyzer(
     opts: &JournalOpts,
 ) -> Result<Session<SortingAnalyzerProvider>> {
     let provider = SortingAnalyzerProvider::open(root)?;
-    open_identity_sealed(provider, &journal_path(opts, root, "sorrel"), opts)
+    let mut session = open_identity_sealed(provider, &journal_path(opts, root, "sorrel"), opts)?;
+    session.fill_detected_sorter(detect_sorter(root, Backend::SortingAnalyzer));
+    Ok(session)
 }
 
 /// Seal a non-phy provider's journal against its identity bytes. Shared by

@@ -109,10 +109,24 @@ class Session:
     def merge(self, sources: list[int], target: int) -> int:
         return self._n.merge(list(sources), target)
 
-    def split(self, cluster: int, spike_idx: list[int]) -> int:
+    def split(self, cluster: int, spike_idx: list[int], by: str = "algo:python") -> int:
         """Move ``spike_idx`` (positions in the cluster's time-sorted spikes)
-        into a new cluster; returns the new cluster id."""
-        return self._n.split(cluster, list(spike_idx))
+        into a new cluster made by ``by`` (``manual``, ``algo:<name>`` or
+        ``llm:<name>``); returns the new cluster id."""
+        return self._n.split(cluster, list(spike_idx), by)
+
+    def origin(self, cluster: int) -> str:
+        """``Auto[<sorter>]`` or ``Sorrel[<method>]``."""
+        return self._n.origin(cluster)
+
+    def parents(self, cluster: int) -> list[int]:
+        return self._n.parents(cluster)
+
+    def note(self, cluster: int) -> str:
+        return self._n.note(cluster)
+
+    def sorter(self) -> str:
+        return self._n.sorter()
 
     def undo(self) -> int:
         return self._n.undo()

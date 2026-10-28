@@ -8,6 +8,8 @@
 //!   channels (`filter::GpuBiquad`).
 //! * **Mean snippet** — reduce/average over `(n_spikes, snippet_len)` matrix
 //!   (`snippets::GpuMeanSnippet`).
+//! * **Matched filter** — per-unit spatiotemporal template filter bank for spike
+//!   rescue (`matched_filter::GpuMatchedFilter`).
 //!
 //! All kernels share a [`GpuContext`] which owns the wgpu device/queue. The
 //! UI bootstrap should construct the context from the eframe-supplied
@@ -22,11 +24,13 @@ use std::sync::Arc;
 mod check;
 pub mod cmr;
 pub mod filter;
+pub mod matched_filter;
 pub mod snippets;
 
 pub use check::self_check;
 pub use cmr::GpuCmr;
 pub use filter::GpuBiquad;
+pub use matched_filter::{GpuMatchedFilter, MatchedFilterBank};
 pub use snippets::GpuMeanSnippet;
 
 /// Holds a wgpu `Device`/`Queue` pair. Cheap to clone.

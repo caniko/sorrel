@@ -1,13 +1,16 @@
-use crate::intent::{from_key_in_context, Intent};
+use crate::amplitude_view::AmplitudeViewState;
+use crate::cluster_view::{cluster_table, ClusterRows, ClusterTableState, RowInputs, TableCtx};
+use crate::feature_view::FeatureViewState;
+use crate::intent::{from_key_in_context, Intent, MoveTarget};
 use crate::jobs::{read, write, Job, JobCtx};
 use crate::layout::{self, Pane, TraceControls, ViewAction, ViewBehavior};
 use crate::prefs::UiPrefs;
 use crate::selection::SelectionSet;
+use crate::similarity_view::{SimilarityPane, SimilarityState};
 use crate::views::{
-    CcgCache, FeatureViewState, QualityCache, RasterCache, SuggestAction, SuggestCache,
-    WaveformCache,
+    CcgCache, QualityCache, RasterCache, SuggestAction, SuggestCache, WaveformCache,
 };
-use crate::widgets::{cluster_table, ClusterTableState, TraceCache};
+use crate::widgets::TraceCache;
 use eframe::egui;
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::SpikeDepths;
@@ -46,8 +49,25 @@ fn describe_command(cmd: &CurationCommand) -> String {
         } => {
             format!("split cluster {} ({} spikes)", cluster.0, spike_idx.len())
         }
-        CurationCommand::Note { cluster, .. } => format!("note on cluster {}", cluster.0),
+        CurationCommand::Note { cluster, text } if text.is_empty() => {
+            format!("clear note on cluster {}", cluster.0)
+        }
+        CurationCommand::Note { cluster, text } => {
+            let brief: String = text.chars().take(24).collect();
+            let dots = if text.chars().count() > 24 { "…" } else { "" };
+            format!("note on cluster {}: {brief}{dots}", cluster.0)
+        }
         CurationCommand::Tag { cluster, .. } => format!("retag cluster {}", cluster.0),
+        CurationCommand::AddSpikes(b) => {
+            let mut clusters = b.clusters.clone();
+            clusters.sort_unstable();
+            clusters.dedup();
+            format!(
+                "add {} spikes to {} clusters",
+                b.times.len(),
+                clusters.len()
+            )
+        }
         CurationCommand::Batch { children } => {
             // A multi-select relabel is journaled as one batch so a single
             // Undo reverts it; say so instead of "batch of N ops".
@@ -133,6 +153,8 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     /// Snapshot of `(history_len, redo_len)` at the last successful save. The
     /// title bar shows a "•" dirty marker when current state differs.
     saved_state: (usize, usize),
+    /// Hover text of the "saved" status chip once a save succeeded.
+    last_save: Option<String>,
     /// Optional pre-processing applied to the trace window before LTTB.
     trace_cfg: TracePreproc,
     /// Dockable view layout — every view is a tile the user can drag,
@@ -141,13 +163,42 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     /// Probe geometry — set by the binary when the backend exposes it.
     /// Empty means the WaveformView falls back to single-channel layout.
     channel_positions: Vec<[f32; 2]>,
+    /// Waveform/CCG/ISI parameters and hidden table columns (phy state_attrs).
+    pub view_params: crate::prefs::ViewParams,
     /// Shank id per raw channel; empty when the backend has one shank or
     /// no geometry. Enables the per-shank CMR toggle in the trace pane.
     channel_shanks: Vec<u32>,
     per_shank_cmr: bool,
     waveform_cache: WaveformCache,
     table_state: ClusterTableState,
+    /// Table cells shared by the Clusters panel and the Similar pane.
+    cluster_rows: ClusterRows,
+    /// Per-cluster quality metrics (phy `cluster_*.tsv` / `quality_metrics.csv`).
+    cluster_metrics: sorrel_io::QualityMetrics,
+    similarity: SimilarityState,
     feature_state: FeatureViewState,
+    amplitude_state: AmplitudeViewState,
+    cluster_scatter: crate::cluster_scatter::ClusterScatterState,
+    template_features: crate::template_feature_view::TemplateFeatureState,
+    /// Panes frozen on a selection (phy `toggle_auto_update`).
+    frozen: std::collections::HashMap<Pane, Vec<ClusterId>>,
+    screenshot_pane: Option<Pane>,
+    template_grid: crate::template_grid::TemplateGridCache,
+    trace_display: crate::widgets::TraceDisplay,
+    /// phy `toggle_spike_reorder` (Ctrl+R): time axes use `spike_reorder.npy`.
+    spike_reorder: bool,
+    trace_image: crate::trace_image::TraceImageCache,
+    spike_attrs: crate::spike_attr_view::SpikeAttrState,
+    /// phy v2.1 merge mode: the selection from before entry while the
+    /// staged clusters (the best part) collect similar candidates.
+    merge_mode: Option<SelectionSet>,
+    /// phy colour field for unselected clusters, and its colours cached
+    /// per `(version, scheme, depths known)` with a generation.
+    scheme: crate::theme::ColourScheme,
+    scheme_colours: Option<SchemeColours>,
+    scheme_gen: u64,
+    /// Pane rects waiting for a viewport screenshot.
+    pending_screenshots: Vec<(Pane, egui::Rect)>,
     raster_cache: RasterCache,
     suggest_cache: SuggestCache,
     ccg_cache: CcgCache,
@@ -177,11 +228,23 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     /// the re-issued close request is not intercepted again.
     close_approved: bool,
     show_help: bool,
+    /// phy snippet bar text while open (`:` or `l`).
+    snippet: Option<String>,
+    /// Ctrl+Q: close on the next frame through the unsaved-changes guard.
+    quit_requested: bool,
     /// Last window title sent to the OS; only re-sent when it changes.
     last_title: String,
     /// AA-contrast visuals go in on the first frame (no ctx before then).
     visuals_installed: bool,
 }
+
+/// Scheme colours keyed by `(version, scheme, depths known)`, with the
+/// generation the raster re-colours on.
+type SchemeColours = (
+    (u64, crate::theme::ColourScheme, bool),
+    u64,
+    Vec<Option<egui::Color32>>,
+);
 
 /// A staged action that needs explicit user approval before it runs.
 #[derive(Debug)]
@@ -240,6 +303,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             loading: None,
             load_error: None,
             saved_state: (0, 0),
+            last_save: None,
             label_str,
             selection: SelectionSet::new(),
             window_start: 0,
@@ -253,11 +317,30 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             trace_cfg: TracePreproc::Off,
             tree: layout::default_tree(),
             channel_positions: Vec::new(),
+            view_params: Default::default(),
             channel_shanks: Vec::new(),
             per_shank_cmr: true,
             waveform_cache: WaveformCache::new(),
             table_state: ClusterTableState::default(),
+            cluster_rows: ClusterRows::default(),
+            cluster_metrics: Default::default(),
+            similarity: SimilarityState::default(),
             feature_state: FeatureViewState::default(),
+            amplitude_state: AmplitudeViewState::default(),
+            cluster_scatter: Default::default(),
+            template_features: Default::default(),
+            frozen: Default::default(),
+            screenshot_pane: None,
+            template_grid: Default::default(),
+            trace_display: Default::default(),
+            spike_reorder: false,
+            trace_image: Default::default(),
+            spike_attrs: Default::default(),
+            merge_mode: None,
+            scheme: Default::default(),
+            scheme_colours: None,
+            scheme_gen: 0,
+            pending_screenshots: Vec::new(),
             raster_cache: RasterCache::new(),
             suggest_cache: SuggestCache::new(),
             ccg_cache: CcgCache::new(),
@@ -274,6 +357,8 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             pending_confirm: None,
             close_approved: false,
             show_help: false,
+            snippet: None,
+            quit_requested: false,
             last_title: String::new(),
             visuals_installed: false,
         }
@@ -310,6 +395,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         }
         self.table_state.hide_empty = prefs.hide_empty;
         self.table_state.hide_noise = prefs.hide_noise;
+        self.view_params = prefs.views;
         if let Some(ms) = prefs.window_ms {
             self.window_len = ((ms / 1000.0) * sr.max(1.0)).round().max(1.0) as u32;
         }
@@ -331,7 +417,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         };
         let prefs = UiPrefs {
             tree: Some(self.tree.clone()),
-            sort_by: Some(self.table_state.sort_by),
+            sort_by: Some(self.table_state.sort_by.clone()),
             sort_descending: self.table_state.sort_descending,
             hide_empty: self.table_state.hide_empty,
             hide_noise: self.table_state.hide_noise,
@@ -339,10 +425,16 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             hp: self.trace_cfg.hp().is_some(),
             cmr: self.trace_cfg.has_cmr(),
             anchor: self.selection.anchor().map(|c| c.0),
+            views: self.view_params.clone(),
         };
         if let Err(e) = prefs.save(dir) {
             log::warn!("could not write UI prefs: {e}");
         }
+    }
+
+    /// The shared session (tests and embedders inspect curation state).
+    pub fn session(&self) -> &Arc<RwLock<Session<P>>> {
+        &self.session
     }
 
     /// Hand the app the wgpu device/queue from `eframe`'s render state so
@@ -454,7 +546,14 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         self.trace_cache = TraceCache::default();
     }
 
+    /// Supply the dataset's per-cluster quality metrics (KS `cluster_*.tsv`,
+    /// SpikeInterface `quality_metrics.csv`); each becomes a table column.
+    pub fn set_cluster_metrics(&mut self, metrics: sorrel_io::QualityMetrics) {
+        self.cluster_metrics = metrics;
+    }
+
     pub fn set_channel_positions(&mut self, positions: Vec<[f32; 2]>) {
+        self.suggest_cache.positions = positions.clone();
         self.channel_positions = positions;
     }
 
@@ -468,11 +567,227 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         self.suggest_cache.cancel();
         self.quality_cache.cancel();
         self.depth_memo.cancel();
+        self.feature_state.cancel();
+        self.amplitude_state.cancel();
+        self.template_features.cancel();
+        self.spike_attrs.cancel();
+    }
+
+    /// The similar list the Space wizard steps through: the Similar
+    /// table's rows in display order (clusters most similar to the last
+    /// best one), with noise and MUA skipped (phy v2.1
+    /// `skip_noise_and_mua`, on by default).
+    fn similar_order(&mut self) -> Vec<ClusterId> {
+        let s = read(&self.session);
+        self.similarity.ensure(&s, self.selection.best());
+        let labels = s.labels();
+        self.similarity
+            .order()
+            .into_iter()
+            .filter(|c| {
+                labels
+                    .get(c.idx())
+                    .is_none_or(|l| !matches!((self.label_str)(l), "noise" | "mua"))
+            })
+            .collect()
+    }
+
+    /// Write `image` to `<data>/.sorrel/screenshots/<pane>-<unix secs>.png`
+    /// (phy keeps them in `~/.phy/screenshots`).
+    fn save_screenshot(&self, pane: Pane, image: &egui::ColorImage) -> anyhow::Result<PathBuf> {
+        let dir = self
+            .save_dir
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("no dataset directory"))?
+            .join(".sorrel/screenshots");
+        std::fs::create_dir_all(&dir)?;
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let name = pane.title().to_lowercase().replace([' ', '·'], "_");
+        let path = dir.join(format!("{name}-{secs}.png"));
+        let [w, h] = image.size;
+        let rgba: Vec<u8> = image
+            .pixels
+            .iter()
+            .flat_map(|c| c.to_srgba_unmultiplied())
+            .collect();
+        image::RgbaImage::from_raw(w as u32, h as u32, rgba)
+            .ok_or_else(|| anyhow::anyhow!("bad image size"))?
+            .save(&path)?;
+        Ok(path)
+    }
+
+    /// phy snippet mode: Enter runs the command, Esc closes the bar.
+    fn snippet_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(text) = self.snippet.as_mut() else {
+            return;
+        };
+        let resp = ui
+            .horizontal(|ui| {
+                ui.label(egui::RichText::new("snippet").weak());
+                let resp = ui.add(
+                    egui::TextEdit::singleline(text)
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text(":c 3 7 · :g · :l group good · :note text · :tg 12.5"),
+                );
+                resp.request_focus();
+                resp
+            })
+            .inner;
+        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            let text = self.snippet.take().unwrap_or_default();
+            match crate::snippets::parse(&text) {
+                Ok(snippet) => self.run_snippet(snippet),
+                Err(e) => self.status = toast(e),
+            }
+        }
+    }
+
+    fn run_snippet(&mut self, snippet: crate::snippets::Snippet) {
+        use crate::snippets::Snippet;
+        let n = read(&self.session).n_clusters();
+        match snippet {
+            Snippet::Merge => self.dispatch_intent(Intent::MergeSelection),
+            Snippet::Split => self.dispatch_intent(Intent::Split),
+            Snippet::Select(ids) => {
+                let ids: Vec<ClusterId> = ids.into_iter().filter(|c| c.0 < n).collect();
+                let Some((&first, rest)) = ids.split_first() else {
+                    self.status = toast("no such cluster");
+                    return;
+                };
+                self.selection.replace(first);
+                for &c in rest {
+                    self.selection.toggle(c);
+                }
+            }
+            Snippet::Label { name, value } if name == "group" => {
+                let op = match value.as_str() {
+                    "good" => PhyLabelOp::SetGood,
+                    "mua" => PhyLabelOp::SetMua,
+                    "noise" => PhyLabelOp::SetNoise,
+                    "unsorted" => PhyLabelOp::SetUnsorted,
+                    other => {
+                        self.status = toast(format!("unknown group {other}"));
+                        return;
+                    }
+                };
+                self.dispatch_intent(Intent::Move(MoveTarget::All, op));
+            }
+            Snippet::Label { name, value } => {
+                // phy custom label on every selected cluster, one undo step.
+                let cmds: Result<Vec<CurationCommand>, String> = {
+                    let s = read(&self.session);
+                    self.selection
+                        .iter()
+                        .map(|&c| s.set_label_command(c, &name, &value))
+                        .collect()
+                };
+                let cmd = match cmds {
+                    Ok(mut cmds) if cmds.len() == 1 => cmds.remove(0),
+                    Ok(cmds) => match CurationCommand::batch(cmds) {
+                        Some(b) => b,
+                        None => return,
+                    },
+                    Err(e) => {
+                        self.status = toast(e);
+                        return;
+                    }
+                };
+                self.commit(cmd);
+            }
+            Snippet::Note(text) => {
+                // One note on every selected cluster, one undo step.
+                let mut cmds: Vec<CurationCommand> = self
+                    .selection
+                    .iter()
+                    .map(|&cluster| CurationCommand::Note {
+                        cluster,
+                        text: text.clone(),
+                    })
+                    .collect();
+                match cmds.len() {
+                    0 => {}
+                    1 => {
+                        self.commit(cmds.remove(0));
+                    }
+                    _ => {
+                        if let Some(b) = CurationCommand::batch(cmds) {
+                            self.commit(b);
+                        }
+                    }
+                }
+            }
+            Snippet::Filter(expr) => self.table_state.set_filter(&expr),
+            Snippet::Sort(col) => {
+                if !self.table_state.sort_by(&col, None) {
+                    self.status = toast(format!("unknown column {col}"));
+                }
+            }
+            Snippet::TraceGoto(t) => {
+                let s = read(&self.session);
+                let sample = (t * s.provider.sample_rate()) as u64;
+                let max = s
+                    .provider
+                    .n_samples()
+                    .0
+                    .saturating_sub(self.window_len as u64);
+                self.window_start = sample.min(max);
+            }
+            Snippet::KMeans(k) => self.feature_state.request_kmeans(k),
+            Snippet::RateBins(n) => self.view_params.rate.n_bins = n,
+            Snippet::RateBinSize(secs) => {
+                let s = read(&self.session);
+                let duration = s.provider.n_samples().0 as f32 / s.provider.sample_rate().max(1.0);
+                let (lo, hi) = self.view_params.rate.x_range(duration);
+                self.view_params.rate.n_bins =
+                    (((hi - lo) / secs.max(1e-3)).round() as usize).clamp(2, 5000);
+            }
+            Snippet::RateXMin(t) => {
+                self.view_params.rate.x_min = t;
+                self.view_params.rate.pz = Default::default();
+            }
+            Snippet::RateXMax(t) => {
+                self.view_params.rate.x_max = t;
+                self.view_params.rate.pz = Default::default();
+            }
+            Snippet::ColourField(name) => match crate::theme::ColourScheme::parse(&name) {
+                Some(s) => self.scheme = s,
+                None => {
+                    self.status = toast(format!(
+                        "unknown colour field {name} (none, cluster, group, depth, fr)"
+                    ))
+                }
+            },
+            // ponytail: one sequential colormap (viridis); phy also offers
+            // diverging and rainbow. Add them if curators ask.
+            Snippet::Colormap(name) => {
+                self.status = toast(format!("colormap {name}: only viridis is available"));
+            }
+            Snippet::ScatterAxis(axis, col) => match crate::cluster_scatter::Column::parse(&col) {
+                Some(c) => self.cluster_scatter.axes[axis] = c,
+                None => {
+                    self.status = toast(format!(
+                        "unknown column {col} (amp, depth, fr, n_spikes, ch)"
+                    ))
+                }
+            },
+            Snippet::TraceWindow(len) => {
+                let s = read(&self.session);
+                let samples = (len * s.provider.sample_rate()) as u64;
+                self.window_len = samples.clamp(64, s.provider.n_samples().0.max(64)) as u32;
+            }
+        }
     }
 
     fn jobs_pending(&self) -> bool {
         self.suggest_cache.pending()
             || self.quality_cache.pending()
+            || self.feature_state.pending()
+            || self.amplitude_state.pending()
+            || self.template_features.pending()
+            || self.spike_attrs.pending()
             || self.depth_memo.pending()
             || self.phy_export_job.is_some()
     }
@@ -530,6 +845,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 cluster,
                 spike_idx,
                 new_cluster: ClusterId(0), // schema field; ClusterIndex auto-allocates
+                by: sorrel_data::command::Method::Manual,
             });
         }
         let cmd = match cmds.len() {
@@ -547,7 +863,18 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         match self.save_dir.as_deref().map(Path::to_path_buf) {
             Some(dir) => match self.save_to(&dir) {
                 Ok(()) => {
-                    self.status = toast(format!("saved to {}", dir.display()));
+                    // No toast: the status chip carries the save state, and
+                    // a stale edit message must not outlive the save.
+                    self.status = None;
+                    self.last_save = Some(format!(
+                        "Saved to {}{}",
+                        dir.display(),
+                        if self.reseal_on_save {
+                            " · undo history sealed"
+                        } else {
+                            ""
+                        }
+                    ));
                     self.error = None;
                     let s = read(&self.session);
                     self.saved_state = (s.history_len(), s.redo_len());
@@ -580,43 +907,69 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         let body = pending.body.clone();
         let is_quit = matches!(pending.action, ConfirmAction::Quit);
         let accent = egui::Color32::from_rgb(80, 130, 60);
+        let danger = ctx.global_style().visuals.error_fg_color;
+        let btn = egui::vec2(110.0, 30.0);
         let mut decision: Option<Decision> = None;
-        let resp = egui::Modal::new(egui::Id::new("sorrel-confirm")).show(ctx, |ui| {
-            ui.set_width(380.0);
-            ui.heading(&title);
-            ui.label(&body);
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").on_hover_text("Esc").clicked() {
-                    decision = Some(Decision::Cancel);
-                }
-                if is_quit {
-                    if ui.button("Quit without saving").clicked() {
+        let frame = egui::Frame::popup(&ctx.global_style())
+            .inner_margin(20.0)
+            .corner_radius(8.0);
+        let resp = egui::Modal::new(egui::Id::new("sorrel-confirm"))
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.heading(&title);
+                ui.add_space(4.0);
+                ui.label(&body);
+                ui.add_space(14.0);
+                // Right-aligned; the primary action is added first (rightmost).
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    let primary = egui::Button::new(
+                        egui::RichText::new(if is_quit { "Save & quit" } else { "Confirm" })
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(accent)
+                    .min_size(btn);
+                    let resp = ui.add(primary).on_hover_text("Enter");
+                    if ui.memory(|m| m.focused().is_none()) {
+                        resp.request_focus();
+                    }
+                    if resp.clicked() {
+                        decision = Some(if is_quit {
+                            Decision::SaveThenConfirm
+                        } else {
+                            Decision::Confirm
+                        });
+                    }
+                    if is_quit
+                        && ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Quit without saving").color(danger),
+                                )
+                                .stroke(egui::Stroke::new(1.0_f32, danger))
+                                .min_size(btn),
+                            )
+                            .clicked()
+                    {
                         decision = Some(Decision::Confirm);
                     }
                     if ui
-                        .add(egui::Button::new("Save & quit").fill(accent))
-                        .on_hover_text("Enter")
+                        .add(egui::Button::new("Cancel").min_size(btn))
+                        .on_hover_text("Esc")
                         .clicked()
                     {
-                        decision = Some(Decision::SaveThenConfirm);
+                        decision = Some(Decision::Cancel);
                     }
-                } else if ui
-                    .add(egui::Button::new("Confirm").fill(accent))
-                    .on_hover_text("Enter")
-                    .clicked()
-                {
-                    decision = Some(Decision::Confirm);
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    decision = Some(if is_quit {
+                        Decision::SaveThenConfirm
+                    } else {
+                        Decision::Confirm
+                    });
                 }
             });
-            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                decision = Some(if is_quit {
-                    Decision::SaveThenConfirm
-                } else {
-                    Decision::Confirm
-                });
-            }
-        });
         if decision.is_none() && resp.should_close() {
             decision = Some(Decision::Cancel);
         }
@@ -649,36 +1002,31 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         if !self.show_help {
             return;
         }
-        let rows: &[(&str, &str)] = &[
-            (
-                "G / M / N / U",
-                "label selection good / MUA / noise / unsorted",
-            ),
-            (
-                "J or Down · K or Up",
-                "next / previous cluster (table order)",
-            ),
-            (
-                "H or Left · L or Right",
-                "pan the trace window back / forward",
-            ),
-            (
-                "Ctrl/Cmd-G",
-                "merge the selection into the first-selected cluster",
-            ),
-            ("Ctrl/Cmd-Z", "undo"),
-            ("Ctrl/Cmd-Shift-Z · Ctrl/Cmd-Y", "redo"),
-            ("Ctrl/Cmd-S", "save spike_clusters.npy + cluster_group.tsv"),
-            ("Esc", "cancel a dialog or an in-progress lasso"),
-            ("? · F1", "toggle this help"),
+        // Keyboard rows come from the keymap itself, so they cannot drift.
+        use crate::intent::{help_rows, Section};
+        let keys = help_rows();
+        let section = |s: Section| -> Vec<(String, &'static str)> {
+            keys.iter()
+                .filter(|r| r.0 == s)
+                .map(|r| (r.1.clone(), r.2))
+                .collect()
+        };
+        let mouse: Vec<(String, &'static str)> = [
             ("click", "select one cluster"),
-            ("Ctrl/Cmd-click", "add or remove a cluster"),
+            ("Ctrl-click", "add or remove a cluster"),
             ("Shift-click", "select the range of visible rows"),
-            ("drag in Features", "lasso spikes, then split them off"),
+            (
+                "Ctrl-click in Features",
+                "add a lasso point (Ctrl-right-click clears)",
+            ),
+            (
+                "wheel · Ctrl-wheel · Alt-wheel in Features",
+                "zoom · scale · marker size",
+            ),
             ("click in Raster", "seek the trace to that time"),
             (
                 "click in Similar",
-                "compare with that cluster (Ctrl/Cmd adds it)",
+                "compare with that cluster (Ctrl adds it)",
             ),
             (
                 "drag / wheel in Trace",
@@ -688,6 +1036,14 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 "drag a tab",
                 "rearrange views · × closes · View menu reopens",
             ),
+        ]
+        .map(|(k, v)| (k.to_string(), v))
+        .to_vec();
+        let groups = [
+            ("Curation", section(Section::Curation)),
+            ("Navigation", section(Section::Navigation)),
+            ("Views", section(Section::Views)),
+            ("Mouse", mouse),
         ];
         egui::Window::new("Keyboard & mouse")
             .collapsible(false)
@@ -695,22 +1051,51 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .open(&mut self.show_help)
             .show(ctx, |ui| {
-                egui::Grid::new("sorrel-help")
-                    .num_columns(2)
-                    .spacing([16.0, 4.0])
-                    .striped(true)
+                ui.set_min_width(640.0);
+                // The key list is taller than a small window: scroll it.
+                egui::ScrollArea::vertical()
+                    // Fit inside the centred window, which egui clamps to the screen.
+                    .max_height(ctx.content_rect().height() * 0.6)
+                    // A hidden bar made the clipped list look complete.
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .show(ui, |ui| {
-                        for (key, what) in rows {
-                            ui.strong(*key);
-                            ui.label(*what);
-                            ui.end_row();
-                        }
+                        egui::Grid::new("sorrel-help")
+                            .num_columns(2)
+                            .spacing([24.0, 2.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for (heading, rows) in &groups {
+                                    ui.label(egui::RichText::new(*heading).strong());
+                                    ui.end_row();
+                                    for (key, what) in rows {
+                                        ui.label(egui::RichText::new(key).monospace().strong());
+                                        ui.label(*what);
+                                        ui.end_row();
+                                    }
+                                }
+                            });
                     });
             });
     }
 
     fn dispatch_intent(&mut self, intent: Intent) {
         let n = read(&self.session).n_clusters();
+        // phy merge mode: picks become merge candidates and labels wait.
+        if self.merge_mode.is_some() {
+            match intent {
+                Intent::SelectCluster(c) | Intent::ToggleCluster(c) | Intent::ExtendCluster(c) => {
+                    if c.0 < n && !self.selection.best().contains(&c) {
+                        self.selection.toggle_similar(c);
+                    }
+                    return;
+                }
+                Intent::Move(..) | Intent::Snippet(":l ") => {
+                    self.status = toast("labels are unavailable in merge mode (V leaves it)");
+                    return;
+                }
+                _ => {}
+            }
+        }
         match intent {
             Intent::SelectCluster(c) => {
                 if c.0 < n {
@@ -727,24 +1112,136 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     self.selection.extend_to(c, &self.table_state.visible);
                 }
             }
-            Intent::Relabel(op) => {
-                // Apply to every cluster in the active selection as one
-                // journal entry, so a single Undo reverts the whole relabel.
-                let mut cmds: Vec<CurationCommand> = self
-                    .selection
+            Intent::Move(target, op) => {
+                let clusters = match target {
+                    MoveTarget::Best => self.selection.best(),
+                    MoveTarget::Similar => self.selection.similar(),
+                    MoveTarget::All => self.selection.as_slice(),
+                }
+                .to_vec();
+                if clusters.is_empty() {
+                    self.status = toast("no similar cluster selected");
+                    return;
+                }
+                // One journal entry, so a single Undo reverts the whole move.
+                let mut cmds: Vec<CurationCommand> = clusters
                     .iter()
                     .map(|&c| CurationCommand::Relabel { cluster: c, op })
                     .collect();
                 let cmd = match cmds.len() {
-                    0 => return,
                     1 => cmds.remove(0),
                     _ => match CurationCommand::batch(cmds) {
                         Some(b) => b,
                         None => return,
                     },
                 };
-                self.commit(cmd);
+                if !self.commit(cmd) {
+                    return;
+                }
+                // phy `_after_move`: a moved similar cluster advances the
+                // similar list; moving the best advances the cluster table.
+                if target == MoveTarget::Similar {
+                    let order = self.similar_order();
+                    self.selection.step_similar(1, &order);
+                } else {
+                    self.selection.bump(1, &self.table_state.visible);
+                }
             }
+            Intent::FirstCluster => self.selection.bump(i32::MIN, &self.table_state.visible),
+            Intent::LastCluster => self.selection.bump(i32::MAX, &self.table_state.visible),
+            Intent::ResetWizard => self.selection.bump(i32::MIN, &self.table_state.visible),
+            Intent::NextSimilar | Intent::PrevSimilar => {
+                let order = self.similar_order();
+                let delta = if intent == Intent::NextSimilar { 1 } else { -1 };
+                self.selection.step_similar(delta, &order);
+            }
+            Intent::SelectFirstSimilar => {
+                let order = self.similar_order();
+                self.selection.set_similar(&order[..order.len().min(15)]);
+            }
+            Intent::UnselectSimilar => self.selection.set_similar(&[]),
+            Intent::TraceStart => self.window_start = 0,
+            Intent::TraceEnd => {
+                self.window_start = read(&self.session)
+                    .provider
+                    .n_samples()
+                    .0
+                    .saturating_sub(self.window_len as u64);
+            }
+            Intent::TraceNarrow => self.window_len = (self.window_len / 2).max(64),
+            Intent::TraceWiden => {
+                let n = read(&self.session).provider.n_samples().0;
+                self.window_len = (self.window_len.saturating_mul(2) as u64).min(n.max(64)) as u32;
+            }
+            Intent::ToggleSpikeReorder => {
+                if !read(&self.session).cluster_index().has_spike_reorder() {
+                    self.status = toast("no spike_reorder.npy in this dataset");
+                } else {
+                    self.spike_reorder = !self.spike_reorder;
+                    self.status = toast(if self.spike_reorder {
+                        "time axes: reordered (spike_reorder.npy)"
+                    } else {
+                        "time axes: recorded spike times"
+                    });
+                }
+            }
+            Intent::TraceOrigin => self.trace_display.flip = !self.trace_display.flip,
+            Intent::TraceAllSpikes => {
+                self.trace_display.all_spikes = !self.trace_display.all_spikes;
+            }
+            Intent::TraceLabels => self.trace_display.labels = !self.trace_display.labels,
+            Intent::TraceGain(d) => {
+                let g = self.trace_display.gain * 1.25f32.powi(d);
+                self.trace_display.gain = g.clamp(0.05, 50.0);
+            }
+            Intent::NextSpike | Intent::PrevSpike => {
+                // The selection's spike nearest after (before) the window
+                // centre, centred in the window.
+                let s = read(&self.session);
+                let centre = self.window_start + self.window_len as u64 / 2;
+                let next = intent == Intent::NextSpike;
+                let pick = self
+                    .selection
+                    .iter()
+                    .filter_map(|&c| {
+                        let t = s.spike_times(c);
+                        let i = t.partition_point(|x| x.0 <= centre);
+                        if next {
+                            t.get(i).map(|x| x.0)
+                        } else {
+                            let j = t.partition_point(|x| x.0 < centre);
+                            j.checked_sub(1).map(|j| t[j].0)
+                        }
+                    })
+                    .reduce(|a, b| if next { a.min(b) } else { a.max(b) });
+                if let Some(t) = pick {
+                    let max = s
+                        .provider
+                        .n_samples()
+                        .0
+                        .saturating_sub(self.window_len as u64);
+                    self.window_start = t.saturating_sub(self.window_len as u64 / 2).min(max);
+                }
+            }
+            Intent::Snippet(prefill) => self.snippet = Some(prefill.to_string()),
+            Intent::Quit => self.quit_requested = true,
+            Intent::ToggleMergeMode => match self.merge_mode.take() {
+                // Cancel: back to the selection from before entry.
+                Some(before) => self.selection = before,
+                None if self.selection.is_empty() => {
+                    self.status = toast("select a cluster to stage first");
+                }
+                None => {
+                    // Stage the whole selection, reference (blue) first; the
+                    // Similar pane then adds candidates.
+                    self.merge_mode = Some(self.selection.clone());
+                    let staged = self.selection.as_slice().to_vec();
+                    self.selection.replace(staged[0]);
+                    for &c in &staged[1..] {
+                        self.selection.toggle(c);
+                    }
+                }
+            },
             Intent::MergeSelection => {
                 let sel = self.selection.as_slice();
                 if sel.len() < 2 {
@@ -755,7 +1252,9 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     sources: sel[1..].to_vec(),
                     target: sel[0],
                 };
-                self.commit(cmd);
+                if self.commit(cmd) {
+                    self.merge_mode = None;
+                }
             }
             Intent::Undo => {
                 // Peek the about-to-be-undone command first so the status
@@ -805,14 +1304,65 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             Intent::Cancel => {
                 if self.pending_confirm.take().is_some() {
                     // Dialog dismissed.
+                } else if self.snippet.take().is_some() {
+                    // Snippet bar closed.
                 } else if self.show_help {
                     self.show_help = false;
+                } else if self.spike_attrs.cancel_lasso() {
+                    // Spike-data lasso cleared.
+                } else if self.template_features.cancel_lasso() {
+                    // Template-feature lasso cleared.
+                } else if self.cluster_scatter.cancel_lasso() {
+                    // Cluster-scatter lasso cleared.
+                } else if self.amplitude_state.cancel_split() {
+                    self.status = toast("amplitude split cancelled");
                 } else if self.feature_state.lasso_active() {
                     self.feature_state.cancel_lasso();
                     self.status = toast("lasso cancelled");
                 }
             }
             Intent::ToggleHelp => self.show_help = !self.show_help,
+            Intent::SplitInit => {
+                let cmds: Vec<CurationCommand> = {
+                    let s = read(&self.session);
+                    self.selection
+                        .iter()
+                        .flat_map(|&c| s.split_by_template_commands(c))
+                        .collect()
+                };
+                let nothing = cmds.is_empty();
+                match CurationCommand::batch(cmds).filter(|_| !nothing) {
+                    Some(cmd) => {
+                        self.commit(cmd);
+                    }
+                    None => self.status = toast("every selected cluster has a single template"),
+                }
+            }
+            // phy asks every view for its lasso; the first armed one splits.
+            Intent::Split => {
+                if self.feature_state.lasso_closed() {
+                    self.feature_state.request_split();
+                } else if self.amplitude_state.can_split() {
+                    self.amplitude_state.request_split();
+                } else if self.template_features.lasso_closed() {
+                    self.template_features.request_split();
+                } else if self.spike_attrs.lasso_closed() {
+                    self.spike_attrs.request_split();
+                } else {
+                    self.status = toast("draw a lasso first: Ctrl+click in Features or Amplitudes");
+                }
+            }
+            Intent::CycleAmplitudes(delta) => {
+                let kind = self.amplitude_state.cycle(delta);
+                self.status = toast(format!("amplitudes: {kind:?}").to_lowercase());
+            }
+            Intent::ToggleFeatureChannels => {
+                self.status = toast(if self.feature_state.toggle_channels() {
+                    "feature channels fixed"
+                } else {
+                    "feature channels follow the selection"
+                });
+            }
         }
     }
 
@@ -833,12 +1383,83 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             )
         };
         ui.horizontal(|ui| {
-            ui.heading(if dirty { "Sorrel •" } else { "Sorrel" })
-                .on_hover_text(if dirty {
-                    "Unsaved curation — Cmd/Ctrl-S writes phy artefacts."
-                } else {
-                    "All curation saved."
-                });
+            ui.heading(egui::RichText::new("Sorrel").strong());
+            // Save-state chip: unsaved / saved / failed, with the detail on hover.
+            let theme = crate::theme::Theme::from_ui(ui);
+            let failed = self
+                .error
+                .as_deref()
+                .filter(|e| e.starts_with("save failed"));
+            // Icon kinds are painted: egui's bundled fonts lack ● and ✓.
+            #[derive(PartialEq)]
+            enum Icon {
+                None,
+                Dot,
+                Check,
+                Cross,
+            }
+            let (icon, text, colour, tip) = if let Some(e) = failed {
+                (Icon::Cross, "save failed", theme.danger, e.to_string())
+            } else if dirty {
+                (
+                    Icon::Dot,
+                    "unsaved",
+                    theme.warn,
+                    "Unsaved curation — Cmd/Ctrl-S writes phy artefacts.".to_string(),
+                )
+            } else if let Some(tip) = &self.last_save {
+                (Icon::Check, "saved", theme.good, tip.clone())
+            } else {
+                (
+                    Icon::None,
+                    "no changes",
+                    theme.caption,
+                    "All curation saved.".to_string(),
+                )
+            };
+            egui::Frame::new()
+                .fill(colour.gamma_multiply(0.18))
+                .corner_radius(10)
+                .inner_margin(egui::Margin::symmetric(8, 1))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    ui.horizontal(|ui| {
+                        if icon != Icon::None {
+                            let (r, _) =
+                                ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                            let (p, s) = (ui.painter(), egui::Stroke::new(1.6_f32, colour));
+                            let c = r.center();
+                            match icon {
+                                Icon::Dot => {
+                                    p.circle_filled(c, 3.5, colour);
+                                }
+                                Icon::Check => {
+                                    p.add(egui::Shape::line(
+                                        vec![
+                                            egui::pos2(c.x - 4.0, c.y),
+                                            egui::pos2(c.x - 1.5, c.y + 3.0),
+                                            egui::pos2(c.x + 4.0, c.y - 3.0),
+                                        ],
+                                        s,
+                                    ));
+                                }
+                                _ => {
+                                    p.line_segment(
+                                        [c - egui::vec2(3.5, 3.5), c + egui::vec2(3.5, 3.5)],
+                                        s,
+                                    );
+                                    p.line_segment(
+                                        [c + egui::vec2(-3.5, 3.5), c + egui::vec2(3.5, -3.5)],
+                                        s,
+                                    );
+                                }
+                            }
+                        }
+                        ui.label(egui::RichText::new(text).color(colour));
+                    });
+                })
+                .response
+                .on_hover_text(tip);
             ui.separator();
             ui.label(info);
             ui.separator();
@@ -876,8 +1497,13 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 .first()
                 .map(|c| c.0.to_string())
                 .unwrap_or_default();
+            let merge_label = if n_sel >= 2 {
+                format!("Merge {n_sel} -> c{target}")
+            } else {
+                "Merge".to_string()
+            };
             if ui
-                .add_enabled(n_sel >= 2, egui::Button::new(format!("Merge {n_sel}")))
+                .add_enabled(n_sel >= 2, egui::Button::new(merge_label))
                 .on_hover_text(format!(
                     "Merge the selection into cluster {target} (Cmd/Ctrl-G)"
                 ))
@@ -897,21 +1523,24 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     Err(e) => self.error = Some(format!("phy export failed: {e:#}")),
                 }
             }
-            if let Some(err) = self.error.clone() {
-                ui.separator();
-                ui.colored_label(ui.visuals().error_fg_color, &err);
-                if ui.small_button("×").on_hover_text("dismiss").clicked() {
-                    self.error = None;
-                }
-            } else if let Some((status, _)) = &self.status {
-                ui.separator();
-                ui.weak(status);
-            }
-            if self.jobs_pending() {
-                ui.separator();
-                ui.spinner();
-                ui.weak("working…")
-                    .on_hover_text("Background metrics are computing; curation stays responsive.");
+            let save_tip = match self.save_dir.as_deref() {
+                Some(dir) => format!(
+                    "Write spike_clusters.npy + cluster_group.tsv to {} (Cmd/Ctrl-S)",
+                    dir.display()
+                ),
+                None => "Open sorrel with a kilosort directory to enable saving.".to_string(),
+            };
+            if ui
+                .add_enabled(dirty && self.save_dir.is_some(), egui::Button::new("Save"))
+                .on_hover_text(&save_tip)
+                .on_disabled_hover_text(if self.save_dir.is_some() {
+                    "Nothing to save".to_string()
+                } else {
+                    save_tip.clone()
+                })
+                .clicked()
+            {
+                self.dispatch_intent(Intent::Save);
             }
 
             // Stable ids for the right-hand widgets: the left side's widget
@@ -921,7 +1550,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             ui.with_layout(right, |ui| {
                 ui.push_id("topbar-right", |ui| {
                     if ui
-                        .small_button("?")
+                        .button("Help")
                         .on_hover_text("Keyboard & mouse help (? / F1)")
                         .clicked()
                     {
@@ -951,7 +1580,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     .response
                     .on_hover_text("Drag tabs to rearrange; close with ×; reopen here");
                     if ui
-                        .small_button("Export QC")
+                        .button("Export QC")
                         .on_hover_text(
                             "Write cluster_qc.tsv + cluster_qc.json into the save directory \
                          (SpikeInterface-compatible).",
@@ -982,7 +1611,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                         if ui
                             .add_enabled(
                                 self.phy_export_job.is_none(),
-                                egui::Button::new("Export phy").small(),
+                                egui::Button::new("Export phy"),
                             )
                             .on_hover_text(
                                 "Write the curated data as a complete phy directory next to \
@@ -1000,20 +1629,26 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                             ));
                         }
                     }
-                    // Show the configured save target so users know where
-                    // Cmd/Ctrl-S and Export QC will write.
-                    if let Some(dir) = self.save_dir.as_deref() {
-                        ui.label(format!("saves to {}", short_path(dir)))
-                            .on_hover_text(format!(
-                                "Save target: {}\nWrites spike_clusters.npy, cluster_group.tsv \
-                             (Cmd/Ctrl-S) and cluster_qc.tsv/json (Export QC).",
-                                dir.display()
-                            ));
-                    } else {
-                        ui.colored_label(ui.visuals().warn_fg_color, "no save target")
-                            .on_hover_text(
-                                "Open sorrel with a kilosort directory to enable saving.",
-                            );
+                    // Whatever room is left between the two groups goes to
+                    // the transient message, truncated with the full text
+                    // on hover.
+                    if self.jobs_pending() {
+                        ui.weak("working…").on_hover_text(
+                            "Background metrics are computing; curation stays responsive.",
+                        );
+                        ui.spinner();
+                    }
+                    if let Some(err) = self.error.clone() {
+                        if ui.button("×").on_hover_text("dismiss").clicked() {
+                            self.error = None;
+                        }
+                        let text = egui::RichText::new(&err).color(ui.visuals().error_fg_color);
+                        ui.add(egui::Label::new(text).truncate())
+                            .on_hover_text(&err);
+                    } else if let Some((status, _)) = self.status.clone() {
+                        let text = egui::RichText::new(&status).weak();
+                        ui.add(egui::Label::new(text).truncate())
+                            .on_hover_text(&status);
                     }
                 })
             });
@@ -1032,17 +1667,18 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             }
             ViewAction::Split(splits) => self.apply_lasso_splits(splits),
             ViewAction::Suggest(act) => self.apply_suggest_action(act),
-            ViewAction::Compare { cluster, add } => {
+            ViewAction::SelectSimilar { cluster, add } => {
                 if add {
-                    self.selection.toggle(cluster);
-                } else if let Some(&primary) = self.selection.as_slice().first() {
-                    self.selection.replace(primary);
-                    if cluster != primary {
-                        self.selection.toggle(cluster);
-                    }
+                    self.selection.toggle_similar(cluster);
+                } else {
+                    self.selection.set_similar(&[cluster]);
                 }
             }
+            ViewAction::SelectChannel { channel, secondary } => {
+                self.feature_state.select_channel(channel, secondary);
+            }
             ViewAction::AddPane(pane, into) => layout::add_pane(&mut self.tree, pane, Some(into)),
+            ViewAction::Screenshot(pane, rect) => self.pending_screenshots.push((pane, rect)),
         }
     }
 
@@ -1064,6 +1700,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     cluster,
                     spike_idx,
                     new_cluster: ClusterId(0),
+                    by: sorrel_data::command::Method::Algo("gmm".into()),
                 });
             }
             SuggestAction::ApplyHighConfidenceMerges { threshold } => {
@@ -1126,13 +1763,15 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 }
                 Err(TryRecvError::Empty) => {
                     egui::CentralPanel::default().show_inside(root_ui, |ui| {
-                        ui.centered_and_justified(|ui| {
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(ui.available_height() * 0.4);
-                                ui.spinner();
-                                ui.heading(format!("Loading {name}…"));
-                                ui.weak("seeding amplitudes, features and templates; replaying the journal");
-                            });
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(ui.available_height() * 0.35);
+                            ui.add(egui::Spinner::new().size(28.0));
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Sorrel").strong());
+                            ui.heading(format!("Loading {name}…"));
+                            ui.label(
+                                "seeding amplitudes, features and templates; replaying the journal",
+                            );
                         });
                     });
                     ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -1141,13 +1780,32 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             }
         }
         if let Some(err) = self.load_error.clone() {
+            let path = self.save_dir.as_deref().map(|p| p.display().to_string());
             egui::CentralPanel::default().show_inside(root_ui, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(ui.available_height() * 0.3);
-                    ui.heading(format!("Could not open {name}"));
-                    ui.colored_label(ui.visuals().error_fg_color, err);
+                    let danger = ui.visuals().error_fg_color;
+                    ui.add_space(ui.available_height() * 0.35);
+                    ui.heading(
+                        egui::RichText::new(format!("Could not open {name}"))
+                            .strong()
+                            .color(danger),
+                    );
+                    ui.add_space(4.0);
+                    if let Some(path) = path {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_width(480.0);
+                            ui.add(egui::Label::new(egui::RichText::new(path).monospace()).wrap());
+                        });
+                    }
+                    ui.scope(|ui| {
+                        ui.set_max_width(480.0);
+                        ui.add(egui::Label::new(egui::RichText::new(err).color(danger)).wrap());
+                    });
                     ui.add_space(8.0);
-                    if ui.button("Quit").clicked() {
+                    if ui
+                        .add(egui::Button::new("Quit").min_size(egui::vec2(160.0, 30.0)))
+                        .clicked()
+                    {
                         self.close_approved = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -1164,6 +1822,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
         let ctx = root_ui.ctx().clone();
         if !self.visuals_installed {
             crate::theme::install_visuals(&ctx);
+            crate::theme::install_style(&ctx);
             self.visuals_installed = true;
         }
         if self.show_loading(&ctx, root_ui) {
@@ -1174,6 +1833,39 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
         // so typing in a filter box doesn't relabel selected clusters; global
         // shortcuts (Cmd/Ctrl-S/Z/Shift-Z) still fire. While a confirm
         // dialog is open only Esc gets through — the modal owns the keys.
+        // phy `screenshot`: ask for the frame, then crop and save the pane.
+        for (pane, rect) in self.pending_screenshots.drain(..) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new((
+                pane, rect,
+            ))));
+        }
+        let shots: Vec<(Pane, egui::Rect, std::sync::Arc<egui::ColorImage>)> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|ev| match ev {
+                    egui::Event::Screenshot {
+                        user_data, image, ..
+                    } => {
+                        let &(pane, rect) = user_data
+                            .data
+                            .as_ref()?
+                            .downcast_ref::<(Pane, egui::Rect)>()?;
+                        Some((pane, rect, image.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        });
+        for (pane, rect, image) in shots {
+            let ppp = ctx.pixels_per_point();
+            self.status = toast(
+                match self.save_screenshot(pane, &image.region(&rect, Some(ppp))) {
+                    Ok(path) => format!("screenshot saved to {}", path.display()),
+                    Err(e) => format!("screenshot failed: {e}"),
+                },
+            );
+        }
+
         let text_input_active = ctx.egui_wants_keyboard_input();
         let input_intents: Vec<Intent> = ctx.input(|i| {
             i.events
@@ -1197,6 +1889,9 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
             self.dispatch_intent(it);
         }
 
+        if std::mem::take(&mut self.quit_requested) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         let dirty = self.dirty();
 
         // Unsaved-changes guard: intercept the window close once and ask.
@@ -1204,9 +1899,13 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.pending_confirm = Some(PendingConfirm {
                 title: "Quit with unsaved curation?".into(),
-                body: "Edits are journaled, but spike_clusters.npy and cluster_group.tsv \
-                       have not been written since the last save."
-                    .into(),
+                body: format!(
+                    "Edits are journaled, but spike_clusters.npy and cluster_group.tsv in {} \
+                     have not been written since the last save.",
+                    self.save_dir
+                        .as_deref()
+                        .map_or_else(|| "the save directory".to_string(), short_path)
+                ),
                 action: ConfirmAction::Quit,
                 on_success: String::new(),
             });
@@ -1249,21 +1948,86 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
             }
         }
 
-        egui::Panel::top("top").show_inside(root_ui, |ui| self.top_bar(ui, dirty));
+        // 24 px controls + 6 px margins = a 36 px bar.
+        let bar_frame = egui::Frame::side_top_panel(root_ui.style())
+            .inner_margin(egui::Margin::symmetric(8, 6));
+        egui::Panel::top("top")
+            .frame(bar_frame)
+            .show_inside(root_ui, |ui| self.top_bar(ui, dirty));
+        if self.merge_mode.is_some() {
+            let (staged, similar) = (self.selection.best().len(), self.selection.similar().len());
+            egui::Panel::bottom("merge-mode")
+                .frame(bar_frame)
+                .show_inside(root_ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong("Merge mode");
+                        ui.label(format!(
+                            "{staged} staged + {similar} similar · G merges {} · V cancels",
+                            staged + similar
+                        ));
+                        if ui.button("Cancel merge mode").clicked() {
+                            self.dispatch_intent(Intent::ToggleMergeMode);
+                        }
+                    });
+                });
+        }
+        if self.snippet.is_some() {
+            egui::Panel::bottom("snippet")
+                .frame(bar_frame)
+                .show_inside(root_ui, |ui| self.snippet_bar(ui));
+        }
 
+        // No side margin: the table runs edge to edge, and the heading and
+        // filter strip pad themselves.
+        let side_frame = egui::Frame::side_top_panel(root_ui.style()).inner_margin(egui::Margin {
+            left: 0,
+            right: 0,
+            top: 12,
+            bottom: 0,
+        });
         egui::Panel::left("clusters")
+            .frame(side_frame)
             .resizable(true)
-            .default_size(260.0)
+            .default_size((root_ui.available_width() * 0.22).max(300.0))
+            .size_range(300.0..=640.0)
             .show_inside(root_ui, |ui| {
-                ui.heading("Clusters");
                 let session = read(&self.session);
-                cluster_table(
-                    ui,
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.heading("Clusters");
+                    // `visible` is last frame's list; one frame of lag is invisible.
+                    ui.weak(format!(
+                        "{} / {}",
+                        self.table_state.visible.len(),
+                        session.n_clusters()
+                    ))
+                    .on_hover_text("visible / total clusters");
+                });
+                self.cluster_rows.ensure(
                     &session,
-                    &mut self.selection,
-                    &mut self.table_state,
+                    RowInputs {
+                        positions: &self.channel_positions,
+                        shanks: &self.channel_shanks,
+                        metrics: &self.cluster_metrics,
+                    },
                     self.label_str,
                 );
+                let selected: Vec<ClusterId> = self.selection.iter().copied().collect();
+                let click = cluster_table(
+                    ui,
+                    &session,
+                    &mut self.table_state,
+                    TableCtx {
+                        selected: &selected,
+                        anchor: self.selection.anchor(),
+                        rows: &self.cluster_rows,
+                        hidden: &mut self.view_params.hidden_cols,
+                        similar: None,
+                    },
+                );
+                if let Some(click) = click {
+                    click.apply(&mut self.selection, &self.table_state.visible);
+                }
             });
 
         egui::CentralPanel::default().show_inside(root_ui, |ui| {
@@ -1300,6 +2064,39 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                         &[]
                     },
                 );
+                // Colour-scheme colours for unselected clusters, per curation
+                // version and scheme.
+                let scheme_key = (session.version(), self.scheme, depths.is_some());
+                if self
+                    .scheme_colours
+                    .as_ref()
+                    .is_none_or(|(k, ..)| *k != scheme_key)
+                {
+                    let n = session.n_clusters();
+                    let duration = (session.provider.n_samples().0 as f32
+                        / session.provider.sample_rate().max(1.0))
+                    .max(1e-3);
+                    let ids = (0..n).map(ClusterId);
+                    let groups: Vec<&str> = ids
+                        .clone()
+                        .map(|c| session.label(c).map_or("", |l| (self.label_str)(&l)))
+                        .collect();
+                    let fr: Vec<f32> = ids
+                        .clone()
+                        .map(|c| session.spike_times(c).len() as f32 / duration)
+                        .collect();
+                    let depth: Vec<f32> = ids
+                        .map(|c| {
+                            let d = depths.and_then(|d| d.per_cluster.get(c.idx()));
+                            d.filter(|d| !d.is_empty())
+                                .map_or(f32::NAN, |d| d.iter().sum::<f32>() / d.len() as f32)
+                        })
+                        .collect();
+                    let colours = crate::theme::scheme_colours(self.scheme, &groups, &depth, &fr);
+                    self.scheme_gen += 1;
+                    self.scheme_colours = Some((scheme_key, self.scheme_gen, colours));
+                }
+                let (_, colours_gen, colours) = self.scheme_colours.as_ref().expect("just built");
                 let mut behavior = ViewBehavior {
                     session: &session,
                     selection: &selected,
@@ -1307,9 +2104,28 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                     channel_positions: &self.channel_positions,
                     waveform_cache: &mut self.waveform_cache,
                     feature_state: &mut self.feature_state,
+                    amplitude_state: &mut self.amplitude_state,
+                    cluster_scatter: &mut self.cluster_scatter,
+                    template_features: &mut self.template_features,
+                    frozen: &mut self.frozen,
+                    screenshot: &mut self.screenshot_pane,
+                    table_order: &self.table_state.visible,
+                    template_grid: &mut self.template_grid,
+                    trace_image: &mut self.trace_image,
+                    spike_attrs: &mut self.spike_attrs,
+                    colours,
+                    colours_gen: *colours_gen,
+                    scheme_delta: 0,
+                    spike_reorder: self.spike_reorder,
                     raster_cache: &mut self.raster_cache,
                     suggest_cache: &mut self.suggest_cache,
                     ccg_cache: &mut self.ccg_cache,
+                    view_params: &mut self.view_params,
+                    similar: SimilarityPane {
+                        state: &mut self.similarity,
+                        rows: &self.cluster_rows,
+                        best: self.selection.best(),
+                    },
                     quality_cache: &mut self.quality_cache,
                     jobs: &jobs,
                     events: self.events.as_deref(),
@@ -1325,14 +2141,20 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                         cache: &mut self.trace_cache,
                         shanks: &self.channel_shanks,
                         per_shank: &mut self.per_shank_cmr,
+                        display: self.trace_display,
                     },
                     closed,
                     active_tabs,
                     actions: Vec::new(),
                 };
                 self.tree.ui(&mut behavior, ui);
-                behavior.actions
+                (behavior.actions, behavior.scheme_delta)
             };
+            let (actions, scheme_delta) = actions;
+            if scheme_delta != 0 {
+                self.scheme = self.scheme.step(scheme_delta);
+                self.status = toast(format!("colour scheme: {}", self.scheme.name()));
+            }
             for action in actions {
                 self.apply_view_action(action);
             }
@@ -1448,11 +2270,48 @@ mod tests {
     }
 
     #[test]
+    fn merge_mode_stages_candidates_and_cancel_restores() {
+        let (mut app, _d) = make_app();
+        app.selection.replace(ClusterId(0));
+        app.dispatch_intent(Intent::ToggleMergeMode);
+        // Picks become candidates; labels wait.
+        app.dispatch_intent(Intent::SelectCluster(ClusterId(2)));
+        assert_eq!(app.selection.as_slice(), &[ClusterId(0), ClusterId(2)]);
+        app.dispatch_intent(Intent::Move(MoveTarget::All, PhyLabelOp::SetGood));
+        assert_eq!(history_len(&app), 0, "no relabel in merge mode");
+        // V again cancels back to the pre-entry selection.
+        app.dispatch_intent(Intent::ToggleMergeMode);
+        assert_eq!(app.selection.as_slice(), &[ClusterId(0)]);
+        // G merges staged + candidates and leaves merge mode.
+        app.dispatch_intent(Intent::ToggleMergeMode);
+        app.dispatch_intent(Intent::ToggleCluster(ClusterId(1)));
+        app.dispatch_intent(Intent::MergeSelection);
+        assert_eq!(history_len(&app), 1);
+        assert!(app.merge_mode.is_none());
+    }
+
+    #[test]
+    fn alt_pgdn_centres_the_trace_on_the_selections_next_spike() {
+        let (mut app, _d) = make_app();
+        app.selection.replace(ClusterId(0));
+        app.selection.toggle(ClusterId(1));
+        (app.window_start, app.window_len) = (0, 10);
+        app.dispatch_intent(Intent::NextSpike);
+        assert_eq!(app.window_start, 5, "spike 10 centred");
+        app.dispatch_intent(Intent::NextSpike);
+        assert_eq!(app.window_start, 25, "spike 30, across both clusters");
+        app.dispatch_intent(Intent::NextSpike);
+        assert_eq!(app.window_start, 35, "spike 40 of cluster 1");
+        app.dispatch_intent(Intent::PrevSpike);
+        assert_eq!(app.window_start, 25);
+    }
+
+    #[test]
     fn relabel_intent_mutates_session_and_marks_dirty() {
         let (mut app, _d) = make_app();
         assert!(!app.dirty(), "fresh session should be clean");
 
-        app.dispatch_intent(Intent::Relabel(PhyLabelOp::SetGood));
+        app.dispatch_intent(Intent::Move(MoveTarget::All, PhyLabelOp::SetGood));
 
         assert_eq!(label(&app, 0), Some(1));
         assert!(
@@ -1467,7 +2326,7 @@ mod tests {
         let (mut app, _d) = make_app();
         app.selection.toggle(ClusterId(1));
         app.selection.toggle(ClusterId(2));
-        app.dispatch_intent(Intent::Relabel(PhyLabelOp::SetMua));
+        app.dispatch_intent(Intent::Move(MoveTarget::All, PhyLabelOp::SetMua));
         assert_eq!(history_len(&app), 1, "batched into one entry");
         assert!(app
             .status
@@ -1507,20 +2366,25 @@ mod tests {
     fn save_with_save_dir_clears_dirty_sets_status_and_writes_prefs() {
         let (mut app, dir) = make_app();
         app.set_save_dir(dir.path().to_path_buf(), false);
-        app.dispatch_intent(Intent::Relabel(PhyLabelOp::SetMua));
+        app.dispatch_intent(Intent::Move(MoveTarget::All, PhyLabelOp::SetMua));
         assert!(app.dirty());
 
         app.dispatch_intent(Intent::Save);
 
         assert!(app.error.is_none(), "save should succeed: {:?}", app.error);
-        assert!(app.status.is_some(), "save should produce a status toast");
+        assert!(
+            app.status.is_none(),
+            "save clears the toast; the chip says it"
+        );
+        assert!(app.last_save.is_some(), "save should feed the saved chip");
         assert!(
             !app.dirty(),
             "saved_state should snap to current after a successful save"
         );
         let prefs = UiPrefs::load(dir.path());
         assert!(prefs.tree.is_some(), "prefs written next to the dataset");
-        assert_eq!(prefs.anchor, Some(0));
+        // The move advanced the wizard to the next row (phy `_after_move`).
+        assert_eq!(prefs.anchor, Some(1));
     }
 
     #[test]
@@ -1564,7 +2428,7 @@ mod tests {
     #[test]
     fn undo_status_describes_the_reverted_command() {
         let (mut app, _d) = make_app();
-        app.dispatch_intent(Intent::Relabel(PhyLabelOp::SetNoise));
+        app.dispatch_intent(Intent::Move(MoveTarget::All, PhyLabelOp::SetNoise));
         app.dispatch_intent(Intent::Undo);
         let (msg, _) = app.status.as_ref().expect("undo should produce a status");
         assert!(

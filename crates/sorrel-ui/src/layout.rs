@@ -3,14 +3,21 @@
 //! (phy's workflow) instead of flipping through one tab at a time. The tree
 //! is plain data: it serialises for the per-dataset prefs file.
 
+use crate::amplitude_view::{amplitude_view, AmpAction, AmplitudeViewState};
+use crate::cluster_scatter::{cluster_scatter_view, ClusterScatterState};
+use crate::feature_view::{feature_view, FeatureViewState};
 use crate::jobs::JobCtx;
+use crate::similarity_view::{similarity_view, SimilarityPane};
+use crate::spike_attr_view::{spike_attr_view, SpikeAttrState};
+use crate::template_feature_view::{template_feature_view, TemplateFeatureState};
+use crate::template_grid::{template_grid_view, TemplateGridCache};
 use crate::theme::selection_colour;
+use crate::trace_image::{trace_image_view, TraceImageCache};
 use crate::views::{
-    amplitude_view, cluster_statistics_view, contamination_over_time_view, correlogram_grid_view,
-    drift_map_view, feature_view, firing_rate_view, isi_view, probe_view, psth_view, quality_view,
-    raster_view, selection_summary, similarity_view, suggest_view, template_view, waveform_view,
-    waveform_window_samples, CcgCache, FeatureViewState, PsthCache, PsthState, QualityCache,
-    RasterCache, SuggestAction, SuggestCache, WaveformCache,
+    cluster_statistics_view_for, contamination_over_time_view, correlogram_grid_view,
+    drift_map_view, firing_rate_view, isi_view, probe_view, psth_view, quality_view, raster_view,
+    selection_summary, suggest_view, waveform_view, waveform_window_samples, CcgCache, PsthCache,
+    PsthState, QualityCache, RasterCache, RasterClick, SuggestAction, SuggestCache, WaveformCache,
 };
 use crate::widgets::{trace_view, TraceCache, TraceMarker};
 use egui::Ui;
@@ -44,10 +51,14 @@ pub enum Pane {
     DriftMap,
     ContamTime,
     Psth,
+    ClusterScatter,
+    TemplateFeatures,
+    TraceImage,
+    SpikeData,
 }
 
 impl Pane {
-    pub const ALL: [Pane; 18] = [
+    pub const ALL: [Pane; 22] = [
         Pane::Trace,
         Pane::Summary,
         Pane::Waveforms,
@@ -66,6 +77,10 @@ impl Pane {
         Pane::DriftMap,
         Pane::ContamTime,
         Pane::Psth,
+        Pane::ClusterScatter,
+        Pane::TemplateFeatures,
+        Pane::TraceImage,
+        Pane::SpikeData,
     ];
 
     pub fn title(self) -> &'static str {
@@ -88,15 +103,20 @@ impl Pane {
             Pane::DriftMap => "Drift",
             Pane::ContamTime => "Contam·time",
             Pane::Psth => "PSTH",
+            Pane::ClusterScatter => "Scatter",
+            Pane::TemplateFeatures => "Tmpl features",
+            Pane::TraceImage => "Trace image",
+            Pane::SpikeData => "Spike data",
         }
     }
 }
 
 const TREE_ID: &str = "sorrel-layout";
 
-/// Three tab groups side by side (shape / comparison / assessment) over a
-/// full-width trace. Every pane is present so nothing is lost versus the
-/// old tab strip.
+/// Three tab groups side by side (shape / comparison / assessment) over the
+/// trace with a time-view group (raster / drift / contamination / PSTH)
+/// beside it. Every pane is present so nothing is lost versus the old tab
+/// strip.
 pub fn default_tree() -> Tree<Pane> {
     let mut tiles: Tiles<Pane> = Tiles::default();
     let group = |tiles: &mut Tiles<Pane>, panes: &[Pane]| {
@@ -105,7 +125,13 @@ pub fn default_tree() -> Tree<Pane> {
     };
     let shape = group(
         &mut tiles,
-        &[Pane::Waveforms, Pane::Templates, Pane::Probe, Pane::Summary],
+        &[
+            Pane::Waveforms,
+            Pane::Templates,
+            Pane::TemplateFeatures,
+            Pane::Probe,
+            Pane::Summary,
+        ],
     );
     let compare = group(
         &mut tiles,
@@ -114,9 +140,7 @@ pub fn default_tree() -> Tree<Pane> {
             Pane::Features,
             Pane::Amplitudes,
             Pane::Isi,
-            Pane::Rate,
             Pane::Similar,
-            Pane::Psth,
         ],
     );
     let assess = group(
@@ -125,14 +149,28 @@ pub fn default_tree() -> Tree<Pane> {
             Pane::Quality,
             Pane::Suggest,
             Pane::Stats,
-            Pane::Raster,
-            Pane::DriftMap,
-            Pane::ContamTime,
+            Pane::Rate,
+            Pane::SpikeData,
         ],
     );
     let top = tiles.insert_horizontal_tile(vec![shape, compare, assess]);
-    let trace = tiles.insert_pane(Pane::Trace);
-    let root = tiles.insert_container(Linear::new_binary(LinearDir::Vertical, [top, trace], 0.68));
+    let trace = group(&mut tiles, &[Pane::Trace, Pane::TraceImage]);
+    let time = group(
+        &mut tiles,
+        &[
+            Pane::Raster,
+            Pane::DriftMap,
+            Pane::ContamTime,
+            Pane::Psth,
+            Pane::ClusterScatter,
+        ],
+    );
+    let bottom = tiles.insert_container(Linear::new_binary(
+        LinearDir::Horizontal,
+        [trace, time],
+        0.7,
+    ));
+    let root = tiles.insert_container(Linear::new_binary(LinearDir::Vertical, [top, bottom], 0.62));
     Tree::new(TREE_ID, root, tiles)
 }
 
@@ -209,14 +247,23 @@ pub enum ViewAction {
     /// Lasso split from the Features pane.
     Split(Vec<(ClusterId, Vec<u32>)>),
     Suggest(SuggestAction),
-    /// Similar-pane row click: compare `cluster` with the primary selection
-    /// (`add == false`) or add it to the current selection (`add == true`).
-    Compare {
+    /// Similar-pane row click: make `cluster` the similar selection
+    /// (`add == false`) or toggle it in the similar part (`add == true`).
+    /// The best clusters are kept either way (phy `_similar_selected`).
+    SelectSimilar {
         cluster: ClusterId,
         add: bool,
     },
+    /// Waveforms ctrl+click on a channel box: pin it as the FeatureView's
+    /// first (`secondary == false`) or second channel (phy `select_channel`).
+    SelectChannel {
+        channel: u32,
+        secondary: bool,
+    },
     /// Open a closed pane in the tab group that asked for it.
     AddPane(Pane, TileId),
+    /// phy `screenshot`: save this pane's area of the window as a PNG.
+    Screenshot(Pane, egui::Rect),
 }
 
 /// Trace-pane state the toolbar and mouse navigation edit in place.
@@ -230,6 +277,7 @@ pub struct TraceControls<'a> {
     /// Shank id per raw channel (empty = one shank); enables per-shank CMR.
     pub shanks: &'a [u32],
     pub per_shank: &'a mut bool,
+    pub display: crate::widgets::TraceDisplay,
 }
 
 /// Borrows of everything the panes draw from, built fresh each frame.
@@ -240,9 +288,14 @@ pub struct ViewBehavior<'a, P: DataProvider> {
     pub channel_positions: &'a [[f32; 2]],
     pub waveform_cache: &'a mut WaveformCache,
     pub feature_state: &'a mut FeatureViewState,
+    pub amplitude_state: &'a mut AmplitudeViewState,
     pub raster_cache: &'a mut RasterCache,
     pub suggest_cache: &'a mut SuggestCache,
     pub ccg_cache: &'a mut CcgCache,
+    /// Persisted per-view parameters (`UiPrefs.views`).
+    pub view_params: &'a mut crate::prefs::ViewParams,
+    /// SimilarityView: ranked list memo, table state, row cache, best clusters.
+    pub similar: SimilarityPane<'a>,
     pub quality_cache: &'a mut QualityCache,
     /// Shared session + repaint handle for panes that compute on a worker.
     pub jobs: &'a JobCtx<Session<P>>,
@@ -250,6 +303,8 @@ pub struct ViewBehavior<'a, P: DataProvider> {
     pub events: Option<&'a Events>,
     /// Per-spike depths when the backend can estimate them.
     pub depths: Option<&'a SpikeDepths>,
+    pub cluster_scatter: &'a mut ClusterScatterState,
+    pub template_features: &'a mut TemplateFeatureState,
     pub psth_state: &'a mut PsthState,
     pub psth_cache: &'a mut PsthCache,
     pub trace: TraceControls<'a>,
@@ -257,6 +312,24 @@ pub struct ViewBehavior<'a, P: DataProvider> {
     pub closed: Vec<Pane>,
     /// The visible tab of every tab group; only these show a close button.
     pub active_tabs: Vec<TileId>,
+    /// phy `toggle_auto_update`: panes showing a frozen selection instead
+    /// of the live one.
+    pub frozen: &'a mut std::collections::HashMap<Pane, Vec<ClusterId>>,
+    /// The cluster table's visible rows, in display order.
+    pub table_order: &'a [ClusterId],
+    pub template_grid: &'a mut TemplateGridCache,
+    pub trace_image: &'a mut TraceImageCache,
+    pub spike_attrs: &'a mut SpikeAttrState,
+    /// Colour of each unselected cluster under the colour scheme, and a
+    /// generation that changes with it.
+    pub colours: &'a [Option<egui::Color32>],
+    pub colours_gen: u64,
+    /// Shift+wheel notches over the coloured panes this frame.
+    pub scheme_delta: i32,
+    /// phy `toggle_spike_reorder` (Ctrl+R).
+    pub spike_reorder: bool,
+    /// Pane whose screenshot was asked for from its tab menu.
+    pub screenshot: &'a mut Option<Pane>,
     pub actions: Vec<ViewAction>,
 }
 
@@ -271,9 +344,9 @@ impl<P: DataProvider> ViewBehavior<'_, P> {
         ui.horizontal(|ui| {
             let window_ms = *self.trace.window_len as f32 * 1000.0 / sr;
             ui.label(format!(
-                "t = {:.3} s · window {:.0} ms",
+                "t = {:.3} / {:.1} s",
                 *self.trace.window_start as f64 / sr as f64,
-                window_ms
+                n_samples as f64 / sr as f64
             ))
             .on_hover_text(format!(
                 "Window start sample: {}\nWindow length samples: {}\n\
@@ -334,6 +407,27 @@ impl<P: DataProvider> ViewBehavior<'_, P> {
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_millis(50));
             }
+            if !self.selection.is_empty() {
+                let (lo, hi) = (
+                    *self.trace.window_start,
+                    *self.trace.window_start + *self.trace.window_len as u64,
+                );
+                let n: usize = self
+                    .selection
+                    .iter()
+                    .map(|&c| {
+                        let t = session.spike_times(c);
+                        t.partition_point(|s| s.0 < hi) - t.partition_point(|s| s.0 < lo)
+                    })
+                    .sum();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let text = format!(
+                        "{n} selected spike{} in window",
+                        if n == 1 { "" } else { "s" }
+                    );
+                    ui.add(egui::Label::new(egui::RichText::new(text).weak()).truncate());
+                });
+            }
         });
 
         // Spike markers for the selection, on each cluster's peak channel.
@@ -349,6 +443,33 @@ impl<P: DataProvider> ViewBehavior<'_, P> {
                 channel: self.waveform_cache.peak_channel(slot),
             })
             .collect();
+        // phy `toggle_highlighted_spikes` (Alt+S): every other cluster with a
+        // spike in the window too, neutral, on its template's peak channel.
+        let mut markers = markers;
+        if self.trace.display.all_spikes {
+            let times = session.cluster_index().all_spike_times();
+            let (lo, hi) = (
+                *self.trace.window_start,
+                *self.trace.window_start + *self.trace.window_len as u64,
+            );
+            let (a, b) = (
+                times.partition_point(|t| t.0 < lo),
+                times.partition_point(|t| t.0 < hi),
+            );
+            let mut in_window: Vec<ClusterId> = session.spike_clusters_global()[a..b].to_vec();
+            in_window.sort_unstable();
+            in_window.dedup();
+            for c in in_window.into_iter().filter(|c| !selected.contains(c)) {
+                markers.push(TraceMarker {
+                    colour: ui.visuals().weak_text_color(),
+                    times: session.spike_times(c),
+                    channel: session
+                        .primary_template(c)
+                        .and_then(|t| crate::amplitude_view::peak_channel(session, t))
+                        .map(|ch| ch as usize),
+                });
+            }
+        }
 
         let nav = trace_view(
             ui,
@@ -359,6 +480,7 @@ impl<P: DataProvider> ViewBehavior<'_, P> {
             *self.trace.cfg,
             self.trace.gpu,
             &markers,
+            self.trace.display,
             if *self.trace.per_shank {
                 self.trace.shanks
             } else {
@@ -375,14 +497,42 @@ impl<P: DataProvider> ViewBehavior<'_, P> {
             let start = *self.trace.window_start as i64 + nav.pan + pivot;
             *self.trace.window_start = start.clamp(0, max_start.max(0)) as u64;
             *self.trace.window_len = new_len;
+            if let Some(sample) = nav.pick {
+                // ponytail: nearest spike in time within 1 ms on any
+                // channel; phy also weighs the clicked channel.
+                let times = self.session.cluster_index().all_spike_times();
+                let i = times.partition_point(|t| t.0 < sample);
+                let tol = (self.session.provider.sample_rate() * 0.001) as u64;
+                let nearest = [i.checked_sub(1), Some(i)]
+                    .into_iter()
+                    .flatten()
+                    .filter(|&j| j < times.len())
+                    .min_by_key(|&j| times[j].0.abs_diff(sample))
+                    .filter(|&j| times[j].0.abs_diff(sample) <= tol);
+                if let Some(j) = nearest {
+                    let c = self.session.spike_clusters_global()[j];
+                    self.actions
+                        .push(ViewAction::Suggest(SuggestAction::Select(vec![c])));
+                }
+            }
         }
     }
 }
 
 impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
     fn pane_ui(&mut self, ui: &mut Ui, _tile_id: TileId, pane: &mut Pane) -> UiResponse {
+        if *self.screenshot == Some(*pane) {
+            *self.screenshot = None;
+            self.actions
+                .push(ViewAction::Screenshot(*pane, ui.max_rect()));
+        }
+        let frozen = self.frozen.get(pane).cloned();
+        // Inner padding: views draw edge to edge in the rect they are given.
+        let padded = ui.max_rect().shrink2(egui::vec2(6.0, 4.0));
+        let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(padded));
+        let ui = &mut ui;
         let session = self.session;
-        let selected = self.selection;
+        let selected: &[ClusterId] = frozen.as_deref().unwrap_or(self.selection);
         let scroll = |ui: &mut Ui, pane: Pane, f: &mut dyn FnMut(&mut Ui)| {
             egui::ScrollArea::vertical()
                 .id_salt(pane.title())
@@ -400,30 +550,137 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                 session,
                 selected,
                 self.channel_positions,
+                self.trace.shanks,
                 self.waveform_cache,
+                &mut self.view_params.waveform,
+                &mut self.actions,
             ),
-            Pane::Templates => template_view(ui, session, selected),
-            Pane::Amplitudes => amplitude_view(ui, session, selected),
-            Pane::Isi => scroll(ui, *pane, &mut |ui| isi_view(ui, session, selected)),
+            Pane::SpikeData => {
+                if let Some(splits) = spike_attr_view(
+                    ui,
+                    session,
+                    selected,
+                    self.spike_attrs,
+                    self.jobs,
+                    self.spike_reorder,
+                ) {
+                    self.actions.push(ViewAction::Split(splits));
+                }
+            }
+            Pane::TraceImage => {
+                let shanks = if *self.trace.per_shank {
+                    self.trace.shanks
+                } else {
+                    &[]
+                };
+                trace_image_view(
+                    ui,
+                    session,
+                    *self.trace.window_start,
+                    *self.trace.window_len,
+                    *self.trace.cfg,
+                    shanks,
+                    self.trace.display.flip,
+                    self.trace_image,
+                );
+            }
+            Pane::Templates => {
+                if let Some(next) = template_grid_view(
+                    ui,
+                    session,
+                    selected,
+                    self.table_order,
+                    self.template_grid,
+                    self.colours,
+                    &mut self.scheme_delta,
+                ) {
+                    self.actions
+                        .push(ViewAction::Suggest(SuggestAction::Select(next)));
+                }
+            }
+            Pane::Amplitudes => {
+                let shanks = if *self.trace.per_shank {
+                    self.trace.shanks
+                } else {
+                    &[]
+                };
+                let feature = self.feature_state.amplitude_feature();
+                match amplitude_view(
+                    ui,
+                    session,
+                    selected,
+                    self.amplitude_state,
+                    self.jobs,
+                    *self.trace.cfg,
+                    shanks,
+                    feature,
+                    self.spike_reorder,
+                ) {
+                    Some(AmpAction::Split(splits)) => self.actions.push(ViewAction::Split(splits)),
+                    Some(AmpAction::Seek(sample)) => self.actions.push(ViewAction::Seek(sample)),
+                    None => {}
+                }
+            }
+            Pane::Isi => {
+                let p = &mut self.view_params.isi;
+                scroll(ui, *pane, &mut |ui| isi_view(ui, session, selected, p));
+            }
             Pane::Ccg => {
-                let cache = &mut *self.ccg_cache;
+                let (cache, p, jobs) = (&mut *self.ccg_cache, &mut self.view_params.ccg, self.jobs);
                 scroll(ui, *pane, &mut |ui| {
-                    correlogram_grid_view(ui, session, selected, cache)
+                    correlogram_grid_view(ui, session, selected, cache, jobs, p)
                 });
             }
             Pane::Features => {
-                if let Some(splits) = feature_view(ui, session, selected, self.feature_state) {
+                // Computed PCs follow the trace pane's HP/CMR toggles.
+                let shanks = if *self.trace.per_shank {
+                    self.trace.shanks
+                } else {
+                    &[]
+                };
+                let cfg = *self.trace.cfg;
+                if let Some(splits) = feature_view(
+                    ui,
+                    session,
+                    selected,
+                    self.feature_state,
+                    self.jobs,
+                    cfg,
+                    shanks,
+                    self.spike_reorder,
+                ) {
                     self.actions.push(ViewAction::Split(splits));
                 }
             }
             Pane::Raster => {
                 let window = (*self.trace.window_start, *self.trace.window_len);
-                if let Some(sample) = raster_view(ui, session, selected, window, self.raster_cache)
-                {
-                    self.actions.push(ViewAction::Seek(sample));
+                match raster_view(
+                    ui,
+                    session,
+                    selected,
+                    window,
+                    self.raster_cache,
+                    (self.colours, self.colours_gen),
+                    &mut self.scheme_delta,
+                ) {
+                    Some(RasterClick::Seek(sample)) => self.actions.push(ViewAction::Seek(sample)),
+                    Some(RasterClick::Select(c, add)) => {
+                        let mut next = if add { selected.to_vec() } else { Vec::new() };
+                        match next.iter().position(|&s| s == c) {
+                            Some(i) => {
+                                next.remove(i);
+                            }
+                            None => next.push(c),
+                        }
+                        if !next.is_empty() {
+                            self.actions
+                                .push(ViewAction::Suggest(SuggestAction::Select(next)));
+                        }
+                    }
+                    None => {}
                 }
             }
-            Pane::Rate => firing_rate_view(ui, session, selected),
+            Pane::Rate => firing_rate_view(ui, session, selected, &mut self.view_params.rate),
             Pane::Probe => probe_view(
                 ui,
                 session,
@@ -432,11 +689,17 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                 self.waveform_cache,
             ),
             Pane::Similar => {
-                if let Some((cluster, add)) = similarity_view(ui, session, selected) {
-                    self.actions.push(ViewAction::Compare { cluster, add });
+                let hidden = &mut self.view_params.hidden_cols;
+                if let Some((cluster, add)) =
+                    similarity_view(ui, session, selected, &mut self.similar, hidden)
+                {
+                    self.actions
+                        .push(ViewAction::SelectSimilar { cluster, add });
                 }
             }
-            Pane::Stats => scroll(ui, *pane, &mut |ui| cluster_statistics_view(ui, session)),
+            Pane::Stats => scroll(ui, *pane, &mut |ui| {
+                cluster_statistics_view_for(ui, session, selected)
+            }),
             Pane::Quality => {
                 let cache = &mut *self.quality_cache;
                 let jobs = self.jobs;
@@ -445,6 +708,7 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                 });
             }
             Pane::Suggest => {
+                self.suggest_cache.selection = selected.to_vec();
                 let label_str = self.label_str;
                 let jobs = self.jobs;
                 let action = egui::ScrollArea::vertical()
@@ -467,12 +731,37 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                 self.psth_state,
                 self.psth_cache,
             ),
+            Pane::TemplateFeatures => {
+                if let Some(splits) =
+                    template_feature_view(ui, session, selected, self.template_features, self.jobs)
+                {
+                    self.actions.push(ViewAction::Split(splits));
+                }
+            }
+            Pane::ClusterScatter => {
+                if let Some(clusters) = cluster_scatter_view(
+                    ui,
+                    session,
+                    selected,
+                    self.depths,
+                    self.cluster_scatter,
+                    self.colours,
+                    &mut self.scheme_delta,
+                ) {
+                    self.actions
+                        .push(ViewAction::Suggest(SuggestAction::Select(clusters)));
+                }
+            }
         }
         UiResponse::None
     }
 
     fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
-        pane.title().into()
+        if self.frozen.contains_key(pane) {
+            format!("🔒 {}", pane.title()).into()
+        } else {
+            pane.title().into()
+        }
     }
 
     /// egui_tiles paints tab titles without widget info, so screen readers
@@ -487,7 +776,45 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
             let title = pane.title();
             response
                 .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, title));
+            // phy view menu: freeze the view on this selection, or save it.
+            let pane = *pane;
+            response.context_menu(|ui| {
+                let frozen = self.frozen.contains_key(&pane);
+                if ui
+                    .button(if frozen {
+                        "Follow the selection"
+                    } else {
+                        "Freeze on this selection"
+                    })
+                    .clicked()
+                {
+                    if frozen {
+                        self.frozen.remove(&pane);
+                    } else {
+                        self.frozen.insert(pane, self.selection.to_vec());
+                    }
+                    ui.close();
+                }
+                if ui.button("Save screenshot").clicked() {
+                    *self.screenshot = Some(pane);
+                    ui.close();
+                }
+            });
         }
+        // egui_tiles never scrolls the strip to the active tab, so a tab
+        // opened from the View menu or a keyboard shortcut could sit behind
+        // the overflow arrows. Scroll once when a tab becomes active; the
+        // user can still scroll the strip freely afterwards.
+        let key = egui::Id::new("sorrel-tab-shown").with(tile_id);
+        let active = self.active_tabs.contains(&tile_id);
+        let shown = response
+            .ctx
+            .data(|d| d.get_temp::<bool>(key))
+            .unwrap_or(false);
+        if active && !shown {
+            response.scroll_to_me(Some(egui::Align::Center));
+        }
+        response.ctx.data_mut(|d| d.insert_temp(key, active));
         response
     }
 
@@ -497,6 +824,27 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
         // egui_tiles detaches the tab group while drawing its bar, so the
         // parent cannot be looked up here; `active_tabs` is taken up front.
         self.active_tabs.contains(&tile_id)
+    }
+
+    fn tab_bar_height(&self, _style: &egui::Style) -> f32 {
+        30.0
+    }
+
+    fn gap_width(&self, _style: &egui::Style) -> f32 {
+        6.0
+    }
+
+    fn tab_title_spacing(&self, _visuals: &egui::Visuals) -> f32 {
+        5.0
+    }
+
+    /// 16 px hit target around an 8 px cross.
+    fn close_button_outer_size(&self) -> f32 {
+        16.0
+    }
+
+    fn close_button_inner_margin(&self) -> f32 {
+        4.0
     }
 
     fn simplification_options(&self) -> SimplificationOptions {
