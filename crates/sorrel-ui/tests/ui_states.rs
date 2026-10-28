@@ -1108,6 +1108,11 @@ return { page: D.page, frame: D.name, groups: D.groups.length };
 /// Ctrl+click four points around the middle of Features cell 1 (x = 1A,
 /// y = 0A) and press `k`.
 fn lasso_and_split(h: &mut Harness<'static, App>) {
+    lasso_points(h, 4);
+}
+
+/// Ctrl+click the first `n` corners of a square around cell 1's middle.
+fn lasso_points(h: &mut Harness<'static, App>, n: usize) {
     let cell = h.get_by_label("feature cell 1").rect();
     let (c, r) = (cell.center(), cell.size() * 0.35);
     for d in [
@@ -1115,7 +1120,10 @@ fn lasso_and_split(h: &mut Harness<'static, App>) {
         egui::vec2(1.0, -1.0),
         egui::vec2(1.0, 1.0),
         egui::vec2(-1.0, 1.0),
-    ] {
+    ]
+    .into_iter()
+    .take(n)
+    {
         let pos = c + d * r;
         h.hover_at(pos);
         // Ctrl stays down across press and release, as a real click.
@@ -1282,6 +1290,35 @@ fn spike_data_and_trace_image() {
         click_tab(&mut h, "Spike data");
         click_tab(&mut h, "Trace image");
         snap(&mut h, "spike_data_trace_image", name);
+        h
+    });
+}
+
+#[test]
+fn features_lasso_drawing_and_kmeans() {
+    if no_gpu() {
+        return;
+    }
+    // The lasso tool's states: open polygon, then the k-means button's
+    // auto-lasso (with the exact part highlighted), `k` splitting it, and
+    // auto-run refitting on what is left.
+    each_theme(|theme, name| {
+        let mut h = fixture(&format!("features-km-{name}"), 3, theme);
+        select_two_and_open_features(&mut h);
+        lasso_points(&mut h, 2);
+        snap(&mut h, "features_lasso_drawing", name);
+        h.key_press(egui::Key::Escape);
+        settle(&mut h);
+        h.get_by_label("k-means").click();
+        settle(&mut h);
+        snap(&mut h, "features_kmeans", name);
+        h.key_press(egui::Key::K);
+        settle(&mut h);
+        let s = sorrel_ui::jobs::read(h.state().session()).history_len();
+        assert_eq!(s, 1, "k splits the k-means lasso as one journal entry");
+        h.get_by_label("auto-run").click();
+        settle(&mut h);
+        snap(&mut h, "features_kmeans_auto", name);
         h
     });
 }

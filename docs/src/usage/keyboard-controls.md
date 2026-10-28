@@ -88,17 +88,18 @@ every view (first selected = blue, second = orange, …).
 
 ## Views mouse
 
-| Where    | Gesture                                              | Action                                                                                               |
-| -------- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| Trace    | drag / wheel                                         | Pan in time.                                                                                         |
-| Trace    | Ctrl-wheel / pinch                                   | Zoom the window around the pointer (1 ms – 5 s).                                                     |
-| Raster   | click                                                | Seek the trace window to that time.                                                                  |
-| Features | Ctrl-click                                           | Add a lasso point in that subplot; `Ctrl`-right-click or `Esc` clears; `K` splits the spikes inside. |
-| Features | wheel / Ctrl-wheel / Alt-wheel / drag / double-click | Zoom / scale the features / marker size / pan / reset (shared by every subplot).                     |
-| Similar  | click a row                                          | Select the primary cluster together with that candidate.                                             |
-| Similar  | Cmd/Ctrl-click a row                                 | Add that candidate to the current selection.                                                         |
-| Any tab  | drag the tab title                                   | Move the view to another group or split; `×` closes it.                                              |
-| Tab bar  | `+`                                                  | Reopen a closed view in that group.                                                                  |
+| Where    | Gesture                                              | Action                                                                                                                                                                          |
+| -------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Trace    | drag / wheel                                         | Pan in time.                                                                                                                                                                    |
+| Trace    | Ctrl-wheel / pinch                                   | Zoom the window around the pointer (1 ms – 5 s).                                                                                                                                |
+| Raster   | click                                                | Seek the trace window to that time.                                                                                                                                             |
+| Features | Ctrl-click                                           | Add a lasso point in that subplot; `Ctrl`-right-click or `Esc` clears; `K` splits the spikes inside.                                                                            |
+| Features | **k-means** button / `:km`                           | Lasso the smallest k-means part of the first selected cluster (exact members highlighted, a chip per part to switch); **auto-run** refits as the selection changes. `K` splits. |
+| Features | wheel / Ctrl-wheel / Alt-wheel / drag / double-click | Zoom / scale the features / marker size / pan / reset (shared by every subplot).                                                                                                |
+| Similar  | click a row                                          | Select the primary cluster together with that candidate.                                                                                                                        |
+| Similar  | Cmd/Ctrl-click a row                                 | Add that candidate to the current selection.                                                                                                                                    |
+| Any tab  | drag the tab title                                   | Move the view to another group or split; `×` closes it.                                                                                                                         |
+| Tab bar  | `+`                                                  | Reopen a closed view in that group.                                                                                                                                             |
 
 ## Journaling guarantee
 

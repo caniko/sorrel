@@ -167,6 +167,216 @@ pub struct FeatureViewState {
     preview: Option<(ClusterId, std::collections::HashSet<u32>)>,
     preview_gen: u64,
     cells_gen: u64,
+    pub km: KmState,
+    /// Closed-lasso hit count for `(set generation, lasso vertices)`.
+    hits: Option<(u64, Vec<[f32; 2]>, usize)>,
+}
+
+/// The k-means auto-lasso: fit on the first selected cluster's features
+/// (rayon, off the UI thread), wrap the lasso around one part.
+#[derive(Default)]
+pub struct KmState {
+    /// `None` picks k in 2..=5 by silhouette.
+    pub k: Option<usize>,
+    /// Refit whenever the features change; the lasso follows unless the
+    /// user drew or edited one.
+    pub auto_run: bool,
+    /// The part the lasso wraps (index into the fit's parts).
+    pub part: usize,
+    requested: bool,
+    /// The fit already turned into a lasso.
+    applied: Option<KmKey>,
+    /// The lasso came from k-means, so a newer fit may replace it.
+    lasso_auto: bool,
+    /// The split preview shows a k-means part (not a proposal).
+    previewing: bool,
+    /// Bring the lasso's cell into view on the next frame.
+    scroll_to_lasso: bool,
+    memo: Memo<KmKey, Option<Arc<KmFit>>>,
+    /// The last finished fit and the key it was made for.
+    fit: Option<(KmKey, Option<Arc<KmFit>>)>,
+}
+
+/// `(feature set generation, cluster, k choice)`.
+type KmKey = (u64, ClusterId, Option<usize>);
+
+/// k-means parts of one cluster's points, largest first, with a lasso
+/// around each.
+struct KmFit {
+    /// Indices into `FeatureSet::points`.
+    parts: Vec<Vec<usize>>,
+    lassos: Vec<Lasso>,
+}
+
+/// Fit on at most this many rows, then label every row.
+const KM_FIT_ROWS: usize = 5000;
+
+/// k-means on the 4 PC columns of `slot`'s points, each scaled to `[0, 1]`
+/// by the plot bounds. `k = None` tries 2..=5 in parallel and keeps the
+/// best silhouette. `None` when the cluster has too few points.
+fn fit_kmeans(set: &FeatureSet, slot: u16, k: Option<usize>) -> Option<KmFit> {
+    use sorrel_compute::{kmeans, kmeans_assign};
+    let idx: Vec<usize> = (0..set.points.len())
+        .filter(|&i| set.points[i].slot == slot && set.points[i].f.iter().all(|v| v.is_finite()))
+        .collect();
+    if idx.len() < 10 {
+        return None;
+    }
+    let data: Vec<f32> = idx
+        .iter()
+        .flat_map(|&i| {
+            let f = set.points[i].f;
+            (0..4).map(move |j| {
+                let (lo, hi) = set.bounds[j];
+                (f[j] - lo) / (hi - lo).max(f32::MIN_POSITIVE)
+            })
+        })
+        .collect();
+    let stride = idx.len().div_ceil(KM_FIT_ROWS);
+    let sub: Vec<f32> = data
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .step_by(stride)
+        .flatten()
+        .copied()
+        .collect();
+    let ks: Vec<usize> = k.map_or((2..=5).collect(), |k| vec![k.clamp(2, 8)]);
+    let km = ks
+        .into_par_iter()
+        .map(|k| {
+            let km = kmeans(&sub, 4, k, 50);
+            (km.silhouette(&sub, 4), km)
+        })
+        .max_by(|a, b| {
+            a.0.total_cmp(&b.0)
+                .then(b.1.centroids.len().cmp(&a.1.centroids.len()))
+        })?
+        .1;
+    let mut parts: Vec<Vec<usize>> = vec![Vec::new(); km.centroids.len() / 4];
+    for (row, l) in kmeans_assign(&data, 4, &km.centroids)
+        .into_iter()
+        .enumerate()
+    {
+        parts[l as usize].push(idx[row]);
+    }
+    parts.retain(|p| !p.is_empty());
+    if parts.len() < 2 {
+        return None;
+    }
+    parts.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    let lassos = (0..parts.len())
+        .into_par_iter()
+        .map(|i| auto_lasso(set, &parts, i))
+        .collect();
+    Some(KmFit { parts, lassos })
+}
+
+/// The lasso around `parts[target]`: in each grid cell, the convex hull of
+/// the 95% of the part's points nearest its median; the cell whose hull
+/// holds the fewest points of the other parts wins (then the smaller hull).
+// ponytail: a polygon in one 2-D view only approximates a 4-D k-means
+// part; the split preview shows the exact membership next to it.
+fn auto_lasso(set: &FeatureSet, parts: &[Vec<usize>], target: usize) -> Lasso {
+    let mut best: Option<(usize, f32, usize, Vec<[f32; 2]>)> = None;
+    for (cell, &(dx, dy)) in GRID.iter().flatten().enumerate() {
+        let xy = |i: usize| [set.points[i].value(dx), set.points[i].value(dy)];
+        let mut pts: Vec<[f32; 2]> = parts[target].iter().map(|&i| xy(i)).collect();
+        if pts.len() < 3 {
+            continue;
+        }
+        let median = |a: usize| {
+            let mut v: Vec<f32> = pts.iter().map(|p| p[a]).collect();
+            let m = v.len() / 2;
+            *v.select_nth_unstable_by(m, f32::total_cmp).1
+        };
+        let (mx, my) = (median(0), median(1));
+        // Distances scaled per axis so time and PCs weigh alike.
+        let (sx, sy) = pts.iter().fold((0.0f32, 0.0f32), |(a, b), p| {
+            (a.max((p[0] - mx).abs()), b.max((p[1] - my).abs()))
+        });
+        let dist = |p: &[f32; 2]| {
+            ((p[0] - mx) / sx.max(f32::MIN_POSITIVE)).powi(2)
+                + ((p[1] - my) / sy.max(f32::MIN_POSITIVE)).powi(2)
+        };
+        pts.sort_by(|a, b| dist(a).total_cmp(&dist(b)));
+        pts.truncate((pts.len() * 95).div_ceil(100).max(3));
+        let mut hull = convex_hull(pts);
+        if hull.len() < 3 {
+            continue;
+        }
+        // Grow it 5% about its centroid: the hull's own vertices sit on the
+        // boundary, where the even-odd test may call them outside.
+        let n = hull.len() as f32;
+        let (cx, cy) = hull
+            .iter()
+            .fold((0.0, 0.0), |(a, b), p| (a + p[0] / n, b + p[1] / n));
+        for p in &mut hull {
+            *p = [cx + (p[0] - cx) * 1.05, cy + (p[1] - cy) * 1.05];
+        }
+        let probe = Lasso {
+            cell,
+            points: hull.clone(),
+        };
+        let contamination = parts
+            .iter()
+            .enumerate()
+            .filter(|&(j, _)| j != target)
+            .flat_map(|(_, p)| p.iter())
+            .filter(|&&i| probe.contains(xy(i)))
+            .count();
+        // Area in units of each axis' spread, so cells compare.
+        let area = polygon_area(&hull) / (sx * sy).max(f32::MIN_POSITIVE);
+        if best
+            .as_ref()
+            .is_none_or(|b| (contamination, area) < (b.2, b.1))
+        {
+            best = Some((cell, area, contamination, hull));
+        }
+    }
+    best.map_or_else(Lasso::default, |(cell, _, _, points)| Lasso {
+        cell,
+        points,
+    })
+}
+
+/// Andrew's monotone chain; counter-clockwise, no repeated last point.
+fn convex_hull(mut pts: Vec<[f32; 2]>) -> Vec<[f32; 2]> {
+    pts.retain(|p| p[0].is_finite() && p[1].is_finite());
+    pts.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    pts.dedup();
+    if pts.len() < 3 {
+        return pts;
+    }
+    let cross = |o: [f32; 2], a: [f32; 2], b: [f32; 2]| {
+        (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    };
+    let mut hull: Vec<[f32; 2]> = Vec::with_capacity(2 * pts.len());
+    for pass in [&pts[..], &pts.iter().rev().copied().collect::<Vec<_>>()[..]] {
+        let start = hull.len();
+        for &p in pass {
+            while hull.len() >= start + 2
+                && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0
+            {
+                hull.pop();
+            }
+            hull.push(p);
+        }
+        hull.pop();
+    }
+    hull
+}
+
+fn polygon_area(poly: &[[f32; 2]]) -> f32 {
+    let n = poly.len();
+    (0..n)
+        .map(|i| {
+            let (a, b) = (poly[i], poly[(i + 1) % n]);
+            a[0] * b[1] - b[0] * a[1]
+        })
+        .sum::<f32>()
+        .abs()
+        / 2.0
 }
 
 impl Default for FeatureViewState {
@@ -188,6 +398,8 @@ impl Default for FeatureViewState {
             preview: None,
             preview_gen: 0,
             cells_gen: 0,
+            km: KmState::default(),
+            hits: None,
         }
     }
 }
@@ -198,6 +410,16 @@ impl FeatureViewState {
         self.lasso.clear();
         self.split_requested = false;
         self.want_full = false;
+        self.clear_km_preview();
+    }
+
+    /// Drop the k-means highlight (not a proposal's) with the lasso it drew.
+    fn clear_km_preview(&mut self) {
+        if self.km.previewing {
+            self.preview = None;
+            self.preview_gen += 1;
+            self.km.previewing = false;
+        }
     }
 
     pub fn lasso_active(&self) -> bool {
@@ -239,16 +461,28 @@ impl FeatureViewState {
         self.fixed_channels = Some(ch);
     }
 
-    /// The `(channel, pc)` the AmplitudeView's feature type plots: the last
-    /// Alt+clicked dimension (phy `select_feature`), else PC1 on the first
-    /// channel shown.
     /// Highlight a proposed split (`(cluster, local spike indices)` as in
     /// `CurationCommand::Split`) until it is cleared with `None`.
     pub fn set_split_preview(&mut self, preview: Option<(ClusterId, Vec<u32>)>) {
         self.preview = preview.map(|(c, idx)| (c, idx.into_iter().collect()));
         self.preview_gen += 1;
+        self.km.previewing = false;
     }
 
+    /// Run k-means on the first selected cluster and wrap the lasso around
+    /// the smallest part (the k-means button, `:km`). `k = None` picks k by
+    /// silhouette.
+    pub fn request_kmeans(&mut self, k: Option<Option<usize>>) {
+        if let Some(k) = k {
+            self.km.k = k;
+        }
+        self.km.requested = true;
+        self.km.applied = None;
+    }
+
+    /// The `(channel, pc)` the AmplitudeView's feature type plots: the last
+    /// Alt+clicked dimension (phy `select_feature`), else PC1 on the first
+    /// channel shown.
     pub fn amplitude_feature(&self) -> Option<(u32, usize)> {
         self.amplitude_dim
             .or_else(|| self.shown_channels.map(|c| (c[0], 0)))
@@ -329,6 +563,7 @@ pub fn feature_view<P: DataProvider>(
     state.shown_channels = Some(set.channels);
 
     header(ui, state, &set, current.is_none());
+    kmeans_controls(ui, state, &set, selection[0], jobs);
 
     let dark = ui.visuals().dark_mode;
     let cells_key = (set.generation, dark, state.preview_gen);
@@ -374,6 +609,10 @@ pub fn feature_view<P: DataProvider>(
                 let strip = Rect::from_min_size(origin, egui::vec2(side, LABEL_H));
                 let rect =
                     Rect::from_min_size(origin + egui::vec2(0.0, LABEL_H), egui::vec2(side, side));
+                if state.km.scroll_to_lasso && state.lasso.cell == cell {
+                    state.km.scroll_to_lasso = false;
+                    ui.scroll_to_rect(strip.union(rect), Some(egui::Align::Center));
+                }
                 if !ui.is_rect_visible(strip.union(rect)) {
                     continue;
                 }
@@ -433,7 +672,31 @@ pub fn feature_view<P: DataProvider>(
                     egui::StrokeKind::Inside,
                 );
                 if state.lasso.is_active() && state.lasso.cell == cell {
-                    state.lasso.paint(&painter, to_screen, theme.text);
+                    // The k-means lasso's cell is outlined, so it reads at a
+                    // glance which of the 16 views the polygon lives in.
+                    if state.km.previewing {
+                        painter.rect_stroke(
+                            rect,
+                            0.0,
+                            Stroke::new(2.0_f32, ui.visuals().selection.bg_fill),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    state
+                        .lasso
+                        .paint(&painter, to_screen, ui.visuals().strong_text_color());
+                    if state.lasso.is_closed() {
+                        let n = lasso_hit_count(state, &set);
+                        hit_badge(
+                            &painter.with_clip_rect(rect),
+                            &state.lasso,
+                            to_screen,
+                            rect,
+                            n,
+                            &theme,
+                            ui.visuals().strong_text_color(),
+                        );
+                    }
                 }
 
                 let resp = ui.interact(
@@ -458,7 +721,13 @@ pub fn feature_view<P: DataProvider>(
                 };
                 if let Some(Dim::Pc { ch, pc }) = picked {
                     state.amplitude_dim = Some((set.channels[ch as usize], pc as usize));
-                } else if !state.lasso.interact(cell, &resp, to_data) {
+                } else if state.lasso.interact(cell, &resp, to_data) {
+                    // A hand-edited lasso is the user's: auto-run leaves it.
+                    state.km.lasso_auto = false;
+                    if !state.lasso.is_active() {
+                        state.clear_km_preview();
+                    }
+                } else {
                     interact_view(ui, state, &resp);
                 }
             }
@@ -471,6 +740,7 @@ pub fn feature_view<P: DataProvider>(
                 state.want_full = false;
                 let splits = lasso_hits(&set, &state.lasso, selection);
                 state.lasso.clear();
+                state.clear_km_preview();
                 return Some(splits);
             }
             // Computed PCs: project every lassoed spike, then split.
@@ -527,6 +797,176 @@ fn header(ui: &mut Ui, state: &mut FeatureViewState, set: &FeatureSet, busy: boo
              Alt+click / Alt+right-click: amplitude feature (x / y)",
         );
     });
+}
+
+/// The k-means row: button, k, auto-run and one chip per part. Runs the
+/// fit as a job and, when it lands, wraps the lasso around the smallest
+/// part unless the user drew their own lasso since.
+fn kmeans_controls<P: DataProvider>(
+    ui: &mut Ui,
+    state: &mut FeatureViewState,
+    set: &Arc<FeatureSet>,
+    anchor: ClusterId,
+    jobs: &JobCtx<Session<P>>,
+) {
+    let key: KmKey = (set.generation, anchor, state.km.k);
+    let mut chosen = None;
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .button("k-means")
+            .on_hover_text(format!(
+                "Cluster c{anchor}'s spikes in PC space and lasso the smallest part; K splits it"
+            ))
+            .clicked()
+        {
+            state.request_kmeans(None);
+        }
+        egui::ComboBox::from_id_salt("km-k")
+            .width(64.0)
+            .selected_text(
+                state
+                    .km
+                    .k
+                    .map_or("k: auto".to_string(), |k| format!("k: {k}")),
+            )
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut state.km.k, None, "auto")
+                    .on_hover_text("best silhouette for k = 2..5");
+                for k in 2..=6 {
+                    ui.selectable_value(&mut state.km.k, Some(k), k.to_string());
+                }
+            });
+        ui.checkbox(&mut state.km.auto_run, "auto-run")
+            .on_hover_text(
+                "Refit (on all cores, off the UI thread) whenever the selection or features \
+             change; the lasso follows unless you drew one",
+            );
+        if state.km.memo.pending() {
+            ui.spinner();
+        }
+        match &state.km.fit {
+            Some((k, Some(fit))) if *k == key => {
+                for (i, part) in fit.parts.iter().enumerate() {
+                    let label = format!("part {} · {}", i + 1, part.len());
+                    if ui
+                        .selectable_label(state.km.part == i && state.km.previewing, label)
+                        .clicked()
+                    {
+                        chosen = Some(i);
+                    }
+                }
+                if state.km.previewing && state.lasso.is_closed() {
+                    let (dx, dy) = GRID[state.lasso.cell / 4][state.lasso.cell % 4];
+                    ui.weak(format!(
+                        "lasso in {} × {}",
+                        dim_label(dx, set),
+                        dim_label(dy, set)
+                    ));
+                }
+            }
+            Some((k, None)) if *k == key => {
+                ui.weak("too few spikes to cluster");
+            }
+            _ => {}
+        }
+    });
+
+    if state.km.requested || state.km.auto_run {
+        let (s, k) = (Arc::clone(set), state.km.k);
+        if let Some(fit) = state
+            .km
+            .memo
+            .ensure(key, &jobs.session, jobs.repaint(), move |_, _| {
+                fit_kmeans(&s, 0, k).map(Arc::new)
+            })
+            .cloned()
+        {
+            state.km.fit = Some((key, fit.clone()));
+            if state.km.applied != Some(key) {
+                let take = state.km.requested || !state.lasso.is_active() || state.km.lasso_auto;
+                if let (true, Some(fit)) = (take, fit) {
+                    state.km.part = fit.parts.len() - 1;
+                    apply_part(state, set, &fit, anchor);
+                }
+                state.km.applied = Some(key);
+                state.km.requested = false;
+            }
+        }
+    }
+    if let (Some(i), Some((_, Some(fit)))) = (chosen, state.km.fit.clone()) {
+        state.km.part = i;
+        apply_part(state, set, &fit, anchor);
+    }
+}
+
+/// Lasso the fit's part `state.km.part` and highlight its exact members.
+fn apply_part(state: &mut FeatureViewState, set: &FeatureSet, fit: &KmFit, anchor: ClusterId) {
+    let part = state.km.part.min(fit.parts.len() - 1);
+    state.lasso = fit.lassos[part].clone();
+    state.km.lasso_auto = true;
+    state.preview = Some((
+        anchor,
+        fit.parts[part]
+            .iter()
+            .map(|&i| set.points[i].local)
+            .collect(),
+    ));
+    state.preview_gen += 1;
+    state.km.previewing = true;
+    state.km.scroll_to_lasso = true;
+}
+
+/// Selected spikes inside the closed lasso, cached per set and polygon.
+fn lasso_hit_count(state: &mut FeatureViewState, set: &FeatureSet) -> usize {
+    if let Some((g, pts, n)) = &state.hits {
+        if *g == set.generation && *pts == state.lasso.points {
+            return *n;
+        }
+    }
+    let (dx, dy) = GRID[state.lasso.cell / 4][state.lasso.cell % 4];
+    let n = set
+        .points
+        .iter()
+        .filter(|p| p.slot != BACKGROUND && state.lasso.contains([p.value(dx), p.value(dy)]))
+        .count();
+    state.hits = Some((set.generation, state.lasso.points.clone(), n));
+    n
+}
+
+/// "N spikes · K splits · Esc clears" under the lasso, kept inside `cell`.
+fn hit_badge(
+    painter: &egui::Painter,
+    lasso: &Lasso,
+    to_screen: impl Fn([f32; 2]) -> Pos2,
+    cell: Rect,
+    n: usize,
+    theme: &Theme,
+    text: egui::Color32,
+) {
+    let bbox = Rect::from_points(
+        &lasso
+            .points
+            .iter()
+            .map(|&p| to_screen(p))
+            .collect::<Vec<_>>(),
+    );
+    let galley = painter.layout_no_wrap(
+        format!("{n} spikes · K splits · Esc clears"),
+        egui::FontId::proportional(11.0),
+        text,
+    );
+    let size = galley.size() + egui::vec2(8.0, 4.0);
+    let min = egui::pos2(bbox.center().x - size.x / 2.0, bbox.bottom() + 4.0)
+        .clamp(cell.min, (cell.max - size).max(cell.min));
+    let r = Rect::from_min_size(min, size);
+    painter.rect_filled(r, 3.0, theme.plot_bg.gamma_multiply(0.85));
+    painter.rect_stroke(
+        r,
+        3.0,
+        Stroke::new(0.5_f32, theme.grid),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(r.min + egui::vec2(4.0, 2.0), galley, text);
 }
 
 /// Pan (drag), zoom (wheel), feature scaling (Ctrl+wheel), marker size
@@ -929,6 +1369,116 @@ mod tests {
                 assert_eq!(x, if r == c { Dim::Time } else { feats[c] });
             }
         }
+    }
+
+    #[test]
+    fn convex_hull_drops_interior_points() {
+        let pts = vec![
+            [0.0, 0.0],
+            [2.0, 0.0],
+            [2.0, 2.0],
+            [0.0, 2.0],
+            [1.0, 1.0],
+            [0.5, 1.5],
+            [2.0, 1.0],
+        ];
+        let hull = convex_hull(pts);
+        assert_eq!(hull, vec![[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]]);
+        assert_eq!(polygon_area(&hull), 4.0);
+    }
+
+    /// 400 spikes around the origin and 100 around 5 in all four PC
+    /// columns, plus background that must be ignored.
+    fn two_blobs() -> FeatureSet {
+        let mut s = 0x5EED_u32;
+        let mut noise = || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            s as f32 / u32::MAX as f32 - 0.5
+        };
+        let mut points = Vec::new();
+        for local in 0..500u32 {
+            let c = if local < 400 { 0.0 } else { 5.0 };
+            let f = [c + noise(), c + noise(), c + noise(), c + noise()];
+            points.push(FeaturePoint {
+                local,
+                slot: 0,
+                t: local as f32 / 500.0,
+                f,
+            });
+        }
+        for _ in 0..50 {
+            points.push(FeaturePoint {
+                local: 0,
+                slot: BACKGROUND,
+                t: 0.5,
+                f: [2.5; 4],
+            });
+        }
+        FeatureSet {
+            channels: [0, 1],
+            computed: false,
+            full: true,
+            points,
+            bounds: [(-1.0, 6.0); 4],
+            duration: 1.0,
+            generation: 0,
+        }
+    }
+
+    #[test]
+    fn kmeans_auto_lasso_wraps_the_small_blob() {
+        let set = two_blobs();
+        let fit = fit_kmeans(&set, 0, None).expect("two blobs cluster");
+        assert_eq!(fit.parts.len(), 2, "k = auto picks 2 on two blobs");
+        assert_eq!(
+            fit.parts.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![400, 100]
+        );
+        // The smallest part (last) is the lasso the button draws.
+        let lasso = &fit.lassos[1];
+        assert!(lasso.is_closed());
+        let (dx, dy) = GRID[lasso.cell / 4][lasso.cell % 4];
+        let inside = |p: &FeaturePoint| lasso.contains([p.value(dx), p.value(dy)]);
+        let big = set.points.iter().filter(|p| p.slot == 0 && p.local < 400);
+        assert_eq!(
+            big.filter(|p| inside(p)).count(),
+            0,
+            "no spike of the big blob"
+        );
+        let small = set.points.iter().filter(|p| p.slot == 0 && p.local >= 400);
+        // The hull trims the 5% outermost points, so most but not all.
+        assert!(small.filter(|p| inside(p)).count() >= 90);
+        assert!(fit_kmeans(&set, 0, Some(3)).is_some_and(|f| f.parts.len() == 3));
+        assert!(
+            fit_kmeans(&set, 7, None).is_none(),
+            "no points for that slot"
+        );
+    }
+
+    /// `cargo test -p sorrel-ui --release kmeans_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn kmeans_timing_on_100k_spikes() {
+        let mut set = two_blobs();
+        let base = set.points.clone();
+        set.points = (0..200)
+            .flat_map(|r| {
+                base.iter().map(move |p| FeaturePoint {
+                    local: p.local + r * 500,
+                    ..*p
+                })
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        let fit = fit_kmeans(&set, 0, None).unwrap();
+        eprintln!(
+            "k=auto on {} spikes: {:?}, parts {:?}",
+            set.points.len(),
+            t.elapsed(),
+            fit.parts.iter().map(Vec::len).collect::<Vec<_>>()
+        );
     }
 
     #[test]

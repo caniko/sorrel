@@ -684,6 +684,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     .saturating_sub(self.window_len as u64);
                 self.window_start = sample.min(max);
             }
+            Snippet::KMeans(k) => self.feature_state.request_kmeans(k),
             Snippet::RateBins(n) => self.view_params.rate.n_bins = n,
             Snippet::RateBinSize(secs) => {
                 let s = read(&self.session);

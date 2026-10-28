@@ -3,6 +3,12 @@
 //! The seed is fixed, so the same input always gives the same partition —
 //! suggestions must not flicker between recomputes. Used by the multi-
 //! dimensional split proposer in `sorrel-data`.
+//!
+//! The per-row work (nearest-centroid search, k-means++ distance updates)
+//! runs on rayon; the centroid sums stay sequential in f64, so results are
+//! identical whatever the thread count.
+
+use rayon::prelude::*;
 
 /// Fixed seed for the k-means++ draws.
 const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -49,7 +55,7 @@ pub fn assign(data: &[f32], d: usize, centroids: &[f32]) -> Vec<u32> {
     if d == 0 || centroids.is_empty() {
         return Vec::new();
     }
-    data.chunks_exact(d)
+    data.par_chunks_exact(d)
         .map(|row| nearest(row, centroids, d).0 as u32)
         .collect()
 }
@@ -72,7 +78,10 @@ pub fn kmeans(data: &[f32], d: usize, k: usize, max_iter: usize) -> KMeans {
     // k-means++: each next centre is drawn with probability ∝ squared
     // distance to the nearest centre chosen so far.
     let mut centroids: Vec<f32> = row(next_u64(&mut rng) as usize % n).to_vec();
-    let mut near: Vec<f64> = (0..n).map(|i| dist2(row(i), &centroids) as f64).collect();
+    let mut near: Vec<f64> = (0..n)
+        .into_par_iter()
+        .map(|i| dist2(row(i), &centroids) as f64)
+        .collect();
     while centroids.len() < k * d {
         let total: f64 = near.iter().sum();
         let pick = if total > 0.0 {
@@ -87,21 +96,18 @@ pub fn kmeans(data: &[f32], d: usize, k: usize, max_iter: usize) -> KMeans {
             next_u64(&mut rng) as usize % n // all rows identical
         };
         let c = row(pick).to_vec();
-        for (i, w) in near.iter_mut().enumerate() {
-            *w = w.min(dist2(row(i), &c) as f64);
-        }
+        near.par_iter_mut()
+            .enumerate()
+            .for_each(|(i, w)| *w = w.min(dist2(row(i), &c) as f64));
         centroids.extend(c);
     }
 
     // Lloyd's.
     let mut labels = vec![u32::MAX; n];
     for _ in 0..max_iter.max(1) {
-        let mut changed = false;
-        for (i, l) in labels.iter_mut().enumerate() {
-            let j = nearest(row(i), &centroids, d).0 as u32;
-            changed |= *l != j;
-            *l = j;
-        }
+        let next = assign(data, d, &centroids);
+        let changed = next != labels;
+        labels = next;
         if !changed {
             break;
         }
@@ -207,5 +213,26 @@ mod tests {
         assert_eq!(assign(&data, 2, &km.centroids), km.labels);
         // Fixed seed: identical rerun.
         assert_eq!(kmeans(&data, 2, 3, 50).labels, km.labels);
+    }
+
+    #[test]
+    fn parallel_runs_are_identical_on_large_inputs() {
+        // 20k rows, so rayon actually splits the work.
+        let mut s = 0xBEEF_u32;
+        let data: Vec<f32> = (0..20_000)
+            .flat_map(|i| {
+                let c = (i % 4) as f32 * 3.0;
+                [c + noise(&mut s), -c + noise(&mut s), noise(&mut s)]
+            })
+            .collect();
+        let a = kmeans(&data, 3, 4, 50);
+        let b = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| kmeans(&data, 3, 4, 50));
+        assert_eq!(a.labels, b.labels, "thread count must not change labels");
+        assert_eq!(a.centroids, b.centroids);
+        assert_eq!(a.inertia, b.inertia);
     }
 }

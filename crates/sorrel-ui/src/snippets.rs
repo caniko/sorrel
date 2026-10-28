@@ -24,6 +24,9 @@ pub enum Snippet {
     TraceWindow(f32),
     /// `:csx amp`, `:csy depth`, `:css fr`: ClusterScatter x / y / size.
     ScatterAxis(usize, String),
+    /// `:km`, `:km 3`, `:km auto`: FeatureView k-means lasso (optionally
+    /// setting k; `auto` picks it by silhouette).
+    KMeans(Option<Option<usize>>),
     /// `:frn 200`: FiringRate bin count.
     RateBins(usize),
     /// `:frb 10`: FiringRate bin size in seconds.
@@ -63,6 +66,16 @@ pub fn parse(text: &str) -> Result<Snippet, String> {
         "s" if !rest.is_empty() => Snippet::Sort(rest.to_string()),
         "tg" => Snippet::TraceGoto(number("a time in seconds")?),
         "ts" => Snippet::TraceWindow(number("a window length in seconds")?),
+        "km" => Snippet::KMeans(match rest {
+            "" => None,
+            "auto" => Some(None),
+            n => Some(Some(
+                n.parse()
+                    .ok()
+                    .filter(|k| (2..=8).contains(k))
+                    .ok_or(":km takes k from 2 to 8, or auto")?,
+            )),
+        }),
         "frb" => Snippet::RateBinSize(number("a bin size in seconds")?),
         "frn" => Snippet::RateBins(
             rest.parse()
@@ -140,6 +153,10 @@ mod tests {
         assert_eq!(parse(":tg 12.5"), Ok(Snippet::TraceGoto(12.5)));
         assert_eq!(parse(":cf group"), Ok(Snippet::ColourField("group".into())));
         assert_eq!(parse(":frn 50"), Ok(Snippet::RateBins(50)));
+        assert_eq!(parse(":km"), Ok(Snippet::KMeans(None)));
+        assert_eq!(parse(":km 3"), Ok(Snippet::KMeans(Some(Some(3)))));
+        assert_eq!(parse(":km auto"), Ok(Snippet::KMeans(Some(None))));
+        assert!(parse(":km 1").is_err());
         assert_eq!(parse(":frb 2.5"), Ok(Snippet::RateBinSize(2.5)));
         assert!(parse(":frn 1").is_err());
         assert_eq!(
