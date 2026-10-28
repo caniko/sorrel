@@ -456,7 +456,7 @@ impl ClusterIndex {
             .collect()
     }
 
-    /// Attribute `name` of the spike at `global_idx` (1 or 2 values).
+    /// Attribute `name` of the spike at `global_idx` (one value per column).
     pub fn spike_attribute(&self, name: &str, global_idx: u32) -> Option<&[f32]> {
         let i = self.spike_attributes.iter().position(|a| a.0 == name)?;
         let (_, flat, k) = &self.spike_attributes[i];

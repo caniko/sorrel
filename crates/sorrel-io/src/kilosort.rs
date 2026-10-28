@@ -873,11 +873,10 @@ fn read_spike_attributes(root: &Path, n_spikes: usize) -> Vec<SpikeAttribute> {
             });
             match read {
                 Ok((flat, shape)) if shape.first() == Some(&n_spikes) => {
+                    // Full row width: a rewrite re-encodes added spikes
+                    // against the file's whole row shape.
                     let cols: usize = shape[1..].iter().product::<usize>().max(1);
-                    let keep = cols.min(2);
-                    let flat: Vec<f32> =
-                        flat.chunks(cols).flat_map(|r| r[..keep].to_vec()).collect();
-                    Some((name, std::sync::Arc::from(flat), keep))
+                    Some((name, std::sync::Arc::from(flat), cols))
                 }
                 Ok((_, shape)) => {
                     log::warn!(
@@ -1138,16 +1137,16 @@ pub fn read_cluster_group_tsv(path: &Path) -> Option<Vec<(u32, PhyLabel)>> {
     )
 }
 
-/// phy custom labels (`:l name value` writes `cluster_<name>.tsv`) as
-/// `name=value` tags, from every `cluster_*.tsv` with a non-numeric value
-/// (all-numeric files load as metrics). A cluster that already has a
-/// `name=` tag from the sorrel sidecar keeps it.
-fn with_phy_labels(root: &Path, mut tags: Vec<Vec<String>>) -> Vec<Vec<String>> {
+/// `(key, rows)` of every `cluster_<key>.tsv` that [`with_phy_labels`] reads
+/// as a label file: a non-reserved key whose non-empty values are not all
+/// numeric. Sorted by file name.
+fn phy_label_files(root: &Path) -> Vec<(String, Vec<(usize, String)>)> {
     let Ok(rd) = std::fs::read_dir(root) else {
-        return tags;
+        return Vec::new();
     };
     let mut files: Vec<_> = rd.flatten().map(|e| e.path()).collect();
     files.sort();
+    let mut out = Vec::new();
     for path in files {
         let Some(key) = path
             .file_name()
@@ -1162,18 +1161,35 @@ fn with_phy_labels(root: &Path, mut tags: Vec<Vec<String>>) -> Vec<Vec<String>> 
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let rows: Vec<(usize, &str)> = text
+        let rows: Vec<(usize, String)> = text
             .lines()
             .skip(1)
             .filter_map(|l| {
                 let (id, v) = l.split_once('\t')?;
-                Some((id.trim().parse().ok()?, v.trim()))
+                Some((id.trim().parse().ok()?, v.trim().to_owned()))
             })
             .filter(|(_, v)| !v.is_empty())
             .collect();
         if rows.iter().all(|(_, v)| v.parse::<f32>().is_ok()) {
             continue;
         }
+        out.push((key.to_owned(), rows));
+    }
+    out
+}
+
+/// Keys of the `cluster_<key>.tsv` files a directory open turns into custom
+/// labels. The saver blanks the ones whose label the session has cleared.
+pub fn phy_label_keys(root: &Path) -> Vec<String> {
+    phy_label_files(root).into_iter().map(|f| f.0).collect()
+}
+
+/// phy custom labels (`:l name value` writes `cluster_<name>.tsv`) as
+/// `name=value` tags, from every `cluster_*.tsv` with a non-numeric value
+/// (all-numeric files load as metrics). A cluster that already has a
+/// `name=` tag from the sorrel sidecar keeps it.
+fn with_phy_labels(root: &Path, mut tags: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    for (key, rows) in phy_label_files(root) {
         let prefix = format!("{key}=");
         for (id, v) in rows {
             let tag = format!("{prefix}{v}");
@@ -1216,6 +1232,9 @@ pub fn roll_forward_pending(root: &Path) -> Result<()> {
                 .with_context(|| format!("roll forward {tmp} -> {fin}"))?;
         }
     }
+    // Renames durable before the manifest (the only record of them) goes.
+    // ponytail: best effort (a directory cannot be opened on Windows).
+    let _ = std::fs::File::open(root).and_then(|d| d.sync_all());
     std::fs::remove_file(&manifest).with_context(|| format!("remove {}", manifest.display()))
 }
 

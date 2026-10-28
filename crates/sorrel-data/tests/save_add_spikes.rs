@@ -305,3 +305,153 @@ fn plain_save_with_added_spikes_errors_and_export_rewrites() {
     );
     assert!(!o.join("spike_times.npy.tmp").exists());
 }
+
+/// A `spike_<name>.npy` wider than two columns keeps every column, so the
+/// rewrite carries them all instead of failing to encode short rows.
+#[test]
+fn wide_spike_attribute_survives_the_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_fixture(root);
+    let wide: Vec<f32> = (0..6)
+        .flat_map(|i| [i as f32, 10. + i as f32, 20.])
+        .collect();
+    write_npy(&root.join("spike_wide.npy"), "<f4", &[6, 3], &f32s(&wide));
+    let mut s = open(root);
+    let ci = s.cluster_index();
+    assert!(ci.spike_attribute_names().contains(&("wide", 3)));
+    assert_eq!(ci.spike_attribute("wide", 1), Some(&[1., 11., 20.][..]));
+    s.dispatch(CurationCommand::AddSpikes(SpikeBatch {
+        times: vec![40, 100],
+        clusters: vec![ClusterId(1), ClusterId(2)],
+        templates: vec![1, 1],
+        amplitudes: vec![9., 8.],
+        pc_features: vec![900., 901., 910., 911.],
+        template_features: vec![7., 7.5, 8., 8.5],
+        attributes: vec![
+            ("depth".into(), 1, vec![500., 501.]),
+            ("wide".into(), 3, vec![-1., -2., -3., -4., -5., -6.]),
+        ],
+    }))
+    .unwrap();
+    save_and_reseal_journal(&s, root, &root.join("j.journal"), label_str).unwrap();
+    let (flat, shape) = read_npy_f32_flat(&root.join("spike_wide.npy")).unwrap();
+    assert_eq!(shape, [8, 3]);
+    assert_eq!(&flat[6..9], [-1., -2., -3.]); // added spike at g = 2
+    assert_eq!(&flat[9..12], [2., 12., 20.]); // original row 2 now at g = 3
+}
+
+#[test]
+fn cleared_custom_label_is_blanked_not_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_fixture(root);
+    let set = |s: &mut Session<KilosortProvider>, v: &str| {
+        let cmd = s.set_label_command(ClusterId(1), "quality", v).unwrap();
+        s.dispatch(cmd).unwrap();
+    };
+    let mut s = open(root);
+    set(&mut s, "great");
+    save_and_reseal_journal(&s, root, &root.join("j.journal"), label_str).unwrap();
+    let mut s = open(root);
+    assert_eq!(s.custom_label(ClusterId(1), "quality"), Some("great"));
+
+    set(&mut s, "");
+    save_and_reseal_journal(&s, root, &root.join("j.journal"), label_str).unwrap();
+    // The user's file is kept, header only.
+    let tsv = std::fs::read_to_string(root.join("cluster_quality.tsv")).unwrap();
+    assert_eq!(tsv, "cluster_id\tquality\n");
+    let s = open(root);
+    assert_eq!(s.custom_label(ClusterId(1), "quality"), None);
+    assert!(s.custom_label_keys().is_empty());
+}
+
+/// Run a full add-spikes save, then rebuild the directory as a crash would
+/// have left it: pre-save files in place, every changed file staged as
+/// `<name>.tmp`, the manifest published, and the first `renamed` renames done.
+fn crash_after_manifest(renamed: usize) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_fixture(root);
+    let mut s = open(root);
+    add_two(&mut s);
+    let cmd = s
+        .set_label_command(ClusterId(1), "quality", "great")
+        .unwrap();
+    s.dispatch(cmd).unwrap();
+    s.dispatch(CurationCommand::Relabel {
+        cluster: ClusterId(2),
+        op: sorrel_data::PhyLabelOp::SetGood,
+    })
+    .unwrap();
+    let pre = snapshot(root);
+    save_and_reseal_journal(&s, root, &root.join("j.journal"), label_str).unwrap();
+    drop(s);
+    let post = snapshot(root);
+
+    let mut changed: Vec<&String> = post
+        .iter()
+        .filter(|(k, v)| pre.get(*k) != Some(*v))
+        .map(|(k, _)| k)
+        .collect();
+    changed.sort_by_key(|k| k.as_str() == "j.journal"); // journal last
+    assert!(changed.iter().any(|k| *k == "j.journal"));
+    assert!(changed.iter().any(|k| *k == "spike_clusters.npy"));
+    let mut manifest = String::new();
+    for (i, name) in changed.iter().enumerate() {
+        match pre.get(*name) {
+            Some(old) => std::fs::write(root.join(name), old).unwrap(),
+            None => std::fs::remove_file(root.join(name)).unwrap(),
+        }
+        if i < renamed {
+            std::fs::write(root.join(name), &post[*name]).unwrap();
+        } else {
+            std::fs::write(root.join(format!("{name}.tmp")), &post[*name]).unwrap();
+        }
+        manifest.push_str(&format!("{name}.tmp\t{name}\n"));
+    }
+    std::fs::write(root.join("sorrel_rewrite.pending"), manifest).unwrap();
+    dir
+}
+
+fn assert_resealed_with_everything(root: &Path) {
+    let s = open(root); // roll-forward, then the journal seal check
+    assert_eq!(s.cluster_index().n_spikes(), 8);
+    assert_eq!(s.custom_label(ClusterId(1), "quality"), Some("great"));
+    assert_eq!(s.label(ClusterId(2)), Some(PhyLabel::Good));
+    assert_eq!(s.journal().n_records(), 0, "journal resealed");
+    assert_eq!(
+        s.cluster_index().spike_attribute("sorrel_rescued", 2),
+        Some(&[1.0][..])
+    );
+    assert!(!root.join("sorrel_rewrite.pending").exists());
+    assert!(snapshot(root).keys().all(|k| !k.ends_with(".tmp")));
+}
+
+#[test]
+fn crash_after_manifest_before_any_rename_completes_on_open() {
+    let dir = crash_after_manifest(0);
+    assert_resealed_with_everything(dir.path());
+}
+
+#[test]
+fn crash_after_partial_rename_completes_on_open() {
+    // Mid-way: some arrays renamed, the journal still old.
+    let dir = crash_after_manifest(3);
+    assert_resealed_with_everything(dir.path());
+}
+
+#[test]
+fn crash_before_manifest_keeps_the_old_state_and_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_fixture(root);
+    let mut s = open(root);
+    add_two(&mut s);
+    // Tmps without a manifest are ignored: the old files and journal reopen.
+    std::fs::write(root.join("spike_clusters.npy.tmp"), b"junk").unwrap();
+    std::fs::write(root.join("j.journal.tmp"), b"junk").unwrap();
+    drop(s);
+    let s = open(root);
+    assert_eq!(s.cluster_index().n_spikes(), 8);
+}

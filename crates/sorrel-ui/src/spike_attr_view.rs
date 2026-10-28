@@ -69,10 +69,11 @@ static GENERATION: AtomicU64 = AtomicU64::new(1);
 fn compute<P: DataProvider>(s: &Session<P>, key: &AttrKey) -> AttrSet {
     let (selection, _, name, reorder) = key;
     let ci = s.cluster_index();
+    // Two or more columns plot as x/y on the first two (phy's convention).
     let two_d = ci
         .spike_attribute_names()
         .iter()
-        .any(|&(n, k)| n == name && k == 2);
+        .any(|&(n, k)| n == name && k >= 2);
     let sr = s.provider.sample_rate().max(1.0);
     let slot_of: HashMap<ClusterId, u16> = selection
         .iter()

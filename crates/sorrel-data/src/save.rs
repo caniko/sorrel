@@ -73,7 +73,64 @@ where
     let path = root.join("spike_clusters.npy");
     write_1d_u32_atomic(&path, &clusters_in_row_order(session.cluster_index()))
         .with_context(|| format!("write {}", path.display()))?;
+    stage_assignments(session, root, &label_str, &Sink::direct())
+}
 
+/// Where a save's small files go: written and renamed one by one
+/// ([`Sink::direct`]), or left as fsynced `<name>.tmp` for one manifest
+/// roll-forward ([`Sink::staging`]), which records their final names.
+struct Sink(Option<std::cell::RefCell<Vec<String>>>);
+
+impl Sink {
+    fn direct() -> Self {
+        Self(None)
+    }
+    fn staging() -> Self {
+        Self(Some(Default::default()))
+    }
+    /// Remember `name` as staged (before writing it, so a failed write's
+    /// partial tmp is cleaned up too).
+    fn note(&self, name: &str) {
+        if let Some(v) = &self.0 {
+            v.borrow_mut().push(name.to_owned());
+        }
+    }
+    fn names(&self) -> Vec<String> {
+        self.0
+            .as_ref()
+            .map(|v| v.borrow().clone())
+            .unwrap_or_default()
+    }
+    fn write(&self, path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
+        use std::io::Write;
+        if let Some(n) = path.file_name().and_then(|n| n.to_str()) {
+            self.note(n);
+        }
+        let tmp = with_tmp_suffix(path);
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("write {}", tmp.display()))?;
+        f.write_all(bytes.as_ref())
+            .and_then(|()| f.sync_all())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        if self.0.is_some() {
+            return Ok(());
+        }
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
+    }
+}
+
+/// Everything [`write_phy_assignments`] writes except `spike_clusters.npy`.
+fn stage_assignments<P, F>(
+    session: &Session<P>,
+    root: &Path,
+    label_str: &F,
+    sink: &Sink,
+) -> Result<()>
+where
+    P: DataProvider,
+    F: Fn(&P::Label) -> &'static str,
+{
     let tsv_path = root.join("cluster_group.tsv");
     let mut text = String::from("cluster_id\tgroup\n");
     for (i, lbl) in session.labels().iter().enumerate() {
@@ -82,7 +139,7 @@ where
             text.push_str(&format!("{i}\t{s}\n"));
         }
     }
-    write_atomic(&tsv_path, &text)?;
+    sink.write(&tsv_path, &text)?;
 
     // Tags: written whenever a cluster has any, or to clear a stale sidecar.
     let tags_path = root.join(sorrel_io::kilosort::TAGS_TSV);
@@ -96,28 +153,42 @@ where
         }
     }
     if any || tags_path.exists() {
-        write_atomic(&tags_path, &tags_text)?;
+        sink.write(&tags_path, &tags_text)?;
     }
 
-    write_annotations_tsv(session, root)?;
+    write_annotations_tsv(session, root, sink)?;
 
     // phy custom labels: one `cluster_<key>.tsv` per key, as phy writes them.
-    for key in session.custom_label_keys() {
+    let keys = session.custom_label_keys();
+    for key in &keys {
         let mut text = format!("cluster_id\t{key}\n");
         for c in (0..session.n_clusters()).map(sorrel_io::ClusterId) {
-            if let Some(v) = session.custom_label(c, &key) {
+            if let Some(v) = session.custom_label(c, key) {
                 text.push_str(&format!("{c}\t{v}\n"));
             }
         }
-        write_atomic(&root.join(format!("cluster_{key}.tsv")), &text)?;
+        sink.write(&root.join(format!("cluster_{key}.tsv")), &text)?;
     }
-    write_cluster_info(session, root, &label_str)
+    // A key whose last value was cleared is no longer listed, but its old
+    // file would restore the value on reopen: blank it (header only) rather
+    // than delete a file that is the user's.
+    for key in sorrel_io::kilosort::phy_label_keys(root) {
+        if !keys.contains(&key) {
+            let text = format!("cluster_id\t{key}\n");
+            sink.write(&root.join(format!("cluster_{key}.tsv")), &text)?;
+        }
+    }
+    write_cluster_info(session, root, label_str, sink)
 }
 
 /// `cluster_sorrel_annotations.tsv`: origin, direct parents and note for every
 /// non-empty unit, so a resealed (emptied) journal loses nothing. An
 /// `Auto[<sorter>]` row also pins the sorter name for the next open.
-fn write_annotations_tsv<P: DataProvider>(session: &Session<P>, root: &Path) -> Result<()> {
+fn write_annotations_tsv<P: DataProvider>(
+    session: &Session<P>,
+    root: &Path,
+    sink: &Sink,
+) -> Result<()> {
     let mut text = String::from("cluster_id\tsorrel_origin\tsorrel_parents\tsorrel_note\n");
     for c in (0..session.n_clusters()).map(sorrel_io::ClusterId) {
         if session.spike_times(c).is_empty() {
@@ -133,14 +204,19 @@ fn write_annotations_tsv<P: DataProvider>(session: &Session<P>, root: &Path) -> 
             sorrel_io::kilosort::escape_note(session.note(c))
         ));
     }
-    write_atomic(&root.join(sorrel_io::kilosort::ANNOTATIONS_TSV), &text)
+    sink.write(&root.join(sorrel_io::kilosort::ANNOTATIONS_TSV), &text)
 }
 
 /// phy's `cluster_info.tsv`: one row per non-empty cluster with the columns
 /// phy's cluster view shows (`cluster_id`, `ch`, `fr`, `amp`, `n_spikes`,
 /// `group`, custom labels), rewritten on every save. `depth` needs probe
 /// geometry, which the session does not hold, so it is left out.
-fn write_cluster_info<P, F>(session: &Session<P>, root: &Path, label_str: &F) -> Result<()>
+fn write_cluster_info<P, F>(
+    session: &Session<P>,
+    root: &Path,
+    label_str: &F,
+    sink: &Sink,
+) -> Result<()>
 where
     P: DataProvider,
     F: Fn(&P::Label) -> &'static str,
@@ -197,14 +273,7 @@ where
         }
         text.push('\n');
     }
-    write_atomic(&root.join("cluster_info.tsv"), &text)
-}
-
-fn write_atomic(path: &Path, text: &str) -> Result<()> {
-    let tmp = with_tmp_suffix(path);
-    std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
+    sink.write(&root.join("cluster_info.tsv"), &text)
 }
 
 /// The per-spike cluster ids in the backend's original row order (the order
@@ -220,7 +289,7 @@ fn clusters_in_row_order(index: &ClusterIndex) -> Vec<u32> {
     let clusters = index.spike_clusters();
     let rows = index.spike_pc_indices();
     let time_order = || clusters.iter().map(|c| c.0).collect::<Vec<u32>>();
-    // After `rewrite_spike_arrays` every file is in global (time) order.
+    // After an AddSpikes rewrite every file is in global (time) order.
     if rows.len() != clusters.len() || has_added_spikes(index) {
         return time_order();
     }
@@ -251,28 +320,79 @@ where
     P: DataProvider,
     F: Fn(&P::Label) -> &'static str,
 {
-    if has_added_spikes(session.cluster_index()) {
-        rewrite_spike_arrays(session, root)?;
-    }
-    write_curation(session, root, &label_str)?;
-
-    // Hash the bytes we just wrote (post-rename, post-fsync).
-    let bytes = std::fs::read(root.join("spike_clusters.npy"))
-        .context("hash freshly-written spike_clusters.npy")?;
-    let new_baseline = baseline_hash(&bytes);
+    let added = has_added_spikes(session.cluster_index());
     let n_clusters = session.n_clusters();
-    let journal = Journal::truncate(journal_path, new_baseline, n_clusters)?;
-    // The artifacts now carry every merge and split, so the interchange
-    // document must not repeat them: rewrite it as labels only. The session
-    // still holds the old history until the caller swaps in `journal`.
-    let labels_only = crate::curation_json::curation_document_sealed(session, label_str);
-    let json_path = root.join("curation.json");
-    let tmp = json_path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&labels_only)?)
-        .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &json_path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), json_path.display()))?;
-    Ok(journal)
+    // The journal can join the atomic publish only when it lives in `root`
+    // (the default). ponytail: an external journal is resealed after the
+    // artifacts, so a crash in between leaves it stale (`open_phy` then asks
+    // for `--discard-journal`); fixing that needs a journal-side two-phase seal.
+    let journal_name = journal_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|_| same_dir(journal_path.parent(), root))
+        .map(str::to_owned);
+
+    // Stage every output as an fsynced `<name>.tmp`; nothing is visible yet.
+    let sink = Sink::staging();
+    let mut backup = Vec::new();
+    let staged = (|| -> Result<u64> {
+        if added {
+            // Also stages spike_clusters.npy (global order = the index order).
+            backup = write_spike_array_tmps(session, root, root)?;
+            backup.iter().for_each(|n| sink.note(n));
+        } else {
+            let path = root.join("spike_clusters.npy");
+            sink.note("spike_clusters.npy");
+            let rows = clusters_in_row_order(session.cluster_index());
+            write_rows_tmp(&path, "<u4", &[], rows.iter().map(|c| c.to_le_bytes()))
+                .with_context(|| format!("write {}", path.display()))?;
+        }
+        stage_assignments(session, root, &label_str, &sink)?;
+        // The artifacts carry every merge and split, so the interchange
+        // document must not repeat them: labels only. The session still holds
+        // the old history until the caller swaps in the new journal.
+        let doc = crate::curation_json::curation_document_sealed(session, &label_str);
+        sink.write(
+            &root.join("curation.json"),
+            serde_json::to_vec_pretty(&doc)?,
+        )?;
+        // Seal against the bytes that will be renamed into place.
+        let tmp = with_tmp_suffix(&root.join("spike_clusters.npy"));
+        let bytes = std::fs::read(&tmp).with_context(|| format!("hash {}", tmp.display()))?;
+        let baseline = baseline_hash(&bytes);
+        if let Some(name) = &journal_name {
+            sink.note(name);
+            Journal::truncate(&with_tmp_suffix(&root.join(name)), baseline, n_clusters)?;
+        }
+        Ok(baseline)
+    })();
+    let baseline = match staged {
+        Ok(b) => b,
+        Err(e) => {
+            discard_staged(root, &sink.names());
+            return Err(e);
+        }
+    };
+    // One roll-forward publishes everything (journal last); an interruption
+    // anywhere is completed by the next open.
+    publish_staged(root, &backup, &sink.names())?;
+    match journal_name {
+        Some(_) => Journal::open_or_create(journal_path, baseline, n_clusters),
+        None => Journal::truncate(journal_path, baseline, n_clusters),
+    }
+}
+
+fn same_dir(a: Option<&Path>, b: &Path) -> bool {
+    let a = a
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
+}
+
+fn discard_staged(root: &Path, names: &[String]) {
+    for n in names {
+        let _ = std::fs::remove_file(with_tmp_suffix(&root.join(n)));
+    }
 }
 
 fn with_tmp_suffix(path: &Path) -> std::path::PathBuf {
@@ -296,39 +416,40 @@ pub(crate) fn has_added_spikes(index: &ClusterIndex) -> bool {
         .any(|r| r.get().is_some_and(|r| r as usize >= n))
 }
 
-/// Rewrite every per-spike array of a phy directory in global (time) order so
-/// they include the spikes added by `AddSpikes`. Crash-safe: tmp files are
-/// fsynced, a manifest naming them is fsynced, then the renames are rolled
-/// out by [`sorrel_io::kilosort::roll_forward_pending`], which
-/// `KilosortProvider::open` also runs after an interruption. Originals go to
-/// `sorrel_original/` first (never overwritten), and phy's `.phy/` cache,
-/// now stale, is moved to `.phy.sorrel-stale`.
+/// Publish staged `<name>.tmp` files crash-safely: originals of `backup` go to
+/// `sorrel_original/` first (never overwritten) and phy's `.phy/` cache, now
+/// stale, to `.phy.sorrel-stale` (both only when `backup` is non-empty); a
+/// manifest naming the tmps is fsynced and renamed into place; the renames
+/// are then rolled out by [`sorrel_io::kilosort::roll_forward_pending`], the
+/// same routine `KilosortProvider::open` runs after an interruption. A crash
+/// before the manifest leaves the old state; after it, the next open finishes
+/// the whole save.
 ///
-/// The session's own index keeps the old row numbering: reopen the directory
-/// afterwards (a second rewrite from the same session is refused).
-pub(crate) fn rewrite_spike_arrays<P: DataProvider>(
-    session: &Session<P>,
-    root: &Path,
-) -> Result<()> {
+/// After an `AddSpikes` rewrite the session's own index keeps the old row
+/// numbering: reopen the directory afterwards (a second rewrite from the same
+/// session is refused).
+fn publish_staged(root: &Path, backup: &[String], names: &[String]) -> Result<()> {
     use sorrel_io::kilosort::{roll_forward_pending, REWRITE_PENDING};
     use std::io::Write;
-    let names = write_spike_array_tmps(session, root, root)?;
-    let tmp_of = |n: &String| root.join(format!("{n}.tmp"));
     let prepare = || -> Result<()> {
-        let bak = root.join(BACKUP_DIR);
-        std::fs::create_dir_all(&bak).with_context(|| format!("create {}", bak.display()))?;
-        for n in &names {
-            let (from, to) = (root.join(n), bak.join(n));
-            if from.exists() && !to.exists() && std::fs::hard_link(&from, &to).is_err() {
-                std::fs::copy(&from, &to).with_context(|| format!("back up {n}"))?;
+        if !backup.is_empty() {
+            let bak = root.join(BACKUP_DIR);
+            std::fs::create_dir_all(&bak).with_context(|| format!("create {}", bak.display()))?;
+            for n in backup {
+                let (from, to) = (root.join(n), bak.join(n));
+                if from.exists() && !to.exists() && std::fs::hard_link(&from, &to).is_err() {
+                    std::fs::copy(&from, &to).with_context(|| format!("back up {n}"))?;
+                }
+            }
+            let phy = root.join(".phy");
+            if phy.exists() {
+                let stale = root.join(".phy.sorrel-stale");
+                let _ = std::fs::remove_dir_all(&stale);
+                std::fs::rename(&phy, &stale).context("move aside stale .phy cache")?;
             }
         }
-        let phy = root.join(".phy");
-        if phy.exists() {
-            let stale = root.join(".phy.sorrel-stale");
-            let _ = std::fs::remove_dir_all(&stale);
-            std::fs::rename(&phy, &stale).context("move aside stale .phy cache")?;
-        }
+        // The tmps' directory entries are durable before the manifest names them.
+        sync_dir(root);
         // Manifest via tmp + rename so a torn one is never seen.
         let manifest = root.join(REWRITE_PENDING);
         let tmp = with_tmp_suffix(&manifest);
@@ -336,18 +457,22 @@ pub(crate) fn rewrite_spike_arrays<P: DataProvider>(
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
-        std::fs::rename(&tmp, &manifest).context("publish rewrite manifest")
+        std::fs::rename(&tmp, &manifest).context("publish rewrite manifest")?;
+        sync_dir(root);
+        Ok(())
     };
     if let Err(e) = prepare() {
-        names
-            .iter()
-            .for_each(|n| drop(std::fs::remove_file(tmp_of(n))));
+        discard_staged(root, names);
         return Err(e);
     }
     roll_forward_pending(root)?;
-    // ponytail: best effort (a directory cannot be opened on Windows).
-    let _ = std::fs::File::open(root).and_then(|d| d.sync_all());
+    sync_dir(root);
     Ok(())
+}
+
+/// ponytail: best effort (a directory cannot be opened on Windows).
+fn sync_dir(root: &Path) {
+    let _ = std::fs::File::open(root).and_then(|d| d.sync_all());
 }
 
 /// Write every per-spike array of `session` as `<dst>/<name>.tmp` (fsynced,
