@@ -78,7 +78,7 @@ mod tests {
     fn subspace_key() -> CacheKey {
         pc_subspace::key(pc_subspace::KeyParts {
             session_identity: b"provider-identity",
-            journal_head: 17,
+            n_spikes_total: 17,
             cluster: ClusterId(3),
             cluster_spike_count: 2,
             cluster_spike_fingerprint: [0x5a; 32],

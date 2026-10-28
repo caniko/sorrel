@@ -6,7 +6,8 @@ use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 
 pub const ACG_KIND: &str = "correlogram_acg";
 pub const CCG_KIND: &str = "correlogram_ccg";
-pub const ALGO_VERSION: u32 = 1;
+// v2: keys no longer carry the journal head (times alone determine a correlogram).
+pub const ALGO_VERSION: u32 = 2;
 
 #[derive(Archive, Serialize, Deserialize, Debug, PartialEq)]
 pub struct CachedCorrelogram {
@@ -18,14 +19,12 @@ pub struct CachedCorrelogram {
 
 pub fn acg_key(
     session_identity: &[u8],
-    journal_head: u64,
     cluster_fp: [u8; 32],
     bin_size_samples: u32,
     window_samples: u32,
 ) -> CacheKey {
     let fingerprint = Fingerprint::builder()
         .add_provider_identity(session_identity)
-        .add_journal_head(journal_head)
         .add_algo_version(ALGO_VERSION)
         .add_param_bytes("cluster_spike_fingerprint", &cluster_fp)
         .add_param_bytes("bin_size_samples", &bin_size_samples.to_le_bytes())
@@ -41,7 +40,6 @@ pub fn acg_key(
 /// callers must not sort the fingerprints before hashing.
 pub fn ccg_key(
     session_identity: &[u8],
-    journal_head: u64,
     a_fp: [u8; 32],
     b_fp: [u8; 32],
     bin_size_samples: u32,
@@ -49,7 +47,6 @@ pub fn ccg_key(
 ) -> CacheKey {
     let fingerprint = Fingerprint::builder()
         .add_provider_identity(session_identity)
-        .add_journal_head(journal_head)
         .add_algo_version(ALGO_VERSION)
         .add_param_bytes("cluster_a_spike_fingerprint", &a_fp)
         .add_param_bytes("cluster_b_spike_fingerprint", &b_fp)
@@ -114,7 +111,6 @@ where
     let cluster_fp = spike_time_fingerprint(times);
     let key = acg_key(
         &session.provider.identity_bytes(),
-        session.journal_head(),
         cluster_fp,
         bin_size_samples,
         window_samples,
@@ -159,7 +155,6 @@ where
 
     let key = ccg_key(
         &session.provider.identity_bytes(),
-        session.journal_head(),
         spike_time_fingerprint(times_a),
         spike_time_fingerprint(times_b),
         bin_size_samples,
@@ -372,7 +367,7 @@ mod tests {
     fn cached_correlogram_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let store = CacheStore::open(dir.path()).unwrap();
-        let key = acg_key(b"provider", 7, [0x11; 32], 30, 1_500);
+        let key = acg_key(b"provider", [0x11; 32], 30, 1_500);
         let value = CachedCorrelogram {
             bins: vec![1, 2, 3, 5, 8],
             bin_size_samples: 30,
@@ -426,7 +421,6 @@ mod tests {
         let times_b = session.spike_times(ClusterId(1));
         let key_ab = ccg_key(
             &session.provider.identity_bytes(),
-            session.journal_head(),
             spike_time_fingerprint(times_a),
             spike_time_fingerprint(times_b),
             30,
@@ -434,7 +428,6 @@ mod tests {
         );
         let key_ba = ccg_key(
             &session.provider.identity_bytes(),
-            session.journal_head(),
             spike_time_fingerprint(times_b),
             spike_time_fingerprint(times_a),
             30,

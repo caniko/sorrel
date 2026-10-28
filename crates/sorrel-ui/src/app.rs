@@ -542,6 +542,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     }
 
     pub fn set_channel_positions(&mut self, positions: Vec<[f32; 2]>) {
+        self.suggest_cache.positions = positions.clone();
         self.channel_positions = positions;
     }
 

@@ -100,6 +100,8 @@ struct CacheClusterIdentity {
 struct CacheInvalidation {
     prev_head: u64,
     new_head: u64,
+    /// Total spike count before the edit (part of the pc-subspace key).
+    n_spikes: u64,
     clusters: Vec<CacheClusterIdentity>,
 }
 
@@ -262,10 +264,6 @@ impl<P: DataProvider> Session<P> {
         self.journal.path().parent()
     }
 
-    pub(crate) fn journal_head(&self) -> u64 {
-        self.journal.head()
-    }
-
     /// Monotonic version of the replay-visible curation state: changes on
     /// every journaled command (including undo/redo) and on reseal. Use it
     /// as the cache key for anything derived from curation state; the
@@ -319,7 +317,7 @@ impl<P: DataProvider> Session<P> {
                 }
                 let subspace_key = pc_subspace::key(pc_subspace::KeyParts {
                     session_identity: &provider_identity,
-                    journal_head: entry.prev_head,
+                    n_spikes_total: entry.n_spikes,
                     cluster: cluster.cluster,
                     cluster_spike_count: cluster.spike_count,
                     cluster_spike_fingerprint: cluster.cluster_spike_fingerprint,
@@ -885,13 +883,14 @@ impl<P: DataProvider> Session<P> {
         }
         let prev_head = self.journal.head();
         let affected = self.cache_identities_for_command(&cmd);
+        let n_before = self.cluster_index.n_spikes() as u64;
         self.journal.append(&cmd)?;
         if let Some(sink) = &mut self.record_sink {
             sink(&cmd);
         }
         let new_head = self.journal.head();
         self.apply_record(cmd)?;
-        self.record_cache_invalidation(prev_head, new_head, affected);
+        self.record_cache_invalidation(prev_head, new_head, n_before, affected);
         Ok(())
     }
 
@@ -1199,6 +1198,7 @@ impl<P: DataProvider> Session<P> {
         &mut self,
         prev_head: u64,
         new_head: u64,
+        n_spikes: u64,
         clusters: Vec<CacheClusterIdentity>,
     ) {
         if prev_head == new_head {
@@ -1210,6 +1210,7 @@ impl<P: DataProvider> Session<P> {
         self.cache_invalidations.push_back(CacheInvalidation {
             prev_head,
             new_head,
+            n_spikes,
             clusters,
         });
     }
@@ -1229,13 +1230,12 @@ impl<P: DataProvider> Session<P> {
     fn cache_identity(&self, cluster: ClusterId) -> CacheClusterIdentity {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"sorrel-pc-subspace-cluster-spikes-v1");
-        let mut count = 0usize;
-        for (global_idx, &assigned) in self.spike_clusters_global().iter().enumerate() {
-            if assigned == cluster {
-                count += 1;
-                hasher.update(&(global_idx as u64).to_le_bytes());
-            }
+        // The cluster's own bucket of global indices, ascending.
+        let indices = self.cluster_index.global_indices(cluster);
+        for &global_idx in indices {
+            hasher.update(&(global_idx as u64).to_le_bytes());
         }
+        let count = indices.len();
         CacheClusterIdentity {
             cluster,
             spike_count: count,
@@ -2077,11 +2077,10 @@ mod tests {
     fn merge_then_cache_invalidation_evicts_pre_merge_cluster_archive() {
         let (mut s, dir) = fresh_session();
         let store = CacheStore::open(dir.path()).unwrap();
-        let old_head = s.journal_head();
         let old_identity = s.cache_identity(ClusterId(0));
         let old_key = pc_subspace::key(pc_subspace::KeyParts {
             session_identity: &s.provider.identity_bytes(),
-            journal_head: old_head,
+            n_spikes_total: s.cluster_index.n_spikes() as u64,
             cluster: old_identity.cluster,
             cluster_spike_count: old_identity.spike_count,
             cluster_spike_fingerprint: old_identity.cluster_spike_fingerprint,
@@ -2123,5 +2122,50 @@ mod tests {
             "pre-merge archive should not survive save/next-open invalidation"
         );
         assert!(!old_path.exists());
+    }
+
+    /// The bucket-based identity must hash exactly what the old full scan
+    /// did, or existing cache entries would silently stop matching.
+    #[test]
+    fn cache_identity_matches_the_full_scan_after_merge_and_split() {
+        let reference = |s: &Session<MockProvider>, cluster: ClusterId| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"sorrel-pc-subspace-cluster-spikes-v1");
+            let mut count = 0usize;
+            for (g, &c) in s.spike_clusters_global().iter().enumerate() {
+                if c == cluster {
+                    count += 1;
+                    hasher.update(&(g as u64).to_le_bytes());
+                }
+            }
+            (count, *hasher.finalize().as_bytes())
+        };
+        let (mut s, _d) = fresh_session();
+        let check = |s: &Session<MockProvider>| {
+            for c in (0..s.n_clusters()).map(ClusterId) {
+                let id = s.cache_identity(c);
+                assert_eq!(
+                    (id.spike_count, id.cluster_spike_fingerprint),
+                    reference(s, c)
+                );
+            }
+        };
+        check(&s);
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(0)],
+            target: ClusterId(2),
+        })
+        .unwrap();
+        check(&s);
+        s.dispatch(CurationCommand::Split {
+            cluster: ClusterId(2),
+            spike_idx: vec![1, 3],
+            new_cluster: ClusterId(0),
+            by: crate::command::Method::Manual,
+        })
+        .unwrap();
+        check(&s);
+        s.dispatch(CurationCommand::Undo).unwrap();
+        check(&s);
     }
 }

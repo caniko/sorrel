@@ -33,5 +33,9 @@ hdf5 = ["sorrel-io/hdf5"]
 name = "seed_amplitudes_cache"
 harness = false
 
+[[bench]]
+name = "suggest_incremental"
+harness = false
+
 [dev-dependencies]
 tempfile.workspace = true

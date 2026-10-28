@@ -6,9 +6,10 @@
 
 use egui::{Color32, Pos2, Sense, Stroke, Ui};
 use sorrel_compute::{psth, sliding_refractory_contamination, QualityBreakdown};
+use sorrel_data::suggest::{rank_merge_candidates_memo, rank_split_candidates_memo, SuggestMemo};
 use sorrel_data::{
-    cluster_quality, preview_merge, rank_merge_candidates, rank_split_candidates, DepthSource,
-    MergeCandidate, Session, SpikeDepths, SplitCandidate, SuggestConfig,
+    cluster_quality, preview_merge, DepthSource, MergeCandidate, Session, SpikeDepths,
+    SplitCandidate, SuggestConfig,
 };
 use sorrel_io::{ClusterId, DataProvider, Events};
 
@@ -178,7 +179,6 @@ pub(crate) fn num_cell(ui: &mut Ui, text: String, colour: Option<Color32>) {
     });
 }
 
-/// Right-aligned strong header cell.
 /// One-row parameter bar for plot panes: `primary` controls inline, the
 /// rest in a "⚙" popover, `caption` right-aligned and truncated (full
 /// text on hover). Keeps pane toolbars on one row at ~300 px.
@@ -206,6 +206,7 @@ pub fn param_bar(
     });
 }
 
+/// Right-aligned strong header cell.
 pub(crate) fn num_head(ui: &mut Ui, text: &str) -> egui::Response {
     right_aligned(ui, |ui| ui.strong(text))
 }
@@ -1338,14 +1339,15 @@ impl SuggestResult {
     fn compute<P: DataProvider>(
         session: &Session<P>,
         config: &SuggestConfig,
+        memo: &mut SuggestMemo,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Self {
         use std::sync::atomic::Ordering;
-        let merges = rank_merge_candidates(session, config);
+        let merges = rank_merge_candidates_memo(session, config, memo);
         if cancel.load(Ordering::Relaxed) {
             return Self::default();
         }
-        let splits = rank_split_candidates(session, config);
+        let splits = rank_split_candidates_memo(session, config, memo);
         if cancel.load(Ordering::Relaxed) {
             return Self::default();
         }
@@ -1386,6 +1388,11 @@ impl SuggestResult {
 #[derive(Default)]
 pub struct SuggestCache {
     memo: crate::jobs::Memo<(u64, u64), std::sync::Arc<SuggestResult>>,
+    /// Per-pair and per-cluster scores kept across versions; only the worker
+    /// thread locks it.
+    scores: std::sync::Arc<std::sync::Mutex<SuggestMemo>>,
+    /// Probe channel positions (µm); enables the drift-fragment merge source.
+    pub positions: Vec<[f32; 2]>,
     force: u64,
     pub config: SuggestConfig,
     /// Current selection, set by the caller each frame so rows involving
@@ -1406,9 +1413,14 @@ impl SuggestCache {
     ) -> Option<std::sync::Arc<SuggestResult>> {
         let key = (session.version(), self.force);
         let config = self.config;
+        let (scores, positions) = (self.scores.clone(), self.positions.clone());
         self.memo
             .ensure(key, &jobs.session, jobs.repaint(), move |s, cancel| {
-                std::sync::Arc::new(SuggestResult::compute(s, &config, cancel))
+                let mut memo = scores.lock().unwrap_or_else(|e| e.into_inner());
+                if memo.positions != positions {
+                    memo.positions = positions;
+                }
+                std::sync::Arc::new(SuggestResult::compute(s, &config, &mut memo, cancel))
             })
             .cloned()
     }
