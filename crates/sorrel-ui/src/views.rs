@@ -80,31 +80,6 @@ pub(crate) fn grid_colour(theme: &Theme) -> Color32 {
     blend(theme.plot_bg, theme.text, 0.6)
 }
 
-/// Translucent refractory-period band.
-pub(crate) fn refractory_fill(theme: &Theme) -> Color32 {
-    theme
-        .danger
-        .gamma_multiply(if theme.dark { 0.30 } else { 0.22 })
-}
-
-/// Black or white, whichever reads better on `bg`.
-pub(crate) fn text_on(bg: Color32) -> Color32 {
-    let l = |c: u8| {
-        let v = c as f32 / 255.0;
-        if v <= 0.03928 {
-            v / 12.92
-        } else {
-            ((v + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    let lum = 0.2126 * l(bg.r()) + 0.7152 * l(bg.g()) + 0.0722 * l(bg.b());
-    if lum > 0.18 {
-        Color32::from_gray(20)
-    } else {
-        Color32::WHITE
-    }
-}
-
 /// "c1 blue, c2 orange": colour key for the selection.
 pub(crate) fn legend(selection: &[ClusterId]) -> String {
     selection
@@ -171,21 +146,6 @@ pub(crate) fn pad_range(lo: f32, hi: f32, frac: f32) -> (f32, f32) {
     (lo - p, hi + p)
 }
 
-/// Rounded label chip with its top-left at `pos`; returns its rect.
-pub(crate) fn paint_chip(
-    painter: &egui::Painter,
-    pos: Pos2,
-    text: &str,
-    bg: Color32,
-) -> egui::Rect {
-    let fg = text_on(bg);
-    let g = painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(TICK_PX), fg);
-    let r = egui::Rect::from_min_size(pos, g.size() + egui::vec2(10.0, 4.0));
-    painter.rect_filled(r, 3.0, bg);
-    painter.galley(r.min + egui::vec2(5.0, 2.0), g, fg);
-    r
-}
-
 /// Small slot-colour square.
 pub(crate) fn swatch(ui: &mut Ui, colour: Color32) {
     let (r, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), Sense::hover());
@@ -219,6 +179,33 @@ pub(crate) fn num_cell(ui: &mut Ui, text: String, colour: Option<Color32>) {
 }
 
 /// Right-aligned strong header cell.
+/// One-row parameter bar for plot panes: `primary` controls inline, the
+/// rest in a "⚙" popover, `caption` right-aligned and truncated (full
+/// text on hover). Keeps pane toolbars on one row at ~300 px.
+#[allow(dead_code)] // used by the pane views
+pub fn param_bar(
+    ui: &mut Ui,
+    caption: &str,
+    primary: impl FnOnce(&mut Ui),
+    secondary: impl FnOnce(&mut Ui),
+) {
+    ui.horizontal(|ui| {
+        primary(ui);
+        ui.menu_button("⚙", |ui| {
+            ui.set_min_width(180.0);
+            secondary(ui);
+        })
+        .response
+        .on_hover_text("More settings");
+        if !caption.is_empty() {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(caption).small().weak()).truncate())
+                    .on_hover_text(caption);
+            });
+        }
+    });
+}
+
 pub(crate) fn num_head(ui: &mut Ui, text: &str) -> egui::Response {
     right_aligned(ui, |ui| ui.strong(text))
 }

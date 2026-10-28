@@ -1,6 +1,6 @@
-//! phy ISIView: per-cluster inter-spike-interval histograms.
+//! phy ISIView: inter-spike-interval histograms, overlaid per cluster.
 //!
-//! One row per cluster, each with its own count axis. `n_bins` bins span
+//! One plot, one slot-coloured step outline per cluster. `n_bins` bins span
 //! exactly `[x_min, x_max)` (`n_bins + 1` edges; phy's `linspace` loses one).
 
 use std::sync::Arc;
@@ -10,12 +10,11 @@ use sorrel_compute::{isi_histogram_range, isi_violations};
 use sorrel_data::Session;
 use sorrel_io::{ClusterId, DataProvider};
 
-use crate::correlogram_view::wheel_scale;
+use crate::correlogram_view::{band_fill, wheel_scale};
 use crate::prefs::IsiParams;
-use crate::theme::{selection_colour, Theme};
+use crate::theme::{contrast_text, selection_colour, Theme};
 use crate::views::{
-    axes, axes_data_rect, caption, fill_height, int_ticks, refractory_fill, swatch, AxisOpts,
-    TICK_PX,
+    axes, axes_data_rect, fill_height, int_ticks, param_bar, AxisOpts, TICK_PX,
 };
 
 /// Rows past this are not drawn (phy's grid limit; keeps the pane legible).
@@ -56,29 +55,46 @@ pub(crate) fn scale_bins(n: usize, f: f32) -> usize {
     }
 }
 
+/// One row: x max inline, x min and bins behind the gear.
 fn header(ui: &mut Ui, p: &mut IsiParams) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label("x min");
-        ui.add(
-            egui::DragValue::new(&mut p.x_min_ms)
-                .speed(0.5)
-                .range(0.0..=9_999.0)
-                .suffix(" ms"),
-        );
-        ui.label("x max");
-        ui.add(
-            egui::DragValue::new(&mut p.x_max_ms)
-                .speed(0.5)
-                .range(0.1..=10_000.0)
-                .suffix(" ms"),
-        );
-        ui.label("bins");
-        ui.add(egui::DragValue::new(&mut p.n_bins).range(1..=MAX_BINS));
-    });
+    let caption = format!(
+        "ISI histogram · {} · {} bins",
+        isi_caption(p.x_min_ms, p.x_max_ms),
+        p.n_bins
+    );
+    let (x_min, x_max, bins) = (&mut p.x_min_ms, &mut p.x_max_ms, &mut p.n_bins);
+    param_bar(
+        ui,
+        &caption,
+        |ui| {
+            ui.label("x max");
+            ui.add(
+                egui::DragValue::new(x_max)
+                    .speed(0.5)
+                    .range(0.1..=10_000.0)
+                    .suffix(" ms"),
+            );
+        },
+        |ui| {
+            egui::Grid::new("isi_params").show(ui, |ui| {
+                ui.label("x min");
+                ui.add(
+                    egui::DragValue::new(x_min)
+                        .speed(0.5)
+                        .range(0.0..=9_999.0)
+                        .suffix(" ms"),
+                );
+                ui.end_row();
+                ui.label("bins");
+                ui.add(egui::DragValue::new(bins).range(1..=MAX_BINS));
+                ui.end_row();
+            });
+        },
+    );
 }
 
-/// Inter-spike-interval histogram for every cluster in the selection,
-/// stacked vertically so individual cluster shapes stay legible.
+/// Inter-spike-interval histograms of the selection, overlaid in one plot
+/// as slot-coloured step outlines, with a per-cluster violations legend.
 pub fn isi_view<P: DataProvider>(
     ui: &mut Ui,
     session: &Session<P>,
@@ -129,113 +145,96 @@ pub fn isi_view<P: DataProvider>(
         }
     };
 
-    caption(
-        ui,
-        &theme,
-        format!(
-            "ISI histogram · {} · {} bins · refractory period shaded",
-            isi_caption(p.x_min_ms, p.x_max_ms),
-            p.n_bins
-        ),
-    );
-    // Fill the pane: each block is a header row plus a plot.
-    let n = shown.len() as f32;
-    let header_h = 22.0;
-    let gap = 8.0;
-    let plot_h = ((fill_height(ui) - n * (header_h + gap)) / n).max(110.0);
+    // Legend row: one chip per cluster with its <1 ms violations.
     let refractory_samples = (sr * 0.001).round() as u64;
-    // The 1 ms band, clipped to the visible range (empty past x_min >= 1).
+    ui.horizontal_wrapped(|ui| {
+        for (slot, &c) in shown.iter().enumerate() {
+            let n = session.spike_times(c).len();
+            let viol = isi_violations(session.spike_times(c), refractory_samples);
+            let pct = if n == 0 { 0.0 } else { viol as f32 / n as f32 * 100.0 };
+            let (bg, text) = (selection_colour(slot), format!("c{c} <1 ms {viol}/{n} ({pct:.1}%)"));
+            let fg = contrast_text(bg);
+            let g = ui
+                .painter()
+                .layout_no_wrap(text, egui::FontId::proportional(TICK_PX), fg);
+            let (r, _) = ui.allocate_exact_size(g.size() + egui::vec2(10.0, 4.0), Sense::hover());
+            ui.painter().rect_filled(r, 3.0, bg);
+            ui.painter().galley(r.min + egui::vec2(5.0, 2.0), g, fg);
+        }
+    });
+
+    let (rect, _resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().max(120.0), fill_height(ui).max(160.0)),
+        Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, theme.plot_bg);
+    let data = axes_data_rect(rect, true);
+    let max_count = hists
+        .iter()
+        .flatten()
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1) as f32;
+    let y_top = max_count * 1.1;
+    let yt = int_ticks(max_count, 3);
+    axes(
+        &painter,
+        rect,
+        (p.x_min_ms, p.x_max_ms),
+        (0.0, y_top),
+        "ms",
+        "",
+        &theme,
+        AxisOpts {
+            grid: true,
+            y_ticks: Some(&yt),
+            ..AxisOpts::default()
+        },
+    );
+    let dp = painter.with_clip_rect(data);
+    let x_of = |ms: f32| data.left() + (ms - p.x_min_ms) / (p.x_max_ms - p.x_min_ms) * data.width();
+
+    // Shade [0, 1 ms) over the full height (clipped to the visible range;
+    // empty once x_min >= 1), at least 3 px wide so it never reads as a line.
     let band = (p.x_min_ms.max(0.0), 1.0_f32.min(p.x_max_ms));
-    for (slot, &c) in shown.iter().enumerate() {
-        let times = session.spike_times(c);
-        let h = &hists[slot];
-        let max_count = h.iter().copied().max().unwrap_or(1).max(1) as f32;
-        let viol = isi_violations(times, refractory_samples);
-        let pct = if times.is_empty() {
-            0.0
-        } else {
-            viol as f32 / times.len() as f32 * 100.0
-        };
-
-        ui.horizontal(|ui| {
-            swatch(ui, selection_colour(slot));
-            ui.label(egui::RichText::new(format!("c{c}")).strong());
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(format!(
-                        "{} spikes · ISI<1 ms: {viol}/{} ({pct:.1}%)",
-                        times.len(),
-                        times.len()
-                    ))
-                    .color(theme.caption),
-                )
-                .truncate(),
-            );
-        });
-
-        let (rect, _resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width().max(120.0), plot_h),
-            Sense::hover(),
+    if band.1 > band.0 {
+        let (x0, x1) = (x_of(band.0), x_of(band.1).max(x_of(band.0) + 3.0));
+        dp.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(x0, data.top()), egui::pos2(x1, data.bottom())),
+            0.0,
+            band_fill(&theme),
         );
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, theme.plot_bg);
-        let data = axes_data_rect(rect, true);
-        let y_top = max_count * 1.1;
-        let yt = int_ticks(max_count, 2);
-        axes(
-            &painter,
-            rect,
-            (p.x_min_ms, p.x_max_ms),
-            (0.0, y_top),
-            "ms",
-            "",
-            &theme,
-            AxisOpts {
-                grid: true,
-                y_ticks: Some(&yt),
-                ..AxisOpts::default()
-            },
+        dp.line_segment(
+            [egui::pos2(x1, data.top()), egui::pos2(x1, data.bottom())],
+            Stroke::new(1.0_f32, theme.danger),
         );
-        let dp = painter.with_clip_rect(data);
-        let x_of =
-            |ms: f32| data.left() + (ms - p.x_min_ms) / (p.x_max_ms - p.x_min_ms) * data.width();
+        dp.text(
+            egui::pos2(x1 + 4.0, data.top() + 2.0),
+            egui::Align2::LEFT_TOP,
+            "1 ms",
+            egui::FontId::proportional(TICK_PX),
+            theme.danger,
+        );
+    }
 
-        // Shade the refractory zone so violations jump out.
-        if band.1 > band.0 {
-            let (x0, x1) = (x_of(band.0), x_of(band.1).max(x_of(band.0) + 3.0));
-            dp.rect_filled(
-                egui::Rect::from_min_max(egui::pos2(x0, data.top()), egui::pos2(x1, data.bottom())),
-                0.0,
-                refractory_fill(&theme),
-            );
-            dp.line_segment(
-                [egui::pos2(x1, data.top()), egui::pos2(x1, data.bottom())],
-                Stroke::new(1.0_f32, theme.danger),
-            );
-            dp.text(
-                egui::pos2(x1 + 4.0, data.top() + 2.0),
-                egui::Align2::LEFT_TOP,
-                "1 ms",
-                egui::FontId::proportional(TICK_PX),
-                theme.danger,
-            );
-        }
-
-        let bw = data.width() / p.n_bins as f32;
-        let colour = selection_colour(slot);
+    // Step outlines, one per cluster, on a shared count axis.
+    let bw = data.width() / p.n_bins as f32;
+    let y_of = |count: u32| data.bottom() - count as f32 / y_top * data.height();
+    for (slot, h) in hists.iter().enumerate() {
+        let mut pts = Vec::with_capacity(h.len() * 2 + 2);
+        pts.push(egui::pos2(data.left(), data.bottom()));
         for (i, &count) in h.iter().enumerate() {
-            let bx0 = data.left() + bw * i as f32;
-            let by0 = data.bottom() - count as f32 / y_top * data.height();
-            dp.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(bx0, by0),
-                    egui::pos2(bx0 + bw * 0.95, data.bottom()),
-                ),
-                0.0,
-                colour,
-            );
+            let x0 = data.left() + bw * i as f32;
+            pts.push(egui::pos2(x0, y_of(count)));
+            pts.push(egui::pos2(x0 + bw, y_of(count)));
         }
-        ui.add_space(gap - 4.0);
+        pts.push(egui::pos2(data.left() + bw * h.len() as f32, data.bottom()));
+        dp.add(egui::Shape::line(
+            pts,
+            Stroke::new(2.0_f32, selection_colour(slot)),
+        ));
     }
 }
 

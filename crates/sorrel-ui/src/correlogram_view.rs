@@ -13,10 +13,10 @@ use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 
 use crate::jobs::{JobCtx, Memo};
 use crate::prefs::CcgParams;
-use crate::theme::{selection_colour, Theme};
+use crate::theme::{contrast_text, selection_colour, Theme};
 use crate::views::{
-    axes, axes_data_rect, caption, fill_height, grid_colour, int_ticks, legend, paint_chip,
-    refractory_fill, AxisOpts, TICK_PX,
+    axes, blend, fill_height, grid_colour, int_ticks, param_bar, AxisOpts, TICK_PX, X_STRIP,
+    Y_GUTTER,
 };
 
 /// phy draws at most this many clusters in the grid.
@@ -153,32 +153,71 @@ pub(crate) fn wheel_scale(ui: &Ui, ctrl: bool) -> f32 {
     })
 }
 
+/// Cells are never smaller than this; past it the grid scrolls.
+const MIN_CELL: f32 = 120.0;
+
+/// Refractory band: stronger on the light background.
+pub(crate) fn band_fill(theme: &Theme) -> Color32 {
+    theme
+        .danger
+        .gamma_multiply(if theme.dark { 0.30 } else { 0.35 })
+}
+
+/// Independent-firing baseline: stronger than the gridlines in both themes.
+fn baseline_colour(theme: &Theme) -> Color32 {
+    blend(theme.plot_bg, theme.text, if theme.dark { 0.75 } else { 0.9 })
+}
+
+/// Rounded label chip with its top-left at `pos`; text contrasts the fill.
+fn chip(painter: &egui::Painter, pos: egui::Pos2, text: &str, bg: Color32) -> egui::Rect {
+    let fg = contrast_text(bg);
+    let g = painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(TICK_PX), fg);
+    let r = egui::Rect::from_min_size(pos, g.size() + egui::vec2(10.0, 4.0));
+    painter.rect_filled(r, 3.0, bg);
+    painter.galley(r.min + egui::vec2(5.0, 2.0), g, fg);
+    r
+}
+
+/// One row: window inline, the rest behind the gear.
 fn header(ui: &mut Ui, p: &mut CcgParams) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label("bin");
-        ui.add(
-            egui::DragValue::new(&mut p.bin_ms)
-                .speed(0.1)
-                .range(0.1..=1000.0)
-                .suffix(" ms"),
-        );
-        ui.label("window");
-        ui.add(
-            egui::DragValue::new(&mut p.window_ms)
-                .speed(1.0)
-                .range(1.0..=5000.0)
-                .suffix(" ms"),
-        );
-        ui.label("refractory");
-        ui.add(
-            egui::DragValue::new(&mut p.refrac_ms)
-                .speed(0.1)
-                .range(0.1..=100.0)
-                .suffix(" ms"),
-        );
-        ui.checkbox(&mut p.uniform, "uniform")
-            .on_hover_text("One y scale for every cell instead of per-cell (N)");
-    });
+    let caption = format!("ACG/CCG · {}", ccg_caption(p.window_ms, p.bin_ms));
+    let (window, bin, refrac, uniform) =
+        (&mut p.window_ms, &mut p.bin_ms, &mut p.refrac_ms, &mut p.uniform);
+    param_bar(
+        ui,
+        &caption,
+        |ui| {
+            ui.label("window");
+            ui.add(
+                egui::DragValue::new(window)
+                    .speed(1.0)
+                    .range(1.0..=5000.0)
+                    .suffix(" ms"),
+            );
+        },
+        |ui| {
+            egui::Grid::new("ccg_params").show(ui, |ui| {
+                ui.label("bin");
+                ui.add(
+                    egui::DragValue::new(bin)
+                        .speed(0.1)
+                        .range(0.1..=1000.0)
+                        .suffix(" ms"),
+                );
+                ui.end_row();
+                ui.label("refractory");
+                ui.add(
+                    egui::DragValue::new(refrac)
+                        .speed(0.1)
+                        .range(0.1..=100.0)
+                        .suffix(" ms"),
+                );
+                ui.end_row();
+            });
+            ui.checkbox(uniform, "uniform")
+                .on_hover_text("One y scale for every cell instead of per-cell (N)");
+        },
+    );
 }
 
 /// Pairwise correlogram grid for the selected clusters.
@@ -236,15 +275,6 @@ pub fn correlogram_grid_view<P: DataProvider>(
     // Bins are centred on 0, so the axis runs half a bin past the last lag.
     let ext = nb as f32 * bin_ms / 2.0;
     let tick_ms = half as f32 * bin_ms;
-    caption(
-        ui,
-        &theme,
-        format!(
-            "ACG/CCG · {} · {}",
-            ccg_caption(p.window_ms, p.bin_ms),
-            legend(shown)
-        ),
-    );
     let global_max = data
         .counts
         .iter()
@@ -255,32 +285,73 @@ pub fn correlogram_grid_view<P: DataProvider>(
         .unwrap_or(0);
     let bin_s = bin_ms as f64 / 1e3;
 
+    // Every cell's *data area* is dw x dh; the left column adds the y
+    // gutter and the bottom row the x strip, so axes labels cost the other
+    // cells nothing. Cells are at least MIN_CELL; past that the grid scrolls.
     let gap = 6.0;
     let gaps = gap * (n as f32 - 1.0);
-    let w_total = ui.available_width().max(120.0);
-    let cell_w = (w_total - gaps) / n as f32;
-    let cell_h = ((fill_height(ui) - gaps) / n as f32).max(60.0);
-    let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(w_total, cell_h * n as f32 + gaps),
-        Sense::hover(),
+    let header_h = 22.0;
+    let pane_w = ui.available_width().max(MIN_CELL);
+    let pane_h = fill_height(ui);
+    let dw = ((pane_w - gaps - Y_GUTTER) / n as f32).max(MIN_CELL);
+    let dh = ((pane_h - gaps - X_STRIP) / n as f32 - header_h).max(MIN_CELL - header_h);
+    let total = egui::vec2(
+        dw * n as f32 + Y_GUTTER + gaps,
+        (header_h + dh) * n as f32 + X_STRIP + gaps,
     );
+
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            grid(
+                ui, &theme, &data, shown, session, p, total, (dw, dh), (gap, header_h), ext,
+                tick_ms, global_max, bin_s, half,
+            );
+        });
+}
+
+/// Paint the grid into a `total`-sized allocation (see the sizing above).
+#[allow(clippy::too_many_arguments)]
+fn grid<P: DataProvider>(
+    ui: &mut Ui,
+    theme: &Theme,
+    data: &CcgData,
+    shown: &[ClusterId],
+    session: &Session<P>,
+    p: &CcgParams,
+    total: egui::Vec2,
+    (dw, dh): (f32, f32),
+    (gap, header_h): (f32, f32),
+    ext: f32,
+    tick_ms: f32,
+    global_max: u32,
+    bin_s: f64,
+    half: usize,
+) {
+    let n = shown.len();
+    let nb = data.counts[0][0].len();
+    let bin_ms = data.bin_ms;
+    let (rect, resp) = ui.allocate_exact_size(total, Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme.plot_bg);
 
-    // Small grids drop their axes and keep only the bars.
-    let compact = cell_h < 110.0 || cell_w < 110.0;
-    let header_h = 22.0;
     let xt = [-tick_ms, 0.0, tick_ms];
     let hover = resp.hover_pos();
     let mut tip = None;
     for (ri, &c_row) in shown.iter().enumerate() {
         for (ci, &c_col) in shown.iter().enumerate() {
+            let (left_col, bottom_row) = (ci == 0, ri == n - 1);
+            let x0 = if left_col {
+                rect.left()
+            } else {
+                rect.left() + Y_GUTTER + ci as f32 * (dw + gap)
+            };
             let cell = egui::Rect::from_min_size(
-                egui::pos2(
-                    rect.left() + ci as f32 * (cell_w + gap),
-                    rect.top() + ri as f32 * (cell_h + gap),
+                egui::pos2(x0, rect.top() + ri as f32 * (header_h + dh + gap)),
+                egui::vec2(
+                    dw + if left_col { Y_GUTTER } else { 0.0 },
+                    header_h + dh + if bottom_row { X_STRIP } else { 0.0 },
                 ),
-                egui::vec2(cell_w, cell_h),
             );
             painter.rect_filled(cell, 0.0, theme.panel);
 
@@ -291,7 +362,7 @@ pub fn correlogram_grid_view<P: DataProvider>(
             let colour = selection_colour(ri);
 
             // Header strip: label chip, plus a sparse note when it fits.
-            let chip = paint_chip(
+            let chip = chip(
                 &painter,
                 cell.left_top() + egui::vec2(4.0, 3.0),
                 &format!("c{c_row}×c{c_col}"),
@@ -320,31 +391,52 @@ pub fn correlogram_grid_view<P: DataProvider>(
                 }
             }
 
-            let body = egui::Rect::from_min_max(
-                egui::pos2(cell.left(), cell.top() + header_h),
-                cell.right_bottom(),
+            let data_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    cell.left() + if left_col { Y_GUTTER } else { 0.0 },
+                    cell.top() + header_h,
+                ),
+                egui::vec2(dw, dh),
             );
-            let data_rect = if compact {
-                body.shrink2(egui::vec2(4.0, 2.0))
-            } else {
-                let yt = int_ticks(y_top / 1.15, 2);
-                axes(
-                    &painter,
-                    body,
-                    (-ext, ext),
-                    (0.0, y_top),
-                    "ms",
-                    "",
-                    &theme,
-                    AxisOpts {
-                        grid: true,
-                        x_ticks: Some(&xt),
-                        y_ticks: Some(&yt),
-                        ..AxisOpts::default()
-                    },
-                );
-                axes_data_rect(body, true)
-            };
+            // `axes` places its gutters around the data area it is given.
+            let axes_rect = egui::Rect::from_min_max(
+                egui::pos2(
+                    data_rect.left() - if left_col { Y_GUTTER } else { 0.0 },
+                    data_rect.top(),
+                ),
+                egui::pos2(data_rect.right(), data_rect.bottom() + X_STRIP),
+            );
+            let yt = int_ticks(y_top / 1.15, 2);
+            // Labels only on the left column (y) and bottom row (lag); an
+            // empty y range drops the y axis, so the gridlines are ours.
+            axes(
+                &painter,
+                axes_rect,
+                (-ext, ext),
+                if left_col { (0.0, y_top) } else { (0.0, 0.0) },
+                "ms",
+                "",
+                theme,
+                AxisOpts {
+                    grid: true,
+                    hide_x: !bottom_row,
+                    x_ticks: Some(&xt),
+                    y_ticks: Some(&yt),
+                    ..AxisOpts::default()
+                },
+            );
+            if !left_col {
+                for &v in &yt {
+                    let y = data_rect.bottom() - v / y_top * data_rect.height();
+                    painter.line_segment(
+                        [
+                            egui::pos2(data_rect.left(), y),
+                            egui::pos2(data_rect.right(), y),
+                        ],
+                        Stroke::new(0.5_f32, grid_colour(theme)),
+                    );
+                }
+            }
             let dp = painter.with_clip_rect(data_rect);
             let x_of = |ms: f32| data_rect.left() + (ms + ext) / (2.0 * ext) * data_rect.width();
             // Refractory band (±refrac_ms) and the zero-lag line.
@@ -354,14 +446,14 @@ pub fn correlogram_grid_view<P: DataProvider>(
                     egui::pos2(x_of(p.refrac_ms), data_rect.bottom()),
                 ),
                 0.0,
-                refractory_fill(&theme),
+                band_fill(theme),
             );
             dp.line_segment(
                 [
                     egui::pos2(x_of(0.0), data_rect.top()),
                     egui::pos2(x_of(0.0), data_rect.bottom()),
                 ],
-                Stroke::new(0.5_f32, grid_colour(&theme)),
+                Stroke::new(0.5_f32, grid_colour(theme)),
             );
 
             let bw = data_rect.width() / nb as f32;
@@ -388,7 +480,7 @@ pub fn correlogram_grid_view<P: DataProvider>(
                         egui::pos2(data_rect.left(), y),
                         egui::pos2(data_rect.right(), y),
                     ],
-                    Stroke::new(1.0_f32, Color32::GRAY),
+                    Stroke::new(1.5_f32, baseline_colour(theme)),
                 );
             }
             if let Some(pos) = hover.filter(|q| data_rect.contains(*q)) {
@@ -409,7 +501,7 @@ pub fn correlogram_grid_view<P: DataProvider>(
     resp.on_hover_text(tip.unwrap_or_else(|| {
         format!(
             "Diagonal: autocorrelograms. Off-diagonal: cross-correlograms. \
-             The shaded band is the ±{:.1} ms refractory period; the grey line is the \
+             The shaded band is the ±{:.1} ms refractory period; the dark line is the \
              count expected from independent firing.{note}",
             p.refrac_ms
         )

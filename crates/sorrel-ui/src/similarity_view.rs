@@ -99,7 +99,8 @@ pub fn similarity_view<P: DataProvider>(
         ui.colored_label(selection_colour(slot), "■");
         ui.heading(format!("Most similar to cluster {reference}"));
     });
-    ui.weak("click a row to compare · Cmd/Ctrl-click to add to the selection");
+    ui.weak("click: compare · Ctrl+click: add")
+        .on_hover_text("click a row to compare · Cmd/Ctrl-click to add to the selection");
     ui.separator();
     let click = cluster_table(
         ui,

@@ -76,6 +76,18 @@ const N_COMPUTED: usize = 500;
 /// Snippets the temporal PCs are fitted on.
 const N_FIT: usize = 1000;
 const BACKGROUND: u16 = u16::MAX;
+/// Grid layout: gap between cells, the label strip above each cell, the
+/// pane width one column wants, and the background marker radius (1 px).
+const CELL_GAP: f32 = 6.0;
+const LABEL_H: f32 = 14.0;
+const COL_W: f32 = 140.0;
+const BACKGROUND_RADIUS: f32 = 0.5;
+
+/// Columns (2 to 4) and square cell side for a pane `width` wide.
+fn grid_geometry(width: f32) -> (usize, f32) {
+    let cols = ((width / COL_W) as usize).clamp(2, 4);
+    (cols, ((width - (cols - 1) as f32 * CELL_GAP) / cols as f32).max(40.0))
+}
 
 #[derive(Copy, Clone, Debug)]
 struct FeaturePoint {
@@ -115,13 +127,14 @@ struct FeatureSet {
     computed: bool,
     full: bool,
     points: Vec<FeaturePoint>,
-    /// Robust max |value| per feature column, for symmetric axes.
-    bounds: [f32; 4],
+    /// 0.5-99.5 percentile range (padded) per feature column.
+    bounds: [(f32, f32); 4],
     duration: f32,
     generation: u64,
 }
 
-type CellVertices = Vec<Arc<Vec<ScatterVertex>>>;
+/// Per cell: `[background, selected]` vertex buffers.
+type CellVertices = Vec<[Arc<Vec<ScatterVertex>>; 2]>;
 
 /// Temporal PC basis fitted on raw snippets, reused across selections.
 type Basis = Arc<Mutex<Option<(TracePreproc, u32, Arc<[Vec<f32>; 2]>)>>>;
@@ -158,7 +171,7 @@ impl Default for FeatureViewState {
         Self {
             fixed_channels: None,
             scaling: 1.0,
-            marker: 1.5,
+            marker: 2.5,
             zoom: 1.0,
             pan: [0.0; 2],
             lasso: Lasso::default(),
@@ -314,14 +327,6 @@ pub fn feature_view<P: DataProvider>(
 
     header(ui, state, &set, current.is_none());
 
-    let avail = ui.available_size_before_wrap();
-    let side = avail.x.min(avail.y).max(160.0);
-    let (grid_rect, _) =
-        ui.allocate_exact_size(egui::vec2(avail.x.max(160.0), side), Sense::hover());
-    let gap = 2.0;
-    let cell_w = (grid_rect.width() - 3.0 * gap) / 4.0;
-    let cell_h = (grid_rect.height() - 3.0 * gap) / 4.0;
-
     let dark = ui.visuals().dark_mode;
     let cells_key = (set.generation, dark, state.preview_gen);
     if !matches!(&state.cells, Some((k, ..)) if *k == cells_key) {
@@ -343,88 +348,120 @@ pub fn feature_view<P: DataProvider>(
         .map(|(_, _, c)| c.clone())
         .unwrap_or_default();
 
-    let painter = ui.painter_at(grid_rect);
-    for (cell, &(dx, dy)) in GRID.iter().flatten().enumerate() {
-        let (row, col) = (cell / 4, cell % 4);
-        let rect = Rect::from_min_size(
-            grid_rect.min + egui::vec2(col as f32 * (cell_w + gap), row as f32 * (cell_h + gap)),
-            egui::vec2(cell_w, cell_h),
-        );
-        painter.rect_filled(rect, 0.0, theme.plot_bg);
-        let (x, y) = (
-            axis_range(&set, state, dx, 0),
-            axis_range(&set, state, dy, 1),
-        );
-        let to_screen = |p: [f32; 2]| {
-            Pos2::new(
-                rect.left() + (p[0] - x.0) / (x.1 - x.0) * rect.width(),
-                rect.bottom() - (p[1] - y.0) / (y.1 - y.0) * rect.height(),
-            )
-        };
-        let to_data = |p: Pos2| {
-            [
-                x.0 + (p.x - rect.left()) / rect.width() * (x.1 - x.0),
-                y.0 + (rect.bottom() - p.y) / rect.height() * (y.1 - y.0),
-            ]
-        };
-        if let Some(vertices) = cells.get(cell) {
-            ui.painter()
-                .add(eframe::egui_wgpu::Callback::new_paint_callback(
+    egui::ScrollArea::vertical()
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            let (cols, side) = grid_geometry(ui.available_width());
+            let rows = GRID.len() * GRID[0].len() / cols;
+            let (grid_rect, _) = ui.allocate_exact_size(
+                egui::vec2(
+                    cols as f32 * side + (cols - 1) as f32 * CELL_GAP,
+                    rows as f32 * (side + LABEL_H) + (rows - 1) as f32 * CELL_GAP,
+                ),
+                Sense::hover(),
+            );
+            let painter = ui.painter_at(grid_rect);
+            for (cell, &(dx, dy)) in GRID.iter().flatten().enumerate() {
+                let (row, col) = (cell / cols, cell % cols);
+                let origin = grid_rect.min
+                    + egui::vec2(
+                        col as f32 * (side + CELL_GAP),
+                        row as f32 * (side + LABEL_H + CELL_GAP),
+                    );
+                let strip = Rect::from_min_size(origin, egui::vec2(side, LABEL_H));
+                let rect = Rect::from_min_size(
+                    origin + egui::vec2(0.0, LABEL_H),
+                    egui::vec2(side, side),
+                );
+                if !ui.is_rect_visible(strip.union(rect)) {
+                    continue;
+                }
+                painter.with_clip_rect(strip).text(
+                    strip.left_center() + egui::vec2(2.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    format!("{} × {}", dim_label(dx, &set), dim_label(dy, &set)),
+                    egui::FontId::proportional(11.0),
+                    theme.caption,
+                );
+                painter.rect_filled(rect, 0.0, theme.plot_bg);
+                let (x, y) = (
+                    axis_range(&set, state, dx, 0),
+                    axis_range(&set, state, dy, 1),
+                );
+                let to_screen = |p: [f32; 2]| {
+                    Pos2::new(
+                        rect.left() + (p[0] - x.0) / (x.1 - x.0) * rect.width(),
+                        rect.bottom() - (p[1] - y.0) / (y.1 - y.0) * rect.height(),
+                    )
+                };
+                let to_data = |p: Pos2| {
+                    [
+                        x.0 + (p.x - rect.left()) / rect.width() * (x.1 - x.0),
+                        y.0 + (rect.bottom() - p.y) / rect.height() * (y.1 - y.0),
+                    ]
+                };
+                // Background first (1 px, faint), the selection on top.
+                if let Some([background, selected]) = cells.get(cell) {
+                    for (layer, vertices, radius) in [
+                        (
+                            "feature-bg",
+                            background,
+                            if dark { 0.75 } else { BACKGROUND_RADIUS },
+                        ),
+                        ("feature-cell", selected, state.marker),
+                    ] {
+                        ui.painter()
+                            .add(eframe::egui_wgpu::Callback::new_paint_callback(
+                                rect,
+                                ScatterCallback {
+                                    id: ui.id().with((layer, cell)).value(),
+                                    vertices: Arc::clone(vertices),
+                                    generation: cells_gen,
+                                    x,
+                                    y,
+                                    radius,
+                                    size: rect.size(),
+                                },
+                            ));
+                    }
+                }
+                painter.rect_stroke(
                     rect,
-                    ScatterCallback {
-                        id: ui.id().with(("feature-cell", cell)).value(),
-                        vertices: Arc::clone(vertices),
-                        generation: cells_gen,
-                        x,
-                        y,
-                        radius: state.marker,
-                        size: rect.size(),
-                    },
-                ));
-        }
-        painter.rect_stroke(
-            rect,
-            0.0,
-            Stroke::new(0.5_f32, theme.grid),
-            egui::StrokeKind::Inside,
-        );
-        painter.text(
-            rect.left_top() + egui::vec2(3.0, 2.0),
-            egui::Align2::LEFT_TOP,
-            format!("{} · {}", dim_label(dx, &set), dim_label(dy, &set)),
-            egui::FontId::proportional(9.0),
-            theme.caption,
-        );
-        if state.lasso.is_active() && state.lasso.cell == cell {
-            state.lasso.paint(&painter, to_screen, theme.text);
-        }
+                    0.0,
+                    Stroke::new(0.5_f32, theme.grid),
+                    egui::StrokeKind::Inside,
+                );
+                if state.lasso.is_active() && state.lasso.cell == cell {
+                    state.lasso.paint(&painter, to_screen, theme.text);
+                }
 
-        let resp = ui.interact(
-            rect,
-            ui.id().with(("feature-hit", cell)),
-            Sense::click_and_drag(),
-        );
-        resp.widget_info(|| {
-            egui::WidgetInfo::labeled(
-                egui::WidgetType::Other,
-                true,
-                format!("feature cell {cell}"),
-            )
+                let resp = ui.interact(
+                    rect,
+                    ui.id().with(("feature-hit", cell)),
+                    Sense::click_and_drag(),
+                );
+                resp.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Other,
+                        true,
+                        format!("feature cell {cell}"),
+                    )
+                });
+                // phy `select_feature`: Alt+click picks the x (left) or y
+                // (right) dimension for the AmplitudeView feature type.
+                let alt = ui.input(|i| i.modifiers.alt);
+                let picked = match (alt, resp.clicked(), resp.secondary_clicked()) {
+                    (true, true, _) => Some(dx),
+                    (true, _, true) => Some(dy),
+                    _ => None,
+                };
+                if let Some(Dim::Pc { ch, pc }) = picked {
+                    state.amplitude_dim = Some((set.channels[ch as usize], pc as usize));
+                } else if !state.lasso.interact(cell, &resp, to_data) {
+                    interact_view(ui, state, &resp);
+                }
+            }
         });
-        // phy `select_feature`: Alt+click picks the x (left) or y (right)
-        // dimension for the AmplitudeView feature type.
-        let alt = ui.input(|i| i.modifiers.alt);
-        let picked = match (alt, resp.clicked(), resp.secondary_clicked()) {
-            (true, true, _) => Some(dx),
-            (true, _, true) => Some(dy),
-            _ => None,
-        };
-        if let Some(Dim::Pc { ch, pc }) = picked {
-            state.amplitude_dim = Some((set.channels[ch as usize], pc as usize));
-        } else if !state.lasso.interact(cell, &resp, to_data) {
-            interact_view(ui, state, &resp);
-        }
-    }
 
     if state.split_requested && state.lasso.is_closed() {
         match current.filter(|s| s.full || !s.computed) {
@@ -470,14 +507,25 @@ fn header(ui: &mut Ui, state: &mut FeatureViewState, set: &FeatureSet, busy: boo
             ui.spinner();
         }
     });
-    // One truncated line whatever it says, so the grid never moves under
-    // the cursor while a lasso is being drawn.
+    // One short line whatever it says, so the grid never moves under the
+    // cursor while a lasso is being drawn; the full gesture list is on hover.
     let hint = match (state.lasso.is_active(), state.lasso.is_closed()) {
-        (_, true) => "k splits the lassoed spikes · Esc clears",
-        (true, false) => "Ctrl+click to add points · Ctrl+right-click clears",
-        _ => "Ctrl+click: lasso · wheel: zoom · Ctrl+wheel: scale · Alt+wheel: size · double-click: reset",
+        (_, true) => "K: split · Esc: clear",
+        (true, false) => "Ctrl+click: add point · Ctrl+right-click: clear",
+        _ => "Ctrl+click: lasso · K: split",
     };
-    ui.add(egui::Label::new(egui::RichText::new(hint).weak()).truncate());
+    ui.horizontal(|ui| {
+        ui.add(egui::Label::new(egui::RichText::new(hint).weak()).truncate());
+        // The old "ⓘ" glyph rendered as an empty checkbox-like box (missing
+        // glyph); plain ASCII always draws.
+        ui.label("(?)").on_hover_text(
+            "Ctrl+click: add lasso point · Ctrl+right-click: clear lasso\n\
+             K: split the lassoed spikes · Esc: cancel\n\
+             wheel: zoom · drag: pan · double-click: reset\n\
+             Ctrl+wheel: feature scale · Alt+wheel: marker size\n\
+             Alt+click / Alt+right-click: amplitude feature (x / y)",
+        );
+    });
 }
 
 /// Pan (drag), zoom (wheel), feature scaling (Ctrl+wheel), marker size
@@ -518,8 +566,9 @@ fn axis_range(set: &FeatureSet, state: &FeatureViewState, dim: Dim, axis: usize)
     let (lo, hi) = match dim {
         Dim::Time => (0.0, set.duration.max(1e-3)),
         Dim::Pc { ch, pc } => {
-            let b = set.bounds[pc as usize * 2 + ch as usize] / state.scaling;
-            (-b, b)
+            let (a, b) = set.bounds[pc as usize * 2 + ch as usize];
+            let half = (b - a) / 2.0 / state.scaling;
+            (((a + b) / 2.0) - half, ((a + b) / 2.0) + half)
         }
     };
     let span = hi - lo;
@@ -541,8 +590,13 @@ fn cell_vertices(
     set: &FeatureSet,
     dark: bool,
     preview: Option<(u16, &std::collections::HashSet<u32>)>,
-) -> Vec<Arc<Vec<ScatterVertex>>> {
-    let grey = if dark { 150 } else { 110 };
+) -> CellVertices {
+    // Faint background: gray(170)@~0.47 in dark, gray(190)@0.5 in light.
+    let background = if dark {
+        pack_rgba(170, 170, 170, 120)
+    } else {
+        pack_rgba(190, 190, 190, 128)
+    };
     let highlight = if dark {
         pack_rgba(255, 255, 255, 240)
     } else {
@@ -551,7 +605,6 @@ fn cell_vertices(
     let previewed = |p: &FeaturePoint| {
         preview.is_some_and(|(slot, idx)| p.slot == slot && idx.contains(&p.local))
     };
-    let background = pack_rgba(grey, grey, grey, 110);
     let mut counts: HashMap<u16, usize> = HashMap::new();
     for p in &set.points {
         *counts.entry(p.slot).or_default() += 1;
@@ -571,25 +624,31 @@ fn cell_vertices(
     GRID.iter()
         .flatten()
         .map(|&(dx, dy)| {
-            Arc::new(
-                order
-                    .iter()
-                    .filter_map(|p| {
-                        let (x, y) = (p.value(dx), p.value(dy));
-                        (x.is_finite() && y.is_finite()).then(|| ScatterVertex {
-                            pos: [x, y],
-                            color: if p.slot == BACKGROUND {
-                                background
-                            } else if previewed(p) {
-                                highlight
-                            } else {
-                                let c = selection_colour(p.slot as usize);
-                                pack_rgba(c.r(), c.g(), c.b(), 220)
-                            },
+            // `order` is sorted background-first, so a stable partition keeps
+            // the previewed split last within the selection.
+            let layer = |bg: bool| {
+                Arc::new(
+                    order
+                        .iter()
+                        .filter(|p| (p.slot == BACKGROUND) == bg)
+                        .filter_map(|p| {
+                            let (x, y) = (p.value(dx), p.value(dy));
+                            (x.is_finite() && y.is_finite()).then(|| ScatterVertex {
+                                pos: [x, y],
+                                color: if bg {
+                                    background
+                                } else if previewed(p) {
+                                    highlight
+                                } else {
+                                    let c = selection_colour(p.slot as usize);
+                                    pack_rgba(c.r(), c.g(), c.b(), 255)
+                                },
+                            })
                         })
-                    })
-                    .collect(),
-            )
+                        .collect(),
+                )
+            };
+            [layer(true), layer(false)]
         })
         .collect()
 }
@@ -691,7 +750,7 @@ fn compute<P: DataProvider>(
         computed,
         full: key.full || !computed,
         bounds: std::array::from_fn(|i| {
-            robust_abs_max(
+            robust_range(
                 points
                     .iter()
                     .filter(|p| p.slot != BACKGROUND)
@@ -704,15 +763,18 @@ fn compute<P: DataProvider>(
     }
 }
 
-/// 99th percentile of |v| over finite values (1.0 when there are none).
-fn robust_abs_max(vals: impl Iterator<Item = f32>) -> f32 {
-    let mut v: Vec<f32> = vals.filter(|v| v.is_finite()).map(f32::abs).collect();
+/// 0.5-99.5 percentile range of the finite values, padded 5% each side
+/// (`(-1, 1)` when there are none).
+fn robust_range(vals: impl Iterator<Item = f32>) -> (f32, f32) {
+    let mut v: Vec<f32> = vals.filter(|v| v.is_finite()).collect();
     if v.is_empty() {
-        return 1.0;
+        return (-1.0, 1.0);
     }
-    let k = ((v.len() as f32 * 0.99) as usize).min(v.len() - 1);
-    let (_, m, _) = v.select_nth_unstable_by(k, f32::total_cmp);
-    m.max(1e-6) * 1.05
+    v.sort_unstable_by(f32::total_cmp);
+    let at = |q: f32| v[((v.len() - 1) as f32 * q).round() as usize];
+    let (lo, hi) = (at(0.005), at(0.995));
+    let pad = ((hi - lo) * 0.05).max(1e-6);
+    (lo - pad, hi + pad)
 }
 
 fn computed_features<P: DataProvider>(
@@ -838,6 +900,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grid_geometry_clamps_columns_and_stays_square() {
+        for (w, cols) in [(100.0, 2), (300.0, 2), (420.0, 3), (700.0, 4), (2000.0, 4)] {
+            let (c, side) = grid_geometry(w);
+            assert_eq!(c, cols, "width {w}");
+            assert!(c as f32 * side + (c - 1) as f32 * CELL_GAP <= w.max(86.0) + 1e-3);
+        }
+    }
+
+    #[test]
+    fn robust_range_ignores_outliers() {
+        let mut v: Vec<f32> = (0..1000).map(|i| i as f32).collect();
+        v.push(1e6);
+        let (lo, hi) = robust_range(v.into_iter());
+        assert!(lo < 5.0 && hi > 990.0 && hi < 1100.0, "{lo} {hi}");
+        assert_eq!(robust_range(std::iter::empty()), (-1.0, 1.0));
+    }
+
+    #[test]
     fn grid_matches_phy_default() {
         // Diagonal is time vs the row's feature; off-diagonal x is the
         // column's feature (phy `time,0A 1A,0A 0B,0A 1B,0A`, …).
@@ -868,7 +948,7 @@ mod tests {
                 pt(0, 1, 0.2, 0.8),
                 pt(0, BACKGROUND, 0.5, 0.5),
             ],
-            bounds: [1.0; 4],
+            bounds: [(-1.0, 1.0); 4],
             duration: 1.0,
             generation: 0,
         };

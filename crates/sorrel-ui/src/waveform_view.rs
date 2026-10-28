@@ -14,8 +14,8 @@ use crate::layout::ViewAction;
 use crate::prefs::{WaveformMode, WaveformParams};
 use crate::theme::{selection_colour, Theme};
 use crate::views::{
-    alloc_plot, axes_data_rect, caption, draw_axes_grid, grid_colour, legend, nice_ticks,
-    pad_range, tick_label, TICK_PX,
+    alloc_plot, axes_data_rect, draw_axes_grid, grid_colour, nice_ticks, pad_range, tick_label,
+    TICK_PX,
 };
 
 /// phylib's `n_closest_channels`: channels shown besides the peak.
@@ -526,47 +526,54 @@ pub fn waveform_view<P: DataProvider>(
 
     let theme = Theme::from_ui(ui);
     let hp = if cache.cfg.hp().is_some() {
-        "high_pass"
+        "filtered"
     } else {
         "raw"
     };
-    let mode_name = match mode {
-        WaveformMode::Waveforms => "spikes + mean",
-        WaveformMode::Mean => "mean",
-        WaveformMode::Templates => "templates",
-    };
     let ms = pre as f32 / sr * 1000.0;
     let head = if geometry_available {
-        format!(
-            "waveforms · {hp} · {mode_name} · {} channels · ±{ms:.1} ms · {}",
-            chans.len(),
-            legend(selection)
-        )
+        format!("{} ch · ±{ms:.1} ms", chans.len())
     } else {
         let peak = peaks
             .iter()
             .enumerate()
             .fold((0, 0.0f32), |b, (i, &v)| if v > b.1 { (i, v) } else { b });
-        format!(
-            "waveforms · {hp} · {mode_name} · channel {} · ±{ms:.1} ms · {} · no probe geometry",
-            peak.0,
-            legend(selection)
-        )
+        format!("ch {} · ±{ms:.1} ms · no probe geometry", peak.0)
     };
-    // Header strip: caption, and the sampled spikes per cluster on the right.
-    ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    // V1: one-row bar. `overlap` (phy `o`) checked (default) superimposes
+    // every cluster in the cell; unchecked is phy's side-by-side slots.
+    crate::views::param_bar(
+        ui,
+        &head,
+        |ui| {
             ui.add(
                 egui::DragValue::new(&mut params.n_spikes)
                     .range(1..=2000)
-                    .speed(1.0),
+                    .speed(1.0)
+                    .suffix(" spikes"),
             )
             .on_hover_text("spikes sampled per cluster (phy n_spikes_waveforms)");
-            ui.weak("spikes");
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                caption(ui, &theme, head)
-            });
-        });
+            ui.checkbox(&mut params.overlap, "overlap")
+                .on_hover_text("o: superimpose the selected clusters (off = side-by-side slots)");
+        },
+        |ui| {
+            ui.weak(format!("source: {hp} (follows the trace pane)"));
+            ui.selectable_value(&mut params.mode, WaveformMode::Waveforms, "spikes + mean");
+            ui.selectable_value(&mut params.mode, WaveformMode::Mean, "mean");
+            if has_templates {
+                ui.selectable_value(&mut params.mode, WaveformMode::Templates, "templates");
+            }
+            ui.checkbox(&mut params.show_labels, "channel labels")
+                .on_hover_text("ctrl+l");
+        },
+    );
+    // V6.2 legend: swatch + cluster id per selection slot.
+    ui.horizontal_wrapped(|ui| {
+        for (slot, c) in selection.iter().enumerate() {
+            let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
+            ui.painter().rect_filled(r, 2.0, selection_colour(slot));
+            ui.label(egui::RichText::new(format!("c{c}")).size(TICK_PX));
+        }
     });
 
     let mut ctx = Ctx {
@@ -752,13 +759,16 @@ impl<P: DataProvider> Ctx<'_, P> {
             );
             self.draw_box(&painter, sub, ch, &present, p.overlap, (lo, hi), 1.5);
             if p.show_labels {
-                painter.text(
-                    sub.right_bottom() + egui::vec2(-3.0, -2.0),
-                    egui::Align2::RIGHT_BOTTOM,
+                // Corner chip over a translucent backing, clear of the traces.
+                let g = painter.layout_no_wrap(
                     format!("ch{ch}"),
                     egui::FontId::proportional(TICK_PX),
                     theme.caption,
                 );
+                let chip =
+                    egui::Rect::from_min_size(sub.left_top(), g.size() + egui::vec2(6.0, 2.0));
+                painter.rect_filled(chip, 2.0, theme.panel.gamma_multiply(0.85));
+                painter.galley(chip.min + egui::vec2(3.0, 1.0), g, theme.caption);
             }
         }
 
@@ -800,7 +810,7 @@ impl<P: DataProvider> Ctx<'_, P> {
     }
 
     /// One channel box: baseline, 1 ms ticks, then the clusters in `present`
-    /// (selection slots) — side by side unless `overlap`. Spike clouds come
+    /// (selection slots) — superimposed if `overlap`, else side by side. Spike clouds come
     /// first, means on top.
     #[allow(clippy::too_many_arguments)]
     fn draw_box(

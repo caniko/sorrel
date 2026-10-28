@@ -7,17 +7,38 @@ use sorrel_io::ClusterId;
 
 /// Categorical palette used to colour clusters across views (Tableau-10
 /// subset). Index modulo length so we never run out — phy uses the same
-/// trick.
+/// trick. Tableau's red and purple are swapped (red sits at slot 6, purple
+/// at slot 2) so the third selection slot never collides with the danger red
+/// used for errors and destructive actions.
 pub const PALETTE: [Color32; 8] = [
     Color32::from_rgb(78, 121, 167),
     Color32::from_rgb(242, 142, 43),
-    Color32::from_rgb(225, 87, 89),
+    Color32::from_rgb(176, 122, 161),
     Color32::from_rgb(118, 183, 178),
     Color32::from_rgb(89, 161, 79),
     Color32::from_rgb(237, 201, 72),
-    Color32::from_rgb(176, 122, 161),
+    Color32::from_rgb(225, 87, 89),
     Color32::from_rgb(255, 157, 167),
 ];
+
+/// Black or white, whichever reads better on `bg` (WCAG relative luminance), for text on slot-coloured chips.
+pub fn contrast_text(bg: Color32) -> Color32 {
+    let lin = |c: u8| {
+        let c = f32::from(c) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let l = 0.2126 * lin(bg.r()) + 0.7152 * lin(bg.g()) + 0.0722 * lin(bg.b());
+    // Contrast vs black is (l + .05) / .05, vs white 1.05 / (l + .05).
+    if (l + 0.05) / 0.05 > 1.05 / (l + 0.05) {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    }
+}
 
 /// Colour for a cluster by its *position in the selection*: the first
 /// selected cluster is always blue, the second orange, and so on, and every
@@ -324,6 +345,28 @@ mod tests {
             }
         }
         assert_eq!(selection_colour(PALETTE.len()), selection_colour(0));
+    }
+
+    #[test]
+    fn contrast_text_is_readable_on_every_slot() {
+        assert_eq!(contrast_text(Color32::from_rgb(0xf2, 0x8e, 0x2b)), Color32::BLACK);
+        assert_eq!(contrast_text(Color32::from_rgb(0xb0, 0x7a, 0xa1)), Color32::BLACK);
+        let lum = |c: Color32| {
+            let lin = |v: u8| {
+                let v = f32::from(v) / 255.0;
+                if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+        };
+        for bg in PALETTE {
+            let (a, b) = (lum(bg) + 0.05, lum(contrast_text(bg)) + 0.05);
+            let ratio = a.max(b) / a.min(b);
+            assert!(ratio >= 4.5, "{bg:?} only reaches {ratio:.2}:1");
+        }
     }
 
     #[test]

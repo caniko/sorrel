@@ -1925,8 +1925,8 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
         egui::Panel::left("clusters")
             .frame(side_frame)
             .resizable(true)
-            .default_size(340.0)
-            .size_range(280.0..=460.0)
+            .default_size((root_ui.available_width() * 0.22).max(300.0))
+            .size_range(300.0..=640.0)
             .show_inside(root_ui, |ui| {
                 let session = read(&self.session);
                 ui.horizontal(|ui| {

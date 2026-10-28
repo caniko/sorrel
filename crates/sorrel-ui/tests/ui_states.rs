@@ -274,8 +274,16 @@ fn harness_with(
     theme: egui::Theme,
     build: impl FnOnce() -> App + 'static,
 ) -> Harness<'static, App> {
+    harness_sized(theme, SIZE, build)
+}
+
+fn harness_sized(
+    theme: egui::Theme,
+    size: [f32; 2],
+    build: impl FnOnce() -> App + 'static,
+) -> Harness<'static, App> {
     Harness::builder()
-        .with_size(SIZE)
+        .with_size(size)
         .with_theme(theme)
         .wgpu_setup(vulkan_only())
         .build_eframe(move |cc| {
@@ -465,6 +473,67 @@ fn dense_tabs() {
     });
 }
 
+/// Ctrl+click the table row of cluster `id` (the table is the leftmost
+/// node with that label; trace channels and other columns repeat numbers).
+fn ctrl_click_row(h: &mut Harness<'static, App>, id: &str) {
+    h.get_all_by_label(id)
+        .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+        .unwrap_or_else(|| panic!("cluster {id} row"))
+        .click_modifiers(egui::Modifiers::COMMAND);
+    settle(h);
+}
+
+#[test]
+fn parity_views() {
+    if no_gpu() {
+        return;
+    }
+    // The phy-parity views with three units selected on the dense
+    // dataset, a filtered table, and the shell at 1920×1080.
+    each_theme(|theme, name| {
+        let mut h = fixture(&format!("parity-{name}"), 40, theme);
+        h.key_press(egui::Key::ArrowDown);
+        settle(&mut h);
+        ctrl_click_row(&mut h, "5");
+        ctrl_click_row(&mut h, "9");
+        snap(&mut h, "p3_waveforms", name);
+        for tab in ["CCG", "Features", "ISI", "Similar", "Scatter"] {
+            click_tab(&mut h, tab);
+            snap(&mut h, &format!("p3_{}", tab.to_lowercase()), name);
+        }
+        // The cluster table's filter is the leftmost text input.
+        h.get_all_by_role(Role::TextInput)
+            .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+            .expect("cluster filter")
+            .type_text("n_spikes > 50");
+        h.key_press(egui::Key::Enter);
+        snap(&mut h, "p3_table_filter", name);
+        h
+    });
+}
+
+#[test]
+fn wide_shell() {
+    if no_gpu() {
+        return;
+    }
+    each_theme(|theme, name| {
+        let root = dataset(&format!("wide-{name}"), 40);
+        let mut h = harness_sized(theme, [1920.0, 1080.0], move || {
+            let (session, positions) = open(&root);
+            let mut app = SorrelApp::new(session, label_str);
+            configure(&mut app, &root, positions);
+            app
+        });
+        settle(&mut h);
+        h.key_press(egui::Key::ArrowDown);
+        settle(&mut h);
+        ctrl_click_row(&mut h, "5");
+        snap(&mut h, "wide_shell", name);
+        h
+    });
+}
+
 #[test]
 fn multi_select() {
     if no_gpu() {
@@ -608,10 +677,11 @@ mod design {
     const LOADER: &str = r#"
 const FONTS = {};
 async function font(mono) {
-  const want = mono ? ["Hack", "Regular"] : ["Ubuntu", "Light"];
+  // OpenPencil's renderer lacks Hack, so prefer DejaVu Sans Mono for monospace.
+  const want = mono ? ["DejaVu Sans Mono", "Book"] : ["Ubuntu", "Light"];
   const key = want.join(" ");
   if (!FONTS[key]) {
-    for (const [family, style] of [want, mono ? ["JetBrains Mono", "Regular"] : ["Ubuntu", "Regular"], ["Inter", "Regular"]]) {
+    for (const [family, style] of [want, mono ? ["DejaVu Sans Mono", "Regular"] : ["Ubuntu", "Regular"], ...(mono ? [["Hack", "Regular"]] : []), ["Inter", "Regular"]]) {
       try { await figma.loadFontAsync({ family, style }); FONTS[key] = { family, style }; break; } catch (e) {}
     }
   }

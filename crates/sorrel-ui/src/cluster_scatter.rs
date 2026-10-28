@@ -11,6 +11,14 @@ use crate::lasso::Lasso;
 use crate::theme::{selection_colour, Theme};
 use crate::views::{axes_data_rect, draw_axes_grid};
 
+/// Gap between the pane edge and the plot.
+const PLOT_INSET: f32 = 6.0;
+/// Margin inside the data rect that points map into, so a selection ring
+/// (radius up to 9 + 3, 2 px stroke) at the extreme never clips.
+const DATA_INSET: f32 = 12.0;
+/// Row above the plot that carries the y-axis title.
+const TITLE_H: f32 = 14.0;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Column {
     NSpikes,
@@ -37,6 +45,17 @@ impl Column {
             Column::Amplitude => "amp",
             Column::Depth => "depth",
             Column::Channel => "ch",
+        }
+    }
+
+    /// Axis title with units.
+    fn title(self) -> &'static str {
+        match self {
+            Column::NSpikes => "n_spikes",
+            Column::FiringRate => "firing rate (Hz)",
+            Column::Amplitude => "amp",
+            Column::Depth => "depth (µm)",
+            Column::Channel => "channel",
         }
     }
 
@@ -137,18 +156,32 @@ pub fn cluster_scatter_view<P: DataProvider>(
     if !matches!(&state.rows, Some((v, d, _)) if (*v, *d) == key) {
         state.rows = Some((key.0, key.1, rows(session, depths)));
     }
-    ui.horizontal_wrapped(|ui| {
-        for (i, what) in ["x", "y", "size"].into_iter().enumerate() {
-            egui::ComboBox::from_id_salt(("cluster-scatter-axis", i))
-                .selected_text(format!("{what}: {}", state.axes[i].name()))
-                .show_ui(ui, |ui| {
-                    for c in Column::ALL {
-                        ui.selectable_value(&mut state.axes[i], c, c.name());
-                    }
-                });
-            ui.checkbox(&mut state.log[i], "log");
-        }
-    });
+    let n_clusters = state.rows.as_ref().map_or(0, |r| r.2.len());
+    let [ax, ay, asize] = &mut state.axes;
+    let log = &mut state.log;
+    let axis_combo = |ui: &mut Ui, i: usize, what: &str, axis: &mut Column| {
+        egui::ComboBox::from_id_salt(("cluster-scatter-axis", i))
+            .selected_text(format!("{what}: {}", axis.name()))
+            .show_ui(ui, |ui| {
+                for c in Column::ALL {
+                    ui.selectable_value(axis, c, c.name());
+                }
+            });
+    };
+    crate::views::param_bar(
+        ui,
+        &format!("{n_clusters} clusters"),
+        |ui| {
+            axis_combo(ui, 0, "x", ax);
+            axis_combo(ui, 1, "y", ay);
+        },
+        |ui| {
+            axis_combo(ui, 2, "size", asize);
+            for (flag, what) in log.iter_mut().zip(["log x", "log y", "log size"]) {
+                ui.checkbox(flag, what);
+            }
+        },
+    );
     let rows = state
         .rows
         .as_ref()
@@ -192,25 +225,41 @@ pub fn cluster_scatter_view<P: DataProvider>(
         .fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
 
     let avail = ui.available_size_before_wrap();
-    let (rect, resp) = ui.allocate_exact_size(
+    let (outer, resp) = ui.allocate_exact_size(
         egui::vec2(avail.x.max(160.0), avail.y.max(140.0)),
         Sense::click_and_drag(),
     );
+    let full = outer.shrink(PLOT_INSET);
+    let rect = Rect::from_min_max(Pos2::new(full.left(), full.top() + TITLE_H), full.max);
     resp.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "cluster scatter")
     });
-    let painter = ui.painter_at(rect);
+    let painter = ui.painter_at(outer);
     painter.rect_filled(rect, 0.0, theme.plot_bg);
     let axis_name = |i: usize| {
-        let n = state.axes[i].name();
+        let n = state.axes[i].title();
         if state.log[i] {
             format!("log {n}")
         } else {
             n.to_string()
         }
     };
-    draw_axes_grid(&painter, rect, x, y, &axis_name(0), &axis_name(1), &theme);
     let data: Rect = axes_data_rect(rect, true);
+    // Widen the axis ranges by the inset so ticks stay true to the mapping.
+    let widen = |r: (f32, f32), len: f32| {
+        let pad = (r.1 - r.0) * DATA_INSET / (len - 2.0 * DATA_INSET).max(1.0);
+        (r.0 - pad, r.1 + pad)
+    };
+    let (x, y) = (widen(x, data.width()), widen(y, data.height()));
+    // The y title sits in its own row above the plot, clear of the spine.
+    draw_axes_grid(&painter, rect, x, y, &axis_name(0), "", &theme);
+    painter.text(
+        full.left_top(),
+        egui::Align2::LEFT_TOP,
+        axis_name(1),
+        egui::FontId::proportional(crate::views::TICK_PX),
+        theme.caption,
+    );
     state.pz.interact(&resp, data);
     let dp = painter.with_clip_rect(data);
     let to_screen = |p: [f32; 2]| {
@@ -239,8 +288,11 @@ pub fn cluster_scatter_view<P: DataProvider>(
         let at = to_screen([px, py]);
         match selection.iter().position(|&s| s == c) {
             Some(slot) => {
-                dp.circle_filled(at, radius(ps), selection_colour(slot));
-                dp.circle_stroke(at, radius(ps) + 1.0, Stroke::new(1.0_f32, theme.text));
+                // Cluster colour inside, detached slot-coloured ring outside.
+                let r = radius(ps).max(5.0);
+                let fill = colours.get(c.idx()).copied().flatten();
+                dp.circle_filled(at, r, fill.unwrap_or(selection_colour(slot)));
+                dp.circle_stroke(at, r + 3.0, Stroke::new(2.0_f32, selection_colour(slot)));
             }
             None => {
                 let col = colours.get(c.idx()).copied().flatten();

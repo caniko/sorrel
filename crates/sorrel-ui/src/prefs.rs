@@ -96,7 +96,8 @@ pub enum WaveformMode {
 #[serde(default)]
 pub struct WaveformParams {
     pub mode: WaveformMode,
-    /// `o`: superimpose clusters instead of phy's side-by-side slots.
+    /// `o` (checkbox "overlap"): true superimposes the selected clusters in
+    /// each channel box (default); false is phy's side-by-side slots.
     pub overlap: bool,
     /// `ctrl+l`: channel id labels.
     pub show_labels: bool,
@@ -114,7 +115,7 @@ impl Default for WaveformParams {
     fn default() -> Self {
         Self {
             mode: WaveformMode::default(),
-            overlap: false,
+            overlap: true,
             show_labels: true,
             n_spikes: 100,
             box_scale: [1.0, 1.0],
