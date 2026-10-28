@@ -60,6 +60,23 @@
           workspace_strategy = "aggregate";
           with_audit = true;
           with_deny = true;
+          # Run the cross-built sorrel.exe and Windows wheel on real Windows:
+          # wine's shader compiler is not Microsoft's, so DX12 only proves out here.
+          target_smokes = [
+            {
+              id = "windows";
+              nix_build = ".#packages.x86_64-linux.sorrel-windows-smoke";
+              runner = "windows-2025";
+              shell = "pwsh";
+              run = "./release/smoke-windows.ps1";
+              timeout_minutes = 30;
+              env.RUST_LOG = "info";
+              artifacts = {
+                name = "windows-smoke";
+                paths = ["smoke-out/**"];
+              };
+            }
+          ];
           # Public caches only; the private macOS SDK cache is a release concern.
           cache = {
             substituters = [
