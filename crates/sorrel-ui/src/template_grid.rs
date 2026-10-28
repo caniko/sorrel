@@ -16,6 +16,8 @@ pub struct TemplateGridCache {
     traces: Vec<Vec<f32>>,
     /// Max |value| over every trace, for one shared y scale like phy.
     scale: f32,
+    /// ln of the box zoom (0 = 1×): Ctrl+wheel / pinch, double-click resets.
+    zoom_ln: f32,
 }
 
 impl TemplateGridCache {
@@ -72,14 +74,23 @@ pub fn template_grid_view<P: DataProvider>(
     egui::ScrollArea::vertical()
         .id_salt("template-grid")
         .show(ui, |ui| {
+            // phy's PanZoom for the grid: the wheel scrolls (pans), Ctrl+wheel
+            // or pinch zooms every box, double-clicking one resets.
+            if ui.ui_contains_pointer() {
+                let d = ui.input(|i| i.zoom_delta());
+                cache.zoom_ln = (cache.zoom_ln + d.ln()).clamp(-0.7, 2.0);
+            }
+            let size = egui::vec2(64.0, 46.0) * cache.zoom_ln.exp();
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
                 for &c in order {
                     let Some(trace) = cache.traces.get(c.idx()).filter(|t| t.len() > 1) else {
                         continue;
                     };
-                    let (rect, resp) =
-                        ui.allocate_exact_size(egui::vec2(64.0, 46.0), Sense::click());
+                    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+                    if resp.double_clicked() {
+                        cache.zoom_ln = 0.0;
+                    }
                     resp.widget_info(|| {
                         egui::WidgetInfo::labeled(
                             egui::WidgetType::Button,

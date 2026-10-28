@@ -740,8 +740,17 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             Snippet::RateBinSize(secs) => {
                 let s = read(&self.session);
                 let duration = s.provider.n_samples().0 as f32 / s.provider.sample_rate().max(1.0);
+                let (lo, hi) = self.view_params.rate.x_range(duration);
                 self.view_params.rate.n_bins =
-                    ((duration / secs.max(1e-3)).round() as usize).clamp(2, 5000);
+                    (((hi - lo) / secs.max(1e-3)).round() as usize).clamp(2, 5000);
+            }
+            Snippet::RateXMin(t) => {
+                self.view_params.rate.x_min = t;
+                self.view_params.rate.pz = Default::default();
+            }
+            Snippet::RateXMax(t) => {
+                self.view_params.rate.x_max = t;
+                self.view_params.rate.pz = Default::default();
             }
             Snippet::ColourField(name) => match crate::theme::ColourScheme::parse(&name) {
                 Some(s) => self.scheme = s,

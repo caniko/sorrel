@@ -51,12 +51,12 @@ statuses:
 
 ## Every view
 
-| phy                                   | Sorrel                                                                                                   | Status  | Test             |
-| ------------------------------------- | -------------------------------------------------------------------------------------------------------- | ------- | ---------------- |
-| `toggle_auto_update` (freeze a view)  | tab right-click → Freeze on this selection (🔒 in the title)                                             | done    |                  |
-| `screenshot`                          | tab right-click → Save screenshot, a PNG in `<dataset>/.sorrel/screenshots/` (phy: `~/.phy/screenshots`) | done    |                  |
-| pan / zoom / reset                    | drag, wheel, double-click on Features, Amplitudes, Scatter, Tmpl features and Spike data                 | done    | `panzoom::tests` |
-| pan / zoom on Raster, Rate, Templates | —                                                                                                        | planned |                  |
+| phy                                   | Sorrel                                                                                                                                                                                             | Status | Test                                |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ----------------------------------- |
+| `toggle_auto_update` (freeze a view)  | tab right-click → Freeze on this selection (🔒 in the title)                                                                                                                                       | done   |                                     |
+| `screenshot`                          | tab right-click → Save screenshot, a PNG in `<dataset>/.sorrel/screenshots/` (phy: `~/.phy/screenshots`)                                                                                           | done   |                                     |
+| pan / zoom / reset                    | drag, wheel, double-click on Features, Amplitudes, Scatter, Tmpl features and Spike data                                                                                                           | done   | `panzoom::tests`                    |
+| pan / zoom on Raster, Rate, Templates | Raster: drag, wheel, double-click (time and rows). Rate: the same in time, re-binned over the visible span. Templates: the wheel scrolls, Ctrl+wheel or pinch zooms the boxes, double-click resets | done   | `ui_states::raster_and_rate_zoomed` |
 
 ## Supervisor actions
 
@@ -86,17 +86,17 @@ statuses:
 
 ## Snippets
 
-| phy snippet                                   | Status                                 | Test                                   |
-| --------------------------------------------- | -------------------------------------- | -------------------------------------- |
-| `:g`, `:k`, `:c 1 2 3` (ranges `3-7`)         | done                                   | `snippets::tests::parses_phy_snippets` |
-| `:l name value` (`group` moves the selection) | done                                   | `snippets::tests::parses_phy_snippets` |
-| `:tg time`, `:ts window`                      | done                                   | `snippets::tests::parses_phy_snippets` |
-| `:csx`, `:csy`, `:css` (ClusterScatter axes)  | done                                   | `snippets::tests::parses_phy_snippets` |
-| `:f expr`, `:s col`                           | done                                   |                                        |
-| `:frn n`, `:cf field`                         | done                                   | `snippets::tests::parses_phy_snippets` |
-| `:wn`, `:cb`, `:cw`, `:cr`, `:isi…`           | Waveforms / CCG / ISI lane (sorrel-f6) |                                        |
-| `:frb seconds` (bin size)                     | done                                   | `snippets::tests::parses_phy_snippets` |
-| `:frmin`, `:frmax` (x range)                  | planned                                |                                        |
+| phy snippet                                            | Status                                 | Test                                                                                                        |
+| ------------------------------------------------------ | -------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `:g`, `:k`, `:c 1 2 3` (ranges `3-7`)                  | done                                   | `snippets::tests::parses_phy_snippets`                                                                      |
+| `:l name value` (`group` moves the selection)          | done                                   | `snippets::tests::parses_phy_snippets`                                                                      |
+| `:tg time`, `:ts window`                               | done                                   | `snippets::tests::parses_phy_snippets`                                                                      |
+| `:csx`, `:csy`, `:css` (ClusterScatter axes)           | done                                   | `snippets::tests::parses_phy_snippets`                                                                      |
+| `:f expr`, `:s col`                                    | done                                   |                                                                                                             |
+| `:frn n`, `:cf field`                                  | done                                   | `snippets::tests::parses_phy_snippets`                                                                      |
+| `:wn`, `:cb`, `:cw`, `:cr`, `:isi…`                    | Waveforms / CCG / ISI lane (sorrel-f6) |                                                                                                             |
+| `:frb seconds` (bin size)                              | done                                   | `snippets::tests::parses_phy_snippets`                                                                      |
+| `:frmin`, `:frmax` (x range, seconds; no value resets) | done                                   | `snippets::tests::parses_phy_snippets`, `prefs::tests::rate_x_range_clamps_and_falls_back_to_the_recording` |
 
 ## Trace shortcuts
 

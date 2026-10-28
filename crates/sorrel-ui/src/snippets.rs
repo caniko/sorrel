@@ -13,7 +13,10 @@ pub enum Snippet {
     Select(Vec<ClusterId>),
     /// `:l name value` set label `name` on the selection (`group` is the
     /// good/mua/noise/unsorted label).
-    Label { name: String, value: String },
+    Label {
+        name: String,
+        value: String,
+    },
     /// `:note text` set the note of every selected cluster (empty clears).
     Note(String),
     /// `:f expr` filter the cluster table.
@@ -33,6 +36,10 @@ pub enum Snippet {
     RateBins(usize),
     /// `:frb 10`: FiringRate bin size in seconds.
     RateBinSize(f32),
+    /// `:frmin 10`, `:frmax 600`: FiringRate x range in seconds; no value
+    /// resets that edge to the recording's.
+    RateXMin(Option<f32>),
+    RateXMax(Option<f32>),
     /// `:cf group`: phy colour field for unselected clusters.
     ColourField(String),
     /// `:cm name`: phy colormap.
@@ -80,6 +87,16 @@ pub fn parse(text: &str) -> Result<Snippet, String> {
             )),
         }),
         "frb" => Snippet::RateBinSize(number("a bin size in seconds")?),
+        "frmin" | "frmax" => {
+            let t = (!rest.is_empty())
+                .then(|| number("a time in seconds"))
+                .transpose()?;
+            if head == "frmin" {
+                Snippet::RateXMin(t)
+            } else {
+                Snippet::RateXMax(t)
+            }
+        }
         "frn" => Snippet::RateBins(
             rest.parse()
                 .ok()
@@ -166,6 +183,9 @@ mod tests {
         assert_eq!(parse(":km auto"), Ok(Snippet::KMeans(Some(None))));
         assert!(parse(":km 1").is_err());
         assert_eq!(parse(":frb 2.5"), Ok(Snippet::RateBinSize(2.5)));
+        assert_eq!(parse(":frmin 10"), Ok(Snippet::RateXMin(Some(10.0))));
+        assert_eq!(parse(":frmax"), Ok(Snippet::RateXMax(None)));
+        assert!(parse(":frmax soon").is_err());
         assert!(parse(":frn 1").is_err());
         assert_eq!(
             parse(":css n_spikes"),

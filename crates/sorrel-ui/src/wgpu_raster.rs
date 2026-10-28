@@ -28,9 +28,9 @@ pub struct RasterVertex {
 struct RasterUniforms {
     t0: f32,
     t_span_inv: f32,
-    n_rows_inv: f32,
-    /// Padding so the struct is a multiple of 16 bytes (WGSL std140).
-    _pad: f32,
+    /// Visible rows: the first (fractional) row at the top and 1 / span.
+    r0: f32,
+    rows_inv: f32,
 }
 
 const VERTEX_SIZE: u64 = std::mem::size_of::<RasterVertex>() as u64;
@@ -215,7 +215,8 @@ pub struct RasterCallback {
     pub n_vertices: u32,
     pub t0: f32,
     pub t_span: f32,
-    pub n_rows: u32,
+    /// Visible rows as (first row at the top, number of rows shown).
+    pub rows: (f32, f32),
 }
 
 impl egui_wgpu::CallbackTrait for RasterCallback {
@@ -238,12 +239,12 @@ impl egui_wgpu::CallbackTrait for RasterCallback {
             } else {
                 0.0
             },
-            n_rows_inv: if self.n_rows > 0 {
-                1.0 / self.n_rows as f32
+            r0: self.rows.0,
+            rows_inv: if self.rows.1 > 0.0 {
+                1.0 / self.rows.1
             } else {
                 0.0
             },
-            _pad: 0.0,
         };
         pipeline.upload(device, queue, &self.vertices, self.generation, uniforms);
         Vec::new()
@@ -278,8 +279,8 @@ struct VertexIn {
 struct Uniforms {
     t0: f32,
     t_span_inv: f32,
-    n_rows_inv: f32,
-    _pad: f32,
+    r0: f32,
+    rows_inv: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -293,9 +294,9 @@ struct VertexOut {
 fn vs_main(input: VertexIn) -> VertexOut {
     let x_norm = (input.pos.x - u.t0) * u.t_span_inv;
     let x_clip = x_norm * 2.0 - 1.0;
-    // y_center: row 0 near the top (+1), last row near the bottom (-1).
-    let row = input.pos.y + 0.5;
-    let y_clip = 1.0 - row * 2.0 * u.n_rows_inv;
+    // y_center: row r0 at the top (+1), r0 + span at the bottom (-1).
+    let row = input.pos.y + 0.5 - u.r0;
+    let y_clip = 1.0 - row * 2.0 * u.rows_inv;
     var out: VertexOut;
     out.clip_pos = vec4<f32>(x_clip, y_clip, 0.0, 1.0);
     out.color = unpack4x8unorm(input.color);

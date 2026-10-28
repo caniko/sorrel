@@ -590,6 +590,8 @@ pub struct RasterCache {
     row_ids: Vec<u32>,
     /// Theme the neutral dot colour was built for.
     dark: bool,
+    /// phy's PanZoom over time (x) and rows (y).
+    pz: crate::panzoom::PanZoom,
 }
 
 impl RasterCache {
@@ -721,15 +723,23 @@ pub fn raster_view<P: DataProvider>(
             selection.len()
         ),
     );
-    let (rect, resp) = alloc_plot(ui, egui::vec2(120.0, 160.0), Sense::click());
-    let resp = resp.on_hover_text("Click to seek the trace to that time.");
+    // The visible time span and rows (row r_top at the top, r_span shown);
+    // PanZoom's y runs bottom-up, rows top-down.
+    let n_rows = cache.n_rows as f32;
+    let ((v0, v1), (y0, y1)) = cache.pz.apply((cache.t0, cache.t0 + t_span), (0.0, n_rows));
+    let (v_span, r_top, r_span) = ((v1 - v0).max(1e-6), n_rows - y1, (y1 - y0).max(1e-3));
+    let (rect, resp) = alloc_plot(ui, egui::vec2(120.0, 160.0), Sense::click_and_drag());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "raster plot"));
+    let resp = resp.on_hover_text(
+        "Click to seek the trace to that time. Drag pans, wheel zooms, double-click resets.",
+    );
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme.plot_bg);
     // Row ids are drawn below; an empty y tick list only reserves the gutter.
     axes(
         &painter,
         rect,
-        (cache.t0, cache.t0 + t_span),
+        (v0, v1),
         (0.0, 1.0),
         "time (s)",
         "",
@@ -740,7 +750,8 @@ pub fn raster_view<P: DataProvider>(
         },
     );
     let data = axes_data_rect(rect, true);
-    let row_h = data.height() / cache.n_rows as f32;
+    let row_h = data.height() / r_span;
+    let row_y = |row: f32| data.top() + (row - r_top) * row_h;
     let dp = painter.with_clip_rect(data);
 
     // Selected rows: translucent band under the dots.
@@ -751,7 +762,7 @@ pub fn raster_view<P: DataProvider>(
         if row < 0 {
             continue;
         }
-        let y0 = data.top() + row as f32 * row_h;
+        let y0 = row_y(row as f32);
         let band = egui::Rect::from_min_max(
             egui::pos2(data.left(), y0),
             egui::pos2(data.right(), y0 + row_h.max(2.0)),
@@ -763,9 +774,9 @@ pub fn raster_view<P: DataProvider>(
         vertices: std::sync::Arc::clone(&cache.vertices),
         generation: cache.generation,
         n_vertices,
-        t0: cache.t0,
-        t_span,
-        n_rows: cache.n_rows,
+        t0: v0,
+        t_span: v_span,
+        rows: (r_top, r_span),
     };
     ui.painter()
         .add(eframe::egui_wgpu::Callback::new_paint_callback(
@@ -788,10 +799,10 @@ pub fn raster_view<P: DataProvider>(
         if row < 0 {
             continue;
         }
-        let yc = data.top() + (row as f32 + 0.5) * row_h;
+        let yc = row_y(row as f32 + 0.5);
         let colour = selection_colour(slot);
         for t in session.spike_times(c).iter().step_by(stride) {
-            let x = data.left() + (t.as_f32() * inv_sr - cache.t0) / t_span * data.width();
+            let x = data.left() + (t.as_f32() * inv_sr - v0) / v_span * data.width();
             dp.rect_filled(
                 egui::Rect::from_center_size(egui::pos2(x, yc), egui::vec2(2.0, tick_h)),
                 0.0,
@@ -808,11 +819,12 @@ pub fn raster_view<P: DataProvider>(
         .unwrap_or(1000);
     for (row, &id) in cache.row_ids.iter().enumerate() {
         let slot = selection.iter().position(|&c| c.0 == id);
-        if row % step != 0 && slot.is_none() {
+        let y = row_y(row as f32 + 0.5);
+        if (row % step != 0 && slot.is_none()) || !(data.top()..=data.bottom()).contains(&y) {
             continue;
         }
         painter.text(
-            egui::pos2(data.left() - 6.0, data.top() + (row as f32 + 0.5) * row_h),
+            egui::pos2(data.left() - 6.0, y),
             egui::Align2::RIGHT_CENTER,
             id.to_string(),
             egui::FontId::proportional(TICK_PX),
@@ -824,8 +836,8 @@ pub fn raster_view<P: DataProvider>(
     let sr = session.provider.sample_rate().max(1.0);
     let w0 = trace_window.0 as f32 / sr;
     let w1 = (trace_window.0 + trace_window.1 as u64) as f32 / sr;
-    let x0 = data.left() + ((w0 - cache.t0) / t_span).clamp(0.0, 1.0) * data.width();
-    let x1 = data.left() + ((w1 - cache.t0) / t_span).clamp(0.0, 1.0) * data.width();
+    let x0 = data.left() + ((w0 - v0) / v_span).clamp(0.0, 1.0) * data.width();
+    let x1 = data.left() + ((w1 - v0) / v_span).clamp(0.0, 1.0) * data.width();
     let marker = egui::Rect::from_min_max(
         egui::pos2(x0 - 1.0, data.top()),
         egui::pos2(x1.max(x0 + 2.0), data.bottom()),
@@ -839,12 +851,13 @@ pub fn raster_view<P: DataProvider>(
 
     // Click → seek. Map x in the data area to time, return as samples.
     *scheme_delta += crate::theme::scheme_wheel(ui, &resp);
+    cache.pz.interact(&resp, data);
     // phy: Ctrl+click selects the row's cluster, Shift+click adds it.
     let mut seek_to = None;
     if resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
             let m = ui.input(|i| i.modifiers);
-            let row = ((p.y - data.top()) / row_h).floor() as i32;
+            let row = ((p.y - data.top()) / row_h + r_top).floor() as i32;
             let cluster = cache
                 .rows
                 .iter()
@@ -854,7 +867,7 @@ pub fn raster_view<P: DataProvider>(
                 Some(c) if m.command || m.shift => Some(RasterClick::Select(c, m.shift)),
                 _ => {
                     let frac = ((p.x - data.left()) / data.width()).clamp(0.0, 1.0);
-                    let t_sec = cache.t0 + frac * t_span;
+                    let t_sec = v0 + frac * v_span;
                     Some(RasterClick::Seek(
                         (t_sec * session.provider.sample_rate()).max(0.0) as u64,
                     ))
@@ -909,14 +922,11 @@ pub fn firing_rate_view<P: DataProvider>(
             ui.selectable_value(&mut params.unit, unit, unit.label());
         }
     });
+    // `n_bins` over the visible span: the `:frmin`/`:frmax` range, then pan/zoom.
     let bins = params.n_bins.clamp(2, 5000);
-    let bin_samples = (total_samples / bins as u64).max(1);
-    let bin_s = bin_samples as f32 / sr;
+    let ((x0, x1), _) = params.pz.apply(params.x_range(total_s), (0.0, 1.0));
+    let bin_s = (x1 - x0) / bins as f32;
     let unit = params.unit;
-    if bin_samples == 0 {
-        ui.label("bin width collapsed to 0 — recording too short");
-        return;
-    }
 
     // Bin every selected cluster's spike train into the same axis.
     let mut histograms: Vec<Vec<u32>> = Vec::with_capacity(selection.len());
@@ -925,9 +935,9 @@ pub fn firing_rate_view<P: DataProvider>(
         let times = session.spike_times(c);
         let mut h = vec![0u32; bins];
         for &t in times {
-            let idx = (t.0 / bin_samples) as usize;
-            if idx < bins {
-                h[idx] += 1;
+            let u = (t.0 as f64 / sr as f64 - x0 as f64) / bin_s as f64;
+            if u >= 0.0 && (u as usize) < bins {
+                h[u as usize] += 1;
             }
         }
         if let Some(&m) = h.iter().max() {
@@ -938,25 +948,34 @@ pub fn firing_rate_view<P: DataProvider>(
         histograms.push(h);
     }
 
+    let width = if bin_s >= 1.0 {
+        format!("{bin_s:.1} s")
+    } else {
+        format!("{:.1} ms", bin_s * 1e3)
+    };
     caption(
         ui,
         &theme,
         format!(
-            "firing rate · {bins} bins × {bin_s:.1} s · {}",
+            "firing rate · {bins} bins × {width} · {}",
             legend(selection)
         ),
     );
-    let (rect, _resp) = alloc_plot(ui, egui::vec2(160.0, 160.0), Sense::hover());
+    let (rect, resp) = alloc_plot(ui, egui::vec2(160.0, 160.0), Sense::drag());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "rate plot"));
+    let resp = resp.on_hover_text("Drag pans, wheel zooms in time, double-click resets.");
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme.plot_bg);
     let data = axes_data_rect(rect, true);
+    // Only time pans and zooms; y always fits the visible bins.
+    params.pz.interact(&resp, data);
 
     // 15% headroom above the tallest bin.
     let y_top = max_count as f32 / bin_s * 1.15;
     draw_axes_grid(
         &painter,
         rect,
-        (0.0, total_s / unit.seconds()),
+        (x0 / unit.seconds(), x1 / unit.seconds()),
         (0.0, y_top),
         &format!("time ({})", unit.label()),
         "Hz",

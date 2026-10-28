@@ -1314,8 +1314,7 @@ fn features_lasso_drawing_and_kmeans() {
         select_two_and_open_features(&mut h);
         lasso_points(&mut h, 2);
         snap(&mut h, "features_lasso_drawing", name);
-        h.key_press(egui::Key::Escape);
-        settle(&mut h);
+        // The button replaces the open lasso; Esc would leave a timed toast.
         h.get_by_label("k-means").click();
         settle(&mut h);
         snap(&mut h, "features_kmeans", name);
@@ -1326,6 +1325,40 @@ fn features_lasso_drawing_and_kmeans() {
         h.get_by_label("auto-run").click();
         settle(&mut h);
         snap(&mut h, "features_kmeans_auto", name);
+        h
+    });
+}
+
+/// Hover the middle of the plot labelled `label` and scroll the wheel up.
+fn wheel_zoom(h: &mut Harness<'static, App>, label: &str) {
+    let at = h.get_by_label(label).rect().center();
+    h.hover_at(at);
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, 300.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    settle(h);
+}
+
+#[test]
+fn raster_and_rate_zoomed() {
+    if no_gpu() {
+        return;
+    }
+    // phy's PanZoom on Raster (time and rows, GPU dots included) and Rate
+    // (time, re-binned over the visible span).
+    each_theme(|theme, name| {
+        let mut h = fixture(&format!("panzoom-{name}"), 40, theme);
+        h.key_press(egui::Key::ArrowDown);
+        settle(&mut h);
+        click_tab(&mut h, "Raster");
+        wheel_zoom(&mut h, "raster plot");
+        snap(&mut h, "raster_zoomed", name);
+        click_tab(&mut h, "Rate");
+        wheel_zoom(&mut h, "rate plot");
+        snap(&mut h, "rate_zoomed", name);
         h
     });
 }

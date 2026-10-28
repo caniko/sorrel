@@ -43,6 +43,11 @@ pub struct ViewParams {
 pub struct RateParams {
     pub n_bins: usize,
     pub unit: TimeUnit,
+    /// `:frmin` / `:frmax`: the x range in seconds (None = recording edge).
+    pub x_min: Option<f32>,
+    pub x_max: Option<f32>,
+    #[serde(skip)]
+    pub pz: crate::panzoom::PanZoom,
 }
 
 impl Default for RateParams {
@@ -50,6 +55,23 @@ impl Default for RateParams {
         Self {
             n_bins: 200,
             unit: TimeUnit::Seconds,
+            x_min: None,
+            x_max: None,
+            pz: Default::default(),
+        }
+    }
+}
+
+impl RateParams {
+    /// The `:frmin`/`:frmax` range within a `total_s` recording, or all of
+    /// it when the range is empty.
+    pub fn x_range(&self, total_s: f32) -> (f32, f32) {
+        let lo = self.x_min.unwrap_or(0.0).clamp(0.0, total_s);
+        let hi = self.x_max.unwrap_or(total_s).clamp(0.0, total_s);
+        if hi > lo {
+            (lo, hi)
+        } else {
+            (0.0, total_s)
         }
     }
 }
@@ -198,6 +220,16 @@ impl UiPrefs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_x_range_clamps_and_falls_back_to_the_recording() {
+        let mut p = RateParams::default();
+        assert_eq!(p.x_range(100.0), (0.0, 100.0));
+        (p.x_min, p.x_max) = (Some(10.0), Some(500.0));
+        assert_eq!(p.x_range(100.0), (10.0, 100.0));
+        p.x_max = Some(5.0);
+        assert_eq!(p.x_range(100.0), (0.0, 100.0));
+    }
 
     #[test]
     fn prefs_round_trip_and_tolerate_garbage() {
