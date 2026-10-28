@@ -36,7 +36,13 @@ function Invoke-Native([string]$Name, [string]$File, [string[]]$Arguments) {
     $e = Join-Path $OutDir "$Name.err.txt"
     $argList = @{ FilePath = $File; Wait = $true; PassThru = $true; NoNewWindow = $true;
         RedirectStandardOutput = $o; RedirectStandardError = $e }
-    if ($Arguments) { $argList.ArgumentList = $Arguments }
+    # Start-Process joins ArgumentList with spaces unquoted, so quote any
+    # argument with whitespace or quotes (MSVCRT command-line rules).
+    if ($Arguments) {
+        $argList.ArgumentList = $Arguments | ForEach-Object {
+            if ($_ -match '[\s"]') { '"' + ($_ -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"' } else { $_ }
+        }
+    }
     $p = Start-Process @argList
     Write-Host "--- $Name (exit $($p.ExitCode))"
     Get-Content $o, $e | Write-Host
