@@ -464,8 +464,18 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
         .zip(scores)
         .filter_map(|(&(a, b, n_a, n_b, amp_mean_delta, complement), s)| {
             let s = s?;
-            let amp_sim = (1.0 - s.amp_ks).clamp(0.0, 1.0);
-            let amp_mean_sim = (1.0 - amp_mean_delta).clamp(0.0, 1.0);
+            // Missing amplitudes are absent evidence, not a perfect match:
+            // the amplitude terms contribute nothing.
+            let has_amps =
+                !session.spike_amplitudes(a).is_empty() && !session.spike_amplitudes(b).is_empty();
+            let (amp_sim, amp_mean_sim) = if has_amps {
+                (
+                    (1.0 - s.amp_ks).clamp(0.0, 1.0),
+                    (1.0 - amp_mean_delta).clamp(0.0, 1.0),
+                )
+            } else {
+                (0.0, 0.0)
+            };
 
             // Weighted combination — refractory dip is the strongest single
             // signal (0.6); amplitude evidence rounds it out (0.3 + 0.1).
@@ -895,6 +905,21 @@ mod tests {
             ClusterId(0),
             "expected bimodal cluster 0 to top"
         );
+    }
+
+    #[test]
+    fn merge_suggester_ignores_unrelated_pair_without_amplitudes() {
+        // No amplitude data and no refractory dip: nothing to go on.
+        let a: Vec<SampleIndex> = (0..500).map(|i| SampleIndex(i * 10)).collect();
+        let b: Vec<SampleIndex> = (0..500).map(|i| SampleIndex(i * 7 + 3)).collect();
+        let prov = MockProvider {
+            spikes: vec![a, b],
+            amps: vec![vec![], vec![]],
+            n_samples: SampleIndex(10_000),
+        };
+        let (sess, _d) = fresh_session(prov);
+        let merges = rank_merge_candidates(&sess, &SuggestConfig::default());
+        assert!(merges.is_empty(), "{merges:?}");
     }
 
     #[test]

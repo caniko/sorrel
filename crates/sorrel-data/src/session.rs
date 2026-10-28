@@ -632,19 +632,9 @@ impl<P: DataProvider> Session<P> {
         key: &str,
         value: &str,
     ) -> Result<CurationCommand, String> {
-        let reserved = [
-            "group",
-            "groups",
-            "KSLabel",
-            "purity",
-            "info",
-            "sorrel_tags",
-            "id",
-            "n_spikes",
-        ];
         if key.is_empty()
             || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            || reserved.contains(&key)
+            || sorrel_io::kilosort::RESERVED_COLUMNS.contains(&key)
         {
             return Err(format!("{key:?} cannot be a label name"));
         }
@@ -1485,6 +1475,15 @@ mod tests {
         let journal = Journal::open(&dir.path().join("j.sqlite")).unwrap();
         let session = Session::new(provider, journal);
         (session, dir)
+    }
+
+    #[test]
+    fn set_label_command_rejects_reserved_sidecar_names() {
+        let (s, _d) = fresh_session();
+        for k in ["sorrel_annotations", "sorrel_origin", "group", "id"] {
+            assert!(s.set_label_command(ClusterId(0), k, "x").is_err(), "{k}");
+        }
+        assert!(s.set_label_command(ClusterId(0), "my_label", "x").is_ok());
     }
 
     #[test]

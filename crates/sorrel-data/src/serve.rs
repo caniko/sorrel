@@ -775,67 +775,19 @@ where
         }
         "attention_queue" => {
             let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
-            let version = session.version();
-            if env.qc.as_ref().is_none_or(|(v, _)| *v != version) {
-                env.qc = Some((version, collect_qc_rows(session)));
-            }
-            let qc = env.qc.take().expect("just filled");
             let (merges, splits) = suggestions(session, env);
-            // TODO(lead): switch to `Session::attention(c)` (p2-stats) once it
-            // lands; until then max(1 - quality, split, merge, review tag).
-            let mut rows: Vec<(f32, Value)> = (0..session.n_clusters())
-                .map(ClusterId)
-                .filter(|&c| !session.spike_times(c).is_empty())
-                .filter_map(|c| {
-                    let mut reasons = Vec::new();
-                    let mut score = 0f32;
-                    let mut note = |s: f32, why: String| {
-                        if s.is_finite() && s > 0.0 {
-                            score = score.max(s);
-                            reasons.push((s, why));
-                        }
-                    };
-                    if let Some(r) = qc.1.iter().find(|r| r.cluster_id == c.0) {
-                        note(
-                            1.0 - r.composite_quality,
-                            format!("low quality {:.2}", r.composite_quality),
-                        );
-                    }
-                    if let Some(s) = splits.iter().find(|s| s.cluster == c) {
-                        note(s.score, format!("split candidate ({:.2})", s.score));
-                    }
-                    if let Some(m) = merges
-                        .iter()
-                        .filter(|m| m.a == c || m.b == c)
-                        .max_by(|x, y| x.score.total_cmp(&y.score))
-                    {
-                        let other = if m.a == c { m.b } else { m.a };
-                        note(
-                            m.score,
-                            format!("merge candidate with {} ({:.2})", other.0, m.score),
-                        );
-                    }
-                    if let Some(t) = session.tags(c).iter().find(|t| t.starts_with("review:")) {
-                        note(1.0, format!("tagged {t}"));
-                    }
-                    reasons.sort_by(|a, b| b.0.total_cmp(&a.0));
-                    (score > 0.0).then(|| {
-                        let why: Vec<String> = reasons.into_iter().map(|r| r.1).collect();
-                        (
-                            score,
-                            json!({"cluster": c.0, "attention": score, "reasons": why,
-                            "n_spikes": session.spike_times(c).len(), "tags": session.tags(c)}),
-                        )
-                    })
+            // Same scorer as `Session::attention`, with the suggestions the
+            // env already caches.
+            let rows: Vec<Value> = crate::proposers::attention_all(session, merges, splits)
+                .into_iter()
+                .filter(|r| r.1 > 0.0)
+                .take(limit)
+                .map(|(c, score, why)| {
+                    json!({"cluster": c.0, "attention": score, "reasons": why,
+                    "n_spikes": session.spike_times(c).len(), "tags": session.tags(c)})
                 })
                 .collect();
-            env.qc = Some(qc);
-            rows.sort_by(|a, b| b.0.total_cmp(&a.0));
-            text(json!(rows
-                .into_iter()
-                .take(limit)
-                .map(|r| r.1)
-                .collect::<Vec<_>>()))
+            text(json!(rows))
         }
         "split_proposals" => {
             let c = check(session, arg_u32(args, "cluster")?)?;

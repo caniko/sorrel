@@ -125,6 +125,17 @@ struct FeatureKey {
     reorder: bool,
 }
 
+/// What a lasso is valid for: the key of the set on screen, without the
+/// `full` flag (loading every spike keeps the same polygon) and with the
+/// channels resolved.
+fn lasso_key(key: &FeatureKey, shown: [u32; 2]) -> FeatureKey {
+    FeatureKey {
+        full: false,
+        channels: Some(key.channels.unwrap_or(shown)),
+        ..key.clone()
+    }
+}
+
 struct FeatureSet {
     channels: [u32; 2],
     computed: bool,
@@ -152,6 +163,9 @@ pub struct FeatureViewState {
     zoom: f32,
     pan: [f32; 2],
     lasso: Lasso,
+    /// The data the lasso was drawn against ([`lasso_key`]); a different
+    /// key drops the lasso and any pending split.
+    lasso_key: Option<FeatureKey>,
     split_requested: bool,
     want_full: bool,
     /// Channels of the last drawn set, so `c` can freeze what is on screen.
@@ -388,6 +402,7 @@ impl Default for FeatureViewState {
             zoom: 1.0,
             pan: [0.0; 2],
             lasso: Lasso::default(),
+            lasso_key: None,
             split_requested: false,
             want_full: false,
             shown_channels: None,
@@ -408,6 +423,7 @@ impl FeatureViewState {
     /// Abandon an in-progress lasso (Esc).
     pub fn cancel_lasso(&mut self) {
         self.lasso.clear();
+        self.lasso_key = None;
         self.split_requested = false;
         self.want_full = false;
         self.clear_km_preview();
@@ -428,6 +444,28 @@ impl FeatureViewState {
 
     pub fn lasso_closed(&self) -> bool {
         self.lasso.is_closed()
+    }
+
+    /// Drop the lasso and a pending split drawn against other data than `cur`.
+    fn drop_stale_lasso(&mut self, cur: &FeatureKey) {
+        if self.lasso_key.as_ref().is_some_and(|k| k != cur) {
+            self.cancel_lasso();
+        }
+    }
+
+    /// End of frame: stamp a fresh lasso with `cur` once its set is loaded
+    /// (a lasso drawn over a stale set is dropped), and forget the stamp
+    /// once the lasso is gone.
+    fn stamp_lasso(&mut self, cur: &FeatureKey, loaded: bool) {
+        if !self.lasso.is_active() {
+            self.lasso_key = None;
+        } else if self.lasso_key.is_none() {
+            if loaded {
+                self.lasso_key = Some(cur.clone());
+            } else {
+                self.cancel_lasso(); // drawn against a stale set
+            }
+        }
     }
 
     /// phy `split` (`k`): the next frame splits off the lassoed spikes.
@@ -540,6 +578,7 @@ pub fn feature_view<P: DataProvider>(
     };
     let basis = Arc::clone(&state.basis);
     let job_key = key.clone();
+    let bound_key = key.clone();
     let current = state
         .memo
         .ensure(key, &jobs.session, jobs.repaint(), move |s, cancel| {
@@ -561,6 +600,10 @@ pub fn feature_view<P: DataProvider>(
         }
     };
     state.shown_channels = Some(set.channels);
+    let cur = lasso_key(&bound_key, set.channels);
+    // A lasso from before a selection/channel change must not hit the new
+    // set's points.
+    state.drop_stale_lasso(&cur);
 
     header(ui, state, &set, current.is_none());
     kmeans_controls(ui, state, &set, selection[0], jobs);
@@ -733,14 +776,14 @@ pub fn feature_view<P: DataProvider>(
             }
         });
 
+    state.stamp_lasso(&cur, current.is_some());
     if state.split_requested && state.lasso.is_closed() {
         match current.filter(|s| s.full || !s.computed) {
             Some(set) => {
                 state.split_requested = false;
                 state.want_full = false;
                 let splits = lasso_hits(&set, &state.lasso, selection);
-                state.lasso.clear();
-                state.clear_km_preview();
+                state.cancel_lasso();
                 return Some(splits);
             }
             // Computed PCs: project every lassoed spike, then split.
@@ -1339,6 +1382,45 @@ fn fitted_basis<P: DataProvider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lasso_is_dropped_when_the_feature_key_changes() {
+        let key = FeatureKey {
+            selection: vec![ClusterId(1)],
+            channels: None,
+            version: 0,
+            cfg: TracePreproc::default(),
+            shanks: Vec::new(),
+            full: false,
+            reorder: false,
+        };
+        let cur = lasso_key(&key, [3, 4]);
+        let mut st = FeatureViewState::default();
+        let tri = Lasso {
+            cell: 0,
+            points: vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]],
+        };
+        st.lasso = tri.clone();
+        st.stamp_lasso(&cur, false);
+        assert!(!st.lasso.is_active(), "drawn over a stale set");
+        st.lasso = tri;
+        st.stamp_lasso(&cur, true);
+        st.request_split();
+        // Loading every spike keeps the same polygon.
+        let full = FeatureKey {
+            full: true,
+            ..key.clone()
+        };
+        st.drop_stale_lasso(&lasso_key(&full, [3, 4]));
+        assert!(st.lasso.is_closed() && st.split_requested);
+        // A new selection drops lasso and the pending split.
+        let other = FeatureKey {
+            selection: vec![ClusterId(2)],
+            ..key
+        };
+        st.drop_stale_lasso(&lasso_key(&other, [3, 4]));
+        assert!(!st.lasso.is_active() && !st.split_requested);
+    }
 
     #[test]
     fn grid_geometry_clamps_columns_and_stays_square() {

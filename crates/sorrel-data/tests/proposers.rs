@@ -262,3 +262,65 @@ fn attention_ranks_flagged_clusters_first() {
     );
     assert_eq!(s.attention(ClusterId(3)).0, 1.0);
 }
+
+impl sorrel_data::session::ApplyPhyLabel for Prov {
+    fn label_from_op(_: sorrel_data::PhyLabelOp) -> u8 {
+        0
+    }
+}
+impl sorrel_io::HasGeometry for Prov {
+    fn channel_positions(&self) -> &[[f32; 2]] {
+        &[]
+    }
+}
+
+/// The MCP attention queue uses the shared scorer, so a cluster whose only
+/// problem is PC-space outliers is listed with the "outliers" reason.
+#[test]
+fn mcp_attention_queue_includes_pc_outliers() {
+    let (mut p, _) = build(vec![]);
+    // 4% of the clean cluster 3 far out, in varying directions.
+    for (j, &row) in p.pc_rows[3].clone().iter().step_by(25).enumerate() {
+        for k in 0..9 {
+            let bit = ((j as u32 + 1).wrapping_mul(2_654_435_761) >> (k + 3)) & 1;
+            p.pc[row as usize * 9 + k] = if bit == 0 { 15.0 } else { -15.0 };
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(&dir.path().join("j.sqlite")).unwrap();
+    let mut s = Session::new(p, journal);
+    s.seed_amplitudes();
+    s.seed_templates();
+    s.seed_pc_features();
+    s.seed_template_waveforms();
+    let want = s.attention(ClusterId(3));
+    assert!(want.1.contains(&"outliers"), "{want:?}");
+    let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"attention_queue","arguments":{"limit":50}}}"#;
+    let mut out = Vec::new();
+    sorrel_data::serve(
+        &mut s,
+        dir.path(),
+        false,
+        |_: &u8| "unsorted",
+        std::io::Cursor::new(format!("{req}\n")),
+        &mut out,
+    )
+    .unwrap();
+    let reply: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let rows: serde_json::Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["cluster"] == 3)
+        .expect("outlier cluster listed");
+    assert!(
+        row["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "outliers"),
+        "{row}"
+    );
+}
