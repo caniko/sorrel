@@ -19,6 +19,18 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   on with the others instead of panicking. It exits non-zero on a CPU/GPU
   mismatch, or when no compute-capable adapter can run the kernels.
 
+### Changed (release)
+
+- First release on winget (`winget install Caniko.Sorrel`). The release
+  workflow now submits the manifests through the GitHub API; 0.2.0's
+  submission failed because `wingetcreate` needs .NET, which hosted
+  runners lack under wine.
+- The workspace crates publish to crates.io from CI in dependency order,
+  through simit's trusted publisher, instead of by hand.
+- Every change now runs the Windows build on a real `windows-2025` runner:
+  `gpu-check` on DX12, headless `qc` and `report`, a GUI launch with a
+  screenshot, and a Python wheel install.
+
 ## [0.2.0] - 2026-10-26
 
 ### Fixed (data integrity)
