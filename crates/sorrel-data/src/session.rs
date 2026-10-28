@@ -1022,6 +1022,11 @@ impl<P: DataProvider> Session<P> {
                 }
             }
             CurationCommand::Merge { sources, target } => {
+                // A target listed among its sources is not its own parent
+                // (the index already skips the self-move).
+                let sources: Vec<ClusterId> =
+                    sources.iter().copied().filter(|s| s != target).collect();
+                let sources = &sources[..];
                 // Capture pre-merge labels so undo can restore them.
                 let labels: Vec<(ClusterId, P::Label)> = sources
                     .iter()
@@ -1688,6 +1693,17 @@ mod tests {
         assert_eq!(s.note(ClusterId(2)), "two");
         s.dispatch(CurationCommand::Redo).unwrap();
         assert_eq!(s.note(ClusterId(2)), "two\n#1: one", "redo appends once");
+    }
+
+    #[test]
+    fn merge_with_target_among_sources_is_not_its_own_parent() {
+        let (mut s, _d) = fresh_session();
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(2), ClusterId(1)],
+            target: ClusterId(2),
+        })
+        .unwrap();
+        assert_eq!(s.parents(ClusterId(2)), [ClusterId(1)]);
     }
 
     #[test]

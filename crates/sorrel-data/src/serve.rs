@@ -465,6 +465,9 @@ where
                 .map(|c| check(session, c))
                 .collect::<Result<_, _>>()?;
             let target = check(session, arg_u32(args, "target")?)?;
+            if sources.contains(&target) {
+                return fail(format!("target {} is also listed in sources", target.0));
+            }
             session.dispatch(as_agent(
                 session,
                 CurationCommand::Merge { sources, target },
@@ -1394,6 +1397,24 @@ mod tests {
         drop(run);
         assert_eq!(s.version(), version, "session untouched");
         assert!(s.tags(ClusterId(0)).is_empty());
+    }
+
+    #[test]
+    fn headless_merge_rejects_target_among_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = mock_session(dir.path());
+        let mut env = Env::new(dir.path(), false, label);
+        let version = s.version();
+        let r = handle_line(
+            &mut s,
+            &mut env,
+            &Mode::Headless,
+            &call(1, "merge", json!({"sources": [0, 1], "target": 0})),
+        )
+        .unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        assert_eq!(s.version(), version);
+        assert!(s.parents(ClusterId(0)).is_empty());
     }
 
     #[test]
