@@ -7,8 +7,66 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Unit origin: every unit is `Auto[<sorter>]` or `Sorrel[Manual]`,
+  `Sorrel[Algo:<name>]` or `Sorrel[LLM:<name>]`, with direct parents and a
+  free-text note (`:note`). Auto units edited in sorrel are tagged `tuned` or
+  `split`; units phy already edited are tagged `external`. Saved in
+  `cluster_sorrel_annotations.tsv` and as a curation.json `origin` label.
+  `--sorter NAME` overrides the detected sorter name.
+- `sorrel rescue`: FDR-controlled matched-filter spike rescue for existing
+  units, with hybrid-injection recall checks.
+- In-place `AddSpikes`: rescued spikes are journaled as one undoable batch.
+  Save rewrites every per-spike array, with backups in `sorrel_original/`.
+
+### Changed
+
+- The curation journal is format v2 (`Split` records how the unit was made,
+  plus `AddSpikes`). v1 journals are upgraded on open; sorrel 0.2.x refuses
+  a v2 journal instead of truncating it. Remote protocol v2.
+- Suggestions are memoised per cluster. Re-ranking after an edit takes
+  137 ms instead of 807 ms on 1000 clusters and 2M spikes (about 5.7×).
+- Merge suggestions include drift-fragment pairs: nearby peak channels with
+  complementary firing over time.
+- Split suggestions ignore amplitude bimodality that bursting explains
+  (reason `burst_explained`).
+- Per-cluster cache keys no longer include the journal head, so caches
+  survive unrelated edits.
+
+### Fixed
+
+- The cluster table's "amp" column is mean spike amplitude × template
+  peak-to-peak, as in phy. It used to show the template peak alone, which
+  is the same for every cluster on unit-norm Kilosort templates.
+
 ### Changed (UI)
 
+- **phy-parity views fit their panes.**
+  - CCG, ISI, Waveforms and Scatter keep their main control on one row and
+    put the rest in a ⚙ popover, so toolbars no longer wrap or overlap.
+  - **Cluster table:**
+    - The default columns (ID, ch, fr, n, qual, label) fit the panel, which
+      opens at 22% of the window.
+    - depth, sh, amp, isi, tags, origin and note are opt-in from the header
+      menu.
+    - Only the label cell is coloured, and descending sorts show ▼.
+  - **Similar:** drops the repeated filter block.
+  - **Features:**
+    - Selected clusters are drawn over dimmed background spikes.
+    - The grid adapts to the pane width, with square cells and readable
+      labels.
+    - Axes fit the spikes shown.
+  - **Waveforms:** overlays the selected clusters by default, with a colour
+    legend. "overlap" (`o`) switches to phy's side-by-side layout.
+  - **CCG:** cells keep a 120 px minimum and scroll; axes sit on the outer
+    edges; chips are readable.
+  - **ISI:** overlays every selected cluster in one plot, with a shaded
+    refractory band and per-cluster "<1 ms" chips.
+  - **Scatter:** fills its pane, rings the selection, and labels axes with
+    units.
+  - The third selection colour is purple instead of red, so a selected
+    cluster no longer looks like an error.
 - **Roomier layout.**
   - Text is 14 px, captions are at least 11 px, and controls and table rows are 24 px.
   - The top bar is 36 px and tab bars are 30 px, with 6 px gaps between panes.

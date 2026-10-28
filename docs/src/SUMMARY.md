@@ -32,3 +32,4 @@
 - [Sorrel improvement research](./reference/sorrel-improvement-research.md)
 - [Sorrel scientific correctness research](./reference/sorrel-science-research.md)
 - [phy parity](./reference/phy-parity.md)
+- [Clustering brainstorm](./reference/clustering-brainstorm.md)
