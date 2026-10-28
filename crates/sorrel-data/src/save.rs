@@ -84,7 +84,82 @@ where
     if any || tags_path.exists() {
         write_atomic(&tags_path, &tags_text)?;
     }
-    Ok(())
+
+    // phy custom labels: one `cluster_<key>.tsv` per key, as phy writes them.
+    for key in session.custom_label_keys() {
+        let mut text = format!("cluster_id\t{key}\n");
+        for c in (0..session.n_clusters()).map(sorrel_io::ClusterId) {
+            if let Some(v) = session.custom_label(c, &key) {
+                text.push_str(&format!("{c}\t{v}\n"));
+            }
+        }
+        write_atomic(&root.join(format!("cluster_{key}.tsv")), &text)?;
+    }
+    write_cluster_info(session, root, &label_str)
+}
+
+/// phy's `cluster_info.tsv`: one row per non-empty cluster with the columns
+/// phy's cluster view shows (`cluster_id`, `ch`, `fr`, `amp`, `n_spikes`,
+/// `group`, custom labels), rewritten on every save. `depth` needs probe
+/// geometry, which the session does not hold, so it is left out.
+fn write_cluster_info<P, F>(session: &Session<P>, root: &Path, label_str: &F) -> Result<()>
+where
+    P: DataProvider,
+    F: Fn(&P::Label) -> &'static str,
+{
+    let keys = session.custom_label_keys();
+    let duration =
+        session.provider.n_samples().0 as f64 / session.provider.sample_rate().max(1.0) as f64;
+    let mut text = String::from("cluster_id\tch\tfr\tamp\tn_spikes\tgroup");
+    for k in &keys {
+        text.push('\t');
+        text.push_str(k);
+    }
+    text.push('\n');
+    for c in (0..session.n_clusters()).map(sorrel_io::ClusterId) {
+        let n = session.spike_times(c).len();
+        if n == 0 {
+            continue;
+        }
+        // Peak channel of the primary template.
+        let ch = session
+            .primary_template(c)
+            .and_then(|t| session.template_waveform(t))
+            .map(|w| {
+                let (_, ns, nc) = session.template_shape();
+                let ptp = |ch: usize| {
+                    let col = (0..ns).filter_map(|s| w.get(s * nc + ch));
+                    let (lo, hi) =
+                        col.fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+                    hi - lo
+                };
+                let peak = (0..nc)
+                    .max_by(|&a, &b| ptp(a).total_cmp(&ptp(b)))
+                    .unwrap_or(0);
+                peak.to_string()
+            })
+            .unwrap_or_default();
+        let amps = session.spike_amplitudes(c);
+        let amp = if amps.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{:.3}",
+                amps.iter().map(|&a| a as f64).sum::<f64>() / amps.len() as f64
+            )
+        };
+        let group = session.label(c).map_or("", |l| label_str(&l));
+        text.push_str(&format!(
+            "{c}\t{ch}\t{:.3}\t{amp}\t{n}\t{group}",
+            n as f64 / duration.max(f64::MIN_POSITIVE)
+        ));
+        for k in &keys {
+            text.push('\t');
+            text.push_str(session.custom_label(c, k).unwrap_or(""));
+        }
+        text.push('\n');
+    }
+    write_atomic(&root.join("cluster_info.tsv"), &text)
 }
 
 fn write_atomic(path: &Path, text: &str) -> Result<()> {
@@ -346,6 +421,38 @@ mod tests {
         assert!(sorrel_io::kilosort::read_tags_tsv(&tsv)
             .iter()
             .all(Vec::is_empty));
+    }
+
+    #[test]
+    fn custom_labels_write_phy_tsvs_and_undo() {
+        let (mut s, dir) = fresh_session();
+        let cmd = s
+            .set_label_command(ClusterId(1), "quality", "great")
+            .unwrap();
+        s.dispatch(cmd).unwrap();
+        let cmd = s.set_label_command(ClusterId(1), "quality", "ok").unwrap();
+        s.dispatch(cmd).unwrap();
+        assert_eq!(
+            s.custom_label(ClusterId(1), "quality"),
+            Some("ok"),
+            "one value per key"
+        );
+        assert!(s.set_label_command(ClusterId(1), "group", "x").is_err());
+        assert!(s.set_label_command(ClusterId(1), "q", "a,b").is_err());
+        save_to_phy(&s, dir.path(), label_str).unwrap();
+
+        let tsv = std::fs::read_to_string(dir.path().join("cluster_quality.tsv")).unwrap();
+        assert_eq!(tsv, "cluster_id\tquality\n1\tok\n");
+        let info = std::fs::read_to_string(dir.path().join("cluster_info.tsv")).unwrap();
+        let mut lines = info.lines();
+        assert_eq!(
+            lines.next(),
+            Some("cluster_id\tch\tfr\tamp\tn_spikes\tgroup\tquality")
+        );
+        assert!(lines.any(|l| l.starts_with("1\t") && l.ends_with("\tok")));
+
+        s.dispatch(CurationCommand::Undo).unwrap();
+        assert_eq!(s.custom_label(ClusterId(1), "quality"), Some("great"));
     }
 
     #[test]

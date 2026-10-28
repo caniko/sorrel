@@ -68,6 +68,10 @@ pub struct SplitCandidate {
     /// event.
     pub drift_corr: f32,
     pub n_spikes: usize,
+    /// Which proposer produced `bipartition_minor_idx`: `"kmeans"` (PC-feature
+    /// k-means) or `"gmm"` (amplitude GMM; also the label when there is no
+    /// proposal). k-means is preferred when both pass.
+    pub method: &'static str,
     /// `BIC(k=1) - BIC(k=2)` for the GMM fit on this cluster's
     /// amplitudes. Positive = mixture model wins. NaN if the GMM was
     /// unable to fit (small cluster, no amplitudes, etc.).
@@ -165,11 +169,40 @@ pub fn rank_merge_candidates<P: DataProvider>(
         }));
     }
 
-    // Build the (a, b) pairs that survive the cheap amplitude pre-filter,
-    // then score each pair in parallel. Rayon spreads the C² work across
-    // all cores; `&Session<P>` is Send + Sync (journal is a plain
-    // BufWriter<File>) so the closure can borrow it directly.
+    // Build the (a, b) pairs that survive the cheap pre-filter, then score
+    // each pair in parallel. Rayon spreads the work across all cores;
+    // `&Session<P>` is Send + Sync (journal is a plain BufWriter<File>) so
+    // the closure can borrow it directly.
     use rayon::prelude::*;
+
+    // With templates loaded, only each cluster's top-10 template-similar
+    // clusters (score >= 0.5) are candidates; otherwise every pair goes
+    // through the amplitude filter below.
+    let similar: Option<std::collections::HashSet<(u32, u32)>> =
+        (session.has_template_waveforms() || !session.similar_templates().is_empty()).then(|| {
+            let mut set = std::collections::HashSet::new();
+            for a in (0..n).filter(|&a| summaries[a as usize].is_some()) {
+                for (b, _) in session
+                    .similar_clusters(ClusterId(a), &[])
+                    .into_iter()
+                    .filter(|&(_, s)| s >= 0.5)
+                    .take(10)
+                {
+                    set.insert((a.min(b.0), a.max(b.0)));
+                }
+            }
+            set
+        });
+    // Rejection memory: `notmerge:<other>` on either cluster hides the pair.
+    let rejected = |a: ClusterId, b: ClusterId| {
+        let has = |x: ClusterId, y: ClusterId| {
+            session
+                .tags(x)
+                .iter()
+                .any(|t| *t == format!("notmerge:{}", y.0))
+        };
+        has(a, b) || has(b, a)
+    };
 
     let mut pairs: Vec<(ClusterId, ClusterId, ClusterSummary, ClusterSummary, f32)> = Vec::new();
     for a in 0..n {
@@ -180,8 +213,14 @@ pub fn rank_merge_candidates<P: DataProvider>(
             let Some(sb) = summaries[b as usize] else {
                 continue;
             };
+            if similar.as_ref().is_some_and(|s| !s.contains(&(a, b))) {
+                continue;
+            }
             let a = ClusterId(a);
             let b = ClusterId(b);
+            if rejected(a, b) {
+                continue;
+            }
             let amp_mean_delta = if sa.mean_amp.is_finite() && sb.mean_amp.is_finite() {
                 let lo = sa.mean_amp.abs().min(sb.mean_amp.abs()).max(1e-6);
                 ((sa.mean_amp - sb.mean_amp).abs() / lo).min(1.0)
@@ -258,6 +297,9 @@ pub fn rank_split_candidates<P: DataProvider>(
     let total_duration = session.provider.n_samples();
 
     use rayon::prelude::*;
+    let globals = session
+        .has_pc_features()
+        .then(|| crate::proposers::all_cluster_globals(session));
     let mut out: Vec<SplitCandidate> = (0..n)
         .into_par_iter()
         .map(ClusterId)
@@ -265,6 +307,10 @@ pub fn rank_split_candidates<P: DataProvider>(
             let times = session.spike_times(c);
             let amps = session.spike_amplitudes(c);
             if times.len() < cfg.min_spikes {
+                return None;
+            }
+            // Rejection memory: a `notsplit` cluster is never proposed again.
+            if session.tags(c).iter().any(|t| t == "notsplit") {
                 return None;
             }
             let bc = if amps.len() >= 8 {
@@ -307,9 +353,23 @@ pub fn rank_split_candidates<P: DataProvider>(
                 (gmm_delta.min(40.0) / 40.0 * 0.15).clamp(0.0, 0.15)
             };
 
-            let raw = ((0.6 * bc_score + 0.25 * cont_score + 0.15 * drift_score) * snr_gate
+            let mut raw = ((0.6 * bc_score + 0.25 * cont_score + 0.15 * drift_score) * snr_gate
                 + gmm_bonus)
                 .clamp(0.0, 1.0);
+            // PC-feature k-means is the stronger proposer: when it passes
+            // its validation it replaces the GMM bipartition and lifts the
+            // score to [0.5, 1] by silhouette.
+            // ponytail: hand-set mapping; calibrate on accepted splits.
+            let mut method = "gmm";
+            let mut bipartition = bipartition;
+            if let Some(km) = globals
+                .as_ref()
+                .and_then(|g| crate::proposers::kmeans_split(session, c, &g[c.idx()]))
+            {
+                raw = raw.max(0.5 + (km.silhouette - 0.25).clamp(0.0, 0.5));
+                bipartition = km.minor_idx;
+                method = "kmeans";
+            }
             if raw < cfg.min_score {
                 return None;
             }
@@ -321,6 +381,7 @@ pub fn rank_split_candidates<P: DataProvider>(
                 contamination,
                 drift_corr: drift,
                 n_spikes: times.len(),
+                method,
                 gmm_bic_delta: gmm_delta,
                 bipartition_minor_idx: bipartition,
             })

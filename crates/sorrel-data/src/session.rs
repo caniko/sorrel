@@ -360,6 +360,101 @@ impl<P: DataProvider> Session<P> {
         self.cluster_index.pc_shape()
     }
 
+    /// PC `pc` of the spike at `global_idx` on real channel `channel`;
+    /// `None` when the spike's template has no feature on that channel.
+    pub fn pc_feature(&self, global_idx: u32, channel: u32, pc: usize) -> Option<f32> {
+        self.cluster_index.pc_feature(global_idx, channel, pc)
+    }
+
+    /// FeatureView channels for `selection` (phy `FeatureView._get_channel_ids`):
+    /// the first cluster's PC channels ranked by template amplitude, with the
+    /// channels every other selected cluster also has moved to the front.
+    pub fn best_channels(&self, selection: &[ClusterId]) -> Vec<u32> {
+        let Some((&first, rest)) = selection.split_first() else {
+            return Vec::new();
+        };
+        let ranked = |c: ClusterId| -> Vec<u32> {
+            let Some(t) = self.primary_template(c) else {
+                return Vec::new();
+            };
+            let mut chans = self.cluster_index.pc_channels(t).to_vec();
+            if let Some(w) = self.template_waveform(t) {
+                let (_, n_samples, n_chans) = self.template_shape();
+                let ptp = |ch: u32| {
+                    let col = (0..n_samples).filter_map(|s| w.get(s * n_chans + ch as usize));
+                    let (lo, hi) =
+                        col.fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+                    (hi - lo).max(0.0)
+                };
+                chans.sort_by(|&a, &b| ptp(b).total_cmp(&ptp(a)));
+            }
+            chans
+        };
+        let mut best = ranked(first);
+        let others: Vec<Vec<u32>> = rest.iter().map(|&c| ranked(c)).collect();
+        // Stable sort: shared channels first, amplitude order kept within each part.
+        best.sort_by_key(|ch| !others.iter().all(|o| o.contains(ch)));
+        best
+    }
+
+    /// phy's cluster similarity (SimilarityView and the `space` wizard):
+    /// for every non-empty cluster other than `reference` and `exclude`, the
+    /// max of `similar_templates` over all template pairs of the two
+    /// clusters, highest first (ties by id). A merged cluster owns the union
+    /// of its sources' templates. Without the matrix it falls back to the
+    /// cosine of the flattened template waveforms under the same max rule,
+    /// and is empty when neither is loaded.
+    pub fn similar_clusters(
+        &self,
+        reference: ClusterId,
+        exclude: &[ClusterId],
+    ) -> Vec<(ClusterId, f32)> {
+        use rayon::prelude::*;
+        let templates_of = |c: ClusterId| {
+            let mut t = self.spike_templates(c).to_vec();
+            t.sort_unstable();
+            t.dedup();
+            t
+        };
+        let mine = templates_of(reference);
+        let (n_t, _, _) = self.template_shape();
+        let sim = self.similar_templates();
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (norm(a) * norm(b)).max(f32::MIN_POSITIVE)
+        };
+        let have_matrix = n_t > 0 && sim.len() == n_t * n_t;
+        let pair = |a: u32, b: u32| -> Option<f32> {
+            if have_matrix {
+                let (a, b) = (a as usize, b as usize);
+                (a < n_t && b < n_t).then(|| sim[a * n_t + b])
+            } else {
+                // ponytail: recomputes both norms per pair; cache per-template
+                // norms if clusters ever span hundreds of templates.
+                Some(cosine(
+                    self.template_waveform(a)?,
+                    self.template_waveform(b)?,
+                ))
+            }
+        };
+        let score = |c: ClusterId| -> Option<f32> {
+            let theirs = templates_of(c);
+            mine.iter()
+                .flat_map(|&a| theirs.iter().map(move |&b| (a, b)))
+                .filter_map(|(a, b)| pair(a, b))
+                .reduce(f32::max)
+        };
+        let mut out: Vec<(ClusterId, f32)> = (0..self.n_clusters())
+            .into_par_iter()
+            .map(ClusterId)
+            .filter(|&c| c != reference && !exclude.contains(&c) && !self.spike_times(c).is_empty())
+            .filter_map(|c| score(c).filter(|v| v.is_finite()).map(|v| (c, v)))
+            .collect();
+        out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        out
+    }
+
     #[inline]
     pub fn labels(&self) -> &[P::Label] {
         &self.labels
@@ -373,6 +468,98 @@ impl<P: DataProvider> Session<P> {
     /// Provenance/review tags of `cluster` (empty when it has none).
     pub fn tags(&self, cluster: ClusterId) -> &[String] {
         self.tags.get(cluster.idx()).map_or(&[], Vec::as_slice)
+    }
+
+    /// phy `split_init` for one cluster: the `Split`s that give each of its
+    /// original templates (beyond the most common one, which stays) a
+    /// cluster of its own. Indices are local to the bucket as it shrinks,
+    /// so the commands apply in order, e.g. as one batch.
+    pub fn split_by_template_commands(&self, cluster: ClusterId) -> Vec<CurationCommand> {
+        let mut rest = self.spike_templates(cluster).to_vec();
+        let Some(keep) = self.primary_template(cluster) else {
+            return Vec::new();
+        };
+        let mut others: Vec<u32> = rest.iter().copied().filter(|&t| t != keep).collect();
+        others.sort_unstable();
+        others.dedup();
+        others
+            .into_iter()
+            .map(|t| {
+                let spike_idx: Vec<u32> = (0..rest.len() as u32)
+                    .filter(|&i| rest[i as usize] == t)
+                    .collect();
+                rest.retain(|&x| x != t);
+                CurationCommand::Split {
+                    cluster,
+                    spike_idx,
+                    new_cluster: ClusterId(0),
+                }
+            })
+            .collect()
+    }
+
+    /// phy custom label `key` of `cluster` (`:l key value`), stored as a
+    /// `key=value` tag so it journals, undoes and follows merges and
+    /// splits like any tag. After a merge the target's value wins.
+    pub fn custom_label(&self, cluster: ClusterId, key: &str) -> Option<&str> {
+        self.tags(cluster)
+            .iter()
+            .find_map(|t| t.strip_prefix(key)?.strip_prefix('='))
+    }
+
+    /// Every custom label key in use, sorted.
+    pub fn custom_label_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|t| t.split_once('=').map(|(k, _)| k.to_string()))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// The tag edit that sets custom label `key` to `value` on `cluster`
+    /// (an empty value clears it). Keys are phy column names: letters,
+    /// digits and `_`, and not one of phy's own label files.
+    pub fn set_label_command(
+        &self,
+        cluster: ClusterId,
+        key: &str,
+        value: &str,
+    ) -> Result<CurationCommand, String> {
+        let reserved = [
+            "group",
+            "groups",
+            "KSLabel",
+            "purity",
+            "info",
+            "sorrel_tags",
+            "id",
+            "n_spikes",
+        ];
+        if key.is_empty()
+            || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || reserved.contains(&key)
+        {
+            return Err(format!("{key:?} cannot be a label name"));
+        }
+        let prefix = format!("{key}=");
+        let mut tags: Vec<String> = self
+            .tags(cluster)
+            .iter()
+            .filter(|t| !t.starts_with(&prefix))
+            .cloned()
+            .collect();
+        if !value.is_empty() {
+            let tag = format!("{prefix}{value}");
+            if !sorrel_io::kilosort::valid_tag(&tag) {
+                return Err("label values cannot contain commas, tabs or newlines".into());
+            }
+            tags.push(tag);
+        }
+        Ok(CurationCommand::Tag { cluster, tags })
     }
 
     /// `cmd` as a human decision: preceded by retags that drop the touched
@@ -800,6 +987,44 @@ impl<P: DataProvider> Session<P> {
             spike_count: count,
             cluster_spike_fingerprint: *hasher.finalize().as_bytes(),
         }
+    }
+}
+
+/// Review-queue ordering (see [`crate::proposers::attention_with`]).
+impl<P: DataProvider> Session<P> {
+    /// `(score, reasons)` of how much `cluster` needs a human. Ranks every
+    /// merge/split to find this cluster's share, so use
+    /// [`Self::attention_all`] (or `proposers::attention_all` with
+    /// suggestions you already hold) when scoring more than one.
+    pub fn attention(&self, cluster: ClusterId) -> (f32, Vec<&'static str>) {
+        let (merges, splits) = self.all_suggestions();
+        let globals = crate::proposers::cluster_globals(self, cluster);
+        crate::proposers::attention_with(self, cluster, &globals, &merges, &splits)
+    }
+
+    /// Attention of every non-empty cluster, highest first; suggestions are
+    /// computed once.
+    pub fn attention_all(&self) -> Vec<(ClusterId, f32, Vec<&'static str>)> {
+        let (merges, splits) = self.all_suggestions();
+        crate::proposers::attention_all(self, &merges, &splits)
+    }
+
+    /// Untruncated merge and split suggestions (default thresholds).
+    fn all_suggestions(
+        &self,
+    ) -> (
+        Vec<crate::suggest::MergeCandidate>,
+        Vec<crate::suggest::SplitCandidate>,
+    ) {
+        let cfg = crate::suggest::SuggestConfig {
+            top_merges: usize::MAX,
+            top_splits: usize::MAX,
+            ..Default::default()
+        };
+        (
+            crate::suggest::rank_merge_candidates(self, &cfg),
+            crate::suggest::rank_split_candidates(self, &cfg),
+        )
     }
 }
 

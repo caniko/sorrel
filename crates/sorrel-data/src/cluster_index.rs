@@ -82,6 +82,16 @@ pub struct ClusterIndex {
     pc_features_flat: std::sync::Arc<[f32]>,
     /// `(n_pcs, n_channels_per_template)` shape of the PC feature buffer.
     pc_shape: (usize, usize),
+    /// Flat `(n_templates, n_channels_per_template)` real channel ids for
+    /// each column of `pc_features_flat` (phy `pc_feature_ind.npy`).
+    pc_feature_ind: std::sync::Arc<[u32]>,
+    /// `template_features.npy` flat, its width, and `template_feature_ind.npy`.
+    template_features: (std::sync::Arc<[f32]>, usize, std::sync::Arc<[u32]>),
+    /// phylib spike attributes `(name, row-major values, columns)`.
+    spike_attributes: Vec<(String, std::sync::Arc<[f32]>, usize)>,
+    /// `spike_reorder.npy` applied: the time each global spike shows on
+    /// the time axes while reordering is on. Empty when absent.
+    reordered_times: Vec<SampleIndex>,
 
     /// Flat `(n_templates, n_samples_per_template, n_channels)` template
     /// waveforms, copied from the provider when seeded. Empty otherwise.
@@ -146,6 +156,10 @@ impl ClusterIndex {
             spike_pc_indices: Vec::new(),
             pc_features_flat: std::sync::Arc::from([]),
             pc_shape: (0, 0),
+            pc_feature_ind: std::sync::Arc::from([]),
+            template_features: (std::sync::Arc::from([]), 0, std::sync::Arc::from([])),
+            spike_attributes: Vec::new(),
+            reordered_times: Vec::new(),
             template_waveforms: std::sync::Arc::from([]),
             template_shape: (0, 0, 0),
             similar_templates: Vec::new(),
@@ -195,6 +209,35 @@ impl ClusterIndex {
         );
         self.pc_features_flat = provider.pc_features_shared();
         self.pc_shape = provider.pc_shape();
+        self.pc_feature_ind = std::sync::Arc::from(provider.pc_feature_ind());
+        let (tf, k, ind) = provider.template_features();
+        self.template_features = (tf, k, std::sync::Arc::from(ind));
+        self.spike_attributes = provider.spike_attributes();
+        self.reordered_times = match provider.spike_reorder() {
+            Some(reorder) => {
+                // phy: time of row `i` becomes the time of row `reorder[i]`.
+                let rows: Vec<Option<usize>> = self
+                    .spike_pc_indices
+                    .iter()
+                    .map(|r| r.get().map(|r| r as usize))
+                    .collect();
+                let mut time_of_row = vec![SampleIndex(0); reorder.len()];
+                for (g, row) in rows.iter().enumerate() {
+                    if let Some(slot) = row.and_then(|r| time_of_row.get_mut(r)) {
+                        *slot = self.spike_times[g];
+                    }
+                }
+                rows.iter()
+                    .enumerate()
+                    .map(|(g, row)| {
+                        row.and_then(|r| reorder.get(r))
+                            .and_then(|&j| time_of_row.get(j as usize).copied())
+                            .unwrap_or(self.spike_times[g])
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
     }
 
     /// Pull per-spike template ids from a backend that has them. Same shape
@@ -239,6 +282,13 @@ impl ClusterIndex {
     #[inline]
     pub fn all_spike_times(&self) -> &[SampleIndex] {
         &self.spike_times
+    }
+
+    /// Per-spike amplitudes in the same global order; empty when the
+    /// backend has none.
+    #[inline]
+    pub fn spike_amplitudes_global(&self) -> &[f32] {
+        &self.spike_amplitudes
     }
 
     #[inline]
@@ -300,6 +350,74 @@ impl ClusterIndex {
         let start = orig * stride;
         let end = start + stride;
         self.pc_features_flat.get(start..end)
+    }
+
+    /// Real channel ids of `template`'s PC feature columns, best first
+    /// (phy `pc_feature_ind[template]`). Empty when not seeded.
+    pub fn pc_channels(&self, template: u32) -> &[u32] {
+        let n = self.pc_shape.1;
+        let start = template as usize * n;
+        self.pc_feature_ind.get(start..start + n).unwrap_or(&[])
+    }
+
+    /// The spike's projection on `template` (phy TemplateFeatureView);
+    /// `None` when `template` is not among the spike's `k` nearest.
+    pub fn template_feature(&self, global_idx: u32, template: u32) -> Option<f32> {
+        let (flat, k, ind) = &self.template_features;
+        let own = *self.spike_templates.get(global_idx as usize)? as usize;
+        let pos = ind
+            .get(own * k..(own + 1) * k)?
+            .iter()
+            .position(|&t| t == template)?;
+        let row = self.spike_pc_indices.get(global_idx as usize)?.get()? as usize;
+        flat.get(row * k + pos).copied()
+    }
+
+    /// Names and column counts of the phylib spike attributes.
+    pub fn spike_attribute_names(&self) -> Vec<(&str, usize)> {
+        self.spike_attributes
+            .iter()
+            .map(|(n, _, k)| (n.as_str(), *k))
+            .collect()
+    }
+
+    /// Attribute `name` of the spike at `global_idx` (1 or 2 values).
+    pub fn spike_attribute(&self, name: &str, global_idx: u32) -> Option<&[f32]> {
+        let (_, flat, k) = self.spike_attributes.iter().find(|a| a.0 == name)?;
+        let row = self.spike_pc_indices.get(global_idx as usize)?.get()? as usize;
+        flat.get(row * k..(row + 1) * k)
+    }
+
+    /// The spike's time on the time axes: `spike_reorder.npy`'s when
+    /// `reorder` is on and the file exists (phy `toggle_spike_reorder`).
+    pub fn display_time(&self, global_idx: u32, reorder: bool) -> SampleIndex {
+        let g = global_idx as usize;
+        match self.reordered_times.get(g) {
+            Some(&t) if reorder => t,
+            _ => self.spike_times[g],
+        }
+    }
+
+    pub fn has_spike_reorder(&self) -> bool {
+        !self.reordered_times.is_empty()
+    }
+
+    pub fn has_template_features(&self) -> bool {
+        self.template_features.1 > 0
+    }
+
+    /// PC `pc` of the spike at `global_idx` on real channel `channel`.
+    /// `None` when that channel is not among the spike's template channels,
+    /// which phy also leaves out of the FeatureView.
+    pub fn pc_feature(&self, global_idx: u32, channel: u32, pc: usize) -> Option<f32> {
+        let template = *self.spike_templates.get(global_idx as usize)?;
+        let pos = self
+            .pc_channels(template)
+            .iter()
+            .position(|&c| c == channel)?;
+        self.pc_feature_for(global_idx)?
+            .get(pc * self.pc_shape.1 + pos)
+            .copied()
     }
 
     /// Pull template waveforms + similarity matrix from a backend that has

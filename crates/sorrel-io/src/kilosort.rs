@@ -86,6 +86,11 @@ pub struct KilosortProvider {
     pc_features: std::sync::Arc<[f32]>,
     pc_shape: (usize, usize), // (n_pcs, n_channels_per_template)
     pc_feature_ind: Vec<u32>, // (n_templates * n_channels_per_template) flat
+    /// `template_features.npy` flat, its width `k`, and `template_feature_ind.npy`.
+    template_features: (std::sync::Arc<[f32]>, usize, Vec<u32>),
+    /// phylib spike attributes and `spike_reorder.npy`.
+    spike_attributes: Vec<(String, std::sync::Arc<[f32]>, usize)>,
+    spike_reorder: Option<std::sync::Arc<[u32]>>,
     /// Per-cluster, time-sorted, original NPY row indices into pc_features.
     /// Doubles as the row index into `amplitudes.npy`/`spike_times.npy`/etc.
     pc_indices_per_cluster: Vec<Vec<u32>>,
@@ -258,7 +263,7 @@ impl KilosortProvider {
             .unwrap_or_else(|| load_cluster_groups(&root.join("cluster_KSLabel.tsv"), n_clusters))
         };
 
-        let initial_tags = read_tags_tsv(&root.join(TAGS_TSV));
+        let initial_tags = with_phy_labels(&root, read_tags_tsv(&root.join(TAGS_TSV)));
 
         // 2.5. Probe geometry. All optional; absence is fine.
         let channel_positions = read_optional_positions(&root.join("channel_positions.npy"))?;
@@ -274,6 +279,12 @@ impl KilosortProvider {
         // neither — having pc_features without pc_feature_ind makes the
         // shape unusable.
         let (pc_features, pc_shape, pc_feature_ind) = read_optional_pc_features(&root, n_spikes)?;
+        let template_features = read_optional_template_features(&root, n_spikes)?;
+        let spike_attributes = read_spike_attributes(&root, n_spikes);
+        let spike_reorder = read_1d_u32(&root.join("spike_reorder.npy"))
+            .ok()
+            .filter(|r| r.len() == n_spikes && r.iter().all(|&i| (i as usize) < n_spikes))
+            .map(std::sync::Arc::from);
 
         // 2.7. Template waveforms + similarity matrix. Both optional; the
         // TemplateView and SimilarityView gracefully degrade when absent.
@@ -379,6 +390,9 @@ impl KilosortProvider {
             pc_features: pc_features.into(),
             pc_shape,
             pc_feature_ind,
+            template_features,
+            spike_attributes,
+            spike_reorder,
             pc_indices_per_cluster,
             template_waveforms: template_waveforms.into(),
             template_shape,
@@ -577,6 +591,16 @@ impl HasPcFeatures for KilosortProvider {
             .get(cluster.idx())
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+    fn template_features(&self) -> (std::sync::Arc<[f32]>, usize, &[u32]) {
+        let (flat, k, ind) = &self.template_features;
+        (flat.clone(), *k, ind)
+    }
+    fn spike_attributes(&self) -> Vec<(String, std::sync::Arc<[f32]>, usize)> {
+        self.spike_attributes.clone()
+    }
+    fn spike_reorder(&self) -> Option<std::sync::Arc<[u32]>> {
+        self.spike_reorder.clone()
     }
 }
 
@@ -777,6 +801,84 @@ fn read_optional_u32_1d(path: &Path, expected_len: usize) -> Result<Option<Vec<u
 /// Read `pc_features.npy` and `pc_feature_ind.npy` together when both are
 /// present. Returns `(flat, (n_pcs, n_chans_per_template), feature_ind_flat)`
 /// with empty defaults when either file is absent.
+/// phylib `_load_spike_attributes`: every `spike_<name>.npy` except the
+/// known per-spike files, with `n_spikes` rows; at most 2 columns are kept
+/// (phy plots 1-D as time vs value and 2-D as x vs y). Unreadable or
+/// mis-sized files are skipped with a warning, as phylib does.
+fn read_spike_attributes(root: &Path, n_spikes: usize) -> Vec<SpikeAttribute> {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<SpikeAttribute> = rd
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let name = path
+                .file_name()?
+                .to_str()?
+                .strip_prefix("spike_")?
+                .strip_suffix(".npy")?
+                .to_string();
+            if matches!(
+                name.as_str(),
+                "clusters" | "templates" | "samples" | "times" | "amplitudes" | "reorder"
+            ) {
+                return None;
+            }
+            let read = read_npy_f32_flat(&path).or_else(|_| {
+                read_npy_u32_flat(&path)
+                    .map(|(v, s)| (v.into_iter().map(|x| x as f32).collect(), s))
+            });
+            match read {
+                Ok((flat, shape)) if shape.first() == Some(&n_spikes) => {
+                    let cols: usize = shape[1..].iter().product::<usize>().max(1);
+                    let keep = cols.min(2);
+                    let flat: Vec<f32> =
+                        flat.chunks(cols).flat_map(|r| r[..keep].to_vec()).collect();
+                    Some((name, std::sync::Arc::from(flat), keep))
+                }
+                Ok((_, shape)) => {
+                    log::warn!(
+                        "{}: shape {shape:?} does not match {n_spikes} spikes",
+                        path.display()
+                    );
+                    None
+                }
+                Err(e) => {
+                    log::warn!("{}: {e}", path.display());
+                    None
+                }
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// `(name, row-major values, columns)` of one phylib spike attribute.
+type SpikeAttribute = (String, std::sync::Arc<[f32]>, usize);
+
+/// `template_features.npy` + `template_feature_ind.npy`: both or neither,
+/// with matching widths. Absent files give an empty triple.
+fn read_optional_template_features(
+    root: &Path,
+    n_spikes: usize,
+) -> Result<(std::sync::Arc<[f32]>, usize, Vec<u32>)> {
+    let (feat, ind) = (
+        root.join("template_features.npy"),
+        root.join("template_feature_ind.npy"),
+    );
+    if !feat.exists() || !ind.exists() {
+        return Ok((std::sync::Arc::from([]), 0, Vec::new()));
+    }
+    let (flat, shape) = read_npy_f32_flat(&feat)?;
+    let (ind_flat, ind_shape) = read_npy_u32_flat(&ind)?;
+    match (shape.as_slice(), ind_shape.as_slice()) {
+        ([n, k], [_, k2]) if *n == n_spikes && k == k2 => Ok((flat.into(), *k, ind_flat)),
+        _ => bail!("template_features.npy {shape:?} and template_feature_ind.npy {ind_shape:?} do not match {n_spikes} spikes"),
+    }
+}
+
 type PcFeatures = (Vec<f32>, (usize, usize), Vec<u32>);
 
 fn read_optional_pc_features(root: &Path, n_spikes: usize) -> Result<PcFeatures> {
@@ -994,6 +1096,62 @@ pub fn read_cluster_group_tsv(path: &Path) -> Option<Vec<(u32, PhyLabel)>> {
     )
 }
 
+/// phy custom labels (`:l name value` writes `cluster_<name>.tsv`) as
+/// `name=value` tags, from every `cluster_*.tsv` with a non-numeric value
+/// (all-numeric files load as metrics). A cluster that already has a
+/// `name=` tag from the sorrel sidecar keeps it.
+fn with_phy_labels(root: &Path, mut tags: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return tags;
+    };
+    let mut files: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    files.sort();
+    for path in files {
+        let Some(key) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("cluster_")?.strip_suffix(".tsv"))
+        else {
+            continue;
+        };
+        if matches!(
+            key,
+            "group" | "groups" | "KSLabel" | "purity" | "info" | "sorrel_tags"
+        ) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let rows: Vec<(usize, &str)> = text
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let (id, v) = l.split_once('\t')?;
+                Some((id.trim().parse().ok()?, v.trim()))
+            })
+            .filter(|(_, v)| !v.is_empty())
+            .collect();
+        if rows.iter().all(|(_, v)| v.parse::<f32>().is_ok()) {
+            continue;
+        }
+        let prefix = format!("{key}=");
+        for (id, v) in rows {
+            let tag = format!("{prefix}{v}");
+            if !valid_tag(&tag) {
+                continue;
+            }
+            if tags.len() <= id {
+                tags.resize_with(id + 1, Vec::new);
+            }
+            if !tags[id].iter().any(|t| t.starts_with(&prefix)) {
+                tags[id].push(tag);
+            }
+        }
+    }
+    tags
+}
+
 /// Sorrel's tag sidecar in a phy directory: `cluster_id\tsorrel_tags` with
 /// comma-joined tags, which phy shows as an ordinary column.
 pub const TAGS_TSV: &str = "cluster_sorrel_tags.tsv";
@@ -1042,6 +1200,23 @@ pub fn spike_counts<P: DataProvider>(p: &P) -> HashMap<ClusterId, usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phy_label_tsvs_become_tags_and_metrics_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = |name: &str, text: &str| std::fs::write(dir.path().join(name), text).unwrap();
+        w(
+            "cluster_quality.tsv",
+            "cluster_id\tquality\n0\tgreat\n2\tbad\n",
+        );
+        w("cluster_ContamPct.tsv", "cluster_id\tContamPct\n0\t1.5\n");
+        w("cluster_group.tsv", "cluster_id\tgroup\n0\tgood\n");
+        // The sorrel sidecar already holds quality for cluster 2.
+        let tags = with_phy_labels(dir.path(), vec![vec![], vec![], vec!["quality=ok".into()]]);
+        assert_eq!(tags[0], ["quality=great"]);
+        assert!(tags[1].is_empty());
+        assert_eq!(tags[2], ["quality=ok"]);
+    }
 
     #[test]
     fn parse_tsv_value_recognises_known_groups() {

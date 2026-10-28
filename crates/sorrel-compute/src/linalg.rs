@@ -40,6 +40,72 @@ impl Sym {
             self.set(i, i, v + lambda);
         }
     }
+
+    /// The `k` unit eigenvectors with the largest eigenvalues, largest
+    /// first (cyclic Jacobi). Sign is fixed so each vector's largest-|v|
+    /// entry is negative, matching the trough-first convention of spike
+    /// snippets. Cost is O(d³) per sweep; fine for snippet lengths (~90).
+    pub fn top_eigenvectors(&self, k: usize) -> Vec<Vec<f64>> {
+        let d = self.d;
+        let mut a = self.data.clone();
+        let mut v = vec![0.0_f64; d * d];
+        for i in 0..d {
+            v[i * d + i] = 1.0;
+        }
+        for _sweep in 0..64 {
+            let off: f64 = (0..d)
+                .flat_map(|p| ((p + 1)..d).map(move |q| (p, q)))
+                .map(|(p, q)| a[p * d + q] * a[p * d + q])
+                .sum();
+            if off < 1e-22 {
+                break;
+            }
+            for p in 0..d {
+                for q in (p + 1)..d {
+                    let apq = a[p * d + q];
+                    if apq.abs() < 1e-300 {
+                        continue;
+                    }
+                    let theta = (a[q * d + q] - a[p * d + p]) / (2.0 * apq);
+                    let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                    let c = 1.0 / (t * t + 1.0).sqrt();
+                    let s = t * c;
+                    for r in 0..d {
+                        let (arp, arq) = (a[r * d + p], a[r * d + q]);
+                        a[r * d + p] = c * arp - s * arq;
+                        a[r * d + q] = s * arp + c * arq;
+                    }
+                    for r in 0..d {
+                        let (apr, aqr) = (a[p * d + r], a[q * d + r]);
+                        a[p * d + r] = c * apr - s * aqr;
+                        a[q * d + r] = s * apr + c * aqr;
+                    }
+                    for r in 0..d {
+                        let (vrp, vrq) = (v[r * d + p], v[r * d + q]);
+                        v[r * d + p] = c * vrp - s * vrq;
+                        v[r * d + q] = s * vrp + c * vrq;
+                    }
+                }
+            }
+        }
+        let mut order: Vec<usize> = (0..d).collect();
+        order.sort_by(|&i, &j| a[j * d + j].total_cmp(&a[i * d + i]));
+        order
+            .into_iter()
+            .take(k)
+            .map(|col| {
+                let mut e: Vec<f64> = (0..d).map(|r| v[r * d + col]).collect();
+                let peak = e
+                    .iter()
+                    .copied()
+                    .fold(0.0_f64, |m, x| if x.abs() > m.abs() { x } else { m });
+                if peak > 0.0 {
+                    e.iter_mut().for_each(|x| *x = -*x);
+                }
+                e
+            })
+            .collect()
+    }
 }
 
 /// Sample mean of `n` rows of length `d`, supplied row-major in `data`.
@@ -289,6 +355,26 @@ fn ln_gamma(z: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_eigenvectors_recover_known_basis() {
+        let basis =
+            [[1.0, 2.0, 2.0], [2.0, 1.0, -2.0], [2.0, -2.0, 1.0]].map(|v| v.map(|x: f64| x / 3.0));
+        let mut m = Sym::zeros(3);
+        for (lambda, b) in [5.0, 2.0, 1.0].iter().zip(&basis) {
+            for r in 0..3 {
+                for c in 0..3 {
+                    m.set(r, c, m.get(r, c) + lambda * b[r] * b[c]);
+                }
+            }
+        }
+        let top = m.top_eigenvectors(2);
+        assert_eq!(top.len(), 2);
+        for (e, b) in top.iter().zip(&basis) {
+            let dot: f64 = e.iter().zip(b).map(|(x, y)| x * y).sum();
+            assert!((dot.abs() - 1.0).abs() < 1e-9, "dot {dot}");
+        }
+    }
 
     #[test]
     fn invert_identity_returns_identity() {

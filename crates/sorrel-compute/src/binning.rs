@@ -38,9 +38,40 @@ pub fn isi_histogram(spikes: &[SampleIndex], max_samples: u64, bins: usize) -> V
     h
 }
 
+/// ISI histogram with exactly `n_bins` bins over `[min_samples, max_samples)`
+/// (`n_bins + 1` edges; phy's `linspace(.., n_bins)` yields one bin fewer).
+/// Intervals outside the range are dropped.
+pub fn isi_histogram_range(
+    spikes: &[SampleIndex],
+    min_samples: u64,
+    max_samples: u64,
+    n_bins: usize,
+) -> Vec<u32> {
+    let isis: Vec<u64> = spikes
+        .windows(2)
+        .map(|w| w[1].0.saturating_sub(w[0].0))
+        .collect();
+    histogram_u64(&isis, min_samples, max_samples, n_bins)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isi_range_has_n_bins_and_drops_outside() {
+        let spikes: Vec<SampleIndex> = [0u64, 5, 30, 40, 100, 160]
+            .iter()
+            .copied()
+            .map(SampleIndex)
+            .collect();
+        // ISIs 5, 25, 10, 60, 60 over [10, 70) in 3 bins of 20:
+        // 5 dropped (< min); 25 and 10 -> bin 0, 60 and 60 -> bin 2.
+        assert_eq!(isi_histogram_range(&spikes, 10, 70, 3), vec![2, 0, 2]);
+        // Upper edge is exclusive: both 60s drop out.
+        assert_eq!(isi_histogram_range(&spikes, 0, 60, 3), vec![2, 1, 0]);
+        assert!(isi_histogram_range(&spikes, 0, 60, 0).is_empty());
+    }
 
     #[test]
     fn histogram_counts_in_range_values() {
