@@ -53,6 +53,10 @@ enum Backend {
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
+    /// Run the session host without the GUI: MCP clients connect with
+    /// `sorrel mcp <DATA_DIR>`. Stops on Ctrl-C.
+    #[arg(long)]
+    headless: bool,
     /// `sorrel <DATA_DIR> [flags]` with no subcommand means `open`.
     #[command(flatten)]
     open: OpenArgs,
@@ -155,9 +159,12 @@ enum Cmd {
         #[arg(long, value_name = "PREFIX")]
         tag: Option<String>,
     },
-    /// Serve JSON-RPC 2.0 over stdio (MCP shape) so agents and notebooks can
-    /// inspect metrics, request plots and curate through the journal
-    Serve {
+    /// MCP over stdio, the command an agent launches: attaches to the host
+    /// running on DATA_DIR (the GUI or `--headless`), else opens the dataset
+    /// in-process. Agents inspect metrics, request plots and curate through
+    /// the journal.
+    #[command(alias = "serve")]
+    Mcp {
         #[command(flatten)]
         open: OpenArgs,
     },
@@ -1147,6 +1154,50 @@ fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> String {
     rows.iter().map(|(k, v)| format!("{k:<14}{v}\n")).collect()
 }
 
+/// Where a host for `open` writes `.sorrel/mcp.json`: the save directory,
+/// i.e. the dataset directory or a single file's parent.
+fn host_dir(open: &OpenArgs) -> PathBuf {
+    let root = open.root();
+    match root.is_dir() {
+        true => root.to_path_buf(),
+        false => root.parent().unwrap_or(Path::new(".")).to_path_buf(),
+    }
+}
+
+/// `sorrel mcp`: bridge stdio to a running host, else serve in-process.
+fn run_mcp(open: &OpenArgs) -> Result<()> {
+    if sorrel_data::attach(&host_dir(open), std::io::stdin(), std::io::stdout())? {
+        return Ok(());
+    }
+    with_session(open, Serve)
+}
+
+/// `sorrel --headless`: the host and its MCP listener, no window.
+struct Headless;
+impl SessionVisitor for Headless {
+    fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
+    where
+        P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
+    {
+        let host = std::sync::Arc::new(sorrel_data::SessionHost::new(seeded(session, seed)?));
+        let listener = sorrel_data::spawn_listener(
+            host,
+            &ctx.save_dir,
+            ctx.reseal_on_save,
+            phy_label_str,
+            None,
+        )?;
+        println!(
+            "sorrel host on 127.0.0.1:{}; connect an agent with `sorrel mcp {}`; Ctrl-C stops",
+            listener.port(),
+            ctx.save_dir.display()
+        );
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
 struct Serve;
 impl SessionVisitor for Serve {
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
@@ -1274,6 +1325,10 @@ where
         native_options,
         Box::new(move |cc| {
             let mut app = app;
+            let ctx = cc.egui_ctx.clone();
+            if let Err(e) = app.serve_mcp(move || ctx.request_repaint()) {
+                log::warn!("MCP listener not started: {e:#}");
+            }
             if let Some(rs) = cc.wgpu_render_state.as_ref() {
                 TracePipeline::install(rs);
                 RasterPipeline::install(rs);
@@ -1296,6 +1351,7 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
     match cli.cmd {
+        None if cli.headless => with_session(&cli.open, Headless),
         None => run_open(cli.open),
         Some(Cmd::Open(open)) => run_open(open),
         Some(Cmd::Qc { open, out }) => with_session(&open, Qc(out)),
@@ -1365,7 +1421,7 @@ fn main() -> Result<()> {
             )
         }
         Some(Cmd::Diff { a, b, json }) => diff_tsvs(&a, &b, json),
-        Some(Cmd::Serve { open }) => with_session(&open, Serve),
+        Some(Cmd::Mcp { open }) => run_mcp(&open),
         Some(Cmd::Describe { open }) => with_session(&open, Describe),
         Some(Cmd::Report {
             open,
@@ -1490,6 +1546,18 @@ mod tests {
                 Some(Cmd::ExportPhy { copy_raw: true, .. })
             ));
         }
+
+        for name in ["mcp", "serve"] {
+            let cli = Cli::try_parse_from(["sorrel", name, "/x"]).unwrap();
+            assert!(matches!(cli.cmd, Some(Cmd::Mcp { .. })), "{name}");
+        }
+        let cli = Cli::try_parse_from(["sorrel", "--headless", "/x"]).unwrap();
+        assert!(cli.headless && cli.cmd.is_none());
+        assert_eq!(
+            host_dir(&cli.open),
+            PathBuf::from("/"),
+            "a missing path is a file"
+        );
 
         let cli = Cli::try_parse_from(["sorrel", "/x", "--events", "e.csv"]).unwrap();
         assert_eq!(cli.open.events, Some(PathBuf::from("e.csv")));

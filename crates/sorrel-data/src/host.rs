@@ -2,9 +2,11 @@
 //! server and the remote host all hold an `Arc<SessionHost>` and edit
 //! through [`SessionHost::apply`] / [`SessionHost::checkout`], so every edit
 //! is journaled with its [`Actor`], tagged the same way, and announced to
-//! every subscriber as a [`HostEvent`].
+//! every subscriber as a [`HostEvent`]. The host also holds the agents'
+//! [`AgentPolicy`] and the queue of proposals waiting for a human.
 
 use crate::command::{describe_command, Actor, CurationCommand};
+use crate::proposals::Proposal;
 use crate::session::{ApplyPhyLabel, Session};
 use anyhow::Result;
 use sorrel_io::{ClusterId, DataProvider};
@@ -29,10 +31,21 @@ pub struct HostEvent {
 
 type Waker = Box<dyn Fn() + Send + Sync>;
 
+/// What an agent's edit tools do: apply directly (each edit visible and
+/// undoable), or only queue a proposal for a human to accept.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AgentPolicy {
+    #[default]
+    Direct,
+    ProposeOnly,
+}
+
 /// Owner of a session behind a lock, plus the event subscribers.
 pub struct SessionHost<P: DataProvider> {
     session: Arc<RwLock<Session<P>>>,
     subscribers: Mutex<Vec<(Sender<HostEvent>, Waker)>>,
+    policy: Mutex<AgentPolicy>,
+    proposals: Mutex<Vec<Proposal>>,
 }
 
 impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
@@ -40,6 +53,8 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
         Self {
             session: Arc::new(RwLock::new(session)),
             subscribers: Mutex::default(),
+            policy: Mutex::default(),
+            proposals: Mutex::default(),
         }
     }
 
@@ -119,16 +134,39 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
     /// unsubscribes at the next event.
     pub fn subscribe(&self, waker: impl Fn() + Send + Sync + 'static) -> Receiver<HostEvent> {
         let (tx, rx) = channel();
-        self.subscribers
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push((tx, Box::new(waker)));
+        lock(&self.subscribers).push((tx, Box::new(waker)));
         rx
     }
 
+    pub fn policy(&self) -> AgentPolicy {
+        *lock(&self.policy)
+    }
+
+    pub fn set_policy(&self, policy: AgentPolicy) {
+        *lock(&self.policy) = policy;
+    }
+
+    /// Queue `p` for a human and wake the subscribers (no event: nothing
+    /// changed yet). The caller writes the audit log.
+    pub fn propose(&self, p: Proposal) {
+        lock(&self.proposals).push(p);
+        lock(&self.subscribers).iter().for_each(|(_, wake)| wake());
+    }
+
+    /// The proposals waiting for a decision, oldest first.
+    pub fn proposals(&self) -> Vec<Proposal> {
+        lock(&self.proposals).clone()
+    }
+
+    /// Remove proposal `id` from the queue (to accept or reject it).
+    pub fn take_proposal(&self, id: u64) -> Option<Proposal> {
+        let mut q = lock(&self.proposals);
+        let i = q.iter().position(|p| p.id == id)?;
+        Some(q.remove(i))
+    }
+
     fn publish(&self, ev: &HostEvent) {
-        let mut subs = self.subscribers.lock().unwrap_or_else(|p| p.into_inner());
-        subs.retain(|(tx, wake)| {
+        lock(&self.subscribers).retain(|(tx, wake)| {
             let alive = tx.send(ev.clone()).is_ok();
             if alive {
                 wake();
@@ -136,6 +174,12 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
             alive
         });
     }
+}
+
+/// Mutex lock that survives poisoning (a panicking frontend thread must not
+/// take the host down).
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// Description and clusters of a head move over `cmd` (`None` at the end of

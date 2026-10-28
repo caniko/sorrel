@@ -33,7 +33,7 @@ pub use diff::{diff_labels, LabelDiff};
 pub use feature_subspace::{
     collect_pc_subspace, PcSubspace, DEFAULT_CHANNEL_IDX, DEFAULT_D, DEFAULT_MAX_BACKGROUND,
 };
-pub use host::{HostEvent, SessionHost};
+pub use host::{AgentPolicy, HostEvent, SessionHost};
 pub use journal::{artifacts_hash, baseline_hash, Journal, Record};
 pub use open::{
     journal_path, open_identity_sealed, open_journal, open_phy, open_sorting_analyzer,
@@ -52,9 +52,8 @@ pub use report::{render_cluster_svgs, render_report, write_report, ClusterSvgs, 
 pub use rules::{apply_rules, Rule, RuleSet};
 pub use save::{save_and_seal, save_session, save_to_phy};
 pub use serve::{
-    attach, attached_tool_list, handle_line, handle_line_attached, serve, spawn_listener,
-    tool_list, AgentMsg, Attached, Env, ListenerHandle, Mode, SharedSelection, PROTOCOL_VERSION,
-    RUBRIC,
+    actor_name, attach, handle_line, serve, spawn_listener, tool_list, Env, ListenerHandle,
+    SharedSelection, Ui, PROTOCOL_VERSION, RUBRIC,
 };
 pub use session::Session;
 pub use spike_depth::{pc_weighted_depth, spike_depths, DepthSource, SpikeDepths};

@@ -15,11 +15,11 @@ use eframe::egui;
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::SpikeDepths;
 use sorrel_data::{
-    describe_command, export_qc, save_session, Actor, CurationCommand, PhyLabelOp, Session,
-    SessionHost,
+    actor_name, describe_command, export_qc, save_session, Actor, AgentPolicy, CurationCommand,
+    HostEvent, PhyLabelOp, Session, SessionHost,
 };
 use sorrel_gpu::GpuContext;
-use sorrel_io::{ClusterId, DataProvider, Events};
+use sorrel_io::{ClusterId, DataProvider, Events, HasGeometry};
 use sorrel_render::{GpuTracePreproc, TracePreproc};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -59,6 +59,15 @@ pub type DepthFn<P> = fn(&Session<P>) -> Option<SpikeDepths>;
 /// Whole-dataset phy exporter the binary plugs in (see
 /// [`SorrelApp::set_phy_export`]); returns the directory it wrote.
 pub type PhyExportFn<P> = Arc<dyn Fn(&Session<P>) -> anyhow::Result<PathBuf> + Send + Sync>;
+
+/// What the window keeps while it serves MCP clients: the listener, the
+/// `select` requests, the selection it publishes, and the host's events.
+struct McpLink {
+    _listener: sorrel_data::ListenerHandle,
+    select: Receiver<Vec<ClusterId>>,
+    selection: sorrel_data::SharedSelection,
+    events: Receiver<HostEvent>,
+}
 
 /// Generic eframe app. The whole window is monomorphised against `P`.
 ///
@@ -170,6 +179,8 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     snippet: Option<String>,
     /// Ctrl+Q: close on the next frame through the unsaved-changes guard.
     quit_requested: bool,
+    /// MCP clients' link to this window (see [`Self::serve_mcp`]).
+    mcp: Option<McpLink>,
     /// Last window title sent to the OS; only re-sent when it changes.
     last_title: String,
     /// AA-contrast visuals go in on the first frame (no ctx before then).
@@ -298,6 +309,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             show_help: false,
             snippet: None,
             quit_requested: false,
+            mcp: None,
             last_title: String::new(),
             visuals_installed: false,
         }
@@ -374,6 +386,69 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     /// through it.
     pub fn host(&self) -> &Arc<SessionHost<P>> {
         &self.host
+    }
+
+    /// Serve this window's session to MCP clients (`sorrel mcp <dir>`
+    /// attaches): a loopback listener next to the save directory, whose
+    /// `select` moves this selection. `wake` repaints the window after
+    /// every host event, proposal or `select` (e.g. `ctx.request_repaint`).
+    /// Needs `set_save_dir` first.
+    pub fn serve_mcp(
+        &mut self,
+        wake: impl Fn() + Send + Sync + Clone + 'static,
+    ) -> anyhow::Result<()>
+    where
+        P: HasGeometry + 'static,
+        Session<P>: Send + Sync,
+    {
+        let dir = self
+            .save_dir
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("MCP needs a save directory"))?;
+        let (tx, select) = std::sync::mpsc::channel();
+        let selection = sorrel_data::SharedSelection::default();
+        let ui = sorrel_data::Ui {
+            selection: Arc::clone(&selection),
+            select: tx,
+            wake: Arc::new(wake.clone()),
+        };
+        let events = self.host.subscribe(wake);
+        let listener = sorrel_data::spawn_listener(
+            Arc::clone(&self.host),
+            &dir,
+            self.reseal_on_save,
+            self.label_str,
+            Some(Arc::new(ui)),
+        )?;
+        self.mcp = Some(McpLink {
+            _listener: listener,
+            select,
+            selection,
+            events,
+        });
+        Ok(())
+    }
+
+    /// Apply what MCP clients asked for since the last frame and publish
+    /// the selection they read: `select` replaces the selection, and an edit
+    /// by someone else is named in the status toast.
+    fn poll_mcp(&mut self) {
+        let Some(link) = &self.mcp else { return };
+        let picks: Vec<Vec<ClusterId>> = link.select.try_iter().collect();
+        let events: Vec<HostEvent> = link.events.try_iter().collect();
+        for ids in picks {
+            if let Some((&first, rest)) = ids.split_first() {
+                self.selection.replace(first);
+                rest.iter().for_each(|&c| self.selection.toggle(c));
+            }
+        }
+        if let Some(ev) = events.iter().rev().find(|e| e.actor != Actor::Human) {
+            self.status = toast(format!("{}: {}", actor_name(&ev.actor), ev.desc));
+        }
+        if let Some(link) = &self.mcp {
+            *link.selection.lock().unwrap_or_else(|p| p.into_inner()) =
+                self.selection.as_slice().to_vec();
+        }
     }
 
     /// Hand the app the wgpu device/queue from `eframe`'s render state so
@@ -1395,6 +1470,31 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             {
                 self.dispatch_intent(Intent::Redo);
             }
+            if self.mcp.is_some() {
+                ui.separator();
+                let policy = self.host.policy();
+                ui.label("Agent:");
+                for (p, name, tip) in [
+                    (
+                        AgentPolicy::Direct,
+                        "Direct",
+                        "MCP agents edit directly; every edit is undoable",
+                    ),
+                    (
+                        AgentPolicy::ProposeOnly,
+                        "Propose",
+                        "MCP agents only propose; you accept or reject each one",
+                    ),
+                ] {
+                    if ui
+                        .selectable_label(policy == p, name)
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        self.host.set_policy(p);
+                    }
+                }
+            }
             let n_sel = self.selection.len();
             let target = self
                 .selection
@@ -1733,6 +1833,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
         if self.show_loading(&ctx, root_ui) {
             return;
         }
+        self.poll_mcp();
 
         // Input. Suppress single-letter intents while a text widget has focus
         // so typing in a filter box doesn't relabel selected clusters; global
@@ -2155,6 +2256,56 @@ mod tests {
         };
         let journal = Journal::open_or_create(&dir.join("j.sqlite"), 0xCAFE, 3).unwrap();
         Session::new(provider, journal)
+    }
+
+    impl HasGeometry for StubProvider {
+        fn channel_positions(&self) -> &[[f32; 2]] {
+            &[]
+        }
+    }
+
+    /// With MCP served, an agent's edit (through the host, as a listener
+    /// client would) shows up in the toast, a `select` moves the selection,
+    /// and the selection is published back for `selection`.
+    #[test]
+    fn mcp_edits_and_selects_reach_the_window() {
+        let (mut app, dir) = make_app();
+        app.set_save_dir(dir.path().to_path_buf(), false);
+        app.serve_mcp(|| {}).unwrap();
+        assert!(dir.path().join(".sorrel/mcp.json").exists());
+        let agent = Actor::Agent {
+            client: "codex".into(),
+        };
+        app.host
+            .apply(
+                agent,
+                CurationCommand::Relabel {
+                    cluster: ClusterId(2),
+                    op: PhyLabelOp::SetNoise,
+                },
+            )
+            .unwrap();
+        let (port, token) = sorrel_data::serve::read_mcp_json(dir.path()).unwrap();
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        use std::io::{BufRead, Write};
+        writeln!(c, "{{\"token\":\"{token}\"}}").unwrap();
+        writeln!(
+            c,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"select","arguments":{{"clusters":[1]}}}}}}"#
+        )
+        .unwrap();
+        let mut r = std::io::BufReader::new(c);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap(); // ack
+        r.read_line(&mut line).unwrap(); // select reply
+        app.poll_mcp();
+        assert_eq!(
+            app.status.as_ref().map(|s| s.0.as_str()),
+            Some("codex: relabel cluster 2 as Noise")
+        );
+        assert_eq!(app.selection.as_slice(), &[ClusterId(1)]);
+        let published = app.mcp.as_ref().unwrap().selection.lock().unwrap().clone();
+        assert_eq!(published, [ClusterId(1)]);
     }
 
     fn make_app() -> (SorrelApp<StubProvider>, tempfile::TempDir) {

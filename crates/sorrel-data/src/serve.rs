@@ -4,22 +4,27 @@
 //!
 //! One JSON object per line in, one per line out, hand-rolled on
 //! `serde_json`: a handful of synchronous tools do not justify an async
-//! runtime. Two transports share [`handle_line`]:
+//! runtime. One handler, [`handle_line`], serves every client of a
+//! [`SessionHost`], over two transports:
 //!
-//! - **stdio, headless** ([`serve`], `Mode::Headless`): the agent edits the
-//!   session through its [`SessionHost`], as `Actor::Agent` (tagged
-//!   `src:agent`, journaled and undoable).
-//! - **GUI listener** ([`spawn_listener`], `Mode::Attached`): the running GUI
-//!   exposes its session on a loopback socket. The agent can read, move the
-//!   human's selection and `propose`, but never edits: proposals queue for a
-//!   human to accept. `sorrel mcp attach` ([`attach`]) bridges stdio to it.
+//! - **stdio** ([`serve`]): `sorrel mcp <dir>` when no host is running.
+//! - **loopback TCP** ([`spawn_listener`]): a running host (`sorrel <dir>`,
+//!   `sorrel --headless <dir>`) listens on `127.0.0.1`, behind a token in
+//!   `<dir>/.sorrel/mcp.json`; `sorrel mcp <dir>` bridges stdio to it
+//!   ([`attach`]).
+//!
+//! Edit tools apply as `Actor::Agent` (tagged `src:agent`, journaled and
+//! undoable) under [`AgentPolicy::Direct`], and only queue a proposal under
+//! [`AgentPolicy::ProposeOnly`]. `propose` always queues. `select` and
+//! `selection` need a GUI ([`Ui`]). Every host event caused by someone else
+//! reaches the client as a `notifications/message` after its next reply.
 //!
 //! Plots come back as SVG resources (see `report`); PNG needs a GPU
 //! surface and is deliberately out of scope.
 
 use crate::command::{Actor, CurationCommand, Method};
-use crate::host::SessionHost;
-use crate::proposals::{self, Action, Outcome, Proposal, Source};
+use crate::host::{AgentPolicy, HostEvent, SessionHost};
+use crate::proposals::{self, Action, Proposal, Source};
 use crate::qc_export::{collect_qc_rows, QcRow};
 use crate::report::render_cluster_svgs;
 use crate::save::save_session;
@@ -32,8 +37,8 @@ use serde_json::{json, Value};
 use sorrel_io::{ClusterId, DataProvider, HasGeometry};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 /// MCP protocol revision this server answers `initialize` with.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -86,44 +91,30 @@ Judge with this rubric:
 
 ";
 
-/// What the listener forwards to the GUI thread.
-#[derive(Debug)]
-pub enum AgentMsg {
-    /// Stage a proposal in the review pane (already logged as pending).
-    Propose(Proposal),
-    /// Replace the GUI selection with these clusters.
-    Select(Vec<ClusterId>),
-}
-
 /// The GUI's current selection, for the `selection` tool. The GUI must write
 /// it whenever it changes (cheapest: once per frame).
 pub type SharedSelection = Arc<Mutex<Vec<ClusterId>>>;
 
-/// Everything attached mode needs besides the session.
-pub struct Attached {
-    pub save_dir: PathBuf,
-    pub msgs: Sender<AgentMsg>,
+/// What a GUI shares with MCP clients besides the host: its selection, and
+/// a channel for `select` requests (wake the GUI with a host subscriber).
+pub struct Ui {
     pub selection: SharedSelection,
-    /// Wake the GUI (a repaint) after queueing a message.
-    pub on_change: Arc<dyn Fn() + Send + Sync>,
+    pub select: Sender<Vec<ClusterId>>,
+    /// Wake the GUI after a `select` (e.g. `ctx.request_repaint()`).
+    pub wake: Arc<dyn Fn() + Send + Sync>,
 }
 
-pub enum Mode {
-    /// Direct journaled edits (`sorrel serve`).
-    Headless,
-    /// Read-only plus proposals (the GUI listener).
-    Attached(Attached),
-}
-
-/// Per-connection state: where to save, how to name labels, and caches keyed
-/// on `Session::version()`.
+/// Per-connection state: where to save, how to name labels, the GUI link,
+/// host events to forward, and caches keyed on `Session::version()`.
 pub struct Env<'a, F> {
     pub save_dir: &'a Path,
     pub reseal_on_save: bool,
     pub label_str: F,
+    ui: Option<Arc<Ui>>,
+    events: Option<Receiver<HostEvent>>,
     qc: Option<(u64, Vec<QcRow>)>,
     suggest: Option<(u64, Vec<MergeCandidate>, Vec<SplitCandidate>)>,
-    /// MCP `clientInfo.name` from `initialize`; headless splits are named after it.
+    /// MCP `clientInfo.name` from `initialize`; agent edits are named after it.
     client: Option<String>,
 }
 
@@ -133,9 +124,47 @@ impl<'a, F> Env<'a, F> {
             save_dir,
             reseal_on_save,
             label_str,
+            ui: None,
+            events: None,
             qc: None,
             suggest: None,
             client: None,
+        }
+    }
+
+    /// Give `select` / `selection` a GUI to act on.
+    pub fn with_ui(mut self, ui: Option<Arc<Ui>>) -> Self {
+        self.ui = ui;
+        self
+    }
+
+    /// Forward `host`'s events to this client (see [`Self::notifications`]).
+    pub fn subscribe<P: DataProvider + ApplyPhyLabel>(mut self, host: &SessionHost<P>) -> Self {
+        self.events = Some(host.subscribe(|| {}));
+        self
+    }
+
+    /// `notifications/message` for every event since the last call that
+    /// another actor caused (this client's own edits are in its replies).
+    pub fn notifications(&self) -> Vec<Value> {
+        let me = self.agent();
+        self.events
+            .iter()
+            .flat_map(Receiver::try_iter)
+            .filter(|ev| ev.actor != me)
+            .map(|ev| {
+                json!({"jsonrpc": "2.0", "method": "notifications/message", "params": {
+                    "level": "info", "logger": "sorrel",
+                    "data": {"actor": actor_name(&ev.actor), "change": ev.desc, "node": ev.node,
+                             "clusters": ev.clusters.iter().map(|c| c.0).collect::<Vec<_>>(),
+                             "version": ev.version}}})
+            })
+            .collect()
+    }
+
+    fn agent(&self) -> Actor {
+        Actor::Agent {
+            client: self.client.clone().unwrap_or_else(|| "agent".into()),
         }
     }
 
@@ -151,6 +180,17 @@ impl<'a, F> Env<'a, F> {
                 self.client = Some(name.to_string());
             }
         }
+    }
+}
+
+/// Short name of an actor for event text: `you`, the agent's client, the
+/// algorithm or the remote peer.
+pub fn actor_name(a: &Actor) -> &str {
+    match a {
+        Actor::Human => "you",
+        Actor::Agent { client } => client,
+        Actor::Algo { name } => name,
+        Actor::Remote { peer } => peer,
     }
 }
 
@@ -179,33 +219,20 @@ fn read_tools() -> Vec<Value> {
     ]
 }
 
-/// Tool catalogue of the headless server (`tools/list`).
+/// Tool catalogue (`tools/list`).
 pub fn tool_list() -> Value {
     let mut tools = read_tools();
     tools.extend([
-        json!({"name": "relabel", "description": "Set a cluster's label (good | mua | noise | unsorted); journaled and undoable",
+        json!({"name": "relabel", "description": "Set a cluster's label (good | mua | noise | unsorted); journaled and undoable. Queued as a proposal instead when the human chose propose-only",
          "inputSchema": {"type": "object", "properties": {"cluster": {"type": "integer"}, "label": {"type": "string"}}, "required": ["cluster", "label"]}}),
-        json!({"name": "merge", "description": "Merge source clusters into target; journaled and undoable",
+        json!({"name": "merge", "description": "Merge source clusters into target; journaled and undoable. Queued as a proposal instead when the human chose propose-only",
          "inputSchema": {"type": "object", "properties": {"sources": {"type": "array", "items": {"type": "integer"}}, "target": {"type": "integer"}}, "required": ["sources", "target"]}}),
-        json!({"name": "split", "description": "Move the given spike indices (positions in the cluster's time-sorted spikes) into a new cluster",
+        json!({"name": "split", "description": "Move the given spike indices (positions in the cluster's time-sorted spikes) into a new cluster. Queued as a proposal instead when the human chose propose-only",
          "inputSchema": {"type": "object", "properties": {"cluster": {"type": "integer"}, "spike_idx": {"type": "array", "items": {"type": "integer"}}}, "required": ["cluster", "spike_idx"]}}),
         json!({"name": "tag", "description": "Replace a cluster's tag set (provenance/review markers, e.g. drop review:* once decided); journaled and undoable",
          "inputSchema": {"type": "object", "properties": {"cluster": {"type": "integer"}, "tags": {"type": "array", "items": {"type": "string"}}}, "required": ["cluster", "tags"]}}),
-        json!({"name": "undo", "description": "Undo the last curation command", "inputSchema": {"type": "object", "properties": {}}}),
+        json!({"name": "undo", "description": "Undo the last curation command (it stays in the history as a branch)", "inputSchema": {"type": "object", "properties": {}}}),
         json!({"name": "save", "description": "Write spike_clusters.npy, cluster_group.tsv and curation.json", "inputSchema": {"type": "object", "properties": {}}}),
-    ]);
-    #[cfg(feature = "phy-export")]
-    tools.push(json!(
-        {"name": "export_phy", "description": "Write the curated session as a complete phy directory at out (params.py references the raw file unless copy_raw)",
-         "inputSchema": {"type": "object", "properties": {"out": {"type": "string"}, "copy_raw": {"type": "boolean"}}, "required": ["out"]}}
-    ));
-    Value::Array(tools)
-}
-
-/// Tool catalogue of the GUI listener: reads, `select`, `selection`, `propose`.
-pub fn attached_tool_list() -> Value {
-    let mut tools = read_tools();
-    tools.extend([
         json!({"name": "propose", "description": "Stage a curation proposal for the human to accept or reject; nothing is applied. action: relabel (clusters=[c], label) | merge (clusters, first is the target) | split (clusters=[c], spike_idx) | accept (clusters=[c]). confidence in [0,1]; at most 3 reasons.",
          "inputSchema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["relabel", "merge", "split", "accept"]},
@@ -215,11 +242,16 @@ pub fn attached_tool_list() -> Value {
             "confidence": {"type": "number"},
             "reasons": {"type": "array", "items": {"type": "string"}, "maxItems": 3}},
           "required": ["action", "clusters", "confidence", "reasons"]}}),
-        json!({"name": "select", "description": "Move the human's GUI selection to these clusters so they see what you are discussing",
+        json!({"name": "select", "description": "Move the human's GUI selection to these clusters so they see what you are discussing (needs the GUI)",
          "inputSchema": {"type": "object", "properties": {"clusters": {"type": "array", "items": {"type": "integer"}}}, "required": ["clusters"]}}),
-        json!({"name": "selection", "description": "The clusters the human has selected in the GUI right now",
+        json!({"name": "selection", "description": "The clusters the human has selected in the GUI right now (needs the GUI)",
          "inputSchema": {"type": "object", "properties": {}}}),
     ]);
+    #[cfg(feature = "phy-export")]
+    tools.push(json!(
+        {"name": "export_phy", "description": "Write the curated session as a complete phy directory at out (params.py references the raw file unless copy_raw)",
+         "inputSchema": {"type": "object", "properties": {"out": {"type": "string"}, "copy_raw": {"type": "boolean"}}, "required": ["out"]}}
+    ));
     Value::Array(tools)
 }
 
@@ -236,71 +268,58 @@ fn prompt_get(name: &str) -> Option<Value> {
     })
 }
 
-/// Serve headless until `input` closes. `reseal_on_save` follows the same
-/// rule as the GUI: true only for phy directories.
+/// Serve `host` over stdio until `input` closes. `reseal_on_save` follows
+/// the same rule as the GUI: true only for phy directories.
 pub fn serve<P, F>(
     host: &SessionHost<P>,
     save_dir: &Path,
     reseal_on_save: bool,
     label_str: F,
     input: impl BufRead,
-    mut output: impl Write,
+    output: impl Write,
 ) -> Result<()>
 where
     P: DataProvider + ApplyPhyLabel + HasGeometry,
     F: Fn(&P::Label) -> &'static str + Sync,
 {
-    let mut env = Env::new(save_dir, reseal_on_save, label_str);
+    let env = Env::new(save_dir, reseal_on_save, label_str).subscribe(host);
+    serve_lines(host, env, input, output).map_err(Into::into)
+}
+
+/// Answer each line of `input` on `output`, followed by the notifications
+/// that piled up meanwhile.
+fn serve_lines<P, F>(
+    host: &SessionHost<P>,
+    mut env: Env<F>,
+    input: impl BufRead,
+    mut output: impl Write,
+) -> std::io::Result<()>
+where
+    P: DataProvider + ApplyPhyLabel + HasGeometry,
+    F: Fn(&P::Label) -> &'static str + Sync,
+{
     for line in input.lines() {
-        if let Some(reply) = handle_line(host, &mut env, &Mode::Headless, &line?) {
-            write_json(&mut output, &reply)?;
+        let reply = handle_line(host, &mut env, &line?);
+        for v in reply.into_iter().chain(env.notifications()) {
+            write_json(&mut output, &v).map_err(std::io::Error::other)?;
         }
     }
     Ok(())
 }
 
 /// One request line to its reply; `None` for blank lines and notifications.
-/// `Headless` edits through `host`; `Attached` only reads (and queues
-/// proposals), see [`handle_line_attached`] for the read-locked entry point.
-pub fn handle_line<P, F>(
-    host: &SessionHost<P>,
-    env: &mut Env<F>,
-    mode: &Mode,
-    line: &str,
-) -> Option<Value>
+pub fn handle_line<P, F>(host: &SessionHost<P>, env: &mut Env<F>, line: &str) -> Option<Value>
 where
     P: DataProvider + ApplyPhyLabel + HasGeometry,
     F: Fn(&P::Label) -> &'static str + Sync,
 {
-    match mode {
-        Mode::Headless => {
-            env.capture_client(line);
-            respond(line, false, |name, args| call_tool(host, env, name, args))
-        }
-        Mode::Attached(a) => handle_line_attached(&host.read(), env, a, line),
-    }
+    env.capture_client(line);
+    respond(line, |name, args| call_tool(host, env, name, args))
 }
 
-/// [`handle_line`] for `Mode::Attached`, which never needs a write lock.
-pub fn handle_line_attached<P, F>(
-    session: &Session<P>,
-    env: &mut Env<F>,
-    attached: &Attached,
-    line: &str,
-) -> Option<Value>
-where
-    P: DataProvider,
-    F: Fn(&P::Label) -> &'static str + Sync,
-{
-    respond(line, true, |name, args| {
-        call_attached(session, env, attached, name, args)
-    })
-}
-
-/// The JSON-RPC envelope shared by both modes.
+/// The JSON-RPC envelope.
 fn respond(
     line: &str,
-    attached: bool,
     call: impl FnOnce(&str, &Value) -> Result<Value, ToolError>,
 ) -> Option<Value> {
     if line.trim().is_empty() {
@@ -323,9 +342,7 @@ fn respond(
             "serverInfo": {"name": "sorrel", "version": env!("CARGO_PKG_VERSION")},
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => {
-            Ok(json!({"tools": if attached { attached_tool_list() } else { tool_list() }}))
-        }
+        "tools/list" => Ok(json!({"tools": tool_list()})),
         "prompts/list" => Ok(prompts_list()),
         "prompts/get" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
@@ -405,11 +422,21 @@ where
     P: DataProvider + ApplyPhyLabel + HasGeometry,
     F: Fn(&P::Label) -> &'static str + Sync,
 {
-    let client = env.client.clone().unwrap_or_else(|| "agent".into());
-    let agent = Actor::Agent {
-        client: client.clone(),
-    };
-    let ok = |ev: crate::host::HostEvent| text(json!({"ok": true, "version": ev.version}));
+    let agent = env.agent();
+    let ok = |ev: HostEvent| text(json!({"ok": true, "version": ev.version}));
+    if host.policy() == AgentPolicy::ProposeOnly {
+        match name {
+            "relabel" | "merge" | "split" => {
+                let args = edit_as_proposal(name, args);
+                let p = parse_proposal(&host.read(), &args)?;
+                return queue(host, env, p);
+            }
+            "tag" | "undo" | "save" | "export_phy" => {
+                return fail("the human set agents to propose-only: use propose")
+            }
+            _ => {}
+        }
+    }
     Ok(match name {
         "tag" => {
             let cluster = check(&host.read(), arg_u32(args, "cluster")?)?;
@@ -452,12 +479,12 @@ where
             let cluster = check(&host.read(), arg_u32(args, "cluster")?)?;
             let spike_idx = arg_u32_list(args, "spike_idx")?;
             let ev = host.apply(
-                agent,
+                agent.clone(),
                 CurationCommand::Split {
                     cluster,
                     spike_idx,
                     new_cluster: ClusterId(u32::MAX),
-                    by: Method::Llm(client),
+                    by: Method::Llm(actor_name(&agent).to_owned()),
                 },
             )?;
             let new_cluster = ev.clusters.last().map(|c| c.0);
@@ -486,54 +513,72 @@ where
             crate::phy_export::export_phy(&host.read(), Path::new(out), copy_raw, &env.label_str)?;
             text(json!({"ok": true, "out": out}))
         }
+        "propose" => {
+            let p = parse_proposal(&host.read(), args)?;
+            return queue(host, env, p);
+        }
+        "select" => {
+            let ui = env.ui.as_ref().ok_or(no_gui())?;
+            let clusters: Vec<ClusterId> = {
+                let s = host.read();
+                arg_u32_list(args, "clusters")?
+                    .into_iter()
+                    .map(|c| check(&s, c))
+                    .collect::<Result<_, _>>()?
+            };
+            if ui.select.send(clusters).is_err() {
+                return fail("the GUI is no longer listening");
+            }
+            (ui.wake)();
+            text(json!({"ok": true}))
+        }
+        "selection" => {
+            let ui = env.ui.as_ref().ok_or(no_gui())?;
+            let sel = ui.selection.lock().unwrap_or_else(|p| p.into_inner());
+            text(json!({"clusters": sel.iter().map(|c| c.0).collect::<Vec<_>>()}))
+        }
         _ => return call_read(&host.read(), env, name, args),
     })
 }
 
-fn call_attached<P, F>(
-    session: &Session<P>,
-    env: &mut Env<F>,
-    a: &Attached,
-    name: &str,
-    args: &Value,
-) -> Result<Value, ToolError>
+fn no_gui() -> ToolError {
+    ToolError::Failed("no GUI is attached to this session".into())
+}
+
+/// Audit `p` as pending and queue it on the host for a human.
+fn queue<P, F>(host: &SessionHost<P>, env: &Env<F>, p: Proposal) -> Result<Value, ToolError>
 where
-    P: DataProvider,
-    F: Fn(&P::Label) -> &'static str + Sync,
+    P: DataProvider + ApplyPhyLabel,
 {
-    Ok(match name {
-        "propose" => {
-            let p = parse_proposal(session, args)?;
-            let (id, queued) = (p.id, p.clone());
-            proposals::append(&a.save_dir, &p)
-                .map_err(|e| ToolError::Failed(format!("audit log: {e}")))?;
-            if a.msgs.send(AgentMsg::Propose(queued)).is_err() {
-                let _ = proposals::record_outcome(&a.save_dir, id, Outcome::Superseded);
-                return fail("the GUI is no longer listening");
+    proposals::append(env.save_dir, &p)
+        .map_err(|e| ToolError::Failed(format!("audit log: {e}")))?;
+    let id = p.id;
+    host.propose(p);
+    Ok(text(
+        json!({"ok": true, "id": id, "status": "queued for human review; NOT applied"}),
+    ))
+}
+
+/// The `propose` arguments an edit tool's arguments stand for (propose-only
+/// policy); confidence defaults to 1 and the reason names the tool.
+fn edit_as_proposal(name: &str, args: &Value) -> Value {
+    let mut out = json!({"action": name, "reasons": [format!("{name} under propose-only")],
+                         "confidence": args.get("confidence").cloned().unwrap_or(json!(1.0))});
+    match name {
+        "merge" => {
+            let mut clusters = vec![args.get("target").cloned().unwrap_or(Value::Null)];
+            if let Some(src) = args.get("sources").and_then(Value::as_array) {
+                clusters.extend(src.iter().cloned());
             }
-            (a.on_change)();
-            text(json!({"ok": true, "id": id, "status": "queued for human review; NOT applied"}))
+            out["clusters"] = json!(clusters);
         }
-        "select" => {
-            let clusters: Vec<ClusterId> = arg_u32_list(args, "clusters")?
-                .into_iter()
-                .map(|c| check(session, c))
-                .collect::<Result<_, _>>()?;
-            if a.msgs.send(AgentMsg::Select(clusters)).is_err() {
-                return fail("the GUI is no longer listening");
-            }
-            (a.on_change)();
-            text(json!({"ok": true}))
+        _ => {
+            out["clusters"] = json!([args.get("cluster").cloned().unwrap_or(Value::Null)]);
+            out["label"] = args.get("label").cloned().unwrap_or(Value::Null);
+            out["spike_idx"] = args.get("spike_idx").cloned().unwrap_or(Value::Null);
         }
-        "selection" => {
-            let sel = a.selection.lock().unwrap_or_else(|p| p.into_inner());
-            text(json!({"clusters": sel.iter().map(|c| c.0).collect::<Vec<_>>()}))
-        }
-        "relabel" | "merge" | "split" | "tag" | "undo" | "save" | "export_phy" => {
-            return fail("edits are disabled while the GUI is attached: use `propose`")
-        }
-        _ => return call_read(session, env, name, args),
-    })
+    }
+    out
 }
 
 /// Validate `propose` arguments against the session; nothing is changed.
@@ -910,25 +955,22 @@ impl Drop for ListenerHandle {
     }
 }
 
-/// Expose `session` to MCP clients on `127.0.0.1:<ephemeral>` (Attached
-/// mode). Proposals and selection requests go to `msgs`; the GUI should
-/// drain it each frame and keep `selection` current. `on_change` wakes the
-/// GUI after a message is queued (e.g. `ctx.request_repaint()`).
+/// Expose `host` to MCP clients on `127.0.0.1:<ephemeral>`: the same
+/// handler as stdio, with `ui` (when a GUI runs) behind `select` and
+/// `selection`. Each connection subscribes to the host's events.
 ///
-/// Each request holds the session read lock for the length of the tool call
-/// (attached mode never writes). ponytail: one thread per connection with no
-/// cap; every connection must present the token first, so only local
-/// processes that can read the 0600 `mcp.json` get a thread's worth of work.
+/// ponytail: one thread per connection with no cap; every connection must
+/// present the token first, so only local processes that can read the 0600
+/// `mcp.json` get a thread's worth of work.
 pub fn spawn_listener<P>(
-    session: Arc<RwLock<Session<P>>>,
+    host: Arc<SessionHost<P>>,
     save_dir: &Path,
+    reseal_on_save: bool,
     label_str: fn(&P::Label) -> &'static str,
-    msgs: Sender<AgentMsg>,
-    selection: SharedSelection,
-    on_change: impl Fn() + Send + Sync + 'static,
+    ui: Option<Arc<Ui>>,
 ) -> std::io::Result<ListenerHandle>
 where
-    P: DataProvider + 'static,
+    P: DataProvider + ApplyPhyLabel + HasGeometry + 'static,
     Session<P>: Send + Sync,
 {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
@@ -936,18 +978,13 @@ where
     let token = random_token();
     let mcp_json = write_mcp_json(save_dir, port, &token)?;
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let attached = Arc::new(Attached {
-        save_dir: save_dir.to_owned(),
-        msgs,
-        selection,
-        on_change: Arc::new(on_change),
-    });
     let handle = ListenerHandle {
         port,
         token: token.clone(),
         mcp_json,
         stop: stop.clone(),
     };
+    let save_dir = save_dir.to_owned();
     std::thread::Builder::new()
         .name("sorrel-mcp".into())
         .spawn(move || {
@@ -956,9 +993,13 @@ where
                     break;
                 }
                 let Ok(stream) = stream else { continue };
-                let (session, attached, token) = (session.clone(), attached.clone(), token.clone());
+                let (host, ui, token, dir) =
+                    (host.clone(), ui.clone(), token.clone(), save_dir.clone());
                 std::thread::spawn(move || {
-                    if let Err(e) = serve_client(stream, &token, &session, &attached, label_str) {
+                    let env = Env::new(&dir, reseal_on_save, label_str)
+                        .with_ui(ui)
+                        .subscribe(&host);
+                    if let Err(e) = serve_client(stream, &token, &host, env) {
                         log::debug!("mcp client ended: {e}");
                     }
                 });
@@ -967,13 +1008,16 @@ where
     Ok(handle)
 }
 
-fn serve_client<P: DataProvider>(
+fn serve_client<P, F>(
     stream: std::net::TcpStream,
     token: &str,
-    session: &RwLock<Session<P>>,
-    attached: &Attached,
-    label_str: fn(&P::Label) -> &'static str,
-) -> std::io::Result<()> {
+    host: &SessionHost<P>,
+    env: Env<F>,
+) -> std::io::Result<()>
+where
+    P: DataProvider + ApplyPhyLabel + HasGeometry,
+    F: Fn(&P::Label) -> &'static str + Sync,
+{
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     let mut reader = std::io::BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -988,21 +1032,10 @@ fn serve_client<P: DataProvider>(
     }
     writer.set_read_timeout(None)?; // shared socket: clears the reader's timeout too
     writer.write_all(b"{\"ok\":true}\n")?;
-    let mut env = Env::new(&attached.save_dir, false, label_str);
-    for line in reader.lines() {
-        let line = line?;
-        let reply = {
-            let s = session.read().unwrap_or_else(|p| p.into_inner());
-            handle_line_attached(&s, &mut env, attached, &line)
-        };
-        if let Some(reply) = reply {
-            write_json(&mut writer, &reply).map_err(std::io::Error::other)?;
-        }
-    }
-    Ok(())
+    serve_lines(host, env, reader, writer)
 }
 
-/// `{port, token}` of a running GUI listener in `save_dir`, if any.
+/// `{port, token}` of a running host's listener in `save_dir`, if any.
 pub fn read_mcp_json(save_dir: &Path) -> Option<(u16, String)> {
     let v: Value =
         serde_json::from_str(&std::fs::read_to_string(save_dir.join(MCP_JSON)).ok()?).ok()?;
@@ -1012,7 +1045,7 @@ pub fn read_mcp_json(save_dir: &Path) -> Option<(u16, String)> {
     ))
 }
 
-/// `sorrel mcp attach`: pipe `input` to the GUI listener of `save_dir` and
+/// `sorrel mcp`: pipe `input` to the host listening in `save_dir` and
 /// its replies to `output`, line by line, until either side closes. Returns
 /// `Ok(false)` without touching either stream when no listener answers (no
 /// `mcp.json`, refused connection, rejected token): the caller then falls
@@ -1143,7 +1176,7 @@ mod tests {
         assert_eq!(replies[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(
             replies[1]["result"]["tools"].as_array().unwrap().len(),
-            15 + usize::from(cfg!(feature = "phy-export"))
+            18 + usize::from(cfg!(feature = "phy-export"))
         );
         assert_eq!(replies[2]["id"], 3);
         assert_eq!(replies[2]["result"]["isError"], false);
@@ -1277,26 +1310,24 @@ mod tests {
         serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
     }
 
-    fn attached(dir: &Path) -> (Attached, std::sync::mpsc::Receiver<AgentMsg>) {
+    fn ui() -> (Arc<Ui>, std::sync::mpsc::Receiver<Vec<ClusterId>>) {
         let (tx, rx) = std::sync::mpsc::channel();
-        let a = Attached {
-            save_dir: dir.to_owned(),
-            msgs: tx,
+        let ui = Ui {
             selection: Arc::new(Mutex::new(vec![ClusterId(1)])),
-            on_change: Arc::new(|| {}),
+            select: tx,
+            wake: Arc::new(|| {}),
         };
-        (a, rx)
+        (Arc::new(ui), rx)
     }
 
     #[test]
-    fn attached_propose_queues_and_changes_nothing() {
+    fn propose_queues_on_the_host_and_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let h = SessionHost::new(mock_session(dir.path()));
-        let (a, rx) = attached(dir.path());
-        let mode = Mode::Attached(a);
-        let mut env = Env::new(dir.path(), false, label);
+        let (ui, rx) = ui();
+        let mut env = Env::new(dir.path(), false, label).with_ui(Some(ui));
         let version = h.read().version();
-        let mut run = |line: String| handle_line(&h, &mut env, &mode, &line).unwrap();
+        let mut run = |line: String| handle_line(&h, &mut env, &line).unwrap();
 
         let ok = run(call(
             1,
@@ -1304,7 +1335,7 @@ mod tests {
             json!({"action": "merge", "clusters": [0, 1], "confidence": 0.9, "reasons": ["CCG dip"]}),
         ));
         assert_eq!(ok["result"]["isError"], false);
-        let Some(AgentMsg::Propose(p)) = rx.try_recv().ok() else {
+        let [p] = &h.proposals()[..] else {
             panic!("proposal not queued")
         };
         assert_eq!(
@@ -1320,7 +1351,7 @@ mod tests {
             "audited as pending"
         );
 
-        // Invalid arguments and edit tools are refused; nothing is queued.
+        // Invalid arguments are refused; nothing more is queued.
         for bad in [
             call(
                 2,
@@ -1337,16 +1368,15 @@ mod tests {
                 "propose",
                 json!({"action": "split", "clusters": [0], "spike_idx": [0, 1, 2], "confidence": 0.5, "reasons": []}),
             ),
-            call(5, "relabel", json!({"cluster": 0, "label": "good"})),
         ] {
             assert_eq!(run(bad)["result"]["isError"], true);
         }
-        assert!(rx.try_recv().is_err());
+        assert_eq!(h.proposals().len(), 1);
 
         let sel = run(call(6, "selection", json!({})));
         assert_eq!(payload(&sel)["clusters"], json!([1]));
         run(call(7, "select", json!({"clusters": [0]})));
-        assert!(matches!(rx.try_recv(), Ok(AgentMsg::Select(c)) if c == [ClusterId(0)]));
+        assert!(matches!(rx.try_recv(), Ok(c) if c == [ClusterId(0)]));
         let tools = run(rpc(8, "tools/list", json!({})));
         let names: Vec<&str> = tools["result"]["tools"]
             .as_array()
@@ -1354,12 +1384,95 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"propose") && !names.contains(&"relabel"));
+        assert!(names.contains(&"propose") && names.contains(&"relabel"));
         let q = run(call(9, "attention_queue", json!({})));
         assert_eq!(q["result"]["isError"], false);
         drop(run);
         assert_eq!(h.read().version(), version, "session untouched");
         assert!(h.read().tags(ClusterId(0)).is_empty());
+
+        // Without a GUI, select and selection say so.
+        let mut env = Env::new(dir.path(), false, label);
+        let r = handle_line(&h, &mut env, &call(10, "selection", json!({}))).unwrap();
+        assert_eq!(r["result"]["isError"], true);
+    }
+
+    /// Under propose-only, edit tools queue proposals (a merge keeps its
+    /// target first) and the tools without a proposal form are refused.
+    #[test]
+    fn propose_only_turns_edits_into_proposals() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SessionHost::new(mock_session(dir.path()));
+        h.set_policy(AgentPolicy::ProposeOnly);
+        let mut env = Env::new(dir.path(), false, label);
+        let version = h.read().version();
+        let mut run = |line: String| handle_line(&h, &mut env, &line).unwrap();
+        for (i, (tool, args)) in [
+            ("relabel", json!({"cluster": 0, "label": "good"})),
+            ("merge", json!({"sources": [1], "target": 0})),
+            ("split", json!({"cluster": 0, "spike_idx": [0]})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let r = run(call(i as u32, tool, args));
+            assert_eq!(r["result"]["isError"], false, "{tool}: {r}");
+            assert!(payload(&r)["status"]
+                .as_str()
+                .unwrap()
+                .contains("NOT applied"));
+        }
+        for tool in ["tag", "undo", "save"] {
+            let r = run(call(9, tool, json!({"cluster": 0, "tags": []})));
+            assert_eq!(r["result"]["isError"], true, "{tool}");
+        }
+        drop(run);
+        let queued: Vec<Action> = h.proposals().into_iter().map(|p| p.action).collect();
+        assert_eq!(
+            queued,
+            [
+                Action::Relabel {
+                    cluster: ClusterId(0),
+                    label: "good".into()
+                },
+                Action::Merge {
+                    clusters: vec![ClusterId(0), ClusterId(1)]
+                },
+                Action::Split {
+                    cluster: ClusterId(0),
+                    spike_idx: vec![0]
+                },
+            ]
+        );
+        assert_eq!(h.read().version(), version, "nothing applied");
+    }
+
+    /// Changes by someone else reach the client as notifications; its own
+    /// edits do not.
+    #[test]
+    fn other_actors_changes_become_notifications() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SessionHost::new(mock_session(dir.path()));
+        let mut env = Env::new(dir.path(), false, label).subscribe(&h);
+        handle_line(
+            &h,
+            &mut env,
+            &call(1, "relabel", json!({"cluster": 0, "label": "good"})),
+        );
+        assert!(env.notifications().is_empty(), "own edit");
+        h.apply(
+            Actor::Human,
+            CurationCommand::Relabel {
+                cluster: ClusterId(1),
+                op: crate::command::PhyLabelOp::SetNoise,
+            },
+        )
+        .unwrap();
+        let n = env.notifications();
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0]["method"], "notifications/message");
+        assert_eq!(n[0]["params"]["data"]["actor"], "you");
+        assert_eq!(n[0]["params"]["data"]["clusters"], json!([1]));
     }
 
     #[test]
@@ -1371,7 +1484,6 @@ mod tests {
         let r = handle_line(
             &h,
             &mut env,
-            &Mode::Headless,
             &call(1, "merge", json!({"sources": [0, 1], "target": 0})),
         )
         .unwrap();
@@ -1385,7 +1497,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let h = SessionHost::new(mock_session(dir.path()));
         let mut env = Env::new(dir.path(), false, label);
-        let mut run = |line: String| handle_line(&h, &mut env, &Mode::Headless, &line).unwrap();
+        let mut run = |line: String| handle_line(&h, &mut env, &line).unwrap();
         assert_eq!(
             run(call(1, "relabel", json!({"cluster": 0, "label": "good"})))["result"]["isError"],
             false
@@ -1432,7 +1544,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let h = SessionHost::new(mock_session(dir.path()));
         let mut env = Env::new(dir.path(), false, label);
-        let mut run = |line: String| handle_line(&h, &mut env, &Mode::Headless, &line).unwrap();
+        let mut run = |line: String| handle_line(&h, &mut env, &line).unwrap();
         // No clientInfo yet: the split is attributed to "agent".
         assert_eq!(
             run(call(1, "split", json!({"cluster": 0, "spike_idx": [0]})))["result"]["isError"],
@@ -1457,15 +1569,13 @@ mod tests {
     #[test]
     fn loopback_listener_round_trip_and_bad_token() {
         let dir = tempfile::tempdir().unwrap();
-        let s = Arc::new(RwLock::new(mock_session(dir.path())));
-        let (tx, rx) = std::sync::mpsc::channel();
-        let sel: SharedSelection = Arc::new(Mutex::new(vec![ClusterId(1)]));
+        let h = Arc::new(SessionHost::new(mock_session(dir.path())));
         let woke = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let w = woke.clone();
-        let handle = spawn_listener(s.clone(), dir.path(), label, tx, sel, move || {
+        let _gui = h.subscribe(move || {
             w.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        })
-        .unwrap();
+        });
+        let handle = spawn_listener(h.clone(), dir.path(), false, label, None).unwrap();
         let (port, token) = read_mcp_json(dir.path()).unwrap();
         assert_eq!((port, token.as_str()), (handle.port(), handle.token()));
         #[cfg(unix)]
@@ -1502,13 +1612,11 @@ mod tests {
             .collect();
         assert_eq!(replies.len(), 3);
         assert_eq!(replies[1]["result"]["isError"], false);
-        assert_eq!(
-            replies[2]["result"]["isError"], true,
-            "attached edits refused"
-        );
-        assert!(matches!(rx.try_recv(), Ok(AgentMsg::Propose(_))));
-        assert_eq!(woke.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(s.read().unwrap().label(ClusterId(0)), Some(0), "unchanged");
+        assert_eq!(replies[2]["result"]["isError"], false, "direct edit");
+        assert_eq!(h.proposals().len(), 1);
+        // The GUI's subscriber woke for the proposal and for the edit.
+        assert_eq!(woke.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(h.read().label(ClusterId(0)), Some(1), "relabelled");
 
         drop(handle);
         assert!(!dir.path().join(MCP_JSON).exists());
