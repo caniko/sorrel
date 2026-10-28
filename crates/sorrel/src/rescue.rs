@@ -50,7 +50,7 @@ pub struct RescueArgs {
     #[arg(long, value_name = "SET", default_value = "good")]
     pub units: String,
     /// Target false-discovery rate per unit
-    #[arg(long, default_value_t = 0.05)]
+    #[arg(long, default_value_t = 0.05, value_parser = parse_q)]
     pub q: f32,
     /// A detection must beat the best competitor's explained energy by this fraction
     #[arg(long, default_value_t = 0.2)]
@@ -88,6 +88,16 @@ pub struct RescueArgs {
     pub cpu: bool,
 }
 
+/// `--q` must be a proper false-discovery rate: 0 < q < 1 (NaN fails too).
+fn parse_q(s: &str) -> Result<f32, String> {
+    let q: f32 = s.parse().map_err(|e| format!("{e}"))?;
+    if q > 0.0 && q < 1.0 {
+        Ok(q)
+    } else {
+        Err(format!("--q must satisfy 0 < q < 1, got {s}"))
+    }
+}
+
 // ---- small helpers ---------------------------------------------------------
 
 struct Rng(u64);
@@ -108,6 +118,38 @@ impl Rng {
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// Up to `want` random window starts in `[lo, hi)` whose spike (the start
+/// shifted by `PRE`) is at least `gap` from every time in `existing`
+/// (ascending) and from every start already in `chosen` (ascending; extended
+/// with the new ones). Returns the new starts, sorted.
+fn place_injections(
+    want: usize,
+    (lo, hi): (u64, u64),
+    gap: u64,
+    existing: &[u64],
+    chosen: &mut Vec<u64>,
+    rng: &mut Rng,
+) -> Vec<u64> {
+    let mut v = vec![];
+    for _ in 0..want * 20 {
+        if v.len() >= want {
+            break;
+        }
+        let ws = lo + rng.below(hi.saturating_sub(lo));
+        let t = ws + PRE as u64;
+        let i = existing.partition_point(|&e| e + gap <= t);
+        let j = chosen.partition_point(|&c| c + gap <= ws);
+        if existing.get(i).is_none_or(|&e| e >= t + gap)
+            && chosen.get(j).is_none_or(|&c| c >= ws + gap)
+        {
+            chosen.insert(j, ws);
+            v.push(ws);
+        }
+    }
+    v.sort_unstable();
+    v
 }
 
 fn clamp_scale(x: f32) -> f32 {
@@ -136,10 +178,10 @@ fn groups_of<P: DataProvider>(s: &Session<P>) -> Groups {
         g.push((Kind::Pc, n_pcs * n_ch));
     }
     if ci.has_template_features() {
-        let w = ci
-            .global_indices(ClusterId::new(0))
-            .first()
-            .and_then(|&i| ci.template_feature_row(i))
+        // The width is global, so read it off the first spike that has a
+        // row rather than assuming cluster 0 is non-empty.
+        let w = (0..ci.n_spikes() as u32)
+            .find_map(|i| ci.template_feature_row(i))
             .map_or(0, <[f32]>::len);
         if w > 0 {
             g.push((Kind::Tf, w));
@@ -421,6 +463,8 @@ pub struct Outcome {
     /// Detected spike times per target unit (read by the tests).
     #[cfg_attr(not(test), allow(dead_code))]
     pub added_times: Vec<(u32, Vec<u64>)>,
+    /// Usable units that could not be trained; detections near their spikes are rejected.
+    pub unmodelled: Vec<u32>,
 }
 
 fn parse_targets<P: DataProvider<Label = PhyLabel>>(
@@ -554,10 +598,25 @@ pub fn run<P: DataProvider<Label = PhyLabel>>(
         units.iter().any(|u| u.target),
         "no target unit could be modelled (units {skipped:?})"
     );
+    // Usable units that could not be trained (e.g. a merged unit with too few
+    // spikes on its primary template) neither compete nor get subtracted, so
+    // detections near their spikes are rejected instead and the units are reported.
+    let unmodelled: Vec<u32> = usable
+        .iter()
+        .filter(|&&id| !units.iter().any(|u| u.id == id))
+        .map(|id| id.0)
+        .collect();
+    let mut blocked: Vec<u64> = unmodelled
+        .iter()
+        .flat_map(|&id| s.spike_times(ClusterId::new(id)).iter().map(|t| t.0))
+        .collect();
+    blocked.sort_unstable();
 
-    // Hybrid injections: (window start, scale), sorted, >= 2 ms from the
-    // unit's own spikes and from each other.
+    // Hybrid injections: (window start, scale), sorted, >= 2 ms from every
+    // existing spike and from every other injection (across targets too).
     let gap = (0.002 * sr) as u64;
+    let all_t: Vec<u64> = all.iter().map(|t| t.0).collect();
+    let mut chosen: Vec<u64> = vec![];
     let inj: Vec<Vec<(u64, f32)>> = units
         .iter()
         .map(|u| {
@@ -566,20 +625,14 @@ pub fn run<P: DataProvider<Label = PhyLabel>>(
             };
             let want = (frac * u.times.len() as f32).round() as usize;
             let (lo, hi) = (settle + 400, n_samples - NT - 400);
-            let mut v: Vec<u64> = vec![];
-            for _ in 0..want * 20 {
-                if v.len() >= want {
-                    break;
-                }
-                let ws = (lo as u64) + rng.below((hi - lo) as u64);
-                let t = ws + PRE as u64;
-                let i = u.times.partition_point(|&e| e + gap <= t);
-                if u.times.get(i).is_none_or(|&e| e >= t + gap) {
-                    v.push(ws);
-                }
-            }
-            v.sort_unstable();
-            v.dedup_by(|b, a| *b < *a + gap);
+            let v = place_injections(
+                want,
+                (lo as u64, hi as u64),
+                gap,
+                &all_t,
+                &mut chosen,
+                &mut rng,
+            );
             v.into_iter()
                 .map(|ws| {
                     let sc = u.scales.get(rng.below(u.scales.len() as u64) as usize);
@@ -744,10 +797,16 @@ pub fn run<P: DataProvider<Label = PhyLabel>>(
                     let (e0, e1) = (b0 + PRE, b0 + n_time + PRE);
                     let i0 = u.times.partition_point(|&t| (t as usize) < e0);
                     let i1 = u.times.partition_point(|&t| (t as usize) < e1);
-                    let existing: Vec<u64> = u.times[i0..i1]
+                    let (j0, j1) = (
+                        blocked.partition_point(|&t| (t as usize) < e0),
+                        blocked.partition_point(|&t| (t as usize) < e1),
+                    );
+                    let mut existing: Vec<u64> = u.times[i0..i1]
                         .iter()
+                        .chain(&blocked[j0..j1])
                         .map(|&t| t - PRE as u64 - b0 as u64)
                         .collect();
+                    existing.sort_unstable();
                     let peaks = apply_refractory(&peaks, &existing, refr);
                     if pass == 0 {
                         for p in peaks {
@@ -865,6 +924,7 @@ pub fn run<P: DataProvider<Label = PhyLabel>>(
         cmd,
         added,
         added_times,
+        unmodelled,
     })
 }
 
@@ -977,7 +1037,10 @@ impl SessionVisitor for Rescue {
                     })
                 })
                 .collect();
-            let doc = serde_json::json!({ "added": out.added, "applied": out.cmd.is_some(), "units": units });
+            let doc = serde_json::json!({
+                "added": out.added, "applied": out.cmd.is_some(), "units": units,
+                "unmodelled_units": out.unmodelled,
+            });
             serde_json::to_writer_pretty(std::io::stdout().lock(), &doc)?;
             println!();
         } else {
@@ -1009,6 +1072,13 @@ impl SessionVisitor for Rescue {
                         pct(v[3])
                     );
                 }
+            }
+            if !out.unmodelled.is_empty() {
+                println!(
+                    "{} units could not be modelled (detections near their spikes are rejected): {:?}",
+                    out.unmodelled.len(),
+                    out.unmodelled
+                );
             }
             println!(
                 "{} spikes found{}",

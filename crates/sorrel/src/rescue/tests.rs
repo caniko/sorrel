@@ -47,17 +47,30 @@ fn write_u32_2d(path: &Path, rows: usize, cols: usize, data: &[u32]) {
 
 /// Returns the omitted unit-0 spike times.
 fn write_fixture(root: &Path) -> Vec<u64> {
+    write_fixture_ext(root, false, false)
+}
+
+/// `merged`: a third `mua` cluster 2 of 30 unit-0-shaped spikes spread over
+/// three templates (no template reaches `MIN_SPIKES`, so it cannot be
+/// trained). `empty0`: unit 0 is relabelled cluster 2, leaving cluster 0
+/// empty, and template features are written.
+fn write_fixture_ext(root: &Path, merged: bool, empty0: bool) -> Vec<u64> {
     let mut r = Xs(0x1234_5678_9abc_def1);
     // Unit weights per channel and peak amplitude. Both units span every
     // channel (the channel-shift null only breaks spikes that need several
     // channels to line up) with sign patterns whose median is ~0, so the
     // 4-channel median reference leaves the waveform alone.
-    let w: [[f32; NC]; 2] = [[1.0, 0.7, -0.7, -1.0], [1.0, -1.0, 0.7, -0.7]];
-    let amp = [40.0f32, 25.0];
+    let w: [[f32; NC]; 3] = [
+        [1.0, 0.7, -0.7, -1.0],
+        [1.0, -1.0, 0.7, -0.7],
+        [1.0, 0.7, -0.7, -1.0],
+    ];
+    let amp = [40.0f32, 25.0, 40.0];
     let mut raw: Vec<f32> = (0..N * NC).map(|_| SIGMA * r.gauss()).collect();
     // (time, unit, scale), >= 150 samples apart.
     let mut spikes: Vec<(u64, usize, f32)> = vec![];
-    for (u, n) in [(0usize, 100usize), (1, 80)] {
+    let counts = [(0usize, 100usize), (1, 80), (2, 30)];
+    for (u, n) in counts.into_iter().take(if merged { 3 } else { 2 }) {
         while spikes.iter().filter(|s| s.1 == u).count() < n {
             let t = 200 + (r.u() * (N - 400) as f32) as u64;
             if spikes.iter().all(|s| s.0.abs_diff(t) > 150) {
@@ -96,10 +109,34 @@ fn write_fixture(root: &Path) -> Vec<u64> {
         .collect();
     let n = kept.len();
     let times: Vec<u64> = kept.iter().map(|s| s.0).collect();
-    let cl: Vec<u32> = kept.iter().map(|s| s.1 as u32).collect();
+    let tpl: Vec<u32> = kept
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            if s.1 == 2 {
+                2 + (i % 3) as u32
+            } else {
+                s.1 as u32
+            }
+        })
+        .collect();
+    let cl: Vec<u32> = kept
+        .iter()
+        .map(|s| if empty0 && s.1 == 0 { 2 } else { s.1 as u32 })
+        .collect();
     npy::write_1d_u64_atomic(&root.join("spike_times.npy"), &times).unwrap();
     npy::write_1d_u32_atomic(&root.join("spike_clusters.npy"), &cl).unwrap();
-    npy::write_1d_u32_atomic(&root.join("spike_templates.npy"), &cl).unwrap();
+    npy::write_1d_u32_atomic(&root.join("spike_templates.npy"), &tpl).unwrap();
+    if empty0 {
+        let tf: Vec<f32> = (0..n * 2).map(|i| i as f32).collect();
+        npy::write_f32_atomic(&root.join("template_features.npy"), &[n, 2], &tf).unwrap();
+        write_u32_2d(
+            &root.join("template_feature_ind.npy"),
+            3,
+            2,
+            &[0, 1, 1, 0, 0, 1],
+        );
+    }
     let amps: Vec<f32> = kept.iter().map(|s| s.2 * amp[s.1]).collect();
     npy::write_f32_atomic(&root.join("amplitudes.npy"), &[n], &amps).unwrap();
     // 2 PCs x 4 channels, linear in the spike scale plus a little noise.
@@ -116,12 +153,9 @@ fn write_fixture(root: &Path) -> Vec<u64> {
         })
         .collect();
     npy::write_f32_atomic(&root.join("pc_features.npy"), &[n, 2, NC], &pcs).unwrap();
-    write_u32_2d(
-        &root.join("pc_feature_ind.npy"),
-        2,
-        NC,
-        &[0, 1, 2, 3, 0, 1, 2, 3],
-    );
+    let n_t = if merged { 5 } else { 2 };
+    let ind: Vec<u32> = (0..n_t).flat_map(|_| 0..NC as u32).collect();
+    write_u32_2d(&root.join("pc_feature_ind.npy"), n_t, NC, &ind);
     std::fs::write(
         root.join("params.py"),
         format!(
@@ -132,7 +166,11 @@ fn write_fixture(root: &Path) -> Vec<u64> {
     .unwrap();
     std::fs::write(
         root.join("cluster_group.tsv"),
-        "cluster_id\tgroup\n0\tgood\n1\tgood\n",
+        if merged {
+            "cluster_id\tgroup\n0\tgood\n1\tgood\n2\tmua\n"
+        } else {
+            "cluster_id\tgroup\n0\tgood\n1\tgood\n"
+        },
     )
     .unwrap();
     omitted
@@ -249,4 +287,79 @@ fn apply_journals_one_batch_and_adds_the_spikes() {
     // A second pass finds (almost) nothing new: the additions are accepted spikes now.
     let again = run(&s, &args(&["--cpu"]), &[]).unwrap();
     assert!(again.added <= 3, "{} new spikes on rerun", again.added);
+}
+
+fn try_args(extra: &[&str]) -> Result<RescueArgs, clap::Error> {
+    #[derive(Parser)]
+    struct W {
+        #[command(flatten)]
+        a: RescueArgs,
+    }
+    W::try_parse_from(std::iter::once("t").chain(extra.iter().copied())).map(|w| w.a)
+}
+
+#[test]
+fn q_must_be_a_proper_fdr() {
+    for bad in ["0", "1", "1.5", "-0.1", "nan", "inf"] {
+        assert!(try_args(&["--q", bad]).is_err(), "--q {bad} accepted");
+    }
+    assert_eq!(try_args(&["--q", "0.1"]).unwrap().q, 0.1);
+}
+
+#[test]
+fn untrainable_competitor_is_reported_and_its_spikes_are_not_added() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture_ext(dir.path(), true, false);
+    let s = open(dir.path());
+    let out = run(&s, &args(&["--cpu"]), &[]).unwrap();
+    assert_eq!(out.unmodelled, vec![2]);
+    // Cluster 2's spikes look like unit 0's; none may be added to anyone.
+    let refr = (0.0015 * s.provider.sample_rate()).ceil() as u64;
+    for t2 in s.spike_times(ClusterId::new(2)) {
+        for (u, ts) in &out.added_times {
+            assert!(
+                ts.iter().all(|t| t.abs_diff(t2.0) >= refr),
+                "unit {u} gained a spike at cluster 2's {}",
+                t2.0
+            );
+        }
+    }
+}
+
+#[test]
+fn template_feature_width_does_not_depend_on_cluster_0() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture_ext(dir.path(), false, true);
+    let s = open(dir.path());
+    assert!(s.cluster_index().has_template_features());
+    assert!(s.spike_times(ClusterId::new(0)).is_empty());
+    assert!(groups_of(&s)
+        .iter()
+        .any(|(k, w)| matches!(k, Kind::Tf) && *w == 2));
+}
+
+#[test]
+fn injections_avoid_all_existing_spikes_and_each_other() {
+    let gap = 60;
+    // A spike every 200 samples leaves [t+gap, t+200-gap) = 80-sample slots.
+    // (At a 100-sample period nothing fits, which is what the first draft hit.)
+    let existing: Vec<u64> = (0..500).map(|i| 1000 + 200 * i).collect();
+    let mut chosen = vec![];
+    let mut rng = Rng::new(7);
+    let a = place_injections(200, (1000, 100_000), gap, &existing, &mut chosen, &mut rng);
+    let b = place_injections(200, (1000, 100_000), gap, &existing, &mut chosen, &mut rng);
+    assert!(!a.is_empty() && !b.is_empty());
+    let mut ws: Vec<u64> = a.iter().chain(&b).copied().collect();
+    for &w in &ws {
+        let t = w + PRE as u64;
+        assert!(
+            existing.iter().all(|&e| e.abs_diff(t) >= gap),
+            "{w} near a spike"
+        );
+    }
+    ws.sort_unstable();
+    assert!(
+        ws.windows(2).all(|p| p[1] - p[0] >= gap),
+        "injections overlap"
+    );
 }
