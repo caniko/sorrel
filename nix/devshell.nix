@@ -6,7 +6,6 @@
   cargoConfig,
   checks,
   deps,
-  simit,
   preCommitEnabledPackages ? [],
   shellHook ? "",
 }: let
@@ -35,7 +34,6 @@ in
         imagemagick
         mdbook
         pre-commit
-        simit
         python3
         xdotool
         xorg.xorgserver
@@ -62,7 +60,6 @@ in
           cargo-nextest
           mdbook
           pre-commit
-          simit
         ]
         ++ hdf5Packages
         ++ preCommitEnabledPackages

@@ -4,15 +4,6 @@
   inputs = {
     harbor-rs.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk";
 
-    # No nixpkgs/rust-overlay/crane follows: simit must keep its own locked
-    # toolchain so the dev shell hits the closure simit's trunk prebuild
-    # publishes to the canix Attic cache instead of compiling it.
-    simit = {
-      url = "git+https://github.com/caniko/simit.git?ref=trunk";
-      inputs.flake-utils.follows = "flake-utils";
-      inputs.plinth.follows = "plinth";
-    };
-
     # Pinned SDK used by harbor-rs's reproducible osxcross builder.
     harbor-macos-sdk-pin.url = "git+https://github.com/caniko/harbor-macos-sdk-pin.git?ref=trunk";
 
@@ -26,17 +17,12 @@
     flake-utils.url = "github:numtide/flake-utils";
     treefmt-nix.follows = "harbor-rs/treefmt-nix";
     git-hooks.follows = "harbor-rs/git-hooks";
-    plinth = {
-      url = "git+https://github.com/caniko/plinth.git?ref=trunk";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
   outputs = {
     self,
     nixpkgs,
     harbor-rs,
-    simit,
     harbor-macos-sdk-pin,
     nix-appimage,
     flake-utils,
@@ -359,7 +345,6 @@
 
       devShells = import ./nix/devshell.nix {
         inherit pkgs harbor-rs craneLib cross cargoConfig deps;
-        simit = simit.packages.${system}.default;
         checks = self.checks.${system};
         preCommitEnabledPackages = pre-commit-check.enabledPackages;
         inherit (pre-commit-check) shellHook;
