@@ -32,10 +32,20 @@
     ...
   }:
     {
+      homeManagerModules.default = import ./nix/hm-module.nix self;
+
       # This is the sole simit project configuration source.  Keep CI and
       # release policy next to the flake outputs it describes; simit.toml is
       # intentionally not used.
-      simitConfig = {
+      simitConfig = let
+        qualification = map (check: ".#checks.x86_64-linux.${check}") [
+          "clippy"
+          "default"
+          "formatting"
+          "hm-module"
+          "workspace-tests"
+        ];
+      in {
         flake.mode = "custom";
         ci = {
           platform = "github";
@@ -82,6 +92,17 @@
             repo = "caniko/sorrel";
             site_output = ".#site";
             source_branch = "trunk";
+          };
+          # Exact-installable qualification of every x86_64-linux flake check,
+          # the lavapipe UI snapshot states included (checks.workspace-tests).
+          nix_builds = qualification;
+          nix_build = {
+            check_systems = ["x86_64-linux"];
+            groups.checks = qualification;
+            capture_results = true;
+            timeout_minutes = 120;
+            # The simit that generated the workflows; vars.SIMIT_CI_ENGINE_REVISION overrides.
+            engine_revision = "78b775803103ae960faf475ad46070d771fddc91";
           };
         };
         # Linux closures only: the darwin build depends on the private macOS
@@ -337,7 +358,9 @@
 
       checks =
         (import ./nix/checks.nix {
-          inherit craneLib commonArgs cargoArtifacts sorrel;
+          inherit pkgs craneLib commonArgs cargoArtifacts sorrel;
+          inherit (deps) runtimeLibs;
+          hmModule = self.homeManagerModules.default;
         })
         // {
           formatting = treefmtEval.config.build.check self;

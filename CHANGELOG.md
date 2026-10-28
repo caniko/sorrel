@@ -18,6 +18,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - `sorrel rescue`: FDR-controlled matched-filter spike rescue for existing
   units, with hybrid-injection recall checks.
 - In-place `AddSpikes`: rescued spikes are journaled as one undoable batch.
+- Home Manager module (`homeManagerModules.default`, `programs.sorrel`), and a
+  `sorrel.desktop` menu entry in the Nix packages.
+- `checks.workspace-tests`: every workspace test under nextest in the Nix
+  sandbox, the UI snapshot states on pinned lavapipe (`SORREL_REQUIRE_GPU`
+  fails instead of skipping). simit qualifies every x86_64-linux flake check
+  as an exact installable (`nix-builds.yaml`).
   Save rewrites every per-spike array, with backups in `sorrel_original/`.
 
 ### Changed

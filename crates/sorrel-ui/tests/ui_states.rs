@@ -42,6 +42,12 @@ fn no_gpu() -> bool {
             .map(|e| e.to_string())
     });
     if let Some(e) = err {
+        // The Nix check sets this, so a broken lavapipe fails instead of
+        // passing every snapshot test as a skip.
+        assert!(
+            std::env::var_os("SORREL_REQUIRE_GPU").is_none(),
+            "SORREL_REQUIRE_GPU is set but no GPU is available: {e}"
+        );
         eprintln!("skipping UI snapshot test: {e}");
     }
     err.is_some()

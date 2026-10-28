@@ -16,9 +16,13 @@
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
+  # Also installs the menu entry, so every Nix install (profile, Home
+  # Manager, NixOS) gets one.
   rpathFixup = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
     patchelf --add-rpath "${pkgs.lib.makeLibraryPath runtimeLibs}" \
       "$out/bin/sorrel"
+    install -Dm644 ${import ./desktop.nix {inherit pkgs;}} \
+      "$out/share/applications/sorrel.desktop"
   '';
 
   sorrelHdf5 =
