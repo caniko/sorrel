@@ -45,6 +45,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - The cluster table's "amp" column is mean spike amplitude × template
   peak-to-peak, as in phy. It used to show the template peak alone, which
   is the same for every cluster on unit-norm Kilosort templates.
+- The `sorrel` crate is published again. Its embedded SpikeInterface
+  sidecar (`sorrel_auto.py`) now lives inside the crate. 0.2.1's
+  crates.io release stopped at `sorrel` because the packaged crate could
+  not find the script; the other eight crates are on crates.io at 0.2.1.
 
 ### Changed (UI)
 
