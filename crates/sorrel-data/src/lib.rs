@@ -7,6 +7,7 @@ pub mod command;
 pub mod curation_json;
 pub mod diff;
 pub mod feature_subspace;
+pub mod host;
 pub mod journal;
 pub mod open;
 #[cfg(feature = "phy-export")]
@@ -26,12 +27,13 @@ pub mod suggest;
 
 pub use cache::correlograms::{acg_or_compute, ccg_or_compute};
 pub use cluster_index::{ClusterIndex, MergeRecord, SplitRecord};
-pub use command::{Actor, CurationCommand, Method, PhyLabelOp, UnitOrigin};
+pub use command::{describe_command, Actor, CurationCommand, Method, PhyLabelOp, UnitOrigin};
 pub use curation_json::write_curation_json;
 pub use diff::{diff_labels, LabelDiff};
 pub use feature_subspace::{
     collect_pc_subspace, PcSubspace, DEFAULT_CHANNEL_IDX, DEFAULT_D, DEFAULT_MAX_BACKGROUND,
 };
+pub use host::{HostEvent, SessionHost};
 pub use journal::{artifacts_hash, baseline_hash, Journal, Record};
 pub use open::{
     journal_path, open_identity_sealed, open_journal, open_phy, open_sorting_analyzer,

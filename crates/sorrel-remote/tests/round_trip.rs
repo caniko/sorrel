@@ -7,12 +7,13 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use libp2p::{identity::Keypair, Multiaddr};
-use sorrel_data::{baseline_hash, CurationCommand, Journal, PhyLabelOp, Session};
+use sorrel_data::{baseline_hash, CurationCommand, Journal, PhyLabelOp, Session, SessionHost};
 use sorrel_io::kilosort::{KilosortOpenParams, KilosortProvider};
 use sorrel_io::{ClusterId, DataProvider, SampleIndex, TraceSamples};
 use sorrel_remote::protocol::{Cursor, HostError, Record};
 use sorrel_remote::swarm::{Mode, Role};
 use sorrel_remote::{join, rt, serve, DatSource, Pairing, PairingCode, Served, SessionServed};
+use std::sync::Arc;
 
 const N_CH: usize = 4;
 const N_SAMPLES: usize = 40_000; // 320 KiB of int16: five 64 KiB blocks
@@ -76,7 +77,11 @@ fn open_host(root: &Path) -> (Box<dyn Served>, DatSource, u64) {
     };
     let mut s = Session::new(p, j);
     s.replay_journal().unwrap();
-    (Box::new(SessionServed(s)), dat, baseline)
+    (
+        Box::new(SessionServed(Arc::new(SessionHost::new(s)))),
+        dat,
+        baseline,
+    )
 }
 
 fn wait_until(what: &str, mut f: impl FnMut() -> bool) {

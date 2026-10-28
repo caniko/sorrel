@@ -298,7 +298,7 @@ fn mcp_attention_queue_includes_pc_outliers() {
     let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"attention_queue","arguments":{"limit":50}}}"#;
     let mut out = Vec::new();
     sorrel_data::serve(
-        &mut s,
+        &sorrel_data::SessionHost::new(s),
         dir.path(),
         false,
         |_: &u8| "unsorted",

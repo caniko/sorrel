@@ -14,7 +14,10 @@ use crate::widgets::TraceCache;
 use eframe::egui;
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::SpikeDepths;
-use sorrel_data::{export_qc, save_session, CurationCommand, PhyLabelOp, Session};
+use sorrel_data::{
+    describe_command, export_qc, save_session, Actor, CurationCommand, PhyLabelOp, Session,
+    SessionHost,
+};
 use sorrel_gpu::GpuContext;
 use sorrel_io::{ClusterId, DataProvider, Events};
 use sorrel_render::{GpuTracePreproc, TracePreproc};
@@ -22,69 +25,6 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-
-fn label_name(op: PhyLabelOp) -> &'static str {
-    match op {
-        PhyLabelOp::SetGood => "Good",
-        PhyLabelOp::SetMua => "MUA",
-        PhyLabelOp::SetNoise => "Noise",
-        PhyLabelOp::SetUnsorted => "Unsorted",
-    }
-}
-
-/// Short human description of a curation command — for status toasts so
-/// undo/redo say *what* they reverted instead of a bare "undone".
-fn describe_command(cmd: &CurationCommand) -> String {
-    match cmd {
-        CurationCommand::Relabel { cluster, op } => {
-            format!("relabel cluster {} as {}", cluster.0, label_name(*op))
-        }
-        CurationCommand::Merge { sources, target } => {
-            format!("merge {} cluster(s) into {}", sources.len(), target.0)
-        }
-        CurationCommand::Split {
-            cluster, spike_idx, ..
-        } => {
-            format!("split cluster {} ({} spikes)", cluster.0, spike_idx.len())
-        }
-        CurationCommand::Note { cluster, text } if text.is_empty() => {
-            format!("clear note on cluster {}", cluster.0)
-        }
-        CurationCommand::Note { cluster, text } => {
-            let brief: String = text.chars().take(24).collect();
-            let dots = if text.chars().count() > 24 { "…" } else { "" };
-            format!("note on cluster {}: {brief}{dots}", cluster.0)
-        }
-        CurationCommand::Tag { cluster, .. } => format!("retag cluster {}", cluster.0),
-        CurationCommand::AddSpikes(b) => {
-            let mut clusters = b.clusters.clone();
-            clusters.sort_unstable();
-            clusters.dedup();
-            format!(
-                "add {} spikes to {} clusters",
-                b.times.len(),
-                clusters.len()
-            )
-        }
-        CurationCommand::Batch { children } => {
-            // A multi-select relabel is journaled as one batch so a single
-            // Undo reverts it; say so instead of "batch of N ops".
-            if let Some(CurationCommand::Relabel { op, .. }) = children.first() {
-                let uniform = children
-                    .iter()
-                    .all(|c| matches!(c, CurationCommand::Relabel { op: o, .. } if o == op));
-                if uniform {
-                    return format!("relabel {} clusters as {}", children.len(), label_name(*op));
-                }
-            }
-            format!("batch of {} ops", children.len())
-        }
-        // Undo/Redo records never appear in history — they are applied as
-        // moves between stacks rather than pushed.
-        CurationCommand::Undo => "undo".into(),
-        CurationCommand::Redo => "redo".into(),
-    }
-}
 
 /// Render a `PathBuf` for the top bar: keep the last two segments so users
 /// recognise it (`run42/ks4`) without overflowing the bar on deep paths.
@@ -122,11 +62,14 @@ pub type PhyExportFn<P> = Arc<dyn Fn(&Session<P>) -> anyhow::Result<PathBuf> + S
 
 /// Generic eframe app. The whole window is monomorphised against `P`.
 ///
-/// The session sits behind an `Arc<RwLock<_>>`: the UI thread takes short
-/// read locks per frame, curation commands take the write lock, and
-/// background jobs (Suggest ranking, quality metrics, initial seeding)
+/// The session is owned by a [`SessionHost`] and sits behind its
+/// `Arc<RwLock<_>>`: the UI thread takes short read locks per frame,
+/// curation commands go through [`SessionHost::apply`] (the write lock),
+/// and background jobs (Suggest ranking, quality metrics, initial seeding)
 /// hold a read or write lock on worker threads — see [`crate::jobs`].
 pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
+    host: Arc<SessionHost<P>>,
+    /// `host.session()`, kept for the per-frame reads.
     session: Arc<RwLock<Session<P>>>,
     /// `Some` while the initial seed/replay runs on a worker thread; the
     /// session must not be touched until it reports.
@@ -293,8 +236,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
 
     fn build(session: Session<P>, label_str: fn(&P::Label) -> &'static str) -> Self {
         let window_len = (session.provider.sample_rate() as u32).max(1) / 10; // 100 ms
+        let host = Arc::new(SessionHost::new(session));
         Self {
-            session: Arc::new(RwLock::new(session)),
+            session: Arc::clone(host.session()),
+            host,
             loading: None,
             load_error: None,
             last_save: None,
@@ -423,6 +368,12 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     /// The shared session (tests and embedders inspect curation state).
     pub fn session(&self) -> &Arc<RwLock<Session<P>>> {
         &self.session
+    }
+
+    /// The host that owns the session; other frontends (MCP, remote) edit
+    /// through it.
+    pub fn host(&self) -> &Arc<SessionHost<P>> {
+        &self.host
     }
 
     /// Hand the app the wgpu device/queue from `eframe`'s render state so
@@ -791,10 +742,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     fn commit_with_follow(&mut self, cmd: CurationCommand, follow: Option<Vec<ClusterId>>) -> bool {
         let desc = describe_command(&cmd);
         self.cancel_jobs();
-        // Every GUI edit is a human decision: it clears the touched clusters'
-        // `review:*` tags (from `sorrel auto`), so the review queue drains.
-        let cmd = read(&self.session).with_human_review(cmd);
-        if let Err(e) = write(&self.session).dispatch(cmd) {
+        // Every GUI edit is a human decision: the host clears the touched
+        // clusters' `review:*` tags (from `sorrel auto`), so the review
+        // queue drains.
+        if let Err(e) = self.host.apply(Actor::Human, cmd) {
             self.error = Some(format!("{desc} failed: {e}"));
             return false;
         }
@@ -808,6 +759,18 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         }
         self.status = toast(desc);
         true
+    }
+
+    /// Undo or redo; the toast names what moved ("undid: relabel cluster 12
+    /// as MUA"), and nothing is said at the end of the walk.
+    fn move_head(&mut self, cmd: CurationCommand) {
+        self.cancel_jobs();
+        let before = read(&self.session).version();
+        match self.host.apply(Actor::Human, cmd) {
+            Err(e) => self.error = Some(format!("journal write failed: {e}")),
+            Ok(ev) if ev.version != before => self.status = toast(ev.desc),
+            Ok(_) => {}
+        }
     }
 
     /// Turn lasso hits into one journal entry (a batch when several
@@ -1223,33 +1186,8 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     self.merge_mode = None;
                 }
             }
-            Intent::Undo => {
-                // Peek the about-to-be-undone command first so the status
-                // toast can name it ("undid: relabel cluster 12 → MUA")
-                // rather than a generic "undo".
-                let desc = read(&self.session)
-                    .history_commands()
-                    .last()
-                    .map(describe_command);
-                self.cancel_jobs();
-                if let Err(e) = write(&self.session).dispatch(CurationCommand::Undo) {
-                    self.error = Some(format!("journal write failed: {e}"));
-                } else if let Some(d) = desc {
-                    self.status = toast(format!("undid: {d}"));
-                }
-            }
-            Intent::Redo => {
-                self.cancel_jobs();
-                if let Err(e) = write(&self.session).dispatch(CurationCommand::Redo) {
-                    self.error = Some(format!("journal write failed: {e}"));
-                } else if let Some(d) = read(&self.session)
-                    .history_commands()
-                    .last()
-                    .map(describe_command)
-                {
-                    self.status = toast(format!("redid: {d}"));
-                }
-            }
+            Intent::Undo => self.move_head(CurationCommand::Undo),
+            Intent::Redo => self.move_head(CurationCommand::Redo),
             Intent::Save => self.save(),
             Intent::NextCluster => {
                 self.selection.bump(1, &self.table_state.visible);

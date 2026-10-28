@@ -233,6 +233,24 @@ impl CurationCommand {
         }
     }
 
+    /// Every cluster the command names (for a split, the source only: the
+    /// new id is allocated at apply time), sorted and deduplicated.
+    pub fn clusters(&self) -> Vec<ClusterId> {
+        let mut out = match self {
+            Self::Relabel { cluster, .. }
+            | Self::Split { cluster, .. }
+            | Self::Note { cluster, .. }
+            | Self::Tag { cluster, .. } => vec![*cluster],
+            Self::Merge { sources, target } => [&[*target][..], sources].concat(),
+            Self::AddSpikes(b) => b.clusters.clone(),
+            Self::Batch { children } => children.iter().flat_map(Self::clusters).collect(),
+            Self::Undo | Self::Redo => Vec::new(),
+        };
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// True for the curation actions that move state forward (i.e. anything
     /// that gets pushed onto the undo stack).
     pub fn is_forward(&self) -> bool {
@@ -249,6 +267,69 @@ impl CurationCommand {
             }
         }
         Some(Self::Batch { children })
+    }
+}
+
+fn label_name(op: PhyLabelOp) -> &'static str {
+    match op {
+        PhyLabelOp::SetGood => "Good",
+        PhyLabelOp::SetMua => "MUA",
+        PhyLabelOp::SetNoise => "Noise",
+        PhyLabelOp::SetUnsorted => "Unsorted",
+    }
+}
+
+/// Short human description of a curation command, shared by GUI toasts,
+/// MCP replies and host events, so undo/redo say *what* they reverted
+/// instead of a bare "undone".
+pub fn describe_command(cmd: &CurationCommand) -> String {
+    match cmd {
+        CurationCommand::Relabel { cluster, op } => {
+            format!("relabel cluster {} as {}", cluster.0, label_name(*op))
+        }
+        CurationCommand::Merge { sources, target } => {
+            format!("merge {} cluster(s) into {}", sources.len(), target.0)
+        }
+        CurationCommand::Split {
+            cluster, spike_idx, ..
+        } => {
+            format!("split cluster {} ({} spikes)", cluster.0, spike_idx.len())
+        }
+        CurationCommand::Note { cluster, text } if text.is_empty() => {
+            format!("clear note on cluster {}", cluster.0)
+        }
+        CurationCommand::Note { cluster, text } => {
+            let brief: String = text.chars().take(24).collect();
+            let dots = if text.chars().count() > 24 { "…" } else { "" };
+            format!("note on cluster {}: {brief}{dots}", cluster.0)
+        }
+        CurationCommand::Tag { cluster, .. } => format!("retag cluster {}", cluster.0),
+        CurationCommand::AddSpikes(b) => {
+            let mut clusters = b.clusters.clone();
+            clusters.sort_unstable();
+            clusters.dedup();
+            format!(
+                "add {} spikes to {} clusters",
+                b.times.len(),
+                clusters.len()
+            )
+        }
+        CurationCommand::Batch { children } => {
+            // A multi-select relabel is journaled as one batch so a single
+            // Undo reverts it; say so instead of "batch of N ops".
+            if let Some(CurationCommand::Relabel { op, .. }) = children.first() {
+                let uniform = children
+                    .iter()
+                    .all(|c| matches!(c, CurationCommand::Relabel { op: o, .. } if o == op));
+                if uniform {
+                    return format!("relabel {} clusters as {}", children.len(), label_name(*op));
+                }
+            }
+            format!("batch of {} ops", children.len())
+        }
+        // Undo/Redo are head moves, never nodes.
+        CurationCommand::Undo => "undo".into(),
+        CurationCommand::Redo => "redo".into(),
     }
 }
 

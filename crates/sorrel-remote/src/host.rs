@@ -3,13 +3,14 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use piying::actor::{ActorId, Spawn};
 use piying::message::{Context as ActorContext, Message};
 use sorrel_data::session::ApplyPhyLabel;
-use sorrel_data::{CurationCommand, Journal, Record as JournalRecord, Session};
+use sorrel_data::{Actor, CurationCommand, Journal, Record as JournalRecord, SessionHost};
 use sorrel_io::{DataProvider, TraceDtype};
 
 use crate::pairing::{Pairing, PairingCode};
@@ -22,31 +23,37 @@ pub trait Served: Send + 'static {
     fn cursor(&self) -> Cursor;
     fn n_clusters_at_baseline(&self) -> u32;
     fn identity_bytes(&self) -> Vec<u8>;
-    fn journal_path(&self) -> &Path;
+    fn journal_path(&self) -> PathBuf;
     fn apply(&mut self, cmd: CurationCommand) -> Result<()>;
 }
 
-pub struct SessionServed<P: DataProvider>(pub Session<P>);
+/// The served session: the same host a local GUI or MCP client edits.
+pub struct SessionServed<P: DataProvider>(pub Arc<SessionHost<P>>);
 
 impl<P: DataProvider + ApplyPhyLabel> Served for SessionServed<P> {
     fn cursor(&self) -> Cursor {
-        let j = self.0.journal();
+        let s = self.0.read();
         Cursor {
-            baseline: j.baseline(),
-            n_records: j.n_records(),
+            baseline: s.journal().baseline(),
+            n_records: s.journal().n_records(),
         }
     }
     fn n_clusters_at_baseline(&self) -> u32 {
-        self.0.journal().n_clusters_at_baseline()
+        self.0.read().journal().n_clusters_at_baseline()
     }
     fn identity_bytes(&self) -> Vec<u8> {
-        self.0.provider.identity_bytes()
+        self.0.read().provider.identity_bytes()
     }
-    fn journal_path(&self) -> &Path {
-        self.0.journal_path()
+    fn journal_path(&self) -> PathBuf {
+        self.0.read().journal_path().to_path_buf()
     }
     fn apply(&mut self, cmd: CurationCommand) -> Result<()> {
-        self.0.dispatch(cmd)
+        // ponytail: one guest per host, so the peer is not named yet; name
+        // it when several guests can join.
+        let guest = Actor::Remote {
+            peer: "guest".into(),
+        };
+        self.0.apply(guest, cmd).map(drop)
     }
 }
 
@@ -79,7 +86,7 @@ impl HostActor {
         if dat.offset > total {
             bail!("dat offset {} exceeds file size {total}", dat.offset);
         }
-        let exclude = [canon(&dat.path), canon(served.journal_path())];
+        let exclude = [canon(&dat.path), canon(&served.journal_path())];
         let mut files = Vec::new();
         let mut by_path = HashMap::new();
         walk(&root, &root, &exclude, &mut files, &mut by_path)?;
@@ -233,7 +240,7 @@ impl Message<JournalTail> for HostActor {
         msg: JournalTail,
         _: &mut ActorContext<Self, Self::Reply>,
     ) -> Self::Reply {
-        let all = Journal::replay_at(self.served.journal_path()).map_err(failed)?;
+        let all = Journal::replay_at(&self.served.journal_path()).map_err(failed)?;
         let from = (msg.from as usize).min(all.len());
         Ok(all[from..].to_vec())
     }

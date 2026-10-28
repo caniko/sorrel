@@ -772,6 +772,34 @@ impl<P: DataProvider> Session<P> {
         CurationCommand::Batch { children: out }
     }
 
+    /// `cmd` as an agent edit: the touched clusters first gain `src:agent`,
+    /// in the same undoable batch.
+    pub fn with_agent_source(&self, cmd: CurationCommand) -> CurationCommand {
+        let mut clusters = match &cmd {
+            CurationCommand::Relabel { cluster, .. } | CurationCommand::Split { cluster, .. } => {
+                vec![*cluster]
+            }
+            CurationCommand::Merge { sources, target } => [&[*target][..], sources].concat(),
+            _ => Vec::new(),
+        };
+        clusters.sort_unstable();
+        clusters.dedup();
+        let mut children: Vec<CurationCommand> = clusters
+            .into_iter()
+            .filter(|&c| !self.tags(c).iter().any(|t| t == "src:agent"))
+            .map(|cluster| {
+                let mut tags = self.tags(cluster).to_vec();
+                tags.push("src:agent".into());
+                CurationCommand::Tag { cluster, tags }
+            })
+            .collect();
+        if children.is_empty() {
+            return cmd;
+        }
+        children.push(cmd);
+        CurationCommand::Batch { children }
+    }
+
     /// Replace `cluster`'s tags, returning the previous set.
     fn swap_tags(&mut self, cluster: ClusterId, tags: Vec<String>) -> Vec<String> {
         if self.tags.len() <= cluster.idx() {

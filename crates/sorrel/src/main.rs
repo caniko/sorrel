@@ -645,7 +645,9 @@ fn run_share(open: &OpenArgs, port: u16, relay: Option<sorrel_remote::Multiaddr>
         None => sorrel_remote::Mode::Direct { port, dial: None },
     };
     sorrel_remote::share(
-        Box::new(sorrel_remote::SessionServed(session)),
+        Box::new(sorrel_remote::SessionServed(std::sync::Arc::new(
+            sorrel_data::SessionHost::new(session),
+        ))),
         ctx.save_dir,
         dat,
         mode,
@@ -1151,11 +1153,11 @@ impl SessionVisitor for Serve {
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
-        let mut session = seeded(session, seed)?;
+        let host = sorrel_data::SessionHost::new(seeded(session, seed)?);
         let stdin = std::io::stdin();
         let stdout = std::io::stdout();
         serve(
-            &mut session,
+            &host,
             &ctx.save_dir,
             ctx.reseal_on_save,
             phy_label_str,

@@ -6,8 +6,9 @@
 //! `serde_json`: a handful of synchronous tools do not justify an async
 //! runtime. Two transports share [`handle_line`]:
 //!
-//! - **stdio, headless** ([`serve`], `Mode::Headless`): the agent edits its
-//!   own session through the journaled commands, each edit tagged `src:agent`.
+//! - **stdio, headless** ([`serve`], `Mode::Headless`): the agent edits the
+//!   session through its [`SessionHost`], as `Actor::Agent` (tagged
+//!   `src:agent`, journaled and undoable).
 //! - **GUI listener** ([`spawn_listener`], `Mode::Attached`): the running GUI
 //!   exposes its session on a loopback socket. The agent can read, move the
 //!   human's selection and `propose`, but never edits: proposals queue for a
@@ -16,7 +17,8 @@
 //! Plots come back as SVG resources (see `report`); PNG needs a GPU
 //! surface and is deliberately out of scope.
 
-use crate::command::{CurationCommand, Method};
+use crate::command::{Actor, CurationCommand, Method};
+use crate::host::SessionHost;
 use crate::proposals::{self, Action, Outcome, Proposal, Source};
 use crate::qc_export::{collect_qc_rows, QcRow};
 use crate::report::render_cluster_svgs;
@@ -237,7 +239,7 @@ fn prompt_get(name: &str) -> Option<Value> {
 /// Serve headless until `input` closes. `reseal_on_save` follows the same
 /// rule as the GUI: true only for phy directories.
 pub fn serve<P, F>(
-    session: &mut Session<P>,
+    host: &SessionHost<P>,
     save_dir: &Path,
     reseal_on_save: bool,
     label_str: F,
@@ -250,7 +252,7 @@ where
 {
     let mut env = Env::new(save_dir, reseal_on_save, label_str);
     for line in input.lines() {
-        if let Some(reply) = handle_line(session, &mut env, &Mode::Headless, &line?) {
+        if let Some(reply) = handle_line(host, &mut env, &Mode::Headless, &line?) {
             write_json(&mut output, &reply)?;
         }
     }
@@ -258,10 +260,10 @@ where
 }
 
 /// One request line to its reply; `None` for blank lines and notifications.
-/// `Headless` edits `session` directly; `Attached` only reads it (and queues
+/// `Headless` edits through `host`; `Attached` only reads (and queues
 /// proposals), see [`handle_line_attached`] for the read-locked entry point.
 pub fn handle_line<P, F>(
-    session: &mut Session<P>,
+    host: &SessionHost<P>,
     env: &mut Env<F>,
     mode: &Mode,
     line: &str,
@@ -273,11 +275,9 @@ where
     match mode {
         Mode::Headless => {
             env.capture_client(line);
-            respond(line, false, |name, args| {
-                call_tool(session, env, name, args)
-            })
+            respond(line, false, |name, args| call_tool(host, env, name, args))
         }
-        Mode::Attached(a) => handle_line_attached(session, env, a, line),
+        Mode::Attached(a) => handle_line_attached(&host.read(), env, a, line),
     }
 }
 
@@ -395,36 +395,8 @@ fn check<P: DataProvider>(session: &Session<P>, c: u32) -> Result<ClusterId, Too
     }
 }
 
-/// `cmd` as an agent edit: the touched clusters first gain `src:agent`, in
-/// the same undoable batch.
-fn as_agent<P: DataProvider>(session: &Session<P>, cmd: CurationCommand) -> CurationCommand {
-    let mut clusters = match &cmd {
-        CurationCommand::Relabel { cluster, .. } | CurationCommand::Split { cluster, .. } => {
-            vec![*cluster]
-        }
-        CurationCommand::Merge { sources, target } => [&[*target][..], sources].concat(),
-        _ => Vec::new(),
-    };
-    clusters.sort_unstable();
-    clusters.dedup();
-    let mut children: Vec<CurationCommand> = clusters
-        .into_iter()
-        .filter(|&c| !session.tags(c).iter().any(|t| t == "src:agent"))
-        .map(|cluster| {
-            let mut tags = session.tags(cluster).to_vec();
-            tags.push("src:agent".into());
-            CurationCommand::Tag { cluster, tags }
-        })
-        .collect();
-    if children.is_empty() {
-        return cmd;
-    }
-    children.push(cmd);
-    CurationCommand::Batch { children }
-}
-
 fn call_tool<P, F>(
-    session: &mut Session<P>,
+    host: &SessionHost<P>,
     env: &mut Env<F>,
     name: &str,
     args: &Value,
@@ -433,9 +405,14 @@ where
     P: DataProvider + ApplyPhyLabel + HasGeometry,
     F: Fn(&P::Label) -> &'static str + Sync,
 {
+    let client = env.client.clone().unwrap_or_else(|| "agent".into());
+    let agent = Actor::Agent {
+        client: client.clone(),
+    };
+    let ok = |ev: crate::host::HostEvent| text(json!({"ok": true, "version": ev.version}));
     Ok(match name {
         "tag" => {
-            let cluster = check(session, arg_u32(args, "cluster")?)?;
+            let cluster = check(&host.read(), arg_u32(args, "cluster")?)?;
             let mut tags: Vec<String> = args
                 .get("tags")
                 .and_then(Value::as_array)
@@ -447,54 +424,53 @@ where
             if !tags.iter().any(|t| t == "src:agent") {
                 tags.push("src:agent".into());
             }
-            session.dispatch(CurationCommand::Tag { cluster, tags })?;
-            text(json!({"ok": true, "version": session.version()}))
+            ok(host.apply(agent, CurationCommand::Tag { cluster, tags })?)
         }
         "relabel" => {
-            let cluster = check(session, arg_u32(args, "cluster")?)?;
+            let cluster = check(&host.read(), arg_u32(args, "cluster")?)?;
             let label = args.get("label").and_then(Value::as_str).unwrap_or("");
             let Some(op) = proposals::parse_label(label) else {
                 return fail(format!("unknown label {label:?}"));
             };
-            session.dispatch(as_agent(session, CurationCommand::Relabel { cluster, op }))?;
-            text(json!({"ok": true, "version": session.version()}))
+            ok(host.apply(agent, CurationCommand::Relabel { cluster, op })?)
         }
         "merge" => {
-            let sources: Vec<ClusterId> = arg_u32_list(args, "sources")?
-                .into_iter()
-                .map(|c| check(session, c))
-                .collect::<Result<_, _>>()?;
-            let target = check(session, arg_u32(args, "target")?)?;
+            let (sources, target) = {
+                let s = host.read();
+                let sources: Vec<ClusterId> = arg_u32_list(args, "sources")?
+                    .into_iter()
+                    .map(|c| check(&s, c))
+                    .collect::<Result<_, _>>()?;
+                (sources, check(&s, arg_u32(args, "target")?)?)
+            };
             if sources.contains(&target) {
                 return fail(format!("target {} is also listed in sources", target.0));
             }
-            session.dispatch(as_agent(
-                session,
-                CurationCommand::Merge { sources, target },
-            ))?;
-            text(json!({"ok": true, "version": session.version()}))
+            ok(host.apply(agent, CurationCommand::Merge { sources, target })?)
         }
         "split" => {
-            let cluster = check(session, arg_u32(args, "cluster")?)?;
+            let cluster = check(&host.read(), arg_u32(args, "cluster")?)?;
             let spike_idx = arg_u32_list(args, "spike_idx")?;
-            session.dispatch(as_agent(
-                session,
+            let ev = host.apply(
+                agent,
                 CurationCommand::Split {
                     cluster,
                     spike_idx,
                     new_cluster: ClusterId(u32::MAX),
-                    by: Method::Llm(env.client.clone().unwrap_or_else(|| "agent".into())),
+                    by: Method::Llm(client),
                 },
-            ))?;
-            let new_cluster = session.n_clusters() - 1;
-            text(json!({"ok": true, "new_cluster": new_cluster, "version": session.version()}))
+            )?;
+            let new_cluster = ev.clusters.last().map(|c| c.0);
+            text(json!({"ok": true, "new_cluster": new_cluster, "version": ev.version}))
         }
-        "undo" => {
-            session.dispatch(CurationCommand::Undo)?;
-            text(json!({"ok": true, "version": session.version()}))
-        }
+        "undo" => ok(host.apply(agent, CurationCommand::Undo)?),
         "save" => {
-            save_session(session, env.save_dir, env.reseal_on_save, &env.label_str)?;
+            save_session(
+                &mut host.write(),
+                env.save_dir,
+                env.reseal_on_save,
+                &env.label_str,
+            )?;
             text(json!({"ok": true, "save_dir": env.save_dir.display().to_string()}))
         }
         #[cfg(feature = "phy-export")]
@@ -507,10 +483,10 @@ where
                 .get("copy_raw")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            crate::phy_export::export_phy(session, Path::new(out), copy_raw, &env.label_str)?;
+            crate::phy_export::export_phy(&host.read(), Path::new(out), copy_raw, &env.label_str)?;
             text(json!({"ok": true, "out": out}))
         }
-        _ => return call_read(session, env, name, args),
+        _ => return call_read(&host.read(), env, name, args),
     })
 }
 
@@ -1154,16 +1130,9 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"save","arguments":{}}}"#,
             "\n",
         );
+        let h = SessionHost::new(s);
         let mut out = Vec::new();
-        serve(
-            &mut s,
-            dir.path(),
-            false,
-            label,
-            Cursor::new(input),
-            &mut out,
-        )
-        .unwrap();
+        serve(&h, dir.path(), false, label, Cursor::new(input), &mut out).unwrap();
 
         let replies: Vec<Value> = String::from_utf8(out)
             .unwrap()
@@ -1178,8 +1147,8 @@ mod tests {
         );
         assert_eq!(replies[2]["id"], 3);
         assert_eq!(replies[2]["result"]["isError"], false);
-        assert_eq!(s.label(ClusterId(0)), Some(1));
-        assert!(s.spike_times(ClusterId(1)).is_empty(), "merged away");
+        assert_eq!(h.read().label(ClusterId(0)), Some(1));
+        assert!(h.read().spike_times(ClusterId(1)).is_empty(), "merged away");
 
         let listed: Value =
             serde_json::from_str(replies[4]["result"]["content"][0]["text"].as_str().unwrap())
@@ -1219,7 +1188,7 @@ mod tests {
             n_samples: SampleIndex(1000),
         };
         let dir = tempfile::tempdir().unwrap();
-        let mut s = Session::new(prov, Journal::open(&dir.path().join("j.journal")).unwrap());
+        let s = Session::new(prov, Journal::open(&dir.path().join("j.journal")).unwrap());
         std::fs::create_dir(dir.path().join("sorrel_auto")).unwrap();
         std::fs::write(
             dir.path().join("sorrel_auto/evidence.json"),
@@ -1242,9 +1211,10 @@ mod tests {
             call(4, "evidence", r#"{"cluster":1}"#),
         ]
         .concat();
+        let h = SessionHost::new(s);
         let mut out = Vec::new();
         serve(
-            &mut s,
+            &h,
             dir.path(),
             false,
             |_: &u8| "unsorted",
@@ -1262,7 +1232,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(
-            s.tags(ClusterId(1)),
+            h.read().tags(ClusterId(1)),
             ["review:merge", "src:bombcell", "src:agent"]
         );
         assert_eq!(
@@ -1321,12 +1291,12 @@ mod tests {
     #[test]
     fn attached_propose_queues_and_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = mock_session(dir.path());
+        let h = SessionHost::new(mock_session(dir.path()));
         let (a, rx) = attached(dir.path());
         let mode = Mode::Attached(a);
         let mut env = Env::new(dir.path(), false, label);
-        let version = s.version();
-        let mut run = |line: String| handle_line(&mut s, &mut env, &mode, &line).unwrap();
+        let version = h.read().version();
+        let mut run = |line: String| handle_line(&h, &mut env, &mode, &line).unwrap();
 
         let ok = run(call(
             1,
@@ -1388,34 +1358,34 @@ mod tests {
         let q = run(call(9, "attention_queue", json!({})));
         assert_eq!(q["result"]["isError"], false);
         drop(run);
-        assert_eq!(s.version(), version, "session untouched");
-        assert!(s.tags(ClusterId(0)).is_empty());
+        assert_eq!(h.read().version(), version, "session untouched");
+        assert!(h.read().tags(ClusterId(0)).is_empty());
     }
 
     #[test]
     fn headless_merge_rejects_target_among_sources() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = mock_session(dir.path());
+        let h = SessionHost::new(mock_session(dir.path()));
         let mut env = Env::new(dir.path(), false, label);
-        let version = s.version();
+        let version = h.read().version();
         let r = handle_line(
-            &mut s,
+            &h,
             &mut env,
             &Mode::Headless,
             &call(1, "merge", json!({"sources": [0, 1], "target": 0})),
         )
         .unwrap();
         assert_eq!(r["result"]["isError"], true);
-        assert_eq!(s.version(), version);
-        assert!(s.parents(ClusterId(0)).is_empty());
+        assert_eq!(h.read().version(), version);
+        assert!(h.read().parents(ClusterId(0)).is_empty());
     }
 
     #[test]
     fn headless_relabel_tags_src_agent_and_triage_prompt() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = mock_session(dir.path());
+        let h = SessionHost::new(mock_session(dir.path()));
         let mut env = Env::new(dir.path(), false, label);
-        let mut run = |line: String| handle_line(&mut s, &mut env, &Mode::Headless, &line).unwrap();
+        let mut run = |line: String| handle_line(&h, &mut env, &Mode::Headless, &line).unwrap();
         assert_eq!(
             run(call(1, "relabel", json!({"cluster": 0, "label": "good"})))["result"]["isError"],
             false
@@ -1441,8 +1411,16 @@ mod tests {
             -32602
         );
         drop(run);
+        let mut s = h.write();
         assert_eq!(s.label(ClusterId(0)), Some(1));
         assert!(s.tags(ClusterId(0)).iter().any(|t| t == "src:agent"));
+        let node = s.node(s.head().unwrap()).unwrap();
+        assert_eq!(
+            node.1,
+            &Actor::Agent {
+                client: "agent".into()
+            }
+        );
         // One undo reverts the relabel's tag and label together.
         s.dispatch(CurationCommand::Undo).unwrap();
         s.dispatch(CurationCommand::Undo).unwrap();
@@ -1452,9 +1430,9 @@ mod tests {
     #[test]
     fn headless_split_origin_names_the_mcp_client() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = mock_session(dir.path());
+        let h = SessionHost::new(mock_session(dir.path()));
         let mut env = Env::new(dir.path(), false, label);
-        let mut run = |line: String| handle_line(&mut s, &mut env, &Mode::Headless, &line).unwrap();
+        let mut run = |line: String| handle_line(&h, &mut env, &Mode::Headless, &line).unwrap();
         // No clientInfo yet: the split is attributed to "agent".
         assert_eq!(
             run(call(1, "split", json!({"cluster": 0, "spike_idx": [0]})))["result"]["isError"],
@@ -1470,6 +1448,7 @@ mod tests {
             false
         );
         drop(run);
+        let s = h.read();
         let n = s.n_clusters();
         assert_eq!(s.origin_label(ClusterId(n - 2)), "Sorrel[LLM:agent]");
         assert_eq!(s.origin_label(ClusterId(n - 1)), "Sorrel[LLM:codex]");
