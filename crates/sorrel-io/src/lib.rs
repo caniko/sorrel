@@ -29,7 +29,7 @@ pub use extras::{
     HasAmplitudes, HasGeometry, HasPcFeatures, HasQualityMetrics, HasSpikeTemplates,
     HasTemplateWaveforms, QualityMetrics,
 };
-pub use kilosort::KilosortProvider;
+pub use kilosort::{KilosortProvider, RootView};
 pub use mda::MdaHeader;
 pub use open_ephys::{OebinMeta, OebinStream};
 pub use params::PhyParams;

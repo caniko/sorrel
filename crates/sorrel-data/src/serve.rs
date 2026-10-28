@@ -20,7 +20,7 @@ use crate::command::{CurationCommand, Method};
 use crate::proposals::{self, Action, Outcome, Proposal, Source};
 use crate::qc_export::{collect_qc_rows, QcRow};
 use crate::report::render_cluster_svgs;
-use crate::save::{save_and_reseal_journal, save_to_phy};
+use crate::save::save_session;
 use crate::session::{ApplyPhyLabel, Session};
 use crate::suggest::{
     rank_merge_candidates, rank_split_candidates, MergeCandidate, SplitCandidate, SuggestConfig,
@@ -494,14 +494,7 @@ where
             text(json!({"ok": true, "version": session.version()}))
         }
         "save" => {
-            if env.reseal_on_save {
-                let journal_path = session.journal_path().to_path_buf();
-                let journal =
-                    save_and_reseal_journal(session, env.save_dir, &journal_path, &env.label_str)?;
-                session.reseal(journal);
-            } else {
-                save_to_phy(session, env.save_dir, &env.label_str)?;
-            }
+            save_session(session, env.save_dir, env.reseal_on_save, &env.label_str)?;
             text(json!({"ok": true, "save_dir": env.save_dir.display().to_string()}))
         }
         #[cfg(feature = "phy-export")]

@@ -3,8 +3,8 @@
 //! reopened state matches the saved state.
 
 use sorrel_data::{
-    baseline_hash, save_and_reseal_journal, save_to_phy, CurationCommand, Journal, PhyLabelOp,
-    Session,
+    open_phy, save_and_seal, save_to_phy, seed_phy, CurationCommand, Journal, JournalOpts,
+    PhyLabelOp, Session,
 };
 use sorrel_io::kilosort::{KilosortOpenParams, KilosortProvider, PhyLabel};
 use sorrel_io::{ClusterId, DataProvider, SampleIndex};
@@ -163,29 +163,23 @@ fn split_save_reopen_introduces_new_cluster_id() {
     assert_eq!(provider.spike_times(new_id), &[SampleIndex(30)]);
 }
 
-/// Seal a journal against the on-disk `spike_clusters.npy`, exactly as the
-/// binary does for phy directories.
-fn open_sealed(root: &Path, journal_path: &Path, n_clusters: u32) -> anyhow::Result<Journal> {
-    let baseline = baseline_hash(&std::fs::read(root.join("spike_clusters.npy")).unwrap());
-    Journal::open_or_create(journal_path, baseline, n_clusters)
+/// Open and seed the directory the way the binary does.
+fn open(root: &Path) -> anyhow::Result<Session<KilosortProvider>> {
+    let mut s = open_phy(root, KilosortOpenParams::default(), &JournalOpts::default())?;
+    seed_phy(&mut s)?;
+    Ok(s)
 }
 
-/// The production save path: the phy artifacts are rewritten *and* the
-/// journal is resealed, so reopening loads the saved state once instead
-/// of replaying the same edits on top of it (the pre-reseal bug turned
-/// every reopen-after-save into a second application of each split).
+/// The production save path keeps the action tree: reopening replays the
+/// journal onto the root snapshot, so the saved state comes back exactly
+/// once (a split is not applied twice) and the history is still there.
 #[test]
-fn reopen_after_save_and_reseal_yields_identical_state_once() {
+fn reopen_after_save_yields_identical_state_and_keeps_history() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write_fixture(root);
-
-    let journal_path = root.join("sorrel.journal");
     {
-        let provider = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
-        let journal = open_sealed(root, &journal_path, provider.n_clusters()).unwrap();
-        let mut session = Session::new(provider, journal);
-
+        let mut session = open(root).unwrap();
         session
             .dispatch(CurationCommand::Relabel {
                 cluster: ClusterId(0),
@@ -207,23 +201,19 @@ fn reopen_after_save_and_reseal_yields_identical_state_once() {
                 by: sorrel_data::command::Method::Manual,
             })
             .unwrap();
-        let before = (session.history_len(), session.redo_len());
-        assert_eq!(before, (3, 0));
-
-        let journal = save_and_reseal_journal(&session, root, &journal_path, label_str).unwrap();
-        session.reseal(journal);
-        assert_eq!((session.history_len(), session.redo_len()), (0, 0));
+        save_and_seal(&mut session, root, label_str).unwrap();
+        assert!(session.is_saved());
+        assert_eq!((session.history_len(), session.redo_len()), (3, 0));
     }
 
-    // Reopen the way the binary does: the saved npy is the new baseline.
-    let provider = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
-    let n_clusters = provider.n_clusters();
-    let journal = open_sealed(root, &journal_path, n_clusters).unwrap();
-    let mut session = Session::new(provider, journal);
-    session.replay_journal().unwrap();
-
-    assert_eq!(session.history_len(), 0, "resealed journal has no records");
-    assert_eq!(n_clusters, 4, "one split allocated exactly one cluster");
+    let mut session = open(root).unwrap();
+    assert_eq!(session.history_len(), 3, "the tree survives the save");
+    assert!(session.is_saved(), "the files on disk are the head's");
+    assert_eq!(
+        session.n_clusters(),
+        4,
+        "one split allocated exactly one cluster"
+    );
     assert_eq!(session.label(ClusterId(0)), Some(PhyLabel::Good));
     assert_eq!(
         session.spike_times(ClusterId(0)),
@@ -235,6 +225,16 @@ fn reopen_after_save_and_reseal_yields_identical_state_once() {
         session.spike_times(ClusterId(2)),
         &[SampleIndex(50), SampleIndex(100), SampleIndex(200)]
     );
+    // Undo past the save reaches the sort as it was.
+    for _ in 0..3 {
+        session.dispatch(CurationCommand::Undo).unwrap();
+    }
+    assert!(!session.is_saved());
+    assert_eq!(session.n_clusters(), 3);
+    assert_eq!(
+        session.spike_times(ClusterId(1)),
+        &[SampleIndex(50), SampleIndex(200)]
+    );
 }
 
 /// A saved sorter pin is the default; `set_sorter` (`--sorter`) overrides it.
@@ -243,11 +243,8 @@ fn set_sorter_overrides_saved_pin() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write_fixture(root);
-    let journal_path = root.join("sorrel.journal");
     {
-        let provider = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
-        let journal = open_sealed(root, &journal_path, provider.n_clusters()).unwrap();
-        let mut session = Session::new(provider, journal);
+        let mut session = open(root).unwrap();
         session.set_sorter("kilosort4");
         session
             .dispatch(CurationCommand::Merge {
@@ -255,12 +252,11 @@ fn set_sorter_overrides_saved_pin() {
                 target: ClusterId(2),
             })
             .unwrap();
-        let journal = save_and_reseal_journal(&session, root, &journal_path, label_str).unwrap();
-        session.reseal(journal);
+        save_and_seal(&mut session, root, label_str).unwrap();
     }
 
     let provider = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
-    let journal = open_sealed(root, &journal_path, provider.n_clusters()).unwrap();
+    let journal = Journal::open(&root.join("other.journal")).unwrap();
     let mut session = Session::new(provider, journal);
     assert_eq!(session.sorter(), "kilosort4", "saved pin is the default");
     session.fill_detected_sorter(Some("detected".into()));
@@ -273,20 +269,18 @@ fn set_sorter_overrides_saved_pin() {
     assert_eq!(session.sorter(), "x");
 }
 
-/// Origins, parents, notes and the tuned/split markers live in the
-/// annotations sidecar, so they survive a save that empties the journal.
+/// Origins, parents, notes and the tuned/split markers survive a save and
+/// reopen (replayed from the journal), and land in the annotations sidecar
+/// for phy and other readers.
 #[test]
-fn origin_parents_and_notes_survive_save_reseal_and_reopen() {
+fn origin_parents_and_notes_survive_save_and_reopen() {
     use sorrel_data::command::{Method, UnitOrigin};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write_fixture(root);
-    let journal_path = root.join("sorrel.journal");
     let note = "two\tlines\nand a \\ slash";
     {
-        let provider = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
-        let journal = open_sealed(root, &journal_path, provider.n_clusters()).unwrap();
-        let mut session = Session::new(provider, journal);
+        let mut session = open(root).unwrap();
         session.set_sorter("kilosort4");
         let cmds = [
             CurationCommand::Merge {
@@ -307,15 +301,11 @@ fn origin_parents_and_notes_survive_save_reseal_and_reopen() {
         for c in cmds {
             session.dispatch(c).unwrap();
         }
-        let journal = save_and_reseal_journal(&session, root, &journal_path, label_str).unwrap();
-        session.reseal(journal);
+        save_and_seal(&mut session, root, label_str).unwrap();
     }
 
-    let provider = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
-    let journal = open_sealed(root, &journal_path, provider.n_clusters()).unwrap();
-    let mut session = Session::new(provider, journal);
-    session.replay_journal().unwrap();
-    assert_eq!(session.history_len(), 0);
+    let session = open(root).unwrap();
+    assert_eq!(session.history_len(), 3);
     assert_eq!(session.sorter(), "kilosort4", "Auto row pins the sorter");
     assert_eq!(session.origin_label(ClusterId(0)), "Auto[kilosort4]");
     assert_eq!(session.tags(ClusterId(0)), ["split"]);
@@ -334,19 +324,15 @@ fn origin_parents_and_notes_survive_save_reseal_and_reopen() {
     assert!(!tsv.contains("\n1\t"), "empty unit 1 gets no row");
 }
 
-/// A plain `save_to_phy` (no reseal) followed by a sealed reopen must fail
-/// closed: the journal's edits were recorded against the pre-save bytes.
+/// A plain `save_to_phy` into the directory (no seal, no root snapshot)
+/// rewrites the root itself, so the next open fails closed.
 #[test]
-fn sealed_open_refuses_journal_after_unresealed_save() {
+fn open_refuses_journal_after_unsealed_save() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write_fixture(root);
-
-    let journal_path = root.join("sorrel.journal");
     {
-        let provider = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
-        let journal = open_sealed(root, &journal_path, provider.n_clusters()).unwrap();
-        let mut session = Session::new(provider, journal);
+        let mut session = open(root).unwrap();
         session
             .dispatch(CurationCommand::Merge {
                 sources: vec![ClusterId(1)],
@@ -355,10 +341,9 @@ fn sealed_open_refuses_journal_after_unresealed_save() {
             .unwrap();
         save_to_phy(&session, root, label_str).unwrap();
     }
-
-    let err = open_sealed(root, &journal_path, 3).unwrap_err();
+    let err = open(root).err().expect("refused");
     assert!(
-        err.to_string().contains("changed since"),
+        format!("{err:#}").contains("changed since this journal was sealed"),
         "unexpected error: {err:#}"
     );
 }

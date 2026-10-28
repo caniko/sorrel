@@ -63,6 +63,23 @@ impl std::str::FromStr for Method {
     }
 }
 
+/// Who made an edit in the action tree. Journaled with every node; closed,
+/// so a new kind needs a journal version bump.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum Actor {
+    #[default]
+    Human,
+    Agent {
+        client: String,
+    },
+    Algo {
+        name: String,
+    },
+    Remote {
+        peer: String,
+    },
+}
+
 /// Where a unit came from: straight out of the sorter, or created in sorrel.
 /// Exclusive; there is no "unknown" state.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -130,9 +147,9 @@ impl std::str::FromStr for UnitOrigin {
 /// Strongly-typed curation operations. Concrete enum -> no `Box<dyn Trait>`,
 /// no per-op heap allocation, perfectly packed history.
 ///
-/// `Undo`/`Redo` are first-class journal records: the on-disk log captures
-/// every user action, including reversions. Replay reconstructs the same
-/// in-memory history/redo stacks the live session would hold.
+/// `Undo`/`Redo` move the head of the action tree (parent / most recently
+/// visited child); the journal records them as head moves, never as nodes.
+/// Pre-v3 journals stored them as records, which the v3 upgrade folds.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CurationCommand {
     Relabel {

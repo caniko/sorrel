@@ -14,9 +14,7 @@ use crate::widgets::TraceCache;
 use eframe::egui;
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::SpikeDepths;
-use sorrel_data::{
-    export_qc, save_and_reseal_journal, save_to_phy, CurationCommand, PhyLabelOp, Session,
-};
+use sorrel_data::{export_qc, save_session, CurationCommand, PhyLabelOp, Session};
 use sorrel_gpu::GpuContext;
 use sorrel_io::{ClusterId, DataProvider, Events};
 use sorrel_render::{GpuTracePreproc, TracePreproc};
@@ -150,9 +148,6 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     /// Last status message + the time it was set, so the top bar can fade
     /// it out after a few seconds rather than pinning it.
     status: Option<(String, Instant)>,
-    /// Snapshot of `(history_len, redo_len)` at the last successful save. The
-    /// title bar shows a "•" dirty marker when current state differs.
-    saved_state: (usize, usize),
     /// Hover text of the "saved" status chip once a save succeeded.
     last_save: Option<String>,
     /// Optional pre-processing applied to the trace window before LTTB.
@@ -302,7 +297,6 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             session: Arc::new(RwLock::new(session)),
             loading: None,
             load_error: None,
-            saved_state: (0, 0),
             last_save: None,
             label_str,
             selection: SelectionSet::new(),
@@ -367,16 +361,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     /// Called once the session is seeded: initial selection, clean-state
     /// snapshot, and the per-dataset prefs.
     fn finish_loading(&mut self) {
-        let (n_clusters, sr, history, redo) = {
+        let (n_clusters, sr) = {
             let s = read(&self.session);
-            (
-                s.n_clusters(),
-                s.provider.sample_rate(),
-                s.history_len(),
-                s.redo_len(),
-            )
+            (s.n_clusters(), s.provider.sample_rate())
         };
-        self.saved_state = (history, redo);
         if n_clusters > 0 && self.selection.is_empty() {
             self.selection = SelectionSet::single(ClusterId(0));
         }
@@ -468,11 +456,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     /// typically points this at the kilosort root. Also loads the
     /// per-dataset UI prefs stored next to the cache.
     ///
-    /// `reseal` must be `true` only for backends that read the saved
-    /// `spike_clusters.npy` back on open (phy/Kilosort): the journal is then
-    /// truncated at save so the next open does not replay the same edits on
-    /// top of already-curated data. Backends that reload the original sort
-    /// (SortingAnalyzer, NWB, rez) keep the journal as the source of truth.
+    /// `reseal` must be `true` only when `dir` is the phy/Kilosort directory
+    /// the session was opened from: the save then captures the root and
+    /// seals the journal (`sorrel_data::save_and_seal`). Other targets get a
+    /// plain export.
     pub fn set_save_dir(&mut self, dir: PathBuf, reseal: bool) {
         let prefs = UiPrefs::load(&dir);
         match Events::detect(&dir) {
@@ -493,23 +480,13 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     }
 
     /// Write the phy artifacts into `dir`, dropping stale derived-cache
-    /// entries, and reseal the journal when this backend requires it.
+    /// entries, and seal the journal when this backend requires it.
     fn save_to(&mut self, dir: &Path) -> anyhow::Result<()> {
         self.cancel_jobs();
         let mut session = write(&self.session);
-        if self.reseal_on_save {
-            let journal_path = session.journal_path().to_path_buf();
-            // Invalidate before the reseal drops the pending-invalidation list.
-            if let Err(err) = session.invalidate_dataset_caches() {
-                log::warn!("cache invalidation after save failed: {err}");
-            }
-            let journal = save_and_reseal_journal(&session, dir, &journal_path, self.label_str)?;
-            session.reseal(journal);
-        } else {
-            save_to_phy(&session, dir, self.label_str)?;
-            if let Err(err) = session.invalidate_dataset_caches() {
-                log::warn!("cache invalidation after save failed: {err}");
-            }
+        save_session(&mut session, dir, self.reseal_on_save, self.label_str)?;
+        if let Err(err) = session.invalidate_dataset_caches() {
+            log::warn!("cache invalidation after save failed: {err}");
         }
         Ok(())
     }
@@ -557,9 +534,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         self.channel_positions = positions;
     }
 
+    /// The title bar shows a "•" dirty marker while the head is not the
+    /// saved node.
     fn dirty(&self) -> bool {
-        let s = read(&self.session);
-        (s.history_len(), s.redo_len()) != self.saved_state
+        !read(&self.session).is_saved()
     }
 
     /// Stop background jobs so the write lock is free at once.
@@ -866,19 +844,8 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     // No toast: the status chip carries the save state, and
                     // a stale edit message must not outlive the save.
                     self.status = None;
-                    self.last_save = Some(format!(
-                        "Saved to {}{}",
-                        dir.display(),
-                        if self.reseal_on_save {
-                            " · undo history sealed"
-                        } else {
-                            ""
-                        }
-                    ));
+                    self.last_save = Some(format!("Saved to {}", dir.display()));
                     self.error = None;
-                    let s = read(&self.session);
-                    self.saved_state = (s.history_len(), s.redo_len());
-                    drop(s);
                     self.save_prefs();
                 }
                 Err(e) => {
@@ -2379,7 +2346,7 @@ mod tests {
         assert!(app.last_save.is_some(), "save should feed the saved chip");
         assert!(
             !app.dirty(),
-            "saved_state should snap to current after a successful save"
+            "the head is the saved node after a successful save"
         );
         let prefs = UiPrefs::load(dir.path());
         assert!(prefs.tree.is_some(), "prefs written next to the dataset");
@@ -2408,12 +2375,16 @@ mod tests {
     #[test]
     fn loader_runs_off_thread_and_then_unlocks_the_session() {
         let dir = tempfile::tempdir().unwrap();
-        let mut app = SorrelApp::with_loader(stub_session(dir.path()), label_str, |s| {
-            s.dispatch(CurationCommand::Relabel {
+        let mut earlier = stub_session(dir.path());
+        earlier
+            .dispatch(CurationCommand::Relabel {
                 cluster: ClusterId(1),
                 op: PhyLabelOp::SetGood,
             })
-        });
+            .unwrap();
+        drop(earlier);
+        let mut app =
+            SorrelApp::with_loader(stub_session(dir.path()), label_str, |s| s.replay_journal());
         assert!(app.loading.is_some());
         let rx = app.loading.take().unwrap();
         rx.recv_timeout(std::time::Duration::from_secs(5))

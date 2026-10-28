@@ -1,9 +1,10 @@
 //! Write the curated session as a complete phy template-gui directory.
 //!
 //! Two paths, picked by [`DataProvider::phy_dir`]:
-//! - **phy/Kilosort source**: its `*.npy`/`*.tsv`/`*.csv` files are copied
-//!   byte for byte; only the curation (`spike_clusters.npy`,
-//!   `cluster_group.tsv`) and `params.py` are rewritten.
+//! - **phy/Kilosort source**: its `*.npy`/`*.tsv`/`*.csv` files, as the sort
+//!   left them (`sorrel_io::RootView`), are copied byte for byte; only the
+//!   curation (`spike_clusters.npy`, `cluster_group.tsv`) and `params.py`
+//!   are rewritten.
 //! - **any other backend** (SortingAnalyzer, NWB, rez): the arrays phy
 //!   requires are written from memory, with one mean template per cluster
 //!   computed from the raw trace, the way SpikeInterface's `export_to_phy`
@@ -14,12 +15,12 @@
 //! `recording.dat` instead. It is written last, so an interrupted export
 //! never looks complete to phy.
 
-use crate::save::{has_added_spikes, write_phy_assignments, write_spike_array_tmps};
+use crate::save::{needs_array_rewrite, write_phy_assignments, write_spike_array_tmps};
 use crate::session::Session;
 use anyhow::{bail, ensure, Context, Result};
 use rayon::prelude::*;
 use sorrel_io::npy::{write_1d_u32_atomic, write_1d_u64_atomic, write_f32_atomic};
-use sorrel_io::{ClusterId, DataProvider, HasGeometry, SampleIndex, TraceDtype};
+use sorrel_io::{ClusterId, DataProvider, HasGeometry, RootView, SampleIndex, TraceDtype};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -79,12 +80,13 @@ where
     match provider.phy_dir() {
         Some(src) => {
             // Added spikes: the per-spike arrays are rewritten, not copied.
-            let rewritten = if has_added_spikes(session.cluster_index()) {
-                write_spike_array_tmps(session, src, out)?
+            let src = RootView::open(src)?;
+            let rewritten = if needs_array_rewrite(session.cluster_index(), &src) {
+                write_spike_array_tmps(session, &src, out)?
             } else {
                 Vec::new()
             };
-            copy_phy_files(src, out, &rewritten)?;
+            copy_phy_files(&src, out, &rewritten)?;
             for n in &rewritten {
                 let (from, to) = (out.join(format!("{n}.tmp")), out.join(n));
                 std::fs::rename(&from, &to)
@@ -120,20 +122,17 @@ where
     atomically(&out.join("params.py"), |tmp| std::fs::write(tmp, params))
 }
 
-/// Copy the phy files of `src` (top level only) into `out`.
-fn copy_phy_files(src: &Path, out: &Path, skip: &[String]) -> Result<()> {
-    for entry in std::fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let ext = Path::new(name).extension().and_then(|e| e.to_str());
+/// Copy the root versions of the phy files of `src` (top level only) into
+/// `out`.
+fn copy_phy_files(src: &RootView, out: &Path, skip: &[String]) -> Result<()> {
+    for (name, from) in src.files() {
+        let ext = Path::new(&name).extension().and_then(|e| e.to_str());
         let wanted = ext.is_some_and(|e| COPIED_EXTENSIONS.contains(&e))
             && !name.starts_with('.')
-            && !REWRITTEN.contains(&name)
-            && !skip.iter().any(|s| s == name);
-        if wanted && entry.file_type()?.is_file() {
-            let from = entry.path();
-            atomically(&out.join(name), |tmp| std::fs::copy(&from, tmp).map(drop))?;
+            && !REWRITTEN.contains(&name.as_str())
+            && !skip.contains(&name);
+        if wanted && from.is_file() {
+            atomically(&out.join(&name), |tmp| std::fs::copy(&from, tmp).map(drop))?;
         }
     }
     Ok(())

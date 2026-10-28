@@ -1,13 +1,12 @@
 //! Writer for SpikeInterface's manual-curation JSON (`format_version` 2).
 //!
-//! The document describes what is **not yet** in the artifacts the journal
-//! is sealed against: labels for every unit, plus the merges and splits on
-//! the undo stack. After `save_and_reseal_journal` the stack is empty and
-//! the file degrades to labels only, which is exactly right for phy
-//! directories where `spike_clusters.npy` already carries the structure.
-//! For SortingAnalyzer folders (never resealed) the file is the carrier,
-//! and `spikeinterface.curation.apply_curation(analyzer, "curation.json")`
-//! reproduces the session.
+//! The document describes the session relative to the sorter's output:
+//! labels for every unit, plus the merges and splits on the path to the
+//! head. A phy directory saved onto itself (`save_and_seal`) gets the
+//! labels-only form instead, because its `spike_clusters.npy` already
+//! carries the structure. For SortingAnalyzer folders the file is the
+//! carrier, and `spikeinterface.curation.apply_curation(analyzer,
+//! "curation.json")` reproduces the session.
 //!
 //! Field names follow `spikeinterface/curation/curation_model.py`:
 //! `format_version`, `unit_ids`, `label_definitions`, `manual_labels`,
@@ -52,8 +51,8 @@ where
     build(session, label_str, session.applied_commands())
 }
 
-/// The document for a session whose artifacts were just rewritten and whose
-/// journal is about to be resealed: labels only, every cluster a unit.
+/// The document for a session whose artifacts were just rewritten (a sealed
+/// save): labels only, every cluster a unit.
 pub fn curation_document_sealed<P, F>(session: &Session<P>, label_str: F) -> Value
 where
     P: DataProvider,
@@ -69,8 +68,8 @@ where
 {
     let p = &session.provider;
     let uid = |c| p.unit_id(c);
-    // With edits pending, the units are the backend's originals; once
-    // resealed every cluster in the artifacts is a unit.
+    // With edits on the path, the units are the backend's originals; in a
+    // sealed save every cluster in the artifacts is a unit.
     let n_units = if history.is_empty() {
         session.n_clusters()
     } else {

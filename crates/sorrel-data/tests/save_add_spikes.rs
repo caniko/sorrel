@@ -1,10 +1,12 @@
-//! Save after `AddSpikes`: every per-spike array of a phy directory is
-//! rewritten aligned and time-sorted, originals are backed up, unknown
-//! per-spike files block the save, and an interrupted rewrite rolls forward.
+//! Saving a phy directory: after `AddSpikes` every per-spike array is
+//! rewritten aligned and time-sorted, the root versions are captured into
+//! `sorrel_original/`, unknown per-spike files block the save, a crash at any
+//! point of the save reopens cleanly, and an external edit fails closed.
 
 use sorrel_data::command::SpikeBatch;
 use sorrel_data::{
-    open_phy, save_and_reseal_journal, seed_phy, CurationCommand, JournalOpts, Session,
+    baseline_hash, open_phy, save_and_seal, seed_phy, CurationCommand, JournalOpts, PhyLabelOp,
+    Session,
 };
 use sorrel_io::kilosort::{KilosortOpenParams, KilosortProvider, PhyLabel};
 use sorrel_io::npy::{read_1d_f32, read_1d_u32, read_npy_f32_flat, read_npy_u32_flat};
@@ -162,7 +164,7 @@ fn save_and_reseal_rewrites_every_array_aligned() {
     let before = snapshot(root);
     let mut s = open(root);
     add_two(&mut s);
-    save_and_reseal_journal(&s, root, &root.join("j.journal"), label_str).unwrap();
+    save_and_seal(&mut s, root, label_str).unwrap();
 
     let u32f = |n: &str| read_1d_u32(&root.join(n)).unwrap();
     assert_eq!(
@@ -189,7 +191,7 @@ fn save_and_reseal_rewrites_every_array_aligned() {
     assert_eq!(&tf[6..8], [2., 2.5]);
     assert!(read_npy_u32_flat(&root.join("pc_feature_ind.npy")).is_ok());
 
-    // Backups are the untouched originals; the stale phy cache moved aside.
+    // The root copies are the untouched originals; the stale phy cache moved aside.
     for n in [
         "spike_times.npy",
         "spike_clusters.npy",
@@ -208,7 +210,7 @@ fn save_and_reseal_rewrites_every_array_aligned() {
     assert!(!root.join("sorrel_rewrite.pending").exists());
     assert!(!root.join("spike_times.npy.tmp").exists());
 
-    // The sealed directory reopens, aligned, with a journal that replays clean.
+    // The provider reads the root; the journal replays the rescue onto it.
     let p = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
     let times = |c| {
         p.spike_times(ClusterId(c))
@@ -216,14 +218,19 @@ fn save_and_reseal_rewrites_every_array_aligned() {
             .map(|t| t.0)
             .collect::<Vec<_>>()
     };
-    assert_eq!(times(1), [40, 50, 200]);
-    assert_eq!(times(2), [100, 100]);
-    let s2 = open(root);
+    assert_eq!(times(1), [50, 200]);
+    assert_eq!(times(2), [100]);
+    let mut s2 = open(root);
+    assert!(s2.is_saved());
     assert_eq!(s2.cluster_index().n_spikes(), 8);
-    assert_eq!(
-        s2.cluster_index().spike_attribute("sorrel_rescued", 2),
-        Some(&[1.0][..])
-    );
+    // Undoing the rescue and saving again writes the original arrays back
+    // (from the root copies) instead of misaligning them.
+    s2.dispatch(CurationCommand::Undo).unwrap();
+    save_and_seal(&mut s2, root, label_str).unwrap();
+    assert_eq!(u32f("spike_times.npy"), [10, 30, 50, 100, 150, 200]);
+    assert_eq!(u32f("spike_clusters.npy"), [0, 0, 1, 2, 0, 1]);
+    assert_eq!(u32f("spike_sorrel_rescued.npy"), [0; 6]);
+    assert_eq!(open(root).cluster_index().n_spikes(), 6);
 }
 
 #[test]
@@ -235,7 +242,7 @@ fn unknown_per_spike_array_blocks_the_save() {
     let before = snapshot(root);
     let mut s = open(root);
     add_two(&mut s);
-    let e = save_and_reseal_journal(&s, root, &root.join("j.journal"), label_str).unwrap_err();
+    let e = save_and_seal(&mut s, root, label_str).unwrap_err();
     assert!(e.to_string().contains("foo.npy"), "{e}");
     let after = snapshot(root);
     // Only the journal (opened by the session) may differ.
@@ -334,7 +341,7 @@ fn wide_spike_attribute_survives_the_rewrite() {
         ],
     }))
     .unwrap();
-    save_and_reseal_journal(&s, root, &root.join("j.journal"), label_str).unwrap();
+    save_and_seal(&mut s, root, label_str).unwrap();
     let (flat, shape) = read_npy_f32_flat(&root.join("spike_wide.npy")).unwrap();
     assert_eq!(shape, [8, 3]);
     assert_eq!(&flat[6..9], [-1., -2., -3.]); // added spike at g = 2
@@ -352,12 +359,12 @@ fn cleared_custom_label_is_blanked_not_restored() {
     };
     let mut s = open(root);
     set(&mut s, "great");
-    save_and_reseal_journal(&s, root, &root.join("j.journal"), label_str).unwrap();
+    save_and_seal(&mut s, root, label_str).unwrap();
     let mut s = open(root);
     assert_eq!(s.custom_label(ClusterId(1), "quality"), Some("great"));
 
     set(&mut s, "");
-    save_and_reseal_journal(&s, root, &root.join("j.journal"), label_str).unwrap();
+    save_and_seal(&mut s, root, label_str).unwrap();
     // The user's file is kept, header only.
     let tsv = std::fs::read_to_string(root.join("cluster_quality.tsv")).unwrap();
     assert_eq!(tsv, "cluster_id\tquality\n");
@@ -366,10 +373,22 @@ fn cleared_custom_label_is_blanked_not_restored() {
     assert!(s.custom_label_keys().is_empty());
 }
 
-/// Run a full add-spikes save, then rebuild the directory as a crash would
-/// have left it: pre-save files in place, every changed file staged as
-/// `<name>.tmp`, the manifest published, and the first `renamed` renames done.
-fn crash_after_manifest(renamed: usize) -> tempfile::TempDir {
+/// Where a save was interrupted (see `save_and_seal`'s steps).
+#[derive(Clone, Copy, Debug)]
+enum Crash {
+    /// Tmps staged; nothing captured, nothing journaled.
+    BeforeCapture,
+    /// Root captured; no seal yet.
+    BeforeSeal,
+    /// Seal journaled; no manifest yet.
+    BeforeManifest,
+    /// Manifest published and the first `n` renames done.
+    Renamed(usize),
+}
+
+/// Run a full add-spikes save, then rebuild the directory as a crash at
+/// `at` would have left it.
+fn crash(at: Crash) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write_fixture(root);
@@ -381,22 +400,30 @@ fn crash_after_manifest(renamed: usize) -> tempfile::TempDir {
     s.dispatch(cmd).unwrap();
     s.dispatch(CurationCommand::Relabel {
         cluster: ClusterId(2),
-        op: sorrel_data::PhyLabelOp::SetGood,
+        op: PhyLabelOp::SetGood,
     })
     .unwrap();
     let pre = snapshot(root);
-    save_and_reseal_journal(&s, root, &root.join("j.journal"), label_str).unwrap();
+    save_and_seal(&mut s, root, label_str).unwrap();
     drop(s);
     let post = snapshot(root);
 
-    let mut changed: Vec<&String> = post
+    let changed: Vec<&String> = post
         .iter()
-        .filter(|(k, v)| pre.get(*k) != Some(*v))
+        .filter(|(k, v)| pre.get(*k) != Some(*v) && k.as_str() != "j.journal")
         .map(|(k, _)| k)
         .collect();
-    changed.sort_by_key(|k| k.as_str() == "j.journal"); // journal last
-    assert!(changed.iter().any(|k| *k == "j.journal"));
     assert!(changed.iter().any(|k| *k == "spike_clusters.npy"));
+    if matches!(at, Crash::BeforeCapture | Crash::BeforeSeal) {
+        std::fs::write(root.join("j.journal"), &pre["j.journal"]).unwrap();
+    }
+    if matches!(at, Crash::BeforeCapture) {
+        std::fs::remove_dir_all(root.join("sorrel_original")).unwrap();
+    }
+    let renamed = match at {
+        Crash::Renamed(n) => n,
+        _ => 0,
+    };
     let mut manifest = String::new();
     for (i, name) in changed.iter().enumerate() {
         match pre.get(*name) {
@@ -410,35 +437,164 @@ fn crash_after_manifest(renamed: usize) -> tempfile::TempDir {
         }
         manifest.push_str(&format!("{name}.tmp\t{name}\n"));
     }
-    std::fs::write(root.join("sorrel_rewrite.pending"), manifest).unwrap();
+    if matches!(at, Crash::Renamed(_)) {
+        std::fs::write(root.join("sorrel_rewrite.pending"), manifest).unwrap();
+    }
     dir
 }
 
-fn assert_resealed_with_everything(root: &Path) {
-    let s = open(root); // roll-forward, then the journal seal check
+/// The reopened session is the head with every edit, whatever the files.
+fn assert_head_with_everything(s: &Session<KilosortProvider>) {
     assert_eq!(s.cluster_index().n_spikes(), 8);
     assert_eq!(s.custom_label(ClusterId(1), "quality"), Some("great"));
     assert_eq!(s.label(ClusterId(2)), Some(PhyLabel::Good));
-    assert_eq!(s.journal().n_records(), 0, "journal resealed");
+    assert_eq!(s.history_len(), 3, "the journal keeps the history");
+}
+
+/// After the manifest, the next open finishes the save: the files are the
+/// head's and match its seal.
+#[test]
+fn crash_after_the_manifest_completes_on_open() {
+    for n in [0, 3, usize::MAX] {
+        let dir = crash(Crash::Renamed(n));
+        let root = dir.path();
+        let s = open(root); // roll-forward, then the external-edit check
+        assert_head_with_everything(&s);
+        assert!(s.is_saved(), "renamed {n}");
+        assert!(!root.join("sorrel_rewrite.pending").exists());
+        assert!(snapshot(root).keys().all(|k| !k.ends_with(".tmp")));
+        assert_eq!(read_1d_u32(&root.join("spike_times.npy")).unwrap().len(), 8);
+    }
+}
+
+/// Before the manifest, the old files stay on top; they are the root (or an
+/// older seal), so the directory opens at the head, unsaved, and a second
+/// save goes through.
+#[test]
+fn crash_before_the_manifest_reopens_unsaved_and_saves_again() {
+    for at in [
+        Crash::BeforeCapture,
+        Crash::BeforeSeal,
+        Crash::BeforeManifest,
+    ] {
+        let dir = crash(at);
+        let root = dir.path();
+        let mut s = open(root);
+        assert_head_with_everything(&s);
+        assert!(!s.is_saved(), "{at:?}");
+        assert_eq!(
+            read_1d_u32(&root.join("spike_times.npy")).unwrap().len(),
+            6,
+            "{at:?}: old files on top"
+        );
+        save_and_seal(&mut s, root, label_str).unwrap();
+        drop(s);
+        let s = open(root);
+        assert_head_with_everything(&s);
+        assert!(s.is_saved(), "{at:?}");
+    }
+}
+
+/// A phy edit after a sorrel save (a label in `cluster_group.tsv`) would be
+/// overwritten by the next save, so the open refuses; `--discard-journal`
+/// sets the journal and the snapshot aside and starts from the files.
+#[test]
+fn external_edit_after_a_save_fails_closed_until_discarded() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_fixture(root);
+    let mut s = open(root);
+    s.dispatch(CurationCommand::Relabel {
+        cluster: ClusterId(0),
+        op: PhyLabelOp::SetGood,
+    })
+    .unwrap();
+    save_and_seal(&mut s, root, label_str).unwrap();
+    drop(s);
+    std::fs::write(
+        root.join("cluster_group.tsv"),
+        "cluster_id\tgroup\n0\tgood\n1\tnoise\n",
+    )
+    .unwrap();
+
+    let opts = |discard| JournalOpts {
+        path: Some(root.join("j.journal")),
+        discard,
+    };
+    let e = open_phy(root, KilosortOpenParams::default(), &opts(false))
+        .err()
+        .expect("refused");
+    assert!(e.to_string().contains("--discard-journal"), "{e}");
+
+    let mut s = open_phy(root, KilosortOpenParams::default(), &opts(true)).unwrap();
+    seed_phy(&mut s).unwrap();
+    assert_eq!(s.history_len(), 0);
     assert_eq!(
-        s.cluster_index().spike_attribute("sorrel_rescued", 2),
-        Some(&[1.0][..])
+        s.label(ClusterId(0)),
+        Some(PhyLabel::Good),
+        "saved by sorrel"
     );
-    assert!(!root.join("sorrel_rewrite.pending").exists());
-    assert!(snapshot(root).keys().all(|k| !k.ends_with(".tmp")));
+    assert_eq!(
+        s.label(ClusterId(1)),
+        Some(PhyLabel::Noise),
+        "edited in phy"
+    );
+    let names: Vec<String> = std::fs::read_dir(root)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().into_string().unwrap())
+        .collect();
+    let aside = |p: &str| names.iter().any(|n| n.starts_with(p) && n.len() > p.len());
+    assert!(
+        aside("j.journal.") && aside("sorrel_original."),
+        "{names:?}"
+    );
+    assert!(!root.join("sorrel_original").exists());
 }
 
+/// A v2 journal (with an undo) upgrades on open: it replays onto the files
+/// it was sealed against, and a manifest-less `sorrel_original/` from a
+/// pre-v3 rescue is moved aside rather than read as the root.
 #[test]
-fn crash_after_manifest_before_any_rename_completes_on_open() {
-    let dir = crash_after_manifest(0);
-    assert_resealed_with_everything(dir.path());
-}
+fn v2_journal_and_legacy_backup_upgrade_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_fixture(root);
+    std::fs::create_dir(root.join("sorrel_original")).unwrap();
+    std::fs::write(root.join("sorrel_original/spike_times.npy"), b"old").unwrap();
+    let mut bytes = b"SORREL\x00\x02".to_vec();
+    bytes.extend(2u32.to_le_bytes());
+    bytes.extend(0u32.to_le_bytes());
+    let sc = std::fs::read(root.join("spike_clusters.npy")).unwrap();
+    bytes.extend(baseline_hash(&sc).to_le_bytes());
+    bytes.extend(3u32.to_le_bytes());
+    bytes.extend(0u32.to_le_bytes());
+    for c in [
+        CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetGood,
+        },
+        CurationCommand::Relabel {
+            cluster: ClusterId(1),
+            op: PhyLabelOp::SetMua,
+        },
+        CurationCommand::Undo,
+    ] {
+        let rec = rmp_serde::to_vec(&c).unwrap();
+        bytes.extend((rec.len() as u32).to_le_bytes());
+        bytes.extend(rec);
+    }
+    std::fs::write(root.join("j.journal"), bytes).unwrap();
 
-#[test]
-fn crash_after_partial_rename_completes_on_open() {
-    // Mid-way: some arrays renamed, the journal still old.
-    let dir = crash_after_manifest(3);
-    assert_resealed_with_everything(dir.path());
+    let s = open(root);
+    assert_eq!(s.label(ClusterId(0)), Some(PhyLabel::Good));
+    assert_eq!(s.label(ClusterId(1)), Some(PhyLabel::Unsorted));
+    assert_eq!((s.history_len(), s.redo_len(), s.n_nodes()), (1, 1, 2));
+    assert!(!root.join("sorrel_original").exists());
+    assert_eq!(
+        &std::fs::read(root.join("j.journal")).unwrap()[..8],
+        b"SORREL\x00\x03"
+    );
 }
 
 #[test]

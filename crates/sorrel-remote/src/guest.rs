@@ -86,14 +86,19 @@ pub fn join(code: &PairingCode, mode: &Mode, into: &Path) -> Result<Joined> {
                 .send()
                 .await
                 .map_err(|e| anyhow::anyhow!("journal tail: {e}"))?;
-            for cmd in &tail {
-                journal.append(cmd)?;
+            for rec in &tail {
+                journal.append(rec)?;
             }
             println!("journal: pulled {} records from host", tail.len());
         } else if local_n > host_n {
             // We curated offline (or the host was down): push our tail first.
             let ours = Journal::replay_at(&journal_path)?;
-            for cmd in &ours[host_n as usize..] {
+            for rec in &ours[host_n as usize..] {
+                // ponytail: only offline edits are pushed; an offline undo,
+                // redo or save needs the node-id protocol (PROTO v4).
+                let sorrel_data::Record::Node { cmd, .. } = rec else {
+                    bail!("cannot push an offline undo, redo or save to the host; re-join fresh");
+                };
                 cursor = host
                     .ask(&Record {
                         cursor,

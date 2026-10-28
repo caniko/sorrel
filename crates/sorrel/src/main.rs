@@ -12,8 +12,8 @@ use clap::{Args, Parser, Subcommand};
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::{
     apply_rules, baseline_hash, collect_qc_rows, diff_labels, export_qc, rank_merge_candidates,
-    rank_split_candidates, save_and_reseal_journal, save_to_phy, serve, write_report, Journal,
-    ReportFilter, RuleSet, Session, SuggestConfig,
+    rank_split_candidates, save_session as save_dir_session, save_to_phy, serve, write_report,
+    Journal, ReportFilter, RuleSet, Session, SuggestConfig,
 };
 use sorrel_io::kilosort::{read_cluster_group_tsv, KilosortOpenParams, PhyLabel};
 use sorrel_io::open_ephys::OebinMeta;
@@ -357,43 +357,21 @@ fn phy_label_str(l: &PhyLabel) -> &'static str {
     l.as_str()
 }
 
-/// Resolve the journal path: explicit `--journal`, else `<dir>/<stem>.journal`.
-/// Falls back to the legacy `<stem>.sqlite` name when only that file exists
-/// (the format was never SQLite; the name was historical).
+fn journal_opts(open: &OpenArgs) -> sorrel_data::JournalOpts {
+    sorrel_data::JournalOpts {
+        path: open.journal.clone(),
+        discard: open.discard_journal,
+    }
+}
+
+/// `--journal`, else `<dir>/<stem>.journal` (see [`sorrel_data::journal_path`]).
 fn journal_path(open: &OpenArgs, dir: &Path, stem: &str) -> PathBuf {
-    if let Some(p) = &open.journal {
-        return p.clone();
-    }
-    let current = dir.join(format!("{stem}.journal"));
-    let legacy = dir.join(format!("{stem}.sqlite"));
-    if !current.exists() && legacy.exists() {
-        log::warn!(
-            "using legacy journal {}; rename it to {} at your convenience",
-            legacy.display(),
-            current.display()
-        );
-        return legacy;
-    }
-    current
+    sorrel_data::journal_path(&journal_opts(open), dir, stem)
 }
 
 /// Open the journal sealed against `baseline`, honouring `--discard-journal`.
-/// A baseline mismatch means the journal's edits would replay onto data they
-/// were not recorded against, so this fails closed and names both ways out.
 fn open_journal(open: &OpenArgs, path: &Path, baseline: u64, n_clusters: u32) -> Result<Journal> {
-    if open.discard_journal && path.exists() {
-        std::fs::remove_file(path)
-            .with_context(|| format!("discard journal {}", path.display()))?;
-        log::warn!("discarded journal {}", path.display());
-    }
-    Journal::open_or_create(path, baseline, n_clusters).with_context(|| {
-        format!(
-            "journal {} was sealed against different data (or by an older sorrel without a \
-             seal). If that curation is already saved, rerun with --discard-journal; to keep \
-             unsaved edits, restore the spike_clusters.npy the journal was recorded against.",
-            path.display()
-        )
-    })
+    sorrel_data::open_journal(&journal_opts(open), path, baseline, n_clusters)
 }
 
 /// Detect which backend a path looks like. Phy markers take precedence
@@ -527,7 +505,7 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
             let root = open.root().to_path_buf();
             let provider = SortingAnalyzerProvider::open(&root)?;
             // The analyzer's own sorting is reloaded on every open, so the
-            // journal stays the source of truth and is never resealed.
+            // journal stays the source of truth and is never sealed.
             let baseline = baseline_hash(&provider.identity_bytes());
             let journal_path = journal_path(open, &root, "sorrel");
             let journal = open_journal(open, &journal_path, baseline, provider.n_clusters())?;
@@ -594,24 +572,19 @@ fn new_session<P: DataProvider>(
     session
 }
 
-/// Open a phy directory with explicit `params`, sealed against the saved
-/// `spike_clusters.npy` (phy dirs read it back, so saves reseal). The
-/// session comes back **unseeded**: run [`seed_kilosort`] (or hand it to
-/// the GUI loader) before using it.
+/// Open a phy directory with explicit `params` (see [`sorrel_data::open_phy`]:
+/// sealed against the root, refusing external edits). The session comes
+/// back **unseeded**: run [`seed_kilosort`] (or hand it to the GUI loader)
+/// before using it.
 fn open_kilosort(
     open: &OpenArgs,
     params: KilosortOpenParams,
 ) -> Result<(Session<KilosortProvider>, OpenCtx<KilosortProvider>)> {
     let root = open.root().to_path_buf();
-    let provider = KilosortProvider::open(&root, params)?;
-    let clusters_path = root.join("spike_clusters.npy");
-    let baseline = baseline_hash(
-        &std::fs::read(&clusters_path)
-            .with_context(|| format!("read {}", clusters_path.display()))?,
-    );
-    let journal_path = journal_path(open, &root, "sorrel");
-    let journal = open_journal(open, &journal_path, baseline, provider.n_clusters())?;
-    let session = new_session(provider, journal, open, sorrel_io::Backend::Kilosort);
+    let mut session = sorrel_data::open_phy(&root, params, &journal_opts(open))?;
+    if let Some(flag) = &open.sorter {
+        session.set_sorter(flag.clone());
+    }
     let metrics = session.provider.quality_metrics().clone();
     let positions = session.provider.channel_positions().to_vec();
     let shanks = session.provider.channel_shanks().to_vec();
@@ -699,8 +672,8 @@ fn run_join(
         PathBuf::from(format!("sorrel-remote-{first}"))
     });
     let joined = sorrel_remote::join(&code, &mode, &into)?;
-    // The host tracks our journal cursor, so the guest never reseals: a
-    // reseal would reset the record count and every later record would be
+    // The host tracks our journal cursor, so the guest never seals: a seal
+    // record would advance only our count and every later record would be
     // refused as diverged. Saving still writes the phy files locally.
     let ctx = OpenCtx {
         save_dir: joined.root,
@@ -940,20 +913,13 @@ impl SessionVisitor for Apply {
     }
 }
 
-/// Write the phy artifacts like Ctrl-S in the GUI (resealing the journal on
+/// Write the phy artifacts like Ctrl-S in the GUI (sealing the journal on
 /// backends that read the saved clusters back).
 fn save_session<P>(session: &mut Session<P>, ctx: &OpenCtx<P>) -> Result<()>
 where
     P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
 {
-    if ctx.reseal_on_save {
-        let journal_path = session.journal_path().to_path_buf();
-        let journal =
-            save_and_reseal_journal(session, &ctx.save_dir, &journal_path, phy_label_str)?;
-        session.reseal(journal);
-    } else {
-        save_to_phy(session, &ctx.save_dir, phy_label_str)?;
-    }
+    save_dir_session(session, &ctx.save_dir, ctx.reseal_on_save, phy_label_str)?;
     println!("saved → {}", ctx.save_dir.display());
     Ok(())
 }

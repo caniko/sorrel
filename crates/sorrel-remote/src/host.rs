@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use piying::actor::{ActorId, Spawn};
 use piying::message::{Context as ActorContext, Message};
 use sorrel_data::session::ApplyPhyLabel;
-use sorrel_data::{CurationCommand, Journal, Session};
+use sorrel_data::{CurationCommand, Journal, Record as JournalRecord, Session};
 use sorrel_io::{DataProvider, TraceDtype};
 
 use crate::pairing::{Pairing, PairingCode};
@@ -224,9 +224,9 @@ impl Message<FetchFile> for HostActor {
     }
 }
 
-#[piying::remote_message("sorrel/journal-tail/1")]
+#[piying::remote_message("sorrel/journal-tail/2")]
 impl Message<JournalTail> for HostActor {
-    type Reply = Result<Vec<CurationCommand>, HostError>;
+    type Reply = Result<Vec<JournalRecord>, HostError>;
 
     async fn handle(
         &mut self,

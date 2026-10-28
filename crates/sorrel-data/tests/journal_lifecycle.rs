@@ -18,13 +18,13 @@
 //!   correctly handling its full input range without internal chunking
 //!   artefacts.
 //!
-//! - **Save-and-reseal** → the new commit-on-save flow that fixes the
-//!   journal-vs-artifacts coupling we identified.
+//! - **Save-and-seal** → a save exports the head and journals a `Seal`;
+//!   the history and the baseline (the root) are untouched.
 
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::{
-    save_and_reseal_journal, save_to_phy, ClusterIndex, CurationCommand, Journal, PhyLabelOp,
-    Session,
+    artifacts_hash, save_and_seal, save_to_phy, ClusterIndex, CurationCommand, Journal, PhyLabelOp,
+    Record, Session,
 };
 use sorrel_io::{ClusterId, DataProvider, SampleIndex, TraceSamples, TraceSlice};
 
@@ -343,21 +343,19 @@ fn waveform_extractor_handles_non_uniform_spacing() {
     }
 }
 
-// ---- Save-and-reseal flow (the architectural fix) ------------------------
+// ---- Save-and-seal flow ---------------------------------------------------
 
-/// Saving and resealing produces a fresh journal with a new baseline that
-/// matches the on-disk artifact. Reopening with the new baseline
-/// succeeds; the journal has no records.
+/// Saving writes the artifacts and appends a `Seal` naming their hash; the
+/// journal keeps its records and its baseline (the root), so it reopens
+/// against the same baseline with the history intact.
 #[test]
-fn save_and_reseal_writes_artifacts_and_clears_journal_history() {
+fn save_and_seal_keeps_history_and_journals_the_artifacts_hash() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let journal_path = root.join("sorrel.journal");
-
-    let new_journal_baseline;
     {
         let provider = fixture_provider();
-        let journal = Journal::open_or_create(&journal_path, 0, 3).unwrap();
+        let journal = Journal::open_or_create(&journal_path, 0xFEED, 3).unwrap();
         let mut session = Session::new(provider, journal);
         session
             .dispatch(CurationCommand::Merge {
@@ -371,49 +369,19 @@ fn save_and_reseal_writes_artifacts_and_clears_journal_history() {
                 op: PhyLabelOp::SetMua,
             })
             .unwrap();
-
-        let new_journal =
-            save_and_reseal_journal(&session, &root, &journal_path, label_str_u8).unwrap();
-        new_journal_baseline = new_journal.baseline();
+        save_and_seal(&mut session, &root, label_str_u8).unwrap();
     }
 
-    // Reopen with the same baseline.
-    let journal = Journal::open_or_create(&journal_path, new_journal_baseline, 3).unwrap();
-    assert!(
-        journal.replay().unwrap().is_empty(),
-        "reseal cleared history"
-    );
-}
-
-/// Once the journal is resealed, attempting to reopen with the OLD
-/// baseline fails — exactly the divergence-prevention property we wanted.
-#[test]
-fn save_and_reseal_invalidates_old_baseline() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_path_buf();
-    let journal_path = root.join("sorrel.journal");
-    let old_baseline = 0xDEAD_BEEFu64;
-
-    {
-        let provider = fixture_provider();
-        let journal = Journal::open_or_create(&journal_path, old_baseline, 3).unwrap();
-        let mut session = Session::new(provider, journal);
-        session
-            .dispatch(CurationCommand::Merge {
-                sources: vec![ClusterId(0)],
-                target: ClusterId(2),
-            })
-            .unwrap();
-
-        save_and_reseal_journal(&session, &root, &journal_path, label_str_u8).unwrap();
-    }
-
-    // Reopen with the *old* baseline should fail.
-    let res = Journal::open_or_create(&journal_path, old_baseline, 3);
-    assert!(
-        res.is_err(),
-        "old baseline must not be accepted after reseal",
-    );
+    let journal = Journal::open_or_create(&journal_path, 0xFEED, 3).unwrap();
+    let recs = journal.replay().unwrap();
+    assert_eq!(recs.len(), 3, "two edits and a seal");
+    let on_disk = artifacts_hash(
+        &root.join("spike_clusters.npy"),
+        &root.join("cluster_group.tsv"),
+    )
+    .unwrap();
+    assert_eq!(journal.seals().unwrap(), vec![(Some(1), on_disk)]);
+    assert!(!root.join("spike_clusters.npy.tmp").exists());
 }
 
 /// External edit of `spike_clusters.npy` between sessions: reopening with
@@ -466,8 +434,7 @@ fn external_edit_to_spike_clusters_invalidates_journal() {
     );
 }
 
-/// Saving without reseal (legacy `save_to_phy`) leaves the journal alone.
-/// The user's undo history survives. This is what the binary uses today.
+/// Saving without a seal (`save_to_phy`) leaves the journal alone.
 #[test]
 fn save_to_phy_alone_does_not_touch_journal() {
     let dir = tempfile::tempdir().unwrap();
@@ -490,7 +457,13 @@ fn save_to_phy_alone_does_not_touch_journal() {
     let journal = Journal::open_or_create(&journal_path, 0, 3).unwrap();
     let ops = journal.replay().unwrap();
     assert_eq!(ops.len(), 1);
-    assert!(matches!(ops[0], CurationCommand::Merge { .. }));
+    assert!(matches!(
+        ops[0],
+        Record::Node {
+            cmd: CurationCommand::Merge { .. },
+            ..
+        }
+    ));
 }
 
 // ---- ClusterIndex spike-count invariant under heavy churn ---------------

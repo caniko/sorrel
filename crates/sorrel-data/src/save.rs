@@ -6,22 +6,24 @@
 //!   per-spike cluster assignment, in `spike_times.npy` row order.
 //! - `cluster_group.tsv` — one row per cluster with a non-default label.
 //!
-//! After a successful export, the journal is **resealed**: its baseline
-//! hash is updated to match the freshly-written `spike_clusters.npy`, and
-//! its append history is cleared. This means save = commit, the same
-//! mental model as Word / Photoshop / Git: prior undo state is no longer
-//! reachable, but the user's data is durable.
+//! Saving a phy directory onto itself ([`save_and_seal`]) keeps the whole
+//! action tree: before a file is first replaced, its root version is
+//! captured into `sorrel_original/` (see `sorrel_io::RootView`), the journal
+//! gets a `Seal` record naming the staged files, and only then are they
+//! published. Reopening replays the journal onto the root, so every node
+//! stays reachable after a save.
 //!
-//! Both files are written atomically (write-then-rename) so a crash
-//! mid-save never leaves the directory half-written.
+//! Files are written atomically (write-then-rename) so a crash mid-save
+//! never leaves the directory half-written.
 
 use crate::cluster_index::ClusterIndex;
 use crate::curation_json::write_curation_json;
-use crate::journal::{baseline_hash, Journal};
-use crate::session::Session;
+use crate::journal::artifacts_hash;
+use crate::session::{ApplyPhyLabel, Session};
 use anyhow::{ensure, Context, Result};
+use sorrel_io::kilosort::{ROOT_DIR, ROOT_MANIFEST};
 use sorrel_io::npy::{read_1d_u32, read_header, write_1d_u32_atomic, write_rows_tmp, NpyRows};
-use sorrel_io::DataProvider;
+use sorrel_io::{DataProvider, RootView};
 use std::borrow::Cow;
 use std::path::Path;
 
@@ -33,10 +35,8 @@ use std::path::Path;
 /// elided so a phy directory that has never been curated round-trips with
 /// no TSV at all.
 ///
-/// Does **not** touch the journal. Most callers want
-/// [`save_and_reseal_journal`] instead, which writes the artifacts and
-/// then commits the journal so future opens treat the saved state as
-/// canonical.
+/// Does **not** touch the journal. Saving a phy directory onto itself
+/// goes through [`save_and_seal`] instead (see [`save_session`]).
 pub fn save_to_phy<P, F>(session: &Session<P>, root: &Path, label_str: F) -> Result<()>
 where
     P: DataProvider,
@@ -44,10 +44,32 @@ where
 {
     ensure!(
         !has_added_spikes(session.cluster_index()),
-        "this session added spikes: save with reseal (save_and_reseal_journal); a plain save \
-         would leave them only in the journal and the next replay would add them twice"
+        "this session added spikes: only a save of its own phy directory rewrites the \
+         per-spike arrays they need"
     );
     write_curation(session, root, label_str)
+}
+
+/// Save like Ctrl-S: a phy directory the provider reads back (`seal`) is
+/// saved with [`save_and_seal`]; any other target gets [`save_to_phy`] and
+/// the head is marked saved in memory only.
+pub fn save_session<P, F>(
+    session: &mut Session<P>,
+    dir: &Path,
+    seal: bool,
+    label_str: F,
+) -> Result<()>
+where
+    P: DataProvider + ApplyPhyLabel,
+    F: Fn(&P::Label) -> &'static str,
+{
+    if seal {
+        save_and_seal(session, dir, label_str)
+    } else {
+        save_to_phy(session, dir, label_str)?;
+        session.mark_saved();
+        Ok(())
+    }
 }
 
 fn write_curation<P, F>(session: &Session<P>, root: &Path, label_str: F) -> Result<()>
@@ -182,7 +204,7 @@ where
 }
 
 /// `cluster_sorrel_annotations.tsv`: origin, direct parents and note for every
-/// non-empty unit, so a resealed (emptied) journal loses nothing. An
+/// non-empty unit, for phy and other readers of the saved directory. An
 /// `Auto[<sorter>]` row also pins the sorter name for the next open.
 fn write_annotations_tsv<P: DataProvider>(
     session: &Session<P>,
@@ -305,41 +327,31 @@ fn clusters_in_row_order(index: &ClusterIndex) -> Vec<u32> {
     out
 }
 
-/// Save the curation state to phy artifacts AND reseal the journal at
-/// `journal_path`. The previous journal (with all its undo history) is
-/// truncated; the new journal's baseline hash matches the freshly-written
-/// `spike_clusters.npy`. Subsequent reopens load the new state cleanly
-/// with empty undo history.
-pub fn save_and_reseal_journal<P, F>(
-    session: &Session<P>,
-    root: &Path,
-    journal_path: &Path,
-    label_str: F,
-) -> Result<Journal>
+/// Save the curation state into the phy directory `root` the session was
+/// opened from, keeping the action tree. In order, each step durable before
+/// the next:
+/// 1. every output is staged as an fsynced `<name>.tmp`;
+/// 2. the root version of each file about to be replaced is captured
+///    ([`capture_root`]);
+/// 3. a `Seal` naming the staged artifacts' hash is journaled;
+/// 4. the tmps are published by one manifest roll-forward.
+///
+/// A crash anywhere leaves top-level files that match the root or a seal,
+/// which is what `open_phy` accepts; step 4 is finished by the next open.
+pub fn save_and_seal<P, F>(session: &mut Session<P>, root: &Path, label_str: F) -> Result<()>
 where
-    P: DataProvider,
+    P: DataProvider + ApplyPhyLabel,
     F: Fn(&P::Label) -> &'static str,
 {
-    let added = has_added_spikes(session.cluster_index());
-    let n_clusters = session.n_clusters();
-    // The journal can join the atomic publish only when it lives in `root`
-    // (the default). ponytail: an external journal is resealed after the
-    // artifacts, so a crash in between leaves it stale (`open_phy` then asks
-    // for `--discard-journal`); fixing that needs a journal-side two-phase seal.
-    let journal_name = journal_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|_| same_dir(journal_path.parent(), root))
-        .map(str::to_owned);
-
-    // Stage every output as an fsynced `<name>.tmp`; nothing is visible yet.
+    let view = RootView::open(root)?;
+    let rewrite = needs_array_rewrite(session.cluster_index(), &view);
     let sink = Sink::staging();
-    let mut backup = Vec::new();
+    let mut arrays = Vec::new();
     let staged = (|| -> Result<u64> {
-        if added {
+        if rewrite {
             // Also stages spike_clusters.npy (global order = the index order).
-            backup = write_spike_array_tmps(session, root, root)?;
-            backup.iter().for_each(|n| sink.note(n));
+            arrays = write_spike_array_tmps(session, &view, root)?;
+            arrays.iter().for_each(|n| sink.note(n));
         } else {
             let path = root.join("spike_clusters.npy");
             sink.note("spike_clusters.npy");
@@ -349,44 +361,76 @@ where
         }
         stage_assignments(session, root, &label_str, &sink)?;
         // The artifacts carry every merge and split, so the interchange
-        // document must not repeat them: labels only. The session still holds
-        // the old history until the caller swaps in the new journal.
+        // document must not repeat them: labels only.
         let doc = crate::curation_json::curation_document_sealed(session, &label_str);
         sink.write(
             &root.join("curation.json"),
             serde_json::to_vec_pretty(&doc)?,
         )?;
-        // Seal against the bytes that will be renamed into place.
-        let tmp = with_tmp_suffix(&root.join("spike_clusters.npy"));
-        let bytes = std::fs::read(&tmp).with_context(|| format!("hash {}", tmp.display()))?;
-        let baseline = baseline_hash(&bytes);
-        if let Some(name) = &journal_name {
-            sink.note(name);
-            Journal::truncate(&with_tmp_suffix(&root.join(name)), baseline, n_clusters)?;
-        }
-        Ok(baseline)
+        artifacts_hash(
+            &with_tmp_suffix(&root.join("spike_clusters.npy")),
+            &with_tmp_suffix(&root.join("cluster_group.tsv")),
+        )
     })();
-    let baseline = match staged {
-        Ok(b) => b,
-        Err(e) => {
-            discard_staged(root, &sink.names());
-            return Err(e);
-        }
-    };
-    // One roll-forward publishes everything (journal last); an interruption
-    // anywhere is completed by the next open.
-    publish_staged(root, &backup, &sink.names())?;
-    match journal_name {
-        Some(_) => Journal::open_or_create(journal_path, baseline, n_clusters),
-        None => Journal::truncate(journal_path, baseline, n_clusters),
+    let names = sink.names();
+    let sealed = staged.and_then(|hash| {
+        capture_root(root, &names, &arrays)?;
+        session.seal(hash)
+    });
+    if let Err(e) = sealed {
+        discard_staged(root, &names);
+        return Err(e);
     }
+    publish_staged(root, !arrays.is_empty(), &names)?;
+    session.mark_saved();
+    Ok(())
 }
 
-fn same_dir(a: Option<&Path>, b: &Path) -> bool {
-    let a = a
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
+/// True when a save must rewrite every per-spike array, not just
+/// `spike_clusters.npy`: the session added spikes, or an earlier save
+/// already replaced the arrays (the files on disk no longer follow the
+/// root's row order).
+pub(crate) fn needs_array_rewrite(index: &ClusterIndex, view: &RootView) -> bool {
+    has_added_spikes(index) || view.is_captured("spike_times.npy")
+}
+
+/// Capture the root version of every file in `names` that the snapshot does
+/// not hold yet, before a save replaces it. Files are copied (phy rewrites
+/// its files in place, which would change a hard link too) except the `link`
+/// names (per-spike arrays, which only a rescue rewrites), hard-linked when
+/// the filesystem allows. A file that does not exist yet is recorded
+/// absent. The manifest is replaced last, so a crash leaves at worst
+/// unlisted copies, which the next capture overwrites.
+fn capture_root(root: &Path, names: &[String], link: &[String]) -> Result<()> {
+    let view = RootView::open(root)?;
+    let new: Vec<&String> = names.iter().filter(|n| !view.is_captured(n)).collect();
+    if new.is_empty() {
+        return Ok(());
+    }
+    let snap = root.join(ROOT_DIR);
+    std::fs::create_dir_all(&snap).with_context(|| format!("create {}", snap.display()))?;
+    let state = |present: bool| if present { "present" } else { "absent" };
+    let mut text: String = view
+        .captured()
+        .map(|(n, p)| format!("{n}\t{}\n", state(p)))
+        .collect();
+    for n in new {
+        let (from, to) = (root.join(n), snap.join(n));
+        let present = from.exists();
+        if present {
+            let _ = std::fs::remove_file(&to);
+            if !(link.contains(n) && std::fs::hard_link(&from, &to).is_ok()) {
+                std::fs::copy(&from, &to)
+                    .and_then(|_| std::fs::File::open(&to)?.sync_all())
+                    .with_context(|| format!("capture {n} into {}", snap.display()))?;
+            }
+        }
+        text.push_str(&format!("{n}\t{}\n", state(present)));
+    }
+    sync_dir(&snap);
+    Sink::direct().write(&snap.join(ROOT_MANIFEST), text)?;
+    sync_dir(&snap);
+    Ok(())
 }
 
 fn discard_staged(root: &Path, names: &[String]) {
@@ -401,8 +445,6 @@ fn with_tmp_suffix(path: &Path) -> std::path::PathBuf {
     p.into()
 }
 
-/// Original files of a rewrite are hard-linked (or copied) here, once.
-const BACKUP_DIR: &str = "sorrel_original";
 /// Attribute marking spikes inserted by `AddSpikes` (u32 0/1).
 const RESCUED: &str = "sorrel_rescued";
 
@@ -416,31 +458,19 @@ pub(crate) fn has_added_spikes(index: &ClusterIndex) -> bool {
         .any(|r| r.get().is_some_and(|r| r as usize >= n))
 }
 
-/// Publish staged `<name>.tmp` files crash-safely: originals of `backup` go to
-/// `sorrel_original/` first (never overwritten) and phy's `.phy/` cache, now
-/// stale, to `.phy.sorrel-stale` (both only when `backup` is non-empty); a
-/// manifest naming the tmps is fsynced and renamed into place; the renames
-/// are then rolled out by [`sorrel_io::kilosort::roll_forward_pending`], the
-/// same routine `KilosortProvider::open` runs after an interruption. A crash
-/// before the manifest leaves the old state; after it, the next open finishes
-/// the whole save.
-///
-/// After an `AddSpikes` rewrite the session's own index keeps the old row
-/// numbering: reopen the directory afterwards (a second rewrite from the same
-/// session is refused).
-fn publish_staged(root: &Path, backup: &[String], names: &[String]) -> Result<()> {
+/// Publish staged `<name>.tmp` files crash-safely: when the per-spike
+/// arrays are rewritten (`arrays`), phy's `.phy/` cache, now stale, goes to
+/// `.phy.sorrel-stale`; a manifest naming the tmps is fsynced and renamed
+/// into place; the renames are then rolled out by
+/// [`sorrel_io::kilosort::roll_forward_pending`], the same routine
+/// `KilosortProvider::open` runs after an interruption. A crash before the
+/// manifest leaves the old state; after it, the next open finishes the
+/// whole save.
+fn publish_staged(root: &Path, arrays: bool, names: &[String]) -> Result<()> {
     use sorrel_io::kilosort::{roll_forward_pending, REWRITE_PENDING};
     use std::io::Write;
     let prepare = || -> Result<()> {
-        if !backup.is_empty() {
-            let bak = root.join(BACKUP_DIR);
-            std::fs::create_dir_all(&bak).with_context(|| format!("create {}", bak.display()))?;
-            for n in backup {
-                let (from, to) = (root.join(n), bak.join(n));
-                if from.exists() && !to.exists() && std::fs::hard_link(&from, &to).is_err() {
-                    std::fs::copy(&from, &to).with_context(|| format!("back up {n}"))?;
-                }
-            }
+        if arrays {
             let phy = root.join(".phy");
             if phy.exists() {
                 let stale = root.join(".phy.sorrel-stale");
@@ -476,14 +506,15 @@ fn sync_dir(root: &Path) {
 }
 
 /// Write every per-spike array of `session` as `<dst>/<name>.tmp` (fsynced,
-/// not renamed), reading the originals from `src`, and return the names.
+/// not renamed), reading the originals from the root view `src`, and return
+/// the names.
 /// Rows follow the global order; original rows are copied byte for byte
 /// through the row map, rows of added spikes are encoded in the file's dtype.
 /// Refuses, writing nothing, when `src` holds a per-spike `.npy` this does not
 /// know (it would fall out of alignment) or no longer matches the session.
 pub(crate) fn write_spike_array_tmps<P: DataProvider>(
     session: &Session<P>,
-    src: &Path,
+    src: &RootView,
     dst: &Path,
 ) -> Result<Vec<String>> {
     let ci = session.cluster_index();
@@ -497,11 +528,11 @@ pub(crate) fn write_spike_array_tmps<P: DataProvider>(
         rows.len() == n,
         "the PC row map is incomplete; cannot rewrite the per-spike arrays"
     );
-    let times_hdr = read_header(&src.join("spike_times.npy"))?;
+    let times_hdr = read_header(&src.path("spike_times.npy"))?;
     ensure!(
         times_hdr.shape.first() == Some(&n_orig),
-        "spike_times.npy no longer has the {n_orig} rows this session opened with (already \
-         rewritten?); reopen the directory"
+        "spike_times.npy no longer has the {n_orig} rows this session opened with; reopen the \
+         directory"
     );
 
     let (pc_w, tf) = (
@@ -532,14 +563,11 @@ pub(crate) fn write_spike_array_tmps<P: DataProvider>(
     if !attrs.iter().any(|a| a == RESCUED) {
         known.push(format!("spike_{RESCUED}.npy"));
     }
-    let mut unknown: Vec<String> = std::fs::read_dir(src)
-        .with_context(|| format!("read {}", src.display()))?
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            let hdr = name
-                .ends_with(".npy")
-                .then(|| read_header(&e.path()).ok())??;
+    let mut unknown: Vec<String> = src
+        .files()
+        .into_iter()
+        .filter_map(|(name, path)| {
+            let hdr = name.ends_with(".npy").then(|| read_header(&path).ok())??;
             (hdr.shape.first() == Some(&n_orig) && !known.contains(&name)).then_some(name)
         })
         .collect();
@@ -614,7 +642,7 @@ pub(crate) fn write_spike_array_tmps<P: DataProvider>(
         }
         if ci.has_spike_reorder() {
             // Old value = old row whose time is shown; point at that spike's new index.
-            let old = read_1d_u32(&src.join("spike_reorder.npy"))?;
+            let old = read_1d_u32(&src.path("spike_reorder.npy"))?;
             let mut new_of_row = vec![u32::MAX; n_orig];
             for (g, &r) in rows.iter().enumerate() {
                 if let Some(slot) = new_of_row.get_mut(r as usize) {
@@ -643,17 +671,17 @@ pub(crate) fn write_spike_array_tmps<P: DataProvider>(
 }
 
 /// One row-addressed array: original rows are copied byte for byte from
-/// `<src>/<name>`, rows of added spikes come from `added(g)`, encoded in the
+/// the root version of `name`, rows of added spikes come from `added(g)`, encoded in the
 /// file's dtype. Writes `<dst>/<name>.tmp`.
 fn rewrite_rows<'a>(
-    src: &Path,
+    src: &RootView,
     dst: &Path,
     name: &str,
     rows: &[u32],
     n_orig: usize,
     added: impl Fn(usize) -> Option<&'a [f32]>,
 ) -> Result<()> {
-    let f = NpyRows::open(&src.join(name))?;
+    let f = NpyRows::open(&src.path(name))?;
     ensure!(
         f.n_rows == n_orig,
         "{name}: {} rows, expected {n_orig}",
@@ -764,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn save_writes_spikeinterface_curation_json_and_reseal_drops_structure() {
+    fn save_writes_spikeinterface_curation_json_and_seal_drops_structure() {
         use sorrel_io::read_curation_labels;
         let (mut s, dir) = fresh_session();
         s.dispatch(CurationCommand::Relabel {
@@ -811,9 +839,9 @@ mod tests {
         assert_eq!(labels[0].as_str(), "good");
         assert_eq!(labels[1].as_str(), "unsorted");
 
-        // Reseal: the artifacts now carry the merge and split, so the JSON
+        // Seal: the artifacts now carry the merge and split, so the JSON
         // becomes labels-only over every cluster.
-        save_and_reseal_journal(&s, dir.path(), &dir.path().join("j.sqlite"), label_str).unwrap();
+        save_and_seal(&mut s, dir.path(), label_str).unwrap();
         let doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(doc["unit_ids"], serde_json::json!([0, 1, 2, 3]));

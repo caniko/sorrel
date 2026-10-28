@@ -1,20 +1,22 @@
 //! Opening a dataset *with its journal correctly sealed*. Shared by the
 //! binary and the Python bindings so both apply the same rules:
 //!
-//! - phy / Kilosort directories are sealed against the bytes of
-//!   `spike_clusters.npy`, because that file is read back on open and
-//!   rewritten on save (so saves reseal, see `save_and_reseal_journal`);
+//! - phy / Kilosort directories are sealed against the root's
+//!   `spike_clusters.npy` (the sort as it was before sorrel's first save,
+//!   see `sorrel_io::RootView`), and the files on disk must be the root or
+//!   one of sorrel's saves (`Seal` records): anything else is an external
+//!   edit that the next save would overwrite, so the open fails closed;
 //! - every other backend reloads its original sort on open, so the seal is
-//!   the provider's identity and the journal is never resealed.
+//!   the provider's identity.
 //!
 //! Sessions come back **unseeded**: run [`seed_phy`] / `replay_journal`
 //! (or hand the closure to the GUI loader) before using them.
 
-use crate::journal::{baseline_hash, Journal};
+use crate::journal::{artifacts_hash, baseline_hash, Journal};
 use crate::session::Session;
-use anyhow::{Context, Result};
-use sorrel_io::kilosort::{KilosortOpenParams, KilosortProvider};
-use sorrel_io::{detect_sorter, Backend, DataProvider, SortingAnalyzerProvider};
+use anyhow::{bail, Context, Result};
+use sorrel_io::kilosort::{KilosortOpenParams, KilosortProvider, ROOT_DIR, ROOT_MANIFEST};
+use sorrel_io::{detect_sorter, Backend, DataProvider, RootView, SortingAnalyzerProvider};
 use std::path::{Path, PathBuf};
 
 /// Where the journal lives and whether to throw an existing one away.
@@ -22,8 +24,9 @@ use std::path::{Path, PathBuf};
 pub struct JournalOpts {
     /// Explicit path; `None` = `<dir>/<stem>.journal`.
     pub path: Option<PathBuf>,
-    /// Delete the existing journal before opening: the escape hatch for a
-    /// journal sealed against data that has since changed.
+    /// Set the existing journal aside before opening (renamed to
+    /// `<journal>.<unix seconds>`): the escape hatch for a journal sealed
+    /// against data that has since changed.
     pub discard: bool,
 }
 
@@ -56,42 +59,101 @@ pub fn open_journal(
     baseline: u64,
     n_clusters: u32,
 ) -> Result<Journal> {
-    if opts.discard && path.exists() {
-        std::fs::remove_file(path)
-            .with_context(|| format!("discard journal {}", path.display()))?;
-        log::warn!("discarded journal {}", path.display());
-    }
+    discard_journal(opts, path)?;
     Journal::open_or_create(path, baseline, n_clusters).with_context(|| {
         format!(
             "journal {} was sealed against different data (or by an older sorrel without a \
-             seal). If that curation is already saved, discard the journal; to keep unsaved \
-             edits, restore the spike_clusters.npy the journal was recorded against.",
+             seal). If that curation is already saved, discard the journal (--discard-journal); to \
+             keep unsaved edits, restore the spike_clusters.npy the journal was recorded against.",
             path.display()
         )
     })
 }
 
 /// Open a phy directory. Unseeded; see [`seed_phy`].
+///
+/// A root snapshot without its journal (discarded, deleted, or written by a
+/// pre-v3 build without a manifest) is moved aside first, so the files as
+/// they are become the new root.
 pub fn open_phy(
     root: &Path,
     params: KilosortOpenParams,
     opts: &JournalOpts,
 ) -> Result<Session<KilosortProvider>> {
+    let path = journal_path(opts, root, "sorrel");
+    discard_journal(opts, &path)?;
+    let snap = root.join(ROOT_DIR);
+    if snap.exists() && (!path.exists() || !snap.join(ROOT_MANIFEST).exists()) {
+        retire_snapshot(root)?;
+    }
+    // Rolls an interrupted save forward, then reads the root.
     let provider = KilosortProvider::open(root, params)?;
-    let clusters_path = root.join("spike_clusters.npy");
+    let view = RootView::open(root)?;
+    let clusters_path = view.path("spike_clusters.npy");
     let baseline = baseline_hash(
         &std::fs::read(&clusters_path)
             .with_context(|| format!("read {}", clusters_path.display()))?,
     );
-    let journal = open_journal(
-        opts,
-        &journal_path(opts, root, "sorrel"),
-        baseline,
-        provider.n_clusters(),
+    let journal = open_journal(opts, &path, baseline, provider.n_clusters())?;
+    let top = artifacts_hash(
+        &root.join("spike_clusters.npy"),
+        &root.join("cluster_group.tsv"),
     )?;
+    let at_root = artifacts_hash(
+        &view.path("spike_clusters.npy"),
+        &view.path("cluster_group.tsv"),
+    )?;
+    if top != at_root && !journal.seals()?.iter().any(|s| s.1 == top) {
+        bail!(
+            "{}: spike_clusters.npy or cluster_group.tsv changed outside sorrel since its last \
+             save (phy?). The next sorrel save would overwrite that work, so this journal is \
+             not opened. To curate from the files as they are now, reopen with \
+             --discard-journal: the journal and {ROOT_DIR}/ are set aside, not deleted.",
+            root.display()
+        );
+    }
     let mut session = Session::new(provider, journal);
+    session.set_top_artifacts(top);
     session.fill_detected_sorter(detect_sorter(root, Backend::Kilosort));
     Ok(session)
+}
+
+/// Move `<root>/sorrel_original` to `sorrel_original.<unix seconds>` (never
+/// deleted: it may hold the only copy of the pre-rescue arrays).
+pub fn retire_snapshot(root: &Path) -> Result<()> {
+    set_aside(&root.join(ROOT_DIR))
+}
+
+/// Rename `path` to `<path>.<unix seconds>` (plus `-<n>` if taken).
+fn set_aside(path: &Path) -> Result<()> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let named = |suffix: String| {
+        let mut p = path.as_os_str().to_owned();
+        p.push(suffix);
+        PathBuf::from(p)
+    };
+    let to = (0..)
+        .map(|i| match i {
+            0 => named(format!(".{secs}")),
+            i => named(format!(".{secs}-{i}")),
+        })
+        .find(|p| !p.exists())
+        .expect("an unused name");
+    std::fs::rename(path, &to)
+        .with_context(|| format!("move {} aside to {}", path.display(), to.display()))?;
+    log::warn!("moved {} aside to {}", path.display(), to.display());
+    Ok(())
+}
+
+/// `--discard-journal`: set the journal aside (it holds the whole action
+/// tree, so it is renamed, not deleted).
+fn discard_journal(opts: &JournalOpts, path: &Path) -> Result<()> {
+    if opts.discard && path.exists() {
+        set_aside(path)?;
+    }
+    Ok(())
 }
 
 /// Pull the optional per-spike arrays into the index and replay the journal.
