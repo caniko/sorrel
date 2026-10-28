@@ -58,6 +58,10 @@
           runner = "ubuntu-24.04";
           workspace = true;
           workspace_strategy = "aggregate";
+          # Publish the workspace crates in dependency order through simit's
+          # trusted publisher (simit-crates-io environment, restricted to trunk).
+          publish_crates = true;
+          publish_strategy = "coordinated";
           with_audit = true;
           with_deny = true;
           # Run the cross-built sorrel.exe and Windows wheel on real Windows:
