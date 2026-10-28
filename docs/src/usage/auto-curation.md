@@ -16,7 +16,7 @@ record who decided what. Clusters that still need a person get a
 
 ## Pipeline
 
-`sorrel auto` runs `scripts/sorrel_auto.py` (embedded in the binary) using
+`sorrel auto` runs `crates/sorrel/src/sorrel_auto.py` (embedded in the binary) using
 SpikeInterface ≥ 0.105. The script needs either
 [uv](https://docs.astral.sh/uv/) on `PATH`, which installs the pinned
 dependencies on first use, or `SORREL_PYTHON` pointing to an interpreter

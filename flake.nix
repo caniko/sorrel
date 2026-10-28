@@ -202,7 +202,7 @@
         # BIP-39 list embedded by sorrel-remote's pairing codes.
         || pkgs.lib.hasSuffix "sorrel-remote/wordlist.txt" path
         # SpikeInterface sidecar `sorrel auto` embeds with include_str!.
-        || pkgs.lib.hasSuffix "scripts/sorrel_auto.py" path;
+        || pkgs.lib.hasSuffix "crates/sorrel/src/sorrel_auto.py" path;
       src = pkgs.lib.cleanSourceWith {
         src = ./.;
         filter = srcFilter;
