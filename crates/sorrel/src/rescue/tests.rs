@@ -55,6 +55,11 @@ fn write_fixture(root: &Path) -> Vec<u64> {
 /// trained). `empty0`: unit 0 is relabelled cluster 2, leaving cluster 0
 /// empty, and template features are written.
 fn write_fixture_ext(root: &Path, merged: bool, empty0: bool) -> Vec<u64> {
+    write_fixture_all(root, merged, empty0, true)
+}
+
+/// `omit`: every fourth unit-0 spike is left out of the phy files.
+fn write_fixture_all(root: &Path, merged: bool, empty0: bool, omit: bool) -> Vec<u64> {
     let mut r = Xs(0x1234_5678_9abc_def1);
     // Unit weights per channel and peak amplitude. Both units span every
     // channel (the channel-shift null only breaks spikes that need several
@@ -99,7 +104,7 @@ fn write_fixture_ext(root: &Path, merged: bool, empty0: bool) -> Vec<u64> {
         .filter(|&(t, u, _)| {
             if u == 0 {
                 seen0 += 1;
-                if seen0 % 4 == 0 {
+                if omit && seen0 % 4 == 0 {
                     omitted.push(t);
                     return false;
                 }
@@ -362,4 +367,84 @@ fn injections_avoid_all_existing_spikes_and_each_other() {
         ws.windows(2).all(|p| p[1] - p[0] >= gap),
         "injections overlap"
     );
+}
+
+#[test]
+fn hybrid_injections_stay_out_of_the_null_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    // Nothing unlisted either, so only the injections could reach the null.
+    write_fixture_all(dir.path(), false, false, false);
+    let s = open(dir.path());
+    // One channel per unit: the channel shift cannot break an injected waveform,
+    // so injections left in the null buffer would be counted as false positives.
+    let out = run(
+        &s,
+        &args(&[
+            "--cpu",
+            "--hybrid-frac",
+            "0.2",
+            "--margin",
+            "0",
+            "--channels-per-unit",
+            "1",
+        ]),
+        &[],
+    )
+    .unwrap();
+    let r = out.units.iter().find(|u| u.id == 0).unwrap();
+    let (rec, n) = r.recall.unwrap();
+    assert!(n >= 5);
+    // Without the fix no threshold meets q and nothing is recovered; the
+    // weakest injections stay below detection on a single channel.
+    assert!(
+        r.note.is_empty() && rec[0] >= 0.4 && rec[3] >= 0.9,
+        "recall {rec:?}, note {:?}",
+        r.note
+    );
+}
+
+#[test]
+fn only_primary_template_spikes_are_modelled() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path());
+    // Give every fifth spike of cluster 0 the other template.
+    let p = dir.path().join("spike_templates.npy");
+    let cl = npy::read_1d_u32(&dir.path().join("spike_clusters.npy")).unwrap();
+    let mut tpl = npy::read_1d_u32(&p).unwrap();
+    let mut k = 0;
+    for (t, &c) in tpl.iter_mut().zip(&cl) {
+        if c == 0 {
+            k += 1;
+            if k % 5 == 0 {
+                *t = 1;
+            }
+        }
+    }
+    npy::write_1d_u32_atomic(&p, &tpl).unwrap();
+    let s = open(dir.path());
+    let cfg = TracePreproc::HpAndCmr(TracePreproc::HP_DEFAULT_HZ);
+    let cx = build_ctx(&s, cfg, &[], NC, 100_000, &mut Rng::new(3)).unwrap();
+    let u = train(&s, &cx, ClusterId::new(0), true, &groups_of(&s)).unwrap();
+    assert_eq!(u.primary, 0);
+    let other = u.fit.iter().filter(|f| !**f).count();
+    assert_eq!(u.fit.len(), u.times.len());
+    assert!(other >= 10, "{other} spikes on the secondary template");
+    let swapped = tpl.iter().zip(&cl).filter(|&(&t, &c)| c == 0 && t == 1);
+    assert_eq!(other, swapped.count());
+}
+
+#[test]
+fn noise_windows_only_need_to_be_clean_on_the_units_channels() {
+    // Template 0 reaches channels 0-1, template 1 reaches channel 3.
+    let foot = vec![
+        vec![true, true, false, false],
+        vec![false, false, false, true],
+    ];
+    assert!(!window_hits(&foot, &[1, 1, 1], &[0, 1]));
+    assert!(window_hits(&foot, &[1, 0], &[0, 1]));
+    assert!(window_hits(&foot, &[1], &[2, 3]));
+    assert!(!window_hits(&foot, &[], &[0]));
+    // Unknown footprints stay conservative.
+    assert!(window_hits(&[], &[0], &[0]));
+    assert!(window_hits(&[vec![]], &[0], &[0]));
 }

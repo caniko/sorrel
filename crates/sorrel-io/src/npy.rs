@@ -3,7 +3,7 @@
 //! Supports the dtypes Kilosort emits: `<i64`, `<u32`, `<i32`, `<f32`, `<f64`.
 //! Returns the byte offset to the raw data so the caller can mmap-and-cast.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::Path;
@@ -439,15 +439,34 @@ impl NpyRows {
         &self.map[at..at + self.row_bytes]
     }
 
-    /// `vals` as one row in this file's dtype (`f4`, `f8` and `u4` only).
+    /// `vals` as one row in this file's dtype (every dtype [`NpyDtype`]
+    /// reads). Integer dtypes round to nearest and error when a value is
+    /// out of range or not finite, rather than wrapping.
     pub fn encode(&self, vals: &[f32]) -> Result<Vec<u8>> {
-        let enc: fn(f32) -> Vec<u8> = match NpyDtype::parse(&self.descr)? {
-            NpyDtype::F32 => |v| v.to_le_bytes().to_vec(),
-            NpyDtype::F64 => |v| f64::from(v).to_le_bytes().to_vec(),
-            NpyDtype::U32 => |v| (v as u32).to_le_bytes().to_vec(),
-            _ => bail!("cannot encode new rows as {}", self.descr),
-        };
-        Ok(vals.iter().flat_map(|&v| enc(v)).collect())
+        let dt = NpyDtype::parse(&self.descr)?;
+        let mut out = Vec::with_capacity(vals.len() * dt.size_bytes());
+        for &v in vals {
+            let x = f64::from(v).round();
+            // Half-open [MIN, MAX + 1): exact for every width (2^63 and 2^64
+            // are powers of two), so `as` below never saturates.
+            macro_rules! int {
+                ($t:ty) => {{
+                    let range = <$t>::MIN as f64..<$t>::MAX as f64 + 1.0;
+                    ensure!(range.contains(&x), "{v} does not fit {}", self.descr);
+                    out.extend_from_slice(&(x as $t).to_le_bytes());
+                }};
+            }
+            match dt {
+                NpyDtype::F32 => out.extend_from_slice(&v.to_le_bytes()),
+                NpyDtype::F64 => out.extend_from_slice(&f64::from(v).to_le_bytes()),
+                NpyDtype::I16 => int!(i16),
+                NpyDtype::I32 => int!(i32),
+                NpyDtype::U32 => int!(u32),
+                NpyDtype::I64 => int!(i64),
+                NpyDtype::U64 => int!(u64),
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -892,5 +911,26 @@ mod tests {
         let p = dir.path().join("i.npy");
         write_npy_v1(&p, "<u4", &[3], &ints);
         assert_eq!(read_1d_u32(&p).unwrap(), vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn encode_every_integer_dtype_with_range_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("r.npy");
+        let enc = |descr: &str, vals: &[f32]| {
+            write_npy_v1(&p, descr, &[1], &[0u8; 8]);
+            NpyRows::open(&p).unwrap().encode(vals)
+        };
+        assert_eq!(
+            enc("<i2", &[-5.0, 7.0]).unwrap(),
+            [-5i16, 7].map(i16::to_le_bytes).concat()
+        );
+        assert_eq!(enc("<i8", &[-40.0]).unwrap(), (-40i64).to_le_bytes());
+        assert_eq!(enc("<u8", &[3.0]).unwrap(), 3u64.to_le_bytes());
+        assert_eq!(enc("<i4", &[-1.0]).unwrap(), (-1i32).to_le_bytes());
+        assert!(enc("<i2", &[40000.0]).is_err());
+        assert!(enc("<u4", &[-1.0]).is_err());
+        assert!(enc("<u8", &[f32::NAN]).is_err());
+        assert!(enc("<i8", &[9.3e18]).is_err()); // above i64::MAX
     }
 }

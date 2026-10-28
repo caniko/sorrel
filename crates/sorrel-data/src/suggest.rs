@@ -391,8 +391,8 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
                 continue;
             }
             let amp_mean_delta = if sa.mean_amp.is_finite() && sb.mean_amp.is_finite() {
-                let lo = sa.mean_amp.abs().min(sb.mean_amp.abs()).max(1e-6);
-                ((sa.mean_amp - sb.mean_amp).abs() / lo).min(1.0)
+                let hi = sa.mean_amp.abs().max(sb.mean_amp.abs()).max(1e-6);
+                ((sa.mean_amp - sb.mean_amp).abs() / hi).min(1.0)
             } else {
                 0.0
             };
@@ -858,6 +858,27 @@ mod tests {
             "expected (0,1) at top, got {:?}",
             (merges[0].a, merges[0].b),
         );
+    }
+
+    #[test]
+    fn mean_amp_delta_is_a_fraction_of_the_larger_mean() {
+        // Means 10 and 18: 8/18 = 0.44 of the larger, under the default 0.5
+        // (dividing by the smaller, 0.8, used to discard the pair).
+        let a_times: Vec<SampleIndex> = (0..500).map(|i| SampleIndex((i as u64) * 10)).collect();
+        let b_times: Vec<SampleIndex> =
+            (0..500).map(|i| SampleIndex((i as u64) * 10 + 5)).collect();
+        let prov = MockProvider {
+            spikes: vec![a_times, b_times],
+            amps: vec![vec![10.0; 500], vec![18.0; 500]],
+            n_samples: SampleIndex(10_000),
+        };
+        let (sess, _d) = fresh_session(prov);
+        let merges = rank_merge_candidates(&sess, &SuggestConfig::default());
+        let m = merges
+            .iter()
+            .find(|m| (m.a, m.b) == (ClusterId(0), ClusterId(1)))
+            .expect("pair kept");
+        assert!((m.amp_mean_delta - 8.0 / 18.0).abs() < 1e-4);
     }
 
     #[test]
