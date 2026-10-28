@@ -1386,6 +1386,8 @@ fn agent_edit_toast_and_highlight() {
             let mut app = SorrelApp::new(session, label_str);
             configure(&mut app, &dir, positions);
             app.serve_mcp().unwrap();
+            // The toast and tint must outlast however long the renderer takes.
+            app.set_feedback_duration(Duration::from_secs(24 * 3600));
             app
         });
         settle(&mut h);
@@ -1448,6 +1450,84 @@ fn proposals_pane() {
         }
         click_tab(&mut h, "Proposals");
         snap(&mut h, "proposals_pane", name);
+        h
+    });
+}
+
+/// The History pane over a journal with a branch: you relabelled two
+/// clusters, undid the second, then codex merged instead (a second branch
+/// off the first edit) and you saved. Times are fixed in the records.
+#[test]
+fn history_with_a_branch() {
+    if no_gpu() {
+        return;
+    }
+    use sorrel_data::{Actor, CurationCommand, PhyLabelOp, Record};
+    use sorrel_io::ClusterId;
+    each_theme(|theme, name| {
+        let root = dataset(&format!("history-{name}"), 3);
+        let mut j = Journal::open_or_create(&root.join("sorrel.journal"), 0, 3).unwrap();
+        let t0 = 1_793_200_000_000; // 15:06:40 UTC
+        let node = |id, parent, actor, min: u64, cmd| Record::Node {
+            id,
+            parent,
+            actor,
+            ts_ms: t0 + min * 60_000,
+            cmd,
+        };
+        let codex = Actor::Agent {
+            client: "codex".into(),
+        };
+        for rec in [
+            node(
+                0,
+                None,
+                Actor::Human,
+                0,
+                CurationCommand::Relabel {
+                    cluster: ClusterId(0),
+                    op: PhyLabelOp::SetGood,
+                },
+            ),
+            node(
+                1,
+                Some(0),
+                Actor::Human,
+                1,
+                CurationCommand::Relabel {
+                    cluster: ClusterId(1),
+                    op: PhyLabelOp::SetMua,
+                },
+            ),
+            Record::Head { node: Some(0) },
+            node(
+                2,
+                Some(0),
+                codex,
+                3,
+                CurationCommand::Merge {
+                    sources: vec![ClusterId(1)],
+                    target: ClusterId(2),
+                },
+            ),
+            Record::Seal {
+                node: Some(2),
+                artifacts: 0,
+            },
+        ] {
+            j.append(&rec).unwrap();
+        }
+        drop(j);
+        let dir = root.clone();
+        let mut h = harness_with(theme, move || {
+            let (session, positions) = open(&dir);
+            let mut app = SorrelApp::new(session, label_str);
+            configure(&mut app, &dir, positions);
+            app
+        });
+        settle(&mut h);
+        click_tab(&mut h, "History");
+        snap(&mut h, "history_branch", name);
         h
     });
 }

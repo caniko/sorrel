@@ -57,10 +57,11 @@ pub enum Pane {
     TraceImage,
     SpikeData,
     Proposals,
+    History,
 }
 
 impl Pane {
-    pub const ALL: [Pane; 23] = [
+    pub const ALL: [Pane; 24] = [
         Pane::Trace,
         Pane::Summary,
         Pane::Waveforms,
@@ -84,6 +85,7 @@ impl Pane {
         Pane::TraceImage,
         Pane::SpikeData,
         Pane::Proposals,
+        Pane::History,
     ];
 
     pub fn title(self) -> &'static str {
@@ -111,6 +113,7 @@ impl Pane {
             Pane::TraceImage => "Trace image",
             Pane::SpikeData => "Spike data",
             Pane::Proposals => "Proposals",
+            Pane::History => "History",
         }
     }
 }
@@ -156,6 +159,7 @@ pub fn default_tree() -> Tree<Pane> {
             Pane::Rate,
             Pane::SpikeData,
             Pane::Proposals,
+            Pane::History,
         ],
     );
     let top = tiles.insert_horizontal_tile(vec![shape, compare, assess]);
@@ -274,6 +278,8 @@ pub enum ViewAction {
         id: u64,
         accept: bool,
     },
+    /// History row: check out this node (`None` = the sort as loaded).
+    Checkout(Option<u64>),
 }
 
 /// One card per waiting proposal: who proposed what and how sure, the
@@ -791,6 +797,14 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                 let proposals = self.proposals;
                 let actions = &mut self.actions;
                 scroll(ui, *pane, &mut |ui| proposals_view(ui, proposals, actions));
+            }
+            Pane::History => {
+                let actions = &mut self.actions;
+                scroll(ui, *pane, &mut |ui| {
+                    if let Some(node) = crate::history_view::history_view(ui, session) {
+                        actions.push(ViewAction::Checkout(node));
+                    }
+                });
             }
             Pane::DriftMap => drift_map_view(ui, session, selected, self.depths),
             Pane::ContamTime => contamination_over_time_view(ui, session, selected),

@@ -224,9 +224,12 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     /// repaints, known from the first frame.
     host_events: Receiver<HostEvent>,
     repaint: Arc<std::sync::OnceLock<egui::Context>>,
-    /// Clusters the last edit by another actor touched, and when: drawn in
-    /// the highlight colour for [`HIGHLIGHT`].
+    /// Clusters the last edit by another actor touched, and when: tinted
+    /// for `highlight_for` ([`HIGHLIGHT`] unless a test pins it).
     highlight: Option<(Vec<ClusterId>, Instant)>,
+    highlight_for: std::time::Duration,
+    /// How long the status toast stays (5 s unless a test pins it).
+    toast_for: std::time::Duration,
     /// Last window title sent to the OS; only re-sent when it changes.
     last_title: String,
     /// AA-contrast visuals go in on the first frame (no ctx before then).
@@ -361,6 +364,8 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             host_events,
             repaint,
             highlight: None,
+            highlight_for: HIGHLIGHT,
+            toast_for: std::time::Duration::from_secs(5),
             last_title: String::new(),
             visuals_installed: false,
         }
@@ -608,11 +613,18 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         self.status = toast(format!("{verb}: {what}"));
     }
 
+    /// How long the status toast and another actor's highlight stay up.
+    /// Snapshot tests pin it long so a slow renderer cannot outlast them.
+    pub fn set_feedback_duration(&mut self, d: std::time::Duration) {
+        self.highlight_for = d;
+        self.toast_for = d;
+    }
+
     /// The highlighted clusters while the highlight lasts.
     fn highlighted(&self) -> Option<&[ClusterId]> {
         self.highlight
             .as_ref()
-            .filter(|(_, at)| at.elapsed() < HIGHLIGHT)
+            .filter(|(_, at)| at.elapsed() < self.highlight_for)
             .map(|(c, _)| c.as_slice())
     }
 
@@ -1829,6 +1841,13 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             ViewAction::AddPane(pane, into) => layout::add_pane(&mut self.tree, pane, Some(into)),
             ViewAction::Screenshot(pane, rect) => self.pending_screenshots.push((pane, rect)),
             ViewAction::Decide { id, accept } => self.decide_proposal(id, accept),
+            ViewAction::Checkout(node) => {
+                self.cancel_jobs();
+                match self.host.checkout(Actor::Human, node) {
+                    Ok(ev) => self.status = toast(ev.desc),
+                    Err(e) => self.error = Some(format!("checkout failed: {e}")),
+                }
+            }
         }
     }
 
@@ -1981,7 +2000,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
         let _ = self.repaint.set(ctx.clone());
         self.poll_host();
         if let Some((_, at)) = &self.highlight {
-            match HIGHLIGHT.checked_sub(at.elapsed()) {
+            match self.highlight_for.checked_sub(at.elapsed()) {
                 Some(left) => ctx.request_repaint_after(left),
                 None => self.highlight = None,
             }
@@ -2090,19 +2109,14 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
         self.show_confirm_dialog(&ctx);
         self.show_help_window(&ctx);
 
-        // Status auto-fades after 5 s so the top bar doesn't pin a stale
+        // Status auto-fades (after 5 s) so the top bar doesn't pin a stale
         // "saved" pill from twenty minutes ago.
-        const STATUS_TTL_SECS: u64 = 5;
         if let Some((_, when)) = &self.status {
-            let elapsed = when.elapsed().as_secs();
-            if elapsed >= STATUS_TTL_SECS {
-                self.status = None;
-            } else {
+            match self.toast_for.checked_sub(when.elapsed()) {
                 // Wake the UI when the toast should fade so users on idle
                 // input still see it disappear.
-                ctx.request_repaint_after(std::time::Duration::from_secs(
-                    STATUS_TTL_SECS - elapsed,
-                ));
+                Some(left) => ctx.request_repaint_after(left),
+                None => self.status = None,
             }
         }
 
@@ -2521,6 +2535,29 @@ mod tests {
             (outcome(split), outcome(merge)),
             (Outcome::Accepted, Outcome::Rejected)
         );
+    }
+
+    /// A History click checks out another branch through the host and
+    /// names the node it went back to.
+    #[test]
+    fn history_checkout_crosses_branches() {
+        let (mut app, _d) = make_app();
+        let relabel = |c, op| CurationCommand::Relabel {
+            cluster: ClusterId(c),
+            op,
+        };
+        app.commit(relabel(1, PhyLabelOp::SetGood));
+        app.dispatch_intent(Intent::Undo);
+        app.commit(relabel(1, PhyLabelOp::SetNoise));
+        assert_eq!(label(&app, 1), Some(3));
+        app.apply_view_action(ViewAction::Checkout(Some(0)));
+        assert_eq!(label(&app, 1), Some(1), "the other branch");
+        assert_eq!(
+            app.status.as_ref().map(|s| s.0.as_str()),
+            Some("back to: relabel cluster 1 as Good")
+        );
+        app.apply_view_action(ViewAction::Checkout(Some(9)));
+        assert!(app.error.is_some());
     }
 
     fn make_app() -> (SorrelApp<StubProvider>, tempfile::TempDir) {

@@ -131,9 +131,9 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
         let ev = HostEvent {
             node,
             actor,
-            desc: match node {
-                Some(n) => format!("checkout node {n}"),
-                None => "checkout the sort as loaded".into(),
+            desc: match node.and_then(|n| s.node(n)) {
+                Some((.., cmd)) => format!("back to: {}", describe_command(cmd)),
+                None => "back to the sort as loaded".into(),
             },
             clusters: Vec::new(),
             version: s.version(),

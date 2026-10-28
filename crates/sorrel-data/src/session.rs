@@ -347,6 +347,11 @@ impl<P: DataProvider> Session<P> {
         Ok(())
     }
 
+    /// `(node, artifacts hash)` of every save, oldest first.
+    pub fn seals(&self) -> &[(Option<u64>, u64)] {
+        &self.seals
+    }
+
     /// The saved files now hold the head's state.
     pub fn mark_saved(&mut self) {
         self.saved = self.head;
