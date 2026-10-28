@@ -4,8 +4,7 @@
 
 use sorrel_data::command::SpikeBatch;
 use sorrel_data::{
-    export_phy, open_phy, save_and_reseal_journal, save_to_phy, seed_phy, CurationCommand,
-    JournalOpts, Session,
+    open_phy, save_and_reseal_journal, seed_phy, CurationCommand, JournalOpts, Session,
 };
 use sorrel_io::kilosort::{KilosortOpenParams, KilosortProvider, PhyLabel};
 use sorrel_io::npy::{read_1d_f32, read_1d_u32, read_npy_f32_flat, read_npy_u32_flat};
@@ -276,6 +275,7 @@ fn interrupted_rewrite_rolls_forward_on_open() {
     assert_eq!(p.spike_times(ClusterId(2)).len(), 6);
 }
 
+#[cfg(feature = "phy-export")]
 #[test]
 fn plain_save_with_added_spikes_errors_and_export_rewrites() {
     let dir = tempfile::tempdir().unwrap();
@@ -284,7 +284,7 @@ fn plain_save_with_added_spikes_errors_and_export_rewrites() {
     let before = std::fs::read(root.join("spike_clusters.npy")).unwrap();
     let mut s = open(root);
     add_two(&mut s);
-    let e = save_to_phy(&s, root, label_str).unwrap_err();
+    let e = sorrel_data::save_to_phy(&s, root, label_str).unwrap_err();
     assert!(e.to_string().contains("added spikes"), "{e}");
     assert_eq!(
         std::fs::read(root.join("spike_clusters.npy")).unwrap(),
@@ -292,7 +292,7 @@ fn plain_save_with_added_spikes_errors_and_export_rewrites() {
     );
 
     let out = tempfile::tempdir().unwrap();
-    export_phy(&s, out.path(), false, label_str).unwrap();
+    sorrel_data::export_phy(&s, out.path(), false, label_str).unwrap();
     let o = out.path();
     assert_eq!(read_1d_u32(&o.join("spike_times.npy")).unwrap().len(), 8);
     assert_eq!(
