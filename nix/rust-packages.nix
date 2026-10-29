@@ -16,6 +16,14 @@
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
+  # `sorrel completions` needs to run the binary, so cross builds skip it.
+  completions = pkgs.lib.optionalString (pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform) ''
+    installShellCompletion --cmd sorrel \
+      --bash <("$out/bin/sorrel" completions bash) \
+      --zsh <("$out/bin/sorrel" completions zsh) \
+      --fish <("$out/bin/sorrel" completions fish)
+  '';
+
   # Also installs the menu entry, so every Nix install (profile, Home
   # Manager, NixOS) gets one.
   rpathFixup = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
@@ -33,6 +41,8 @@
           inherit cargoArtifacts;
           buildInputs = buildInputs ++ [hdf5C];
           cargoExtraArgs = "-p sorrel --locked --features hdf5";
+          nativeBuildInputs = nativeBuildInputs ++ [pkgs.installShellFiles];
+          postInstall = completions;
           postFixup = rpathFixup;
         })
     else null;
@@ -41,6 +51,8 @@
     // {
       inherit cargoArtifacts;
       cargoExtraArgs = "-p sorrel --locked";
+      nativeBuildInputs = nativeBuildInputs ++ [pkgs.installShellFiles];
+      postInstall = completions;
       # Add an rpath so the binary finds vulkan/wayland/etc. without
       # leaking the dev shell's LD_LIBRARY_PATH.
       postFixup = rpathFixup;
