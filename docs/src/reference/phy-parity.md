@@ -31,7 +31,7 @@ statuses:
 | ClusterView                           | Cluster table                                                                                                                                                                                                                                                                                                                               | planned              |                                                                                           |
 | SimilarityView                        | **Similar**; cluster similarity is phy's max over both clusters' templates                                                                                                                                                                                                                                                                  | planned              | `phy_parity::phy_cluster_similarity_is_max_over_templates`                                |
 | HistogramView                         | Plugin base class; the built-in histograms are ISI and Rate                                                                                                                                                                                                                                                                                 | excluded: plugin API |                                                                                           |
-| IPythonView                           | Scripting goes through `sorrel-py` and the `sorrel serve` JSON-RPC API instead of an in-window console                                                                                                                                                                                                                                      | excluded             |                                                                                           |
+| IPythonView                           | Scripting goes through `sorrel-py` and the `sorrel mcp` JSON-RPC API instead of an in-window console                                                                                                                                                                                                                                        | excluded             |                                                                                           |
 
 ## FeatureView behaviour
 
@@ -111,12 +111,12 @@ statuses:
 
 ## Command line
 
-| phy                                    | Sorrel                                                            | Status                     |
-| -------------------------------------- | ----------------------------------------------------------------- | -------------------------- |
-| `phy template-gui params.py`           | `sorrel <DATA_DIR>` (Kilosort/phy, SortingAnalyzer, NWB, KS4 rez) | done                       |
-| `phy template-describe params.py`      | `sorrel describe <DATA_DIR>`                                      | done                       |
-| `--clear-cache`                        | `sorrel clear-cache`                                              | done                       |
-| `kwik-gui`, `trace-gui`, `alf-convert` | —                                                                 | excluded: not template-gui |
+| phy                                    | Sorrel                                                                 | Status                     |
+| -------------------------------------- | ---------------------------------------------------------------------- | -------------------------- |
+| `phy template-gui params.py`           | `sorrel open <DATA_DIR>` (Kilosort/phy, SortingAnalyzer, NWB, KS4 rez) | done                       |
+| `phy template-describe params.py`      | `sorrel describe <DATA_DIR>`                                           | done                       |
+| `--clear-cache`                        | `sorrel clear-cache`                                                   | done                       |
+| `kwik-gui`, `trace-gui`, `alf-convert` | —                                                                      | excluded: not template-gui |
 
 ## Differences that stay
 
@@ -131,4 +131,4 @@ statuses:
 - **Custom labels in `curation.json`.** These are written as `name=value`
   tags, not as SpikeInterface label keys.
 - **Plugins and the IPython console.** Both are excluded. Scripting goes
-  through `sorrel-py` and `sorrel serve`.
+  through `sorrel-py` and `sorrel mcp`.

@@ -32,7 +32,7 @@ description = "Trace, raster, ISI, CCG, waveform, template, feature, drift, prob
 
 [[extra.features]]
 title = "Headless QC export"
-description = "sorrel --export-qc DIR runs every metric on the loaded session and writes cluster_qc.tsv + cluster_qc.json without spawning a window."
+description = "sorrel qc DIR --out DIR runs every metric on the loaded session and writes cluster_qc.tsv + cluster_qc.json without spawning a window."
 
 [[extra.features]]
 title = "Python bridge"

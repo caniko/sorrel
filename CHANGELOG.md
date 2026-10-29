@@ -7,6 +7,35 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Breaking
+
+- `sorrel <DATA_DIR>` is now `sorrel open <DATA_DIR>`. Bare `sorrel` starts
+  the launcher.
+- `sorrel --headless <DATA_DIR>` is now `sorrel run --headless <DATA_DIR>`.
+- `sorrel --export-qc DIR` is now `sorrel qc <DATA_DIR> --out DIR`.
+- `sorrel --clear-cache DIR` is now `sorrel clear-cache <DATA_DIR>`.
+- `sorrel serve` is removed; use `sorrel mcp`.
+- The MCP listener file moved from `<DATA_DIR>/.sorrel/mcp.json` to a per-user
+  directory: `$XDG_RUNTIME_DIR/sorrel/mcp/<hash>.json` (fallback
+  `~/.cache/sorrel/mcp/`; `%LOCALAPPDATA%\sorrel\mcp\` on Windows). Use
+  `sorrel mcp` rather than reading it.
+
+### Added
+
+- Tabs and a launcher in the GUI. `sorrel open` adds a dataset as a tab to the
+  running window. The launcher offers Open dataset…, drag-and-drop and recent
+  datasets. Ctrl-O opens, Ctrl-W closes a tab, Ctrl-Tab and Ctrl-Shift-Tab
+  switch tabs.
+- `sorrel run` runs the GUI in the foreground; `--standalone` always starts a
+  separate window.
+- `sorrel status [--json]` lists the running GUI, its tabs and session hosts.
+- `sorrel call` runs one MCP tool from a shell.
+- `sorrel mcp tools` lists the MCP tools offline; `sorrel mcp config` prints how
+  to register sorrel with an agent.
+- `sorrel agent-guide` prints a primer for LLM agents.
+- `sorrel completions` for bash, zsh, fish, elvish and PowerShell.
+- `sorrel describe --json`.
+
 ## [0.2.3] - 2026-10-29
 
 ### Fixed
