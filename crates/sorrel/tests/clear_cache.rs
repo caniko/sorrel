@@ -12,14 +12,14 @@ fn clear_cache_removes_dataset_cache_and_exits_zero() {
     .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_sorrel"))
-        .arg("--clear-cache")
+        .arg("clear-cache")
         .arg(dir.path())
         .output()
         .unwrap();
 
     assert!(
         output.status.success(),
-        "sorrel --clear-cache failed: status={:?}, stderr={}",
+        "sorrel clear-cache failed: status={:?}, stderr={}",
         output.status.code(),
         String::from_utf8_lossy(&output.stderr)
     );

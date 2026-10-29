@@ -9,7 +9,9 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use eframe::egui_wgpu::RenderState;
 use sorrel_data::session::ApplyPhyLabel;
+use sorrel_data::InstanceRequest;
 use sorrel_data::{
     apply_rules, baseline_hash, collect_qc_rows, diff_labels, export_qc, rank_merge_candidates,
     rank_split_candidates, save_session as save_dir_session, save_to_phy, serve, write_report,
@@ -22,7 +24,7 @@ use sorrel_io::{
     detect_sorter, DataProvider, Events, HasGeometry, HasQualityMetrics, KilosortProvider,
     SortingAnalyzerProvider, TraceDtype,
 };
-use sorrel_ui::{RasterPipeline, ScatterPipeline, SorrelApp, TracePipeline};
+use sorrel_ui::{OpenRequest, Opened, Opener, Shell, SorrelApp, Tab};
 use std::path::{Path, PathBuf};
 
 mod rescue;
@@ -39,33 +41,67 @@ enum Backend {
 
 /// sorrel — spike-sorting curation GUI
 ///
-/// `sorrel <DATA_DIR>` opens the GUI; the subcommands run headlessly on the
-/// same data and the same curation journal.
+/// Bare `sorrel` starts the GUI (or focuses the running one); `open` adds a
+/// dataset to it as a tab. The other subcommands run headlessly on the same
+/// data and the same curation journal.
 #[derive(Parser, Debug)]
 #[command(
     name = "sorrel",
     version,
-    args_conflicts_with_subcommands = true,
-    subcommand_negates_reqs = true,
     after_help = "When params.py is present, sample-rate / channels / dtype / offset / \
                   dat-path all default from it; flags override per field."
 )]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
-    /// Run the session host without the GUI: MCP clients connect with
-    /// `sorrel mcp <DATA_DIR>`. Stops on Ctrl-C.
-    #[arg(long)]
-    headless: bool,
-    /// `sorrel <DATA_DIR> [flags]` with no subcommand means `open`.
-    #[command(flatten)]
-    open: OpenArgs,
 }
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Open the curation GUI (the default when no subcommand is given)
+    /// Open DATA_DIR as a tab in the running GUI, starting one (detached) if
+    /// none is running
     Open(OpenArgs),
+    /// The GUI in the foreground (logs, Ctrl-C). Hands DATA_DIR to a running
+    /// GUI unless --standalone
+    #[command(mut_arg("root", |a| a.required(false)))]
+    Run {
+        #[command(flatten)]
+        open: OpenArgs,
+        /// Always start a separate window: neither forward to a running GUI
+        /// nor register as the instance `open` talks to
+        #[arg(long)]
+        standalone: bool,
+        /// Run the session host without a window: MCP clients connect with
+        /// `sorrel mcp <DATA_DIR>`. Stops on Ctrl-C
+        #[arg(long, requires = "root", conflicts_with = "standalone")]
+        headless: bool,
+    },
+    /// Show the running GUI (tabs), session hosts and the detached GUI's log
+    Status {
+        /// Only the hosts of this dataset
+        #[arg(value_name = "DATA_DIR")]
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run one MCP tool: through the running host, else on the dataset
+    /// opened in-process
+    Call {
+        #[command(flatten)]
+        open: OpenArgs,
+        /// Tool name (see `sorrel mcp tools`)
+        tool: String,
+        /// Tool arguments as a JSON object
+        args: Option<String>,
+        /// Print the whole JSON-RPC response
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Print a primer for LLM agents, with the live command list, MCP tools
+    /// and running hosts
+    AgentGuide,
+    /// Print a shell completion script
+    Completions { shell: clap_complete::Shell },
     /// Headless: run every metric and write cluster_qc.tsv + cluster_qc.json
     Qc {
         #[command(flatten)]
@@ -140,6 +176,9 @@ enum Cmd {
     Describe {
         #[command(flatten)]
         open: OpenArgs,
+        /// Emit a JSON object instead of the table
+        #[arg(long)]
+        json: bool,
     },
     /// Headless: write a self-contained HTML report with one card per cluster
     Report {
@@ -160,13 +199,19 @@ enum Cmd {
         tag: Option<String>,
     },
     /// MCP over stdio, the command an agent launches: attaches to the host
-    /// running on DATA_DIR (the GUI or `--headless`), else opens the dataset
-    /// in-process. Agents inspect metrics, request plots and curate through
-    /// the journal.
-    #[command(alias = "serve")]
+    /// running on DATA_DIR (the GUI or `run --headless`), else opens the
+    /// dataset in-process. Without DATA_DIR: the GUI's active tab, else the
+    /// only running host. Agents inspect metrics, request plots and curate
+    /// through the journal.
+    #[command(
+        args_conflicts_with_subcommands = true,
+        mut_arg("root", |a| a.required(false))
+    )]
     Mcp {
         #[command(flatten)]
         open: OpenArgs,
+        #[command(subcommand)]
+        sub: Option<McpCmd>,
     },
     /// Compare two cluster_group.tsv files: confusion table, kappa, disagreements
     Diff {
@@ -255,6 +300,31 @@ enum Cmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum McpCmd {
+    /// List the MCP tools (offline)
+    Tools {
+        /// Print the full `tools/list` JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print how to register sorrel with an agent client
+    Config {
+        #[arg(long, value_enum, default_value = "claude")]
+        client: Client,
+        /// Pin the server to this dataset (default: the active one)
+        #[arg(value_name = "DATA_DIR")]
+        dir: Option<PathBuf>,
+    },
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum Client {
+    Claude,
+    Codex,
+    Json,
+}
+
+#[derive(Subcommand, Debug)]
 // Parsed once at startup; boxing OpenArgs would buy nothing.
 #[allow(clippy::large_enum_variant)]
 enum JournalCmd {
@@ -326,18 +396,37 @@ struct OpenArgs {
     /// <DATA_DIR>/events.csv|npy, else the opened NWB file's trials
     #[arg(long, value_name = "FILE")]
     events: Option<PathBuf>,
-    /// Deprecated alias for `sorrel qc <DATA_DIR> --out DIR`
-    #[arg(long, value_name = "DIR", hide = true)]
-    export_qc: Option<PathBuf>,
-    /// Deprecated alias for `sorrel clear-cache <DATA_DIR>`
-    #[arg(long, hide = true)]
-    clear_cache: bool,
 }
 
 impl OpenArgs {
     fn root(&self) -> &Path {
         self.root.as_deref().expect("clap marks DATA_DIR required")
     }
+
+    /// Make the path fields absolute against `cwd`: the args came from a
+    /// `sorrel open` run somewhere else.
+    fn rebase(&mut self, cwd: &Path) {
+        for p in [
+            &mut self.root,
+            &mut self.dat,
+            &mut self.journal,
+            &mut self.spikeglx_meta,
+            &mut self.oebin,
+            &mut self.events,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *p = cwd.join(&*p);
+        }
+    }
+}
+
+/// A forwarded `sorrel open`'s arguments, parsed again inside the GUI.
+#[derive(Parser)]
+struct TabCli {
+    #[command(flatten)]
+    open: OpenArgs,
 }
 
 fn parse_backend(s: &str) -> std::result::Result<Backend, String> {
@@ -686,15 +775,36 @@ fn run_join(
     // The host tracks our journal cursor, so the guest never seals: a seal
     // record would advance only our count and every later record would be
     // refused as diverged. Saving still writes the phy files locally.
+    let root = std::path::absolute(&joined.root)?;
     let ctx = OpenCtx {
-        save_dir: joined.root,
+        save_dir: joined.root.clone(),
         reseal_on_save: false,
-        positions: joined.positions,
+        positions: joined.positions.clone(),
         shanks: Vec::new(),
         metrics: Default::default(),
         depth_source: Some(sorrel_data::spike_depths),
     };
-    run_app(joined.session, Box::new(|_| Ok(())), ctx, None)
+    // The network state lives in this process, so the window is standalone
+    // and its one tab is the session just joined (`joined` stays alive until
+    // the window closes).
+    let session = joined.session;
+    let mut once = Some(move |rs: Option<&RenderState>| {
+        let app = build_tab(session, Box::new(|_| Ok(())), ctx, None, rs);
+        Opened::Tab(Box::new(app) as Box<dyn Tab>, root)
+    });
+    let opener: Opener = Box::new(move |_, _, rs| {
+        once.take()
+            .map(|f| f(rs))
+            .ok_or_else(|| anyhow::anyhow!("a joined session is a single window"))
+    });
+    run_shell(
+        opener,
+        Some(OpenRequest {
+            cwd: PathBuf::new(),
+            args: vec![],
+        }),
+        false,
+    )
 }
 
 /// Shared open path for single-file backends (`.nwb`, `rez.mat`): the
@@ -738,13 +848,26 @@ where
 
 // ---------------------------------------------------------------- commands
 
-struct Gui(Option<Events>);
-impl SessionVisitor for Gui {
+/// Builds the GUI tab for a session (the typed `SorrelApp<P>` is boxed into
+/// a [`Tab`], so the visitor trait stays unchanged).
+struct TabBuilder<'a> {
+    out: &'a mut Option<Box<dyn Tab>>,
+    events: Option<Events>,
+    rs: Option<&'a RenderState>,
+}
+impl SessionVisitor for TabBuilder<'_> {
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
-        run_app(session, seed, ctx, self.0)
+        *self.out = Some(Box::new(build_tab(
+            session,
+            seed,
+            ctx,
+            self.events,
+            self.rs,
+        )));
+        Ok(())
     }
 }
 
@@ -1064,20 +1187,36 @@ impl SessionVisitor for Report {
     }
 }
 
-struct Describe;
+struct Describe {
+    json: bool,
+}
 impl SessionVisitor for Describe {
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, _: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
         let s = seeded(session, seed)?;
-        print!("{}", describe(&s));
+        let rows = describe(&s);
+        if self.json {
+            let obj: serde_json::Map<String, serde_json::Value> = rows
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.into()))
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&obj)?);
+        } else {
+            print!(
+                "{}",
+                rows.iter()
+                    .map(|(k, v)| format!("{k:<14}{v}\n"))
+                    .collect::<String>()
+            );
+        }
         Ok(())
     }
 }
 
-/// phy `template-describe`: one `name  value` line per dataset fact.
-fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> String {
+/// phy `template-describe`: one `(name, value)` row per dataset fact.
+fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> Vec<(&'static str, String)> {
     let p = &s.provider;
     let sr = p.sample_rate();
     let n_spikes: usize = (0..s.n_clusters())
@@ -1153,11 +1292,11 @@ fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> String {
         }),
         ("undo history", s.history_len().to_string()),
     ];
-    rows.iter().map(|(k, v)| format!("{k:<14}{v}\n")).collect()
+    rows.to_vec()
 }
 
-/// Where a host for `open` writes `.sorrel/mcp.json`: the save directory,
-/// i.e. the dataset directory or a single file's parent.
+/// The save directory a host for `open` registers under: the dataset
+/// directory or a single file's parent.
 fn host_dir(open: &OpenArgs) -> PathBuf {
     let root = open.root();
     match root.is_dir() {
@@ -1182,13 +1321,13 @@ fn busy_hint(e: anyhow::Error) -> anyhow::Error {
         Some(b) => anyhow::anyhow!(
             "{b}: another sorrel owns this dataset but its MCP listener is not \
              reachable (no usable MCP token file). Close it, or run `sorrel mcp` \
-             once its host (the GUI or `sorrel --headless`) is up"
+             once its host (the GUI or `sorrel run --headless`) is up"
         ),
         None => e,
     }
 }
 
-/// `sorrel --headless`: the host and its MCP listener, no window.
+/// `sorrel run --headless`: the host and its MCP listener, no window.
 struct Headless;
 impl SessionVisitor for Headless {
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
@@ -1208,7 +1347,7 @@ impl SessionVisitor for Headless {
             listener.port(),
             ctx.save_dir.display()
         );
-        // Ctrl-C returns, dropping the listener so it removes its mcp.json.
+        // Ctrl-C returns, dropping the listener so it removes its registry file.
         sorrel_remote::wait_for_ctrl_c();
         drop(listener);
         Ok(())
@@ -1283,12 +1422,15 @@ fn clear_cache(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_app<P>(
+/// One curation tab for a session: export hook, save dir, optional extras,
+/// the MCP listener and (with a render state) the GPU compute path.
+fn build_tab<P>(
     session: Session<P>,
     seed: Seed<P>,
     ctx: OpenCtx<P>,
     events: Option<Events>,
-) -> Result<()>
+    rs: Option<&RenderState>,
+) -> SorrelApp<P>
 where
     P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
 {
@@ -1327,49 +1469,556 @@ where
     if let Some(f) = ctx.depth_source {
         app.set_depth_source(f);
     }
+    if let Err(e) = app.serve_mcp() {
+        log::warn!("MCP listener not started: {e:#}");
+    }
+    match rs {
+        Some(rs) => app.install_gpu_compute(
+            rs.device.clone().into(),
+            rs.queue.clone().into(),
+            &rs.adapter.get_info(),
+        ),
+        None => log::warn!("no wgpu render state available; trace view will not render"),
+    }
+    app
+}
 
+/// `--events`, else (for an NWB file without sidecar events) its trials table.
+fn load_events(open: &OpenArgs) -> Result<Option<Events>> {
+    Ok(match &open.events {
+        Some(p) => {
+            Some(Events::read(p).with_context(|| format!("reading events {}", p.display()))?)
+        }
+        // Sidecar events next to an NWB file win (the app detects them);
+        // otherwise its trials table, whose absence is normal.
+        None if open
+            .root()
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("nwb"))
+            && matches!(
+                Events::detect(open.root().parent().unwrap_or(Path::new("."))),
+                Ok(None)
+            ) =>
+        {
+            Events::read(open.root()).ok()
+        }
+        None => None,
+    })
+}
+
+/// The shell's opener: a forwarded `sorrel open`'s args become a tab, or the
+/// index of the tab that already shows the dataset.
+fn tab_opener() -> Opener {
+    Box::new(|req, open_dirs, rs| {
+        let args = std::iter::once("sorrel").chain(req.args.iter().map(String::as_str));
+        let mut open = TabCli::try_parse_from(args)?.open;
+        open.rebase(&req.cwd);
+        let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let dir = canon(&host_dir(&open));
+        if let Some(i) = open_dirs.iter().position(|d| canon(d) == dir) {
+            return Ok(Opened::Existing(i));
+        }
+        let events = load_events(&open)?;
+        let mut tab = None;
+        with_session(
+            &open,
+            TabBuilder {
+                out: &mut tab,
+                events,
+                rs,
+            },
+        )?;
+        let tab = tab.context("backend produced no tab")?;
+        Ok(Opened::Tab(tab, open.root().to_path_buf()))
+    })
+}
+
+/// The window. `register` makes it the instance `sorrel open` hands datasets
+/// to; `first` is opened at startup.
+fn run_shell(opener: Opener, first: Option<OpenRequest>, register: bool) -> Result<()> {
     let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
         setup.instance_descriptor.flags = sorrel_gpu::instance_flags();
     }
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 800.0])
+            .with_app_id("sorrel"),
         wgpu_options,
         ..Default::default()
     };
+    // Held here, not in the app, so it drops (removing gui.json) when
+    // `run_native` returns.
+    let held = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot = held.clone();
     eframe::run_native(
         "Sorrel",
         native_options,
         Box::new(move |cc| {
-            let mut app = app;
-            if let Err(e) = app.serve_mcp() {
-                log::warn!("MCP listener not started: {e:#}");
+            let mut rx = None;
+            if register {
+                let ctx = cc.egui_ctx.clone();
+                match sorrel_data::serve_instance(std::sync::Arc::new(move || {
+                    ctx.request_repaint()
+                })) {
+                    Ok((handle, r)) => {
+                        *slot.borrow_mut() = Some(handle);
+                        rx = Some(r);
+                    }
+                    Err(e) => log::warn!("single-instance listener not started: {e}"),
+                }
             }
-            if let Some(rs) = cc.wgpu_render_state.as_ref() {
-                TracePipeline::install(rs);
-                RasterPipeline::install(rs);
-                ScatterPipeline::install(rs);
-                app.install_gpu_compute(
-                    rs.device.clone().into(),
-                    rs.queue.clone().into(),
-                    &rs.adapter.get_info(),
-                );
-            } else {
-                log::warn!("no wgpu render state available; trace view will not render");
+            let mut shell = Shell::new(cc, opener, rx);
+            if let Some(req) = first {
+                shell.open(req);
             }
-            Ok(Box::new(app))
+            Ok(Box::new(shell))
         }),
     )
-    .map_err(|e| anyhow::anyhow!("eframe: {e}"))
+    .map_err(|e| anyhow::anyhow!("eframe: {e}"))?;
+    drop(held);
+    Ok(())
+}
+
+/// This invocation's arguments after the subcommand, as a forwarded request.
+/// ponytail: assumes no global flags precede the subcommand (there are none);
+/// parse them out of `env::args` if one is ever added.
+fn open_request() -> Result<OpenRequest> {
+    Ok(OpenRequest {
+        cwd: std::env::current_dir()?,
+        // `run`'s own flag; the tab parser only knows the open options.
+        args: std::env::args()
+            .skip(2)
+            .filter(|a| a != "--standalone")
+            .collect(),
+    })
+}
+
+/// Hand `req` to the running GUI. `false`: none is running.
+fn forward(req: &InstanceRequest) -> Result<bool> {
+    match sorrel_data::send_instance(req)? {
+        None => Ok(false),
+        Some(v) => match v["error"].as_str() {
+            Some(e) => bail!("{e}"),
+            None => Ok(true),
+        },
+    }
+}
+
+/// Start the GUI with `run_args`: detached when a terminal would otherwise
+/// hold it, else in-process (a desktop launch, or an AppImage, which unmounts
+/// when its parent exits).
+fn start_gui(run_args: &[String], first: Option<OpenRequest>) -> Result<()> {
+    use std::io::IsTerminal;
+    if !std::io::stderr().is_terminal() || std::env::var_os("APPIMAGE").is_some() {
+        return run_shell(tab_opener(), first, true);
+    }
+    let log_path = sorrel_data::user_dir()?.join("gui.log");
+    let log = std::fs::File::create(&log_path)
+        .with_context(|| format!("create {}", log_path.display()))?;
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.args(run_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    cmd.spawn().context("start the sorrel window")?;
+    println!("sorrel started; log: {}", log_path.display());
+    Ok(())
+}
+
+/// `sorrel`: focus the running GUI, else start one with the launcher.
+fn run_bare() -> Result<()> {
+    if forward(&InstanceRequest::Focus)? {
+        return Ok(());
+    }
+    start_gui(&["run".into()], None)
+}
+
+fn require_exists(open: &OpenArgs) -> Result<()> {
+    anyhow::ensure!(
+        open.root().exists(),
+        "{} does not exist",
+        open.root().display()
+    );
+    Ok(())
+}
+
+/// `sorrel open`: a tab in the running GUI, else a new detached GUI.
+fn run_open(open: &OpenArgs) -> Result<()> {
+    require_exists(open)?;
+    let req = open_request()?;
+    let msg = "opened in the running sorrel window";
+    if forward(&InstanceRequest::Open {
+        cwd: req.cwd.clone(),
+        args: req.args.clone(),
+    })? {
+        println!("{msg}");
+        return Ok(());
+    }
+    let run_args = ["run".to_owned()].into_iter().chain(req.args.clone());
+    start_gui(&run_args.collect::<Vec<_>>(), Some(req))
+}
+
+/// `sorrel run`: the GUI in the foreground.
+fn run_gui(open: &OpenArgs, standalone: bool) -> Result<()> {
+    let first = match open.root {
+        Some(_) => {
+            require_exists(open)?;
+            Some(open_request()?)
+        }
+        None => None,
+    };
+    if !standalone {
+        let req = match &first {
+            Some(r) => InstanceRequest::Open {
+                cwd: r.cwd.clone(),
+                args: r.args.clone(),
+            },
+            None => InstanceRequest::Focus,
+        };
+        if forward(&req)? {
+            println!("opened in the running sorrel window");
+            return Ok(());
+        }
+    }
+    run_shell(tab_opener(), first, !standalone)
+}
+
+/// The dataset `sorrel mcp` (no DATA_DIR) serves: the GUI's active tab, else
+/// the only live host.
+fn mcp_target() -> Result<PathBuf> {
+    // A hung GUI is skipped: the host registry may still name its datasets.
+    let gui = sorrel_data::send_instance(&InstanceRequest::List)
+        .ok()
+        .flatten();
+    let active = gui
+        .as_ref()
+        .and_then(|v| v["tabs"].as_array())
+        .and_then(|t| t.iter().find(|t| t["active"] == true))
+        .and_then(|t| t["dataset"].as_str());
+    if let Some(d) = active {
+        return Ok(d.into());
+    }
+    let mut alive: Vec<_> = sorrel_data::list_hosts()
+        .into_iter()
+        .filter(|h| h.alive)
+        .collect();
+    match alive.len() {
+        0 => bail!("no running sorrel host; pass DATA_DIR"),
+        1 => Ok(alive.remove(0).dataset),
+        _ => bail!(
+            "several sorrel hosts are running; pass DATA_DIR:\n{}",
+            alive
+                .iter()
+                .map(|h| format!("  {} ({}, pid {})", h.dataset.display(), h.kind, h.pid))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    }
+}
+
+/// `sorrel mcp` without DATA_DIR: bridge stdio to the target's host.
+fn run_mcp_active() -> Result<()> {
+    let dir = mcp_target()?;
+    if !sorrel_data::attach(&dir, std::io::stdin(), std::io::stdout())? {
+        bail!("the sorrel host for {} is not reachable", dir.display());
+    }
+    Ok(())
+}
+
+fn first_line(s: &str) -> &str {
+    s.lines().next().unwrap_or_default()
+}
+
+/// `sorrel mcp tools`.
+fn mcp_tools(json: bool) -> Result<()> {
+    let list = sorrel_data::tool_list();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"tools": list}))?
+        );
+        return Ok(());
+    }
+    for t in list.as_array().into_iter().flatten() {
+        let name = t["name"].as_str().unwrap_or_default();
+        println!(
+            "{name:<20}{}",
+            first_line(t["description"].as_str().unwrap_or_default())
+        );
+    }
+    Ok(())
+}
+
+/// `sorrel mcp config`: how to register this binary with an agent client.
+fn mcp_config(client: Client, dir: Option<PathBuf>) -> Result<()> {
+    let exe = std::env::current_exe()?.display().to_string();
+    let mut args = vec!["mcp".to_owned()];
+    if let Some(d) = dir {
+        args.push(std::path::absolute(d)?.display().to_string());
+    }
+    let sh = |s: &str| {
+        if s.chars()
+            .all(|c| c.is_alphanumeric() || "/._-+:@".contains(c))
+        {
+            s.to_owned()
+        } else {
+            format!("'{}'", s.replace('\'', r"'\''"))
+        }
+    };
+    let json = |s: &[String]| serde_json::to_string(s).expect("strings serialise");
+    match client {
+        Client::Claude => println!(
+            "claude mcp add sorrel -- {} {}",
+            sh(&exe),
+            args.iter().map(|a| sh(a)).collect::<Vec<_>>().join(" ")
+        ),
+        // JSON string escapes are valid TOML basic strings.
+        Client::Codex => println!(
+            "[mcp_servers.sorrel]\ncommand = {}\nargs = {}",
+            serde_json::to_string(&exe)?,
+            json(&args)
+        ),
+        Client::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {"sorrel": {"command": exe, "args": args}}
+            }))?
+        ),
+    }
+    Ok(())
+}
+
+/// One-shot tool call on a dataset opened in-process.
+struct CallOnce<'a> {
+    request: &'a str,
+    reply: &'a mut Option<serde_json::Value>,
+}
+impl SessionVisitor for CallOnce<'_> {
+    fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
+    where
+        P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
+    {
+        let host = sorrel_data::SessionHost::new(seeded(session, seed)?);
+        let mut env = sorrel_data::Env::new(&ctx.save_dir, ctx.reseal_on_save, phy_label_str);
+        *self.reply = sorrel_data::handle_line(&host, &mut env, self.request);
+        Ok(())
+    }
+}
+
+/// `sorrel call`: through the running host, else in-process.
+fn run_call(open: &OpenArgs, tool: &str, args: Option<&str>, raw: bool) -> Result<()> {
+    let args: serde_json::Value = match args {
+        Some(s) => serde_json::from_str(s).context("ARGS_JSON is not valid JSON")?,
+        None => serde_json::json!({}),
+    };
+    anyhow::ensure!(args.is_object(), "ARGS_JSON must be a JSON object");
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": tool, "arguments": args},
+    });
+    let reply = match sorrel_data::call_once(&host_dir(open), &request)? {
+        Some(r) => r,
+        None => {
+            let mut reply = None;
+            let line = request.to_string();
+            with_session(
+                open,
+                CallOnce {
+                    request: &line,
+                    reply: &mut reply,
+                },
+            )
+            .map_err(busy_hint)?;
+            reply.context("no reply")?
+        }
+    };
+    print_reply(&reply, raw)
+}
+
+/// Print a `tools/call` reply; an RPC error or `isError` result is an `Err`.
+fn print_reply(reply: &serde_json::Value, raw: bool) -> Result<()> {
+    if raw {
+        println!("{}", serde_json::to_string_pretty(reply)?);
+    }
+    if let Some(e) = reply.get("error") {
+        bail!("{}", e["message"].as_str().unwrap_or("JSON-RPC error"));
+    }
+    let result = &reply["result"];
+    let texts: Vec<&str> = result["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c["text"].as_str())
+        .collect();
+    if result["isError"] == true {
+        bail!("{}", texts.join("\n"));
+    }
+    if !raw {
+        for t in texts {
+            match serde_json::from_str::<serde_json::Value>(t) {
+                Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
+                Err(_) => println!("{t}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `sorrel status`: the GUI, the hosts and the detached log.
+fn run_status(dir: Option<&Path>, json: bool) -> Result<()> {
+    let gui = sorrel_data::send_instance(&InstanceRequest::List).unwrap_or_else(|e| {
+        log::warn!("GUI did not answer: {e:#}");
+        None
+    });
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let want = dir.map(|d| {
+        canon(&host_dir(&OpenArgs {
+            root: Some(d.into()),
+            ..Default::default()
+        }))
+    });
+    let hosts: Vec<_> = sorrel_data::list_hosts()
+        .into_iter()
+        .filter(|h| want.as_ref().is_none_or(|w| canon(&h.dataset) == *w))
+        .collect();
+    let log = sorrel_data::user_dir()
+        .map(|d| d.join("gui.log"))
+        .ok()
+        .filter(|p| p.exists());
+    if json {
+        let doc = serde_json::json!({"gui": gui, "hosts": hosts, "log": log});
+        println!("{}", serde_json::to_string_pretty(&doc)?);
+        return Ok(());
+    }
+    match &gui {
+        None => println!("gui: not running"),
+        Some(g) => {
+            let tabs = g["tabs"].as_array().map_or(&[][..], Vec::as_slice);
+            println!("gui: pid {}, {} tab(s)", g["pid"], tabs.len());
+            for t in tabs {
+                println!(
+                    "  {}{} {}",
+                    if t["active"] == true { "*" } else { " " },
+                    if t["dirty"] == true { " (unsaved)" } else { "" },
+                    t["dataset"].as_str().unwrap_or_default()
+                );
+            }
+        }
+    }
+    println!("hosts:{}", if hosts.is_empty() { " none" } else { "" });
+    for h in &hosts {
+        println!(
+            "  {:<9} pid {:<7} port {:<6} {:<6} {}",
+            h.kind,
+            h.pid,
+            h.port,
+            if h.alive { "alive" } else { "stale" },
+            h.dataset.display()
+        );
+    }
+    if let Some(l) = log {
+        println!("log: {}", l.display());
+    }
+    Ok(())
+}
+
+/// `(name, about)` of every visible subcommand, nested ones as `parent child`.
+fn command_rows() -> Vec<(String, String)> {
+    fn walk(cmd: &clap::Command, prefix: &str, depth: usize, out: &mut Vec<(String, String)>) {
+        for c in cmd.get_subcommands().filter(|c| !c.is_hide_set()) {
+            let name = format!("{prefix}{}", c.get_name());
+            let about = c.get_about().map(|a| a.to_string()).unwrap_or_default();
+            out.push((name.clone(), about));
+            if depth == 0 {
+                walk(c, &format!("{name} "), 1, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&<Cli as clap::CommandFactory>::command(), "", 0, &mut out);
+    out
+}
+
+/// The primer plus sections generated from the live program, so they cannot
+/// drift from it.
+fn agent_guide() -> String {
+    use std::fmt::Write;
+    let mut s = include_str!("agent_guide.md").trim_end().to_owned();
+    s.push_str("\n\n## Commands\n\n");
+    for (name, about) in command_rows() {
+        let _ = writeln!(s, "- `sorrel {name}`: {}", first_line(&about));
+    }
+    s.push_str("\n## MCP tools\n\n");
+    for t in sorrel_data::tool_list().as_array().into_iter().flatten() {
+        let desc = t["description"].as_str().unwrap_or_default();
+        let sentence = desc.split_once(". ").map_or(desc, |(a, _)| a);
+        let _ = writeln!(
+            s,
+            "- `{}`: {}",
+            t["name"].as_str().unwrap_or_default(),
+            first_line(sentence)
+        );
+    }
+    s.push_str("\n## Running now\n\n");
+    let alive: Vec<_> = sorrel_data::list_hosts()
+        .into_iter()
+        .filter(|h| h.alive)
+        .collect();
+    if alive.is_empty() {
+        s.push_str("none\n");
+    }
+    for h in alive {
+        let _ = writeln!(s, "- {} ({}, pid {})", h.dataset.display(), h.kind, h.pid);
+    }
+    s
 }
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
     match cli.cmd {
-        None if cli.headless => with_session(&cli.open, Headless),
-        None => run_open(cli.open),
-        Some(Cmd::Open(open)) => run_open(open),
+        None => run_bare(),
+        Some(Cmd::Open(open)) => run_open(&open),
+        Some(Cmd::Run {
+            open,
+            standalone,
+            headless,
+        }) => match headless {
+            true => with_session(&open, Headless),
+            false => run_gui(&open, standalone),
+        },
+        Some(Cmd::Status { dir, json }) => run_status(dir.as_deref(), json),
+        Some(Cmd::Call {
+            open,
+            tool,
+            args,
+            raw,
+        }) => run_call(&open, &tool, args.as_deref(), raw),
+        Some(Cmd::AgentGuide) => {
+            print!("{}", agent_guide());
+            Ok(())
+        }
+        Some(Cmd::Completions { shell }) => {
+            clap_complete::generate(
+                shell,
+                &mut <Cli as clap::CommandFactory>::command(),
+                "sorrel",
+                &mut std::io::stdout(),
+            );
+            Ok(())
+        }
         Some(Cmd::Qc { open, out }) => with_session(&open, Qc(out)),
         Some(Cmd::Suggest { open, json }) => with_session(&open, Suggest { json }),
         Some(Cmd::Apply {
@@ -1437,8 +2086,13 @@ fn main() -> Result<()> {
             )
         }
         Some(Cmd::Diff { a, b, json }) => diff_tsvs(&a, &b, json),
-        Some(Cmd::Mcp { open }) => run_mcp(&open),
-        Some(Cmd::Describe { open }) => with_session(&open, Describe),
+        Some(Cmd::Mcp { open, sub }) => match (sub, open.root.is_some()) {
+            (Some(McpCmd::Tools { json }), _) => mcp_tools(json),
+            (Some(McpCmd::Config { client, dir }), _) => mcp_config(client, dir),
+            (None, true) => run_mcp(&open),
+            (None, false) => run_mcp_active(),
+        },
+        Some(Cmd::Describe { open, json }) => with_session(&open, Describe { json }),
         Some(Cmd::Report {
             open,
             out,
@@ -1480,39 +2134,6 @@ fn main() -> Result<()> {
         Some(Cmd::Rescue { open, args }) => with_session(&open, rescue::Rescue(args)),
     }
 }
-
-/// `sorrel <DATA_DIR>` plus the two deprecated flag spellings of `qc` and
-/// `clear-cache`, kept so existing scripts (and `sorrel-py`) keep working.
-fn run_open(open: OpenArgs) -> Result<()> {
-    if open.clear_cache {
-        return clear_cache(open.root());
-    }
-    if let Some(out) = open.export_qc.clone() {
-        log::warn!("--export-qc is deprecated; use `sorrel qc <DATA_DIR> --out DIR`");
-        return with_session(&open, Qc(out));
-    }
-    let events = match &open.events {
-        Some(p) => {
-            Some(Events::read(p).with_context(|| format!("reading events {}", p.display()))?)
-        }
-        // Sidecar events next to an NWB file win (the app detects them);
-        // otherwise its trials table, whose absence is normal.
-        None if open
-            .root()
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("nwb"))
-            && matches!(
-                Events::detect(open.root().parent().unwrap_or(Path::new("."))),
-                Ok(None)
-            ) =>
-        {
-            Events::read(open.root()).ok()
-        }
-        None => None,
-    };
-    with_session(&open, Gui(events))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1534,76 +2155,209 @@ mod tests {
         assert_eq!(other.to_string(), "disk full");
     }
 
-    #[test]
-    fn bare_directory_with_flags_means_open() {
-        let cli = Cli::try_parse_from(["sorrel", "/x", "--sample-rate", "3e4", "--channels", "8"])
-            .unwrap();
-        assert!(cli.cmd.is_none());
-        assert_eq!(cli.open.root(), Path::new("/x"));
-        assert_eq!(cli.open.sample_rate, Some(30000.0));
-        assert_eq!(cli.open.n_channels, Some(8));
-        assert_eq!(cli.open.backend, None);
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("sorrel").chain(args.iter().copied()))
     }
 
     #[test]
-    fn subcommands_parse_and_deprecated_aliases_survive() {
-        let cli = Cli::try_parse_from(["sorrel", "suggest", "/x", "--json"]).unwrap();
+    fn gui_entry_points_parse() {
+        assert!(parse(&[]).unwrap().cmd.is_none());
+
+        match parse(&["run"]).unwrap().cmd {
+            Some(Cmd::Run {
+                open,
+                standalone: false,
+                headless: false,
+            }) => {
+                assert!(open.root.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse(&["run", "/x", "--standalone", "--channels", "8"])
+            .unwrap()
+            .cmd
+        {
+            Some(Cmd::Run {
+                open,
+                standalone: true,
+                ..
+            }) => {
+                assert_eq!(open.root(), Path::new("/x"));
+                assert_eq!(open.n_channels, Some(8));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let cli = parse(&["run", "--headless", "/x"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::Run { headless: true, .. })));
+        assert!(
+            parse(&["run", "--headless"]).is_err(),
+            "headless needs DATA_DIR"
+        );
+
+        match parse(&["open", "/x", "--sample-rate", "3e4"]).unwrap().cmd {
+            Some(Cmd::Open(open)) => {
+                assert_eq!(open.root(), Path::new("/x"));
+                assert_eq!(open.sample_rate, Some(30000.0));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(parse(&["open"]).is_err(), "open needs DATA_DIR");
+        assert!(parse(&["/x"]).is_err(), "`sorrel <DIR>` is gone");
+        assert!(parse(&["--headless", "/x"]).is_err());
+        assert!(parse(&["serve", "/x"]).is_err());
+    }
+
+    #[test]
+    fn agent_commands_parse() {
+        match parse(&["mcp"]).unwrap().cmd {
+            Some(Cmd::Mcp { open, sub: None }) => assert!(open.root.is_none()),
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse(&["mcp", "/x"]).unwrap().cmd {
+            Some(Cmd::Mcp { open, sub: None }) => assert_eq!(open.root(), Path::new("/x")),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            parse(&["mcp", "tools", "--json"]).unwrap().cmd,
+            Some(Cmd::Mcp {
+                sub: Some(McpCmd::Tools { json: true }),
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&["mcp", "config", "--client", "codex"]).unwrap().cmd,
+            Some(Cmd::Mcp {
+                sub: Some(McpCmd::Config {
+                    client: Client::Codex,
+                    dir: None
+                }),
+                ..
+            })
+        ));
+        match parse(&["call", "/x", "metrics", r#"{"cluster":1}"#])
+            .unwrap()
+            .cmd
+        {
+            Some(Cmd::Call {
+                open,
+                tool,
+                args,
+                raw: false,
+            }) => {
+                assert_eq!(open.root(), Path::new("/x"));
+                assert_eq!(tool, "metrics");
+                assert_eq!(args.as_deref(), Some(r#"{"cluster":1}"#));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            parse(&["status", "--json"]).unwrap().cmd,
+            Some(Cmd::Status {
+                dir: None,
+                json: true
+            })
+        ));
+        assert!(matches!(
+            parse(&["completions", "bash"]).unwrap().cmd,
+            Some(Cmd::Completions { .. })
+        ));
+        assert!(matches!(
+            parse(&["agent-guide"]).unwrap().cmd,
+            Some(Cmd::AgentGuide)
+        ));
+    }
+
+    #[test]
+    fn subcommands_still_parse() {
+        let cli = parse(&["suggest", "/x", "--json"]).unwrap();
         assert!(matches!(cli.cmd, Some(Cmd::Suggest { json: true, .. })));
 
-        let cli =
-            Cli::try_parse_from(["sorrel", "qc", "/x", "--out", "o", "--backend", "si"]).unwrap();
-        match cli.cmd {
+        match parse(&["qc", "/x", "--out", "o", "--backend", "si"])
+            .unwrap()
+            .cmd
+        {
             Some(Cmd::Qc { open, out }) => {
                 assert_eq!(out, PathBuf::from("o"));
                 assert_eq!(open.backend, Some(Backend::SortingAnalyzer));
             }
             other => panic!("unexpected {other:?}"),
         }
-
-        let cli =
-            Cli::try_parse_from(["sorrel", "journal", "dump", "j.journal", "--json"]).unwrap();
+        let cli = parse(&["journal", "dump", "j.journal", "--json"]).unwrap();
         assert!(matches!(
             cli.cmd,
             Some(Cmd::Journal {
                 action: JournalCmd::Dump { json: true, .. }
             })
         ));
-
+        assert!(matches!(
+            parse(&["describe", "/x", "--json"]).unwrap().cmd,
+            Some(Cmd::Describe { json: true, .. })
+        ));
         #[cfg(feature = "phy-export")]
-        {
-            let cli =
-                Cli::try_parse_from(["sorrel", "export-phy", "/x", "--out", "o", "--copy-raw"])
-                    .unwrap();
-            assert!(matches!(
-                cli.cmd,
-                Some(Cmd::ExportPhy { copy_raw: true, .. })
-            ));
+        assert!(matches!(
+            parse(&["export-phy", "/x", "--out", "o", "--copy-raw"])
+                .unwrap()
+                .cmd,
+            Some(Cmd::ExportPhy { copy_raw: true, .. })
+        ));
+        match parse(&["open", "/x", "--events", "e.csv"]).unwrap().cmd {
+            Some(Cmd::Open(open)) => assert_eq!(open.events, Some(PathBuf::from("e.csv"))),
+            other => panic!("unexpected {other:?}"),
         }
-
-        for name in ["mcp", "serve"] {
-            let cli = Cli::try_parse_from(["sorrel", name, "/x"]).unwrap();
-            assert!(matches!(cli.cmd, Some(Cmd::Mcp { .. })), "{name}");
-        }
-        let cli = Cli::try_parse_from(["sorrel", "--headless", "/x"]).unwrap();
-        assert!(cli.headless && cli.cmd.is_none());
-        assert_eq!(
-            host_dir(&cli.open),
-            PathBuf::from("/"),
-            "a missing path is a file"
-        );
-
-        let cli = Cli::try_parse_from(["sorrel", "/x", "--events", "e.csv"]).unwrap();
-        assert_eq!(cli.open.events, Some(PathBuf::from("e.csv")));
-
-        let cli = Cli::try_parse_from(["sorrel", "/x", "--export-qc", "out"]).unwrap();
-        assert_eq!(cli.open.export_qc, Some(PathBuf::from("out")));
-        let cli = Cli::try_parse_from(["sorrel", "--clear-cache", "/x"]).unwrap();
-        assert!(cli.open.clear_cache);
-
+        assert!(parse(&["open", "/x", "--dtype", "int7"]).is_err());
         assert!(
-            Cli::try_parse_from(["sorrel"]).is_err(),
-            "DATA_DIR is required"
+            parse(&["open", "/x", "--export-qc", "o"]).is_err(),
+            "removed flag"
         );
-        assert!(Cli::try_parse_from(["sorrel", "/x", "--dtype", "int7"]).is_err());
+        assert!(parse(&["clear-cache", "/x"]).is_ok());
+    }
+
+    #[test]
+    fn host_dir_of_a_missing_path_is_its_parent() {
+        let open = OpenArgs {
+            root: Some("/x".into()),
+            ..Default::default()
+        };
+        assert_eq!(host_dir(&open), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn rebase_makes_every_path_absolute() {
+        let rel = |s: &str| Some(PathBuf::from(s));
+        let mut open = OpenArgs {
+            root: rel("ds"),
+            dat: rel("rec.dat"),
+            journal: rel("j/x.journal"),
+            spikeglx_meta: rel("a.meta"),
+            oebin: rel("structure.oebin"),
+            events: rel("e.csv"),
+            ..Default::default()
+        };
+        open.rebase(Path::new("/cwd"));
+        assert_eq!(open.root, rel("/cwd/ds"));
+        assert_eq!(open.dat, rel("/cwd/rec.dat"));
+        assert_eq!(open.journal, rel("/cwd/j/x.journal"));
+        assert_eq!(open.spikeglx_meta, rel("/cwd/a.meta"));
+        assert_eq!(open.oebin, rel("/cwd/structure.oebin"));
+        assert_eq!(open.events, rel("/cwd/e.csv"));
+        // Absolute paths and unset fields stay as they are.
+        let mut open = OpenArgs {
+            root: rel("/abs/ds"),
+            ..Default::default()
+        };
+        open.rebase(Path::new("/cwd"));
+        assert_eq!((open.root, open.dat), (rel("/abs/ds"), None));
+    }
+
+    #[test]
+    fn agent_guide_lists_commands_and_tools() {
+        let g = agent_guide();
+        assert!(g.contains("## Commands") && g.contains("`sorrel call`"));
+        assert!(
+            g.contains("`sorrel mcp tools`"),
+            "nested subcommands are listed"
+        );
+        assert!(g.contains("## MCP tools") && g.contains("`relabel`"));
+        assert!(g.contains("## Running now"));
     }
 }

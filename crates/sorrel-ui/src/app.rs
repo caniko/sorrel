@@ -6,6 +6,7 @@ use crate::jobs::{read, write, Job, JobCtx};
 use crate::layout::{self, Pane, TraceControls, ViewAction, ViewBehavior};
 use crate::prefs::UiPrefs;
 use crate::selection::SelectionSet;
+use crate::shell::CloseState;
 use crate::similarity_view::{SimilarityPane, SimilarityState};
 use crate::views::{
     CcgCache, QualityCache, RasterCache, SuggestAction, SuggestCache, WaveformCache,
@@ -261,14 +262,11 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     /// A destructive action awaiting user confirmation. Staging it here
     /// lets the user back out before anything hits the journal.
     pending_confirm: Option<PendingConfirm>,
-    /// Set once the user has confirmed quitting with unsaved curation, so
-    /// the re-issued close request is not intercepted again.
-    close_approved: bool,
+    /// Where this tab is in closing; the [`Shell`](crate::shell::Shell) reads it.
+    close_state: CloseState,
     show_help: bool,
     /// phy snippet bar text while open (`:` or `l`).
     snippet: Option<String>,
-    /// Ctrl+Q: close on the next frame through the unsaved-changes guard.
-    quit_requested: bool,
     /// MCP clients' link to this window (see [`Self::serve_mcp`]).
     mcp: Option<McpLink>,
     /// `serve_mcp` asked while the loader still owned the session: started
@@ -284,8 +282,6 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     highlight_for: std::time::Duration,
     /// How long the status toast stays (5 s unless a test pins it).
     toast_for: std::time::Duration,
-    /// Last window title sent to the OS; only re-sent when it changes.
-    last_title: String,
     /// AA-contrast visuals go in on the first frame (no ctx before then).
     visuals_installed: bool,
 }
@@ -314,7 +310,7 @@ struct PendingConfirm {
 enum ConfirmAction {
     /// Dispatch this curation command (bulk merges from the Suggest tab).
     Dispatch(CurationCommand),
-    /// Close the window; the dialog offers "Save & quit" as well.
+    /// Close this tab; the dialog offers "Save & quit" as well.
     Quit,
 }
 
@@ -410,10 +406,9 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             phy_export_job: None,
             gpu_preproc: None,
             pending_confirm: None,
-            close_approved: false,
+            close_state: CloseState::Open,
             show_help: false,
             snippet: None,
-            quit_requested: false,
             mcp: None,
             mcp_after_load: None,
             host_events,
@@ -421,7 +416,6 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             highlight: None,
             highlight_for: HIGHLIGHT,
             toast_for: std::time::Duration::from_secs(5),
-            last_title: String::new(),
             visuals_installed: false,
         }
     }
@@ -810,7 +804,50 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     /// The title bar shows a "•" dirty marker while the head is not the
     /// saved node.
     fn dirty(&self) -> bool {
-        !read(&self.session).is_saved()
+        // The loader holds the write lock; never block the UI on it.
+        self.loading.is_none() && !read(&self.session).is_saved()
+    }
+
+    /// Ask to close this tab. Clean (or already approved): `Closed` at once.
+    /// Unsaved curation raises the "Quit with unsaved curation?" dialog and
+    /// sets `Asking`; the dialog's answer ends in `Closed` or back to `Open`.
+    pub fn request_close(&mut self) {
+        if self.close_state != CloseState::Open {
+            return;
+        }
+        if self.load_error.is_some() || !self.dirty() {
+            self.close_state = CloseState::Closed;
+            return;
+        }
+        self.close_state = CloseState::Asking;
+        self.pending_confirm = Some(PendingConfirm {
+            title: "Quit with unsaved curation?".into(),
+            body: format!(
+                "Edits are journaled, but spike_clusters.npy and cluster_group.tsv in {} \
+                 have not been written since the last save.",
+                self.save_dir
+                    .as_deref()
+                    .map_or_else(|| "the save directory".to_string(), short_path)
+            ),
+            action: ConfirmAction::Quit,
+            on_success: String::new(),
+        });
+    }
+
+    /// OS window title: dataset name + dirty marker.
+    pub fn window_title(&self) -> String {
+        let dataset = self
+            .save_dir
+            .as_deref()
+            .and_then(Path::file_name)
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match (dataset.is_empty(), self.dirty()) {
+            (true, false) => "Sorrel".to_string(),
+            (true, true) => "Sorrel •".to_string(),
+            (false, false) => format!("{dataset} — Sorrel"),
+            (false, true) => format!("{dataset} • — Sorrel"),
+        }
     }
 
     /// Stop background jobs so the write lock is free at once.
@@ -1275,14 +1312,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             (Decision::SaveThenConfirm, ConfirmAction::Quit) => {
                 self.save();
                 if self.error.is_none() {
-                    self.close_approved = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.close_state = CloseState::Closed;
                 }
             }
-            (Decision::Confirm, ConfirmAction::Quit) => {
-                self.close_approved = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
+            (Decision::Confirm, ConfirmAction::Quit) => self.close_state = CloseState::Closed,
             (_, ConfirmAction::Dispatch(cmd)) => {
                 if self.commit(cmd) {
                     self.status = toast(pending.on_success);
@@ -1517,7 +1550,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 }
             }
             Intent::Snippet(prefill) => self.snippet = Some(prefill.to_string()),
-            Intent::Quit => self.quit_requested = true,
+            Intent::Quit => self.request_close(),
             Intent::ToggleMergeMode => match self.merge_mode.take() {
                 // Cancel: back to the selection from before entry.
                 Some(before) => self.selection = before,
@@ -2093,8 +2126,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                         .add(egui::Button::new("Quit").min_size(egui::vec2(160.0, 30.0)))
                         .clicked()
                     {
-                        self.close_approved = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        self.close_state = CloseState::Closed;
                     }
                 });
             });
@@ -2184,47 +2216,13 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
             self.dispatch_intent(it);
         }
 
-        if std::mem::take(&mut self.quit_requested) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
         let dirty = self.dirty();
 
-        // Unsaved-changes guard: intercept the window close once and ask.
-        if ctx.input(|i| i.viewport().close_requested()) && dirty && !self.close_approved {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.pending_confirm = Some(PendingConfirm {
-                title: "Quit with unsaved curation?".into(),
-                body: format!(
-                    "Edits are journaled, but spike_clusters.npy and cluster_group.tsv in {} \
-                     have not been written since the last save.",
-                    self.save_dir
-                        .as_deref()
-                        .map_or_else(|| "the save directory".to_string(), short_path)
-                ),
-                action: ConfirmAction::Quit,
-                on_success: String::new(),
-            });
-        }
-
-        // OS window title: dataset name + dirty marker.
-        let dataset = self
-            .save_dir
-            .as_deref()
-            .and_then(Path::file_name)
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let title = match (dataset.is_empty(), dirty) {
-            (true, false) => "Sorrel".to_string(),
-            (true, true) => "Sorrel •".to_string(),
-            (false, false) => format!("{dataset} — Sorrel"),
-            (false, true) => format!("{dataset} • — Sorrel"),
-        };
-        if title != self.last_title {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
-            self.last_title = title;
-        }
-
         self.show_confirm_dialog(&ctx);
+        // The dialog was dismissed (Cancel/Esc): the tab stays open.
+        if self.close_state == CloseState::Asking && self.pending_confirm.is_none() {
+            self.close_state = CloseState::Open;
+        }
         self.show_help_window(&ctx);
 
         // Status auto-fades (after 5 s) so the top bar doesn't pin a stale
@@ -2463,6 +2461,36 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                 log::warn!("cache invalidation on exit failed: {err}");
             }
         }
+    }
+}
+
+impl<P: DataProvider + ApplyPhyLabel> crate::shell::Tab for SorrelApp<P> {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        eframe::App::ui(self, ui, frame);
+    }
+    fn label(&self) -> String {
+        self.save_dir
+            .as_deref()
+            .and_then(Path::file_name)
+            .map_or_else(|| "Sorrel".into(), |s| s.to_string_lossy().into_owned())
+    }
+    fn dataset(&self) -> &Path {
+        self.save_dir.as_deref().unwrap_or(Path::new(""))
+    }
+    fn dirty(&self) -> bool {
+        Self::dirty(self)
+    }
+    fn window_title(&self) -> String {
+        Self::window_title(self)
+    }
+    fn request_close(&mut self) {
+        Self::request_close(self);
+    }
+    fn close_state(&self) -> CloseState {
+        self.close_state
+    }
+    fn on_exit(&mut self) {
+        eframe::App::on_exit(self);
     }
 }
 
