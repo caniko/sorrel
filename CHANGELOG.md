@@ -7,6 +7,16 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-29
+
+### Fixed
+
+- The `sorrel-ui` crate no longer ships its kittest snapshot PNGs (~25 MB),
+  which crates.io rejected as too large. This left `sorrel-ui` and `sorrel`
+  unpublished at 0.2.2.
+
+## [0.2.2] - 2026-10-28
+
 ### Added
 
 - History that never discards: undo moves back, an edit after an undo starts
@@ -79,6 +89,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - The cluster table's "amp" column is mean spike amplitude × template
   peak-to-peak, as in phy. It used to show the template peak alone, which
   is the same for every cluster on unit-norm Kilosort templates.
+- The `sorrel` crate is published again. Its embedded SpikeInterface
+  sidecar (`sorrel_auto.py`) now lives inside the crate. 0.2.1's
+  crates.io release stopped at `sorrel` because the packaged crate could
+  not find the script; the other eight crates are on crates.io at 0.2.1.
 
 ### Changed (UI)
 
@@ -446,5 +460,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Downstream dry-runs can fail until their local path dependencies have been
   published in order. See `RELEASE.md` for the publish sequence.
 
-[Unreleased]: https://github.com/caniko/sorrel/compare/0.2.1...HEAD
+[Unreleased]: https://github.com/caniko/sorrel/compare/0.2.3...HEAD
+[0.2.3]: https://github.com/caniko/sorrel/compare/0.2.2...0.2.3
+[0.2.2]: https://github.com/caniko/sorrel/compare/0.2.1...0.2.2
 [0.2.1]: https://github.com/caniko/sorrel/compare/0.2.0...0.2.1

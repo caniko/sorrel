@@ -53,7 +53,7 @@ def main() -> None:
     phy, out = root / "phy", root / "phy" / "sorrel_auto"
     split_a, split_b, orig, dup = make_phy(phy)
 
-    cmd = [sys.executable, str(Path(__file__).with_name("sorrel_auto.py")), "--data-dir", str(phy), "--out", str(out), "--gain-to-uv", "1.0", "--jobs", "1"]
+    cmd = [sys.executable, str(Path(__file__).resolve().parents[1] / "crates" / "sorrel" / "src" / "sorrel_auto.py"), "--data-dir", str(phy), "--out", str(out), "--gain-to-uv", "1.0", "--jobs", "1"]
     if "--unitrefine" not in sys.argv:
         cmd.append("--no-unitrefine")
     subprocess.run(cmd, check=True)

@@ -154,8 +154,11 @@ jobs:
         run: nix develop -c cargo test --locked -p sorrel --all-targets
       - name: Clippy sorrel
         run: nix develop -c cargo clippy --locked -p sorrel --all-targets -- -D warnings
-      - name: Package coordinated release set
-        run: nix develop -c cargo package --locked --allow-dirty --no-verify -p sorrel-cache -p sorrel-io -p sorrel-compute -p sorrel-data -p sorrel-gpu -p sorrel-remote -p sorrel-render -p sorrel-ui -p sorrel --target-dir "$RUNNER_TEMP/simit-package-target"
+      - name: Verify and package coordinated release set
+        run: |
+          set -euo pipefail
+          nix develop -c cargo --version | awk '{split($2, v, "."); exit !(v[1] > 1 || v[2] >= 89)}' || { echo 'Verifying a coordinated release set needs cargo >= 1.89 (temporary local registry overlay); pin a newer toolchain' >&2; exit 1; }
+          nix develop -c cargo package --locked --allow-dirty -p sorrel-cache -p sorrel-io -p sorrel-compute -p sorrel-data -p sorrel-gpu -p sorrel-remote -p sorrel-render -p sorrel-ui -p sorrel --target-dir "$RUNNER_TEMP/simit-package-target"
       - name: Build immutable archive sorrel-cache
         run: |
           set -euo pipefail
@@ -163,6 +166,8 @@ jobs:
           test "$(nix develop -c cargo pkgid --locked -p sorrel-cache | awk -F'[#@]' 'NF > 1 {print $NF}' | tail -n 1)" = "$version"
           mkdir -p "$RUNNER_TEMP/simit-crates/sorrel-cache"
           cp "$RUNNER_TEMP/simit-package-target/package/sorrel-cache-$version.crate" "$RUNNER_TEMP/simit-crates/sorrel-cache/"
+          size="$(wc -c < "$RUNNER_TEMP/simit-crates/sorrel-cache/sorrel-cache-$version.crate")"
+          test "$size" -le 10485760 || { echo "crate sorrel-cache archive is $size bytes, over the crates.io upload limit of 10485760 bytes (10 MiB)" >&2; exit 1; }
       - name: Retain original-run archive sorrel-cache
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -178,6 +183,8 @@ jobs:
           test "$(nix develop -c cargo pkgid --locked -p sorrel-io | awk -F'[#@]' 'NF > 1 {print $NF}' | tail -n 1)" = "$version"
           mkdir -p "$RUNNER_TEMP/simit-crates/sorrel-io"
           cp "$RUNNER_TEMP/simit-package-target/package/sorrel-io-$version.crate" "$RUNNER_TEMP/simit-crates/sorrel-io/"
+          size="$(wc -c < "$RUNNER_TEMP/simit-crates/sorrel-io/sorrel-io-$version.crate")"
+          test "$size" -le 10485760 || { echo "crate sorrel-io archive is $size bytes, over the crates.io upload limit of 10485760 bytes (10 MiB)" >&2; exit 1; }
       - name: Retain original-run archive sorrel-io
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -193,6 +200,8 @@ jobs:
           test "$(nix develop -c cargo pkgid --locked -p sorrel-compute | awk -F'[#@]' 'NF > 1 {print $NF}' | tail -n 1)" = "$version"
           mkdir -p "$RUNNER_TEMP/simit-crates/sorrel-compute"
           cp "$RUNNER_TEMP/simit-package-target/package/sorrel-compute-$version.crate" "$RUNNER_TEMP/simit-crates/sorrel-compute/"
+          size="$(wc -c < "$RUNNER_TEMP/simit-crates/sorrel-compute/sorrel-compute-$version.crate")"
+          test "$size" -le 10485760 || { echo "crate sorrel-compute archive is $size bytes, over the crates.io upload limit of 10485760 bytes (10 MiB)" >&2; exit 1; }
       - name: Retain original-run archive sorrel-compute
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -208,6 +217,8 @@ jobs:
           test "$(nix develop -c cargo pkgid --locked -p sorrel-data | awk -F'[#@]' 'NF > 1 {print $NF}' | tail -n 1)" = "$version"
           mkdir -p "$RUNNER_TEMP/simit-crates/sorrel-data"
           cp "$RUNNER_TEMP/simit-package-target/package/sorrel-data-$version.crate" "$RUNNER_TEMP/simit-crates/sorrel-data/"
+          size="$(wc -c < "$RUNNER_TEMP/simit-crates/sorrel-data/sorrel-data-$version.crate")"
+          test "$size" -le 10485760 || { echo "crate sorrel-data archive is $size bytes, over the crates.io upload limit of 10485760 bytes (10 MiB)" >&2; exit 1; }
       - name: Retain original-run archive sorrel-data
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -223,6 +234,8 @@ jobs:
           test "$(nix develop -c cargo pkgid --locked -p sorrel-gpu | awk -F'[#@]' 'NF > 1 {print $NF}' | tail -n 1)" = "$version"
           mkdir -p "$RUNNER_TEMP/simit-crates/sorrel-gpu"
           cp "$RUNNER_TEMP/simit-package-target/package/sorrel-gpu-$version.crate" "$RUNNER_TEMP/simit-crates/sorrel-gpu/"
+          size="$(wc -c < "$RUNNER_TEMP/simit-crates/sorrel-gpu/sorrel-gpu-$version.crate")"
+          test "$size" -le 10485760 || { echo "crate sorrel-gpu archive is $size bytes, over the crates.io upload limit of 10485760 bytes (10 MiB)" >&2; exit 1; }
       - name: Retain original-run archive sorrel-gpu
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -238,6 +251,8 @@ jobs:
           test "$(nix develop -c cargo pkgid --locked -p sorrel-remote | awk -F'[#@]' 'NF > 1 {print $NF}' | tail -n 1)" = "$version"
           mkdir -p "$RUNNER_TEMP/simit-crates/sorrel-remote"
           cp "$RUNNER_TEMP/simit-package-target/package/sorrel-remote-$version.crate" "$RUNNER_TEMP/simit-crates/sorrel-remote/"
+          size="$(wc -c < "$RUNNER_TEMP/simit-crates/sorrel-remote/sorrel-remote-$version.crate")"
+          test "$size" -le 10485760 || { echo "crate sorrel-remote archive is $size bytes, over the crates.io upload limit of 10485760 bytes (10 MiB)" >&2; exit 1; }
       - name: Retain original-run archive sorrel-remote
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -253,6 +268,8 @@ jobs:
           test "$(nix develop -c cargo pkgid --locked -p sorrel-render | awk -F'[#@]' 'NF > 1 {print $NF}' | tail -n 1)" = "$version"
           mkdir -p "$RUNNER_TEMP/simit-crates/sorrel-render"
           cp "$RUNNER_TEMP/simit-package-target/package/sorrel-render-$version.crate" "$RUNNER_TEMP/simit-crates/sorrel-render/"
+          size="$(wc -c < "$RUNNER_TEMP/simit-crates/sorrel-render/sorrel-render-$version.crate")"
+          test "$size" -le 10485760 || { echo "crate sorrel-render archive is $size bytes, over the crates.io upload limit of 10485760 bytes (10 MiB)" >&2; exit 1; }
       - name: Retain original-run archive sorrel-render
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -268,6 +285,8 @@ jobs:
           test "$(nix develop -c cargo pkgid --locked -p sorrel-ui | awk -F'[#@]' 'NF > 1 {print $NF}' | tail -n 1)" = "$version"
           mkdir -p "$RUNNER_TEMP/simit-crates/sorrel-ui"
           cp "$RUNNER_TEMP/simit-package-target/package/sorrel-ui-$version.crate" "$RUNNER_TEMP/simit-crates/sorrel-ui/"
+          size="$(wc -c < "$RUNNER_TEMP/simit-crates/sorrel-ui/sorrel-ui-$version.crate")"
+          test "$size" -le 10485760 || { echo "crate sorrel-ui archive is $size bytes, over the crates.io upload limit of 10485760 bytes (10 MiB)" >&2; exit 1; }
       - name: Retain original-run archive sorrel-ui
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -283,6 +302,8 @@ jobs:
           test "$(nix develop -c cargo pkgid --locked -p sorrel | awk -F'[#@]' 'NF > 1 {print $NF}' | tail -n 1)" = "$version"
           mkdir -p "$RUNNER_TEMP/simit-crates/sorrel"
           cp "$RUNNER_TEMP/simit-package-target/package/sorrel-$version.crate" "$RUNNER_TEMP/simit-crates/sorrel/"
+          size="$(wc -c < "$RUNNER_TEMP/simit-crates/sorrel/sorrel-$version.crate")"
+          test "$size" -le 10485760 || { echo "crate sorrel archive is $size bytes, over the crates.io upload limit of 10485760 bytes (10 MiB)" >&2; exit 1; }
       - name: Retain original-run archive sorrel
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

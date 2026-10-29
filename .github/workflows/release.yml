@@ -391,10 +391,13 @@ jobs:
           done < <(printf '%s\n' "${files[@]}" | LC_ALL=C sort -u)
           SCRIPT
       - name: Probe downstream publisher state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           . ./release-env
           : > release-publisher-state.env
+          gh_auth=(); if [ -n "${GITHUB_TOKEN:-}" ]; then gh_auth=(-H "Authorization: Bearer $GITHUB_TOKEN"); fi
           write_state() {
             channel="$1"; state="$2"; detail="$3"
             var="PUBLISH_$(printf '%s' "$channel" | tr '[:lower:]-' '[:upper:]_')_STATE"
@@ -444,7 +447,7 @@ jobs:
           pypi_wheels=(release/*.whl); pypi_name="${pypi_wheels[0]##*/}"; pypi_name="${pypi_name%%-*}"
           active_or_soft pypi "$pypi_name" curl -fsS -o /dev/null "https://pypi.org/pypi/${pypi_name}/json"
           write_state flathub not-configured '-'
-          winget_code="$(curl -sS -o /dev/null -w '%{http_code}' 'https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/c/Caniko/Sorrel' || true)"
+          winget_code="$(curl -sS -o /dev/null -w '%{http_code}' "${gh_auth[@]}" 'https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/c/Caniko/Sorrel' || true)"
           case "$winget_code" in 200) winget_state=active-required ;; 404) winget_state=inactive-soft ;; *) winget_state=probe-failed ;; esac
           if [ "$IS_PRERELEASE" = "true" ]; then winget_state=skipped-prerelease; fi
           write_state winget "$winget_state" 'Caniko.Sorrel'
@@ -629,7 +632,7 @@ jobs:
             exit 0
           }
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=78b775803103ae960faf475ad46070d771fddc91 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=42293ecd5b42df7feffd615881f34dd6c83fbd76 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -657,7 +660,7 @@ jobs:
           set -euo pipefail
           . ./release-env
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=78b775803103ae960faf475ad46070d771fddc91 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=42293ecd5b42df7feffd615881f34dd6c83fbd76 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -706,7 +709,7 @@ jobs:
           if [ -z "${CHOCOLATEY_API_KEY:-}" ]; then publisher_missing chocolatey 'CHOCOLATEY_API_KEY unset'; fi
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
           if [ "${CHOCO_CANDIDATE_CACHE_HIT:-}" != true ]; then echo 'Chocolatey candidate persistence was not verified.' >&2; exit 1; fi
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=78b775803103ae960faf475ad46070d771fddc91 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=42293ecd5b42df7feffd615881f34dd6c83fbd76 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -869,10 +872,13 @@ jobs:
           if [ "${#need[@]}" -gt 0 ]; then (cd release && sha256sum -c --strict ../release-selected.sums); fi
           SCRIPT
       - name: Probe downstream publisher state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           . ./release-env
           : > release-publisher-state.env
+          gh_auth=(); if [ -n "${GITHUB_TOKEN:-}" ]; then gh_auth=(-H "Authorization: Bearer $GITHUB_TOKEN"); fi
           write_state() {
             channel="$1"; state="$2"; detail="$3"
             var="PUBLISH_$(printf '%s' "$channel" | tr '[:lower:]-' '[:upper:]_')_STATE"
@@ -922,7 +928,7 @@ jobs:
           pypi_wheels=(release/*.whl); pypi_name="${pypi_wheels[0]##*/}"; pypi_name="${pypi_name%%-*}"
           active_or_soft pypi "$pypi_name" curl -fsS -o /dev/null "https://pypi.org/pypi/${pypi_name}/json"
           write_state flathub not-configured '-'
-          winget_code="$(curl -sS -o /dev/null -w '%{http_code}' 'https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/c/Caniko/Sorrel' || true)"
+          winget_code="$(curl -sS -o /dev/null -w '%{http_code}' "${gh_auth[@]}" 'https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/c/Caniko/Sorrel' || true)"
           case "$winget_code" in 200) winget_state=active-required ;; 404) winget_state=inactive-soft ;; *) winget_state=probe-failed ;; esac
           if [ "$IS_PRERELEASE" = "true" ]; then winget_state=skipped-prerelease; fi
           write_state winget "$winget_state" 'Caniko.Sorrel'
@@ -1110,7 +1116,7 @@ jobs:
             exit 0
           }
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=78b775803103ae960faf475ad46070d771fddc91 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=42293ecd5b42df7feffd615881f34dd6c83fbd76 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -1138,7 +1144,7 @@ jobs:
           set -euo pipefail
           . ./release-env
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=78b775803103ae960faf475ad46070d771fddc91 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=42293ecd5b42df7feffd615881f34dd6c83fbd76 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -1188,7 +1194,7 @@ jobs:
           if [ -z "${CHOCOLATEY_API_KEY:-}" ]; then publisher_missing chocolatey 'CHOCOLATEY_API_KEY unset'; fi
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
           if [ "${CHOCO_CANDIDATE_CACHE_HIT:-}" != true ]; then echo 'Chocolatey candidate persistence was not verified.' >&2; exit 1; fi
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=78b775803103ae960faf475ad46070d771fddc91 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=42293ecd5b42df7feffd615881f34dd6c83fbd76 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \

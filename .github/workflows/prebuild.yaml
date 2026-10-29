@@ -6,7 +6,8 @@ name: Native Nix prebuild
 
 on:
   push:
-    branches: ["**"]
+    branches:
+      - "trunk"
     tags-ignore: ["**"]
   pull_request:
   workflow_dispatch:
