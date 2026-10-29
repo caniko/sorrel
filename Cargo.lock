@@ -5710,7 +5710,7 @@ dependencies = [
 
 [[package]]
 name = "sorrel"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -5732,7 +5732,7 @@ dependencies = [
 
 [[package]]
 name = "sorrel-cache"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -5745,7 +5745,7 @@ dependencies = [
 
 [[package]]
 name = "sorrel-compute"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "rayon",
  "sorrel-io",
@@ -5753,7 +5753,7 @@ dependencies = [
 
 [[package]]
 name = "sorrel-data"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5774,7 +5774,7 @@ dependencies = [
 
 [[package]]
 name = "sorrel-gpu"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "bytemuck",
  "log",
@@ -5785,7 +5785,7 @@ dependencies = [
 
 [[package]]
 name = "sorrel-io"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5802,7 +5802,7 @@ dependencies = [
 
 [[package]]
 name = "sorrel-remote"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5825,7 +5825,7 @@ dependencies = [
 
 [[package]]
 name = "sorrel-render"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "bytemuck",
  "log",
@@ -5838,7 +5838,7 @@ dependencies = [
 
 [[package]]
 name = "sorrel-ui"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "bytemuck",
