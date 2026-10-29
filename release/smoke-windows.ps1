@@ -6,7 +6,8 @@ checkout on a windows runner, after the Nix output `.#sorrel-windows-smoke`
   pwsh release/smoke-windows.ps1 [-BuildDir DIR] [-OutDir smoke-out] [-GuiSeconds 20]
 
 Steps: version, gpu-check, headless qc + report on release/fixtures/tiny-phy,
-GUI start + screenshot, wheel install in a venv. Any failure exits non-zero;
+GUI start + screenshot, wheel install in a venv, Microsoft Defender scan of
+BuildDir. Any failure exits non-zero;
 logs and gui.png land in OutDir for the runner to upload.
 #>
 param(
@@ -111,5 +112,17 @@ Assert-Ok 'import' (Invoke-Native 'import' $vpy @('-c',
 Assert-Ok 'wheel-exe' (Invoke-Native 'wheel-exe' (Join-Path $venv 'Scripts\sorrel.exe') @('--version'))
 $got = (Get-Content (Join-Path $OutDir 'wheel-exe.out.txt') -Raw).Trim()
 if ($got -ne "sorrel $version") { throw "wheel sorrel.exe --version is '$got', expected 'sorrel $version'" }
+
+# 6. Microsoft Defender: winget-pkgs validation scans the installed package
+#    (Validation-Defender-Error), so reproduce that here on fresh signatures.
+#    -DisableRemediation reports without quarantining; exit 2 = threat found.
+$mp = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'
+if (Test-Path $mp) {
+    Invoke-Native 'defender-update' $mp @('-SignatureUpdate') | Out-Null
+    $code = Invoke-Native 'defender-scan' $mp @('-Scan', '-ScanType', '3', '-File', $BuildDir, '-DisableRemediation')
+    if ($code -eq 2) { throw "Microsoft Defender flagged files in $BuildDir (see defender-scan.out.txt)" }
+    Assert-Ok 'defender-scan' $code
+}
+else { Write-Warning "no $mp on this runner; Defender scan skipped" }
 
 Write-Host "Windows smoke passed for Sorrel $version; evidence in $OutDir"
