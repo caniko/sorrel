@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "egui widgets and views for the Sorrel spike-sorting curation GUI."
+# kittest reference PNGs (~25 MB) exceed the 10 MB crates.io limit; they stay in git.
+exclude = ["tests/snapshots/"]
 
 [dependencies]
 sorrel-io.workspace = true
