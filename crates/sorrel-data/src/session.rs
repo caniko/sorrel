@@ -797,16 +797,25 @@ impl<P: DataProvider> Session<P> {
         CurationCommand::Batch { children: out }
     }
 
-    /// `cmd` as an agent edit: the touched clusters first gain `src:agent`,
-    /// in the same undoable batch.
+    /// `cmd` (or each child of a `Batch`) as an agent edit: the touched
+    /// clusters first gain `src:agent`, in the same undoable batch.
     pub fn with_agent_source(&self, cmd: CurationCommand) -> CurationCommand {
-        let mut clusters = match &cmd {
-            CurationCommand::Relabel { cluster, .. } | CurationCommand::Split { cluster, .. } => {
-                vec![*cluster]
-            }
-            CurationCommand::Merge { sources, target } => [&[*target][..], sources].concat(),
-            _ => Vec::new(),
+        let kids: &[CurationCommand] = match &cmd {
+            CurationCommand::Batch { children } => children,
+            other => std::slice::from_ref(other),
         };
+        let mut clusters = Vec::new();
+        for c in kids {
+            match c {
+                CurationCommand::Relabel { cluster, .. }
+                | CurationCommand::Split { cluster, .. } => clusters.push(*cluster),
+                CurationCommand::Merge { sources, target } => {
+                    clusters.push(*target);
+                    clusters.extend_from_slice(sources);
+                }
+                _ => {}
+            }
+        }
         clusters.sort_unstable();
         clusters.dedup();
         let mut children: Vec<CurationCommand> = clusters
@@ -821,7 +830,10 @@ impl<P: DataProvider> Session<P> {
         if children.is_empty() {
             return cmd;
         }
-        children.push(cmd);
+        match cmd {
+            CurationCommand::Batch { children: rest } => children.extend(rest),
+            other => children.push(other),
+        }
         CurationCommand::Batch { children }
     }
 

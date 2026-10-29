@@ -1,11 +1,13 @@
 //! sorrel-data: the monomorphised core. `Session<P>` is generic over a
 //! `DataProvider`, so the entire state machine specialises per backend.
 
+pub mod brief;
 pub mod cache;
 pub mod cluster_index;
 pub mod command;
 pub mod curation_json;
 pub mod diff;
+pub mod evaluate;
 pub mod feature_subspace;
 pub mod host;
 pub mod instance;
@@ -14,6 +16,7 @@ pub mod open;
 #[cfg(feature = "phy-export")]
 pub mod phy_export;
 pub mod preview;
+pub mod probe;
 pub mod proposals;
 pub mod proposers;
 pub mod qc_export;
@@ -26,11 +29,13 @@ pub mod session;
 pub mod spike_depth;
 pub mod suggest;
 
+pub use brief::{quantise, render_brief, BriefOpts, Flag, FLAGS};
 pub use cache::correlograms::{acg_or_compute, ccg_or_compute};
 pub use cluster_index::{ClusterIndex, MergeRecord, SplitRecord};
 pub use command::{describe_command, Actor, CurationCommand, Method, PhyLabelOp, UnitOrigin};
 pub use curation_json::write_curation_json;
 pub use diff::{diff_labels, LabelDiff};
+pub use evaluate::{eval_merge, eval_split, Handles, MergeEval, Relation, SplitEval};
 pub use feature_subspace::{
     collect_pc_subspace, PcSubspace, DEFAULT_CHANNEL_IDX, DEFAULT_D, DEFAULT_MAX_BACKGROUND,
 };
@@ -48,7 +53,9 @@ pub use proposers::{
     attention_all, attention_with, kmeans_split, kmeans_split_proposal, outlier_proposal,
     outlier_split, KmeansSplit,
 };
-pub use qc_export::{collect_qc_rows, export_qc, write_qc_json, write_qc_tsv, QcRow};
+pub use qc_export::{
+    collect_qc_rows, collect_qc_rows_with, export_qc, write_qc_json, write_qc_tsv, QcRow,
+};
 pub use quality_ext::{cluster_quality, compute_isolation};
 pub use report::{render_cluster_svgs, render_report, write_report, ClusterSvgs, ReportFilter};
 pub use rules::{apply_rules, Rule, RuleSet};

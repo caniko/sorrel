@@ -1893,7 +1893,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                         .clicked()
                     {
                         match self.save_dir.as_deref() {
-                            Some(dir) => match export_qc(&read(&self.session), dir) {
+                            Some(dir) => match export_qc(&read(&self.session), dir, None) {
                                 Ok(n) => {
                                     self.status = toast(format!(
                                         "exported QC for {n} clusters to {}",

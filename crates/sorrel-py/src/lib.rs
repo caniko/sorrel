@@ -18,12 +18,14 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::{
-    collect_qc_rows, curation_json, open_phy, open_sorting_analyzer, rank_merge_candidates,
+    collect_qc_rows_with, curation_json, open_phy, open_sorting_analyzer, rank_merge_candidates,
     rank_split_candidates, save_session, seed_phy, CurationCommand, JournalOpts, Method,
     PhyLabelOp, SuggestConfig,
 };
 use sorrel_io::kilosort::{KilosortOpenParams, KilosortProvider, PhyLabel};
-use sorrel_io::{detect_backend, Backend, ClusterId, DataProvider, SortingAnalyzerProvider};
+use sorrel_io::{
+    detect_backend, Backend, ClusterId, DataProvider, HasGeometry, SortingAnalyzerProvider,
+};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -171,8 +173,7 @@ impl Session {
 
     /// `cluster_qc.tsv` rows as a JSON array of objects.
     fn qc_json(&self) -> String {
-        let rows: Vec<serde_json::Value> =
-            with_session!(self, s => collect_qc_rows(s).iter().map(|r| r.to_json()).collect());
+        let rows: Vec<serde_json::Value> = with_session!(self, s => collect_qc_rows_with(s, Some(s.provider.channel_positions())).iter().map(|r| r.to_json()).collect());
         serde_json::Value::Array(rows).to_string()
     }
 
