@@ -8,6 +8,7 @@ pub mod curation_json;
 pub mod diff;
 pub mod feature_subspace;
 pub mod host;
+pub mod instance;
 pub mod journal;
 pub mod open;
 #[cfg(feature = "phy-export")]
@@ -34,6 +35,7 @@ pub use feature_subspace::{
     collect_pc_subspace, PcSubspace, DEFAULT_CHANNEL_IDX, DEFAULT_D, DEFAULT_MAX_BACKGROUND,
 };
 pub use host::{AgentPolicy, AgentSeat, HostEvent, SessionHost};
+pub use instance::{send_instance, serve_instance, InstanceHandle, InstanceRequest, Pending};
 pub use journal::{artifacts_hash, baseline_hash, Journal, Record};
 pub use open::{
     journal_path, open_identity_sealed, open_journal, open_phy, open_sorting_analyzer,
@@ -52,8 +54,9 @@ pub use report::{render_cluster_svgs, render_report, write_report, ClusterSvgs, 
 pub use rules::{apply_rules, Rule, RuleSet};
 pub use save::{save_and_seal, save_session, save_to_phy};
 pub use serve::{
-    actor_name, attach, handle_line, serve, spawn_listener, tool_list, Env, ListenerHandle,
-    SharedSelection, Ui, PROTOCOL_VERSION, RUBRIC,
+    actor_name, attach, call_once, handle_line, list_hosts, read_mcp_json, serve, spawn_listener,
+    tool_list, user_dir, Env, HostRecord, ListenerHandle, SharedSelection, Ui, PROTOCOL_VERSION,
+    RUBRIC,
 };
 pub use session::Session;
 pub use spike_depth::{pc_weighted_depth, spike_depths, DepthSource, SpikeDepths};
