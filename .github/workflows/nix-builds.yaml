@@ -3,7 +3,8 @@ name: Nix installable builds
 
 on:
   push:
-    branches: ["**"]
+    branches:
+      - "trunk"
   pull_request:
   workflow_dispatch:
 
@@ -11,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: nix-groups-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.ref_type == 'tag' && github.ref || format('refs/heads/{0}', github.event.pull_request.head.ref || github.ref_name) }}
+  group: ${{ github.workflow_ref }}-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.ref_type == 'tag' && github.ref || format('refs/heads/{0}', github.event.pull_request.head.ref || github.ref_name) }}
   cancel-in-progress: true
 
 jobs:
