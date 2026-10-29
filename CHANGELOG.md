@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-10-29
+
 ### Breaking
 
 - `sorrel <DATA_DIR>` is now `sorrel open <DATA_DIR>`. Bare `sorrel` starts
@@ -507,7 +509,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Downstream dry-runs can fail until their local path dependencies have been
   published in order. See `RELEASE.md` for the publish sequence.
 
-[Unreleased]: https://github.com/caniko/sorrel/compare/0.2.3...HEAD
+[Unreleased]: https://github.com/caniko/sorrel/compare/0.2.4...HEAD
+[0.2.4]: https://github.com/caniko/sorrel/compare/0.2.3...0.2.4
 [0.2.3]: https://github.com/caniko/sorrel/compare/0.2.2...0.2.3
 [0.2.2]: https://github.com/caniko/sorrel/compare/0.2.1...0.2.2
 [0.2.1]: https://github.com/caniko/sorrel/compare/0.2.0...0.2.1

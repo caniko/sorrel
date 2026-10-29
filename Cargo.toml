@@ -17,7 +17,7 @@ members = [
 exclude = ["crates/sorrel-py"]
 
 [workspace.package]
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/caniko/sorrel"
@@ -26,15 +26,15 @@ repository = "https://github.com/caniko/sorrel"
 name = "sorrel"
 
 [workspace.dependencies]
-sorrel-io = { version = "0.2.3", path = "crates/sorrel-io" }
-sorrel-cache = { version = "0.2.3", path = "crates/sorrel-cache" }
-sorrel-compute = { version = "0.2.3", path = "crates/sorrel-compute" }
-sorrel-gpu = { version = "0.2.3", path = "crates/sorrel-gpu" }
+sorrel-io = { version = "0.2.4", path = "crates/sorrel-io" }
+sorrel-cache = { version = "0.2.4", path = "crates/sorrel-cache" }
+sorrel-compute = { version = "0.2.4", path = "crates/sorrel-compute" }
+sorrel-gpu = { version = "0.2.4", path = "crates/sorrel-gpu" }
 # Default features off so `sorrel --no-default-features` really drops `phy-export`.
-sorrel-data = { version = "0.2.3", path = "crates/sorrel-data", default-features = false }
-sorrel-render = { version = "0.2.3", path = "crates/sorrel-render" }
-sorrel-ui = { version = "0.2.3", path = "crates/sorrel-ui" }
-sorrel-remote = { version = "0.2.3", path = "crates/sorrel-remote" }
+sorrel-data = { version = "0.2.4", path = "crates/sorrel-data", default-features = false }
+sorrel-render = { version = "0.2.4", path = "crates/sorrel-render" }
+sorrel-ui = { version = "0.2.4", path = "crates/sorrel-ui" }
+sorrel-remote = { version = "0.2.4", path = "crates/sorrel-remote" }
 
 anyhow = "1"
 thiserror = "1"
