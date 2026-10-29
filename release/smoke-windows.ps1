@@ -78,7 +78,7 @@ if (-not (Get-Item $report).Length) { throw 'report.html is empty' }
 Remove-Item Env:WGPU_BACKEND -ErrorAction SilentlyContinue
 $env:RUST_LOG = 'info'
 $guiLog = Join-Path $OutDir 'gui.log'
-$gui = Start-Process -FilePath $exe -ArgumentList @($data) -PassThru `
+$gui = Start-Process -FilePath $exe -ArgumentList @('run', '--standalone', $data) -PassThru `
     -RedirectStandardOutput (Join-Path $OutDir 'gui.out.txt') -RedirectStandardError $guiLog
 try {
     Start-Sleep -Seconds $GuiSeconds

@@ -265,8 +265,9 @@ fn inspect_phy(path: &str) -> PyResult<(u32, u64, f32)> {
     ))
 }
 
-/// Subprocess-launch the `sorrel` binary on `path`. Returns when the user
-/// closes the window (blocking) so the notebook waits.
+/// Subprocess-launch `sorrel run` on `path`. Blocks until the window closes,
+/// so the notebook waits; returns at once when a sorrel window is already
+/// running, which opens `path` as a new tab instead.
 ///
 /// `binary` overrides the executable Sorrel finds via PATH; useful when
 /// running from a development checkout.
@@ -275,7 +276,7 @@ fn inspect_phy(path: &str) -> PyResult<(u32, u64, f32)> {
 fn launch(path: &str, binary: Option<&str>, extra_args: Option<Vec<String>>) -> PyResult<i32> {
     let exe: PathBuf = binary.map(PathBuf::from).unwrap_or_else(|| "sorrel".into());
     let mut cmd = Command::new(&exe);
-    cmd.arg(path);
+    cmd.arg("run").arg(path);
     if let Some(args) = extra_args {
         cmd.args(args);
     }

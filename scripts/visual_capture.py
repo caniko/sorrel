@@ -177,7 +177,7 @@ def capture_window(root: Path, fixture: Path, visual_root: Path) -> Path:
         log_path = visual_root / "sorrel.log"
         log = log_path.open("w")
         process = subprocess.Popen(
-            [str(binary), str(fixture), "--journal", str(fixture / "sorrel.journal")],
+            [str(binary), "run", "--standalone", str(fixture), "--journal", str(fixture / "sorrel.journal")],
             cwd=root,
             env=environment,
             stdout=log,

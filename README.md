@@ -12,22 +12,22 @@ Sorrel is built around **zero-cost abstractions**: the entire core is generic ov
 
 ## Workspace
 
-| Crate            | Role                                                                                                                                           |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sorrel-io`      | Concrete data backends; `DataProvider` trait bound.                                                                                            |
-| `sorrel-compute` | Generic kernels (LTTB, histograms).                                                                                                            |
-| `sorrel-data`    | Generic `Session<P>`, `CurationCommand`, append-only journal, QC export, SI `curation.json`, rules, report, JSON-RPC server.                   |
-| `sorrel-cache`   | Rebuildable derived-data cache (rkyv, GC).                                                                                                     |
-| `sorrel-gpu`     | wgpu kernels for CMR, high-pass and mean snippets.                                                                                             |
-| `sorrel-render`  | Concrete vertex types + monomorphised buffer builders.                                                                                         |
-| `sorrel-ui`      | egui widgets, generic over `P: DataProvider`.                                                                                                  |
-| `sorrel`         | Binary; `sorrel <DIR>` opens the GUI, subcommands (`qc`, `suggest`, `apply`, `report`, `serve`, `diff`, `journal`, `export-phy`) run headless. |
-| `sorrel-py`      | PyO3 bindings: in-process `Session` plus the GUI launcher (outside the workspace; `maturin develop`).                                          |
+| Crate            | Role                                                                                                                                              |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sorrel-io`      | Concrete data backends; `DataProvider` trait bound.                                                                                               |
+| `sorrel-compute` | Generic kernels (LTTB, histograms).                                                                                                               |
+| `sorrel-data`    | Generic `Session<P>`, `CurationCommand`, append-only journal, QC export, SI `curation.json`, rules, report, JSON-RPC server.                      |
+| `sorrel-cache`   | Rebuildable derived-data cache (rkyv, GC).                                                                                                        |
+| `sorrel-gpu`     | wgpu kernels for CMR, high-pass and mean snippets.                                                                                                |
+| `sorrel-render`  | Concrete vertex types + monomorphised buffer builders.                                                                                            |
+| `sorrel-ui`      | egui widgets, generic over `P: DataProvider`.                                                                                                     |
+| `sorrel`         | Binary; `sorrel open <DIR>` opens the GUI, subcommands (`qc`, `suggest`, `apply`, `report`, `mcp`, `diff`, `journal`, `export-phy`) run headless. |
+| `sorrel-py`      | PyO3 bindings: in-process `Session` plus the GUI launcher (outside the workspace; `maturin develop`).                                             |
 
 ## V1 (Kilosort / phy2)
 
 ```
-sorrel <KILOSORT_DIR> --dat recording.dat --sample-rate 30000 --channels 32
+sorrel open <KILOSORT_DIR> --dat recording.dat --sample-rate 30000 --channels 32
 ```
 
 - Memory-maps `spike_times.npy`, `spike_clusters.npy`, and the raw `.dat`.

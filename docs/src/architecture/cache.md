@@ -81,7 +81,7 @@ opens.
 Users can clear the cache without losing data:
 
 ```bash
-sorrel --clear-cache <dataset>
+sorrel clear-cache <dataset>
 ```
 
 This removes `<dataset>/.sorrel/cache/` and exits. Manual deletion of the same

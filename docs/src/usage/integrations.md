@@ -24,7 +24,7 @@ siex.export_to_phy(
 Then:
 
 ```sh
-sorrel my_run/phy
+sorrel open my_run/phy
 ```
 
 Sorrel reads `spike_times.npy`, `spike_clusters.npy`, `params.py`,
@@ -38,7 +38,7 @@ was flattened to `spike_times.npy` + `unit_indices.npy` under
 `<root>/sorting/`, point Sorrel directly at the analyzer root:
 
 ```sh
-sorrel my_run/sorting_analyzer
+sorrel open my_run/sorting_analyzer
 ```
 
 The current implementation reads `recording.json` (sample rate, channel
@@ -97,7 +97,7 @@ auto-detect — see [Backend detection](#backend-detection)).
 ## NWB / DANDI
 
 ```sh
-sorrel my_session.nwb            # build with --features hdf5
+sorrel open my_session.nwb            # build with --features hdf5
 ```
 
 Reads `/units/spike_times` (vlen) bucketed by `/units/id`, picks the first
@@ -117,7 +117,7 @@ Limitations:
 ## Kilosort 4 `rez.mat`
 
 ```sh
-sorrel rez.mat --dat path/to/recording.bin   # build with --features hdf5
+sorrel open rez.mat --dat path/to/recording.bin   # build with --features hdf5
 ```
 
 Reads `rez/st3` for sample/template tuples, `rez/ops/fs` and
@@ -165,7 +165,7 @@ temporary directory is kept by default so that file survives; pass
 
 ## Backend detection
 
-`sorrel <DIR>` walks a small detector list:
+`sorrel open <DIR>` walks a small detector list:
 
 1. If `spike_times.npy` + `spike_clusters.npy` are present → phy/Kilosort.
 2. Else if `recording.json` + `sorting/` are present → SortingAnalyzer.
