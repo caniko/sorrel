@@ -126,8 +126,39 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
         check: impl FnOnce(&Session<P>) -> Result<()>,
         then: impl FnOnce(&Session<P>) -> R,
     ) -> Result<(HostEvent, R)> {
+        self.apply_locked(
+            actor,
+            |s| {
+                check(s)?;
+                Ok(Some(cmd))
+            },
+            then,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("no command to apply"))
+    }
+
+    /// [`Self::apply`], but `build` makes the command from the session under
+    /// the same write lock as the apply, so an edit that changes the state
+    /// the command was derived from (e.g. a tag list it replaces) cannot
+    /// land in between. `Ok(None)` applies nothing; an `Err` applies nothing.
+    pub fn apply_built(
+        &self,
+        actor: Actor,
+        build: impl FnOnce(&Session<P>) -> Result<Option<CurationCommand>>,
+    ) -> Result<Option<HostEvent>> {
+        Ok(self.apply_locked(actor, build, |_| ())?.map(|(ev, ())| ev))
+    }
+
+    fn apply_locked<R>(
+        &self,
+        actor: Actor,
+        build: impl FnOnce(&Session<P>) -> Result<Option<CurationCommand>>,
+        then: impl FnOnce(&Session<P>) -> R,
+    ) -> Result<Option<(HostEvent, R)>> {
         let mut s = self.write();
-        check(&s)?;
+        let Some(cmd) = build(&s)? else {
+            return Ok(None);
+        };
         let (desc, mut clusters) = match &cmd {
             CurationCommand::Undo => crossed(["undid", "undo"], s.history_commands().last()),
             CurationCommand::Redo => crossed(["redid", "redo"], s.redo_commands().last()),
@@ -159,7 +190,7 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
             self.publish(&ev);
         }
         let r = then(&s);
-        Ok((ev, r))
+        Ok(Some((ev, r)))
     }
 
     /// Check out `node` (`None` = the root) as `actor`, then announce it.
@@ -557,6 +588,73 @@ mod tests {
         assert_eq!(h.read().label(ClusterId(1)), Some(0), "nothing applied");
         h.apply_if(Actor::Human, relabel(1, PhyLabelOp::SetNoise), |_| Ok(()))
             .unwrap();
+    }
+
+    /// Tag commands carry a replacement list, so they must be built from the
+    /// state the apply sees: a tag edit that lands between reading the
+    /// session and applying survives accept and reject when `apply_built`
+    /// builds under the lock, and is overwritten when built from a stale read.
+    #[test]
+    fn apply_built_keeps_a_tag_edit_that_landed_first() {
+        use crate::proposals::{Action, Proposal, Source};
+        let tag = |c: u32, t: &str| CurationCommand::Tag {
+            cluster: ClusterId(c),
+            tags: vec![t.into()],
+        };
+        let p = Proposal::new(
+            Source::Agent,
+            Action::Merge {
+                clusters: vec![ClusterId(0), ClusterId(1)],
+            },
+            0.5,
+            vec![],
+            Default::default(),
+        );
+        for accept in [true, false] {
+            let build = |s: &Session<Stub>| {
+                let cmds = if accept {
+                    p.to_commands(s)
+                } else {
+                    p.reject_commands(s)
+                };
+                CurationCommand::batch(cmds)
+            };
+            // Old flow: commands from a read, a tag edit lands, then apply.
+            let dir = tempfile::tempdir().unwrap();
+            let h = host(dir.path());
+            let stale = build(&h.read());
+            h.apply(
+                Actor::Agent {
+                    client: "mcp".into(),
+                },
+                tag(0, "mine"),
+            )
+            .unwrap();
+            h.apply(Actor::Human, stale.unwrap()).unwrap();
+            assert!(
+                !h.read().tags(ClusterId(0)).contains(&"mine".to_owned()),
+                "a stale build overwrites the tag"
+            );
+            // New flow: the builder runs under the write lock, after the edit.
+            let dir = tempfile::tempdir().unwrap();
+            let h = host(dir.path());
+            h.apply(
+                Actor::Agent {
+                    client: "mcp".into(),
+                },
+                tag(0, "mine"),
+            )
+            .unwrap();
+            h.apply_built(Actor::Human, |s| {
+                assert!(h.session().try_read().is_err(), "write lock is held");
+                Ok(build(s))
+            })
+            .unwrap();
+            assert!(
+                h.read().tags(ClusterId(0)).contains(&"mine".to_owned()),
+                "accept={accept}: the tag edit survives"
+            );
+        }
     }
 
     /// A proposal still `Pending` in the audit log when the host closed

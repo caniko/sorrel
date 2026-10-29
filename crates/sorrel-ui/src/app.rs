@@ -635,13 +635,6 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         let Some(p) = self.host.take_proposal(id) else {
             return;
         };
-        let cmds = {
-            let s = read(&self.session);
-            match accept {
-                true => p.to_commands(&s),
-                false => p.reject_commands(&s),
-            }
-        };
         let what = describe_proposal(&p);
         // Select the result the way the same edit made by hand would.
         let follow: Follow = match &p.action {
@@ -656,21 +649,22 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         // Accept and relabel-reject can leave nothing to journal. A proposal
         // that no longer fits the clusters (or whose edit fails) is audited
         // as superseded and its card dropped; the error says why.
-        // The staleness check runs under the write lock of the apply itself.
-        let still_fits = |s: &Session<P>| match accept.then(|| stale_reason(&p, s)).flatten() {
-            Some(why) => Err(anyhow::anyhow!("proposal no longer applies ({why})")),
-            None => Ok(()),
-        };
-        let applied = match CurationCommand::batch(cmds).filter(|b| !b.clusters().is_empty()) {
-            Some(batch) => self.commit_with_follow_if(batch, follow, still_fits),
-            None => match still_fits(&read(&self.session)) {
-                Ok(()) => true,
-                Err(e) => {
-                    self.error = Some(format!("{e}: {what}"));
-                    false
+        // The staleness check and the commands (whose `Tag` edits replace a
+        // cluster's whole tag list) are built under the write lock of the
+        // apply itself, so no MCP tag edit can land in between and be lost.
+        let build = |s: &Session<P>| {
+            if accept {
+                if let Some(why) = stale_reason(&p, s) {
+                    anyhow::bail!("proposal no longer applies ({why})");
                 }
-            },
+            }
+            let cmds = match accept {
+                true => p.to_commands(s),
+                false => p.reject_commands(s),
+            };
+            Ok(CurationCommand::batch(cmds).filter(|b| !b.clusters().is_empty()))
         };
+        let applied = self.commit_built(&what, build, follow);
         let outcome = match (applied, accept) {
             (false, _) => sorrel_data::proposals::Outcome::Superseded,
             (true, true) => sorrel_data::proposals::Outcome::Accepted,
@@ -1080,14 +1074,34 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         check: impl FnOnce(&Session<P>) -> anyhow::Result<()>,
     ) -> bool {
         let desc = describe_command(&cmd);
+        self.commit_built(
+            &desc,
+            |s| {
+                check(s)?;
+                Ok(Some(cmd))
+            },
+            follow,
+        )
+    }
+
+    /// Commit the command `build` makes from the session under the host's
+    /// write lock (`None` = nothing to journal, which counts as done).
+    /// `what` names the edit in the error.
+    fn commit_built(
+        &mut self,
+        what: &str,
+        build: impl FnOnce(&Session<P>) -> anyhow::Result<Option<CurationCommand>>,
+        follow: Follow,
+    ) -> bool {
         self.cancel_jobs();
         // Every GUI edit is a human decision: the host clears the touched
         // clusters' `review:*` tags (from `sorrel auto`), so the review
         // queue drains.
-        let ev = match self.host.apply_if(Actor::Human, cmd, check) {
-            Ok(ev) => ev,
+        let ev = match self.host.apply_built(Actor::Human, build) {
+            Ok(Some(ev)) => ev,
+            Ok(None) => return true,
             Err(e) => {
-                self.error = Some(format!("{desc} failed: {e}"));
+                self.error = Some(format!("{what} failed: {e}"));
                 return false;
             }
         };
@@ -1099,7 +1113,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 self.selection.toggle(c);
             }
         }
-        self.status = toast(desc);
+        self.status = toast(ev.desc);
         true
     }
 

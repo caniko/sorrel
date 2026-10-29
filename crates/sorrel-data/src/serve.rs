@@ -1078,21 +1078,43 @@ where
         stop: stop.clone(),
     };
     let save_dir = save_dir.to_owned();
+    // Connections still waiting to send their token. Each one holds a thread
+    // for up to the handshake timeout, so cap them: past the cap a new
+    // connection is dropped at once instead of costing a thread.
+    let handshaking = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::thread::Builder::new()
         .name("sorrel-mcp".into())
         .spawn(move || {
+            use std::sync::atomic::Ordering::SeqCst;
             for stream in listener.incoming() {
-                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                if stop.load(SeqCst) {
                     break;
                 }
                 let Ok(stream) = stream else { continue };
-                let (host, ui, token, dir) =
-                    (host.clone(), ui.clone(), token.clone(), save_dir.clone());
+                if handshaking.fetch_add(1, SeqCst) >= MAX_HANDSHAKES {
+                    handshaking.fetch_sub(1, SeqCst);
+                    continue;
+                }
+                let (host, ui, token, dir, handshaking) = (
+                    host.clone(),
+                    ui.clone(),
+                    token.clone(),
+                    save_dir.clone(),
+                    Arc::clone(&handshaking),
+                );
                 std::thread::spawn(move || {
+                    let authed = handshake(stream, &token);
+                    handshaking.fetch_sub(1, SeqCst);
+                    let (reader, writer) = match authed {
+                        Ok(Some(rw)) => rw,
+                        Ok(None) => return,
+                        Err(e) => return log::debug!("mcp handshake failed: {e}"),
+                    };
+                    // Only an authenticated client subscribes to host events.
                     let env = Env::new(&dir, reseal_on_save, label_str)
                         .with_ui(ui)
                         .subscribe(&host);
-                    if let Err(e) = serve_client(stream, &token, &host, env) {
+                    if let Err(e) = serve_lines(&host, env, reader, writer) {
                         log::debug!("mcp client ended: {e}");
                     }
                 });
@@ -1101,16 +1123,15 @@ where
     Ok(handle)
 }
 
-fn serve_client<P, F>(
+/// Unauthenticated connections the listener serves at once.
+const MAX_HANDSHAKES: usize = 8;
+
+/// Read the client's `{"token": ...}` line (5 s timeout) and acknowledge it.
+/// `None` when the token is wrong or missing: the caller drops the client.
+fn handshake(
     stream: std::net::TcpStream,
     token: &str,
-    host: &SessionHost<P>,
-    env: Env<F>,
-) -> std::io::Result<()>
-where
-    P: DataProvider + ApplyPhyLabel + HasGeometry,
-    F: Fn(&P::Label) -> &'static str + Sync,
-{
+) -> std::io::Result<Option<(std::io::BufReader<std::net::TcpStream>, std::net::TcpStream)>> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     let mut reader = std::io::BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -1121,11 +1142,11 @@ where
         .ok()
         .and_then(|v| v["token"].as_str().map(str::to_owned));
     if !sent.is_some_and(|t| ct_eq(t.as_bytes(), token.as_bytes())) {
-        return Ok(());
+        return Ok(None);
     }
     writer.set_read_timeout(None)?; // shared socket: clears the reader's timeout too
     writer.write_all(b"{\"ok\":true}\n")?;
-    serve_lines(host, env, reader, writer)
+    Ok(Some((reader, writer)))
 }
 
 /// `{port, token}` of a running host's listener in `save_dir`, if any.
@@ -1757,6 +1778,28 @@ mod tests {
         write_mcp_json(dir.path(), 1, "t", "n").unwrap();
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
         assert_eq!(read_mcp_json(dir.path()).unwrap().1, "t");
+    }
+
+    #[test]
+    fn silent_connections_cannot_exhaust_handshake_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Arc::new(SessionHost::new(mock_session(dir.path())));
+        let handle = spawn_listener(h, dir.path(), false, label, None).unwrap();
+        let connect = || std::net::TcpStream::connect(("127.0.0.1", handle.port())).unwrap();
+        // Fill every handshake slot with a client that never sends a token.
+        let _silent: Vec<_> = (0..MAX_HANDSHAKES).map(|_| connect()).collect();
+        // Give the listener time to accept them all.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // One more is dropped at once (EOF), not parked on a thread for 5 s.
+        let mut extra = connect();
+        extra
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut got = Vec::new();
+        let started = std::time::Instant::now();
+        extra.read_to_end(&mut got).unwrap();
+        assert!(got.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

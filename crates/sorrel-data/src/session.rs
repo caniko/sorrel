@@ -15,7 +15,7 @@ use sorrel_io::{
     ClusterId, DataProvider, HasAmplitudes, HasPcFeatures, HasSpikeTemplates, HasTemplateWaveforms,
     SampleIndex,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 const MAX_CACHE_INVALIDATIONS: usize = 1024;
@@ -103,6 +103,13 @@ struct Node<L: Copy> {
     /// Set exactly while the node is on the path to the head (captured when
     /// it is applied, consumed when it is reverted).
     inverse: Option<InverseOp<L>>,
+}
+
+/// Running state of [`Session::check_ids`] over a batch: the next id a
+/// split allocates, and cluster sizes as the earlier children left them.
+struct IdCheck {
+    limit: usize,
+    sizes: HashMap<ClusterId, usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -1281,7 +1288,7 @@ impl<P: DataProvider> Session<P> {
     /// split indices must be valid ([`Self::check_ids`]) and AddSpikes must
     /// pass its provider gate.
     fn check_gate(&self, cmd: &CurationCommand) -> Result<()> {
-        self.check_ids(cmd, self.n_clusters() as usize)?;
+        self.check_ids(cmd)?;
         self.check_add_spikes_gate(cmd)
     }
 
@@ -1309,30 +1316,58 @@ impl<P: DataProvider> Session<P> {
     /// subset of their cluster's spikes, for every caller (GUI, MCP, guests,
     /// imports) before anything is journaled. Replay does not run this, so old
     /// journals with such no-op records still open.
-    fn check_ids(&self, cmd: &CurationCommand, limit: usize) -> Result<()> {
-        let id = |c: &ClusterId| {
-            if c.idx() < limit {
+    fn check_ids(&self, cmd: &CurationCommand) -> Result<()> {
+        let mut st = IdCheck {
+            limit: self.n_clusters() as usize,
+            sizes: HashMap::new(),
+        };
+        self.check_ids_in(cmd, &mut st)
+    }
+
+    /// [`Self::check_ids`] walking a batch in order: `st` tracks the ids
+    /// earlier splits allocated and every cluster's size after the earlier
+    /// children, so a split of a batch-allocated child (or a second split of
+    /// one cluster) is checked against its real membership.
+    fn check_ids_in(&self, cmd: &CurationCommand, st: &mut IdCheck) -> Result<()> {
+        let id = |c: &ClusterId, st: &IdCheck| {
+            if c.idx() < st.limit {
                 Ok(())
             } else {
                 Err(anyhow::anyhow!("cluster {} does not exist", c.0))
             }
         };
+        let size = |c: ClusterId, st: &IdCheck| {
+            st.sizes.get(&c).copied().unwrap_or_else(|| {
+                if c.0 < self.n_clusters() {
+                    self.spike_times(c).len()
+                } else {
+                    0
+                }
+            })
+        };
         match cmd {
             CurationCommand::Relabel { cluster, .. }
             | CurationCommand::Note { cluster, .. }
-            | CurationCommand::Tag { cluster, .. } => id(cluster),
+            | CurationCommand::Tag { cluster, .. } => id(cluster, st),
             CurationCommand::Merge { sources, target } => {
-                sources.iter().chain([target]).try_for_each(id)
+                sources.iter().chain([target]).try_for_each(|c| id(c, st))?;
+                let moved: usize = sources
+                    .iter()
+                    .filter(|s| *s != target)
+                    .map(|&s| size(s, st))
+                    .sum();
+                let grown = size(*target, st) + moved;
+                for &s in sources.iter().filter(|s| *s != target) {
+                    st.sizes.insert(s, 0);
+                }
+                st.sizes.insert(*target, grown);
+                Ok(())
             }
             CurationCommand::Split {
                 cluster, spike_idx, ..
             } => {
-                id(cluster)?;
-                // Ids a batch's own splits allocate are not known yet: skip.
-                let n = match cluster.0 < self.n_clusters() {
-                    true => self.spike_times(*cluster).len(),
-                    false => return Ok(()),
-                };
+                id(cluster, st)?;
+                let n = size(*cluster, st);
                 let mut idx = spike_idx.clone();
                 idx.sort_unstable();
                 idx.dedup();
@@ -1343,19 +1378,14 @@ impl<P: DataProvider> Session<P> {
                         cluster.0
                     );
                 }
+                // The index allocates the child at the tail.
+                st.sizes.insert(*cluster, n - idx.len());
+                st.sizes.insert(ClusterId(st.limit as u32), idx.len());
+                st.limit += 1;
                 Ok(())
             }
-            // In batch order: a child may address only ids that existed or
-            // that an earlier split in the batch allocated.
             CurationCommand::Batch { children } => {
-                let mut limit = limit;
-                for c in children {
-                    self.check_ids(c, limit)?;
-                    if matches!(c, CurationCommand::Split { .. }) {
-                        limit += 1;
-                    }
-                }
-                Ok(())
+                children.iter().try_for_each(|c| self.check_ids_in(c, st))
             }
             _ => Ok(()),
         }
@@ -2083,6 +2113,14 @@ mod tests {
             CurationCommand::Batch {
                 children: vec![relabel(3), split(0, vec![0])],
             },
+            // The batch-allocated child 3 holds one spike: moving it all.
+            CurationCommand::Batch {
+                children: vec![split(0, vec![0]), split(3, vec![0])],
+            },
+            // Cluster 0 keeps two spikes after the first split: moving both.
+            CurationCommand::Batch {
+                children: vec![split(0, vec![0]), split(0, vec![0, 1])],
+            },
         ] {
             assert!(s.dispatch(bad.clone()).is_err(), "{bad:?} was accepted");
         }
@@ -2093,6 +2131,15 @@ mod tests {
         })
         .unwrap();
         assert_eq!(s.spike_times(ClusterId(3)).len(), 1);
+        // A proper split of a batch-allocated child is fine: child 3 takes two
+        // of cluster 0's three spikes, then gives one of them to child 4.
+        let (mut s, _d2) = fresh_session();
+        s.dispatch(CurationCommand::Batch {
+            children: vec![split(0, vec![0, 1]), split(3, vec![0])],
+        })
+        .unwrap();
+        assert_eq!(s.spike_times(ClusterId(3)).len(), 1);
+        assert_eq!(s.spike_times(ClusterId(4)).len(), 1);
     }
 
     #[test]
