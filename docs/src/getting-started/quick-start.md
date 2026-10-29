@@ -3,7 +3,7 @@
 Point Sorrel at a sorting output and it will auto-detect the backend:
 
 ```bash
-sorrel <DATA_DIR>
+sorrel open <DATA_DIR>
 ```
 
 The detector looks for, in order:
@@ -21,14 +21,14 @@ nwb | ks4-rez`.
 ## Phy / Kilosort
 
 ```bash
-sorrel my_run/phy
+sorrel open my_run/phy
 ```
 
 Sample rate, channel count, dtype, header offset, and dat path are read
 from `params.py` when present. CLI flags override on a per-field basis:
 
 ```bash
-sorrel my_run/phy \
+sorrel open my_run/phy \
   --dat recording.dat \
   --sample-rate 30000 \
   --channels 384 \
@@ -39,14 +39,14 @@ When the trace metadata isn't in `params.py`, point Sorrel at a SpikeGLX
 or Open Ephys metadata file:
 
 ```bash
-sorrel my_run/phy --spikeglx-meta run.imec0.ap.meta
-sorrel my_run/phy --oebin Record\ Node\ 101/structure.oebin
+sorrel open my_run/phy --spikeglx-meta run.imec0.ap.meta
+sorrel open my_run/phy --oebin Record\ Node\ 101/structure.oebin
 ```
 
 ## SpikeInterface SortingAnalyzer
 
 ```bash
-sorrel my_run/sorting_analyzer
+sorrel open my_run/sorting_analyzer
 ```
 
 The analyzer must be saved with `format='binary_folder'` and have a
@@ -56,8 +56,8 @@ supported.
 ## NWB and KS4 rez
 
 ```bash
-sorrel my_session.nwb                           # --features hdf5
-sorrel rez.mat --dat path/to/recording.bin      # --features hdf5
+sorrel open my_session.nwb                           # --features hdf5
+sorrel open rez.mat --dat path/to/recording.bin      # --features hdf5
 ```
 
 ## Curation journal

@@ -6,8 +6,8 @@ checkout on a windows runner, after the Nix output `.#sorrel-windows-smoke`
   pwsh release/smoke-windows.ps1 [-BuildDir DIR] [-OutDir smoke-out] [-GuiSeconds 20]
 
 Steps: version, gpu-check, headless qc + report on release/fixtures/tiny-phy,
-MCP over stdio (`sorrel mcp`), MCP attached to a `--headless` host through the
-%LOCALAPPDATA% token file, `sorrel auto` launching its sidecar through uv.exe,
+MCP over stdio (`sorrel mcp`), MCP attached to a `run --headless` host through its
+%LOCALAPPDATA% listener file, `sorrel auto` launching its sidecar through uv.exe,
 GUI start + screenshot, wheel install in a venv, Microsoft Defender scan of
 BuildDir. (`sorrel rescue` is not run: the fixture has no amplitudes.npy or
 spike_templates.npy, which it needs.) Any failure exits non-zero;
@@ -149,15 +149,22 @@ $rows = Get-Tool $r 3
 if ($rows.Count -ne $nClusters) { throw "list_clusters returned $($rows.Count) clusters, qc found $nClusters" }
 Write-Host "MCP stdio: sorrel $($init.serverInfo.version), $($tools.Count) tools, $($rows.Count) clusters"
 
-# 5. MCP through a host: `sorrel --headless` publishes its port and token under
-#    %LOCALAPPDATA%\sorrel\mcp\ (never in the dataset directory on Windows) and
+# `sorrel mcp config` prints the entry an agent needs to launch this exe.
+Assert-Ok 'mcp-config' (Invoke-Native 'mcp-config' $exe @('mcp', 'config', '--client', 'json', $dataA))
+$cfg = (Get-Content (Join-Path $OutDir 'mcp-config.out.txt') -Raw | ConvertFrom-Json).mcpServers.sorrel
+if (-not $cfg.command -or $cfg.args[0] -ne 'mcp' -or $cfg.args.Count -ne 2) {
+    throw "unexpected mcp config: $($cfg | ConvertTo-Json -Compress)"
+}
+
+# 5. MCP through a host: `sorrel run --headless` publishes its port and token under
+#    %LOCALAPPDATA%\sorrel\mcp\ (never in the dataset directory) and
 #    `sorrel mcp` attaches to it. While the host holds the journal, a `sorrel mcp`
 #    that served in-process would fail with "already open", so success proves the
 #    attach; the label surviving into a second session shows the host owns the state.
 $dataB = New-DataCopy 'host'
 $mcpDir = Join-Path $env:LOCALAPPDATA 'sorrel\mcp'
 $known = @(Get-ChildItem $mcpDir -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object Name)
-$hostProc = Start-Process -FilePath $exe -ArgumentList @('--headless', $dataB) -PassThru `
+$hostProc = Start-Process -FilePath $exe -ArgumentList @('run', '--headless', $dataB) -PassThru `
     -RedirectStandardOutput (Join-Path $OutDir 'headless.out.txt') `
     -RedirectStandardError (Join-Path $OutDir 'headless.err.txt')
 $portFile = $null
@@ -172,9 +179,10 @@ try {
     }
     if (-not $portFile) { throw "headless host wrote no token file under $mcpDir within 30 s" }
     if (Test-Path (Join-Path $dataB '.sorrel\mcp.json')) { throw 'token file was written inside the dataset directory' }
+    $listener = Get-Content $portFile.FullName -Raw | ConvertFrom-Json
+    if ($listener.kind -ne 'headless') { throw "listener kind is '$($listener.kind)', expected 'headless'" }
     # Evidence without the token.
-    Get-Content $portFile.FullName -Raw | ConvertFrom-Json | Select-Object port, pid |
-        ConvertTo-Json | Set-Content (Join-Path $OutDir 'headless-listener.json')
+    $listener | Select-Object port, pid, kind, dataset | ConvertTo-Json | Set-Content (Join-Path $OutDir 'headless-listener.json')
 
     $r = Invoke-Mcp 'mcp-attach' $dataB @(
         (Rpc-Init 1), $rpcInitialized, (Rpc-Call 2 'list_clusters'))
@@ -226,7 +234,7 @@ if ($autoCode -ne 0 -and $autoLog -notmatch 'channel_positions\.npy') {
 Remove-Item Env:WGPU_BACKEND -ErrorAction SilentlyContinue
 $env:RUST_LOG = 'info'
 $guiLog = Join-Path $OutDir 'gui.log'
-$gui = Start-Process -FilePath $exe -ArgumentList @($data) -PassThru `
+$gui = Start-Process -FilePath $exe -ArgumentList @('run', '--standalone', $data) -PassThru `
     -RedirectStandardOutput (Join-Path $OutDir 'gui.out.txt') -RedirectStandardError $guiLog
 try {
     Start-Sleep -Seconds $GuiSeconds

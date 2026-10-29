@@ -10,7 +10,8 @@ feature that links against `libhdf5`.
 cargo build --release -p sorrel
 ```
 
-The binary is written to `target/release/sorrel`.
+The binary is written to `target/release/sorrel`. Shell completions come from
+`sorrel completions <shell>`; see the [CLI reference](cli.md#completions).
 
 To enable the HDF5-backed readers (NWB, KS4 `rez.mat`):
 
@@ -18,7 +19,7 @@ To enable the HDF5-backed readers (NWB, KS4 `rez.mat`):
 cargo build --release -p sorrel --features hdf5
 ```
 
-Full phy export (`sorrel export-phy`, the `export_phy` serve tool, the
+Full phy export (`sorrel export-phy`, the `export_phy` MCP tool, the
 **Export phy** button and `Session.export_phy` in `sorrel-py`) is the
 `phy-export` feature, on by default. Leave it out with:
 
@@ -62,13 +63,14 @@ from the same `PATH`, so an agent can launch it by name (see
 
 New versions show up once the winget-pkgs PR is merged and Chocolatey
 moderation passes, which can take a few days after the GitHub release.
+`sorrel completions powershell` prints a PowerShell completion script.
 
 The window opens on the first backend wgpu likes (Vulkan or DX12). If it
 crashes at startup with a shader error, or stays blank, pick the other one:
 
 ```powershell
 $env:WGPU_BACKEND = "vulkan"   # or "dx12", or "gl"
-sorrel <DATA_DIR>
+sorrel open <DATA_DIR>
 ```
 
 `sorrel gpu-check` shows what each backend can do. Trace filtering falls back

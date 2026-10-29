@@ -11,7 +11,7 @@ use sorrel_data::{Journal, Session};
 use sorrel_io::kilosort::{KilosortOpenParams, PhyLabel};
 use sorrel_io::npy;
 use sorrel_io::{DataProvider, HasGeometry, KilosortProvider};
-use sorrel_ui::{RasterPipeline, ScatterPipeline, SorrelApp, TracePipeline};
+use sorrel_ui::{RasterPipeline, ScatterPipeline, Shell, SorrelApp, TracePipeline};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -436,12 +436,8 @@ fn quit_with_unsaved_edits() {
         h.key_press(egui::Key::ArrowDown);
         h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::M);
         settle(&mut h);
-        h.input_mut()
-            .viewports
-            .entry(egui::ViewportId::ROOT)
-            .or_default()
-            .events
-            .push(egui::ViewportEvent::Close);
+        // The shell asks every tab to close on a window close.
+        h.state_mut().request_close();
         snap(&mut h, "quit_confirm", name);
         h
     });
@@ -580,6 +576,30 @@ fn saved_status() {
         snap(&mut h, "saved", name);
         h
     });
+}
+
+#[test]
+fn launcher() {
+    if no_gpu() {
+        return;
+    }
+    let mut results = SnapshotResults::new();
+    for (theme, name) in [(egui::Theme::Dark, "dark"), (egui::Theme::Light, "light")] {
+        // No storage in the harness, so the recent list is empty.
+        let mut h = Harness::builder()
+            .with_size(SIZE)
+            .with_theme(theme)
+            .wgpu_setup(vulkan_only())
+            .build_eframe(|cc| {
+                Shell::new(cc, Box::new(|_, _, _| anyhow::bail!("no opener")), None)
+            });
+        h.run_ok();
+        h.remove_cursor();
+        h.run_ok();
+        h.snapshot(format!("launcher_{name}"));
+        results.extend_harness(&mut h);
+    }
+    results.unwrap();
 }
 
 #[test]

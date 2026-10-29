@@ -10,7 +10,8 @@ In-process (no window), for notebooks and pipelines::
     s.set_label(3, "good"); s.merge([4, 5], 6) # journaled, undoable
     s.save()                                   # phy files + curation.json
 
-GUI (subprocess, blocks until the window closes)::
+GUI (subprocess, blocks until the window closes; with a sorrel window
+already open, the dataset becomes a new tab there and the call returns)::
 
     sorrel.open(recording, sorting)            # builds a SortingAnalyzer
     sorrel.open_analyzer(sorting_analyzer)     # launches on its binary_folder
@@ -167,7 +168,8 @@ def launch(
     binary: str | None = None,
     extra_args: list[str] | None = None,
 ) -> int:
-    """Spawn the sorrel binary on `path`. Blocks until close."""
+    """Run `sorrel run` on `path`. Blocks until close, or returns at once when
+    a sorrel window is already running (`path` opens there as a new tab)."""
     return _native.launch(str(path), binary or _bundled_binary(), extra_args)
 
 

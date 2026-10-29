@@ -26,5 +26,5 @@ through host memory.
 
 The CPU implementations live in `sorrel-compute::cmr` and
 `sorrel-compute::filter` and are bit-equivalent up to floating-point
-ordering. Headless tools (`--export-qc`) and any host without a wgpu
+ordering. Headless tools (`sorrel qc`) and any host without a wgpu
 adapter use them directly.

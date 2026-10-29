@@ -5,20 +5,23 @@ a remote guest all edit through it. Every edit is journaled with who made
 it, so it can be undone and shows up in the [History](./history.md) pane.
 
 ```text
-sorrel <DATA_DIR>               # host + GUI
-sorrel --headless <DATA_DIR>    # host only; stops on Ctrl-C
-sorrel mcp <DATA_DIR>           # the command an agent launches
+sorrel open <DATA_DIR>               # a tab in the running window, or a new window
+sorrel run --headless <DATA_DIR>     # host only; stops on Ctrl-C
+sorrel mcp [<DATA_DIR>]              # the command an agent launches
 ```
 
 ## Connecting an agent
 
-`sorrel mcp <DATA_DIR>` speaks MCP (JSON-RPC 2.0, one object per line) on
-stdio. When a host is already running on the directory (the GUI or
-`--headless`), it connects to it. Otherwise it opens the dataset itself and
-serves it until stdin closes. `sorrel serve` is the old name and still
-works.
+`sorrel mcp` speaks MCP (JSON-RPC 2.0, one object per line) on stdio. Without
+`<DATA_DIR>` it attaches to the GUI's active tab, or else to the only running
+host; if there are several, it errors and lists them. With `<DATA_DIR>` it
+connects to the host on that directory (the GUI or `run --headless`) when one
+is running. Otherwise it opens the dataset itself and serves it until stdin
+closes. `sorrel serve` is gone; use `sorrel mcp`.
 
-A Claude Code MCP entry looks like this:
+`sorrel mcp config --client claude` prints the registration line for Claude
+Code, `--client codex` a Codex TOML block, and `--client json` an `mcpServers`
+entry like this:
 
 ```json
 {
@@ -40,11 +43,12 @@ the same entry works with a Windows path:
 ```
 
 A running host listens on `127.0.0.1` on a random port. It writes the port
-and a token to `<DATA_DIR>/.sorrel/mcp.json` (mode 0600), and deletes the
-file when it exits. On Windows the file is kept outside the dataset, in
-`%LOCALAPPDATA%\sorrel\mcp\<hash of the dataset path>.json`, which only your
-account can read. A client must send the token first. Only processes that
-can read that file can connect.
+and a token to `$XDG_RUNTIME_DIR/sorrel/mcp/<hash>.json` (fallback
+`~/.cache/sorrel/mcp/`; `%LOCALAPPDATA%\sorrel\mcp\` on Windows, which only your
+account can read), mode 0600 on Unix, and deletes the file when it exits. The file also records the
+dataset path and whether the host is a GUI or headless. `SORREL_USER_DIR`
+overrides the base directory. A client must send the token first. Only
+processes that can read that file can connect.
 
 The client's `clientInfo.name` from `initialize` names the agent. The agent
 indicator, the toasts and the History pane use that name, and a split it
@@ -108,10 +112,24 @@ Every proposal and every decision is appended to
 
 ## Headless mode
 
-`sorrel --headless <DATA_DIR>` opens the dataset, replays the journal and
+`sorrel run --headless <DATA_DIR>` opens the dataset, replays the journal and
 serves agents with no window. It prints the port and the command to
 connect, then runs until Ctrl-C. Edits land in the same journal the GUI
 uses, so opening the GUI afterwards shows them, branches included.
 
 Without a GUI, `select` and `selection` return an error, and agents always
 edit directly.
+
+## From a shell
+
+`sorrel call <DATA_DIR> <TOOL> [ARGS_JSON]` runs one MCP tool through the
+running host, or in-process when none is running. It prints the result and
+exits non-zero on error; `--raw` prints the JSON-RPC response instead:
+
+```bash
+sorrel call ks4/ metrics '{"cluster": 12}'
+```
+
+`sorrel status --json` lists the running GUI, its tabs and every session host,
+for scripts. `sorrel agent-guide` prints a primer for LLM agents, with the live
+command list, the MCP tools and the running hosts.

@@ -10,9 +10,8 @@
 //! - **stdio** ([`serve`]): `sorrel mcp <dir>` when no host is running.
 //! - **loopback TCP** ([`spawn_listener`]): a running host (`sorrel <dir>`,
 //!   `sorrel --headless <dir>`) listens on `127.0.0.1`, behind a token in
-//!   `<dir>/.sorrel/mcp.json` (on Windows in a per-user directory, see
-//!   `mcp_json_path`); `sorrel mcp <dir>` bridges stdio to it
-//!   ([`attach`]).
+//!   `<user_dir>/mcp/<hash>.json` (see `mcp_json_path`; [`list_hosts`] scans
+//!   them); `sorrel mcp <dir>` bridges stdio to it ([`attach`]).
 //!
 //! Edit tools apply as `Actor::Agent` (tagged `src:agent`, journaled and
 //! undoable) under [`AgentPolicy::Direct`], and only queue a proposal under
@@ -956,14 +955,56 @@ fn write_json(out: &mut impl Write, v: &Value) -> Result<()> {
 
 // --- GUI listener and stdio bridge ------------------------------------
 
-#[cfg(not(windows))]
-const MCP_JSON: &str = ".sorrel/mcp.json";
+#[cfg(test)]
+thread_local! {
+    /// Per-test-thread `user_dir()` override: tests never touch the real one
+    /// or race on the environment.
+    static TEST_USER_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The per-user state directory (mode 0700 on Unix), created on demand.
+/// `SORREL_USER_DIR` overrides everything (tests, sandboxes); otherwise
+/// `$XDG_RUNTIME_DIR/sorrel`, else `$HOME/.cache/sorrel`; on Windows
+/// `%LOCALAPPDATA%\sorrel`. Holds the host registry (`mcp/`) and the GUI
+/// instance file (`gui.json`).
+pub fn user_dir() -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(p) = TEST_USER_DIR.with(|d| d.borrow().clone()) {
+        return Ok(p);
+    }
+    let var = |k: &str| {
+        std::env::var_os(k)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    let missing = |k: &str| std::io::Error::other(format!("{k} is not set"));
+    let dir = if let Some(d) = var("SORREL_USER_DIR") {
+        d
+    } else if cfg!(windows) {
+        var("LOCALAPPDATA")
+            .ok_or_else(|| missing("LOCALAPPDATA"))?
+            .join("sorrel")
+    } else if let Some(x) = var("XDG_RUNTIME_DIR") {
+        x.join("sorrel")
+    } else {
+        var("HOME")
+            .ok_or_else(|| missing("HOME"))?
+            .join(".cache")
+            .join("sorrel")
+    };
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(&dir)?;
+    Ok(dir)
+}
 
 /// A fresh 128-bit hex token. std-only: `RandomState` keys come from the OS
 /// RNG (once per process), mixed with the clock and a per-call counter via
 /// SipHash. ponytail: not a CSPRNG; swap in `getrandom` if the token ever
 /// guards more than a loopback socket in a user-only directory.
-fn random_token() -> String {
+pub(crate) fn random_token() -> String {
     use std::hash::BuildHasher;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -978,39 +1019,54 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Where the listener file for `save_dir` lives; `attach` and the listener
-/// both go through here. Unix: `<save_dir>/.sorrel/mcp.json` (mode 0600).
-/// Windows: a file inherits the dataset directory's ACL, which other
-/// accounts may read, so it goes under `%LOCALAPPDATA%\sorrel\mcp\`
-/// (user-private by default), named by a hash of the canonical dataset path.
-fn mcp_json_path(save_dir: &Path) -> std::io::Result<PathBuf> {
-    #[cfg(not(windows))]
-    return Ok(save_dir.join(MCP_JSON));
-    #[cfg(windows)]
-    {
-        let base = std::env::var_os("LOCALAPPDATA")
-            .ok_or_else(|| std::io::Error::other("LOCALAPPDATA is not set"))?;
-        let canon = save_dir
-            .canonicalize()
-            .unwrap_or_else(|_| save_dir.to_owned());
-        let key = blake3::hash(canon.to_string_lossy().to_lowercase().as_bytes());
-        Ok(PathBuf::from(base)
-            .join("sorrel")
-            .join("mcp")
-            .join(format!("{}.json", &key.to_hex()[..32])))
-    }
+fn canonical(save_dir: &Path) -> PathBuf {
+    save_dir
+        .canonicalize()
+        .unwrap_or_else(|_| save_dir.to_owned())
 }
 
-/// `{port, token, pid, nonce}` (see [`mcp_json_path`]), written atomically
-/// (tmp + rename) so a client never reads half of it. `pid` and `nonce`
-/// identify the writer: only it removes the file.
+/// Where the listener file for `save_dir` lives; `attach` and the listener
+/// both go through here: `<user_dir>/mcp/<hash>.json`, named by a hash of the
+/// canonical dataset path (lowercased on Windows, where paths are
+/// case-insensitive). Off the dataset directory so another account that can
+/// read the dataset cannot read the token, and so [`list_hosts`] finds every
+/// running host in one place.
+fn mcp_json_path(save_dir: &Path) -> std::io::Result<PathBuf> {
+    let canon = canonical(save_dir).to_string_lossy().into_owned();
+    let canon = if cfg!(windows) {
+        canon.to_lowercase()
+    } else {
+        canon
+    };
+    let key = blake3::hash(canon.as_bytes());
+    Ok(user_dir()?
+        .join("mcp")
+        .join(format!("{}.json", &key.to_hex()[..32])))
+}
+
+/// `{port, token, pid, nonce, dataset, kind}` (see [`mcp_json_path`]).
+/// `kind` is `"gui"` or `"headless"`.
 fn write_mcp_json(
     save_dir: &Path,
     port: u16,
     token: &str,
     nonce: &str,
+    kind: &str,
 ) -> std::io::Result<PathBuf> {
     let path = mcp_json_path(save_dir)?;
+    let dataset = canonical(save_dir).to_string_lossy().into_owned();
+    write_private_json(
+        &path,
+        &json!({"port": port, "token": token, "pid": std::process::id(), "nonce": nonce,
+                "dataset": dataset, "kind": kind}),
+    )?;
+    Ok(path)
+}
+
+/// Write `body` to `path` (parent created) atomically (tmp + rename, mode
+/// 0600) so a client never reads half of it. Listener files carry `pid` and
+/// `nonce` to identify the writer: only it removes the file.
+pub(crate) fn write_private_json(path: &Path, body: &Value) -> std::io::Result<()> {
     std::fs::create_dir_all(path.parent().expect("has parent"))?;
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     // `create_new` (O_EXCL) never follows a symlink pre-placed at `tmp`.
@@ -1023,14 +1079,34 @@ fn write_mcp_json(
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
     let mut f = opts.open(&tmp)?;
-    let body = json!({"port": port, "token": token, "pid": std::process::id(), "nonce": nonce});
     f.write_all(body.to_string().as_bytes())?;
     f.sync_all()?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(path)
+    std::fs::rename(&tmp, path)
 }
 
-/// Keeps the listener alive; dropping it removes `mcp.json` and stops
+/// Shared tail of a listener handle's `Drop`: stop the accept loop, remove
+/// `path` only if this process wrote it (pid + `nonce`), and wake the
+/// blocking accept so its thread sees `stop`.
+pub(crate) fn shutdown_listener(
+    stop: &std::sync::atomic::AtomicBool,
+    path: &Path,
+    nonce: &str,
+    port: u16,
+) {
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    // A later host in the same place (or a stale file we no longer own) is
+    // left alone.
+    let ours = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .is_some_and(|v| v["pid"] == std::process::id() && v["nonce"].as_str() == Some(nonce));
+    if ours {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+}
+
+/// Keeps the listener alive; dropping it removes the listener file and stops
 /// accepting (connections already open finish on their own).
 pub struct ListenerHandle {
     port: u16,
@@ -1051,20 +1127,7 @@ impl ListenerHandle {
 
 impl Drop for ListenerHandle {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        // Only the writer of the file removes it: a later host in the same
-        // directory (or a stale file we no longer own) is left alone.
-        let ours = std::fs::read_to_string(&self.mcp_json)
-            .ok()
-            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-            .is_some_and(|v| {
-                v["pid"] == std::process::id() && v["nonce"].as_str() == Some(&self.nonce)
-            });
-        if ours {
-            let _ = std::fs::remove_file(&self.mcp_json);
-        }
-        // Wake the blocking accept so its thread sees `stop`.
-        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+        shutdown_listener(&self.stop, &self.mcp_json, &self.nonce, self.port);
     }
 }
 
@@ -1074,7 +1137,7 @@ impl Drop for ListenerHandle {
 ///
 /// ponytail: one thread per connection with no cap; every connection must
 /// present the token first, so only local processes that can read the 0600
-/// `mcp.json` get a thread's worth of work.
+/// listener file get a thread's worth of work.
 pub fn spawn_listener<P>(
     host: Arc<SessionHost<P>>,
     save_dir: &Path,
@@ -1090,7 +1153,8 @@ where
     let port = listener.local_addr()?.port();
     let token = random_token();
     let nonce = random_token();
-    let mcp_json = write_mcp_json(save_dir, port, &token, &nonce)?;
+    let kind = if ui.is_some() { "gui" } else { "headless" };
+    let mcp_json = write_mcp_json(save_dir, port, &token, &nonce, kind)?;
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = ListenerHandle {
         port,
@@ -1150,7 +1214,7 @@ const MAX_HANDSHAKES: usize = 8;
 
 /// Read the client's `{"token": ...}` line (5 s timeout) and acknowledge it.
 /// `None` when the token is wrong or missing: the caller drops the client.
-fn handshake(
+pub(crate) fn handshake(
     stream: std::net::TcpStream,
     token: &str,
 ) -> std::io::Result<Option<(std::io::BufReader<std::net::TcpStream>, std::net::TcpStream)>> {
@@ -1171,43 +1235,84 @@ fn handshake(
     Ok(Some((reader, writer)))
 }
 
-/// `{port, token}` of a running host's listener in `save_dir`, if any.
-pub fn read_mcp_json(save_dir: &Path) -> Option<(u16, String)> {
-    let text = std::fs::read_to_string(mcp_json_path(save_dir).ok()?).ok()?;
-    let v: Value = serde_json::from_str(&text).ok()?;
+/// `{port, token}` from a listener file, if it exists and parses.
+pub(crate) fn read_port_token(path: &Path) -> Option<(u16, String)> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     Some((
         u16::try_from(v["port"].as_u64()?).ok()?,
         v["token"].as_str()?.to_owned(),
     ))
 }
 
-/// `sorrel mcp`: pipe `input` to the host listening in `save_dir` and
-/// its replies to `output`, line by line, until either side closes. Returns
-/// `Ok(false)` without touching either stream only when there is provably no
-/// listener (no `mcp.json`, or the connection is refused: a stale file): the
-/// caller then falls back to a headless `serve`. A host that accepts the
-/// connection but times out, rejects the token or sends a bad ack is alive,
-/// so that is an error, never a second writer on its journal.
-pub fn attach(
-    save_dir: &Path,
-    input: impl Read + Send + 'static,
-    mut output: impl Write,
-) -> Result<bool> {
-    use std::net::{TcpStream, ToSocketAddrs};
+/// `{port, token}` of a running host's listener in `save_dir`, if any.
+pub fn read_mcp_json(save_dir: &Path) -> Option<(u16, String)> {
+    read_port_token(&mcp_json_path(save_dir).ok()?)
+}
+
+/// A running host found in the registry.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HostRecord {
+    pub dataset: PathBuf,
+    pub port: u16,
+    pub pid: u32,
+    /// `"gui"` or `"headless"`.
+    pub kind: String,
+    /// A loopback connect to `port` succeeded (300 ms): the file may still be
+    /// stale if the port was reused.
+    pub alive: bool,
+}
+
+/// Every host in the registry, sorted by dataset. Unreadable or invalid
+/// files are skipped, and nothing is deleted: the files belong to the hosts
+/// that wrote them.
+pub fn list_hosts() -> Vec<HostRecord> {
+    user_dir()
+        .map(|d| list_hosts_in(&d.join("mcp")))
+        .unwrap_or_default()
+}
+
+fn list_hosts_in(dir: &Path) -> Vec<HostRecord> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<HostRecord> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter_map(|p| {
+            let v: Value = serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()?;
+            let port = u16::try_from(v["port"].as_u64()?).ok()?;
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            Some(HostRecord {
+                dataset: v["dataset"].as_str()?.into(),
+                port,
+                pid: u32::try_from(v["pid"].as_u64()?).ok()?,
+                kind: v["kind"].as_str()?.to_owned(),
+                alive: std::net::TcpStream::connect_timeout(
+                    &addr,
+                    std::time::Duration::from_millis(300),
+                )
+                .is_ok(),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.dataset.cmp(&b.dataset));
+    out
+}
+
+/// Connect to a loopback host and complete the token handshake. `Ok(None)`
+/// only when the connection is refused (a stale file); a timeout, a wrong
+/// token or a bad ack means the host is alive, so those are errors. The
+/// returned stream has no read timeout.
+pub(crate) fn connect_authed(
+    port: u16,
+    token: &str,
+) -> Result<Option<(std::net::TcpStream, std::io::BufReader<std::net::TcpStream>)>> {
     use std::time::Duration;
-    let Some((port, token)) = read_mcp_json(save_dir) else {
-        return Ok(false);
-    };
-    let Some(addr) = ("127.0.0.1", port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut a| a.next())
-    else {
-        return Ok(false);
-    };
-    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(None),
         Err(e) => bail!("sorrel host on port {port} did not accept the connection: {e}"),
     };
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -1220,7 +1325,28 @@ pub fn attach(
         Err(e) => bail!("sorrel host on port {port} did not acknowledge: {e}"),
     }
     stream.set_read_timeout(None)?;
-    let mut up = stream.try_clone()?;
+    Ok(Some((stream, reader)))
+}
+
+/// `sorrel mcp`: pipe `input` to the host listening in `save_dir` and
+/// its replies to `output`, line by line, until either side closes. Returns
+/// `Ok(false)` without touching either stream only when there is provably no
+/// listener (no listener file, or the connection is refused: a stale file):
+/// the caller then falls back to a headless `serve`. A host that accepts the
+/// connection but times out, rejects the token or sends a bad ack is alive,
+/// so that is an error, never a second writer on its journal.
+pub fn attach(
+    save_dir: &Path,
+    input: impl Read + Send + 'static,
+    mut output: impl Write,
+) -> Result<bool> {
+    let Some((port, token)) = read_mcp_json(save_dir) else {
+        return Ok(false);
+    };
+    let Some((stream, mut reader)) = connect_authed(port, &token)? else {
+        return Ok(false);
+    };
+    let mut up = stream;
     std::thread::spawn(move || {
         let mut input = std::io::BufReader::new(input);
         let mut line = String::new();
@@ -1245,6 +1371,24 @@ pub fn attach(
     Ok(true)
 }
 
+/// One JSON-RPC `request` to the host in `save_dir`, and its first reply.
+/// `Ok(None)` when no host listens there (see [`attach`]).
+pub fn call_once(save_dir: &Path, request: &Value) -> Result<Option<Value>> {
+    let mut out = Vec::new();
+    let input = std::io::Cursor::new(format!("{request}\n"));
+    if !attach(save_dir, input, &mut out)? {
+        return Ok(None);
+    }
+    let line = out.split(|&b| b == b'\n').next().unwrap_or_default();
+    if line.is_empty() {
+        bail!(
+            "sorrel host in {} closed without a reply",
+            save_dir.display()
+        );
+    }
+    Ok(Some(serde_json::from_slice(line)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1252,6 +1396,13 @@ mod tests {
     use crate::qc_export::tests::MockProvider;
     use sorrel_io::SampleIndex;
     use std::io::Cursor;
+
+    /// Point this test thread's `user_dir()` at a fresh directory.
+    fn scoped_user_dir() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        TEST_USER_DIR.with(|u| *u.borrow_mut() = Some(d.path().to_owned()));
+        d
+    }
 
     impl HasGeometry for MockProvider {
         fn channel_positions(&self) -> &[[f32; 2]] {
@@ -1790,29 +1941,63 @@ mod tests {
     /// function of the dataset directory.
     #[test]
     fn token_file_path_is_shared_by_writer_and_reader() {
+        let _u = scoped_user_dir();
         let dir = tempfile::tempdir().unwrap();
         let path = mcp_json_path(dir.path()).unwrap();
         assert_eq!(path, mcp_json_path(dir.path()).unwrap());
-        assert_eq!(write_mcp_json(dir.path(), 1, "t", "n").unwrap(), path);
+        assert_eq!(
+            write_mcp_json(dir.path(), 1, "t", "n", "gui").unwrap(),
+            path
+        );
         assert_eq!(read_mcp_json(dir.path()), Some((1, "t".to_owned())));
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Off the dataset directory on Windows, so another account that can
-    /// read the dataset cannot read the token.
-    #[cfg(windows)]
+    /// Off the dataset directory, so another account that can read the
+    /// dataset cannot read the token; the record names the dataset and kind.
     #[test]
-    fn windows_token_file_is_outside_the_dataset() {
+    fn token_file_is_outside_the_dataset_and_lists_as_a_host() {
+        let user = scoped_user_dir();
         let dir = tempfile::tempdir().unwrap();
-        let path = mcp_json_path(dir.path()).unwrap();
-        assert!(!path.starts_with(dir.path()));
-        assert!(path.starts_with(std::env::var_os("LOCALAPPDATA").unwrap()));
+        let path = write_mcp_json(dir.path(), 1, "t", "n", "gui").unwrap();
+        assert!(path.starts_with(user.path()) && !path.starts_with(dir.path()));
+        let hosts = list_hosts();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].dataset, dir.path().canonicalize().unwrap());
+        assert_eq!((hosts[0].kind.as_str(), hosts[0].port), ("gui", 1));
+    }
+
+    /// Live port, dead port and garbage: only the first is alive, the
+    /// garbage is skipped, nothing is deleted.
+    #[test]
+    fn list_hosts_in_reports_liveness_and_skips_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let dead = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let rec = |name: &str, dataset: &str, port: u16| {
+            let body = json!({"port": port, "token": "t", "pid": 7, "nonce": "n",
+                              "dataset": dataset, "kind": "headless"});
+            std::fs::write(dir.path().join(name), body.to_string()).unwrap();
+        };
+        rec("b.json", "/b", live.local_addr().unwrap().port());
+        rec("a.json", "/a", dead_port);
+        std::fs::write(dir.path().join("c.json"), "not json").unwrap();
+        let hosts = list_hosts_in(dir.path());
+        let got: Vec<_> = hosts
+            .iter()
+            .map(|h| (h.dataset.to_str().unwrap(), h.alive))
+            .collect();
+        assert_eq!(got, [("/a", false), ("/b", true)]);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
     }
 
     /// A symlink pre-placed at the tmp path is replaced, not written through.
     #[cfg(unix)]
     #[test]
     fn write_does_not_follow_a_preplaced_tmp_symlink() {
+        let _u = scoped_user_dir();
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim");
         std::fs::write(&victim, "keep").unwrap();
@@ -1820,13 +2005,14 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
         std::os::unix::fs::symlink(&victim, &tmp).unwrap();
-        write_mcp_json(dir.path(), 1, "t", "n").unwrap();
+        write_mcp_json(dir.path(), 1, "t", "n", "gui").unwrap();
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
         assert_eq!(read_mcp_json(dir.path()).unwrap().1, "t");
     }
 
     #[test]
     fn silent_connections_cannot_exhaust_handshake_workers() {
+        let _u = scoped_user_dir();
         let dir = tempfile::tempdir().unwrap();
         let h = Arc::new(SessionHost::new(mock_session(dir.path())));
         let handle = spawn_listener(h, dir.path(), false, label, None).unwrap();
@@ -1849,6 +2035,7 @@ mod tests {
 
     #[test]
     fn loopback_listener_round_trip_and_bad_token() {
+        let _u = scoped_user_dir();
         let dir = tempfile::tempdir().unwrap();
         let h = Arc::new(SessionHost::new(mock_session(dir.path())));
         let woke = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1899,8 +2086,13 @@ mod tests {
         assert_eq!(woke.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(h.read().label(ClusterId(0)), Some(1), "relabelled");
 
+        // `call_once` returns after one reply (the server hangs up on EOF).
+        let req = json!({"jsonrpc": "2.0", "id": 9, "method": "tools/list"});
+        assert_eq!(call_once(dir.path(), &req).unwrap().unwrap()["id"], 9);
+
         drop(handle);
         assert!(!mcp_json_path(dir.path()).unwrap().exists());
+        assert!(call_once(dir.path(), &req).unwrap().is_none());
         let mut out = Vec::new();
         assert!(
             !attach(dir.path(), Cursor::new(""), &mut out).unwrap(),
@@ -1930,6 +2122,7 @@ mod tests {
     /// accepts but never acknowledges is alive, so that is an error.
     #[test]
     fn attach_falls_back_only_when_nobody_listens() {
+        let _u = scoped_user_dir();
         let dir = tempfile::tempdir().unwrap();
         let none = || Cursor::new("");
         // No file.
@@ -1938,11 +2131,18 @@ mod tests {
         let dead = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = dead.local_addr().unwrap().port();
         drop(dead);
-        write_mcp_json(dir.path(), port, "t", "n").unwrap();
+        write_mcp_json(dir.path(), port, "t", "n", "gui").unwrap();
         assert!(!attach(dir.path(), none(), Vec::new()).unwrap());
         // Live but silent: accepts, never answers.
         let silent = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        write_mcp_json(dir.path(), silent.local_addr().unwrap().port(), "t", "n").unwrap();
+        write_mcp_json(
+            dir.path(),
+            silent.local_addr().unwrap().port(),
+            "t",
+            "n",
+            "gui",
+        )
+        .unwrap();
         let hold = std::thread::spawn(move || silent.accept().map(|(s, _)| s));
         let err = attach(dir.path(), none(), Vec::new()).unwrap_err();
         assert!(err.to_string().contains("did not acknowledge"), "{err}");
@@ -1952,11 +2152,12 @@ mod tests {
     /// A wrong token after connecting is an error too, not a fallback.
     #[test]
     fn attach_with_a_rejected_token_is_an_error() {
+        let _u = scoped_user_dir();
         let dir = tempfile::tempdir().unwrap();
         let h = Arc::new(SessionHost::new(mock_session(dir.path())));
         let _handle = spawn_listener(h, dir.path(), false, label, None).unwrap();
         let (port, _) = read_mcp_json(dir.path()).unwrap();
-        write_mcp_json(dir.path(), port, "wrong", "n").unwrap();
+        write_mcp_json(dir.path(), port, "wrong", "n", "gui").unwrap();
         let err = attach(dir.path(), Cursor::new(""), Vec::new()).unwrap_err();
         assert!(err.to_string().contains("rejected"), "{err}");
     }
@@ -1964,6 +2165,7 @@ mod tests {
     /// The handle that wrote `mcp.json` is the only one that removes it.
     #[test]
     fn a_second_handles_drop_keeps_the_first_ones_file() {
+        let _u = scoped_user_dir();
         let (a, b, shared) = (
             tempfile::tempdir().unwrap(),
             tempfile::tempdir().unwrap(),
@@ -1983,6 +2185,7 @@ mod tests {
     /// with the busy error and leaves the first host's listener alone.
     #[test]
     fn a_second_host_on_the_same_directory_is_refused() {
+        let _u = scoped_user_dir();
         let dir = tempfile::tempdir().unwrap();
         let h = Arc::new(SessionHost::new(mock_session(dir.path())));
         let first = spawn_listener(h, dir.path(), false, label, None).unwrap();

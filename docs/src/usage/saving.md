@@ -125,7 +125,7 @@ opening it in Sorrel starts a fresh curation on top of the exported state.
 ## Headless QC export
 
 ```bash
-sorrel <DATA_DIR> --export-qc out/qc/
+sorrel qc <DATA_DIR> --out out/qc/
 ```
 
 Loads the data, runs the full metrics pipeline (firing rate, presence,

@@ -7,8 +7,34 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Breaking
+
+- `sorrel <DATA_DIR>` is now `sorrel open <DATA_DIR>`. Bare `sorrel` starts
+  the launcher.
+- `sorrel --headless <DATA_DIR>` is now `sorrel run --headless <DATA_DIR>`.
+- `sorrel --export-qc DIR` is now `sorrel qc <DATA_DIR> --out DIR`.
+- `sorrel --clear-cache DIR` is now `sorrel clear-cache <DATA_DIR>`.
+- `sorrel serve` is removed; use `sorrel mcp`.
+- The MCP listener file moved from `<DATA_DIR>/.sorrel/mcp.json` to a per-user
+  directory: `$XDG_RUNTIME_DIR/sorrel/mcp/<hash>.json` (fallback
+  `~/.cache/sorrel/mcp/`; `%LOCALAPPDATA%\sorrel\mcp\` on Windows). Use
+  `sorrel mcp` rather than reading it.
+
 ### Added
 
+- Tabs and a launcher in the GUI. `sorrel open` adds a dataset as a tab to the
+  running window. The launcher offers Open dataset…, drag-and-drop and recent
+  datasets. Ctrl-O opens, Ctrl-W closes a tab, Ctrl-Tab and Ctrl-Shift-Tab
+  switch tabs.
+- `sorrel run` runs the GUI in the foreground; `--standalone` always starts a
+  separate window.
+- `sorrel status [--json]` lists the running GUI, its tabs and session hosts.
+- `sorrel call` runs one MCP tool from a shell.
+- `sorrel mcp tools` lists the MCP tools offline; `sorrel mcp config` prints how
+  to register sorrel with an agent.
+- `sorrel agent-guide` prints a primer for LLM agents.
+- `sorrel completions` for bash, zsh, fish, elvish and PowerShell.
+- `sorrel describe --json`.
 - History that never discards: undo moves back, an edit after an undo starts
   a branch, and the whole tree survives saving and reopening. A **History**
   pane lists every edit with who made it and when, marks branches and saves,
@@ -17,7 +43,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   journaled with its actor (you, an agent's client name, an algorithm, a
   remote peer).
 - `sorrel mcp <DATA_DIR>` connects an agent to the GUI or headless host on
-  the directory, or serves the dataset itself. `sorrel --headless <DATA_DIR>`
+  the directory, or serves the dataset itself. `sorrel run --headless <DATA_DIR>`
   runs the host without a window. See [Agents](docs/src/usage/agents.md).
 - Agent edits in the GUI: a toast names the agent and the edit, the touched
   clusters are selected and tinted in the table, and the top bar lists the
@@ -28,14 +54,14 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   not-merge / not-split memory.
 - Agents get `notifications/message` when someone else changes the session.
 - The Windows smoke test on a real runner now runs `sorrel mcp` over stdio,
-  `sorrel mcp` attached to a `--headless` host through its
-  `%LOCALAPPDATA%` token file, and `sorrel auto` through `uv.exe`.
+  `sorrel mcp` attached to a `run --headless` host through its
+  `%LOCALAPPDATA%` listener file, and `sorrel auto` through `uv.exe`.
 
 ### Changed
 
 - The curation journal is format v3, a tree of edits with their actor and
   time, head moves and save seals. v1 and v2 journals are upgraded on open,
-  their undone commands kept as branches; sorrel 0.2.x refuses a v3 journal
+  their undone commands kept as branches; sorrel 0.2.3 and earlier refuse a v3 journal
   ("not a sorrel journal (bad magic)") instead of truncating it. Remote protocol v3.
 - Saving no longer clears the undo history. For phy directories, the first
   save that replaces a file keeps its original in `sorrel_original/` (listed
@@ -48,8 +74,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   instead of deleting them.
 - After a rescue save, undoing the rescue and saving again writes the
   original per-spike arrays back; the directory no longer needs a reopen.
-- `sorrel serve` is now an alias of `sorrel mcp`. MCP agents can edit while
-  the GUI is open; `propose`, `select` and `selection` work in the same
+- MCP agents can edit while the GUI is open; `propose`, `select` and `selection` work in the same
   server.
 - Hovering the save status shows the save path or the full error. It no
   longer says whether the undo history was sealed, because saving keeps it.
