@@ -484,7 +484,7 @@ jobs:
           dir="$tmpdir/"'manifests/c/Caniko/Sorrel'"/$VERSION"; mkdir -p "$dir"
           sha="$(sha256sum "release/${ZIP_NAME}" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')"
           { hdr version; f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'DefaultLocale: en-US'; echo 'ManifestType: version'; echo 'ManifestVersion: 1.12.0'; } > "$dir"/'Caniko.Sorrel'.yaml
-          { hdr installer; f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'InstallerType: zip'; echo 'NestedInstallerType: portable'; echo 'Installers:'; echo '- Architecture: x64'; echo '  NestedInstallerFiles:'; printf '%s\n' "  - RelativeFilePath: $(yaml 'sorrel.exe')" "    PortableCommandAlias: $(yaml 'sorrel')"; printf '%s\n' "  InstallerUrl: $(yaml "$ZIP_URL")" "  InstallerSha256: $sha"; echo 'ManifestType: installer'; echo 'ManifestVersion: 1.12.0'; } > "$dir"/'Caniko.Sorrel'.installer.yaml
+          { hdr installer; f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'InstallerType: zip'; echo 'NestedInstallerType: portable'; echo 'Dependencies:'; echo '  PackageDependencies:'; printf '%s\n' "  - PackageIdentifier: $(yaml 'astral-sh.uv')" ; echo 'Installers:'; echo '- Architecture: x64'; echo '  NestedInstallerFiles:'; printf '%s\n' "  - RelativeFilePath: $(yaml 'sorrel.exe')" "    PortableCommandAlias: $(yaml 'sorrel')"; printf '%s\n' "  InstallerUrl: $(yaml "$ZIP_URL")" "  InstallerSha256: $sha"; echo 'ManifestType: installer'; echo 'ManifestVersion: 1.12.0'; } > "$dir"/'Caniko.Sorrel'.installer.yaml
           { hdr defaultLocale; f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'PackageLocale: en-US'; f Publisher 'Caniko'; f PublisherUrl 'https://github.com/caniko'; f PackageName 'Sorrel'; f PackageUrl 'https://github.com/caniko/sorrel'; f License 'MIT OR Apache-2.0'; f LicenseUrl 'https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT'; f ShortDescription 'Native GUI for curating spike-sorted electrophysiology data'; echo 'ManifestType: defaultLocale'; echo 'ManifestVersion: 1.12.0'; } > "$dir"/'Caniko.Sorrel'.locale.en-US.yaml
           # Submit the manifests in "$dir" to microsoft/winget-pkgs through the GitHub
           # REST API as the WINGET_PAT user. Needs curl and jq.
@@ -632,7 +632,7 @@ jobs:
             exit 0
           }
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=42293ecd5b42df7feffd615881f34dd6c83fbd76 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=32322b53b0837137c7b31cb6d8a41b76ef0ec9b2 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -660,7 +660,7 @@ jobs:
           set -euo pipefail
           . ./release-env
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=42293ecd5b42df7feffd615881f34dd6c83fbd76 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=32322b53b0837137c7b31cb6d8a41b76ef0ec9b2 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -709,7 +709,7 @@ jobs:
           if [ -z "${CHOCOLATEY_API_KEY:-}" ]; then publisher_missing chocolatey 'CHOCOLATEY_API_KEY unset'; fi
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
           if [ "${CHOCO_CANDIDATE_CACHE_HIT:-}" != true ]; then echo 'Chocolatey candidate persistence was not verified.' >&2; exit 1; fi
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=42293ecd5b42df7feffd615881f34dd6c83fbd76 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=32322b53b0837137c7b31cb6d8a41b76ef0ec9b2 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -966,7 +966,7 @@ jobs:
           dir="$tmpdir/"'manifests/c/Caniko/Sorrel'"/$VERSION"; mkdir -p "$dir"
           sha="$(sha256sum "release/${ZIP_NAME}" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')"
           { hdr version; f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'DefaultLocale: en-US'; echo 'ManifestType: version'; echo 'ManifestVersion: 1.12.0'; } > "$dir"/'Caniko.Sorrel'.yaml
-          { hdr installer; f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'InstallerType: zip'; echo 'NestedInstallerType: portable'; echo 'Installers:'; echo '- Architecture: x64'; echo '  NestedInstallerFiles:'; printf '%s\n' "  - RelativeFilePath: $(yaml 'sorrel.exe')" "    PortableCommandAlias: $(yaml 'sorrel')"; printf '%s\n' "  InstallerUrl: $(yaml "$ZIP_URL")" "  InstallerSha256: $sha"; echo 'ManifestType: installer'; echo 'ManifestVersion: 1.12.0'; } > "$dir"/'Caniko.Sorrel'.installer.yaml
+          { hdr installer; f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'InstallerType: zip'; echo 'NestedInstallerType: portable'; echo 'Dependencies:'; echo '  PackageDependencies:'; printf '%s\n' "  - PackageIdentifier: $(yaml 'astral-sh.uv')" ; echo 'Installers:'; echo '- Architecture: x64'; echo '  NestedInstallerFiles:'; printf '%s\n' "  - RelativeFilePath: $(yaml 'sorrel.exe')" "    PortableCommandAlias: $(yaml 'sorrel')"; printf '%s\n' "  InstallerUrl: $(yaml "$ZIP_URL")" "  InstallerSha256: $sha"; echo 'ManifestType: installer'; echo 'ManifestVersion: 1.12.0'; } > "$dir"/'Caniko.Sorrel'.installer.yaml
           { hdr defaultLocale; f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'PackageLocale: en-US'; f Publisher 'Caniko'; f PublisherUrl 'https://github.com/caniko'; f PackageName 'Sorrel'; f PackageUrl 'https://github.com/caniko/sorrel'; f License 'MIT OR Apache-2.0'; f LicenseUrl 'https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT'; f ShortDescription 'Native GUI for curating spike-sorted electrophysiology data'; echo 'ManifestType: defaultLocale'; echo 'ManifestVersion: 1.12.0'; } > "$dir"/'Caniko.Sorrel'.locale.en-US.yaml
           # Submit the manifests in "$dir" to microsoft/winget-pkgs through the GitHub
           # REST API as the WINGET_PAT user. Needs curl and jq.
@@ -1116,7 +1116,7 @@ jobs:
             exit 0
           }
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=42293ecd5b42df7feffd615881f34dd6c83fbd76 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=32322b53b0837137c7b31cb6d8a41b76ef0ec9b2 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -1144,7 +1144,7 @@ jobs:
           set -euo pipefail
           . ./release-env
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=42293ecd5b42df7feffd615881f34dd6c83fbd76 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=32322b53b0837137c7b31cb6d8a41b76ef0ec9b2 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -1194,7 +1194,7 @@ jobs:
           if [ -z "${CHOCOLATEY_API_KEY:-}" ]; then publisher_missing chocolatey 'CHOCOLATEY_API_KEY unset'; fi
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
           if [ "${CHOCO_CANDIDATE_CACHE_HIT:-}" != true ]; then echo 'Chocolatey candidate persistence was not verified.' >&2; exit 1; fi
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=42293ecd5b42df7feffd615881f34dd6c83fbd76 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=32322b53b0837137c7b31cb6d8a41b76ef0ec9b2 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
