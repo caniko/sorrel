@@ -496,20 +496,13 @@ where
             ok(env.mine(host.apply(agent, CurationCommand::Merge { sources, target })?))
         }
         "split" => {
-            let (cluster, spike_idx) = {
+            let (cluster, spike_idx, basis) = {
                 let s = host.read();
                 let cluster = check(&s, arg_u32(args, "cluster")?)?;
-                (cluster, split_indices(&s, cluster, args)?)
+                let spike_idx = split_indices(&s, cluster, args)?;
+                (cluster, spike_idx, proposals::spike_basis(&s, cluster))
             };
-            let ev = env.mine(host.apply(
-                agent.clone(),
-                CurationCommand::Split {
-                    cluster,
-                    spike_idx,
-                    new_cluster: ClusterId(u32::MAX),
-                    by: Method::Llm(actor_name(&agent).to_owned()),
-                },
-            )?);
+            let ev = env.mine(apply_split(host, agent, cluster, spike_idx, &basis)?);
             let new_cluster = ev.clusters.last().map(|c| c.0);
             text(json!({"ok": true, "new_cluster": new_cluster, "version": ev.version}))
         }
@@ -626,6 +619,35 @@ fn split_indices<P: DataProvider>(
         ));
     }
     Ok(spike_idx)
+}
+
+/// Split `cluster` by `spike_idx`, positions in the membership `basis`
+/// ([`proposals::spike_basis`]) described. The basis is checked under the
+/// apply's write lock: an edit since it was read refuses the split instead
+/// of moving different spikes.
+fn apply_split<P: DataProvider + ApplyPhyLabel>(
+    host: &SessionHost<P>,
+    agent: Actor,
+    cluster: ClusterId,
+    spike_idx: Vec<u32>,
+    basis: &str,
+) -> Result<HostEvent> {
+    let by = Method::Llm(actor_name(&agent).to_owned());
+    let cmd = CurationCommand::Split {
+        cluster,
+        spike_idx,
+        new_cluster: ClusterId(u32::MAX),
+        by,
+    };
+    host.apply_if(agent, cmd, |s| {
+        if proposals::spike_basis(s, cluster) != basis {
+            bail!(
+                "cluster {} changed since its spikes were read; read them again and retry",
+                cluster.0
+            );
+        }
+        Ok(())
+    })
 }
 
 /// Validate `propose` arguments against the session; nothing is changed.
@@ -1462,6 +1484,29 @@ mod tests {
             proposals::read_log(dir.path())[0].basis.as_deref(),
             Some(&*want)
         );
+    }
+
+    /// A direct split applies positions read from one membership only to that
+    /// membership: an edit in between refuses it and applies nothing.
+    #[test]
+    fn direct_split_refuses_a_cluster_that_changed_since_it_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SessionHost::new(mock_session(dir.path()));
+        let basis = proposals::spike_basis(&h.read(), ClusterId(0));
+        h.apply(
+            Actor::Human,
+            CurationCommand::Merge {
+                sources: vec![ClusterId(1)],
+                target: ClusterId(0),
+            },
+        )
+        .unwrap();
+        let (n, v) = (h.read().n_clusters(), h.read().version());
+        let e = apply_split(&h, Actor::Human, ClusterId(0), vec![0], &basis).unwrap_err();
+        assert!(e.to_string().contains("changed since"), "{e}");
+        assert_eq!((h.read().n_clusters(), h.read().version()), (n, v));
+        let fresh = proposals::spike_basis(&h.read(), ClusterId(0));
+        apply_split(&h, Actor::Human, ClusterId(0), vec![0], &fresh).unwrap();
     }
 
     #[test]

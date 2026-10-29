@@ -97,9 +97,10 @@ pub fn open_phy(
     let lock = lock_journal(&path)?;
     discard_journal(opts, &path)?;
     let snap = root.join(ROOT_DIR);
-    if snap.exists() && (!path.exists() || !snap.join(ROOT_MANIFEST).exists()) {
-        // ponytail: the snapshot does not record its journal, so an alternate
-        // path is refused while the default journal could own it.
+    if snap.exists() {
+        // ponytail: the snapshot does not record its journal, so any alternate
+        // path (existing or not) is refused while the default journal exists
+        // and could own it; recording the owner in ROOT would lift that.
         let default = journal_path(&JournalOpts::default(), root, "sorrel");
         if opts.path.is_some()
             && default != path
@@ -108,13 +109,15 @@ pub fn open_phy(
         {
             bail!(
                 "{}: {ROOT_DIR}/ belongs to {}; an alternate journal would set it aside from \
-                 under that journal. Open without --journal, or set that journal aside first \
-                 (--discard-journal without --journal).",
+                 under that journal or replay against its snapshot. Open without --journal, or \
+                 set that journal aside first (--discard-journal without --journal).",
                 root.display(),
                 default.display()
             );
         }
-        retire_snapshot(root)?;
+        if !path.exists() || !snap.join(ROOT_MANIFEST).exists() {
+            retire_snapshot(root)?;
+        }
     }
     // Rolls an interrupted save forward, then reads the root.
     let provider = KilosortProvider::open(root, params)?;

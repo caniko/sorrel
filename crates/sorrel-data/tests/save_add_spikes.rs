@@ -713,6 +713,36 @@ fn alternate_journal_keeps_the_default_journals_snapshot() {
     assert!(s.is_saved());
 }
 
+/// An alternate journal that already exists is refused beside the default
+/// journal's snapshot too: it would replay against arrays it never recorded.
+#[test]
+fn existing_alternate_journal_is_refused_beside_the_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_fixture(root);
+    let mut s = open_phy(root, KilosortOpenParams::default(), &JournalOpts::default()).unwrap();
+    seed_phy(&mut s).unwrap();
+    s.dispatch(CurationCommand::Relabel {
+        cluster: ClusterId(0),
+        op: PhyLabelOp::SetGood,
+    })
+    .unwrap();
+    save_and_seal(&mut s, root, label_str).unwrap();
+    drop(s);
+
+    let alt = JournalOpts {
+        path: Some(root.join("alt.journal")),
+        discard: false,
+    };
+    std::fs::write(root.join("alt.journal"), b"theirs").unwrap();
+    let e = open_phy(root, KilosortOpenParams::default(), &alt)
+        .err()
+        .expect("refused");
+    assert!(e.to_string().contains("belongs to"), "{e}");
+    assert_eq!(std::fs::read(root.join("alt.journal")).unwrap(), b"theirs");
+    assert!(root.join("sorrel_original/ROOT").exists());
+}
+
 /// A note-only save that crashes after its seal but before the manifest
 /// leaves the old sidecar on top: the reopened session must not be clean.
 #[test]

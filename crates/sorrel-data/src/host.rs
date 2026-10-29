@@ -198,6 +198,8 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
     pub fn checkout(&self, actor: Actor, node: Option<u64>) -> Result<HostEvent> {
         let mut s = self.write();
         let (n_before, old) = (s.n_clusters(), s.head());
+        // Ids the old branch's splits allocated, before it is unwound.
+        let left = s.applied_commands();
         s.checkout(node)?;
         // Nodes on the way up from the old head and on the way down to the
         // new one, below their common ancestor.
@@ -225,6 +227,19 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
         // Splits allocate ids at the tail (and an undone one frees them).
         let (lo, hi) = (n_before.min(s.n_clusters()), n_before.max(s.n_clusters()));
         clusters.extend((lo..hi).map(ClusterId));
+        // Sibling branches can allocate the same id for different spikes,
+        // leaving the count (so the range above) unchanged: name the child
+        // of every crossed split.
+        let (entered, left) = (
+            s.applied_commands(),
+            &left[left.len() - (from.len() - common)..],
+        );
+        clusters.extend(
+            entered[entered.len() - (to.len() - common)..]
+                .iter()
+                .chain(left)
+                .flat_map(split_children),
+        );
         clusters.sort_unstable();
         clusters.dedup();
         let ev = HostEvent {
@@ -342,6 +357,16 @@ impl<P: DataProvider + ApplyPhyLabel> SessionHost<P> {
 /// take the host down).
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The ids a resolved command's splits allocated (see
+/// [`Session::applied_commands`]).
+fn split_children(cmd: &CurationCommand) -> Vec<ClusterId> {
+    match cmd {
+        CurationCommand::Split { new_cluster, .. } => vec![*new_cluster],
+        CurationCommand::Batch { children } => children.iter().flat_map(split_children).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Description and clusters of a head move over `cmd` (`None` at the end of
@@ -552,6 +577,25 @@ mod tests {
         assert_eq!(root.clusters, [ClusterId(1)], "the relabel");
         let fwd = h.checkout(Actor::Human, a.node).unwrap();
         assert_eq!(fwd.clusters, [ClusterId(1)]);
+    }
+
+    /// Moving between sibling split branches that allocate the same id for
+    /// different spikes (the cluster count does not change) still names it.
+    #[test]
+    fn same_size_checkout_between_split_branches_names_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = host(dir.path());
+        let split = |i| CurationCommand::Split {
+            cluster: ClusterId(0),
+            spike_idx: vec![i],
+            new_cluster: ClusterId(u32::MAX),
+            by: crate::command::Method::Manual,
+        };
+        let a = h.apply(Actor::Human, split(1)).unwrap();
+        h.checkout(Actor::Human, None).unwrap();
+        h.apply(Actor::Human, split(0)).unwrap();
+        let ev = h.checkout(Actor::Human, a.node).unwrap();
+        assert_eq!(ev.clusters, [ClusterId(0), ClusterId(2)]);
     }
 
     /// Undoing a split names the child id it frees, as the split named it.
