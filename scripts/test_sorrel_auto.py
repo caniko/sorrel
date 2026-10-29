@@ -13,7 +13,7 @@ duplicate must come back `redundant`, and the output must be a valid
 SpikeInterface curation document carrying a quality label and a `src:` tag
 for every unit.
 
-    uv run --script scripts/test_sorrel_auto.py [--unitrefine] [--keep DIR]
+    uv run --script scripts/test_sorrel_auto.py [--unitrefine] [--keep DIR] [--brief-only]
 """
 
 import json
@@ -47,7 +47,44 @@ def make_phy(folder: Path) -> tuple[int, int, int, int]:
     return ids.index(100), ids.index(101), ids.index(1), ids.index(102)
 
 
+BRIEF = (
+    "# sorrel brief v1\nrec: 180.0 s\nlegend: x\ncards: one row per unit\ndrill: brief{clusters:[..]}\n"
+    "ledger\n"
+    "cards:\nid\tlab\tflags\tfr\n3\tgood\t=\t4.1\n7\tmua\t+A\t0.2\nomitted: cards 9; raise budget\n"
+)
+
+
+def test_brief_cases() -> None:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "crates" / "sorrel" / "src"))
+    import sorrel_auto as sa
+
+    head, card_head, rows = sa.split_brief(BRIEF)
+    assert head.endswith("drill: brief{clusters:[..]}\nledger") and "\ncards:\n" not in head
+    assert card_head == "id\tlab\tflags\tfr" and sorted(rows) == [3, 7], rows
+    rec = {"bombcell": "mua", "unitrefine": "good", "unitrefine_probability": 0.55, "members": [7]}
+    msg = sa.unit_message(card_head, rows, rec, {})
+    assert msg == (
+        "Decide this unit.\nid\tlab\tflags\tfr\n7\tmua\t+A\t0.2\n"
+        'classifiers: {"bombcell":"mua","unitrefine":"good","unitrefine_probability":0.55}'
+    ), msg
+    merged = sa.unit_message(card_head, rows, {**rec, "members": [3, 7]}, {3: "eval: z=1"})
+    assert "merge of 3,7" in merged and "3\tgood" in merged and "7\tmua" in merged and "\neval: z=1\n" in merged
+    assert sa.eval_line("merge {3,4}: rpc 0,0→.05\n") == "merge {3,4}: rpc 0,0→.05"
+    assert sa.merge_message("eval: m", {"slay", "similarity_correlograms"}).endswith("proposed_by: similarity_correlograms,slay")
+    try:
+        sa.unit_message(card_head, rows, {**rec, "members": [99]}, {})
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("a unit without a card must fail loudly")
+
+
 def main() -> None:
+    if "--brief-only" in sys.argv:
+        test_brief_cases()
+        print("ok: brief cases")
+        return
+    test_brief_cases()
     keep = sys.argv[sys.argv.index("--keep") + 1] if "--keep" in sys.argv else None
     root = Path(keep or tempfile.mkdtemp(prefix="sorrel-auto-"))
     phy, out = root / "phy", root / "phy" / "sorrel_auto"

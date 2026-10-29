@@ -170,28 +170,37 @@ or `src:human`. The two are independent, and the `src:*` tags are unchanged.
 With `--llm`, the uncertain cases go to Claude (`--llm-model`, default
 `claude-opus-5`; credentials from `ANTHROPIC_API_KEY` or `ant auth login`).
 
-Claude is sent **numbers, not plots**:
+Claude is sent **text, not plots**: the same token-lean brief an MCP agent
+reads (see [Agents](./agents.md)). `sorrel auto` hands the sidecar its own binary
+and open arguments (`SORREL_BIN`, `SORREL_OPEN_ARGS`), so the sidecar runs
+`sorrel call DIR brief` and `sorrel call DIR eval` on the dataset exactly as
+`sorrel auto` opens it. They run before `sorrel auto` opens the session, so the
+journal is not locked; with a host running, `sorrel call` goes through it. If a
+call fails, the `--llm` stage fails with its stderr and nothing is applied.
 
-- the metrics
-- both classifiers' outputs and the Bombcell rules the unit failed
-- the peak-channel template resampled to 25 points
-- the spatial footprint (ptp on the 8 nearest channels, with offsets in µm)
-- the ACG for 0–30 ms
-- firing rate and median amplitude per tenth of the recording
+- **System prompt** (cached once for all cases): the rubric plus the brief
+  header, which has the recording, the population quantiles of every metric, the
+  flag thresholds and the legend for the cards.
+- **One message per unit**: the unit's card row (every metric, the flags it
+  trips as a delta against the population, SAX strings for the ACG and for
+  amplitude over time) under the card's column line, plus both classifiers'
+  outputs. A merged unit gets its members' cards and the merge counterfactual.
+- **One message per merge**: the counterfactual line from
+  the `eval` tool (`{"merge": [a, b, ...]}`: per-part and merged contamination, presence,
+  cutoff, CCG dip and synchrony, amplitude KS) and which presets proposed it.
 
-Merge cases get both templates on the shared channel, the CCG, template
-similarity and distance.
-
-Everything that decides a label is already numeric, so asking a vision
-model to read it back off a plot only loses precision. SpikeAgent (the only
-published LLM curation study) also found that images alone were unreliable
-until numbers were added.
+Amplitudes are in the brief's own units, which its header states (template
+units for Kilosort; `--gain-to-uv` scales only the SpikeInterface side). A unit
+message is a few hundred bytes where the raw arrays it replaces (25-point
+template, 30-bin ACG, 8-channel footprint, deciles; JSON) took 1-2 KB, and the
+header is paid once, not per case.
 
 The reply is a JSON verdict (label or merge/no-merge, a confidence and up to
-three reasons). It is stored in `evidence.json` next to the exact input that
-produced it. A verdict below 0.7 confidence keeps the case in review as
-`review:llm-unsure`. A confident "do not merge" vetoes a merge that only one
-preset found.
+three reasons). It is stored in `evidence.json` next to the exact user message
+that produced it (`llm_input`, per unit and per merge); the system prompt's
+brief header is stored once, as the top-level `llm_header`. A verdict below 0.7
+confidence keeps the case in review as `review:llm-unsure`. A confident "do not
+merge" vetoes a merge that only one preset found.
 
 ## Checking it on your data
 
