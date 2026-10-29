@@ -1112,9 +1112,16 @@ fn tag_split_candidates<P: DataProvider>(
 /// The SpikeInterface pipeline, embedded so an installed binary carries it.
 const AUTO_SCRIPT: &str = include_str!("sorrel_auto.py");
 
+/// Whether `uv` (`uv.exe` on Windows) is in a directory of the PATH value.
+fn uv_on_path(path: &std::ffi::OsStr) -> bool {
+    let uv = format!("uv{}", std::env::consts::EXE_SUFFIX);
+    std::env::split_paths(path).any(|d| d.join(&uv).is_file())
+}
+
 /// Run the embedded `sorrel_auto.py` into `out`: with `uv run --script` when uv is
 /// on PATH (its PEP 723 header pins the dependencies), else with
-/// `$SORREL_PYTHON` / `python3`, which must already have them installed.
+/// `$SORREL_PYTHON` / `python` (Windows) or `python3`, which must already have
+/// them installed.
 fn run_auto_sidecar(open: &OpenArgs, out: &Path, flags: &[String]) -> Result<()> {
     if !matches!(open.backend, None | Some(Backend::Kilosort)) || !open.root().is_dir() {
         bail!("sorrel auto supports Kilosort/phy directories");
@@ -1149,15 +1156,15 @@ fn run_auto_sidecar(open: &OpenArgs, out: &Path, flags: &[String]) -> Result<()>
     );
     args.extend(flags.iter().map(Into::into));
 
-    let uv = std::env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join("uv").is_file()));
+    let uv = std::env::var_os("PATH").is_some_and(|path| uv_on_path(&path));
     let mut cmd = if uv && std::env::var_os("SORREL_PYTHON").is_none() {
         let mut c = std::process::Command::new("uv");
         c.args(["run", "--script"]);
         c
     } else {
+        let python = if cfg!(windows) { "python" } else { "python3" };
         std::process::Command::new(
-            std::env::var_os("SORREL_PYTHON").unwrap_or_else(|| "python3".into()),
+            std::env::var_os("SORREL_PYTHON").unwrap_or_else(|| python.into()),
         )
     };
     log::info!("running the SpikeInterface pipeline (first run computes the analyzer; slow)");
@@ -2153,6 +2160,19 @@ mod tests {
         );
         let other = busy_hint(anyhow::anyhow!("disk full"));
         assert_eq!(other.to_string(), "disk full");
+    }
+
+    #[test]
+    fn uv_is_found_by_its_platform_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path()
+                .join(format!("uv{}", std::env::consts::EXE_SUFFIX)),
+            b"",
+        )
+        .unwrap();
+        assert!(uv_on_path(dir.path().as_os_str()));
+        assert!(!uv_on_path(std::ffi::OsStr::new("")));
     }
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {

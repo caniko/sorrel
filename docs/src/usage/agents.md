@@ -31,6 +31,17 @@ entry like this:
 }
 ```
 
+On Windows, the winget and Chocolatey packages put `sorrel` on `PATH`, so
+the same entry works with a Windows path:
+
+```json
+{
+  "mcpServers": {
+    "sorrel": { "command": "sorrel", "args": ["mcp", "C:\\data\\run42\\ks4"] }
+  }
+}
+```
+
 A running host listens on `127.0.0.1` on a random port. It writes the port
 and a token to `$XDG_RUNTIME_DIR/sorrel/mcp/<hash>.json` (fallback
 `~/.cache/sorrel/mcp/`; `%LOCALAPPDATA%\sorrel\mcp\` on Windows, which only your
