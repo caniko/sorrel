@@ -55,6 +55,11 @@ winget install Caniko.Sorrel
 choco install sorrel
 ```
 
+Both packages also install [uv](https://docs.astral.sh/uv/), which
+`sorrel auto` uses to run its SpikeInterface pipeline. `sorrel mcp` works
+from the same `PATH`, so an agent can launch it by name (see
+[Agents](../usage/agents.md#connecting-an-agent)).
+
 New versions show up once the winget-pkgs PR is merged and Chocolatey
 moderation passes, which can take a few days after the GitHub release.
 

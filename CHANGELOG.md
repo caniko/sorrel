@@ -7,16 +7,6 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
-## [0.2.3] - 2026-10-29
-
-### Fixed
-
-- The `sorrel-ui` crate no longer ships its kittest snapshot PNGs (~25 MB),
-  which crates.io rejected as too large. This left `sorrel-ui` and `sorrel`
-  unpublished at 0.2.2.
-
-## [0.2.2] - 2026-10-28
-
 ### Added
 
 - History that never discards: undo moves back, an edit after an undo starts
@@ -37,23 +27,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   (an accepted split keeps the agent as its method), Reject leaves the
   not-merge / not-split memory.
 - Agents get `notifications/message` when someone else changes the session.
-
-- Unit origin: every unit is `Auto[<sorter>]` or `Sorrel[Manual]`,
-  `Sorrel[Algo:<name>]` or `Sorrel[LLM:<name>]`, with direct parents and a
-  free-text note (`:note`). Auto units edited in sorrel are tagged `tuned` or
-  `split`; units phy already edited are tagged `external`. Saved in
-  `cluster_sorrel_annotations.tsv` and as a curation.json `origin` label.
-  `--sorter NAME` overrides the detected sorter name.
-- `sorrel rescue`: FDR-controlled matched-filter spike rescue for existing
-  units, with hybrid-injection recall checks.
-- In-place `AddSpikes`: rescued spikes are journaled as one undoable batch.
-  Save rewrites every per-spike array, with backups in `sorrel_original/`.
-- Home Manager module (`homeManagerModules.default`, `programs.sorrel`), and a
-  `sorrel.desktop` menu entry in the Nix packages.
-- `checks.workspace-tests`: every workspace test under nextest in the Nix
-  sandbox, the UI snapshot states on pinned lavapipe (`SORREL_REQUIRE_GPU`
-  fails instead of skipping). simit qualifies every x86_64-linux flake check
-  as an exact installable (`nix-builds.yaml`).
+- The Windows smoke test on a real runner now runs `sorrel mcp` over stdio,
+  `sorrel mcp` attached to a `--headless` host through its
+  `%LOCALAPPDATA%` token file, and `sorrel auto` through `uv.exe`.
 
 ### Changed
 
@@ -75,6 +51,50 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - `sorrel serve` is now an alias of `sorrel mcp`. MCP agents can edit while
   the GUI is open; `propose`, `select` and `selection` work in the same
   server.
+- Hovering the save status shows the save path or the full error. It no
+  longer says whether the undo history was sealed, because saving keeps it.
+- The Windows install docs say the packages install `uv`, and the agents
+  page has a Windows MCP config example.
+
+### Fixed
+
+- `sorrel auto` on Windows finds `uv.exe` on `PATH` (it looked for `uv`) and
+  falls back to `python`, not `python3`, when uv is missing.
+
+## [0.2.3] - 2026-10-29
+
+### Fixed
+
+- The `sorrel-ui` crate no longer ships its kittest snapshot PNGs (~25 MB),
+  which crates.io rejected as too large. This left `sorrel-ui` and `sorrel`
+  unpublished at 0.2.2.
+
+## [0.2.2] - 2026-10-28
+
+### Added
+
+- Unit origin: every unit is `Auto[<sorter>]` or `Sorrel[Manual]`,
+  `Sorrel[Algo:<name>]` or `Sorrel[LLM:<name>]`, with direct parents and a
+  free-text note (`:note`). Auto units edited in sorrel are tagged `tuned` or
+  `split`; units phy already edited are tagged `external`. Saved in
+  `cluster_sorrel_annotations.tsv` and as a curation.json `origin` label.
+  `--sorter NAME` overrides the detected sorter name.
+- `sorrel rescue`: FDR-controlled matched-filter spike rescue for existing
+  units, with hybrid-injection recall checks.
+- In-place `AddSpikes`: rescued spikes are journaled as one undoable batch.
+- Home Manager module (`homeManagerModules.default`, `programs.sorrel`), and a
+  `sorrel.desktop` menu entry in the Nix packages.
+- `checks.workspace-tests`: every workspace test under nextest in the Nix
+  sandbox, the UI snapshot states on pinned lavapipe (`SORREL_REQUIRE_GPU`
+  fails instead of skipping). simit qualifies every x86_64-linux flake check
+  as an exact installable (`nix-builds.yaml`).
+  Save rewrites every per-spike array, with backups in `sorrel_original/`.
+
+### Changed
+
+- The curation journal is format v2 (`Split` records how the unit was made,
+  plus `AddSpikes`). v1 journals are upgraded on open; sorrel 0.2.x refuses
+  a v2 journal instead of truncating it. Remote protocol v2.
 - Suggestions are memoised per cluster. Re-ranking after an edit takes
   137 ms instead of 807 ms on 1000 clusters and 2M spikes (about 5.7×).
 - Merge suggestions include drift-fragment pairs: nearby peak channels with
@@ -126,8 +146,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   - The top bar is 36 px and tab bars are 30 px, with 6 px gaps between panes.
   - The cluster panel opens at 340 px.
 - **Save state is always visible.** A chip next to the title reads
-  "unsaved", "saved" or "save failed". Hovering it shows the save path or
-  the full error.
+  "unsaved", "saved" or "save failed". Hovering it shows the save path,
+  whether the undo history was sealed, or the full error.
   - A Save button joins Undo, Redo and Merge, and Merge names its target
     ("Merge 2 -> c1").
   - The save message no longer prints over the toolbar.
