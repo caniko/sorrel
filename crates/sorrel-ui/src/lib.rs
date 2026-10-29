@@ -10,6 +10,7 @@ pub mod cluster_scatter;
 pub mod cluster_view;
 pub mod correlogram_view;
 pub mod feature_view;
+pub mod history_view;
 pub mod intent;
 pub mod isi_view;
 pub mod jobs;

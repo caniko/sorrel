@@ -6,12 +6,12 @@ use sorrel_data::CurationCommand;
 use sorrel_io::TraceDtype;
 
 /// v2: `CurationCommand::Split` carries `by` (how the new unit was made).
-pub const PROTO_VERSION: u32 = 2;
+pub const PROTO_VERSION: u32 = 3;
 /// Largest byte range a single `FetchFile` / `FetchTrace` may ask for.
 pub const CHUNK: u64 = 1 << 20;
 
-/// Journal position a record was applied against. A reseal resets
-/// `n_records`, so the baseline is always part of the cursor.
+/// Journal position a record was applied against: the root baseline and
+/// the record count.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, piying::Reply)]
 pub struct Cursor {
     pub baseline: u64,

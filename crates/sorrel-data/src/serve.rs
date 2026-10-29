@@ -4,34 +4,42 @@
 //!
 //! One JSON object per line in, one per line out, hand-rolled on
 //! `serde_json`: a handful of synchronous tools do not justify an async
-//! runtime. Two transports share [`handle_line`]:
+//! runtime. One handler, [`handle_line`], serves every client of a
+//! [`SessionHost`], over two transports:
 //!
-//! - **stdio, headless** ([`serve`], `Mode::Headless`): the agent edits its
-//!   own session through the journaled commands, each edit tagged `src:agent`.
-//! - **GUI listener** ([`spawn_listener`], `Mode::Attached`): the running GUI
-//!   exposes its session on a loopback socket. The agent can read, move the
-//!   human's selection and `propose`, but never edits: proposals queue for a
-//!   human to accept. `sorrel mcp attach` ([`attach`]) bridges stdio to it.
+//! - **stdio** ([`serve`]): `sorrel mcp <dir>` when no host is running.
+//! - **loopback TCP** ([`spawn_listener`]): a running host (`sorrel <dir>`,
+//!   `sorrel --headless <dir>`) listens on `127.0.0.1`, behind a token in
+//!   `<dir>/.sorrel/mcp.json` (on Windows in a per-user directory, see
+//!   `mcp_json_path`); `sorrel mcp <dir>` bridges stdio to it
+//!   ([`attach`]).
+//!
+//! Edit tools apply as `Actor::Agent` (tagged `src:agent`, journaled and
+//! undoable) under [`AgentPolicy::Direct`], and only queue a proposal under
+//! [`AgentPolicy::ProposeOnly`]. `propose` always queues. `select` and
+//! `selection` need a GUI ([`Ui`]). Every host event caused by someone else
+//! reaches the client as a `notifications/message` after its next reply.
 //!
 //! Plots come back as SVG resources (see `report`); PNG needs a GPU
 //! surface and is deliberately out of scope.
 
-use crate::command::{CurationCommand, Method};
-use crate::proposals::{self, Action, Outcome, Proposal, Source};
+use crate::command::{Actor, CurationCommand, Method};
+use crate::host::{AgentPolicy, HostEvent, SessionHost};
+use crate::proposals::{self, Action, Proposal, Source};
 use crate::qc_export::{collect_qc_rows, QcRow};
 use crate::report::render_cluster_svgs;
-use crate::save::{save_and_reseal_journal, save_to_phy};
+use crate::save::save_session;
 use crate::session::{ApplyPhyLabel, Session};
 use crate::suggest::{
     rank_merge_candidates, rank_split_candidates, MergeCandidate, SplitCandidate, SuggestConfig,
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use sorrel_io::{ClusterId, DataProvider, HasGeometry};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 /// MCP protocol revision this server answers `initialize` with.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -84,44 +92,36 @@ Judge with this rubric:
 
 ";
 
-/// What the listener forwards to the GUI thread.
-#[derive(Debug)]
-pub enum AgentMsg {
-    /// Stage a proposal in the review pane (already logged as pending).
-    Propose(Proposal),
-    /// Replace the GUI selection with these clusters.
-    Select(Vec<ClusterId>),
-}
-
 /// The GUI's current selection, for the `selection` tool. The GUI must write
 /// it whenever it changes (cheapest: once per frame).
 pub type SharedSelection = Arc<Mutex<Vec<ClusterId>>>;
 
-/// Everything attached mode needs besides the session.
-pub struct Attached {
-    pub save_dir: PathBuf,
-    pub msgs: Sender<AgentMsg>,
+/// What a GUI shares with MCP clients besides the host: its selection, and
+/// a channel for `select` requests (wake the GUI with a host subscriber).
+pub struct Ui {
     pub selection: SharedSelection,
-    /// Wake the GUI (a repaint) after queueing a message.
-    pub on_change: Arc<dyn Fn() + Send + Sync>,
+    pub select: Sender<Vec<ClusterId>>,
+    /// Wake the GUI after a `select` (e.g. `ctx.request_repaint()`).
+    pub wake: Arc<dyn Fn() + Send + Sync>,
 }
 
-pub enum Mode {
-    /// Direct journaled edits (`sorrel serve`).
-    Headless,
-    /// Read-only plus proposals (the GUI listener).
-    Attached(Attached),
-}
-
-/// Per-connection state: where to save, how to name labels, and caches keyed
-/// on `Session::version()`.
+/// Per-connection state: where to save, how to name labels, the GUI link,
+/// host events to forward, and caches keyed on `Session::version()`.
 pub struct Env<'a, F> {
     pub save_dir: &'a Path,
     pub reseal_on_save: bool,
     pub label_str: F,
+    ui: Option<Arc<Ui>>,
+    events: Option<Receiver<HostEvent>>,
+    /// Listed among the host's agents once `initialize` named the client.
+    seat: Option<crate::host::AgentSeat>,
     qc: Option<(u64, Vec<QcRow>)>,
     suggest: Option<(u64, Vec<MergeCandidate>, Vec<SplitCandidate>)>,
-    /// MCP `clientInfo.name` from `initialize`; headless splits are named after it.
+    /// `HostEvent::seq` of this connection's own edits, not yet seen on
+    /// its event stream. Two clients can share a display name, so the
+    /// name alone cannot tell whose edit an event is.
+    own: std::collections::HashSet<u64>,
+    /// MCP `clientInfo.name` from `initialize`; agent edits are named after it.
     client: Option<String>,
 }
 
@@ -131,9 +131,57 @@ impl<'a, F> Env<'a, F> {
             save_dir,
             reseal_on_save,
             label_str,
+            ui: None,
+            events: None,
+            seat: None,
             qc: None,
             suggest: None,
             client: None,
+            own: Default::default(),
+        }
+    }
+
+    /// Give `select` / `selection` a GUI to act on.
+    pub fn with_ui(mut self, ui: Option<Arc<Ui>>) -> Self {
+        self.ui = ui;
+        self
+    }
+
+    /// Forward `host`'s events to this client (see [`Self::notifications`]).
+    pub fn subscribe<P: DataProvider + ApplyPhyLabel>(mut self, host: &SessionHost<P>) -> Self {
+        self.events = Some(host.subscribe(|| {}));
+        self
+    }
+
+    /// `notifications/message` for every event since the last call that
+    /// another connection caused (this client's own edits are in its replies).
+    pub fn notifications(&mut self) -> Vec<Value> {
+        let own = &mut self.own;
+        self.events
+            .iter()
+            .flat_map(Receiver::try_iter)
+            .filter(|ev| !own.remove(&ev.seq))
+            .map(|ev| {
+                json!({"jsonrpc": "2.0", "method": "notifications/message", "params": {
+                    "level": "info", "logger": "sorrel",
+                    "data": {"actor": actor_name(&ev.actor), "change": ev.desc, "node": ev.node,
+                             "clusters": ev.clusters.iter().map(|c| c.0).collect::<Vec<_>>(),
+                             "version": ev.version}}})
+            })
+            .collect()
+    }
+
+    /// Remember `ev` as this connection's own (it is in the reply already).
+    fn mine(&mut self, ev: HostEvent) -> HostEvent {
+        if self.events.is_some() && ev.seq != 0 {
+            self.own.insert(ev.seq);
+        }
+        ev
+    }
+
+    fn agent(&self) -> Actor {
+        Actor::Agent {
+            client: self.client.clone().unwrap_or_else(|| "agent".into()),
         }
     }
 
@@ -149,6 +197,17 @@ impl<'a, F> Env<'a, F> {
                 self.client = Some(name.to_string());
             }
         }
+    }
+}
+
+/// Short name of an actor for event text: `you`, the agent's client, the
+/// algorithm or the remote peer.
+pub fn actor_name(a: &Actor) -> &str {
+    match a {
+        Actor::Human => "you",
+        Actor::Agent { client } => client,
+        Actor::Algo { name } => name,
+        Actor::Remote { peer } => peer,
     }
 }
 
@@ -177,33 +236,20 @@ fn read_tools() -> Vec<Value> {
     ]
 }
 
-/// Tool catalogue of the headless server (`tools/list`).
+/// Tool catalogue (`tools/list`).
 pub fn tool_list() -> Value {
     let mut tools = read_tools();
     tools.extend([
-        json!({"name": "relabel", "description": "Set a cluster's label (good | mua | noise | unsorted); journaled and undoable",
+        json!({"name": "relabel", "description": "Set a cluster's label (good | mua | noise | unsorted); journaled and undoable. Queued as a proposal instead when the human chose propose-only",
          "inputSchema": {"type": "object", "properties": {"cluster": {"type": "integer"}, "label": {"type": "string"}}, "required": ["cluster", "label"]}}),
-        json!({"name": "merge", "description": "Merge source clusters into target; journaled and undoable",
+        json!({"name": "merge", "description": "Merge source clusters into target; journaled and undoable. Queued as a proposal instead when the human chose propose-only",
          "inputSchema": {"type": "object", "properties": {"sources": {"type": "array", "items": {"type": "integer"}}, "target": {"type": "integer"}}, "required": ["sources", "target"]}}),
-        json!({"name": "split", "description": "Move the given spike indices (positions in the cluster's time-sorted spikes) into a new cluster",
+        json!({"name": "split", "description": "Move the given spike indices (positions in the cluster's time-sorted spikes) into a new cluster. Queued as a proposal instead when the human chose propose-only",
          "inputSchema": {"type": "object", "properties": {"cluster": {"type": "integer"}, "spike_idx": {"type": "array", "items": {"type": "integer"}}}, "required": ["cluster", "spike_idx"]}}),
         json!({"name": "tag", "description": "Replace a cluster's tag set (provenance/review markers, e.g. drop review:* once decided); journaled and undoable",
          "inputSchema": {"type": "object", "properties": {"cluster": {"type": "integer"}, "tags": {"type": "array", "items": {"type": "string"}}}, "required": ["cluster", "tags"]}}),
-        json!({"name": "undo", "description": "Undo the last curation command", "inputSchema": {"type": "object", "properties": {}}}),
+        json!({"name": "undo", "description": "Undo the last curation command (it stays in the history as a branch)", "inputSchema": {"type": "object", "properties": {}}}),
         json!({"name": "save", "description": "Write spike_clusters.npy, cluster_group.tsv and curation.json", "inputSchema": {"type": "object", "properties": {}}}),
-    ]);
-    #[cfg(feature = "phy-export")]
-    tools.push(json!(
-        {"name": "export_phy", "description": "Write the curated session as a complete phy directory at out (params.py references the raw file unless copy_raw)",
-         "inputSchema": {"type": "object", "properties": {"out": {"type": "string"}, "copy_raw": {"type": "boolean"}}, "required": ["out"]}}
-    ));
-    Value::Array(tools)
-}
-
-/// Tool catalogue of the GUI listener: reads, `select`, `selection`, `propose`.
-pub fn attached_tool_list() -> Value {
-    let mut tools = read_tools();
-    tools.extend([
         json!({"name": "propose", "description": "Stage a curation proposal for the human to accept or reject; nothing is applied. action: relabel (clusters=[c], label) | merge (clusters, first is the target) | split (clusters=[c], spike_idx) | accept (clusters=[c]). confidence in [0,1]; at most 3 reasons.",
          "inputSchema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["relabel", "merge", "split", "accept"]},
@@ -213,11 +259,16 @@ pub fn attached_tool_list() -> Value {
             "confidence": {"type": "number"},
             "reasons": {"type": "array", "items": {"type": "string"}, "maxItems": 3}},
           "required": ["action", "clusters", "confidence", "reasons"]}}),
-        json!({"name": "select", "description": "Move the human's GUI selection to these clusters so they see what you are discussing",
+        json!({"name": "select", "description": "Move the human's GUI selection to these clusters so they see what you are discussing (needs the GUI)",
          "inputSchema": {"type": "object", "properties": {"clusters": {"type": "array", "items": {"type": "integer"}}}, "required": ["clusters"]}}),
-        json!({"name": "selection", "description": "The clusters the human has selected in the GUI right now",
+        json!({"name": "selection", "description": "The clusters the human has selected in the GUI right now (needs the GUI)",
          "inputSchema": {"type": "object", "properties": {}}}),
     ]);
+    #[cfg(feature = "phy-export")]
+    tools.push(json!(
+        {"name": "export_phy", "description": "Write the curated session as a complete phy directory at out (params.py references the raw file unless copy_raw)",
+         "inputSchema": {"type": "object", "properties": {"out": {"type": "string"}, "copy_raw": {"type": "boolean"}}, "required": ["out"]}}
+    ));
     Value::Array(tools)
 }
 
@@ -234,73 +285,61 @@ fn prompt_get(name: &str) -> Option<Value> {
     })
 }
 
-/// Serve headless until `input` closes. `reseal_on_save` follows the same
-/// rule as the GUI: true only for phy directories.
+/// Serve `host` over stdio until `input` closes. `reseal_on_save` follows
+/// the same rule as the GUI: true only for phy directories.
 pub fn serve<P, F>(
-    session: &mut Session<P>,
+    host: &SessionHost<P>,
     save_dir: &Path,
     reseal_on_save: bool,
     label_str: F,
     input: impl BufRead,
-    mut output: impl Write,
+    output: impl Write,
 ) -> Result<()>
 where
     P: DataProvider + ApplyPhyLabel + HasGeometry,
     F: Fn(&P::Label) -> &'static str + Sync,
 {
-    let mut env = Env::new(save_dir, reseal_on_save, label_str);
+    let env = Env::new(save_dir, reseal_on_save, label_str).subscribe(host);
+    serve_lines(host, env, input, output).map_err(Into::into)
+}
+
+/// Answer each line of `input` on `output`, followed by the notifications
+/// that piled up meanwhile.
+fn serve_lines<P, F>(
+    host: &SessionHost<P>,
+    mut env: Env<F>,
+    input: impl BufRead,
+    mut output: impl Write,
+) -> std::io::Result<()>
+where
+    P: DataProvider + ApplyPhyLabel + HasGeometry,
+    F: Fn(&P::Label) -> &'static str + Sync,
+{
     for line in input.lines() {
-        if let Some(reply) = handle_line(session, &mut env, &Mode::Headless, &line?) {
-            write_json(&mut output, &reply)?;
+        let reply = handle_line(host, &mut env, &line?);
+        for v in reply.into_iter().chain(env.notifications()) {
+            write_json(&mut output, &v).map_err(std::io::Error::other)?;
         }
     }
     Ok(())
 }
 
 /// One request line to its reply; `None` for blank lines and notifications.
-/// `Headless` edits `session` directly; `Attached` only reads it (and queues
-/// proposals), see [`handle_line_attached`] for the read-locked entry point.
-pub fn handle_line<P, F>(
-    session: &mut Session<P>,
-    env: &mut Env<F>,
-    mode: &Mode,
-    line: &str,
-) -> Option<Value>
+pub fn handle_line<P, F>(host: &SessionHost<P>, env: &mut Env<F>, line: &str) -> Option<Value>
 where
     P: DataProvider + ApplyPhyLabel + HasGeometry,
     F: Fn(&P::Label) -> &'static str + Sync,
 {
-    match mode {
-        Mode::Headless => {
-            env.capture_client(line);
-            respond(line, false, |name, args| {
-                call_tool(session, env, name, args)
-            })
-        }
-        Mode::Attached(a) => handle_line_attached(session, env, a, line),
+    env.capture_client(line);
+    if let (Some(name), None) = (&env.client, &env.seat) {
+        env.seat = Some(host.agent_joined(name.clone()));
     }
+    respond(line, |name, args| call_tool(host, env, name, args))
 }
 
-/// [`handle_line`] for `Mode::Attached`, which never needs a write lock.
-pub fn handle_line_attached<P, F>(
-    session: &Session<P>,
-    env: &mut Env<F>,
-    attached: &Attached,
-    line: &str,
-) -> Option<Value>
-where
-    P: DataProvider,
-    F: Fn(&P::Label) -> &'static str + Sync,
-{
-    respond(line, true, |name, args| {
-        call_attached(session, env, attached, name, args)
-    })
-}
-
-/// The JSON-RPC envelope shared by both modes.
+/// The JSON-RPC envelope.
 fn respond(
     line: &str,
-    attached: bool,
     call: impl FnOnce(&str, &Value) -> Result<Value, ToolError>,
 ) -> Option<Value> {
     if line.trim().is_empty() {
@@ -323,9 +362,7 @@ fn respond(
             "serverInfo": {"name": "sorrel", "version": env!("CARGO_PKG_VERSION")},
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => {
-            Ok(json!({"tools": if attached { attached_tool_list() } else { tool_list() }}))
-        }
+        "tools/list" => Ok(json!({"tools": tool_list()})),
         "prompts/list" => Ok(prompts_list()),
         "prompts/get" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
@@ -395,36 +432,8 @@ fn check<P: DataProvider>(session: &Session<P>, c: u32) -> Result<ClusterId, Too
     }
 }
 
-/// `cmd` as an agent edit: the touched clusters first gain `src:agent`, in
-/// the same undoable batch.
-fn as_agent<P: DataProvider>(session: &Session<P>, cmd: CurationCommand) -> CurationCommand {
-    let mut clusters = match &cmd {
-        CurationCommand::Relabel { cluster, .. } | CurationCommand::Split { cluster, .. } => {
-            vec![*cluster]
-        }
-        CurationCommand::Merge { sources, target } => [&[*target][..], sources].concat(),
-        _ => Vec::new(),
-    };
-    clusters.sort_unstable();
-    clusters.dedup();
-    let mut children: Vec<CurationCommand> = clusters
-        .into_iter()
-        .filter(|&c| !session.tags(c).iter().any(|t| t == "src:agent"))
-        .map(|cluster| {
-            let mut tags = session.tags(cluster).to_vec();
-            tags.push("src:agent".into());
-            CurationCommand::Tag { cluster, tags }
-        })
-        .collect();
-    if children.is_empty() {
-        return cmd;
-    }
-    children.push(cmd);
-    CurationCommand::Batch { children }
-}
-
 fn call_tool<P, F>(
-    session: &mut Session<P>,
+    host: &SessionHost<P>,
     env: &mut Env<F>,
     name: &str,
     args: &Value,
@@ -433,9 +442,24 @@ where
     P: DataProvider + ApplyPhyLabel + HasGeometry,
     F: Fn(&P::Label) -> &'static str + Sync,
 {
+    let agent = env.agent();
+    let ok = |ev: HostEvent| text(json!({"ok": true, "version": ev.version}));
+    if host.policy() == AgentPolicy::ProposeOnly {
+        match name {
+            "relabel" | "merge" | "split" => {
+                let args = edit_as_proposal(name, args);
+                let p = parse_proposal(&host.read(), &args)?;
+                return queue(host, env, p);
+            }
+            "tag" | "undo" | "save" | "export_phy" => {
+                return fail("the human set agents to propose-only: use propose")
+            }
+            _ => {}
+        }
+    }
     Ok(match name {
         "tag" => {
-            let cluster = check(session, arg_u32(args, "cluster")?)?;
+            let cluster = check(&host.read(), arg_u32(args, "cluster")?)?;
             let mut tags: Vec<String> = args
                 .get("tags")
                 .and_then(Value::as_array)
@@ -447,61 +471,49 @@ where
             if !tags.iter().any(|t| t == "src:agent") {
                 tags.push("src:agent".into());
             }
-            session.dispatch(CurationCommand::Tag { cluster, tags })?;
-            text(json!({"ok": true, "version": session.version()}))
+            ok(env.mine(host.apply(agent, CurationCommand::Tag { cluster, tags })?))
         }
         "relabel" => {
-            let cluster = check(session, arg_u32(args, "cluster")?)?;
+            let cluster = check(&host.read(), arg_u32(args, "cluster")?)?;
             let label = args.get("label").and_then(Value::as_str).unwrap_or("");
             let Some(op) = proposals::parse_label(label) else {
                 return fail(format!("unknown label {label:?}"));
             };
-            session.dispatch(as_agent(session, CurationCommand::Relabel { cluster, op }))?;
-            text(json!({"ok": true, "version": session.version()}))
+            ok(env.mine(host.apply(agent, CurationCommand::Relabel { cluster, op })?))
         }
         "merge" => {
-            let sources: Vec<ClusterId> = arg_u32_list(args, "sources")?
-                .into_iter()
-                .map(|c| check(session, c))
-                .collect::<Result<_, _>>()?;
-            let target = check(session, arg_u32(args, "target")?)?;
+            let (sources, target) = {
+                let s = host.read();
+                let sources: Vec<ClusterId> = arg_u32_list(args, "sources")?
+                    .into_iter()
+                    .map(|c| check(&s, c))
+                    .collect::<Result<_, _>>()?;
+                (sources, check(&s, arg_u32(args, "target")?)?)
+            };
             if sources.contains(&target) {
                 return fail(format!("target {} is also listed in sources", target.0));
             }
-            session.dispatch(as_agent(
-                session,
-                CurationCommand::Merge { sources, target },
-            ))?;
-            text(json!({"ok": true, "version": session.version()}))
+            ok(env.mine(host.apply(agent, CurationCommand::Merge { sources, target })?))
         }
         "split" => {
-            let cluster = check(session, arg_u32(args, "cluster")?)?;
-            let spike_idx = arg_u32_list(args, "spike_idx")?;
-            session.dispatch(as_agent(
-                session,
-                CurationCommand::Split {
-                    cluster,
-                    spike_idx,
-                    new_cluster: ClusterId(u32::MAX),
-                    by: Method::Llm(env.client.clone().unwrap_or_else(|| "agent".into())),
-                },
-            ))?;
-            let new_cluster = session.n_clusters() - 1;
-            text(json!({"ok": true, "new_cluster": new_cluster, "version": session.version()}))
+            let (cluster, spike_idx, basis) = {
+                let s = host.read();
+                let cluster = check(&s, arg_u32(args, "cluster")?)?;
+                let spike_idx = split_indices(&s, cluster, args)?;
+                (cluster, spike_idx, proposals::spike_basis(&s, cluster))
+            };
+            let ev = env.mine(apply_split(host, agent, cluster, spike_idx, &basis)?);
+            let new_cluster = ev.clusters.last().map(|c| c.0);
+            text(json!({"ok": true, "new_cluster": new_cluster, "version": ev.version}))
         }
-        "undo" => {
-            session.dispatch(CurationCommand::Undo)?;
-            text(json!({"ok": true, "version": session.version()}))
-        }
+        "undo" => ok(env.mine(host.apply(agent, CurationCommand::Undo)?)),
         "save" => {
-            if env.reseal_on_save {
-                let journal_path = session.journal_path().to_path_buf();
-                let journal =
-                    save_and_reseal_journal(session, env.save_dir, &journal_path, &env.label_str)?;
-                session.reseal(journal);
-            } else {
-                save_to_phy(session, env.save_dir, &env.label_str)?;
-            }
+            save_session(
+                &mut host.write(),
+                env.save_dir,
+                env.reseal_on_save,
+                &env.label_str,
+            )?;
             text(json!({"ok": true, "save_dir": env.save_dir.display().to_string()}))
         }
         #[cfg(feature = "phy-export")]
@@ -514,56 +526,127 @@ where
                 .get("copy_raw")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            crate::phy_export::export_phy(session, Path::new(out), copy_raw, &env.label_str)?;
+            crate::phy_export::export_phy(&host.read(), Path::new(out), copy_raw, &env.label_str)?;
             text(json!({"ok": true, "out": out}))
         }
-        _ => return call_read(session, env, name, args),
-    })
-}
-
-fn call_attached<P, F>(
-    session: &Session<P>,
-    env: &mut Env<F>,
-    a: &Attached,
-    name: &str,
-    args: &Value,
-) -> Result<Value, ToolError>
-where
-    P: DataProvider,
-    F: Fn(&P::Label) -> &'static str + Sync,
-{
-    Ok(match name {
         "propose" => {
-            let p = parse_proposal(session, args)?;
-            let (id, queued) = (p.id, p.clone());
-            proposals::append(&a.save_dir, &p)
-                .map_err(|e| ToolError::Failed(format!("audit log: {e}")))?;
-            if a.msgs.send(AgentMsg::Propose(queued)).is_err() {
-                let _ = proposals::record_outcome(&a.save_dir, id, Outcome::Superseded);
-                return fail("the GUI is no longer listening");
-            }
-            (a.on_change)();
-            text(json!({"ok": true, "id": id, "status": "queued for human review; NOT applied"}))
+            let p = parse_proposal(&host.read(), args)?;
+            return queue(host, env, p);
         }
         "select" => {
-            let clusters: Vec<ClusterId> = arg_u32_list(args, "clusters")?
-                .into_iter()
-                .map(|c| check(session, c))
-                .collect::<Result<_, _>>()?;
-            if a.msgs.send(AgentMsg::Select(clusters)).is_err() {
+            let ui = env.ui.as_ref().ok_or(no_gui())?;
+            let clusters: Vec<ClusterId> = {
+                let s = host.read();
+                arg_u32_list(args, "clusters")?
+                    .into_iter()
+                    .map(|c| check(&s, c))
+                    .collect::<Result<_, _>>()?
+            };
+            if ui.select.send(clusters).is_err() {
                 return fail("the GUI is no longer listening");
             }
-            (a.on_change)();
+            (ui.wake)();
             text(json!({"ok": true}))
         }
         "selection" => {
-            let sel = a.selection.lock().unwrap_or_else(|p| p.into_inner());
+            let ui = env.ui.as_ref().ok_or(no_gui())?;
+            let sel = ui.selection.lock().unwrap_or_else(|p| p.into_inner());
             text(json!({"clusters": sel.iter().map(|c| c.0).collect::<Vec<_>>()}))
         }
-        "relabel" | "merge" | "split" | "tag" | "undo" | "save" | "export_phy" => {
-            return fail("edits are disabled while the GUI is attached: use `propose`")
+        _ => return call_read(&host.read(), env, name, args),
+    })
+}
+
+fn no_gui() -> ToolError {
+    ToolError::Failed("no GUI is attached to this session".into())
+}
+
+/// Audit `p` as pending and queue it on the host for a human, named after
+/// the client that proposed it.
+fn queue<P, F>(host: &SessionHost<P>, env: &Env<F>, mut p: Proposal) -> Result<Value, ToolError>
+where
+    P: DataProvider + ApplyPhyLabel,
+{
+    p.proposer = Some(actor_name(&env.agent()).to_owned());
+    proposals::append(env.save_dir, &p)
+        .map_err(|e| ToolError::Failed(format!("audit log: {e}")))?;
+    let id = p.id;
+    host.propose(p);
+    Ok(text(
+        json!({"ok": true, "id": id, "status": "queued for human review; NOT applied"}),
+    ))
+}
+
+/// The `propose` arguments an edit tool's arguments stand for (propose-only
+/// policy); confidence defaults to 1 and the reason names the tool.
+fn edit_as_proposal(name: &str, args: &Value) -> Value {
+    let mut out = json!({"action": name, "reasons": [format!("{name} under propose-only")],
+                         "confidence": args.get("confidence").cloned().unwrap_or(json!(1.0))});
+    match name {
+        "merge" => {
+            let mut clusters = vec![args.get("target").cloned().unwrap_or(Value::Null)];
+            if let Some(src) = args.get("sources").and_then(Value::as_array) {
+                clusters.extend(src.iter().cloned());
+            }
+            out["clusters"] = json!(clusters);
         }
-        _ => return call_read(session, env, name, args),
+        _ => {
+            out["clusters"] = json!([args.get("cluster").cloned().unwrap_or(Value::Null)]);
+            out["label"] = args.get("label").cloned().unwrap_or(Value::Null);
+            out["spike_idx"] = args.get("spike_idx").cloned().unwrap_or(Value::Null);
+        }
+    }
+    out
+}
+
+/// The sorted, deduplicated `spike_idx` of a split of `cluster`: a proper
+/// non-empty subset of its spikes (shared by `split` and `propose`).
+fn split_indices<P: DataProvider>(
+    session: &Session<P>,
+    cluster: ClusterId,
+    args: &Value,
+) -> Result<Vec<u32>, ToolError> {
+    let mut spike_idx = arg_u32_list(args, "spike_idx")?;
+    spike_idx.sort_unstable();
+    spike_idx.dedup();
+    let n = session.spike_times(cluster).len();
+    if spike_idx.is_empty()
+        || spike_idx.len() >= n
+        || spike_idx.last().is_some_and(|&i| i as usize >= n)
+    {
+        return fail(format!(
+            "spike_idx must be a proper non-empty subset of 0..{n}"
+        ));
+    }
+    Ok(spike_idx)
+}
+
+/// Split `cluster` by `spike_idx`, positions in the membership `basis`
+/// ([`proposals::spike_basis`]) described. The basis is checked under the
+/// apply's write lock: an edit since it was read refuses the split instead
+/// of moving different spikes.
+fn apply_split<P: DataProvider + ApplyPhyLabel>(
+    host: &SessionHost<P>,
+    agent: Actor,
+    cluster: ClusterId,
+    spike_idx: Vec<u32>,
+    basis: &str,
+) -> Result<HostEvent> {
+    let by = Method::Llm(actor_name(&agent).to_owned());
+    let cmd = CurationCommand::Split {
+        cluster,
+        spike_idx,
+        new_cluster: ClusterId(u32::MAX),
+        by,
+    };
+    host.apply_if(agent, cmd, |s| {
+        if proposals::spike_basis(s, cluster) != basis {
+            bail!(
+                "cluster {} changed since its spikes were read; read them again and retry",
+                cluster.0
+            );
+        }
+        Ok(())
     })
 }
 
@@ -608,18 +691,7 @@ fn parse_proposal<P: DataProvider>(
         "merge" => return fail("merge needs at least two clusters"),
         "split" => {
             let cluster = one()?;
-            let mut spike_idx = arg_u32_list(args, "spike_idx")?;
-            spike_idx.sort_unstable();
-            spike_idx.dedup();
-            let n = session.spike_times(cluster).len();
-            if spike_idx.is_empty()
-                || spike_idx.len() >= n
-                || spike_idx.last().is_some_and(|&i| i as usize >= n)
-            {
-                return fail(format!(
-                    "spike_idx must be a proper non-empty subset of 0..{n}"
-                ));
-            }
+            let spike_idx = split_indices(session, cluster, args)?;
             Action::Split { cluster, spike_idx }
         }
         "accept" => Action::Accept { cluster: one()? },
@@ -636,13 +708,21 @@ fn parse_proposal<P: DataProvider>(
         .and_then(|a| a.iter().map(|v| v.as_str().map(str::to_owned)).collect())
         .filter(|r: &Vec<String>| r.len() <= 3)
         .ok_or_else(|| ToolError::Failed("reasons must be at most 3 strings".into()))?;
-    Ok(Proposal::new(
+    // Stamp a split's basis against the same session its indices were
+    // validated on, so it reaches the audit log and survives a restart.
+    let basis = match &action {
+        Action::Split { cluster, .. } => Some(proposals::spike_basis(session, *cluster)),
+        _ => None,
+    };
+    let mut p = Proposal::new(
         Source::Agent,
         action,
         confidence as f32,
         reasons,
         args.clone(),
-    ))
+    );
+    p.basis = basis;
+    Ok(p)
 }
 
 /// Suggester output for every pair/cluster (not only the top K), cached per
@@ -876,6 +956,7 @@ fn write_json(out: &mut impl Write, v: &Value) -> Result<()> {
 
 // --- GUI listener and stdio bridge ------------------------------------
 
+#[cfg(not(windows))]
 const MCP_JSON: &str = ".sorrel/mcp.json";
 
 /// A fresh 128-bit hex token. std-only: `RandomState` keys come from the OS
@@ -897,18 +978,53 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// `<save_dir>/.sorrel/mcp.json` = `{port, token}`, mode 0600, written
-/// atomically (tmp + rename) so a client never reads half of it.
-fn write_mcp_json(save_dir: &Path, port: u16, token: &str) -> std::io::Result<PathBuf> {
-    let path = save_dir.join(MCP_JSON);
+/// Where the listener file for `save_dir` lives; `attach` and the listener
+/// both go through here. Unix: `<save_dir>/.sorrel/mcp.json` (mode 0600).
+/// Windows: a file inherits the dataset directory's ACL, which other
+/// accounts may read, so it goes under `%LOCALAPPDATA%\sorrel\mcp\`
+/// (user-private by default), named by a hash of the canonical dataset path.
+fn mcp_json_path(save_dir: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(not(windows))]
+    return Ok(save_dir.join(MCP_JSON));
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .ok_or_else(|| std::io::Error::other("LOCALAPPDATA is not set"))?;
+        let canon = save_dir
+            .canonicalize()
+            .unwrap_or_else(|_| save_dir.to_owned());
+        let key = blake3::hash(canon.to_string_lossy().to_lowercase().as_bytes());
+        Ok(PathBuf::from(base)
+            .join("sorrel")
+            .join("mcp")
+            .join(format!("{}.json", &key.to_hex()[..32])))
+    }
+}
+
+/// `{port, token, pid, nonce}` (see [`mcp_json_path`]), written atomically
+/// (tmp + rename) so a client never reads half of it. `pid` and `nonce`
+/// identify the writer: only it removes the file.
+fn write_mcp_json(
+    save_dir: &Path,
+    port: u16,
+    token: &str,
+    nonce: &str,
+) -> std::io::Result<PathBuf> {
+    let path = mcp_json_path(save_dir)?;
     std::fs::create_dir_all(path.parent().expect("has parent"))?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    // `create_new` (O_EXCL) never follows a symlink pre-placed at `tmp`.
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
     let mut f = opts.open(&tmp)?;
-    f.write_all(json!({"port": port, "token": token}).to_string().as_bytes())?;
+    let body = json!({"port": port, "token": token, "pid": std::process::id(), "nonce": nonce});
+    f.write_all(body.to_string().as_bytes())?;
     f.sync_all()?;
     std::fs::rename(&tmp, &path)?;
     Ok(path)
@@ -920,6 +1036,7 @@ pub struct ListenerHandle {
     port: u16,
     token: String,
     mcp_json: PathBuf,
+    nonce: String,
     stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -935,61 +1052,91 @@ impl ListenerHandle {
 impl Drop for ListenerHandle {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = std::fs::remove_file(&self.mcp_json);
+        // Only the writer of the file removes it: a later host in the same
+        // directory (or a stale file we no longer own) is left alone.
+        let ours = std::fs::read_to_string(&self.mcp_json)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .is_some_and(|v| {
+                v["pid"] == std::process::id() && v["nonce"].as_str() == Some(&self.nonce)
+            });
+        if ours {
+            let _ = std::fs::remove_file(&self.mcp_json);
+        }
         // Wake the blocking accept so its thread sees `stop`.
         let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
     }
 }
 
-/// Expose `session` to MCP clients on `127.0.0.1:<ephemeral>` (Attached
-/// mode). Proposals and selection requests go to `msgs`; the GUI should
-/// drain it each frame and keep `selection` current. `on_change` wakes the
-/// GUI after a message is queued (e.g. `ctx.request_repaint()`).
+/// Expose `host` to MCP clients on `127.0.0.1:<ephemeral>`: the same
+/// handler as stdio, with `ui` (when a GUI runs) behind `select` and
+/// `selection`. Each connection subscribes to the host's events.
 ///
-/// Each request holds the session read lock for the length of the tool call
-/// (attached mode never writes). ponytail: one thread per connection with no
-/// cap; every connection must present the token first, so only local
-/// processes that can read the 0600 `mcp.json` get a thread's worth of work.
+/// ponytail: one thread per connection with no cap; every connection must
+/// present the token first, so only local processes that can read the 0600
+/// `mcp.json` get a thread's worth of work.
 pub fn spawn_listener<P>(
-    session: Arc<RwLock<Session<P>>>,
+    host: Arc<SessionHost<P>>,
     save_dir: &Path,
+    reseal_on_save: bool,
     label_str: fn(&P::Label) -> &'static str,
-    msgs: Sender<AgentMsg>,
-    selection: SharedSelection,
-    on_change: impl Fn() + Send + Sync + 'static,
+    ui: Option<Arc<Ui>>,
 ) -> std::io::Result<ListenerHandle>
 where
-    P: DataProvider + 'static,
+    P: DataProvider + ApplyPhyLabel + HasGeometry + 'static,
     Session<P>: Send + Sync,
 {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let token = random_token();
-    let mcp_json = write_mcp_json(save_dir, port, &token)?;
+    let nonce = random_token();
+    let mcp_json = write_mcp_json(save_dir, port, &token, &nonce)?;
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let attached = Arc::new(Attached {
-        save_dir: save_dir.to_owned(),
-        msgs,
-        selection,
-        on_change: Arc::new(on_change),
-    });
     let handle = ListenerHandle {
         port,
         token: token.clone(),
         mcp_json,
+        nonce,
         stop: stop.clone(),
     };
+    let save_dir = save_dir.to_owned();
+    // Connections still waiting to send their token. Each one holds a thread
+    // for up to the handshake timeout, so cap them: past the cap a new
+    // connection is dropped at once instead of costing a thread.
+    let handshaking = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::thread::Builder::new()
         .name("sorrel-mcp".into())
         .spawn(move || {
+            use std::sync::atomic::Ordering::SeqCst;
             for stream in listener.incoming() {
-                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                if stop.load(SeqCst) {
                     break;
                 }
                 let Ok(stream) = stream else { continue };
-                let (session, attached, token) = (session.clone(), attached.clone(), token.clone());
+                if handshaking.fetch_add(1, SeqCst) >= MAX_HANDSHAKES {
+                    handshaking.fetch_sub(1, SeqCst);
+                    continue;
+                }
+                let (host, ui, token, dir, handshaking) = (
+                    host.clone(),
+                    ui.clone(),
+                    token.clone(),
+                    save_dir.clone(),
+                    Arc::clone(&handshaking),
+                );
                 std::thread::spawn(move || {
-                    if let Err(e) = serve_client(stream, &token, &session, &attached, label_str) {
+                    let authed = handshake(stream, &token);
+                    handshaking.fetch_sub(1, SeqCst);
+                    let (reader, writer) = match authed {
+                        Ok(Some(rw)) => rw,
+                        Ok(None) => return,
+                        Err(e) => return log::debug!("mcp handshake failed: {e}"),
+                    };
+                    // Only an authenticated client subscribes to host events.
+                    let env = Env::new(&dir, reseal_on_save, label_str)
+                        .with_ui(ui)
+                        .subscribe(&host);
+                    if let Err(e) = serve_lines(&host, env, reader, writer) {
                         log::debug!("mcp client ended: {e}");
                     }
                 });
@@ -998,13 +1145,15 @@ where
     Ok(handle)
 }
 
-fn serve_client<P: DataProvider>(
+/// Unauthenticated connections the listener serves at once.
+const MAX_HANDSHAKES: usize = 8;
+
+/// Read the client's `{"token": ...}` line (5 s timeout) and acknowledge it.
+/// `None` when the token is wrong or missing: the caller drops the client.
+fn handshake(
     stream: std::net::TcpStream,
     token: &str,
-    session: &RwLock<Session<P>>,
-    attached: &Attached,
-    label_str: fn(&P::Label) -> &'static str,
-) -> std::io::Result<()> {
+) -> std::io::Result<Option<(std::io::BufReader<std::net::TcpStream>, std::net::TcpStream)>> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     let mut reader = std::io::BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -1015,39 +1164,30 @@ fn serve_client<P: DataProvider>(
         .ok()
         .and_then(|v| v["token"].as_str().map(str::to_owned));
     if !sent.is_some_and(|t| ct_eq(t.as_bytes(), token.as_bytes())) {
-        return Ok(());
+        return Ok(None);
     }
     writer.set_read_timeout(None)?; // shared socket: clears the reader's timeout too
     writer.write_all(b"{\"ok\":true}\n")?;
-    let mut env = Env::new(&attached.save_dir, false, label_str);
-    for line in reader.lines() {
-        let line = line?;
-        let reply = {
-            let s = session.read().unwrap_or_else(|p| p.into_inner());
-            handle_line_attached(&s, &mut env, attached, &line)
-        };
-        if let Some(reply) = reply {
-            write_json(&mut writer, &reply).map_err(std::io::Error::other)?;
-        }
-    }
-    Ok(())
+    Ok(Some((reader, writer)))
 }
 
-/// `{port, token}` of a running GUI listener in `save_dir`, if any.
+/// `{port, token}` of a running host's listener in `save_dir`, if any.
 pub fn read_mcp_json(save_dir: &Path) -> Option<(u16, String)> {
-    let v: Value =
-        serde_json::from_str(&std::fs::read_to_string(save_dir.join(MCP_JSON)).ok()?).ok()?;
+    let text = std::fs::read_to_string(mcp_json_path(save_dir).ok()?).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
     Some((
         u16::try_from(v["port"].as_u64()?).ok()?,
         v["token"].as_str()?.to_owned(),
     ))
 }
 
-/// `sorrel mcp attach`: pipe `input` to the GUI listener of `save_dir` and
+/// `sorrel mcp`: pipe `input` to the host listening in `save_dir` and
 /// its replies to `output`, line by line, until either side closes. Returns
-/// `Ok(false)` without touching either stream when no listener answers (no
-/// `mcp.json`, refused connection, rejected token): the caller then falls
-/// back to a headless `serve`.
+/// `Ok(false)` without touching either stream only when there is provably no
+/// listener (no `mcp.json`, or the connection is refused: a stale file): the
+/// caller then falls back to a headless `serve`. A host that accepts the
+/// connection but times out, rejects the token or sends a bad ack is alive,
+/// so that is an error, never a second writer on its journal.
 pub fn attach(
     save_dir: &Path,
     input: impl Read + Send + 'static,
@@ -1065,15 +1205,19 @@ pub fn attach(
     else {
         return Ok(false);
     };
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
-        return Ok(false);
+    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(false),
+        Err(e) => bail!("sorrel host on port {port} did not accept the connection: {e}"),
     };
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     write_json(&mut stream, &json!({"token": token}))?;
     let mut reader = std::io::BufReader::new(stream.try_clone()?);
     let mut ack = String::new();
-    if reader.read_line(&mut ack).unwrap_or(0) == 0 {
-        return Ok(false);
+    match reader.read_line(&mut ack) {
+        Ok(n) if n > 0 && ack.trim() == "{\"ok\":true}" => {}
+        Ok(_) => bail!("sorrel host on port {port} rejected the connection (bad token or ack)"),
+        Err(e) => bail!("sorrel host on port {port} did not acknowledge: {e}"),
     }
     stream.set_read_timeout(None)?;
     let mut up = stream.try_clone()?;
@@ -1161,16 +1305,9 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"save","arguments":{}}}"#,
             "\n",
         );
+        let h = SessionHost::new(s);
         let mut out = Vec::new();
-        serve(
-            &mut s,
-            dir.path(),
-            false,
-            label,
-            Cursor::new(input),
-            &mut out,
-        )
-        .unwrap();
+        serve(&h, dir.path(), false, label, Cursor::new(input), &mut out).unwrap();
 
         let replies: Vec<Value> = String::from_utf8(out)
             .unwrap()
@@ -1181,12 +1318,12 @@ mod tests {
         assert_eq!(replies[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(
             replies[1]["result"]["tools"].as_array().unwrap().len(),
-            15 + usize::from(cfg!(feature = "phy-export"))
+            18 + usize::from(cfg!(feature = "phy-export"))
         );
         assert_eq!(replies[2]["id"], 3);
         assert_eq!(replies[2]["result"]["isError"], false);
-        assert_eq!(s.label(ClusterId(0)), Some(1));
-        assert!(s.spike_times(ClusterId(1)).is_empty(), "merged away");
+        assert_eq!(h.read().label(ClusterId(0)), Some(1));
+        assert!(h.read().spike_times(ClusterId(1)).is_empty(), "merged away");
 
         let listed: Value =
             serde_json::from_str(replies[4]["result"]["content"][0]["text"].as_str().unwrap())
@@ -1226,7 +1363,7 @@ mod tests {
             n_samples: SampleIndex(1000),
         };
         let dir = tempfile::tempdir().unwrap();
-        let mut s = Session::new(prov, Journal::open(&dir.path().join("j.journal")).unwrap());
+        let s = Session::new(prov, Journal::open(&dir.path().join("j.journal")).unwrap());
         std::fs::create_dir(dir.path().join("sorrel_auto")).unwrap();
         std::fs::write(
             dir.path().join("sorrel_auto/evidence.json"),
@@ -1249,9 +1386,10 @@ mod tests {
             call(4, "evidence", r#"{"cluster":1}"#),
         ]
         .concat();
+        let h = SessionHost::new(s);
         let mut out = Vec::new();
         serve(
-            &mut s,
+            &h,
             dir.path(),
             false,
             |_: &u8| "unsorted",
@@ -1269,7 +1407,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(
-            s.tags(ClusterId(1)),
+            h.read().tags(ClusterId(1)),
             ["review:merge", "src:bombcell", "src:agent"]
         );
         assert_eq!(
@@ -1314,26 +1452,71 @@ mod tests {
         serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
     }
 
-    fn attached(dir: &Path) -> (Attached, std::sync::mpsc::Receiver<AgentMsg>) {
+    fn ui() -> (Arc<Ui>, std::sync::mpsc::Receiver<Vec<ClusterId>>) {
         let (tx, rx) = std::sync::mpsc::channel();
-        let a = Attached {
-            save_dir: dir.to_owned(),
-            msgs: tx,
+        let ui = Ui {
             selection: Arc::new(Mutex::new(vec![ClusterId(1)])),
-            on_change: Arc::new(|| {}),
+            select: tx,
+            wake: Arc::new(|| {}),
         };
-        (a, rx)
+        (Arc::new(ui), rx)
     }
 
     #[test]
-    fn attached_propose_queues_and_changes_nothing() {
+    fn split_proposal_logs_its_basis() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = mock_session(dir.path());
-        let (a, rx) = attached(dir.path());
-        let mode = Mode::Attached(a);
+        let h = SessionHost::new(mock_session(dir.path()));
         let mut env = Env::new(dir.path(), false, label);
-        let version = s.version();
-        let mut run = |line: String| handle_line(&mut s, &mut env, &mode, &line).unwrap();
+        let r = handle_line(
+            &h,
+            &mut env,
+            &call(
+                1,
+                "propose",
+                json!({"action": "split", "clusters": [0], "spike_idx": [0], "confidence": 0.5, "reasons": []}),
+            ),
+        )
+        .unwrap();
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let want = proposals::spike_basis(&h.read(), ClusterId(0));
+        // The audit line (what a restart restores) carries the basis.
+        assert_eq!(
+            proposals::read_log(dir.path())[0].basis.as_deref(),
+            Some(&*want)
+        );
+    }
+
+    /// A direct split applies positions read from one membership only to that
+    /// membership: an edit in between refuses it and applies nothing.
+    #[test]
+    fn direct_split_refuses_a_cluster_that_changed_since_it_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SessionHost::new(mock_session(dir.path()));
+        let basis = proposals::spike_basis(&h.read(), ClusterId(0));
+        h.apply(
+            Actor::Human,
+            CurationCommand::Merge {
+                sources: vec![ClusterId(1)],
+                target: ClusterId(0),
+            },
+        )
+        .unwrap();
+        let (n, v) = (h.read().n_clusters(), h.read().version());
+        let e = apply_split(&h, Actor::Human, ClusterId(0), vec![0], &basis).unwrap_err();
+        assert!(e.to_string().contains("changed since"), "{e}");
+        assert_eq!((h.read().n_clusters(), h.read().version()), (n, v));
+        let fresh = proposals::spike_basis(&h.read(), ClusterId(0));
+        apply_split(&h, Actor::Human, ClusterId(0), vec![0], &fresh).unwrap();
+    }
+
+    #[test]
+    fn propose_queues_on_the_host_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SessionHost::new(mock_session(dir.path()));
+        let (ui, rx) = ui();
+        let mut env = Env::new(dir.path(), false, label).with_ui(Some(ui));
+        let version = h.read().version();
+        let mut run = |line: String| handle_line(&h, &mut env, &line).unwrap();
 
         let ok = run(call(
             1,
@@ -1341,7 +1524,7 @@ mod tests {
             json!({"action": "merge", "clusters": [0, 1], "confidence": 0.9, "reasons": ["CCG dip"]}),
         ));
         assert_eq!(ok["result"]["isError"], false);
-        let Some(AgentMsg::Propose(p)) = rx.try_recv().ok() else {
+        let [p] = &h.proposals()[..] else {
             panic!("proposal not queued")
         };
         assert_eq!(
@@ -1352,12 +1535,17 @@ mod tests {
         );
         assert_eq!(p.source, Source::Agent);
         assert_eq!(
+            p.proposer.as_deref(),
+            Some("agent"),
+            "named after the client"
+        );
+        assert_eq!(
             proposals::read_log(dir.path())[0].id,
             p.id,
             "audited as pending"
         );
 
-        // Invalid arguments and edit tools are refused; nothing is queued.
+        // Invalid arguments are refused; nothing more is queued.
         for bad in [
             call(
                 2,
@@ -1374,16 +1562,15 @@ mod tests {
                 "propose",
                 json!({"action": "split", "clusters": [0], "spike_idx": [0, 1, 2], "confidence": 0.5, "reasons": []}),
             ),
-            call(5, "relabel", json!({"cluster": 0, "label": "good"})),
         ] {
             assert_eq!(run(bad)["result"]["isError"], true);
         }
-        assert!(rx.try_recv().is_err());
+        assert_eq!(h.proposals().len(), 1);
 
         let sel = run(call(6, "selection", json!({})));
         assert_eq!(payload(&sel)["clusters"], json!([1]));
         run(call(7, "select", json!({"clusters": [0]})));
-        assert!(matches!(rx.try_recv(), Ok(AgentMsg::Select(c)) if c == [ClusterId(0)]));
+        assert!(matches!(rx.try_recv(), Ok(c) if c == [ClusterId(0)]));
         let tools = run(rpc(8, "tools/list", json!({})));
         let names: Vec<&str> = tools["result"]["tools"]
             .as_array()
@@ -1391,38 +1578,146 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"propose") && !names.contains(&"relabel"));
+        assert!(names.contains(&"propose") && names.contains(&"relabel"));
         let q = run(call(9, "attention_queue", json!({})));
         assert_eq!(q["result"]["isError"], false);
         drop(run);
-        assert_eq!(s.version(), version, "session untouched");
-        assert!(s.tags(ClusterId(0)).is_empty());
+        assert_eq!(h.read().version(), version, "session untouched");
+        assert!(h.read().tags(ClusterId(0)).is_empty());
+
+        // Without a GUI, select and selection say so.
+        let mut env = Env::new(dir.path(), false, label);
+        let r = handle_line(&h, &mut env, &call(10, "selection", json!({}))).unwrap();
+        assert_eq!(r["result"]["isError"], true);
+    }
+
+    /// Under propose-only, edit tools queue proposals (a merge keeps its
+    /// target first) and the tools without a proposal form are refused.
+    #[test]
+    fn propose_only_turns_edits_into_proposals() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SessionHost::new(mock_session(dir.path()));
+        h.set_policy(AgentPolicy::ProposeOnly);
+        let mut env = Env::new(dir.path(), false, label);
+        let version = h.read().version();
+        let mut run = |line: String| handle_line(&h, &mut env, &line).unwrap();
+        for (i, (tool, args)) in [
+            ("relabel", json!({"cluster": 0, "label": "good"})),
+            ("merge", json!({"sources": [1], "target": 0})),
+            ("split", json!({"cluster": 0, "spike_idx": [0]})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let r = run(call(i as u32, tool, args));
+            assert_eq!(r["result"]["isError"], false, "{tool}: {r}");
+            assert!(payload(&r)["status"]
+                .as_str()
+                .unwrap()
+                .contains("NOT applied"));
+        }
+        for tool in ["tag", "undo", "save"] {
+            let r = run(call(9, tool, json!({"cluster": 0, "tags": []})));
+            assert_eq!(r["result"]["isError"], true, "{tool}");
+        }
+        drop(run);
+        let queued: Vec<Action> = h.proposals().into_iter().map(|p| p.action).collect();
+        assert_eq!(
+            queued,
+            [
+                Action::Relabel {
+                    cluster: ClusterId(0),
+                    label: "good".into()
+                },
+                Action::Merge {
+                    clusters: vec![ClusterId(0), ClusterId(1)]
+                },
+                Action::Split {
+                    cluster: ClusterId(0),
+                    spike_idx: vec![0]
+                },
+            ]
+        );
+        assert_eq!(h.read().version(), version, "nothing applied");
+    }
+
+    /// Changes by someone else reach the client as notifications; its own
+    /// edits do not.
+    #[test]
+    fn other_actors_changes_become_notifications() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SessionHost::new(mock_session(dir.path()));
+        let mut env = Env::new(dir.path(), false, label).subscribe(&h);
+        handle_line(
+            &h,
+            &mut env,
+            &call(1, "relabel", json!({"cluster": 0, "label": "good"})),
+        );
+        assert!(env.notifications().is_empty(), "own edit");
+        h.apply(
+            Actor::Human,
+            CurationCommand::Relabel {
+                cluster: ClusterId(1),
+                op: crate::command::PhyLabelOp::SetNoise,
+            },
+        )
+        .unwrap();
+        let n = env.notifications();
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0]["method"], "notifications/message");
+        assert_eq!(n[0]["params"]["data"]["actor"], "you");
+        assert_eq!(n[0]["params"]["data"]["clusters"], json!([1]));
+    }
+
+    /// Two connections with the same client name (or both defaulting to
+    /// "agent") still see each other's edits, and only their own are quiet.
+    #[test]
+    fn same_named_connections_notify_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SessionHost::new(mock_session(dir.path()));
+        let mut a = Env::new(dir.path(), false, label).subscribe(&h);
+        let mut b = Env::new(dir.path(), false, label).subscribe(&h);
+        handle_line(
+            &h,
+            &mut a,
+            &call(1, "relabel", json!({"cluster": 0, "label": "good"})),
+        );
+        assert!(a.notifications().is_empty(), "own edit");
+        let n = b.notifications();
+        assert_eq!(n.len(), 1, "b hears a's edit");
+        assert_eq!(n[0]["params"]["data"]["actor"], "agent");
+        handle_line(
+            &h,
+            &mut b,
+            &call(2, "relabel", json!({"cluster": 1, "label": "noise"})),
+        );
+        assert!(b.notifications().is_empty(), "own edit");
+        assert_eq!(a.notifications().len(), 1, "a hears b's edit");
     }
 
     #[test]
     fn headless_merge_rejects_target_among_sources() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = mock_session(dir.path());
+        let h = SessionHost::new(mock_session(dir.path()));
         let mut env = Env::new(dir.path(), false, label);
-        let version = s.version();
+        let version = h.read().version();
         let r = handle_line(
-            &mut s,
+            &h,
             &mut env,
-            &Mode::Headless,
             &call(1, "merge", json!({"sources": [0, 1], "target": 0})),
         )
         .unwrap();
         assert_eq!(r["result"]["isError"], true);
-        assert_eq!(s.version(), version);
-        assert!(s.parents(ClusterId(0)).is_empty());
+        assert_eq!(h.read().version(), version);
+        assert!(h.read().parents(ClusterId(0)).is_empty());
     }
 
     #[test]
     fn headless_relabel_tags_src_agent_and_triage_prompt() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = mock_session(dir.path());
+        let h = SessionHost::new(mock_session(dir.path()));
         let mut env = Env::new(dir.path(), false, label);
-        let mut run = |line: String| handle_line(&mut s, &mut env, &Mode::Headless, &line).unwrap();
+        let mut run = |line: String| handle_line(&h, &mut env, &line).unwrap();
         assert_eq!(
             run(call(1, "relabel", json!({"cluster": 0, "label": "good"})))["result"]["isError"],
             false
@@ -1448,8 +1743,16 @@ mod tests {
             -32602
         );
         drop(run);
+        let mut s = h.write();
         assert_eq!(s.label(ClusterId(0)), Some(1));
         assert!(s.tags(ClusterId(0)).iter().any(|t| t == "src:agent"));
+        let node = s.node(s.head().unwrap()).unwrap();
+        assert_eq!(
+            node.1,
+            &Actor::Agent {
+                client: "agent".into()
+            }
+        );
         // One undo reverts the relabel's tag and label together.
         s.dispatch(CurationCommand::Undo).unwrap();
         s.dispatch(CurationCommand::Undo).unwrap();
@@ -1459,9 +1762,9 @@ mod tests {
     #[test]
     fn headless_split_origin_names_the_mcp_client() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = mock_session(dir.path());
+        let h = SessionHost::new(mock_session(dir.path()));
         let mut env = Env::new(dir.path(), false, label);
-        let mut run = |line: String| handle_line(&mut s, &mut env, &Mode::Headless, &line).unwrap();
+        let mut run = |line: String| handle_line(&h, &mut env, &line).unwrap();
         // No clientInfo yet: the split is attributed to "agent".
         assert_eq!(
             run(call(1, "split", json!({"cluster": 0, "spike_idx": [0]})))["result"]["isError"],
@@ -1477,29 +1780,89 @@ mod tests {
             false
         );
         drop(run);
+        let s = h.read();
         let n = s.n_clusters();
         assert_eq!(s.origin_label(ClusterId(n - 2)), "Sorrel[LLM:agent]");
         assert_eq!(s.origin_label(ClusterId(n - 1)), "Sorrel[LLM:codex]");
     }
 
+    /// The listener writes where `attach` reads, and the path is a pure
+    /// function of the dataset directory.
+    #[test]
+    fn token_file_path_is_shared_by_writer_and_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = mcp_json_path(dir.path()).unwrap();
+        assert_eq!(path, mcp_json_path(dir.path()).unwrap());
+        assert_eq!(write_mcp_json(dir.path(), 1, "t", "n").unwrap(), path);
+        assert_eq!(read_mcp_json(dir.path()), Some((1, "t".to_owned())));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Off the dataset directory on Windows, so another account that can
+    /// read the dataset cannot read the token.
+    #[cfg(windows)]
+    #[test]
+    fn windows_token_file_is_outside_the_dataset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = mcp_json_path(dir.path()).unwrap();
+        assert!(!path.starts_with(dir.path()));
+        assert!(path.starts_with(std::env::var_os("LOCALAPPDATA").unwrap()));
+    }
+
+    /// A symlink pre-placed at the tmp path is replaced, not written through.
+    #[cfg(unix)]
+    #[test]
+    fn write_does_not_follow_a_preplaced_tmp_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let path = mcp_json_path(dir.path()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        write_mcp_json(dir.path(), 1, "t", "n").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(read_mcp_json(dir.path()).unwrap().1, "t");
+    }
+
+    #[test]
+    fn silent_connections_cannot_exhaust_handshake_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Arc::new(SessionHost::new(mock_session(dir.path())));
+        let handle = spawn_listener(h, dir.path(), false, label, None).unwrap();
+        let connect = || std::net::TcpStream::connect(("127.0.0.1", handle.port())).unwrap();
+        // Fill every handshake slot with a client that never sends a token.
+        let _silent: Vec<_> = (0..MAX_HANDSHAKES).map(|_| connect()).collect();
+        // Give the listener time to accept them all.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // One more is dropped at once (EOF), not parked on a thread for 5 s.
+        let mut extra = connect();
+        extra
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut got = Vec::new();
+        let started = std::time::Instant::now();
+        extra.read_to_end(&mut got).unwrap();
+        assert!(got.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
     #[test]
     fn loopback_listener_round_trip_and_bad_token() {
         let dir = tempfile::tempdir().unwrap();
-        let s = Arc::new(RwLock::new(mock_session(dir.path())));
-        let (tx, rx) = std::sync::mpsc::channel();
-        let sel: SharedSelection = Arc::new(Mutex::new(vec![ClusterId(1)]));
+        let h = Arc::new(SessionHost::new(mock_session(dir.path())));
         let woke = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let w = woke.clone();
-        let handle = spawn_listener(s.clone(), dir.path(), label, tx, sel, move || {
+        let _gui = h.subscribe(move || {
             w.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        })
-        .unwrap();
+        });
+        let handle = spawn_listener(h.clone(), dir.path(), false, label, None).unwrap();
         let (port, token) = read_mcp_json(dir.path()).unwrap();
         assert_eq!((port, token.as_str()), (handle.port(), handle.token()));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.path().join(MCP_JSON))
+            let mode = std::fs::metadata(mcp_json_path(dir.path()).unwrap())
                 .unwrap()
                 .permissions()
                 .mode();
@@ -1530,20 +1893,102 @@ mod tests {
             .collect();
         assert_eq!(replies.len(), 3);
         assert_eq!(replies[1]["result"]["isError"], false);
-        assert_eq!(
-            replies[2]["result"]["isError"], true,
-            "attached edits refused"
-        );
-        assert!(matches!(rx.try_recv(), Ok(AgentMsg::Propose(_))));
-        assert_eq!(woke.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(s.read().unwrap().label(ClusterId(0)), Some(0), "unchanged");
+        assert_eq!(replies[2]["result"]["isError"], false, "direct edit");
+        assert_eq!(h.proposals().len(), 1);
+        // The GUI's subscriber woke for the proposal and for the edit.
+        assert_eq!(woke.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(h.read().label(ClusterId(0)), Some(1), "relabelled");
 
         drop(handle);
-        assert!(!dir.path().join(MCP_JSON).exists());
+        assert!(!mcp_json_path(dir.path()).unwrap().exists());
         let mut out = Vec::new();
         assert!(
             !attach(dir.path(), Cursor::new(""), &mut out).unwrap(),
             "no listener: caller falls back"
         );
+    }
+
+    /// Direct-mode `split` applies the same proper-subset rule as `propose`.
+    #[test]
+    fn direct_split_rejects_empty_full_and_out_of_range_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SessionHost::new(mock_session(dir.path()));
+        let mut env = Env::new(dir.path(), false, label);
+        let mut run = |idx: Value| {
+            let line = call(1, "split", json!({"cluster": 0, "spike_idx": idx}));
+            handle_line(&h, &mut env, &line).unwrap()
+        };
+        for bad in [json!([]), json!([0, 1, 2]), json!([0, 7]), json!([3])] {
+            assert_eq!(run(bad.clone())["result"]["isError"], true, "{bad}");
+        }
+        drop(run);
+        assert_eq!(h.read().n_clusters(), 2, "nothing was split");
+        assert_eq!(h.read().history_len(), 0);
+    }
+
+    /// A refused connection (stale `mcp.json`) falls back; a host that
+    /// accepts but never acknowledges is alive, so that is an error.
+    #[test]
+    fn attach_falls_back_only_when_nobody_listens() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = || Cursor::new("");
+        // No file.
+        assert!(!attach(dir.path(), none(), Vec::new()).unwrap());
+        // Stale file: the port is closed.
+        let dead = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = dead.local_addr().unwrap().port();
+        drop(dead);
+        write_mcp_json(dir.path(), port, "t", "n").unwrap();
+        assert!(!attach(dir.path(), none(), Vec::new()).unwrap());
+        // Live but silent: accepts, never answers.
+        let silent = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        write_mcp_json(dir.path(), silent.local_addr().unwrap().port(), "t", "n").unwrap();
+        let hold = std::thread::spawn(move || silent.accept().map(|(s, _)| s));
+        let err = attach(dir.path(), none(), Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("did not acknowledge"), "{err}");
+        drop(hold.join().unwrap());
+    }
+
+    /// A wrong token after connecting is an error too, not a fallback.
+    #[test]
+    fn attach_with_a_rejected_token_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Arc::new(SessionHost::new(mock_session(dir.path())));
+        let _handle = spawn_listener(h, dir.path(), false, label, None).unwrap();
+        let (port, _) = read_mcp_json(dir.path()).unwrap();
+        write_mcp_json(dir.path(), port, "wrong", "n").unwrap();
+        let err = attach(dir.path(), Cursor::new(""), Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("rejected"), "{err}");
+    }
+
+    /// The handle that wrote `mcp.json` is the only one that removes it.
+    #[test]
+    fn a_second_handles_drop_keeps_the_first_ones_file() {
+        let (a, b, shared) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let host = |d: &tempfile::TempDir| Arc::new(SessionHost::new(mock_session(d.path())));
+        let first = spawn_listener(host(&a), shared.path(), false, label, None).unwrap();
+        let second = spawn_listener(host(&b), shared.path(), false, label, None).unwrap();
+        // The later host owns the file now; the earlier one must not delete it.
+        drop(first);
+        assert_eq!(read_mcp_json(shared.path()).unwrap().0, second.port());
+        drop(second);
+        assert!(!mcp_json_path(shared.path()).unwrap().exists());
+    }
+
+    /// A second host on a directory whose journal is already open fails
+    /// with the busy error and leaves the first host's listener alone.
+    #[test]
+    fn a_second_host_on_the_same_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Arc::new(SessionHost::new(mock_session(dir.path())));
+        let first = spawn_listener(h, dir.path(), false, label, None).unwrap();
+        let err = Journal::open(&dir.path().join("j.journal")).unwrap_err();
+        let busy = err.downcast_ref::<crate::journal::JournalBusy>().unwrap();
+        assert!(busy.to_string().contains("already open"), "{busy}");
+        assert_eq!(read_mcp_json(dir.path()).unwrap().0, first.port());
     }
 }

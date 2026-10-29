@@ -1368,3 +1368,166 @@ fn raster_and_rate_zoomed() {
         h
     });
 }
+
+/// An MCP agent ("codex") connected to the window merges a cluster: the
+/// top bar names it with a lit activity dot, the toast says what it did,
+/// and the touched cluster is selected and highlighted in the table.
+#[test]
+fn agent_edit_toast_and_highlight() {
+    if no_gpu() {
+        return;
+    }
+    use std::io::{BufRead, Write};
+    each_theme(|theme, name| {
+        let root = dataset(&format!("agent-edit-{name}"), 3);
+        let dir = root.clone();
+        let mut h = harness_with(theme, move || {
+            let (session, positions) = open(&dir);
+            let mut app = SorrelApp::new(session, label_str);
+            configure(&mut app, &dir, positions);
+            app.serve_mcp().unwrap();
+            // The toast and tint must outlast however long the renderer takes.
+            app.set_feedback_duration(Duration::from_secs(24 * 3600));
+            app
+        });
+        settle(&mut h);
+        let (port, token) = sorrel_data::serve::read_mcp_json(&root).unwrap();
+        let mut agent = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut replies = std::io::BufReader::new(agent.try_clone().unwrap());
+        let mut line = String::new();
+        for msg in [
+            format!(r#"{{"token":"{token}"}}"#),
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"codex"}}}"#.into(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"merge","arguments":{"sources":[1],"target":2}}}"#.into(),
+        ] {
+            writeln!(agent, "{msg}").unwrap();
+            replies.read_line(&mut line).unwrap();
+        }
+        assert!(line.contains(r#"\"ok\":true"#), "{line}");
+        snap(&mut h, "agent_edit", name);
+        drop(agent); // after the snapshot: the indicator lists connected agents
+        h
+    });
+}
+
+/// Two agent proposals waiting in the Proposals pane.
+#[test]
+fn proposals_pane() {
+    if no_gpu() {
+        return;
+    }
+    use sorrel_data::proposals::{Action, Proposal, Source};
+    use sorrel_io::ClusterId;
+    each_theme(|theme, name| {
+        let mut h = fixture(&format!("proposals-{name}"), 3, theme);
+        for (action, confidence, reasons) in [
+            (
+                Action::Merge {
+                    clusters: vec![ClusterId(2), ClusterId(1)],
+                },
+                0.9,
+                vec!["CCG dip at 0 ms", "templates nearly identical"],
+            ),
+            (
+                Action::Relabel {
+                    cluster: ClusterId(0),
+                    label: "noise".into(),
+                },
+                0.62,
+                vec!["footprint spread over every channel"],
+            ),
+        ] {
+            let reasons = reasons.into_iter().map(String::from).collect();
+            let mut p = Proposal::new(
+                Source::Agent,
+                action,
+                confidence,
+                reasons,
+                Default::default(),
+            );
+            p.proposer = Some("codex".into());
+            h.state().host().propose(p);
+        }
+        click_tab(&mut h, "Proposals");
+        snap(&mut h, "proposals_pane", name);
+        h
+    });
+}
+
+/// The History pane over a journal with a branch: you relabelled two
+/// clusters, undid the second, then codex merged instead (a second branch
+/// off the first edit) and you saved. Times are fixed in the records.
+#[test]
+fn history_with_a_branch() {
+    if no_gpu() {
+        return;
+    }
+    use sorrel_data::{Actor, CurationCommand, PhyLabelOp, Record};
+    use sorrel_io::ClusterId;
+    each_theme(|theme, name| {
+        let root = dataset(&format!("history-{name}"), 3);
+        let mut j = Journal::open_or_create(&root.join("sorrel.journal"), 0, 3).unwrap();
+        let t0 = 1_793_200_000_000; // 15:06:40 UTC
+        let node = |id, parent, actor, min: u64, cmd| Record::Node {
+            id,
+            parent,
+            actor,
+            ts_ms: t0 + min * 60_000,
+            cmd,
+        };
+        let codex = Actor::Agent {
+            client: "codex".into(),
+        };
+        for rec in [
+            node(
+                0,
+                None,
+                Actor::Human,
+                0,
+                CurationCommand::Relabel {
+                    cluster: ClusterId(0),
+                    op: PhyLabelOp::SetGood,
+                },
+            ),
+            node(
+                1,
+                Some(0),
+                Actor::Human,
+                1,
+                CurationCommand::Relabel {
+                    cluster: ClusterId(1),
+                    op: PhyLabelOp::SetMua,
+                },
+            ),
+            Record::Head { node: Some(0) },
+            node(
+                2,
+                Some(0),
+                codex,
+                3,
+                CurationCommand::Merge {
+                    sources: vec![ClusterId(1)],
+                    target: ClusterId(2),
+                },
+            ),
+            Record::Seal {
+                node: Some(2),
+                artifacts: 0,
+            },
+        ] {
+            j.append(&rec).unwrap();
+        }
+        drop(j);
+        let dir = root.clone();
+        let mut h = harness_with(theme, move || {
+            let (session, positions) = open(&dir);
+            let mut app = SorrelApp::new(session, label_str);
+            configure(&mut app, &dir, positions);
+            app
+        });
+        settle(&mut h);
+        click_tab(&mut h, "History");
+        snap(&mut h, "history_branch", name);
+        h
+    });
+}

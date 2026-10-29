@@ -79,6 +79,26 @@ pub struct Proposal {
     /// The raw tool arguments the agent sent (`Null` for built-in proposers).
     pub args: Value,
     pub outcome: Outcome,
+    /// The agent's MCP client name: an accepted split is made by
+    /// `LLM:<proposer>`. Absent in older logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposer: Option<String>,
+    /// For a split: [`spike_basis`] of the cluster when it was proposed,
+    /// since `spike_idx` is a position in that membership. Absent in older
+    /// logs and for other actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<String>,
+}
+
+/// Fingerprint of `cluster`'s spikes (count plus a hash of their global
+/// indices): changes whenever a merge or split changes the membership.
+pub fn spike_basis<P: DataProvider>(session: &Session<P>, cluster: ClusterId) -> String {
+    let globals = crate::proposers::cluster_globals(session, cluster);
+    let mut hasher = blake3::Hasher::new();
+    for g in &globals {
+        hasher.update(&g.to_le_bytes());
+    }
+    format!("{}:{}", globals.len(), hasher.finalize().to_hex())
 }
 
 /// Process-unique, increasing id: microseconds since the epoch, bumped past
@@ -119,6 +139,8 @@ impl Proposal {
             created: id / 1_000_000,
             args,
             outcome: Outcome::Pending,
+            proposer: None,
+            basis: None,
         }
     }
 
@@ -166,7 +188,7 @@ impl Proposal {
                 spike_idx: spike_idx.clone(),
                 new_cluster: ClusterId(u32::MAX),
                 by: match self.source {
-                    Source::Agent => Method::Llm("agent".into()),
+                    Source::Agent => Method::Llm(self.proposer.clone().unwrap_or("agent".into())),
                     s => Method::Algo(s.tag().trim_start_matches("src:").into()),
                 },
             }),

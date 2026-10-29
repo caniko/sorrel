@@ -19,8 +19,8 @@ use pyo3::prelude::*;
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::{
     collect_qc_rows, curation_json, open_phy, open_sorting_analyzer, rank_merge_candidates,
-    rank_split_candidates, save_and_reseal_journal, save_to_phy, seed_phy, CurationCommand,
-    JournalOpts, Method, PhyLabelOp, SuggestConfig,
+    rank_split_candidates, save_session, seed_phy, CurationCommand, JournalOpts, Method,
+    PhyLabelOp, SuggestConfig,
 };
 use sorrel_io::kilosort::{KilosortOpenParams, KilosortProvider, PhyLabel};
 use sorrel_io::{detect_backend, Backend, ClusterId, DataProvider, SortingAnalyzerProvider};
@@ -63,7 +63,7 @@ macro_rules! with_session {
 struct Session {
     inner: AnySession,
     save_dir: PathBuf,
-    /// phy dirs reseal the journal on save (see `sorrel_data::open`).
+    /// phy dirs seal the journal on save (see `sorrel_data::save_and_seal`).
     reseal_on_save: bool,
 }
 
@@ -236,15 +236,8 @@ impl Session {
     /// into the dataset directory; returns that directory.
     fn save(&mut self) -> PyResult<String> {
         let dir = self.save_dir.clone();
-        if self.reseal_on_save {
-            with_session!(mut self, s => {
-                let journal_path = s.journal_path().to_path_buf();
-                let journal = save_and_reseal_journal(s, &dir, &journal_path, label_str).map_err(err)?;
-                s.reseal(journal);
-            });
-        } else {
-            with_session!(self, s => save_to_phy(s, &dir, label_str).map_err(err)?);
-        }
+        let seal = self.reseal_on_save;
+        with_session!(mut self, s => save_session(s, &dir, seal, label_str).map_err(err)?);
         Ok(dir.display().to_string())
     }
 

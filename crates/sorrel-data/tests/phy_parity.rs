@@ -541,22 +541,22 @@ fn phy_per_cluster_spike_times_are_sorted() {
 }
 
 /// phy: a `Relabel` on a non-existent cluster id is a graceful no-op
-/// rather than a panic. Our dispatcher silently ignores the index, so this
-/// is enforced as "no panic, history grows by 1, label state untouched".
+/// rather than a panic. The dispatcher refuses it before the journal, so this
+/// is enforced as "no panic, an error, no history node, labels untouched".
 #[test]
 fn phy_relabel_on_out_of_range_cluster_is_a_noop() {
     let provider = phy_clustering_provider();
     let (mut s, _d) = fresh_session_with(provider);
     let pre = s.history_len();
 
-    s.dispatch(CurationCommand::Relabel {
-        cluster: ClusterId(999),
-        op: PhyLabelOp::SetGood,
-    })
-    .unwrap();
+    assert!(s
+        .dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(999),
+            op: PhyLabelOp::SetGood,
+        })
+        .is_err());
 
-    // History grew (the journal still has the record) but no label changed.
-    assert_eq!(s.history_len(), pre + 1);
+    assert_eq!(s.history_len(), pre);
     for i in (0..s.n_clusters()).map(ClusterId) {
         // All defaulted to 0 (Unsorted) initially.
         assert_eq!(s.label(i), Some(0u8));

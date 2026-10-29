@@ -29,29 +29,47 @@ The first two are exactly the files `spikeinterface.extractors.read_phy()`
 reads back, so a round trip into SpikeInterface or phy works without
 intermediate steps.
 
-### Journal sealing
+### The journal and `sorrel_original/`
 
-The journal is sealed against the data it was recorded on. For phy /
-Kilosort directories that seal is a hash of `spike_clusters.npy`, and
-saving _reseals_ it: the written artefacts become the new baseline and
-the undo history is cleared, so the next open loads the saved state once
-instead of replaying the same edits on top of it. Saving a
-SortingAnalyzer, NWB or `rez.mat` session does **not** reseal: those
-backends reload the original sort on every open, so the journal stays the
-source of truth and keeps its history.
+The journal replays onto the sort as it was loaded, never onto the files
+the last save wrote. Saving keeps the whole [history](./history.md).
 
-If the data changes underneath a journal (you re-ran the sorter, copied
-`spike_clusters.npy` from elsewhere, or the journal was written by a
-sorrel older than the seal), opening fails closed with a message naming
-the two ways out: `--discard-journal` when the curation was already
-saved, or restoring the file the journal was recorded against.
+For phy / Kilosort directories, the first save that replaces a file
+copies the original into `sorrel_original/`. The arrays a rescue rewrites
+are hard-linked instead. `sorrel_original/ROOT` lists every file captured
+this way, including the files that did not exist yet. Sorrel reads those
+copies on open, so a reopen rebuilds every node of the history. Leave the
+directory in place.
+
+Each save adds a seal to the journal: the hash of the `spike_clusters.npy`
+and `cluster_group.tsv` it is about to write. The seal is recorded before
+the files are renamed into place, so a crash at any point leaves files that
+match the sort as loaded or one of the seals.
+
+Opening checks two things and fails closed when either fails:
+
+- The original `spike_clusters.npy` must match the journal. It does not
+  when the sorter was re-run or the file was copied from elsewhere.
+- The current `spike_clusters.npy` and `cluster_group.tsv` must be the
+  original or one of sorrel's saves. Otherwise someone edited them outside
+  sorrel, for example by curating in phy after a sorrel save, and the next
+  sorrel save would overwrite that work.
+
+To curate from the files as they are now, reopen with `--discard-journal`.
+It renames the journal to `<journal>.<seconds>` and `sorrel_original/` to
+`sorrel_original.<seconds>`. Nothing is deleted. The current files become
+the new starting point. To keep the journal instead, restore the files it
+was recorded against.
+
+SortingAnalyzer, NWB and `rez.mat` sessions reload the original sort on
+every open, so they need no copies or checks.
 
 ### `curation.json`
 
 Every save also writes SpikeInterface's manual-curation document next to
 the phy files. It carries the `good` / `mua` / `noise` labels and, for
-backends that are not resealed, the merges and splits still pending in
-the journal, so a SortingAnalyzer round trip is one call:
+SortingAnalyzer, NWB and `rez.mat` sessions, the merges and splits made
+since the sort was loaded, so a SortingAnalyzer round trip is one call:
 
 ```python
 import spikeinterface.curation as sc
@@ -76,7 +94,7 @@ sorrel export-phy <DATA_DIR> --out curated_phy/ [--copy-raw]
 phy template-gui curated_phy/params.py
 ```
 
-The same export is available as the `export_phy` tool of `sorrel serve`,
+The same export is available as the `export_phy` tool of `sorrel mcp`,
 the **Export phy** button (it writes `<dataset>_phy` next to the dataset),
 and `Session.export_phy(out_dir, copy_raw=False)` in `sorrel-py`. It is the
 `phy-export` Cargo feature, on by default.

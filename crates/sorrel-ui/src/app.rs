@@ -15,78 +15,16 @@ use eframe::egui;
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::SpikeDepths;
 use sorrel_data::{
-    export_qc, save_and_reseal_journal, save_to_phy, CurationCommand, PhyLabelOp, Session,
+    actor_name, describe_command, export_qc, save_session, Actor, AgentPolicy, CurationCommand,
+    HostEvent, PhyLabelOp, Session, SessionHost,
 };
 use sorrel_gpu::GpuContext;
-use sorrel_io::{ClusterId, DataProvider, Events};
+use sorrel_io::{ClusterId, DataProvider, Events, HasGeometry};
 use sorrel_render::{GpuTracePreproc, TracePreproc};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-
-fn label_name(op: PhyLabelOp) -> &'static str {
-    match op {
-        PhyLabelOp::SetGood => "Good",
-        PhyLabelOp::SetMua => "MUA",
-        PhyLabelOp::SetNoise => "Noise",
-        PhyLabelOp::SetUnsorted => "Unsorted",
-    }
-}
-
-/// Short human description of a curation command — for status toasts so
-/// undo/redo say *what* they reverted instead of a bare "undone".
-fn describe_command(cmd: &CurationCommand) -> String {
-    match cmd {
-        CurationCommand::Relabel { cluster, op } => {
-            format!("relabel cluster {} as {}", cluster.0, label_name(*op))
-        }
-        CurationCommand::Merge { sources, target } => {
-            format!("merge {} cluster(s) into {}", sources.len(), target.0)
-        }
-        CurationCommand::Split {
-            cluster, spike_idx, ..
-        } => {
-            format!("split cluster {} ({} spikes)", cluster.0, spike_idx.len())
-        }
-        CurationCommand::Note { cluster, text } if text.is_empty() => {
-            format!("clear note on cluster {}", cluster.0)
-        }
-        CurationCommand::Note { cluster, text } => {
-            let brief: String = text.chars().take(24).collect();
-            let dots = if text.chars().count() > 24 { "…" } else { "" };
-            format!("note on cluster {}: {brief}{dots}", cluster.0)
-        }
-        CurationCommand::Tag { cluster, .. } => format!("retag cluster {}", cluster.0),
-        CurationCommand::AddSpikes(b) => {
-            let mut clusters = b.clusters.clone();
-            clusters.sort_unstable();
-            clusters.dedup();
-            format!(
-                "add {} spikes to {} clusters",
-                b.times.len(),
-                clusters.len()
-            )
-        }
-        CurationCommand::Batch { children } => {
-            // A multi-select relabel is journaled as one batch so a single
-            // Undo reverts it; say so instead of "batch of N ops".
-            if let Some(CurationCommand::Relabel { op, .. }) = children.first() {
-                let uniform = children
-                    .iter()
-                    .all(|c| matches!(c, CurationCommand::Relabel { op: o, .. } if o == op));
-                if uniform {
-                    return format!("relabel {} clusters as {}", children.len(), label_name(*op));
-                }
-            }
-            format!("batch of {} ops", children.len())
-        }
-        // Undo/Redo records never appear in history — they are applied as
-        // moves between stacks rather than pushed.
-        CurationCommand::Undo => "undo".into(),
-        CurationCommand::Redo => "redo".into(),
-    }
-}
 
 /// Render a `PathBuf` for the top bar: keep the last two segments so users
 /// recognise it (`run42/ks4`) without overflowing the bar on deep paths.
@@ -114,6 +52,57 @@ fn toast(msg: impl Into<String>) -> Option<(String, Instant)> {
     Some((msg.into(), Instant::now()))
 }
 
+/// The selection after an edit, computed from the edit's own event.
+type Follow = Box<dyn FnOnce(&HostEvent) -> Vec<ClusterId>>;
+
+/// The ids a split allocated: the tail of its event's clusters.
+fn new_ids(ev: &HostEvent, k: usize) -> &[ClusterId] {
+    &ev.clusters[ev.clusters.len().saturating_sub(k)..]
+}
+
+/// Why accepting `p` would no longer do what it proposed, if so: a cluster
+/// it names has since been emptied, or a split index is out of range.
+fn stale_reason<P: DataProvider>(
+    p: &sorrel_data::proposals::Proposal,
+    s: &Session<P>,
+) -> Option<String> {
+    use sorrel_data::proposals::Action;
+    let named: Vec<ClusterId> = match &p.action {
+        Action::Merge { clusters } => clusters.clone(),
+        Action::Relabel { cluster, .. }
+        | Action::Split { cluster, .. }
+        | Action::Accept { cluster } => vec![*cluster],
+    };
+    if let Some(c) = named.iter().find(|&&c| s.spike_times(c).is_empty()) {
+        return Some(format!("cluster {} is empty now", c.0));
+    }
+    match &p.action {
+        Action::Split { cluster, spike_idx } => {
+            // The indices are positions in the membership it was proposed on.
+            if p.basis
+                .as_ref()
+                .is_some_and(|b| *b != sorrel_data::proposals::spike_basis(s, *cluster))
+            {
+                return Some(format!(
+                    "cluster {} changed since it was proposed",
+                    cluster.0
+                ));
+            }
+            let n = s.spike_times(*cluster).len();
+            spike_idx
+                .iter()
+                .any(|&i| i as usize >= n)
+                .then(|| format!("cluster {} has only {n} spikes now", cluster.0))
+        }
+        _ => None,
+    }
+}
+
+/// Select a split's source and the new half it made.
+fn follow_split(cluster: ClusterId) -> Follow {
+    Box::new(move |ev| [&[cluster][..], new_ids(ev, 1)].concat())
+}
+
 /// Per-spike depth estimator a backend can plug in (see
 /// [`SorrelApp::set_depth_source`]).
 pub type DepthFn<P> = fn(&Session<P>) -> Option<SpikeDepths>;
@@ -122,13 +111,64 @@ pub type DepthFn<P> = fn(&Session<P>) -> Option<SpikeDepths>;
 /// [`SorrelApp::set_phy_export`]); returns the directory it wrote.
 pub type PhyExportFn<P> = Arc<dyn Fn(&Session<P>) -> anyhow::Result<PathBuf> + Send + Sync>;
 
+/// What the window keeps while it serves MCP clients: the listener, the
+/// `select` requests and the selection it publishes.
+struct McpLink {
+    _listener: sorrel_data::ListenerHandle,
+    select: Receiver<Vec<ClusterId>>,
+    selection: sorrel_data::SharedSelection,
+}
+
+/// A waker that repaints the window once its context is known.
+fn waker(ctx: &Arc<std::sync::OnceLock<egui::Context>>) -> impl Fn() + Send + Sync + 'static {
+    let ctx = Arc::clone(ctx);
+    move || {
+        if let Some(c) = ctx.get() {
+            c.request_repaint();
+        }
+    }
+}
+
+/// One line for a proposal: who, what, how sure.
+pub(crate) fn describe_proposal(p: &sorrel_data::proposals::Proposal) -> String {
+    use sorrel_data::proposals::Action;
+    let ids = |c: &[ClusterId]| {
+        c.iter()
+            .map(|c| c.0.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let what = match &p.action {
+        Action::Relabel { cluster, label } => format!("relabel {} as {label}", cluster.0),
+        Action::Merge { clusters } => match clusters.split_first() {
+            Some((t, rest)) => format!("merge {} into {}", ids(rest), t.0),
+            None => "merge".into(),
+        },
+        Action::Split { cluster, spike_idx } => {
+            format!("split {} spikes off {}", spike_idx.len(), cluster.0)
+        }
+        Action::Accept { cluster } => format!("keep {} as it is", cluster.0),
+    };
+    let by = p
+        .proposer
+        .clone()
+        .unwrap_or_else(|| p.source.tag().trim_start_matches("src:").to_owned());
+    format!("{by}: {what} ({:.0}%)", p.confidence * 100.0)
+}
+
+/// How long the clusters another actor touched stay highlighted.
+const HIGHLIGHT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Generic eframe app. The whole window is monomorphised against `P`.
 ///
-/// The session sits behind an `Arc<RwLock<_>>`: the UI thread takes short
-/// read locks per frame, curation commands take the write lock, and
-/// background jobs (Suggest ranking, quality metrics, initial seeding)
+/// The session is owned by a [`SessionHost`] and sits behind its
+/// `Arc<RwLock<_>>`: the UI thread takes short read locks per frame,
+/// curation commands go through [`SessionHost::apply`] (the write lock),
+/// and background jobs (Suggest ranking, quality metrics, initial seeding)
 /// hold a read or write lock on worker threads — see [`crate::jobs`].
 pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
+    host: Arc<SessionHost<P>>,
+    /// `host.session()`, kept for the per-frame reads.
     session: Arc<RwLock<Session<P>>>,
     /// `Some` while the initial seed/replay runs on a worker thread; the
     /// session must not be touched until it reports.
@@ -150,9 +190,6 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     /// Last status message + the time it was set, so the top bar can fade
     /// it out after a few seconds rather than pinning it.
     status: Option<(String, Instant)>,
-    /// Snapshot of `(history_len, redo_len)` at the last successful save. The
-    /// title bar shows a "•" dirty marker when current state differs.
-    saved_state: (usize, usize),
     /// Hover text of the "saved" status chip once a save succeeded.
     last_save: Option<String>,
     /// Optional pre-processing applied to the trace window before LTTB.
@@ -232,6 +269,21 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     snippet: Option<String>,
     /// Ctrl+Q: close on the next frame through the unsaved-changes guard.
     quit_requested: bool,
+    /// MCP clients' link to this window (see [`Self::serve_mcp`]).
+    mcp: Option<McpLink>,
+    /// `serve_mcp` asked while the loader still owned the session: started
+    /// once loading succeeds, never if it fails.
+    mcp_after_load: Option<fn(&mut Self) -> anyhow::Result<()>>,
+    /// The host's events (subscribed at build) and the context their waker
+    /// repaints, known from the first frame.
+    host_events: Receiver<HostEvent>,
+    repaint: Arc<std::sync::OnceLock<egui::Context>>,
+    /// Clusters the last edit by another actor touched, and when: tinted
+    /// for `highlight_for` ([`HIGHLIGHT`] unless a test pins it).
+    highlight: Option<(Vec<ClusterId>, Instant)>,
+    highlight_for: std::time::Duration,
+    /// How long the status toast stays (5 s unless a test pins it).
+    toast_for: std::time::Duration,
     /// Last window title sent to the OS; only re-sent when it changes.
     last_title: String,
     /// AA-contrast visuals go in on the first frame (no ctx before then).
@@ -298,11 +350,14 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
 
     fn build(session: Session<P>, label_str: fn(&P::Label) -> &'static str) -> Self {
         let window_len = (session.provider.sample_rate() as u32).max(1) / 10; // 100 ms
+        let host = Arc::new(SessionHost::new(session));
+        let repaint = Arc::new(std::sync::OnceLock::<egui::Context>::new());
+        let host_events = host.subscribe(waker(&repaint));
         Self {
-            session: Arc::new(RwLock::new(session)),
+            session: Arc::clone(host.session()),
+            host,
             loading: None,
             load_error: None,
-            saved_state: (0, 0),
             last_save: None,
             label_str,
             selection: SelectionSet::new(),
@@ -359,6 +414,13 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             show_help: false,
             snippet: None,
             quit_requested: false,
+            mcp: None,
+            mcp_after_load: None,
+            host_events,
+            repaint,
+            highlight: None,
+            highlight_for: HIGHLIGHT,
+            toast_for: std::time::Duration::from_secs(5),
             last_title: String::new(),
             visuals_installed: false,
         }
@@ -367,16 +429,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     /// Called once the session is seeded: initial selection, clean-state
     /// snapshot, and the per-dataset prefs.
     fn finish_loading(&mut self) {
-        let (n_clusters, sr, history, redo) = {
+        let (n_clusters, sr) = {
             let s = read(&self.session);
-            (
-                s.n_clusters(),
-                s.provider.sample_rate(),
-                s.history_len(),
-                s.redo_len(),
-            )
+            (s.n_clusters(), s.provider.sample_rate())
         };
-        self.saved_state = (history, redo);
         if n_clusters > 0 && self.selection.is_empty() {
             self.selection = SelectionSet::single(ClusterId(0));
         }
@@ -437,6 +493,210 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         &self.session
     }
 
+    /// The host that owns the session; other frontends (MCP, remote) edit
+    /// through it.
+    pub fn host(&self) -> &Arc<SessionHost<P>> {
+        &self.host
+    }
+
+    /// Serve this window's session to MCP clients (`sorrel mcp <dir>`
+    /// attaches): a loopback listener next to the save directory, whose
+    /// `select` moves this selection. Needs `set_save_dir` first.
+    pub fn serve_mcp(&mut self) -> anyhow::Result<()>
+    where
+        P: HasGeometry + 'static,
+        Session<P>: Send + Sync,
+    {
+        let dir = self
+            .save_dir
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("MCP needs a save directory"))?;
+        // A client must never edit a bare or half-replayed session.
+        if self.loading.is_some() {
+            self.mcp_after_load = Some(Self::serve_mcp);
+            return Ok(());
+        }
+        let (tx, select) = std::sync::mpsc::channel();
+        let selection = sorrel_data::SharedSelection::default();
+        let ui = sorrel_data::Ui {
+            selection: Arc::clone(&selection),
+            select: tx,
+            wake: Arc::new(waker(&self.repaint)),
+        };
+        let listener = sorrel_data::spawn_listener(
+            Arc::clone(&self.host),
+            &dir,
+            self.reseal_on_save,
+            self.label_str,
+            Some(Arc::new(ui)),
+        )?;
+        self.mcp = Some(McpLink {
+            _listener: listener,
+            select,
+            selection,
+        });
+        Ok(())
+    }
+
+    /// Show what other actors did since the last frame and apply what MCP
+    /// clients asked for: an edit by an agent (or a remote guest) is named
+    /// in the toast ("codex: merge …"), its clusters are highlighted and
+    /// selected, as a human edit selects its result; `select` replaces the
+    /// selection; the selection is published back for `selection`.
+    fn poll_host(&mut self) {
+        let theirs: Vec<HostEvent> = self
+            .host_events
+            .try_iter()
+            .filter(|e| e.actor != Actor::Human)
+            .collect();
+        if let Some(ev) = theirs.last() {
+            self.status = toast(format!("{}: {}", actor_name(&ev.actor), ev.desc));
+            let live: Vec<ClusterId> = {
+                let s = read(&self.session);
+                theirs
+                    .iter()
+                    .flat_map(|e| e.clusters.iter().copied())
+                    .filter(|&c| !s.spike_times(c).is_empty())
+                    .collect()
+            };
+            if let Some((&first, rest)) = live.split_first() {
+                self.selection.replace(first);
+                rest.iter().for_each(|&c| self.selection.toggle(c));
+            }
+            self.highlight = Some((live, Instant::now()));
+        }
+        let Some(link) = &self.mcp else { return };
+        for ids in link.select.try_iter() {
+            if let Some((&first, rest)) = ids.split_first() {
+                self.selection.replace(first);
+                rest.iter().for_each(|&c| self.selection.toggle(c));
+            }
+        }
+        *link.selection.lock().unwrap_or_else(|p| p.into_inner()) =
+            self.selection.as_slice().to_vec();
+    }
+
+    /// Top-bar agent strip: an activity dot (lit while the last agent edit
+    /// is highlighted), the connected MCP clients, the pending proposals,
+    /// and the Direct | Propose policy toggle.
+    fn agent_indicator(&mut self, ui: &mut egui::Ui) {
+        let theme = crate::theme::Theme::from_ui(ui);
+        let active = self.highlighted().is_some();
+        let agents = self.host.agents();
+        let (r, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+        let dot = if active { theme.good } else { theme.caption };
+        ui.painter().circle_filled(r.center(), 3.5, dot);
+        let who = if agents.is_empty() {
+            "no agent".to_string()
+        } else {
+            agents.join(", ")
+        };
+        ui.label(who).on_hover_text(if active {
+            "An agent just edited; the touched clusters are highlighted"
+        } else {
+            "MCP clients connected with `sorrel mcp <DATA_DIR>`"
+        });
+        let pending = self.host.proposals().len();
+        if pending > 0
+            && ui
+                .button(egui::RichText::new(format!("{pending} to review")).color(theme.warn))
+                .on_hover_text("Open the Proposals pane")
+                .clicked()
+        {
+            layout::add_pane(&mut self.tree, Pane::Proposals, None);
+        }
+        let policy = self.host.policy();
+        for (p, name, tip) in [
+            (
+                AgentPolicy::Direct,
+                "Direct",
+                "MCP agents edit directly; every edit is undoable",
+            ),
+            (
+                AgentPolicy::ProposeOnly,
+                "Propose",
+                "MCP agents only propose; you accept or reject each one",
+            ),
+        ] {
+            if ui
+                .selectable_label(policy == p, name)
+                .on_hover_text(tip)
+                .clicked()
+            {
+                self.host.set_policy(p);
+            }
+        }
+    }
+
+    /// Accept (through the host, as a human decision that keeps the
+    /// proposer as the method) or reject proposal `id`, and audit it.
+    fn decide_proposal(&mut self, id: u64, accept: bool) {
+        use sorrel_data::proposals::Action;
+        let Some(p) = self.host.take_proposal(id) else {
+            return;
+        };
+        let what = describe_proposal(&p);
+        // Select the result the way the same edit made by hand would.
+        let follow: Follow = match &p.action {
+            _ if !accept => Box::new(|_| Vec::new()),
+            Action::Merge { clusters } => {
+                let target: Vec<_> = clusters.first().copied().into_iter().collect();
+                Box::new(move |_| target)
+            }
+            Action::Split { cluster, .. } => follow_split(*cluster),
+            _ => Box::new(|_| Vec::new()),
+        };
+        // Accept and relabel-reject can leave nothing to journal. A proposal
+        // that no longer fits the clusters (or whose edit fails) is audited
+        // as superseded and its card dropped; the error says why.
+        // The staleness check and the commands (whose `Tag` edits replace a
+        // cluster's whole tag list) are built under the write lock of the
+        // apply itself, so no MCP tag edit can land in between and be lost.
+        let build = |s: &Session<P>| {
+            if accept {
+                if let Some(why) = stale_reason(&p, s) {
+                    anyhow::bail!("proposal no longer applies ({why})");
+                }
+            }
+            let cmds = match accept {
+                true => p.to_commands(s),
+                false => p.reject_commands(s),
+            };
+            Ok(CurationCommand::batch(cmds).filter(|b| !b.clusters().is_empty()))
+        };
+        let applied = self.commit_built(&what, build, follow);
+        let outcome = match (applied, accept) {
+            (false, _) => sorrel_data::proposals::Outcome::Superseded,
+            (true, true) => sorrel_data::proposals::Outcome::Accepted,
+            (true, false) => sorrel_data::proposals::Outcome::Rejected,
+        };
+        if let Some(dir) = &self.save_dir {
+            if let Err(e) = sorrel_data::proposals::record_outcome(dir, id, outcome) {
+                log::warn!("proposal audit log: {e}");
+            }
+        }
+        if !applied {
+            return;
+        }
+        let verb = if accept { "accepted" } else { "rejected" };
+        self.status = toast(format!("{verb}: {what}"));
+    }
+
+    /// How long the status toast and another actor's highlight stay up.
+    /// Snapshot tests pin it long so a slow renderer cannot outlast them.
+    pub fn set_feedback_duration(&mut self, d: std::time::Duration) {
+        self.highlight_for = d;
+        self.toast_for = d;
+    }
+
+    /// The highlighted clusters while the highlight lasts.
+    fn highlighted(&self) -> Option<&[ClusterId]> {
+        self.highlight
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < self.highlight_for)
+            .map(|(c, _)| c.as_slice())
+    }
+
     /// Hand the app the wgpu device/queue from `eframe`'s render state so
     /// trace CMR + HP filter can run on the GPU. Without this the app
     /// transparently falls back to the CPU implementation.
@@ -468,17 +728,17 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     /// typically points this at the kilosort root. Also loads the
     /// per-dataset UI prefs stored next to the cache.
     ///
-    /// `reseal` must be `true` only for backends that read the saved
-    /// `spike_clusters.npy` back on open (phy/Kilosort): the journal is then
-    /// truncated at save so the next open does not replay the same edits on
-    /// top of already-curated data. Backends that reload the original sort
-    /// (SortingAnalyzer, NWB, rez) keep the journal as the source of truth.
+    /// `reseal` must be `true` only when `dir` is the phy/Kilosort directory
+    /// the session was opened from: the save then captures the root and
+    /// seals the journal (`sorrel_data::save_and_seal`). Other targets get a
+    /// plain export.
     pub fn set_save_dir(&mut self, dir: PathBuf, reseal: bool) {
         let prefs = UiPrefs::load(&dir);
         match Events::detect(&dir) {
             Ok(events) => self.events = events.map(Arc::new),
             Err(e) => log::warn!("ignoring events file in {}: {e}", dir.display()),
         }
+        self.host.restore_proposals(&dir);
         self.save_dir = Some(dir);
         self.reseal_on_save = reseal;
         if self.loading.is_some() {
@@ -493,23 +753,13 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     }
 
     /// Write the phy artifacts into `dir`, dropping stale derived-cache
-    /// entries, and reseal the journal when this backend requires it.
+    /// entries, and seal the journal when this backend requires it.
     fn save_to(&mut self, dir: &Path) -> anyhow::Result<()> {
         self.cancel_jobs();
         let mut session = write(&self.session);
-        if self.reseal_on_save {
-            let journal_path = session.journal_path().to_path_buf();
-            // Invalidate before the reseal drops the pending-invalidation list.
-            if let Err(err) = session.invalidate_dataset_caches() {
-                log::warn!("cache invalidation after save failed: {err}");
-            }
-            let journal = save_and_reseal_journal(&session, dir, &journal_path, self.label_str)?;
-            session.reseal(journal);
-        } else {
-            save_to_phy(&session, dir, self.label_str)?;
-            if let Err(err) = session.invalidate_dataset_caches() {
-                log::warn!("cache invalidation after save failed: {err}");
-            }
+        save_session(&mut session, dir, self.reseal_on_save, self.label_str)?;
+        if let Err(err) = session.invalidate_dataset_caches() {
+            log::warn!("cache invalidation after save failed: {err}");
         }
         Ok(())
     }
@@ -557,9 +807,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         self.channel_positions = positions;
     }
 
+    /// The title bar shows a "•" dirty marker while the head is not the
+    /// saved node.
     fn dirty(&self) -> bool {
-        let s = read(&self.session);
-        (s.history_len(), s.redo_len()) != self.saved_state
+        !read(&self.session).is_saved()
     }
 
     /// Stop background jobs so the write lock is free at once.
@@ -797,50 +1048,94 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     /// target / both halves of a split) so the next view shows what just
     /// changed. Returns `true` on success.
     fn commit(&mut self, cmd: CurationCommand) -> bool {
-        let follow = match &cmd {
-            CurationCommand::Merge { target, .. } => Some(vec![*target]),
-            // `ClusterIndex::split` always allocates the new id at the tail.
-            CurationCommand::Split { cluster, .. } => {
-                Some(vec![*cluster, ClusterId(read(&self.session).n_clusters())])
+        let follow: Follow = match &cmd {
+            CurationCommand::Merge { target, .. } => {
+                let target = vec![*target];
+                Box::new(move |_| target)
             }
-            _ => None,
+            CurationCommand::Split { cluster, .. } => follow_split(*cluster),
+            _ => Box::new(|_| Vec::new()),
         };
         self.commit_with_follow(cmd, follow)
     }
 
     /// Every view cache is keyed on `Session::version()`, so nothing needs
     /// invalidating by hand here: the next frame rebuilds what changed.
-    fn commit_with_follow(&mut self, cmd: CurationCommand, follow: Option<Vec<ClusterId>>) -> bool {
+    fn commit_with_follow(&mut self, cmd: CurationCommand, follow: Follow) -> bool {
+        self.commit_with_follow_if(cmd, follow, |_| Ok(()))
+    }
+
+    /// [`Self::commit_with_follow`], but `check` runs under the host's write
+    /// lock, so no MCP edit can land between the check and the apply.
+    fn commit_with_follow_if(
+        &mut self,
+        cmd: CurationCommand,
+        follow: Follow,
+        check: impl FnOnce(&Session<P>) -> anyhow::Result<()>,
+    ) -> bool {
         let desc = describe_command(&cmd);
+        self.commit_built(
+            &desc,
+            |s| {
+                check(s)?;
+                Ok(Some(cmd))
+            },
+            follow,
+        )
+    }
+
+    /// Commit the command `build` makes from the session under the host's
+    /// write lock (`None` = nothing to journal, which counts as done).
+    /// `what` names the edit in the error.
+    fn commit_built(
+        &mut self,
+        what: &str,
+        build: impl FnOnce(&Session<P>) -> anyhow::Result<Option<CurationCommand>>,
+        follow: Follow,
+    ) -> bool {
         self.cancel_jobs();
-        // Every GUI edit is a human decision: it clears the touched clusters'
-        // `review:*` tags (from `sorrel auto`), so the review queue drains.
-        let cmd = read(&self.session).with_human_review(cmd);
-        if let Err(e) = write(&self.session).dispatch(cmd) {
-            self.error = Some(format!("{desc} failed: {e}"));
-            return false;
-        }
-        if let Some(ids) = follow {
-            if let Some((&first, rest)) = ids.split_first() {
-                self.selection.replace(first);
-                for &c in rest {
-                    self.selection.toggle(c);
-                }
+        // Every GUI edit is a human decision: the host clears the touched
+        // clusters' `review:*` tags (from `sorrel auto`), so the review
+        // queue drains.
+        let ev = match self.host.apply_built(Actor::Human, build) {
+            Ok(Some(ev)) => ev,
+            Ok(None) => return true,
+            Err(e) => {
+                self.error = Some(format!("{what} failed: {e}"));
+                return false;
+            }
+        };
+        // The ids come from our own event, not from a cluster count read
+        // before the apply: an MCP edit may have landed in between.
+        if let Some((&first, rest)) = follow(&ev).split_first() {
+            self.selection.replace(first);
+            for &c in rest {
+                self.selection.toggle(c);
             }
         }
-        self.status = toast(desc);
+        self.status = toast(ev.desc);
         true
+    }
+
+    /// Undo or redo; the toast names what moved ("undid: relabel cluster 12
+    /// as MUA"), and nothing is said at the end of the walk.
+    fn move_head(&mut self, cmd: CurationCommand) {
+        self.cancel_jobs();
+        let before = read(&self.session).version();
+        match self.host.apply(Actor::Human, cmd) {
+            Err(e) => self.error = Some(format!("journal write failed: {e}")),
+            Ok(ev) if ev.version != before => self.status = toast(ev.desc),
+            Ok(_) => {}
+        }
     }
 
     /// Turn lasso hits into one journal entry (a batch when several
     /// clusters were lassoed) and select source + new halves afterwards.
     fn apply_lasso_splits(&mut self, splits: Vec<(ClusterId, Vec<u32>)>) {
-        let n = read(&self.session).n_clusters();
         let mut cmds = Vec::new();
-        let mut follow = Vec::new();
+        let mut sources = Vec::new();
         for (cluster, spike_idx) in splits.into_iter().filter(|(_, s)| !s.is_empty()) {
-            follow.push(cluster);
-            follow.push(ClusterId(n + cmds.len() as u32));
+            sources.push(cluster);
             cmds.push(CurationCommand::Split {
                 cluster,
                 spike_idx,
@@ -856,7 +1151,16 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 None => return,
             },
         };
-        self.commit_with_follow(cmd, Some(follow));
+        // The new halves are the tail of the event, in command order.
+        let follow: Follow = Box::new(move |ev| {
+            let new = new_ids(ev, sources.len());
+            sources
+                .iter()
+                .zip(new)
+                .flat_map(|(&c, &n)| [c, n])
+                .collect()
+        });
+        self.commit_with_follow(cmd, follow);
     }
 
     fn save(&mut self) {
@@ -866,19 +1170,8 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     // No toast: the status chip carries the save state, and
                     // a stale edit message must not outlive the save.
                     self.status = None;
-                    self.last_save = Some(format!(
-                        "Saved to {}{}",
-                        dir.display(),
-                        if self.reseal_on_save {
-                            " · undo history sealed"
-                        } else {
-                            ""
-                        }
-                    ));
+                    self.last_save = Some(format!("Saved to {}", dir.display()));
                     self.error = None;
-                    let s = read(&self.session);
-                    self.saved_state = (s.history_len(), s.redo_len());
-                    drop(s);
                     self.save_prefs();
                 }
                 Err(e) => {
@@ -1256,33 +1549,8 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     self.merge_mode = None;
                 }
             }
-            Intent::Undo => {
-                // Peek the about-to-be-undone command first so the status
-                // toast can name it ("undid: relabel cluster 12 → MUA")
-                // rather than a generic "undo".
-                let desc = read(&self.session)
-                    .history_commands()
-                    .last()
-                    .map(describe_command);
-                self.cancel_jobs();
-                if let Err(e) = write(&self.session).dispatch(CurationCommand::Undo) {
-                    self.error = Some(format!("journal write failed: {e}"));
-                } else if let Some(d) = desc {
-                    self.status = toast(format!("undid: {d}"));
-                }
-            }
-            Intent::Redo => {
-                self.cancel_jobs();
-                if let Err(e) = write(&self.session).dispatch(CurationCommand::Redo) {
-                    self.error = Some(format!("journal write failed: {e}"));
-                } else if let Some(d) = read(&self.session)
-                    .history_commands()
-                    .last()
-                    .map(describe_command)
-                {
-                    self.status = toast(format!("redid: {d}"));
-                }
-            }
+            Intent::Undo => self.move_head(CurationCommand::Undo),
+            Intent::Redo => self.move_head(CurationCommand::Redo),
             Intent::Save => self.save(),
             Intent::NextCluster => {
                 self.selection.bump(1, &self.table_state.visible);
@@ -1490,6 +1758,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             {
                 self.dispatch_intent(Intent::Redo);
             }
+            if self.mcp.is_some() {
+                ui.separator();
+                self.agent_indicator(ui);
+            }
             let n_sel = self.selection.len();
             let target = self
                 .selection
@@ -1679,6 +1951,14 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             }
             ViewAction::AddPane(pane, into) => layout::add_pane(&mut self.tree, pane, Some(into)),
             ViewAction::Screenshot(pane, rect) => self.pending_screenshots.push((pane, rect)),
+            ViewAction::Decide { id, accept } => self.decide_proposal(id, accept),
+            ViewAction::Checkout(node) => {
+                self.cancel_jobs();
+                match self.host.checkout(Actor::Human, node) {
+                    Ok(ev) => self.status = toast(ev.desc),
+                    Err(e) => self.error = Some(format!("checkout failed: {e}")),
+                }
+            }
         }
     }
 
@@ -1751,14 +2031,21 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 Ok(Ok(())) => {
                     self.loading = None;
                     self.finish_loading();
+                    if let Some(start) = self.mcp_after_load.take() {
+                        if let Err(e) = start(self) {
+                            log::warn!("MCP listener not started: {e:#}");
+                        }
+                    }
                     return false;
                 }
                 Ok(Err(e)) => {
                     self.loading = None;
+                    self.mcp_after_load = None;
                     self.load_error = Some(e.to_string());
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.loading = None;
+                    self.mcp_after_load = None;
                     self.load_error = Some("loader thread exited without a result".into());
                 }
                 Err(TryRecvError::Empty) => {
@@ -1827,6 +2114,14 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
         }
         if self.show_loading(&ctx, root_ui) {
             return;
+        }
+        let _ = self.repaint.set(ctx.clone());
+        self.poll_host();
+        if let Some((_, at)) = &self.highlight {
+            match self.highlight_for.checked_sub(at.elapsed()) {
+                Some(left) => ctx.request_repaint_after(left),
+                None => self.highlight = None,
+            }
         }
 
         // Input. Suppress single-letter intents while a text widget has focus
@@ -1932,19 +2227,14 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
         self.show_confirm_dialog(&ctx);
         self.show_help_window(&ctx);
 
-        // Status auto-fades after 5 s so the top bar doesn't pin a stale
+        // Status auto-fades (after 5 s) so the top bar doesn't pin a stale
         // "saved" pill from twenty minutes ago.
-        const STATUS_TTL_SECS: u64 = 5;
         if let Some((_, when)) = &self.status {
-            let elapsed = when.elapsed().as_secs();
-            if elapsed >= STATUS_TTL_SECS {
-                self.status = None;
-            } else {
+            match self.toast_for.checked_sub(when.elapsed()) {
                 // Wake the UI when the toast should fade so users on idle
                 // input still see it disappear.
-                ctx.request_repaint_after(std::time::Duration::from_secs(
-                    STATUS_TTL_SECS - elapsed,
-                ));
+                Some(left) => ctx.request_repaint_after(left),
+                None => self.status = None,
             }
         }
 
@@ -2013,6 +2303,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                     self.label_str,
                 );
                 let selected: Vec<ClusterId> = self.selection.iter().copied().collect();
+                let highlight = self.highlighted().unwrap_or_default().to_vec();
                 let click = cluster_table(
                     ui,
                     &session,
@@ -2023,6 +2314,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                         rows: &self.cluster_rows,
                         hidden: &mut self.view_params.hidden_cols,
                         similar: None,
+                        highlight: &highlight,
                     },
                 );
                 if let Some(click) = click {
@@ -2034,6 +2326,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
             // Every view is a tile; views only read the session and queue
             // side effects as actions, applied once the read lock is gone.
             let selected: Vec<ClusterId> = self.selection.iter().copied().collect();
+            let proposals = self.host.proposals();
             let closed = layout::missing_panes(&self.tree);
             let active_tabs = layout::active_tabs(&self.tree);
             let jobs = JobCtx {
@@ -2100,6 +2393,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                 let mut behavior = ViewBehavior {
                     session: &session,
                     selection: &selected,
+                    proposals: &proposals,
                     label_str: self.label_str,
                     channel_positions: &self.channel_positions,
                     waveform_cache: &mut self.waveform_cache,
@@ -2252,6 +2546,324 @@ mod tests {
         Session::new(provider, journal)
     }
 
+    impl HasGeometry for StubProvider {
+        fn channel_positions(&self) -> &[[f32; 2]] {
+            &[]
+        }
+    }
+
+    /// With MCP served, an agent's edit (through the host, as a listener
+    /// client would) shows up in the toast, a `select` moves the selection,
+    /// and the selection is published back for `selection`.
+    #[test]
+    fn mcp_edits_and_selects_reach_the_window() {
+        let (mut app, dir) = make_app();
+        app.set_save_dir(dir.path().to_path_buf(), false);
+        app.serve_mcp().unwrap();
+        assert!(sorrel_data::serve::read_mcp_json(dir.path()).is_some());
+        let agent = Actor::Agent {
+            client: "codex".into(),
+        };
+        app.host
+            .apply(
+                agent,
+                CurationCommand::Relabel {
+                    cluster: ClusterId(2),
+                    op: PhyLabelOp::SetNoise,
+                },
+            )
+            .unwrap();
+        let (port, token) = sorrel_data::serve::read_mcp_json(dir.path()).unwrap();
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        use std::io::{BufRead, Write};
+        writeln!(c, "{{\"token\":\"{token}\"}}").unwrap();
+        writeln!(
+            c,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"select","arguments":{{"clusters":[1]}}}}}}"#
+        )
+        .unwrap();
+        let mut r = std::io::BufReader::new(c);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap(); // ack
+        r.read_line(&mut line).unwrap(); // select reply
+        app.poll_host();
+        assert_eq!(
+            app.status.as_ref().map(|s| s.0.as_str()),
+            Some("codex: relabel cluster 2 as Noise")
+        );
+        assert_eq!(app.highlighted(), Some(&[ClusterId(2)][..]));
+        // The agent's edit selected its cluster; the later `select` won.
+        assert_eq!(app.selection.as_slice(), &[ClusterId(1)]);
+        let published = app.mcp.as_ref().unwrap().selection.lock().unwrap().clone();
+        assert_eq!(published, [ClusterId(1)]);
+    }
+
+    /// Accepting a proposal applies it as a human decision whose split is
+    /// made by the proposing agent, and audits it; rejecting a merge leaves
+    /// the not-merge memory.
+    #[test]
+    fn proposal_cards_accept_and_reject_through_the_host() {
+        use sorrel_data::proposals::{self, Action, Outcome, Proposal, Source};
+        let (mut app, dir) = make_app();
+        app.set_save_dir(dir.path().to_path_buf(), false);
+        let queue = |action, app: &SorrelApp<StubProvider>| {
+            let mut p = Proposal::new(
+                Source::Agent,
+                action,
+                0.8,
+                vec!["x".into()],
+                Default::default(),
+            );
+            p.proposer = Some("codex".into());
+            proposals::append(dir.path(), &p).unwrap();
+            app.host.propose(p.clone());
+            p.id
+        };
+        let split = queue(
+            Action::Split {
+                cluster: ClusterId(0),
+                spike_idx: vec![1],
+            },
+            &app,
+        );
+        let merge = queue(
+            Action::Merge {
+                clusters: vec![ClusterId(1), ClusterId(2)],
+            },
+            &app,
+        );
+        app.apply_view_action(ViewAction::Decide {
+            id: split,
+            accept: true,
+        });
+        app.apply_view_action(ViewAction::Decide {
+            id: merge,
+            accept: false,
+        });
+        assert!(app.host.proposals().is_empty());
+        let s = read(&app.session);
+        assert_eq!(s.n_clusters(), 4);
+        assert_eq!(s.origin_label(ClusterId(3)), "Sorrel[LLM:codex]");
+        assert!(s.tags(ClusterId(1)).iter().any(|t| t == "notmerge:2"));
+        assert_eq!(app.selection.as_slice(), &[ClusterId(0), ClusterId(3)]);
+        drop(s);
+        let log = proposals::read_log(dir.path());
+        let outcome = |id| log.iter().find(|p| p.id == id).unwrap().outcome;
+        assert_eq!(
+            (outcome(split), outcome(merge)),
+            (Outcome::Accepted, Outcome::Rejected)
+        );
+    }
+
+    /// The selection after a split comes from the applied event (the ids
+    /// the apply allocated), also when several splits go in one batch.
+    #[test]
+    fn split_follow_uses_the_ids_the_apply_allocated() {
+        let (mut app, _d) = make_app();
+        app.apply_lasso_splits(vec![(ClusterId(0), vec![0])]);
+        assert_eq!(app.selection.as_slice(), &[ClusterId(0), ClusterId(3)]);
+        // Cluster 1 still has both spikes (a split must leave one behind).
+        assert!(app.commit(CurationCommand::Split {
+            cluster: ClusterId(1),
+            spike_idx: vec![0],
+            new_cluster: ClusterId(u32::MAX),
+            by: sorrel_data::command::Method::Manual,
+        }));
+        assert_eq!(app.selection.as_slice(), &[ClusterId(1), ClusterId(4)]);
+    }
+
+    /// A proposal that no longer applies leaves an audit line and no card.
+    #[test]
+    fn stale_proposal_is_audited_when_it_fails() {
+        use sorrel_data::proposals::{self, Action, Outcome, Proposal, Source};
+        let (mut app, dir) = make_app();
+        app.set_save_dir(dir.path().to_path_buf(), false);
+        let p = Proposal::new(
+            Source::Agent,
+            // Cluster 2 is merged away before the human gets to it.
+            Action::Split {
+                cluster: ClusterId(2),
+                spike_idx: vec![0],
+            },
+            0.8,
+            vec![],
+            Default::default(),
+        );
+        let id = p.id;
+        app.commit(CurationCommand::Merge {
+            sources: vec![ClusterId(2)],
+            target: ClusterId(0),
+        });
+        proposals::append(dir.path(), &p).unwrap();
+        app.host.propose(p);
+        app.apply_view_action(ViewAction::Decide { id, accept: true });
+        assert!(app.error.is_some(), "the failure is shown");
+        assert!(app.host.proposals().is_empty());
+        let log = proposals::read_log(dir.path());
+        assert_eq!(log[0].outcome, Outcome::Superseded);
+        assert_eq!(read(&app.session).n_clusters(), 3, "nothing applied");
+    }
+
+    /// A split's indices refer to the membership it was proposed on: after a
+    /// merge into that cluster (indices still in range) accepting is refused.
+    #[test]
+    fn split_proposal_is_refused_after_membership_changes() {
+        use sorrel_data::proposals::{self, Action, Outcome, Proposal, Source};
+        let (mut app, dir) = make_app();
+        app.set_save_dir(dir.path().to_path_buf(), false);
+        let p = Proposal::new(
+            Source::Agent,
+            Action::Split {
+                cluster: ClusterId(0),
+                spike_idx: vec![0],
+            },
+            0.8,
+            vec![],
+            Default::default(),
+        );
+        let id = p.id;
+        proposals::append(dir.path(), &p).unwrap();
+        app.host.propose(p);
+        assert!(app.commit(CurationCommand::Merge {
+            sources: vec![ClusterId(1)],
+            target: ClusterId(0),
+        }));
+        let n = read(&app.session).n_clusters();
+        let version = read(&app.session).version();
+        app.apply_view_action(ViewAction::Decide { id, accept: true });
+        assert!(app.error.is_some(), "the refusal is shown");
+        assert_eq!(read(&app.session).version(), version, "nothing applied");
+        assert_eq!(read(&app.session).n_clusters(), n);
+        let log = proposals::read_log(dir.path());
+        assert_eq!(log[0].outcome, Outcome::Superseded);
+    }
+
+    /// Accepting checks the proposal's basis under the write lock of the
+    /// apply (no MCP edit can land in between), and a refusal there audits
+    /// the proposal as superseded.
+    #[test]
+    fn proposal_accept_checks_under_the_write_lock() {
+        use sorrel_data::proposals::{self, Action, Outcome, Proposal, Source};
+        let (mut app, dir) = make_app();
+        app.set_save_dir(dir.path().to_path_buf(), false);
+        let host = Arc::clone(&app.host);
+        let ran = std::cell::Cell::new(false);
+        let cmd = CurationCommand::Relabel {
+            cluster: ClusterId(1),
+            op: PhyLabelOp::SetGood,
+        };
+        assert!(
+            app.commit_with_follow_if(cmd, Box::new(|_| Vec::new()), |_| {
+                ran.set(true);
+                assert!(host.session().try_read().is_err(), "write lock is held");
+                Ok(())
+            })
+        );
+        assert!(ran.get());
+        let p = Proposal::new(
+            Source::Agent,
+            Action::Split {
+                cluster: ClusterId(0),
+                spike_idx: vec![0],
+            },
+            0.8,
+            vec![],
+            Default::default(),
+        );
+        let id = p.id;
+        proposals::append(dir.path(), &p).unwrap();
+        app.host.propose(p);
+        // The basis stamped at queue time no longer matches by accept time.
+        assert!(app.commit(CurationCommand::Merge {
+            sources: vec![ClusterId(1)],
+            target: ClusterId(0),
+        }));
+        app.apply_view_action(ViewAction::Decide { id, accept: true });
+        assert!(app.error.is_some());
+        let log = proposals::read_log(dir.path());
+        assert_eq!(log[0].outcome, Outcome::Superseded);
+    }
+
+    /// `serve_mcp` while the loader owns the session binds nothing; the
+    /// listener starts when loading succeeds and never when it fails.
+    #[test]
+    fn mcp_listener_waits_for_a_successful_load() {
+        for ok in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (go, wait) = std::sync::mpsc::channel::<()>();
+            let mut app = SorrelApp::with_loader(stub_session(dir.path()), label_str, move |_| {
+                wait.recv().ok();
+                anyhow::ensure!(ok, "load failed");
+                Ok(())
+            });
+            app.set_save_dir(dir.path().to_path_buf(), false);
+            app.serve_mcp().unwrap();
+            assert!(app.mcp.is_none());
+            assert!(sorrel_data::serve::read_mcp_json(dir.path()).is_none());
+            go.send(()).unwrap();
+            let ctx = egui::Context::default();
+            while app.loading.is_some() {
+                let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    app.show_loading(&ctx, ui);
+                });
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(app.mcp.is_some(), ok);
+            assert_eq!(sorrel_data::serve::read_mcp_json(dir.path()).is_some(), ok);
+        }
+    }
+
+    /// A proposal still pending in the audit log is a card again when the
+    /// window opens the dataset; a decided one is not.
+    #[test]
+    fn pending_proposals_come_back_when_the_dataset_opens() {
+        use sorrel_data::proposals::{self, Action, Outcome, Proposal, Source};
+        let (app, dir) = make_app();
+        let new = |c| {
+            let p = Proposal::new(
+                Source::Agent,
+                Action::Accept {
+                    cluster: ClusterId(c),
+                },
+                0.8,
+                vec![],
+                Default::default(),
+            );
+            proposals::append(dir.path(), &p).unwrap();
+            p.id
+        };
+        let (pending, decided) = (new(0), new(1));
+        proposals::record_outcome(dir.path(), decided, Outcome::Accepted).unwrap();
+        drop(app);
+        let (mut app, _d) = make_app();
+        app.set_save_dir(dir.path().to_path_buf(), false);
+        let ids: Vec<u64> = app.host.proposals().iter().map(|p| p.id).collect();
+        assert_eq!(ids, [pending]);
+    }
+
+    /// A History click checks out another branch through the host and
+    /// names the node it went back to.
+    #[test]
+    fn history_checkout_crosses_branches() {
+        let (mut app, _d) = make_app();
+        let relabel = |c, op| CurationCommand::Relabel {
+            cluster: ClusterId(c),
+            op,
+        };
+        app.commit(relabel(1, PhyLabelOp::SetGood));
+        app.dispatch_intent(Intent::Undo);
+        app.commit(relabel(1, PhyLabelOp::SetNoise));
+        assert_eq!(label(&app, 1), Some(3));
+        app.apply_view_action(ViewAction::Checkout(Some(0)));
+        assert_eq!(label(&app, 1), Some(1), "the other branch");
+        assert_eq!(
+            app.status.as_ref().map(|s| s.0.as_str()),
+            Some("back to: relabel cluster 1 as Good")
+        );
+        app.apply_view_action(ViewAction::Checkout(Some(9)));
+        assert!(app.error.is_some());
+    }
+
     fn make_app() -> (SorrelApp<StubProvider>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let mut app = SorrelApp::new(stub_session(dir.path()), label_str);
@@ -2379,7 +2991,7 @@ mod tests {
         assert!(app.last_save.is_some(), "save should feed the saved chip");
         assert!(
             !app.dirty(),
-            "saved_state should snap to current after a successful save"
+            "the head is the saved node after a successful save"
         );
         let prefs = UiPrefs::load(dir.path());
         assert!(prefs.tree.is_some(), "prefs written next to the dataset");
@@ -2408,12 +3020,16 @@ mod tests {
     #[test]
     fn loader_runs_off_thread_and_then_unlocks_the_session() {
         let dir = tempfile::tempdir().unwrap();
-        let mut app = SorrelApp::with_loader(stub_session(dir.path()), label_str, |s| {
-            s.dispatch(CurationCommand::Relabel {
+        let mut earlier = stub_session(dir.path());
+        earlier
+            .dispatch(CurationCommand::Relabel {
                 cluster: ClusterId(1),
                 op: PhyLabelOp::SetGood,
             })
-        });
+            .unwrap();
+        drop(earlier);
+        let mut app =
+            SorrelApp::with_loader(stub_session(dir.path()), label_str, |s| s.replay_journal());
         assert!(app.loading.is_some());
         let rx = app.loading.take().unwrap();
         rx.recv_timeout(std::time::Duration::from_secs(5))

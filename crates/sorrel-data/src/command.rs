@@ -63,6 +63,23 @@ impl std::str::FromStr for Method {
     }
 }
 
+/// Who made an edit in the action tree. Journaled with every node; closed,
+/// so a new kind needs a journal version bump.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum Actor {
+    #[default]
+    Human,
+    Agent {
+        client: String,
+    },
+    Algo {
+        name: String,
+    },
+    Remote {
+        peer: String,
+    },
+}
+
 /// Where a unit came from: straight out of the sorter, or created in sorrel.
 /// Exclusive; there is no "unknown" state.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -130,9 +147,9 @@ impl std::str::FromStr for UnitOrigin {
 /// Strongly-typed curation operations. Concrete enum -> no `Box<dyn Trait>`,
 /// no per-op heap allocation, perfectly packed history.
 ///
-/// `Undo`/`Redo` are first-class journal records: the on-disk log captures
-/// every user action, including reversions. Replay reconstructs the same
-/// in-memory history/redo stacks the live session would hold.
+/// `Undo`/`Redo` move the head of the action tree (parent / most recently
+/// visited child); the journal records them as head moves, never as nodes.
+/// Pre-v3 journals stored them as records, which the v3 upgrade folds.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CurationCommand {
     Relabel {
@@ -216,6 +233,24 @@ impl CurationCommand {
         }
     }
 
+    /// Every cluster the command names (for a split, the source only: the
+    /// new id is allocated at apply time), sorted and deduplicated.
+    pub fn clusters(&self) -> Vec<ClusterId> {
+        let mut out = match self {
+            Self::Relabel { cluster, .. }
+            | Self::Split { cluster, .. }
+            | Self::Note { cluster, .. }
+            | Self::Tag { cluster, .. } => vec![*cluster],
+            Self::Merge { sources, target } => [&[*target][..], sources].concat(),
+            Self::AddSpikes(b) => b.clusters.clone(),
+            Self::Batch { children } => children.iter().flat_map(Self::clusters).collect(),
+            Self::Undo | Self::Redo => Vec::new(),
+        };
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// True for the curation actions that move state forward (i.e. anything
     /// that gets pushed onto the undo stack).
     pub fn is_forward(&self) -> bool {
@@ -232,6 +267,69 @@ impl CurationCommand {
             }
         }
         Some(Self::Batch { children })
+    }
+}
+
+fn label_name(op: PhyLabelOp) -> &'static str {
+    match op {
+        PhyLabelOp::SetGood => "Good",
+        PhyLabelOp::SetMua => "MUA",
+        PhyLabelOp::SetNoise => "Noise",
+        PhyLabelOp::SetUnsorted => "Unsorted",
+    }
+}
+
+/// Short human description of a curation command, shared by GUI toasts,
+/// MCP replies and host events, so undo/redo say *what* they reverted
+/// instead of a bare "undone".
+pub fn describe_command(cmd: &CurationCommand) -> String {
+    match cmd {
+        CurationCommand::Relabel { cluster, op } => {
+            format!("relabel cluster {} as {}", cluster.0, label_name(*op))
+        }
+        CurationCommand::Merge { sources, target } => {
+            format!("merge {} cluster(s) into {}", sources.len(), target.0)
+        }
+        CurationCommand::Split {
+            cluster, spike_idx, ..
+        } => {
+            format!("split cluster {} ({} spikes)", cluster.0, spike_idx.len())
+        }
+        CurationCommand::Note { cluster, text } if text.is_empty() => {
+            format!("clear note on cluster {}", cluster.0)
+        }
+        CurationCommand::Note { cluster, text } => {
+            let brief: String = text.chars().take(24).collect();
+            let dots = if text.chars().count() > 24 { "…" } else { "" };
+            format!("note on cluster {}: {brief}{dots}", cluster.0)
+        }
+        CurationCommand::Tag { cluster, .. } => format!("retag cluster {}", cluster.0),
+        CurationCommand::AddSpikes(b) => {
+            let mut clusters = b.clusters.clone();
+            clusters.sort_unstable();
+            clusters.dedup();
+            format!(
+                "add {} spikes to {} clusters",
+                b.times.len(),
+                clusters.len()
+            )
+        }
+        CurationCommand::Batch { children } => {
+            // A multi-select relabel is journaled as one batch so a single
+            // Undo reverts it; say so instead of "batch of N ops".
+            if let Some(CurationCommand::Relabel { op, .. }) = children.first() {
+                let uniform = children
+                    .iter()
+                    .all(|c| matches!(c, CurationCommand::Relabel { op: o, .. } if o == op));
+                if uniform {
+                    return format!("relabel {} clusters as {}", children.len(), label_name(*op));
+                }
+            }
+            format!("batch of {} ops", children.len())
+        }
+        // Undo/Redo are head moves, never nodes.
+        CurationCommand::Undo => "undo".into(),
+        CurationCommand::Redo => "redo".into(),
     }
 }
 

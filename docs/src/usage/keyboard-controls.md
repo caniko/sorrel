@@ -68,9 +68,10 @@ custom label (`:l group good` moves the selection), `:note text` unit note
 Plain-key shortcuts never fire while a text field has focus. `Ctrl` chords,
 `Esc` and `F1` always do.
 
-Undo and redo are first-class records in the curation journal — replaying
-the journal reconstructs the same history and redo stacks. The top bar's
-Undo/Redo buttons name the command they will revert or re-apply.
+Undo moves to the previous edit and redo to the branch you visited last.
+An edit after an undo starts a new branch, and the old one stays in the
+[History](./history.md) pane. The top bar's Undo/Redo buttons name the
+command they will revert or re-apply.
 
 After a merge the target cluster is selected; after a split both halves
 are. Closing the window with unsaved curation asks whether to save first.
@@ -107,7 +108,7 @@ every view (first selected = blue, second = orange, …).
 
 ## Journaling guarantee
 
-Every label change, merge, split, and undo/redo is written to the journal
+Every label change, merge, split, undo/redo and History jump is written to the journal
 **before** the in-memory session changes. If Sorrel crashes between the
 journal write and the next event, the replay on next open recovers the
 exact same state.

@@ -7,12 +7,13 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use libp2p::{identity::Keypair, Multiaddr};
-use sorrel_data::{baseline_hash, CurationCommand, Journal, PhyLabelOp, Session};
+use sorrel_data::{baseline_hash, CurationCommand, Journal, PhyLabelOp, Session, SessionHost};
 use sorrel_io::kilosort::{KilosortOpenParams, KilosortProvider};
 use sorrel_io::{ClusterId, DataProvider, SampleIndex, TraceSamples};
 use sorrel_remote::protocol::{Cursor, HostError, Record};
 use sorrel_remote::swarm::{Mode, Role};
 use sorrel_remote::{join, rt, serve, DatSource, Pairing, PairingCode, Served, SessionServed};
+use std::sync::Arc;
 
 const N_CH: usize = 4;
 const N_SAMPLES: usize = 40_000; // 320 KiB of int16: five 64 KiB blocks
@@ -62,9 +63,12 @@ fn write_fixture(root: &Path) {
     std::fs::write(root.join(".sorrel/cache/INDEX"), b"not shared").unwrap();
 }
 
-fn open_host(root: &Path) -> (Box<dyn Served>, DatSource, u64) {
+fn open_session(root: &Path) -> (Arc<SessionHost<KilosortProvider>>, DatSource, u64) {
     let p = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
-    let baseline = baseline_hash(&std::fs::read(root.join("spike_clusters.npy")).unwrap());
+    let sc = sorrel_io::RootView::open(root)
+        .unwrap()
+        .path("spike_clusters.npy");
+    let baseline = baseline_hash(&std::fs::read(sc).unwrap());
     let j =
         Journal::open_or_create(&root.join("sorrel.journal"), baseline, p.n_clusters()).unwrap();
     let dat = DatSource {
@@ -76,7 +80,12 @@ fn open_host(root: &Path) -> (Box<dyn Served>, DatSource, u64) {
     };
     let mut s = Session::new(p, j);
     s.replay_journal().unwrap();
-    (Box::new(SessionServed(s)), dat, baseline)
+    (Arc::new(SessionHost::new(s)), dat, baseline)
+}
+
+fn open_host(root: &Path) -> (Box<dyn Served>, DatSource, u64) {
+    let (host, dat, baseline) = open_session(root);
+    (Box::new(SessionServed(host)), dat, baseline)
 }
 
 fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
@@ -157,14 +166,14 @@ fn exercise(mut joined: sorrel_remote::Joined, host_root: &Path, guest_root: &Pa
     }
     let host_journal = host_root.join("sorrel.journal");
     wait_until("3 records on host", || {
-        Journal::replay_at(&host_journal)
+        Journal::read_only_records(&host_journal)
             .map(|r| r.len())
             .unwrap_or(0)
             == 3
     });
     assert_eq!(
-        Journal::replay_at(&host_journal).unwrap().len(),
-        Journal::replay_at(&guest_root.join("sorrel.journal"))
+        Journal::read_only_records(&host_journal).unwrap().len(),
+        Journal::read_only_records(&guest_root.join("sorrel.journal"))
             .unwrap()
             .len()
     );
@@ -190,7 +199,35 @@ fn exercise(mut joined: sorrel_remote::Joined, host_root: &Path, guest_root: &Pa
         ),
         "expected Diverged, got {r:?}"
     );
-    assert_eq!(Journal::replay_at(&host_journal).unwrap().len(), 3);
+    assert_eq!(Journal::read_only_records(&host_journal).unwrap().len(), 3);
+
+    // A guest reading the tail while the host is mid-append (a torn record
+    // at the end) gets the complete records and must not truncate the
+    // journal the host is still writing.
+    let before = std::fs::metadata(&host_journal).unwrap().len();
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&host_journal)
+        .unwrap();
+    f.write_all(&1000u32.to_le_bytes()).unwrap();
+    f.write_all(b"torn").unwrap();
+    drop(f);
+    let torn = std::fs::metadata(&host_journal).unwrap().len();
+    assert!(torn > before);
+    let tail = rt()
+        .block_on(
+            joined
+                .host
+                .ask(&sorrel_remote::protocol::JournalTail { from: 0 })
+                .send(),
+        )
+        .unwrap();
+    assert_eq!(tail.len(), 3);
+    assert_eq!(
+        std::fs::metadata(&host_journal).unwrap().len(),
+        torn,
+        "tail read truncated the live journal"
+    );
 }
 
 fn dirs() -> (tempfile::TempDir, tempfile::TempDir) {
@@ -230,6 +267,62 @@ fn direct_mode_round_trip() {
     )
     .unwrap();
     exercise(joined, host_dir.path(), guest_dir.path(), baseline);
+}
+
+/// A directory the host already saved in sorrel joins: `sorrel_original/`
+/// travels with the other files, and the guest replays the host's journal
+/// onto it, ending at the saved merge. Its own pairing code: tests run in
+/// parallel, and a shared code would pair with another test's host.
+#[test]
+fn join_after_the_host_saved() {
+    let (host_dir, guest_dir) = dirs();
+    let root = host_dir.path();
+    {
+        let (served, ..) = open_host(root);
+        drop(served);
+        let p = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
+        let sc = sorrel_io::RootView::open(root)
+            .unwrap()
+            .path("spike_clusters.npy");
+        let j = Journal::open_or_create(
+            &root.join("sorrel.journal"),
+            baseline_hash(&std::fs::read(sc).unwrap()),
+            p.n_clusters(),
+        )
+        .unwrap();
+        let mut s = Session::new(p, j);
+        s.replay_journal().unwrap();
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(1)],
+            target: ClusterId(0),
+        })
+        .unwrap();
+        sorrel_data::save_and_seal(&mut s, root, |l| l.as_str()).unwrap();
+    }
+    assert!(root.join("sorrel_original/ROOT").exists());
+    let code = PairingCode::parse("absorb abstract absurd abuse access accident").unwrap();
+    let pairing = Pairing::derive(&code).unwrap();
+    let (served, dat, _) = open_host(root);
+    let mode = Mode::Direct {
+        port: 0,
+        dial: None,
+    };
+    let serving = rt()
+        .block_on(serve(served, root.to_path_buf(), dat, &mode, &pairing))
+        .unwrap();
+    let addr = host_listen_addr(&serving);
+    let joined = join(
+        &code,
+        &Mode::Direct {
+            port: 0,
+            dial: Some(addr),
+        },
+        guest_dir.path(),
+    )
+    .unwrap();
+    let s = &joined.session;
+    assert_eq!(s.history_len(), 1);
+    assert!(s.spike_times(ClusterId(1)).is_empty(), "merged away");
 }
 
 #[test]
@@ -298,4 +391,69 @@ fn relay_mode_round_trip() {
         .unwrap();
     let joined = join(&code, &mode, guest_dir.path()).unwrap();
     exercise(joined, host_dir.path(), guest_dir.path(), baseline);
+}
+
+fn relabel(c: u32, op: PhyLabelOp) -> CurationCommand {
+    CurationCommand::Relabel {
+        cluster: ClusterId(c),
+        op,
+    }
+}
+
+/// Guests are human collaborators with a whitelist: undo, redo, add-spikes
+/// and nested batches are refused and change nothing.
+#[test]
+fn guest_commands_are_whitelisted() {
+    let (host_dir, _) = dirs();
+    let (host, ..) = open_session(host_dir.path());
+    let mut served = SessionServed(Arc::clone(&host));
+    let cursor = served.cursor();
+    let batch = |children| CurationCommand::Batch { children };
+    let refused = [
+        CurationCommand::AddSpikes(sorrel_data::command::SpikeBatch::default()),
+        batch(vec![batch(vec![relabel(0, PhyLabelOp::SetGood)])]),
+        batch(vec![relabel(0, PhyLabelOp::SetGood), CurationCommand::Undo]),
+    ];
+    for cmd in refused {
+        let r = served.apply_at(cursor, cmd.clone());
+        assert!(matches!(r, Err(HostError::Rejected(_))), "{cmd:?}: {r:?}");
+        assert_eq!(served.cursor(), cursor, "{cmd:?} changed the journal");
+    }
+    let ok = batch(vec![relabel(0, PhyLabelOp::SetGood)]);
+    let after = served.apply_at(cursor, ok).unwrap();
+    assert!(after.n_records > cursor.n_records);
+    // A guest's own undo key moves the shared head, as a local undo would.
+    let undone = served.apply_at(after, CurationCommand::Undo).unwrap();
+    assert!(undone.n_records > after.n_records);
+    // A split on a cluster that does not exist is refused, not a host panic.
+    let bogus = CurationCommand::Split {
+        cluster: sorrel_io::ClusterId(999),
+        spike_idx: vec![0],
+        new_cluster: sorrel_io::ClusterId(0),
+        by: sorrel_data::Method::Manual,
+    };
+    assert!(served.apply_at(undone, bogus).is_err());
+    assert_eq!(served.cursor(), undone, "nothing applied");
+}
+
+/// A guest record whose cursor went stale because a host edit landed after
+/// the guest read it is refused with `Diverged` and applies nothing.
+#[test]
+fn guest_record_after_a_host_edit_is_diverged() {
+    let (host_dir, _) = dirs();
+    let (host, ..) = open_session(host_dir.path());
+    let mut served = SessionServed(Arc::clone(&host));
+    let seen = served.cursor();
+    host.apply(sorrel_data::Actor::Human, relabel(0, PhyLabelOp::SetGood))
+        .unwrap();
+    let now = served.cursor();
+    let r = served.apply_at(seen, relabel(1, PhyLabelOp::SetNoise));
+    assert_eq!(r, Err(HostError::Diverged { host: now }));
+    assert_eq!(served.cursor(), now, "nothing applied");
+    assert_eq!(
+        served
+            .apply_at(now, relabel(1, PhyLabelOp::SetNoise))
+            .map(|c| c.n_records > now.n_records),
+        Ok(true)
+    );
 }

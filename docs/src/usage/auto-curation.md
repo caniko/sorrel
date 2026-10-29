@@ -113,9 +113,9 @@ child's origin is the method that made the split:
 | Lasso split in the GUI          | `Sorrel[Manual]`                                |
 | split_init                      | `Sorrel[Algo:split_init]`                       |
 | Suggest, GMM split              | `Sorrel[Algo:gmm]`                              |
-| Accepted proposal, agent        | `Sorrel[LLM:agent]`                             |
+| Accepted proposal, agent        | `Sorrel[LLM:<MCP client name>]`                 |
 | Accepted proposal, other source | `Sorrel[Algo:<source>]`, e.g. `Algo:kmeans`     |
-| `sorrel serve` split (MCP)      | `Sorrel[LLM:<MCP client name>]`                 |
+| `sorrel mcp` split              | `Sorrel[LLM:<MCP client name>]`                 |
 | sorrel-py `split(..., by=...)`  | the given method; default `Sorrel[Algo:python]` |
 | Tests and fixtures              | `Sorrel[Manual]`                                |
 
@@ -129,8 +129,7 @@ undo like other edits.
 
 Origins, parents and notes are saved in `cluster_sorrel_annotations.tsv` with
 the columns `cluster_id`, `sorrel_origin`, `sorrel_parents` and `sorrel_note`.
-It has a row for every non-empty unit, so the data survives a save and a
-reseal, and phy shows the columns. Notes are escaped so each fits one cell.
+It has a row for every non-empty unit, and phy shows the columns. Notes are escaped so each fits one cell.
 
 In `curation.json`, the exclusive `origin` label holds each unit's origin, for
 example `Auto[kilosort4]`. Notes are not exported.
@@ -150,10 +149,7 @@ Precedence: `--sorter`, then the name pinned by a saved `Auto[<sorter>]` row,
 then detection. Re-detection never changes a saved name; `--sorter` does, and
 the next save pins the new name. A saved `Auto[unknown]` pins nothing.
 
-The journal is format version 2. This build reads version 1 journals and
-upgrades them on open. Older builds refuse a version 2 journal with
-"unsupported journal version" rather than truncating it. Upgrade every sorrel
-build that opens the same sort.
+The journal format is described in [History](./history.md#journal-format).
 
 `origin` is not the same as the `src:*` tags. The origin says where a unit came
 from. The `src:*` tags say who labelled or reviewed it, for example `src:llm`
@@ -165,7 +161,7 @@ or `src:human`. The two are independent, and the `src:*` tags are unchanged.
   list the clusters with the most review tags first. The filter box matches
   tags as well as ids, e.g. `merged`, `src:llm` or `bc:snr`.
 - **HTML:** `sorrel report DIR --tag review: --out review.html`.
-- **Agents:** `sorrel serve` adds `list_clusters {"tag": "review:"}`,
+- **Agents:** `sorrel mcp` adds `list_clusters {"tag": "review:"}`,
   `evidence {"cluster": N}` (the classifier outputs and Claude verdicts) and
   `tag`, so an MCP client can go through the queue with the same evidence.
 

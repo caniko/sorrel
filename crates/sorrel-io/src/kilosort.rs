@@ -170,10 +170,13 @@ impl KilosortProvider {
     pub fn open(root: impl AsRef<Path>, overrides: KilosortOpenParams) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         roll_forward_pending(&root)?;
+        // Every curation file is read as the sort left it: a file sorrel has
+        // since saved over comes from the root snapshot (see `RootView`).
+        let view = RootView::open(&root)?;
 
         // 1. params.py — optional but strongly preferred. If present, it owns
         // sample_rate / n_channels / dtype / offset / dat_path defaults.
-        let params_path = root.join("params.py");
+        let params_path = view.path("params.py");
         let params: PhyParams = if params_path.exists() {
             PhyParams::read(&params_path)?
         } else {
@@ -192,9 +195,9 @@ impl KilosortProvider {
         let offset = overrides.offset.or(params.offset).unwrap_or(0);
 
         // 2. Spike index files.
-        let spike_times_path = root.join("spike_times.npy");
-        let spike_clusters_path = root.join("spike_clusters.npy");
-        let cluster_group_path = root.join("cluster_group.tsv");
+        let spike_times_path = view.path("spike_times.npy");
+        let spike_clusters_path = view.path("spike_clusters.npy");
+        let cluster_group_path = view.path("cluster_group.tsv");
 
         let st_hdr = read_header(&spike_times_path)?;
         let sc_hdr = read_header(&spike_clusters_path)?;
@@ -216,8 +219,8 @@ impl KilosortProvider {
         // Optional per-spike side data. When present, length must match the
         // number of spikes; we keep `None` when the file is missing so the
         // trait impls can return empty slices instead of fabricating zeros.
-        let amps_full = read_optional_f32_1d(&root.join("amplitudes.npy"), n_spikes)?;
-        let templates_full = read_optional_u32_1d(&root.join("spike_templates.npy"), n_spikes)?;
+        let amps_full = read_optional_f32_1d(&view.path("amplitudes.npy"), n_spikes)?;
+        let templates_full = read_optional_u32_1d(&view.path("spike_templates.npy"), n_spikes)?;
 
         // Single bucketing pass that keeps (time, amp?, tpl?) aligned: collect
         // (time, idx) tuples per cluster, sort by time, then gather aligned
@@ -261,22 +264,23 @@ impl KilosortProvider {
             load_cluster_groups(&cluster_group_path, n_clusters)
         } else {
             crate::curation_json::read_curation_labels(
-                &root.join("curation.json"),
+                &view.path("curation.json"),
                 n_clusters,
                 |uid| usize::try_from(uid).ok(),
             )
-            .unwrap_or_else(|| load_cluster_groups(&root.join("cluster_KSLabel.tsv"), n_clusters))
+            .unwrap_or_else(|| load_cluster_groups(&view.path("cluster_KSLabel.tsv"), n_clusters))
         };
 
-        let mut initial_tags = with_phy_labels(&root, read_tags_tsv(&root.join(TAGS_TSV)));
-        let initial_annotations = read_annotations_tsv(&root.join(ANNOTATIONS_TSV));
-        let pinned_sorter = pinned_sorter(&initial_annotations);
+        let mut initial_tags = with_phy_labels(&view, read_tags_tsv(&view.path(TAGS_TSV)));
+        let initial_annotations = read_annotations_tsv(&view.path(ANNOTATIONS_TSV));
+        // The sorter pin is metadata, not curation: the last save's wins.
+        let pinned_sorter = pinned_sorter(&read_annotations_tsv(&root.join(ANNOTATIONS_TSV)));
 
         // 2.5. Probe geometry. All optional; absence is fine.
-        let channel_positions = read_optional_positions(&root.join("channel_positions.npy"))?;
+        let channel_positions = read_optional_positions(&view.path("channel_positions.npy"))?;
         let channel_shanks =
-            read_optional_u32_1d(&root.join("channel_shanks.npy"), 0)?.unwrap_or_default();
-        let channel_map: Vec<ChannelId> = read_optional_u32_1d(&root.join("channel_map.npy"), 0)?
+            read_optional_u32_1d(&view.path("channel_shanks.npy"), 0)?.unwrap_or_default();
+        let channel_map: Vec<ChannelId> = read_optional_u32_1d(&view.path("channel_map.npy"), 0)?
             .unwrap_or_default()
             .into_iter()
             .map(ChannelId)
@@ -285,10 +289,10 @@ impl KilosortProvider {
         // 2.6. PC features. Both files are optional but we need both or
         // neither — having pc_features without pc_feature_ind makes the
         // shape unusable.
-        let (pc_features, pc_shape, pc_feature_ind) = read_optional_pc_features(&root, n_spikes)?;
-        let template_features = read_optional_template_features(&root, n_spikes)?;
-        let spike_attributes = read_spike_attributes(&root, n_spikes);
-        let spike_reorder = read_1d_u32(&root.join("spike_reorder.npy"))
+        let (pc_features, pc_shape, pc_feature_ind) = read_optional_pc_features(&view, n_spikes)?;
+        let template_features = read_optional_template_features(&view, n_spikes)?;
+        let spike_attributes = read_spike_attributes(&view, n_spikes);
+        let spike_reorder = read_1d_u32(&view.path("spike_reorder.npy"))
             .ok()
             .filter(|r| r.len() == n_spikes && r.iter().all(|&i| (i as usize) < n_spikes))
             .map(std::sync::Arc::from);
@@ -296,7 +300,7 @@ impl KilosortProvider {
         // 2.7. Template waveforms + similarity matrix. Both optional; the
         // TemplateView and SimilarityView gracefully degrade when absent.
         let (template_waveforms, template_shape) =
-            read_optional_templates(&root.join("templates.npy"))?;
+            read_optional_templates(&view.path("templates.npy"))?;
 
         // First open of a folder sorrel has not saved yet: tag units edited
         // outside sorrel (phy). Verified that a FRESH sort never trips either
@@ -326,13 +330,13 @@ impl KilosortProvider {
             }
         }
         let similar_templates =
-            read_optional_similar_templates(&root.join("similar_templates.npy"), template_shape.0)?;
+            read_optional_similar_templates(&view.path("similar_templates.npy"), template_shape.0)?;
 
         // 2.8. Quality metrics. Two sidecar conventions:
         //   - phy:  one `cluster_<metric>.tsv` per metric.
         //   - SI:   a single `quality_metrics.csv` with one row per cluster.
         // We accept both; SI's CSV wins when both are present.
-        let metrics = load_quality_metrics(&root, n_clusters);
+        let metrics = load_quality_metrics(&view, n_clusters);
 
         // 3. Raw recording.
         let dat_rel = overrides
@@ -401,7 +405,7 @@ impl KilosortProvider {
         let identity_bytes = provider_identity_bytes(&[
             &spike_times_path,
             &spike_clusters_path,
-            &root.join("amplitudes.npy"),
+            &view.path("amplitudes.npy"),
             &dat_path,
         ]);
 
@@ -678,21 +682,19 @@ impl HasQualityMetrics for KilosortProvider {
 /// `quality_metrics.csv` first, then falls back to phy's per-metric
 /// `cluster_<metric>.tsv` files. Always returns the metric list sorted by
 /// name so the cluster-table column order is deterministic.
-fn load_quality_metrics(root: &Path, n_clusters: usize) -> crate::extras::QualityMetrics {
+fn load_quality_metrics(view: &RootView, n_clusters: usize) -> crate::extras::QualityMetrics {
     let mut metrics = crate::extras::QualityMetrics::new();
 
     // SI: single CSV with header row, first column is unit id.
-    let si_path = root.join("quality_metrics.csv");
+    let si_path = view.path("quality_metrics.csv");
     if let Ok(text) = std::fs::read_to_string(&si_path) {
         ingest_si_metrics_csv(&text, n_clusters, &mut metrics);
     }
 
     // phy: one TSV per metric. Skip phy's well-known label files since
     // those aren't metrics (they're labels we already loaded).
-    if let Ok(rd) = std::fs::read_dir(root) {
-        for entry in rd.flatten() {
-            let name = entry.file_name();
-            let name_s = name.to_string_lossy();
+    {
+        for (name_s, path) in view.files() {
             let Some(stripped) = name_s
                 .strip_prefix("cluster_")
                 .and_then(|s| s.strip_suffix(".tsv"))
@@ -706,7 +708,7 @@ fn load_quality_metrics(root: &Path, n_clusters: usize) -> crate::extras::Qualit
             if metrics.contains(stripped) {
                 continue; // SI CSV took precedence.
             }
-            if let Ok(text) = std::fs::read_to_string(entry.path()) {
+            if let Ok(text) = std::fs::read_to_string(&path) {
                 if let Some(col) = parse_phy_metric_tsv(&text, stripped, n_clusters) {
                     metrics.insert(stripped.to_string(), col);
                 }
@@ -847,17 +849,12 @@ fn read_optional_u32_1d(path: &Path, expected_len: usize) -> Result<Option<Vec<u
 /// known per-spike files, with `n_spikes` rows; at most 2 columns are kept
 /// (phy plots 1-D as time vs value and 2-D as x vs y). Unreadable or
 /// mis-sized files are skipped with a warning, as phylib does.
-fn read_spike_attributes(root: &Path, n_spikes: usize) -> Vec<SpikeAttribute> {
-    let Ok(rd) = std::fs::read_dir(root) else {
-        return Vec::new();
-    };
-    let mut out: Vec<SpikeAttribute> = rd
-        .flatten()
-        .filter_map(|e| {
-            let path = e.path();
-            let name = path
-                .file_name()?
-                .to_str()?
+fn read_spike_attributes(view: &RootView, n_spikes: usize) -> Vec<SpikeAttribute> {
+    let mut out: Vec<SpikeAttribute> = view
+        .files()
+        .into_iter()
+        .filter_map(|(name, path)| {
+            let name = name
                 .strip_prefix("spike_")?
                 .strip_suffix(".npy")?
                 .to_string();
@@ -902,12 +899,12 @@ type SpikeAttribute = (String, std::sync::Arc<[f32]>, usize);
 /// `template_features.npy` + `template_feature_ind.npy`: both or neither,
 /// with matching widths. Absent files give an empty triple.
 fn read_optional_template_features(
-    root: &Path,
+    view: &RootView,
     n_spikes: usize,
 ) -> Result<(std::sync::Arc<[f32]>, usize, Vec<u32>)> {
     let (feat, ind) = (
-        root.join("template_features.npy"),
-        root.join("template_feature_ind.npy"),
+        view.path("template_features.npy"),
+        view.path("template_feature_ind.npy"),
     );
     if !feat.exists() || !ind.exists() {
         return Ok((std::sync::Arc::from([]), 0, Vec::new()));
@@ -922,9 +919,9 @@ fn read_optional_template_features(
 
 type PcFeatures = (Vec<f32>, (usize, usize), Vec<u32>);
 
-fn read_optional_pc_features(root: &Path, n_spikes: usize) -> Result<PcFeatures> {
-    let feat_path = root.join("pc_features.npy");
-    let ind_path = root.join("pc_feature_ind.npy");
+fn read_optional_pc_features(view: &RootView, n_spikes: usize) -> Result<PcFeatures> {
+    let feat_path = view.path("pc_features.npy");
+    let ind_path = view.path("pc_feature_ind.npy");
     if !feat_path.exists() || !ind_path.exists() {
         return Ok((Vec::new(), (0, 0), Vec::new()));
     }
@@ -1140,18 +1137,12 @@ pub fn read_cluster_group_tsv(path: &Path) -> Option<Vec<(u32, PhyLabel)>> {
 /// `(key, rows)` of every `cluster_<key>.tsv` that [`with_phy_labels`] reads
 /// as a label file: a non-reserved key whose non-empty values are not all
 /// numeric. Sorted by file name.
-fn phy_label_files(root: &Path) -> Vec<(String, Vec<(usize, String)>)> {
-    let Ok(rd) = std::fs::read_dir(root) else {
-        return Vec::new();
-    };
-    let mut files: Vec<_> = rd.flatten().map(|e| e.path()).collect();
-    files.sort();
+fn phy_label_files(view: &RootView) -> Vec<(String, Vec<(usize, String)>)> {
     let mut out = Vec::new();
-    for path in files {
-        let Some(key) = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|n| n.strip_prefix("cluster_")?.strip_suffix(".tsv"))
+    for (name, path) in view.files() {
+        let Some(key) = name
+            .strip_prefix("cluster_")
+            .and_then(|n| n.strip_suffix(".tsv"))
         else {
             continue;
         };
@@ -1181,15 +1172,18 @@ fn phy_label_files(root: &Path) -> Vec<(String, Vec<(usize, String)>)> {
 /// Keys of the `cluster_<key>.tsv` files a directory open turns into custom
 /// labels. The saver blanks the ones whose label the session has cleared.
 pub fn phy_label_keys(root: &Path) -> Vec<String> {
-    phy_label_files(root).into_iter().map(|f| f.0).collect()
+    phy_label_files(&RootView::top(root))
+        .into_iter()
+        .map(|f| f.0)
+        .collect()
 }
 
 /// phy custom labels (`:l name value` writes `cluster_<name>.tsv`) as
 /// `name=value` tags, from every `cluster_*.tsv` with a non-numeric value
 /// (all-numeric files load as metrics). A cluster that already has a
 /// `name=` tag from the sorrel sidecar keeps it.
-fn with_phy_labels(root: &Path, mut tags: Vec<Vec<String>>) -> Vec<Vec<String>> {
-    for (key, rows) in phy_label_files(root) {
+fn with_phy_labels(view: &RootView, mut tags: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    for (key, rows) in phy_label_files(view) {
         let prefix = format!("{key}=");
         for (id, v) in rows {
             let tag = format!("{prefix}{v}");
@@ -1205,6 +1199,109 @@ fn with_phy_labels(root: &Path, mut tags: Vec<Vec<String>>) -> Vec<Vec<String>> 
         }
     }
     tags
+}
+
+/// Sorrel's root snapshot inside a phy directory: the version of every file
+/// a save has replaced (or created), as the sort left it.
+pub const ROOT_DIR: &str = "sorrel_original";
+/// Manifest of [`ROOT_DIR`]: one `name\tpresent|absent` line per captured
+/// file; `absent` = the file did not exist at the root.
+pub const ROOT_MANIFEST: &str = "ROOT";
+
+/// A phy directory as the sort left it, the root of the action tree. The
+/// journal replays onto this view, never onto the files sorrel last saved:
+/// a file listed in the [`ROOT_MANIFEST`] resolves into [`ROOT_DIR`] (or to
+/// nothing when it was absent), anything else to the directory itself.
+#[derive(Clone, Debug)]
+pub struct RootView {
+    dir: PathBuf,
+    /// Captured names, `true` when the file existed at the root.
+    captured: std::collections::BTreeMap<String, bool>,
+}
+
+impl RootView {
+    /// The view of `dir`, honouring its root snapshot when one exists.
+    /// Refuses a manifest that is malformed or names a missing file.
+    pub fn open(dir: &Path) -> Result<Self> {
+        let manifest = dir.join(ROOT_DIR).join(ROOT_MANIFEST);
+        let text = match std::fs::read_to_string(&manifest) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::top(dir)),
+            r => r.with_context(|| format!("read {}", manifest.display()))?,
+        };
+        let mut captured = std::collections::BTreeMap::new();
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            let (name, state) = line
+                .split_once('\t')
+                .filter(|(n, _)| Path::new(n).file_name().is_some_and(|f| f == *n))
+                .with_context(|| format!("{}: malformed line {line:?}", manifest.display()))?;
+            let present = match state {
+                "present" => true,
+                "absent" => false,
+                _ => bail!("{}: malformed line {line:?}", manifest.display()),
+            };
+            if present && !dir.join(ROOT_DIR).join(name).exists() {
+                bail!(
+                    "{}: the root copy of {name} is missing; the journal cannot be replayed",
+                    manifest.display()
+                );
+            }
+            captured.insert(name.to_owned(), present);
+        }
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            captured,
+        })
+    }
+
+    /// `dir` as it is, ignoring any snapshot.
+    pub fn top(dir: &Path) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            captured: Default::default(),
+        }
+    }
+
+    /// The root version of `name` (a path that does not exist when the file
+    /// was absent at the root).
+    pub fn path(&self, name: &str) -> PathBuf {
+        match self.captured.contains_key(name) {
+            true => self.dir.join(ROOT_DIR).join(name),
+            false => self.dir.join(name),
+        }
+    }
+
+    /// True once a save has captured `name` (present or absent).
+    pub fn is_captured(&self, name: &str) -> bool {
+        self.captured.contains_key(name)
+    }
+
+    /// `(name, present)` of every captured file, by name.
+    pub fn captured(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.captured.iter().map(|(n, &p)| (n.as_str(), p))
+    }
+
+    /// `(name, path)` of every entry of the root, sorted by name.
+    pub fn files(&self) -> Vec<(String, PathBuf)> {
+        let mut out: Vec<(String, PathBuf)> = std::fs::read_dir(&self.dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !self.captured.contains_key(n))
+            .chain(
+                self.captured
+                    .iter()
+                    .filter(|c| *c.1)
+                    .map(|(n, _)| n.clone()),
+            )
+            .map(|n| {
+                let p = self.path(&n);
+                (n, p)
+            })
+            .collect();
+        out.sort();
+        out
+    }
 }
 
 /// Manifest of an in-flight per-spike array rewrite: one `tmp\tfinal` pair of
@@ -1438,7 +1535,10 @@ mod tests {
         w("cluster_ContamPct.tsv", "cluster_id\tContamPct\n0\t1.5\n");
         w("cluster_group.tsv", "cluster_id\tgroup\n0\tgood\n");
         // The sorrel sidecar already holds quality for cluster 2.
-        let tags = with_phy_labels(dir.path(), vec![vec![], vec![], vec!["quality=ok".into()]]);
+        let tags = with_phy_labels(
+            &RootView::top(dir.path()),
+            vec![vec![], vec![], vec!["quality=ok".into()]],
+        );
         assert_eq!(tags[0], ["quality=great"]);
         assert!(tags[1].is_empty());
         assert_eq!(tags[2], ["quality=ok"]);
@@ -1568,5 +1668,35 @@ mod tests {
     fn external_tag_skipped_once_annotations_exist() {
         let tags = external_tags(&[0, 1, 1, 1], &[0, 1, 2, 1], 3, true);
         assert!(external(&tags).is_empty());
+    }
+
+    /// Captured names resolve into the snapshot (absent ones to nothing),
+    /// everything else to the directory; a listed copy that is missing is
+    /// refused.
+    #[test]
+    fn root_view_overlays_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir(d.join(ROOT_DIR)).unwrap();
+        for (n, t) in [("a.tsv", "top"), ("b.tsv", "top"), ("c.tsv", "top")] {
+            std::fs::write(d.join(n), t).unwrap();
+        }
+        std::fs::write(d.join(ROOT_DIR).join("a.tsv"), "root").unwrap();
+        let manifest = d.join(ROOT_DIR).join(ROOT_MANIFEST);
+        std::fs::write(&manifest, "a.tsv\tpresent\nb.tsv\tabsent\n").unwrap();
+
+        let v = RootView::open(d).unwrap();
+        assert_eq!(std::fs::read_to_string(v.path("a.tsv")).unwrap(), "root");
+        assert!(!v.path("b.tsv").exists(), "absent at the root");
+        assert_eq!(v.path("c.tsv"), d.join("c.tsv"));
+        let names: Vec<String> = v.files().into_iter().map(|f| f.0).collect();
+        assert!(names.contains(&"a.tsv".to_string()) && names.contains(&"c.tsv".to_string()));
+        assert!(!names.contains(&"b.tsv".to_string()));
+        assert_eq!(RootView::top(d).path("a.tsv"), d.join("a.tsv"));
+
+        std::fs::write(&manifest, "z.tsv\tpresent\n").unwrap();
+        assert!(RootView::open(d).is_err(), "missing root copy");
+        std::fs::write(&manifest, "../x\tpresent\n").unwrap();
+        assert!(RootView::open(d).is_err(), "not a bare name");
     }
 }

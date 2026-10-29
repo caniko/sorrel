@@ -86,14 +86,19 @@ pub fn join(code: &PairingCode, mode: &Mode, into: &Path) -> Result<Joined> {
                 .send()
                 .await
                 .map_err(|e| anyhow::anyhow!("journal tail: {e}"))?;
-            for cmd in &tail {
-                journal.append(cmd)?;
+            for rec in &tail {
+                journal.append(rec)?;
             }
             println!("journal: pulled {} records from host", tail.len());
         } else if local_n > host_n {
             // We curated offline (or the host was down): push our tail first.
             let ours = Journal::replay_at(&journal_path)?;
-            for cmd in &ours[host_n as usize..] {
+            // ponytail: only offline edits are pushed; an offline undo,
+            // redo or save needs the node-id protocol (PROTO v4).
+            // Checked for the whole tail first, so a refusal leaves the host
+            // untouched and a retry behaves the same.
+            let cmds = pushable_tail(&ours[host_n as usize..])?;
+            for cmd in cmds {
                 cursor = host
                     .ask(&Record {
                         cursor,
@@ -105,7 +110,10 @@ pub fn join(code: &PairingCode, mode: &Mode, into: &Path) -> Result<Joined> {
             }
             println!("journal: pushed {} records to host", local_n - host_n);
         }
-        let local_baseline = baseline_hash(&std::fs::read(into.join("spike_clusters.npy"))?);
+        // The journal is sealed against the sort as loaded, which a saved
+        // directory keeps in `sorrel_original/` (synced like any other file).
+        let root_clusters = sorrel_io::RootView::open(into)?.path("spike_clusters.npy");
+        let local_baseline = baseline_hash(&std::fs::read(root_clusters)?);
         if local_baseline != info.cursor.baseline {
             bail!(
                 "spike_clusters.npy hash differs from the host journal baseline; download corrupt?"
@@ -157,6 +165,17 @@ pub fn join(code: &PairingCode, mode: &Mode, into: &Path) -> Result<Joined> {
             error,
         })
     })
+}
+
+/// The commands of an offline journal tail, or an error when any record is
+/// not an edit (nothing may be sent to the host then).
+fn pushable_tail(tail: &[sorrel_data::Record]) -> Result<Vec<&sorrel_data::CurationCommand>> {
+    tail.iter()
+        .map(|rec| match rec {
+            sorrel_data::Record::Node { cmd, .. } => Ok(cmd),
+            _ => bail!("cannot push an offline undo, redo or save to the host; re-join fresh"),
+        })
+        .collect()
 }
 
 async fn sync_file(host: &RemoteActorRef<HostActor>, into: &Path, f: &FileEntry) -> Result<()> {
@@ -211,4 +230,33 @@ fn blake3_of(path: &Path) -> Result<[u8; 32]> {
     let mut h = blake3::Hasher::new();
     h.update_reader(File::open(path)?)?;
     Ok(*h.finalize().as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sorrel_data::{Actor, CurationCommand, PhyLabelOp};
+
+    /// A `Head` anywhere in the offline tail refuses the whole tail, so no
+    /// leading edit is forwarded before the join fails.
+    #[test]
+    fn offline_tail_with_a_head_is_refused_whole() {
+        let node = |id| sorrel_data::Record::Node {
+            id,
+            parent: id.checked_sub(1),
+            actor: Actor::Human,
+            ts_ms: 0,
+            cmd: CurationCommand::Relabel {
+                cluster: sorrel_io::ClusterId(0),
+                op: PhyLabelOp::SetGood,
+            },
+        };
+        assert_eq!(pushable_tail(&[node(0), node(1)]).unwrap().len(), 2);
+        let tail = [
+            node(0),
+            node(1),
+            sorrel_data::Record::Head { node: Some(0) },
+        ];
+        assert!(pushable_tail(&tail).is_err());
+    }
 }

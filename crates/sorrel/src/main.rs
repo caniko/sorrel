@@ -12,8 +12,8 @@ use clap::{Args, Parser, Subcommand};
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::{
     apply_rules, baseline_hash, collect_qc_rows, diff_labels, export_qc, rank_merge_candidates,
-    rank_split_candidates, save_and_reseal_journal, save_to_phy, serve, write_report, Journal,
-    ReportFilter, RuleSet, Session, SuggestConfig,
+    rank_split_candidates, save_session as save_dir_session, save_to_phy, serve, write_report,
+    Journal, ReportFilter, RuleSet, Session, SuggestConfig,
 };
 use sorrel_io::kilosort::{read_cluster_group_tsv, KilosortOpenParams, PhyLabel};
 use sorrel_io::open_ephys::OebinMeta;
@@ -53,6 +53,10 @@ enum Backend {
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
+    /// Run the session host without the GUI: MCP clients connect with
+    /// `sorrel mcp <DATA_DIR>`. Stops on Ctrl-C.
+    #[arg(long)]
+    headless: bool,
     /// `sorrel <DATA_DIR> [flags]` with no subcommand means `open`.
     #[command(flatten)]
     open: OpenArgs,
@@ -155,9 +159,12 @@ enum Cmd {
         #[arg(long, value_name = "PREFIX")]
         tag: Option<String>,
     },
-    /// Serve JSON-RPC 2.0 over stdio (MCP shape) so agents and notebooks can
-    /// inspect metrics, request plots and curate through the journal
-    Serve {
+    /// MCP over stdio, the command an agent launches: attaches to the host
+    /// running on DATA_DIR (the GUI or `--headless`), else opens the dataset
+    /// in-process. Agents inspect metrics, request plots and curate through
+    /// the journal.
+    #[command(alias = "serve")]
+    Mcp {
         #[command(flatten)]
         open: OpenArgs,
     },
@@ -302,8 +309,10 @@ struct OpenArgs {
     /// Curation journal (default: <DATA_DIR>/sorrel.journal)
     #[arg(long, value_name = "PATH")]
     journal: Option<PathBuf>,
-    /// Delete the existing journal before opening. The escape hatch for a
-    /// journal sealed against a spike_clusters.npy that has since changed.
+    /// Set the existing journal aside before opening (renamed to
+    /// `<journal>.<unix seconds>`, not deleted; a phy root's sorrel_original/
+    /// is set aside too). The escape hatch for a journal sealed against a
+    /// spike_clusters.npy that has since changed.
     #[arg(long)]
     discard_journal: bool,
     /// Populate sample-rate / channels / dtype from a SpikeGLX .meta
@@ -357,43 +366,21 @@ fn phy_label_str(l: &PhyLabel) -> &'static str {
     l.as_str()
 }
 
-/// Resolve the journal path: explicit `--journal`, else `<dir>/<stem>.journal`.
-/// Falls back to the legacy `<stem>.sqlite` name when only that file exists
-/// (the format was never SQLite; the name was historical).
+fn journal_opts(open: &OpenArgs) -> sorrel_data::JournalOpts {
+    sorrel_data::JournalOpts {
+        path: open.journal.clone(),
+        discard: open.discard_journal,
+    }
+}
+
+/// `--journal`, else `<dir>/<stem>.journal` (see [`sorrel_data::journal_path`]).
 fn journal_path(open: &OpenArgs, dir: &Path, stem: &str) -> PathBuf {
-    if let Some(p) = &open.journal {
-        return p.clone();
-    }
-    let current = dir.join(format!("{stem}.journal"));
-    let legacy = dir.join(format!("{stem}.sqlite"));
-    if !current.exists() && legacy.exists() {
-        log::warn!(
-            "using legacy journal {}; rename it to {} at your convenience",
-            legacy.display(),
-            current.display()
-        );
-        return legacy;
-    }
-    current
+    sorrel_data::journal_path(&journal_opts(open), dir, stem)
 }
 
 /// Open the journal sealed against `baseline`, honouring `--discard-journal`.
-/// A baseline mismatch means the journal's edits would replay onto data they
-/// were not recorded against, so this fails closed and names both ways out.
 fn open_journal(open: &OpenArgs, path: &Path, baseline: u64, n_clusters: u32) -> Result<Journal> {
-    if open.discard_journal && path.exists() {
-        std::fs::remove_file(path)
-            .with_context(|| format!("discard journal {}", path.display()))?;
-        log::warn!("discarded journal {}", path.display());
-    }
-    Journal::open_or_create(path, baseline, n_clusters).with_context(|| {
-        format!(
-            "journal {} was sealed against different data (or by an older sorrel without a \
-             seal). If that curation is already saved, rerun with --discard-journal; to keep \
-             unsaved edits, restore the spike_clusters.npy the journal was recorded against.",
-            path.display()
-        )
-    })
+    sorrel_data::open_journal(&journal_opts(open), path, baseline, n_clusters)
 }
 
 /// Detect which backend a path looks like. Phy markers take precedence
@@ -527,7 +514,7 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
             let root = open.root().to_path_buf();
             let provider = SortingAnalyzerProvider::open(&root)?;
             // The analyzer's own sorting is reloaded on every open, so the
-            // journal stays the source of truth and is never resealed.
+            // journal stays the source of truth and is never sealed.
             let baseline = baseline_hash(&provider.identity_bytes());
             let journal_path = journal_path(open, &root, "sorrel");
             let journal = open_journal(open, &journal_path, baseline, provider.n_clusters())?;
@@ -594,24 +581,19 @@ fn new_session<P: DataProvider>(
     session
 }
 
-/// Open a phy directory with explicit `params`, sealed against the saved
-/// `spike_clusters.npy` (phy dirs read it back, so saves reseal). The
-/// session comes back **unseeded**: run [`seed_kilosort`] (or hand it to
-/// the GUI loader) before using it.
+/// Open a phy directory with explicit `params` (see [`sorrel_data::open_phy`]:
+/// sealed against the root, refusing external edits). The session comes
+/// back **unseeded**: run [`seed_kilosort`] (or hand it to the GUI loader)
+/// before using it.
 fn open_kilosort(
     open: &OpenArgs,
     params: KilosortOpenParams,
 ) -> Result<(Session<KilosortProvider>, OpenCtx<KilosortProvider>)> {
     let root = open.root().to_path_buf();
-    let provider = KilosortProvider::open(&root, params)?;
-    let clusters_path = root.join("spike_clusters.npy");
-    let baseline = baseline_hash(
-        &std::fs::read(&clusters_path)
-            .with_context(|| format!("read {}", clusters_path.display()))?,
-    );
-    let journal_path = journal_path(open, &root, "sorrel");
-    let journal = open_journal(open, &journal_path, baseline, provider.n_clusters())?;
-    let session = new_session(provider, journal, open, sorrel_io::Backend::Kilosort);
+    let mut session = sorrel_data::open_phy(&root, params, &journal_opts(open))?;
+    if let Some(flag) = &open.sorter {
+        session.set_sorter(flag.clone());
+    }
     let metrics = session.provider.quality_metrics().clone();
     let positions = session.provider.channel_positions().to_vec();
     let shanks = session.provider.channel_shanks().to_vec();
@@ -672,7 +654,9 @@ fn run_share(open: &OpenArgs, port: u16, relay: Option<sorrel_remote::Multiaddr>
         None => sorrel_remote::Mode::Direct { port, dial: None },
     };
     sorrel_remote::share(
-        Box::new(sorrel_remote::SessionServed(session)),
+        Box::new(sorrel_remote::SessionServed(std::sync::Arc::new(
+            sorrel_data::SessionHost::new(session),
+        ))),
         ctx.save_dir,
         dat,
         mode,
@@ -699,8 +683,8 @@ fn run_join(
         PathBuf::from(format!("sorrel-remote-{first}"))
     });
     let joined = sorrel_remote::join(&code, &mode, &into)?;
-    // The host tracks our journal cursor, so the guest never reseals: a
-    // reseal would reset the record count and every later record would be
+    // The host tracks our journal cursor, so the guest never seals: a seal
+    // record would advance only our count and every later record would be
     // refused as diverged. Saving still writes the phy files locally.
     let ctx = OpenCtx {
         save_dir: joined.root,
@@ -940,20 +924,13 @@ impl SessionVisitor for Apply {
     }
 }
 
-/// Write the phy artifacts like Ctrl-S in the GUI (resealing the journal on
+/// Write the phy artifacts like Ctrl-S in the GUI (sealing the journal on
 /// backends that read the saved clusters back).
 fn save_session<P>(session: &mut Session<P>, ctx: &OpenCtx<P>) -> Result<()>
 where
     P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
 {
-    if ctx.reseal_on_save {
-        let journal_path = session.journal_path().to_path_buf();
-        let journal =
-            save_and_reseal_journal(session, &ctx.save_dir, &journal_path, phy_label_str)?;
-        session.reseal(journal);
-    } else {
-        save_to_phy(session, &ctx.save_dir, phy_label_str)?;
-    }
+    save_dir_session(session, &ctx.save_dir, ctx.reseal_on_save, phy_label_str)?;
     println!("saved → {}", ctx.save_dir.display());
     Ok(())
 }
@@ -1179,17 +1156,76 @@ fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> String {
     rows.iter().map(|(k, v)| format!("{k:<14}{v}\n")).collect()
 }
 
+/// Where a host for `open` writes `.sorrel/mcp.json`: the save directory,
+/// i.e. the dataset directory or a single file's parent.
+fn host_dir(open: &OpenArgs) -> PathBuf {
+    let root = open.root();
+    match root.is_dir() {
+        true => root.to_path_buf(),
+        false => root.parent().unwrap_or(Path::new(".")).to_path_buf(),
+    }
+}
+
+/// `sorrel mcp`: bridge stdio to a running host, else serve in-process.
+fn run_mcp(open: &OpenArgs) -> Result<()> {
+    if sorrel_data::attach(&host_dir(open), std::io::stdin(), std::io::stdout())? {
+        return Ok(());
+    }
+    // attach found no listener. If another process still has the journal
+    // open, serving here would be a second writer: refuse and say so.
+    with_session(open, Serve).map_err(busy_hint)
+}
+
+/// Name the process holding the journal when `e` is a [`JournalBusy`].
+fn busy_hint(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast_ref::<sorrel_data::journal::JournalBusy>() {
+        Some(b) => anyhow::anyhow!(
+            "{b}: another sorrel owns this dataset but its MCP listener is not \
+             reachable (no usable MCP token file). Close it, or run `sorrel mcp` \
+             once its host (the GUI or `sorrel --headless`) is up"
+        ),
+        None => e,
+    }
+}
+
+/// `sorrel --headless`: the host and its MCP listener, no window.
+struct Headless;
+impl SessionVisitor for Headless {
+    fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
+    where
+        P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
+    {
+        let host = std::sync::Arc::new(sorrel_data::SessionHost::new(seeded(session, seed)?));
+        let listener = sorrel_data::spawn_listener(
+            host,
+            &ctx.save_dir,
+            ctx.reseal_on_save,
+            phy_label_str,
+            None,
+        )?;
+        println!(
+            "sorrel host on 127.0.0.1:{}; connect an agent with `sorrel mcp {}`; Ctrl-C stops",
+            listener.port(),
+            ctx.save_dir.display()
+        );
+        // Ctrl-C returns, dropping the listener so it removes its mcp.json.
+        sorrel_remote::wait_for_ctrl_c();
+        drop(listener);
+        Ok(())
+    }
+}
+
 struct Serve;
 impl SessionVisitor for Serve {
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
-        let mut session = seeded(session, seed)?;
+        let host = sorrel_data::SessionHost::new(seeded(session, seed)?);
         let stdin = std::io::stdin();
         let stdout = std::io::stdout();
         serve(
-            &mut session,
+            &host,
             &ctx.save_dir,
             ctx.reseal_on_save,
             phy_label_str,
@@ -1213,7 +1249,7 @@ fn diff_tsvs(a: &Path, b: &Path, json: bool) -> Result<()> {
 }
 
 fn journal_dump(path: &Path, json: bool) -> Result<()> {
-    let records = Journal::replay_at(path)?;
+    let records = Journal::read_only_records(path)?;
     if json {
         serde_json::to_writer_pretty(std::io::stdout().lock(), &records)?;
         println!();
@@ -1306,6 +1342,9 @@ where
         native_options,
         Box::new(move |cc| {
             let mut app = app;
+            if let Err(e) = app.serve_mcp() {
+                log::warn!("MCP listener not started: {e:#}");
+            }
             if let Some(rs) = cc.wgpu_render_state.as_ref() {
                 TracePipeline::install(rs);
                 RasterPipeline::install(rs);
@@ -1328,6 +1367,7 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
     match cli.cmd {
+        None if cli.headless => with_session(&cli.open, Headless),
         None => run_open(cli.open),
         Some(Cmd::Open(open)) => run_open(open),
         Some(Cmd::Qc { open, out }) => with_session(&open, Qc(out)),
@@ -1397,7 +1437,7 @@ fn main() -> Result<()> {
             )
         }
         Some(Cmd::Diff { a, b, json }) => diff_tsvs(&a, &b, json),
-        Some(Cmd::Serve { open }) => with_session(&open, Serve),
+        Some(Cmd::Mcp { open }) => run_mcp(&open),
         Some(Cmd::Describe { open }) => with_session(&open, Describe),
         Some(Cmd::Report {
             open,
@@ -1477,6 +1517,23 @@ fn run_open(open: OpenArgs) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// `sorrel mcp` on a dataset another process has open names the owner
+    /// instead of becoming a second writer.
+    #[test]
+    fn busy_journal_is_reported_with_its_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sorrel.journal");
+        let _owner = Journal::open_or_create(&path, 0, 1).unwrap();
+        let busy = Journal::open_or_create(&path, 0, 1).unwrap_err();
+        let msg = busy_hint(busy.context("open journal")).to_string();
+        assert!(
+            msg.contains("already open") && msg.contains("MCP token file"),
+            "{msg}"
+        );
+        let other = busy_hint(anyhow::anyhow!("disk full"));
+        assert_eq!(other.to_string(), "disk full");
+    }
+
     #[test]
     fn bare_directory_with_flags_means_open() {
         let cli = Cli::try_parse_from(["sorrel", "/x", "--sample-rate", "3e4", "--channels", "8"])
@@ -1522,6 +1579,18 @@ mod tests {
                 Some(Cmd::ExportPhy { copy_raw: true, .. })
             ));
         }
+
+        for name in ["mcp", "serve"] {
+            let cli = Cli::try_parse_from(["sorrel", name, "/x"]).unwrap();
+            assert!(matches!(cli.cmd, Some(Cmd::Mcp { .. })), "{name}");
+        }
+        let cli = Cli::try_parse_from(["sorrel", "--headless", "/x"]).unwrap();
+        assert!(cli.headless && cli.cmd.is_none());
+        assert_eq!(
+            host_dir(&cli.open),
+            PathBuf::from("/"),
+            "a missing path is a file"
+        );
 
         let cli = Cli::try_parse_from(["sorrel", "/x", "--events", "e.csv"]).unwrap();
         assert_eq!(cli.open.events, Some(PathBuf::from("e.csv")));
