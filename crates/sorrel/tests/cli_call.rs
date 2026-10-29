@@ -22,21 +22,29 @@ fn run(user_dir: &Path, args: &[&str]) -> Output {
 }
 
 /// `release/fixtures/tiny-phy` copied out, since `call` writes a journal.
-fn fixture(into: &Path) -> PathBuf {
+/// `None` when the source has no fixture: the Nix package check filters
+/// `release/` out (checks.workspace-tests keeps it).
+fn fixture(into: &Path) -> Option<PathBuf> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../release/fixtures/tiny-phy");
+    if !src.join("spike_times.npy").exists() {
+        eprintln!("skipping: no tiny-phy fixture in this source tree");
+        return None;
+    }
     let dst = into.join("tiny-phy");
     std::fs::create_dir(&dst).unwrap();
     for e in std::fs::read_dir(src).unwrap() {
         let e = e.unwrap();
         std::fs::copy(e.path(), dst.join(e.file_name())).unwrap();
     }
-    dst
+    Some(dst)
 }
 
 #[test]
 fn call_runs_a_tool_in_process_and_prints_json() {
     let tmp = tempfile::tempdir().unwrap();
-    let ds = fixture(tmp.path());
+    let Some(ds) = fixture(tmp.path()) else {
+        return;
+    };
     let out = sorrel(
         tmp.path(),
         &[Path::new("call"), &ds, Path::new("list_clusters")],
@@ -64,7 +72,9 @@ fn call_runs_a_tool_in_process_and_prints_json() {
 #[test]
 fn call_fails_on_unknown_tool_and_bad_args() {
     let tmp = tempfile::tempdir().unwrap();
-    let ds = fixture(tmp.path());
+    let Some(ds) = fixture(tmp.path()) else {
+        return;
+    };
     let bad_tool = sorrel(
         tmp.path(),
         &[Path::new("call"), &ds, Path::new("no_such_tool")],
