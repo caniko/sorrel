@@ -3,7 +3,8 @@ name: Target smokes
 
 on:
   push:
-    branches: ["**"]
+    branches:
+      - "trunk"
     tags-ignore: ["**"]
   pull_request:
 

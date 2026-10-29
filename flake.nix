@@ -54,6 +54,10 @@
           runner = "ubuntu-24.04";
           workspace = true;
           workspace_strategy = "aggregate";
+          # PRs qualify branches; push CI runs on trunk only. A branch push run
+          # shares the PR run's concurrency group, gets cancelled, and shows up
+          # as a failed check that blocks the merge.
+          push_branches = ["trunk"];
           # Publish the workspace crates in dependency order through simit's
           # trusted publisher (simit-crates-io environment, restricted to trunk).
           publish_crates = true;
@@ -100,6 +104,7 @@
             check_systems = ["x86_64-linux"];
             groups.checks = qualification;
             capture_results = true;
+            push_branches = ["trunk"];
             timeout_minutes = 120;
             # The simit that generated the workflows; vars.SIMIT_CI_ENGINE_REVISION overrides.
             engine_revision = "78b775803103ae960faf475ad46070d771fddc91";
@@ -109,6 +114,7 @@
         # SDK and must never be published to the public canix cache.
         prebuild = {
           publish_attic = true;
+          push_branches = ["trunk"];
           attic_app = ".#push-flake-inputs";
           system_runners.x86_64-linux = "ubuntu-24.04";
           nix_builds = [
