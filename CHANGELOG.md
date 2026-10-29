@@ -78,6 +78,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   server.
 - Hovering the save status shows the save path or the full error. It no
   longer says whether the undo history was sealed, because saving keeps it.
+- The winget and Chocolatey packages depend on uv (`astral-sh.uv`, `uv`),
+  so `sorrel auto` works right after install.
 - The Windows install docs say the packages install `uv`, and the agents
   page has a Windows MCP config example.
 
