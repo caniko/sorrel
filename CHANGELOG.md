@@ -7,6 +7,41 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Breaking
+
+- The MCP `render` and `features` tools are removed; agents read `brief`.
+  `split_proposals` and `suggest` no longer list spike indices, and
+  `list_clusters` returns a TSV. The `triage` prompt is now `review`
+  (`triage` still works).
+
+### Added
+
+- A review brief for agents: the MCP `brief` tool encodes a sort as text, with
+  a header sent once, a ledger of flagged units, one-row cards and merge/split
+  relations. Numbers are rounded only as far as no flag or rule threshold
+  changes. On a 110-unit sort it is 34 KB in full, against 1.5 MB for the old
+  per-unit tools. See [Agents](docs/src/usage/agents.md).
+- `eval` computes a merge or split without applying it. Candidates have
+  handles (`s12.1`, `m3`) that `split`, `propose` and `decide` accept.
+- `probe` answers `acg`, `ccg`, `compare`, `window`, `split C by=…` and `eval`
+  queries.
+- `rules_eval` and `rules_apply`: an agent writes threshold rules (now with
+  `name`, `all` conditions and `|x|` ops), sees only the units near a
+  threshold or at odds with Bombcell/UnitRefine, and applies them as one undo
+  step. `decide` applies a batch of decisions as one undo step.
+- `cluster_qc.tsv` gains waveform (trough-to-peak, half-width, extrema),
+  footprint (centroid, decay length, 80% radius, propagation), refractory,
+  burst, amplitude-dip and drift-slope columns, all usable in rules.
+- `sorrel auto --llm` sends the brief: its header is cached with the rubric
+  and each case is one card row or one counterfactual line. `evidence.json`
+  stores the exact input with each verdict, and an older `evidence.json` is
+  renamed aside, not deleted.
+
+### Fixed
+
+- Sparse phy templates (`template_ind.npy`) are mapped onto their probe
+  channels. They were read as if on channels 0 to n−1.
+
 ## [0.2.4] - 2026-10-29
 
 ### Breaking

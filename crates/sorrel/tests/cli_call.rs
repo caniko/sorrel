@@ -45,16 +45,21 @@ fn call_runs_a_tool_in_process_and_prints_json() {
     let Some(ds) = fixture(tmp.path()) else {
         return;
     };
-    let out = sorrel(
-        tmp.path(),
-        &[Path::new("call"), &ds, Path::new("list_clusters")],
-    );
+    let out = sorrel(tmp.path(), &[Path::new("call"), &ds, Path::new("suggest")]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
     serde_json::from_slice::<serde_json::Value>(&out.stdout).expect("stdout is JSON");
+
+    // A text tool prints as text: `sorrel call DIR brief` is the brief CLI.
+    let brief = sorrel(tmp.path(), &[Path::new("call"), &ds, Path::new("brief")]);
+    assert!(
+        String::from_utf8_lossy(&brief.stdout).starts_with("# sorrel brief v1"),
+        "{}",
+        String::from_utf8_lossy(&brief.stderr)
+    );
 
     let raw = sorrel(
         tmp.path(),

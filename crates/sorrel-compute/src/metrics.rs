@@ -262,17 +262,40 @@ pub fn min_contamination_sliding_refractory(
     total_duration_samples: u64,
     sample_rate: f32,
 ) -> f32 {
+    sliding_refractory_argmin(
+        spike_times,
+        min_refractory_samples,
+        max_refractory_samples,
+        n_steps,
+        total_duration_samples,
+        sample_rate,
+    )
+    .0
+}
+
+/// [`min_contamination_sliding_refractory`] plus the window (samples) that
+/// attains it. Ties resolve to the **longest** such window: a clean unit is
+/// contamination-free up to its true refractory period, so this estimates
+/// it. `(0.0, 0)` in the degenerate cases.
+pub fn sliding_refractory_argmin(
+    spike_times: &[SampleIndex],
+    min_refractory_samples: u64,
+    max_refractory_samples: u64,
+    n_steps: usize,
+    total_duration_samples: u64,
+    sample_rate: f32,
+) -> (f32, u64) {
     if spike_times.len() < 2
         || n_steps == 0
         || total_duration_samples == 0
         || max_refractory_samples < min_refractory_samples
         || max_refractory_samples == 0
     {
-        return 0.0;
+        return (0.0, 0);
     }
     let lo = min_refractory_samples.max(1);
     let hi = max_refractory_samples.max(lo);
-    let mut min_contam = f32::INFINITY;
+    let (mut min_contam, mut best_rp) = (f32::INFINITY, 0);
     for step in 0..n_steps {
         // Linearly spaced refractory windows from lo to hi (inclusive).
         let rp = if n_steps == 1 {
@@ -281,14 +304,14 @@ pub fn min_contamination_sliding_refractory(
             lo + ((hi - lo) * step as u64) / (n_steps as u64 - 1)
         };
         let c = refractory_contamination(spike_times, rp, total_duration_samples, sample_rate);
-        if c < min_contam {
-            min_contam = c;
+        if c <= min_contam {
+            (min_contam, best_rp) = (c, rp);
         }
     }
     if min_contam.is_finite() {
-        min_contam
+        (min_contam, best_rp)
     } else {
-        0.0
+        (0.0, 0)
     }
 }
 

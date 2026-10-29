@@ -40,6 +40,16 @@ pub struct MergeCandidate {
     pub amp_mean_delta: f32,
     pub n_a: usize,
     pub n_b: usize,
+    /// Presence-complement term of the score (0 below the drift gate): near 1
+    /// means the two fire in alternating parts of the recording (drift
+    /// fragments).
+    pub presence_complement: f32,
+    /// Template similarity (0..1) from the similar-templates table; NaN when
+    /// the table does not list the pair.
+    pub template_sim: f32,
+    /// Distance in um between the clusters' peak channels; NaN without
+    /// channel positions or templates.
+    pub centroid_um: f32,
 }
 
 /// One cluster the suggester believes should be split. May carry a
@@ -80,6 +90,7 @@ pub struct SplitCandidate {
     /// Local spike indices the GMM would move out as a fresh cluster.
     /// Empty when no proposal could be made — the curator falls back to
     /// the FeatureView lasso path in that case.
+    #[serde(skip)] // agents act on a handle (evaluate::Handles), not on indices
     pub bipartition_minor_idx: Vec<u32>,
     /// Why the usual evidence was discounted. `"burst_explained"`: the
     /// amplitude bimodality vanishes once amplitude is regressed on
@@ -135,6 +146,9 @@ const DRIFT_MIN_COMPLEMENT: f32 = 0.3;
 const DRIFT_WEIGHT: f32 = 0.25;
 /// Time bins used for the firing-presence comparison.
 const PRESENCE_BINS: usize = 20;
+
+/// `(a, b, n_a, n_b, amp_mean_delta, presence_complement, centroid_um, template_sim)`
+type Pair = (ClusterId, ClusterId, usize, usize, f32, f32, f32, f32);
 
 #[derive(Clone, Copy)]
 struct PairScore {
@@ -333,17 +347,17 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
     // With templates loaded, only each cluster's top-10 template-similar
     // clusters (score >= 0.5) are candidates (plus drift fragments);
     // otherwise every pair goes through the amplitude filter below.
-    let similar: Option<std::collections::HashSet<(u32, u32)>> =
+    let similar: Option<HashMap<(u32, u32), f32>> =
         (session.has_template_waveforms() || !session.similar_templates().is_empty()).then(|| {
-            let mut set = std::collections::HashSet::new();
+            let mut set = HashMap::new();
             for a in (0..n).filter(|&a| summaries[a as usize].is_some()) {
-                for (b, _) in session
+                for (b, sim) in session
                     .similar_clusters(ClusterId(a), &[])
                     .into_iter()
                     .filter(|&(_, s)| s >= 0.5)
                     .take(10)
                 {
-                    set.insert((a.min(b.0), a.max(b.0)));
+                    set.insert((a.min(b.0), a.max(b.0)), sim);
                 }
             }
             set
@@ -360,7 +374,7 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
     };
 
     // (a, b, n_a, n_b, amp_mean_delta, presence_complement)
-    let mut pairs: Vec<(ClusterId, ClusterId, usize, usize, f32, f32)> = Vec::new();
+    let mut pairs: Vec<Pair> = Vec::new();
     for a in 0..n {
         let Some(sa) = summaries[a as usize] else {
             continue;
@@ -382,7 +396,7 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
             } else {
                 0.0
             };
-            if complement == 0.0 && similar.as_ref().is_some_and(|s| !s.contains(&(a, b))) {
+            if complement == 0.0 && similar.as_ref().is_some_and(|s| !s.contains_key(&(a, b))) {
                 continue;
             }
             let a = ClusterId(a);
@@ -399,7 +413,17 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
             if amp_mean_delta > cfg.max_amp_mean_delta {
                 continue;
             }
-            pairs.push((a, b, sa.n, sb.n, amp_mean_delta, complement));
+            let dist = match (&drift[a.idx()], &drift[b.idx()]) {
+                (Some((pa, _)), Some((pb, _))) => (pa[0] - pb[0]).hypot(pa[1] - pb[1]),
+                _ => f32::NAN,
+            };
+            // ponytail: a drift-source pair outside the top-10 similar table has no sim (NaN).
+            let sim = similar
+                .as_ref()
+                .and_then(|s| s.get(&(a.0, b.0)))
+                .copied()
+                .unwrap_or(f32::NAN);
+            pairs.push((a, b, sa.n, sb.n, amp_mean_delta, complement, dist, sim));
         }
     }
 
@@ -462,42 +486,47 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
     let mut out: Vec<MergeCandidate> = pairs
         .iter()
         .zip(scores)
-        .filter_map(|(&(a, b, n_a, n_b, amp_mean_delta, complement), s)| {
-            let s = s?;
-            // Missing amplitudes are absent evidence, not a perfect match:
-            // the amplitude terms contribute nothing.
-            let has_amps =
-                !session.spike_amplitudes(a).is_empty() && !session.spike_amplitudes(b).is_empty();
-            let (amp_sim, amp_mean_sim) = if has_amps {
-                (
-                    (1.0 - s.amp_ks).clamp(0.0, 1.0),
-                    (1.0 - amp_mean_delta).clamp(0.0, 1.0),
-                )
-            } else {
-                (0.0, 0.0)
-            };
+        .filter_map(
+            |(&(a, b, n_a, n_b, amp_mean_delta, complement, dist, sim), s)| {
+                let s = s?;
+                // Missing amplitudes are absent evidence, not a perfect match:
+                // the amplitude terms contribute nothing.
+                let has_amps = !session.spike_amplitudes(a).is_empty()
+                    && !session.spike_amplitudes(b).is_empty();
+                let (amp_sim, amp_mean_sim) = if has_amps {
+                    (
+                        (1.0 - s.amp_ks).clamp(0.0, 1.0),
+                        (1.0 - amp_mean_delta).clamp(0.0, 1.0),
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
 
-            // Weighted combination — refractory dip is the strongest single
-            // signal (0.6); amplitude evidence rounds it out (0.3 + 0.1).
-            let score = (0.6 * s.dip_score
-                + 0.3 * amp_sim
-                + 0.1 * amp_mean_sim
-                + DRIFT_WEIGHT * complement)
-                .clamp(0.0, 1.0);
-            if score < cfg.min_score {
-                return None;
-            }
-            Some(MergeCandidate {
-                a,
-                b,
-                score,
-                ccg_dip_z: s.z,
-                amp_ks: s.amp_ks,
-                amp_mean_delta,
-                n_a,
-                n_b,
-            })
-        })
+                // Weighted combination — refractory dip is the strongest single
+                // signal (0.6); amplitude evidence rounds it out (0.3 + 0.1).
+                let score = (0.6 * s.dip_score
+                    + 0.3 * amp_sim
+                    + 0.1 * amp_mean_sim
+                    + DRIFT_WEIGHT * complement)
+                    .clamp(0.0, 1.0);
+                if score < cfg.min_score {
+                    return None;
+                }
+                Some(MergeCandidate {
+                    a,
+                    b,
+                    score,
+                    ccg_dip_z: s.z,
+                    amp_ks: s.amp_ks,
+                    amp_mean_delta,
+                    n_a,
+                    n_b,
+                    presence_complement: complement,
+                    template_sim: sim,
+                    centroid_um: dist,
+                })
+            },
+        )
         .collect();
 
     out.sort_by(|x, y| {

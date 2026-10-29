@@ -17,7 +17,8 @@ Kilosort/phy directory in, two files out (in --out):
   `sorrel apply --curation` replays it as one undoable batch, and
   `spikeinterface.curation.apply_curation` reads it as-is.
 - evidence.json: per-unit classifier outputs, Bombcell failures and, with
-  --llm, the exact evidence Claude saw plus its verdict.
+  --llm, the exact user message Claude saw (`llm_input`, the shared brief header once as
+  `llm_header`) plus its verdict.
 
 Pipeline (current SpikeInterface practice, Oct 2026): remove excess
 spikes -> analyzer (cached) -> redundant units -> merge presets
@@ -32,8 +33,11 @@ import argparse
 import ast
 import hashlib
 import json
+import os
 import shutil
+import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -246,118 +250,69 @@ def finite(v):
     return round(v, 4) if np.isfinite(v) else None
 
 
-EVIDENCE_METRICS = [
-    "num_spikes",
-    "firing_rate",
-    "presence_ratio",
-    "isi_violations_ratio",
-    "rp_contamination",
-    "sliding_rp_violation",
-    "amplitude_median",
-    "amplitude_cutoff",
-    "amplitude_cv_median",
-    "snr",
-    "drift_ptp",
-    "isolation_distance",
-    "l_ratio",
-    "d_prime",
-    "silhouette",
-    "nn_hit_rate",
-    "peak_to_trough_duration",
-    "peak_to_valley",
-    "half_width",
-    "num_positive_peaks",
-    "num_negative_peaks",
-    "repolarization_slope",
-    "recovery_slope",
-    "exp_decay",
-    "spread",
-    "velocity_above",
-    "velocity_below",
-]
+# --------------------------------------------------------------------------
+# Brief: the LLM reads the brief's text, not arrays built here. MCP/brief
+# cluster ids are ClusterId indices; for Kilosort/phy (the only backend
+# `sorrel auto` supports) that is the spike_clusters.npy id, i.e. our unit id.
 
 
-def unit_evidence(analyzer, metrics, unit_id) -> dict:
-    """Compact, numeric description of one unit for the LLM (no images: every
-    signal that decides a label is already a number)."""
-    row = metrics.loc[unit_id] if unit_id in metrics.index else {}
-    template = analyzer.get_extension("templates").get_unit_template(unit_id, operator="average")
-    ptp = np.ptp(template, axis=0)
-    peak = int(np.argmax(ptp))
-    trace = template[:, peak]
-    resampled = np.interp(np.linspace(0, len(trace) - 1, 25), np.arange(len(trace)), trace)
-    locs = analyzer.get_channel_locations()
-    near = np.argsort(np.linalg.norm(locs - locs[peak], axis=1))[:8]
-    fs = analyzer.sampling_frequency
-
-    ccgs, bins = analyzer.get_extension("correlograms").get_data()
-    ui = list(analyzer.unit_ids).index(unit_id)
-    centers = (bins[:-1] + bins[1:]) / 2
-    acg = ccgs[ui, ui][(centers >= 0) & (centers <= 30)]
-
-    times = analyzer.sorting.get_unit_spike_train(unit_id) / fs
-    duration = analyzer.get_total_duration()
-    edges = np.linspace(0, duration, 11)
-    counts = np.histogram(times, edges)[0]
-    amps = analyzer.get_extension("spike_amplitudes").get_data(outputs="by_unit")[0][unit_id]
-    deciles = np.clip(np.digitize(times, edges) - 1, 0, 9)
-    med_amp = [finite(np.median(amps[deciles == d])) if np.any(deciles == d) else None for d in range(10)]
-
-    return {
-        "metrics": {k: finite(row[k]) for k in EVIDENCE_METRICS if k in getattr(row, "index", [])},
-        "peak_channel_template_25pts": [round(float(v), 1) for v in resampled],
-        "template_window_ms": [-1.0, 2.0],
-        "footprint_ptp": [
-            {
-                "dx_um": round(float(locs[c, 0] - locs[peak, 0]), 1),
-                "dy_um": round(float(locs[c, 1] - locs[peak, 1]), 1),
-                "ptp": round(float(ptp[c]), 1),
-            }
-            for c in near
-        ],
-        "acg_counts_0_to_30ms_1ms_bins": [int(v) for v in acg],
-        "firing_rate_per_decile_hz": [round(float(c / (duration / 10)), 3) for c in counts],
-        "median_amplitude_per_decile": med_amp,
-    }
+def sorrel_call(data_dir: str, tool: str, arguments: dict) -> str:
+    """One MCP tool (`brief`, `eval`) through `sorrel call`, with the binary and
+    open arguments `sorrel auto` passed in the environment. It goes through a
+    running host, else opens the dataset itself. Fails loudly: a missing brief
+    leaves units in review."""
+    exe = os.environ.get("SORREL_BIN")
+    if not exe:
+        raise SystemExit("--llm needs the sorrel binary: run through `sorrel auto` (SORREL_BIN unset)")
+    open_args = json.loads(os.environ.get("SORREL_OPEN_ARGS", "[]"))
+    cmd = [exe, "call", *open_args, data_dir, tool, json.dumps(arguments)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        raise SystemExit(f"sorrel call {tool} {arguments} failed ({r.returncode}): {r.stderr.strip()}")
+    return r.stdout
 
 
-def merge_evidence(analyzer, group, presets) -> dict:
-    ids = list(analyzer.unit_ids)
-    templates = analyzer.get_extension("templates")
-    first = templates.get_unit_template(group[0], operator="average")
-    shared = int(np.argmax(np.ptp(first, axis=0)))
-    sim = analyzer.get_extension("template_similarity").get_data()
-    locs = analyzer.get_extension("unit_locations").get_data()
-    ccgs, bins = analyzer.get_extension("correlograms").get_data()
-    centers = (bins[:-1] + bins[1:]) / 2
-    window = np.abs(centers) <= 30
-    a = ids.index(group[0])
-    pairs = []
-    for other in group[1:]:
-        b = ids.index(other)
-        pairs.append(
-            {
-                "units": [int(group[0]), int(other)],
-                "template_similarity": finite(sim[a, b]),
-                "distance_um": finite(np.linalg.norm(locs[a][:2] - locs[b][:2])),
-                "ccg_counts_-30_to_30ms_1ms_bins": [int(v) for v in ccgs[a, b][window]],
-            }
-        )
-    return {
-        "proposed_by": sorted(presets),
-        "templates_on_shared_channel_25pts": {
-            str(u): [
-                round(float(v), 1)
-                for v in np.interp(
-                    np.linspace(0, first.shape[0] - 1, 25),
-                    np.arange(first.shape[0]),
-                    templates.get_unit_template(u, operator="average")[:, shared],
-                )
-            ]
-            for u in group
-        },
-        "pairs": pairs,
-    }
+def split_brief(text: str) -> tuple[str, str, dict[int, str]]:
+    """(header, card header line, {unit id: card row}). The header is everything
+    before the `cards:` table; rows end at the first line without a tab
+    (`omitted: ...`)."""
+    header, _, table = text.partition("\ncards:\n")
+    lines = table.splitlines()
+    rows = {}
+    for line in lines[1:]:
+        if "\t" not in line:
+            break
+        rows[int(line.split("\t", 1)[0])] = line
+    return header.rstrip("\n"), (lines[0] if lines else ""), rows
+
+
+def eval_line(text: str) -> str:
+    """The one-line merge counterfactual the `eval` tool returns."""
+    line = text.strip()
+    if not line or "\n" in line:
+        raise SystemExit(f"eval returned no single counterfactual line: {text[-200:]!r}")
+    return line
+
+
+def unit_message(card_head: str, rows: dict[int, str], record: dict, evals: dict[int, str]) -> str:
+    """User message for one (possibly merged) unit: its card row(s), the merge
+    counterfactual when it is a merge of several units, the classifier outputs."""
+    members = record.get("members", [])
+    cards = [rows[m] for m in members if m in rows]
+    if not cards:
+        raise SystemExit(f"the brief returned no card for unit(s) {members}")
+    classifiers = {k: v for k, v in record.items() if k != "members"}
+    msg = "Decide this unit.\n"
+    if len(members) > 1:
+        msg = f"Decide this unit, the merge of {','.join(map(str, members))} (cards are its parts).\n"
+    msg += card_head + "\n" + "\n".join(cards)
+    if len(members) > 1:
+        msg += "\n" + evals[members[0]]
+    return msg + "\nclassifiers: " + json.dumps(classifiers, separators=(",", ":"))
+
+
+def merge_message(line: str, presets) -> str:
+    return f"Decide this merge.\n{line}\nproposed_by: {','.join(sorted(presets))}"
 
 
 def bombcell_failures(row, thresholds: dict, section: str) -> list[str]:
@@ -415,6 +370,9 @@ cross-correlogram shows a refractory dip at 0 ms like an ACG. Do not merge when 
 the CCG has a central peak (synchrony between two neurons) or no dip, or the \
 shapes differ.
 
+The input is a sorrel brief: the header above defines the columns, flags \
+and SAX strings (compare shape, not level); a unit message is its card row(s) \
+and the classifier outputs, a merge message the counterfactual of the merge. \
 Amplitudes are in uV when the input says so, otherwise in ADC units. Give a \
 confidence in [0, 1] (0.5 = coin flip) and at most three short reasons."""
 
@@ -440,7 +398,7 @@ MERGE_SCHEMA = {
 }
 
 
-def ask_claude(client, model: str, kind: str, payload: dict) -> dict | None:
+def ask_claude(client, model: str, system: str, kind: str, message: str) -> dict | None:
     """One structured verdict, or None when Claude declines or errors (the
     caller then falls back to review tags)."""
     import anthropic
@@ -451,7 +409,7 @@ def ask_claude(client, model: str, kind: str, payload: dict) -> dict | None:
             max_tokens=4096,
             betas=["server-side-fallback-2026-07-01"],
             extra_body={"fallbacks": "default"},
-            system=[{"type": "text", "text": RUBRIC, "cache_control": {"type": "ephemeral"}}],
+            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             output_config={
                 "effort": "low",
                 "format": {
@@ -459,12 +417,7 @@ def ask_claude(client, model: str, kind: str, payload: dict) -> dict | None:
                     "schema": UNIT_SCHEMA if kind == "unit" else MERGE_SCHEMA,
                 },
             },
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"Decide this {kind}.\n\n" + json.dumps(payload, separators=(",", ":")),
-                }
-            ],
+            messages=[{"role": "user", "content": message}],
         )
     except anthropic.APIError as e:
         log(f"Claude request failed ({type(e).__name__}: {e}); leaving it for review")
@@ -483,7 +436,7 @@ def ask_claude(client, model: str, kind: str, payload: dict) -> dict | None:
     return verdict
 
 
-def run_claude(model: str, jobs: list[tuple[str, dict]]) -> list[dict | None]:
+def run_claude(model: str, system: str, jobs: list[tuple[str, str]]) -> list[dict | None]:
     if not jobs:
         return []
     import anthropic
@@ -493,7 +446,7 @@ def run_claude(model: str, jobs: list[tuple[str, dict]]) -> list[dict | None]:
     # ponytail: synchronous calls on a small pool; switch to the Batches API
     # (50% cheaper, but no server-side fallbacks) once runs reach thousands of cases.
     with ThreadPoolExecutor(max_workers=8) as pool:
-        return list(pool.map(lambda j: ask_claude(client, model, *j), jobs))
+        return list(pool.map(lambda j: ask_claude(client, model, system, *j), jobs))
 
 
 # --------------------------------------------------------------------------
@@ -598,12 +551,26 @@ def main() -> None:
         merges = resolve_groups(by_preset)
 
     llm_merge = [(g, p) for g, p in merges if len(p) < len(PRESETS)] if args.llm else []
-    verdicts = run_claude(
-        args.llm_model, [("merge", merge_evidence(analyzer, g, p)) for g, p in llm_merge]
-    )
+    system, evals = RUBRIC, {}
+    if args.llm:
+        # The brief's `ev` column reads a previous run's evidence.json, so set
+        # it aside (renamed, never deleted: its paid verdicts survive a crash).
+        old = out / "evidence.json"
+        if old.exists():
+            old.rename(out / f"evidence.json.{int(time.time())}")
+        # ponytail: header from the unfiltered level-0 brief (merges are judged
+        # before the classifiers pick the unsure units); one `sorrel call`
+        # process per merge group, a batched call if runs show hundreds.
+        header, _, _ = split_brief(sorrel_call(args.data_dir, "brief", {"level": 0}))
+        system = RUBRIC + "\n\n" + header
+        evidence["llm_header"] = header
+        for g, _ in llm_merge:
+            evals[g[0]] = eval_line(sorrel_call(args.data_dir, "eval", {"merge": list(g)}))
+    messages = [merge_message(evals[g[0]], p) for g, p in llm_merge]
+    verdicts = run_claude(args.llm_model, system, [("merge", m) for m in messages])
     vetoed = []
-    for (group, _), verdict in zip(llm_merge, verdicts):
-        record = {"units": group, "verdict": verdict}
+    for (group, _), verdict, message in zip(llm_merge, verdicts, messages):
+        record = {"units": group, "verdict": verdict, "llm_input": message}
         evidence["merges"].append(record)
         if verdict and not verdict["merge"] and verdict["confidence"] >= LLM_UNSURE:
             vetoed.append(group)
@@ -689,23 +656,25 @@ def main() -> None:
         if unsure and args.llm:
             llm_units.append(u)
 
-    verdicts = run_claude(
-        args.llm_model,
-        [
-            (
-                "unit",
-                {
-                    "amplitudes_in_uv": in_uv,
-                    "classifiers": {k: v for k, v in evidence["units"][str(u)].items() if k != "members"},
-                    **unit_evidence(analyzer, metrics, u),
-                },
-            )
-            for u in llm_units
-        ],
-    )
-    for u, verdict in zip(llm_units, verdicts):
+    messages = []
+    if llm_units:
+        # Merged units are not in the dataset `sorrel call` opens: ask for
+        # their members' cards plus the merge counterfactual.
+        recs = [evidence["units"][str(u)] for u in llm_units]
+        ids = sorted({m for r in recs for m in r["members"]})
+        _, card_head, rows = split_brief(
+            sorrel_call(args.data_dir, "brief", {"level": 2, "clusters": ids})
+        )
+        for r in recs:
+            m = r["members"]
+            if len(m) > 1 and m[0] not in evals:
+                evals[m[0]] = eval_line(sorrel_call(args.data_dir, "eval", {"merge": list(m)}))
+        messages = [unit_message(card_head, rows, r, evals) for r in recs]
+    verdicts = run_claude(args.llm_model, system, [("unit", m) for m in messages])
+    for u, verdict, message in zip(llm_units, verdicts, messages):
         label, t = decided[u]
         evidence["units"][str(u)]["llm"] = verdict
+        evidence["units"][str(u)]["llm_input"] = message
         if verdict is None:
             continue
         t.add("src:llm")

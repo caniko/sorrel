@@ -122,12 +122,13 @@ function Get-Result($Replies, [int]$Id) {
     if ($r.result.isError) { throw "MCP tool error for id ${Id}: $($r.result.content[0].text)" }
     return $r.result
 }
-# A tool's JSON payload (a text content block holding JSON).
-function Get-Tool($Replies, [int]$Id) {
-    ,@((Get-Result $Replies $Id).content[0].text | ConvertFrom-Json)
+# `list_clusters` rows: a TSV text block (id, n, label, tags, ...), header once.
+function Get-Clusters($Replies, [int]$Id) {
+    ,@(((Get-Result $Replies $Id).content[0].text -split "`r?`n") |
+        Where-Object { $_.Trim() } | ConvertFrom-Csv -Delimiter "`t")
 }
 function Get-Label($Rows, [int]$Cluster) {
-    (@($Rows) | Where-Object { $_.cluster -eq $Cluster }).label
+    (@($Rows) | Where-Object { [int]$_.id -eq $Cluster }).label
 }
 
 # 4. MCP over stdio: no host is running, so `sorrel mcp` serves the dataset itself.
@@ -145,7 +146,7 @@ $tools = @((Get-Result $r 2).tools | ForEach-Object name)
 foreach ($t in 'list_clusters', 'relabel', 'export_phy') {
     if ($tools -notcontains $t) { throw "MCP tools/list lacks $t (got: $($tools -join ', '))" }
 }
-$rows = Get-Tool $r 3
+$rows = Get-Clusters $r 3
 if ($rows.Count -ne $nClusters) { throw "list_clusters returned $($rows.Count) clusters, qc found $nClusters" }
 Write-Host "MCP stdio: sorrel $($init.serverInfo.version), $($tools.Count) tools, $($rows.Count) clusters"
 
@@ -186,16 +187,16 @@ try {
 
     $r = Invoke-Mcp 'mcp-attach' $dataB @(
         (Rpc-Init 1), $rpcInitialized, (Rpc-Call 2 'list_clusters'))
-    $before = Get-Label (Get-Tool $r 2) 0
+    $before = Get-Label (Get-Clusters $r 2) 0
     $target = if ($before -eq 'noise') { 'good' } else { 'noise' }
     $r = Invoke-Mcp 'mcp-attach-relabel' $dataB @(
         (Rpc-Init 1), $rpcInitialized,
         (Rpc-Call 2 'relabel' @{ cluster = 0; label = $target }), (Rpc-Call 3 'list_clusters'))
     Get-Result $r 2 | Out-Null
-    $after = Get-Label (Get-Tool $r 3) 0
+    $after = Get-Label (Get-Clusters $r 3) 0
     if ($after -ne $target) { throw "relabel via the host left cluster 0 '$after', expected '$target'" }
     $r = Invoke-Mcp 'mcp-attach-second' $dataB @((Rpc-Init 1), (Rpc-Call 2 'list_clusters'))
-    $second = Get-Label (Get-Tool $r 2) 0
+    $second = Get-Label (Get-Clusters $r 2) 0
     if ($second -ne $target) { throw "a second session sees cluster 0 '$second', expected '$target'" }
     Write-Host "MCP attach: cluster 0 $before -> $target through the headless host"
 }

@@ -16,6 +16,16 @@ human or an agent, is journaled with its actor and is undoable.
 - **Batch work.** `describe --json`, `suggest --json`, `qc --out DIR`,
   `apply --rules FILE --dry-run`, `report --tag review:`.
 
+## Review a sort
+
+Read `brief` (level 1), never plots. Write threshold rules over its metric
+names, run `rules_eval`, and look only at the margin and disagreement units
+(`brief` with `clusters`, level 3 relations, `eval`, `probe`). Then
+`rules_apply` and one `decide` for the rest. Act on merges and splits by
+handle (`m3`, `s12.1`); never copy spike indices. The MCP `review` prompt
+has the whole protocol and the rubric. From a shell:
+`sorrel call <DATA_DIR> brief '{"level": 1}'`.
+
 ## Find what is running
 
 `sorrel status --json` lists the GUI instance (its tabs: dataset, dirty,
@@ -35,5 +45,5 @@ your edits.
   proposals for a human instead of applying. `propose` always queues.
 - `review:*` tags mark the queue `sorrel auto` left for a human; clear them
   only when you have settled the question.
-- Prefer `--dry-run` and the read tools (`metrics`, `evidence`,
-  `attention_queue`) before any edit.
+- Prefer `--dry-run` and the read tools (`brief`, `rules_eval`, `eval`,
+  `probe`) before any edit.

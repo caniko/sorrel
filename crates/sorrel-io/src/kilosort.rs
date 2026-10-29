@@ -299,8 +299,15 @@ impl KilosortProvider {
 
         // 2.7. Template waveforms + similarity matrix. Both optional; the
         // TemplateView and SimilarityView gracefully degrade when absent.
-        let (template_waveforms, template_shape) =
-            read_optional_templates(&view.path("templates.npy"))?;
+        let (template_waveforms, template_shape) = read_optional_templates(
+            &view.path("templates.npy"),
+            &view.path("template_ind.npy"),
+            if channel_positions.is_empty() {
+                n_channels as usize
+            } else {
+                channel_positions.len()
+            },
+        )?;
 
         // First open of a folder sorrel has not saved yet: tag units edited
         // outside sorrel (phy). Verified that a FRESH sort never trips either
@@ -976,7 +983,16 @@ fn read_optional_positions(path: &Path) -> Result<Vec<[f32; 2]>> {
 
 /// Read `templates.npy` if present. Returns `(flat, (n_templates, n_samples,
 /// n_channels))`. Empty buffer + `(0, 0, 0)` shape when absent.
-fn read_optional_templates(path: &Path) -> Result<(Vec<f32>, (usize, usize, usize))> {
+///
+/// Sparse phy templates (`template_ind.npy`, `(n_templates, n_local)` mapping
+/// local column -> global channel) are densified to `n_channels` columns so
+/// every consumer indexes real probe channels; unused channels are zero and
+/// `-1` / out-of-range entries are skipped.
+fn read_optional_templates(
+    path: &Path,
+    ind_path: &Path,
+    n_channels: usize,
+) -> Result<(Vec<f32>, (usize, usize, usize))> {
     load_optional(path, (Vec::new(), (0, 0, 0)), |path| {
         let (flat, shape) = read_npy_f32_flat(path)?;
         if shape.len() != 3 {
@@ -986,7 +1002,25 @@ fn read_optional_templates(path: &Path) -> Result<(Vec<f32>, (usize, usize, usiz
                 shape
             );
         }
-        Ok((flat, (shape[0], shape[1], shape[2])))
+        let (nt, ns, local) = (shape[0], shape[1], shape[2]);
+        let ind = match read_npy_u32_flat(ind_path) {
+            Ok((ind, s)) if s == [nt, local] && n_channels > 0 => ind,
+            _ => return Ok((flat, (nt, ns, local))),
+        };
+        // ponytail: dense copy (n_templates * n_samples * n_channels); an
+        // index-aware template type if huge sparse sorts appear.
+        let mut dense = vec![0f32; nt * ns * n_channels];
+        for t in 0..nt {
+            for (l, &ch) in ind[t * local..(t + 1) * local].iter().enumerate() {
+                if (ch as usize) >= n_channels {
+                    continue; // -1 wraps to u32::MAX; also out-of-range
+                }
+                for s in 0..ns {
+                    dense[(t * ns + s) * n_channels + ch as usize] = flat[(t * ns + s) * local + l];
+                }
+            }
+        }
+        Ok((dense, (nt, ns, n_channels)))
     })
 }
 

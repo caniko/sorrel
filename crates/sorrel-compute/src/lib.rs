@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod metrics_iso;
 pub mod quality;
 pub mod rescue;
+pub mod shape;
 pub mod snippets;
 
 pub use binning::{histogram_u64, isi_histogram, isi_histogram_range, psth};
@@ -37,11 +38,15 @@ pub use lttb::lttb_downsample;
 pub use metrics::{
     amplitude_snr, auto_correlogram, ccg_baseline, correlograms, cross_correlogram, fraction_below,
     isi_violation_rate, isi_violations, mean_amplitude, min_contamination_sliding_refractory,
-    presence_ratio, refractory_contamination, std_amplitude,
+    presence_ratio, refractory_contamination, sliding_refractory_argmin, std_amplitude,
 };
 pub use metrics_iso::{
     isolation_metrics, lda_d_prime, nn_isolation_metric, simplified_silhouette, IsolationMetrics,
     MIN_CLUSTER_SPIKES,
 };
 pub use quality::{quality_breakdown, QualityBreakdown};
+pub use shape::{
+    burst_index, footprint, log_bins, peak_channel, sax, waveform_landmarks, Footprint,
+    WaveformLandmarks,
+};
 pub use snippets::{extract_snippets_single_channel, mean_snippet, template_snr};

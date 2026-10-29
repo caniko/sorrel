@@ -56,16 +56,108 @@ makes gets the origin `Sorrel[LLM:<name>]`.
 
 ## Tools
 
-| Tool                                                                                                                              | What it does                                                                                    |
-| --------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `list_clusters`, `metrics`, `suggest`, `render`, `evidence`, `attention_queue`, `split_proposals`, `merge_candidates`, `features` | Read the session: cluster lists, QC metrics, ranked suggestions, SVG plots, PC features.        |
-| `relabel`, `merge`, `split`                                                                                                       | Edit. Journaled and undoable; queued as a proposal instead under **Propose** (see below).       |
-| `tag`, `undo`, `save`, `export_phy`                                                                                               | Retag a cluster, undo the last edit, save, export a phy directory. Refused under **Propose**.   |
-| `propose`                                                                                                                         | Queue a relabel, merge, split or accept for a human, with a confidence and up to three reasons. |
-| `select`, `selection`                                                                                                             | Move the human's selection in the GUI, or read it. These need the GUI.                          |
+| Tool                                                                                                                              | What it does                                                                                                                                                                                      |
+| --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `brief`                                                                                                                           | Read the session as compact text. Level 1: header and flagged units. Level 2 (or `clusters`): one card per unit. Level 3: relations (merge components `m<k>`, split candidates `s<cluster>.<k>`). |
+| `eval`                                                                                                                            | Counterfactual of a merge (`merge` ids) or a handle (`candidate`), without applying it.                                                                                                           |
+| `probe`                                                                                                                           | Closed-grammar computations for hypotheses the brief did not anticipate (`acg`, `ccg`, `compare`, `window`, `split`, `eval`). One compact answer per query; no arbitrary code.                    |
+| `rules_eval`                                                                                                                      | Run a threshold rule set (TOML) on every unit. Returns label counts, margin units and disagreements with the auto classifiers.                                                                    |
+| `rules_apply`                                                                                                                     | Apply the rule set as relabels in one undo step. Remembered in `.sorrel/review_rules.toml`.                                                                                                       |
+| `decide`                                                                                                                          | Many decisions in one call: `[target, action, confidence, reasons]`. One undo step under **Direct**, one proposal per item under **Propose**.                                                     |
+| `list_clusters` (TSV), `metrics` (one row, JSON), `suggest`, `evidence`, `attention_queue`, `split_proposals`, `merge_candidates` | Read the session. Each points at the brief for the compact form.                                                                                                                                  |
+| `relabel`, `merge`, `split`                                                                                                       | Edit one thing. Journaled and undoable; queued as a proposal instead under **Propose**. `split` takes a handle.                                                                                   |
+| `tag`, `undo`, `save`, `export_phy`                                                                                               | Retag a cluster, undo the last edit, save, export a phy directory. Refused under **Propose**.                                                                                                     |
+| `propose`                                                                                                                         | Queue one relabel, merge, split or accept for a human, with a confidence and up to three reasons.                                                                                                 |
+| `select`, `selection`                                                                                                             | Move the human's selection in the GUI, or read it. These need the GUI.                                                                                                                            |
 
-The `triage` prompt walks an agent through the attention queue with the
-curation rubric.
+`render` and `features` are gone. They returned SVG coordinates and raw PC
+samples, which a model cannot read. The brief carries the numbers instead:
+waveform landmarks, footprint, ACG and amplitude strings. `sorrel report`
+still writes the SVGs.
+
+### Handles
+
+`brief` level 3 and `suggest` name every merge component `m<k>` and every
+split candidate `s<cluster>.<k>`. Pass the handle as `candidate` to
+`split`, `propose` and `eval`, or as the target in `decide`. A handle
+records the spikes of the clusters it names and is refused as stale once any
+of them changed. Tools never return spike indices.
+
+### `decide`
+
+`decisions` is a list of `[target, action, confidence, reasons]`, or of
+objects with the same keys plus an optional `note`.
+
+- `target`: a cluster id, a split handle (`"s12.1"`), a merge handle
+  (`"m3"`), or a list of ids for a merge (the first is the target).
+- `action`: `good`, `mua`, `noise` or `unsorted` (relabel), `merge`,
+  `split` (needs an `s` handle) or `accept` (drops `review:*` tags).
+- `reasons`: at most three codes (flag codes or rule names). Free text is
+  allowed up to eight words.
+
+Every item is checked first. If one is invalid, nothing is applied and the
+reply lists the errors by item. A cluster may appear in only one item. Under
+**Direct** the items are one batch, so one `undo` reverts all of them, and
+the batch is refused if the session changed since the check. Splits are in
+the batch.
+
+### `probe`
+
+`q` is a query string or a list of them; each gets one answer block. Times in
+`acg`/`ccg` are milliseconds, in `window`/`split` seconds.
+
+- `acg C [win=50] [bin=1]`: refractory estimate and contamination, burst
+  index, a SAX string over log lags and the first six bin rates in Hz.
+- `ccg A B [win=50] [bin=1]`: `dip_z`, `sync_z` (always on the standard 1 ms,
+  ±50 ms CCG), the +/- lag asymmetry with its z, and a SAX string.
+- `compare A B`: template cosine over the union of active channels,
+  peak-channel distance in µm, trough-to-peak and half-width deltas,
+  amplitude ratio.
+- `window C T0 T1`: n, rate, contamination, amplitude and presence of that
+  slice against the whole unit.
+- `split C by=amp|time|pc|kmeans [at=X]`: registers a new split handle
+  `s<C>.<k>` and prints its `eval` line. The minor part is the spikes above
+  (`amp`, `pc`) or after (`time`) `at`. Defaults: the GMM boundary, the
+  largest amplitude jump on a coarse 20-point scan, PC1 at 0 with the smaller
+  side as minor; `kmeans` uses the same proposer as `brief` level 3. Act on the
+  handle with `split`, `decide` or `eval`.
+- `eval merge A B ..`, `eval s12.1`, `eval m3`: as the `eval` tool.
+
+A parse error in one query lists the grammar and does not stop the others.
+
+## The review protocol
+
+The `review` prompt (`triage` is an alias) walks an agent through this:
+
+1. `brief` level 1: read the mode, the population quantiles and the ledger.
+2. Write a rule set for the labels and call `rules_eval`. Refine it until
+   few units are on the margin or disagree with the auto classifiers.
+3. Look only at margin, disagreement and flagged units: `brief` with
+   `clusters`, level 3 for relations, `eval` for a counterfactual, `probe` for a hypothesis neither covers.
+4. `rules_apply`, then `decide` for the exceptions, the merges and the
+   splits.
+5. `brief` level 1 again to confirm.
+
+The cost depends on the number of borderline units, not on the number of
+units. The prompt ends with the curation rubric, which names the brief's
+descriptors.
+
+## Token budget
+
+- **Levels.** Level 1 is the header and a ledger of flagged units. Level 2
+  adds cards. Level 3 adds relations. Ask for `clusters` to get cards for a
+  few units, and `budget` (tokens) to cap the reply. What did not fit is
+  listed with the handles to fetch it.
+- **Mode-delta flags.** The header gives the mode of each metric. A unit
+  lists only the flags where it differs from the population, so a clean
+  sort is a short reply.
+- **Quantiser.** Numbers are rounded to few significant digits and
+  log-scaled where useful. Rounding never moves a value across a flag
+  threshold (including those of your rule set), so a decision on the
+  quantised number is the decision on the raw one.
+- **Handles.** A candidate costs a few characters, not a list of spikes.
+- **Output.** `decide` takes codes and a batch instead of one `propose` call
+  with prose per decision.
 
 Every agent edit adds `src:agent` to the clusters it touches, in the same
 undoable step. When someone else changes the session (you in the GUI,

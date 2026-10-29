@@ -832,3 +832,32 @@ fn params_dat_path_may_point_at_an_mtscomp_cbin() {
     .unwrap();
     assert!(KilosortProvider::open(root, KilosortOpenParams::default()).is_err());
 }
+
+#[test]
+fn sparse_templates_are_densified_via_template_ind() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_minimal_fixture(root, 2, 3);
+    std::fs::write(
+        root.join("params.py"),
+        "n_channels_dat = 3\nsample_rate = 1000.\n",
+    )
+    .unwrap();
+    // 2 templates x 2 samples x 2 local columns; template 0 -> channels
+    // [2, 0], template 1 -> [-1, 1] (-1 = unused column, skipped).
+    let vals: [f32; 8] = [1., 2., 3., 4., 5., 6., 7., 8.];
+    let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+    write_npy_v1_3d(&root.join("templates.npy"), "<f4", 2, 2, 2, &bytes);
+    let ind: [i64; 4] = [2, 0, -1, 1];
+    let ind_bytes: Vec<u8> = ind.iter().flat_map(|v| v.to_le_bytes()).collect();
+    write_npy_v1_2d(&root.join("template_ind.npy"), "<i8", 2, 2, &ind_bytes);
+
+    let p = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
+    use sorrel_io::HasTemplateWaveforms;
+    assert_eq!(p.template_shape(), (2, 2, 3));
+    // [template][sample][channel]
+    assert_eq!(
+        p.template_waveforms(),
+        &[2., 0., 1., 4., 0., 3., 0., 6., 0., 0., 8., 0.]
+    );
+}

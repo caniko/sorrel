@@ -13,9 +13,9 @@ use eframe::egui_wgpu::RenderState;
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::InstanceRequest;
 use sorrel_data::{
-    apply_rules, baseline_hash, collect_qc_rows, diff_labels, export_qc, rank_merge_candidates,
-    rank_split_candidates, save_session as save_dir_session, save_to_phy, serve, write_report,
-    Journal, ReportFilter, RuleSet, Session, SuggestConfig,
+    apply_rules, baseline_hash, collect_qc_rows_with, diff_labels, export_qc,
+    rank_merge_candidates, rank_split_candidates, save_session as save_dir_session, save_to_phy,
+    serve, write_report, Journal, ReportFilter, RuleSet, Session, SuggestConfig,
 };
 use sorrel_io::kilosort::{read_cluster_group_tsv, KilosortOpenParams, PhyLabel};
 use sorrel_io::open_ephys::OebinMeta;
@@ -879,8 +879,12 @@ impl SessionVisitor for Qc {
     {
         let session = seeded(session, seed)?;
         let out_dir = &self.0;
-        let n = export_qc(&session, out_dir)
-            .with_context(|| format!("exporting QC to {}", out_dir.display()))?;
+        let n = export_qc(
+            &session,
+            out_dir,
+            Some(session.provider.channel_positions()),
+        )
+        .with_context(|| format!("exporting QC to {}", out_dir.display()))?;
         println!("exported QC for {n} clusters into {}", out_dir.display());
         Ok(())
     }
@@ -995,7 +999,11 @@ impl SessionVisitor for Apply {
         let cmds = match &self.source {
             ApplySource::Rules(path) => {
                 let rules = RuleSet::from_path(path)?;
-                apply_rules(&rules, &collect_qc_rows(&session), current)?
+                apply_rules(
+                    &rules,
+                    &collect_qc_rows_with(&session, Some(session.provider.channel_positions())),
+                    current,
+                )?
             }
             ApplySource::Curation { path, tag_splits } => {
                 let doc = sorrel_io::read_curation(path)?;
@@ -1133,16 +1141,11 @@ fn run_auto_sidecar(open: &OpenArgs, out: &Path, flags: &[String]) -> Result<()>
     let script = out.join("sorrel_auto.py");
     std::fs::write(&script, AUTO_SCRIPT).with_context(|| format!("write {}", script.display()))?;
 
-    let mut args: Vec<std::ffi::OsString> = vec![
-        script.into(),
-        "--data-dir".into(),
-        open.root().into(),
-        "--out".into(),
-        out.into(),
-    ];
+    // Open overrides shared by the sidecar and the `sorrel call` it makes.
+    let mut shared: Vec<String> = vec![];
     let mut opt = |flag: &str, v: Option<String>| {
         if let Some(v) = v {
-            args.extend([flag.into(), v.into()]);
+            shared.extend([flag.into(), v]);
         }
     };
     opt("--dat", open.dat.as_ref().map(|p| p.display().to_string()));
@@ -1154,6 +1157,21 @@ fn run_auto_sidecar(open: &OpenArgs, out: &Path, flags: &[String]) -> Result<()>
         "--spikeglx-meta",
         open.spikeglx_meta.as_ref().map(|p| p.display().to_string()),
     );
+    // Only `sorrel call` takes this: the journal `sorrel auto` will open.
+    // Never --discard-journal: each call would set the journal aside again.
+    let mut brief_args = shared.clone();
+    if let Some(j) = &open.journal {
+        brief_args.extend(["--journal".into(), j.display().to_string()]);
+    }
+
+    let mut args: Vec<std::ffi::OsString> = vec![
+        script.into(),
+        "--data-dir".into(),
+        open.root().into(),
+        "--out".into(),
+        out.into(),
+    ];
+    args.extend(shared.iter().map(Into::into));
     args.extend(flags.iter().map(Into::into));
 
     let uv = std::env::var_os("PATH").is_some_and(|path| uv_on_path(&path));
@@ -1170,6 +1188,8 @@ fn run_auto_sidecar(open: &OpenArgs, out: &Path, flags: &[String]) -> Result<()>
     log::info!("running the SpikeInterface pipeline (first run computes the analyzer; slow)");
     let status = cmd
         .args(&args)
+        .env("SORREL_BIN", std::env::current_exe()?)
+        .env("SORREL_OPEN_ARGS", serde_json::to_string(&brief_args)?)
         .status()
         .context("spawn the sorrel_auto.py sidecar (install uv, or set SORREL_PYTHON)")?;
     if !status.success() {
