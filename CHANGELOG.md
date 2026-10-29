@@ -7,6 +7,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+
+- The `sorrel-ui` crate no longer ships its kittest snapshot PNGs (~25 MB),
+  which crates.io rejected as too large. This left `sorrel-ui` and `sorrel`
+  unpublished at 0.2.2.
+
 ## [0.2.2] - 2026-10-28
 
 ### Added
