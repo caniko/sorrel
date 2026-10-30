@@ -137,19 +137,28 @@ enum Cmd {
         save: bool,
     },
     /// Headless: automatic curation with SpikeInterface (cleanup, merge
-    /// presets, Bombcell + UnitRefine labels, optional Claude tiebreak),
+    /// presets, Bombcell + UnitRefine labels, optional LLM tiebreak),
     /// applied as one undoable batch; every decision is tagged with its
     /// source, and anything uncertain gets a `review:*` tag
     Auto {
         #[command(flatten)]
         open: OpenArgs,
-        /// Ask Claude to settle units the classifiers disagree on and merges
-        /// only one preset found (API key or `ant auth login` required)
-        #[arg(long)]
-        llm: bool,
-        /// Claude model for --llm
-        #[arg(long, value_name = "MODEL", default_value = "claude-opus-5")]
-        llm_model: String,
+        /// Ask an LLM to settle units the classifiers disagree on and merges
+        /// only one preset found. Bare `--llm` uses the logged-in `claude`
+        /// CLI; name another backend with `--llm=codex`. (`=` is required so
+        /// `auto --llm DIR` keeps DIR a positional.)
+        #[arg(
+            long,
+            value_enum,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "claude",
+            value_name = "BACKEND"
+        )]
+        llm: Option<LlmBackend>,
+        /// Model for --llm (default: the backend's own, `claude-opus-5` for api)
+        #[arg(long, value_name = "MODEL", requires = "llm")]
+        llm_model: Option<String>,
         /// Microvolts per ADC bit (e.g. 2.34375 for Neuropixels 1.0 at gain
         /// 500). Bombcell's amplitude threshold is in uV; without this (or
         /// --spikeglx-meta) amplitudes stay in ADC units
@@ -346,6 +355,19 @@ enum JournalCmd {
         #[arg(long, value_name = "DIR")]
         out: PathBuf,
     },
+}
+
+/// Where `sorrel auto --llm` sends its cases.
+#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
+enum LlmBackend {
+    /// The logged-in `claude` CLI (Claude Code)
+    Claude,
+    /// The logged-in `codex` CLI
+    Codex,
+    /// The `opencode` CLI
+    Opencode,
+    /// The Anthropic API (ANTHROPIC_API_KEY or `ant auth login`)
+    Api,
 }
 
 /// Everything needed to open a dataset and its journal. Shared by the GUI
@@ -2086,8 +2108,15 @@ fn main() -> Result<()> {
             let out = open.root().join("sorrel_auto");
             if !reuse {
                 let mut flags = vec![];
-                if llm {
-                    flags.extend(["--llm".to_string(), "--llm-model".into(), llm_model]);
+                if let Some(backend) = llm {
+                    let name = clap::ValueEnum::to_possible_value(&backend)
+                        .expect("LlmBackend variants are not skipped")
+                        .get_name()
+                        .to_string();
+                    flags.push(format!("--llm={name}"));
+                    if let Some(model) = llm_model {
+                        flags.extend(["--llm-model".to_string(), model]);
+                    }
                 }
                 if let Some(g) = gain_to_uv {
                     flags.extend(["--gain-to-uv".to_string(), g.to_string()]);
@@ -2197,6 +2226,44 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("sorrel").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn auto_llm_backend_parses() {
+        let llm = |args: &[&str]| match parse(args).unwrap().cmd {
+            Some(Cmd::Auto {
+                llm,
+                llm_model,
+                open,
+                ..
+            }) => (llm, llm_model, open.root),
+            other => panic!("unexpected {other:?}"),
+        };
+        let dir = Some(PathBuf::from("DIR"));
+        assert_eq!(llm(&["auto", "DIR"]), (None, None, dir.clone()));
+        assert_eq!(
+            llm(&["auto", "DIR", "--llm"]),
+            (Some(LlmBackend::Claude), None, dir.clone())
+        );
+        // `--llm` before the positional must not swallow it
+        assert_eq!(
+            llm(&["auto", "--llm", "DIR"]),
+            (Some(LlmBackend::Claude), None, dir.clone())
+        );
+        assert_eq!(
+            llm(&["auto", "DIR", "--llm=codex"]).0,
+            Some(LlmBackend::Codex)
+        );
+        assert_eq!(
+            llm(&["auto", "--llm=opencode", "DIR"]).0,
+            Some(LlmBackend::Opencode)
+        );
+        assert_eq!(
+            llm(&["auto", "DIR", "--llm=api", "--llm-model", "m"]),
+            (Some(LlmBackend::Api), Some("m".into()), dir)
+        );
+        assert!(parse(&["auto", "DIR", "--llm=gpt"]).is_err());
+        assert!(parse(&["auto", "DIR", "--llm-model", "m"]).is_err());
     }
 
     #[test]

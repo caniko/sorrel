@@ -6,7 +6,7 @@ the classifiers the SpikeInterface project recommends:
 ```bash
 sorrel auto /data/session1 --gain-to-uv 2.34375          # label + merge, journaled
 sorrel auto /data/session1 --reuse --save                # re-import, write phy files
-sorrel auto /data/session1 --llm                         # Claude settles the uncertain cases
+sorrel auto /data/session1 --llm                         # an LLM settles the uncertain cases
 ```
 
 All of its edits go into one batch in the curation journal, so one
@@ -39,7 +39,7 @@ that already has them.
 5. **Labels.** Bombcell rules and the two UnitRefine random forests label
    each merged unit. SUA counts as `good`. Bombcell's non-somatic call
    becomes the tag `non-somatic`.
-6. **Claude (`--llm`, optional).** Claude decides the units where the two
+6. **LLM (`--llm`, optional).** An LLM decides the units where the two
    classifiers disagree or UnitRefine is unsure, and the merges that only one
    preset found (see [below](#claude)).
 7. **Output.** The script writes `sorrel_auto/curation.json` (SpikeInterface
@@ -167,10 +167,27 @@ or `src:human`. The two are independent, and the `src:*` tags are unchanged.
 
 ## Claude
 
-With `--llm`, the uncertain cases go to Claude (`--llm-model`, default
-`claude-opus-5`; credentials from `ANTHROPIC_API_KEY` or `ant auth login`).
+With `--llm`, the uncertain cases go to an LLM. Bare `--llm` uses the
+`claude` CLI; `--llm=BACKEND` picks one (the `=` keeps `--llm DIR` unambiguous):
 
-Claude is sent **text, not plots**: the same token-lean brief an MCP agent
+| Backend         | Needs                                     | `--llm-model` default            |
+| --------------- | ----------------------------------------- | -------------------------------- |
+| `claude` (bare) | Claude Code on PATH, signed in (`/login`) | the CLI's own                    |
+| `codex`         | `codex` on PATH, `codex login`            | the CLI's own                    |
+| `opencode`      | `opencode` on PATH, `opencode auth login` | the CLI's own (`provider/model`) |
+| `api`           | `ANTHROPIC_API_KEY` or `ant auth login`   | `claude-opus-5`                  |
+
+A missing CLI fails the run before any analysis. The CLI backends run one
+process per case (8 in parallel) with tools disabled, no session and an empty
+working directory: `claude` with no MCP servers, project-only settings and
+`--json-schema`; `codex exec` read-only with `--output-schema`; `opencode run`
+with every permission denied. `opencode` and `codex` get the system prompt
+prepended to the message, and `opencode` has no schema enforcement, so every
+reply is validated (label or merge flag, confidence clamped to [0, 1], at most
+three reasons). A failed, timed-out (10 minutes) or invalid reply leaves that
+case in review.
+
+The LLM is sent **text, not plots**: the same token-lean brief an MCP agent
 reads (see [Agents](./agents.md)). `sorrel auto` hands the sidecar its own binary
 and open arguments (`SORREL_BIN`, `SORREL_OPEN_ARGS`), so the sidecar runs
 `sorrel call DIR brief` and `sorrel call DIR eval` on the dataset exactly as
@@ -196,7 +213,8 @@ template, 30-bin ACG, 8-channel footprint, deciles; JSON) took 1-2 KB, and the
 header is paid once, not per case.
 
 The reply is a JSON verdict (label or merge/no-merge, a confidence and up to
-three reasons). It is stored in `evidence.json` next to the exact user message
+three reasons). Its `model` names the backend: `claude-cli:<model>`,
+`codex:<model>`, `opencode:<model>`, or the bare model id for `api`. It is stored in `evidence.json` next to the exact user message
 that produced it (`llm_input`, per unit and per merge); the system prompt's
 brief header is stored once, as the top-level `llm_header`. A verdict below 0.7
 confidence keeps the case in review as `review:llm-unsure`. A confident "do not

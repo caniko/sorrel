@@ -79,12 +79,115 @@ def test_brief_cases() -> None:
         raise AssertionError("a unit without a card must fail loudly")
 
 
+FAKE = """#!/usr/bin/env python3
+import json, os, sys
+name, a = os.path.basename(sys.argv[0]), sys.argv[1:]
+stdin = "" if name == "opencode" else sys.stdin.read()
+rec = {"argv": a, "stdin": stdin, "cwd": os.getcwd(), "listing": os.listdir("."), "perm": os.environ.get("OPENCODE_PERMISSION")}
+json.dump(rec, open(os.environ["FAKE_RECORD"], "w"))
+fail, V = os.environ["FAKE_MODE"] == "fail", {"label": "mua", "confidence": 1.7, "reasons": ["a", "b", "c", "d"]}
+if name == "claude":
+    print(json.dumps({"type": "result", "is_error": fail, "result": "Not logged in" if fail else "t", "structured_output": None if fail else V, "modelUsage": {"claude-opus-5-5": {}}}))
+elif name == "codex":
+    if fail:
+        print(json.dumps({"type": "turn.failed", "error": {"message": "codex not logged in"}}))
+        sys.exit(1)
+    open(a[a.index("-o") + 1], "w").write(json.dumps(V))
+    print(json.dumps({"type": "turn.completed"}))
+elif fail:
+    print(json.dumps({"type": "error", "error": {"type": "x", "message": "opencode no auth"}}))
+else:
+    print(json.dumps({"type": "text", "part": {"text": "Sure:\\n```json\\n" + json.dumps(V) + "\\n```"}}))
+"""
+
+
+def test_llm_backends() -> None:
+    import contextlib
+    import io
+    import os
+    import sys as _sys
+
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "crates" / "sorrel" / "src"))
+    import sorrel_auto as sa
+
+    pv = sa.parse_verdict
+    ok = {"label": "good", "confidence": 0.9, "reasons": ["r"]}
+    assert pv(json.dumps(ok), "unit") == ok
+    assert pv("```json\n" + json.dumps(ok) + "\n```", "unit") == ok
+    assert pv("Verdict {not json} then " + json.dumps(ok) + " done", "unit") == ok
+    assert pv('{"label":"mua","confidence":-3,"reasons":["1","2","3","4"]}', "unit") == {"label": "mua", "confidence": 0.0, "reasons": ["1", "2", "3"]}
+    assert pv('{"merge":true,"confidence":2,"reasons":[]}', "merge") == {"merge": True, "confidence": 1.0, "reasons": []}
+    for bad, kind in [
+        ('{"label":"sua","confidence":1,"reasons":[]}', "unit"),
+        ('{"label":"good","confidence":1}', "unit"),
+        ('{"label":"good","confidence":"hi","reasons":[]}', "unit"),
+        ('{"label":"good","confidence":NaN,"reasons":[]}', "unit"),
+        ('{"merge":"yes","confidence":1,"reasons":[]}', "merge"),
+        ('{"label":"good","confidence":1,"reasons":[]}', "merge"),
+        ("no json here", "unit"),
+        (None, "unit"),
+    ]:
+        assert pv(bad, kind) is None, bad
+
+    with tempfile.TemporaryDirectory() as d:
+        bindir, rec = Path(d) / "bin", Path(d) / "rec.json"
+        bindir.mkdir()
+        for name in ("claude", "codex", "opencode"):
+            (bindir / name).write_text(FAKE)
+            (bindir / name).chmod(0o755)
+        saved = dict(os.environ)
+        os.environ.update(PATH=f"{bindir}{os.pathsep}{saved['PATH']}", FAKE_RECORD=str(rec))
+        try:
+            def ask(backend, model, mode):
+                os.environ["FAKE_MODE"] = mode
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    v = sa.ask_cli(backend, model, "SYS", "unit", "MSG")
+                r = json.loads(rec.read_text())
+                assert Path(r["cwd"]).resolve() != Path.cwd().resolve() and r["listing"] == [], r
+                return v, r, err.getvalue()
+
+            for backend, model, want in [
+                ("claude", "m1", "claude-cli:claude-opus-5-5"),
+                ("claude", None, "claude-cli:claude-opus-5-5"),
+                ("codex", "m1", "codex:m1"),
+                ("opencode", "m1", "opencode:m1"),
+            ]:
+                v, r, _ = ask(backend, model, "ok")
+                assert v == {"label": "mua", "confidence": 1.0, "reasons": ["a", "b", "c"], "model": want}, (backend, v)
+                a = r["argv"]
+                flag = "--model" if backend == "claude" else "-m"
+                assert (a[a.index(flag) + 1] == model) if model else flag not in a
+                if backend == "claude":
+                    assert a[:3] == ["-p", "--output-format", "json"] and json.loads(a[a.index("--json-schema") + 1]) == sa.UNIT_SCHEMA
+                    assert a[a.index("--tools") + 1] == "" and a[a.index("--system-prompt") + 1] == "SYS"
+                    assert a[a.index("--setting-sources") + 1] == "project" and a[a.index("--mcp-config") + 1].endswith("mcp.json")
+                    for flag in ("--no-session-persistence", "--strict-mcp-config", "--disable-slash-commands"):
+                        assert flag in a, flag
+                    assert r["stdin"] == "MSG"
+                elif backend == "codex":
+                    assert a[:2] == ["exec", "--ephemeral"] and a[-1] == "-" and "--output-schema" in a and "-o" in a and a[a.index("-s") + 1] == "read-only"
+                    assert r["stdin"] == "SYS\n\nMSG"
+                else:
+                    assert a[:3] == ["run", "--format", "json"]
+                    assert a[-1].startswith("SYS\n\nMSG") and "JSON object matching this schema" in a[-1]
+                    assert r["perm"] == '{"*":"deny"}'
+            for backend, msg in [("claude", "Not logged in"), ("codex", "codex not logged in"), ("opencode", "opencode no auth")]:
+                v, _, err = ask(backend, None, "fail")
+                assert v is None and msg in err, (backend, v, err)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+
+
 def main() -> None:
     if "--brief-only" in sys.argv:
         test_brief_cases()
-        print("ok: brief cases")
+        test_llm_backends()
+        print("ok: brief cases, llm backends")
         return
     test_brief_cases()
+    test_llm_backends()
     keep = sys.argv[sys.argv.index("--keep") + 1] if "--keep" in sys.argv else None
     root = Path(keep or tempfile.mkdtemp(prefix="sorrel-auto-"))
     phy, out = root / "phy", root / "phy" / "sorrel_auto"
