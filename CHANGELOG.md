@@ -36,6 +36,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   and each case is one card row or one counterfactual line. `evidence.json`
   stores the exact input with each verdict, and an older `evidence.json` is
   renamed aside, not deleted.
+- GitHub releases include a standalone `sorrel-<VERSION>-x86_64-windows.exe`
+  next to the zip, checksummed in `SHA256SUMS.txt` and signed like the other
+  assets.
 
 ### Fixed
 

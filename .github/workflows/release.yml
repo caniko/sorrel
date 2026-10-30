@@ -281,9 +281,28 @@ jobs:
           df -h /
           free_kib="$(df -Pk / | awk 'NR == 2 { print $4 }')"
           test "$free_kib" -ge 2097152 || { echo "GitHub runner has less than 2 GiB free before release publication" >&2; exit 1; }
+      - name: Promote archive members to release assets
+        run: |
+          set -euo pipefail
+          nix shell nixpkgs#libarchive -c bash <<'SCRIPT'
+          set -euo pipefail
+          . ./release-env
+          tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+          promote() {
+            archive="$1"; member="$2"; asset="$3"
+            test -f "release/$archive" || { echo "release archive missing: $archive" >&2; exit 1; }
+            test ! -e "release/$asset" || { echo "release asset collision: $asset" >&2; exit 1; }
+            dir="$(mktemp -d "$tmp/x.XXXXXX")"
+            bsdtar -xpf "release/$archive" -C "$dir" -- "$member"
+            { test -f "$dir/$member" && test ! -L "$dir/$member"; } || { echo "member $member is not a regular file in $archive" >&2; exit 1; }
+            cp -p "$dir/$member" "release/$asset"
+          }
+          promote "sorrel-${VERSION}-x86_64-windows.zip" "sorrel.exe" "sorrel-${VERSION}-x86_64-windows.exe"
+          SCRIPT
       - name: Generate release checksums
         run: |
           set -euo pipefail
+          . ./release-env
           cd release
           shopt -s nullglob
           files=()
@@ -292,6 +311,7 @@ jobs:
           add_matches '*.zip'
           add_matches '*.AppImage'
           add_matches '*.whl'
+          files+=("sorrel-${VERSION}-x86_64-windows.exe")
           : > SHA256SUMS.txt
           count=0
           while IFS= read -r file; do
@@ -336,6 +356,7 @@ jobs:
           attest_blob_with_key() { file="$1"; predicate="$2"; cosign attest-blob --yes --key "$cosign_key" --predicate "$predicate" --type slsaprovenance1 --bundle "${file}.intoto.bundle" "$file"; }
           shopt -s nullglob
           files=(release/*.tar.gz release/*.zip release/*.AppImage release/*.deb release/*.src.rpm release/*.exe)
+          files+=("release/sorrel-${VERSION}-x86_64-windows.exe")
           while IFS= read -r file; do
             [ -f "$file" ] || continue
             artifact_sha="$(sha256sum "$file" | awk '{print $1}')"; predicate="$(mktemp)"
@@ -382,6 +403,7 @@ jobs:
           add_matches 'release/*.zip'
           add_matches 'release/*.AppImage'
           add_matches 'release/*.whl'
+          files+=("release/sorrel-${VERSION}-x86_64-windows.exe")
           while IFS= read -r file; do
             [ -f "$file" ] || continue
             name=$(basename "$file")
@@ -632,7 +654,7 @@ jobs:
             exit 0
           }
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=32322b53b0837137c7b31cb6d8a41b76ef0ec9b2 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=0dd5b690b2d69f6eba7e8f90102dec8d089db9b9 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -660,7 +682,7 @@ jobs:
           set -euo pipefail
           . ./release-env
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=32322b53b0837137c7b31cb6d8a41b76ef0ec9b2 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=0dd5b690b2d69f6eba7e8f90102dec8d089db9b9 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -709,7 +731,7 @@ jobs:
           if [ -z "${CHOCOLATEY_API_KEY:-}" ]; then publisher_missing chocolatey 'CHOCOLATEY_API_KEY unset'; fi
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
           if [ "${CHOCO_CANDIDATE_CACHE_HIT:-}" != true ]; then echo 'Chocolatey candidate persistence was not verified.' >&2; exit 1; fi
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=32322b53b0837137c7b31cb6d8a41b76ef0ec9b2 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=0dd5b690b2d69f6eba7e8f90102dec8d089db9b9 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -1116,7 +1138,7 @@ jobs:
             exit 0
           }
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=32322b53b0837137c7b31cb6d8a41b76ef0ec9b2 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=0dd5b690b2d69f6eba7e8f90102dec8d089db9b9 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -1144,7 +1166,7 @@ jobs:
           set -euo pipefail
           . ./release-env
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=32322b53b0837137c7b31cb6d8a41b76ef0ec9b2 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=0dd5b690b2d69f6eba7e8f90102dec8d089db9b9 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
@@ -1194,7 +1216,7 @@ jobs:
           if [ -z "${CHOCOLATEY_API_KEY:-}" ]; then publisher_missing chocolatey 'CHOCOLATEY_API_KEY unset'; fi
           ZIP="release/sorrel-${VERSION}-x86_64-windows.zip"; test -s "$ZIP" || publisher_missing chocolatey "missing $ZIP"
           if [ "${CHOCO_CANDIDATE_CACHE_HIT:-}" != true ]; then echo 'Chocolatey candidate persistence was not verified.' >&2; exit 1; fi
-          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=32322b53b0837137c7b31cb6d8a41b76ef0ec9b2 -c simit dist chocolatey bump \
+          nix develop -c nix shell github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=0dd5b690b2d69f6eba7e8f90102dec8d089db9b9 -c simit dist chocolatey bump \
             --version "$VERSION" \
             --package-dir chocolatey-package \
             --archive "x64=$ZIP" \
