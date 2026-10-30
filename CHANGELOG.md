@@ -37,6 +37,17 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   stores the exact input with each verdict, and an older `evidence.json` is
   renamed aside, not deleted.
 
+- `sorrel auto --llm` runs on the agent CLIs you are logged in to: bare
+  `--llm` uses `claude`, `--llm=codex` and `--llm=opencode` the others, and
+  `--llm=api` keeps the Anthropic API. Tools are disabled and each case runs
+  in an empty directory. `evidence.json` records the backend in `model`.
+
+### Changed
+
+- Bare `--llm` now uses the `claude` CLI instead of the Anthropic API, and
+  `--llm-model` has no default (each backend uses its own; `claude-opus-5`
+  for `api`). `--llm` takes its backend as `--llm=NAME`.
+
 ### Fixed
 
 - Sparse phy templates (`template_ind.npy`) are mapped onto their probe

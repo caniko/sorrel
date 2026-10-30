@@ -17,13 +17,13 @@ Kilosort/phy directory in, two files out (in --out):
   `sorrel apply --curation` replays it as one undoable batch, and
   `spikeinterface.curation.apply_curation` reads it as-is.
 - evidence.json: per-unit classifier outputs, Bombcell failures and, with
-  --llm, the exact user message Claude saw (`llm_input`, the shared brief header once as
+  --llm, the exact user message the LLM saw (`llm_input`, the shared brief header once as
   `llm_header`) plus its verdict.
 
 Pipeline (current SpikeInterface practice, Oct 2026): remove excess
 spikes -> analyzer (cached) -> redundant units -> merge presets
 `similarity_correlograms` + `slay` -> Bombcell + UnitRefine labels on the
-merged units -> optional Claude tiebreak on what the classifiers leave
+merged units -> optional LLM tiebreak (claude/codex/opencode CLI or API) on what the classifiers leave
 uncertain. Splits are left to sorrel's own `review:split` tags.
 """
 
@@ -33,10 +33,12 @@ import argparse
 import ast
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -398,9 +400,39 @@ MERGE_SCHEMA = {
 }
 
 
-def ask_claude(client, model: str, system: str, kind: str, message: str) -> dict | None:
-    """One structured verdict, or None when Claude declines or errors (the
-    caller then falls back to review tags)."""
+SCHEMAS = {"unit": UNIT_SCHEMA, "merge": MERGE_SCHEMA}
+BACKENDS = ("claude", "codex", "opencode", "api")
+LOGIN = {
+    "claude": "install Claude Code and run `claude`, then /login",
+    "codex": "install codex and run `codex login`",
+    "opencode": "install opencode and run `opencode auth login`",
+}
+
+
+def parse_verdict(text, kind: str) -> dict | None:
+    """The first valid verdict object in `text` (bare, fenced or inside prose),
+    normalised; None if there is none. Every backend routes through here, and
+    for opencode (no schema enforcement) this is the only check."""
+    if not isinstance(text, str):
+        return None
+    key, dec = ("label" if kind == "unit" else "merge"), json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            obj, _ = dec.raw_decode(text, i)
+        except json.JSONDecodeError:
+            continue
+        v, c, r = obj.get(key), obj.get("confidence"), obj.get("reasons")
+        good = v in ("good", "mua", "noise") if kind == "unit" else isinstance(v, bool)
+        if good and isinstance(c, (int, float)) and not isinstance(c, bool) and math.isfinite(c) and isinstance(r, list):
+            return {key: v, "confidence": min(max(float(c), 0.0), 1.0), "reasons": [str(x) for x in r][:3]}
+    return None
+
+
+def ask_api(client, model: str, system: str, kind: str, message: str) -> dict | None:
+    """One structured verdict from the Anthropic API, or None when Claude
+    declines or errors (the caller then falls back to review tags)."""
     import anthropic
 
     try:
@@ -410,13 +442,7 @@ def ask_claude(client, model: str, system: str, kind: str, message: str) -> dict
             betas=["server-side-fallback-2026-07-01"],
             extra_body={"fallbacks": "default"},
             system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-            output_config={
-                "effort": "low",
-                "format": {
-                    "type": "json_schema",
-                    "schema": UNIT_SCHEMA if kind == "unit" else MERGE_SCHEMA,
-                },
-            },
+            output_config={"effort": "low", "format": {"type": "json_schema", "schema": SCHEMAS[kind]}},
             messages=[{"role": "user", "content": message}],
         )
     except anthropic.APIError as e:
@@ -425,28 +451,109 @@ def ask_claude(client, model: str, system: str, kind: str, message: str) -> dict
     if response.stop_reason != "end_turn":
         log(f"Claude stopped with {response.stop_reason}; leaving it for review")
         return None
-    text = next((b.text for b in response.content if b.type == "text"), None)
-    try:
-        verdict = json.loads(text)
-    except (TypeError, json.JSONDecodeError):
-        return None
-    verdict["confidence"] = min(max(float(verdict.get("confidence", 0.0)), 0.0), 1.0)
-    verdict["reasons"] = [str(r) for r in verdict.get("reasons", [])][:3]
-    verdict["model"] = response.model
+    verdict = parse_verdict(next((b.text for b in response.content if b.type == "text"), None), kind)
+    if verdict:
+        verdict["model"] = response.model
     return verdict
 
 
-def run_claude(model: str, system: str, jobs: list[tuple[str, str]]) -> list[dict | None]:
+def cli_argv(backend: str, model: str | None, system: str, kind: str, message: str, root: Path):
+    """(argv, stdin text, extra env, cwd) for one case. `root` is the case's
+    scratch dir: the CLI runs in the empty `root/cwd` and reads `root/schema.json`
+    / `root/mcp.json` and writes `root/out.json` beside it.
+    ponytail: the system prompt is one argv string for claude (Linux caps a
+    single arg at 128 KiB); switch to a prompt file if a brief header outgrows it."""
+    cwd, m = root / "cwd", (["-m", model] if model else [])
+    if backend == "claude":
+        # Empty MCP set, project-only settings and an empty cwd keep the user's
+        # own Claude Code context (~50k tokens) out of every call.
+        argv = ["claude", "-p", "--output-format", "json", "--json-schema", json.dumps(SCHEMAS[kind]),
+                "--system-prompt", system, "--tools", "", "--no-session-persistence", "--strict-mcp-config",
+                "--mcp-config", str(root / "mcp.json"), "--setting-sources", "project", "--disable-slash-commands"]
+        return argv + (["--model", model] if model else []), message, {}, cwd
+    if backend == "codex":  # no system-prompt flag
+        argv = ["codex", "exec", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "--output-schema",
+                str(root / "schema.json"), "-o", str(root / "out.json"), "-C", str(cwd), "--json", *m, "-"]
+        return argv, f"{system}\n\n{message}", {}, cwd
+    # opencode: no schema, system or stdin; tools denied through its inline permission config
+    prompt = f"{system}\n\n{message}\n\nReply with ONLY a JSON object matching this schema: {json.dumps(SCHEMAS[kind])}"
+    return ["opencode", "run", "--format", "json", *m, prompt], "", {"OPENCODE_PERMISSION": '{"*":"deny"}'}, cwd
+
+
+def cli_text(backend: str, stdout: str, out_file: Path) -> tuple[str | None, str | None, str | None]:
+    """(reply text, model the CLI reported, failure message) from a CLI's output."""
+    if backend == "claude":
+        try:
+            env = json.loads(stdout)
+        except json.JSONDecodeError:
+            return None, None, "unparseable output"
+        if env.get("is_error"):
+            return None, None, str(env.get("result"))
+        so = env.get("structured_output")
+        return (json.dumps(so) if so else env.get("result")), next(iter(env.get("modelUsage") or {}), None), None
+    events = []
+    for line in stdout.splitlines():
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(e, dict):
+            events.append(e)
+    why = None
+    for e in reversed(events):
+        if e.get("type") in ("error", "turn.failed"):
+            x = e.get("error")
+            why = (x.get("message") if isinstance(x, dict) else x) or e.get("message")
+            break
+    if backend == "codex":
+        return (out_file.read_text() if out_file.exists() else None) or None, None, why
+    texts = [(e.get("part") or {}).get("text") or e.get("text") for e in events if e.get("type") == "text"]
+    return (texts[-1] if texts else None), None, why
+
+
+def ask_cli(backend: str, model: str | None, system: str, kind: str, message: str) -> dict | None:
+    """One verdict from an agent CLI (one subprocess per case), or None (the
+    caller then falls back to review tags).
+    ponytail: a process per case, 8 in parallel; a persistent session per
+    backend is the upgrade if process start-up dominates."""
+    with tempfile.TemporaryDirectory(prefix="sorrel-llm-") as d:
+        root = Path(d)
+        argv, stdin, extra, cwd = cli_argv(backend, model, system, kind, message, root)
+        cwd.mkdir()
+        (root / "schema.json").write_text(json.dumps(SCHEMAS[kind]))
+        (root / "mcp.json").write_text('{"mcpServers":{}}')
+        try:
+            r = subprocess.run(argv, input=stdin, cwd=cwd, env={**os.environ, **extra}, capture_output=True, text=True, timeout=600)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log(f"{backend} failed ({type(e).__name__}: {e}); leaving it for review")
+            return None
+        text, reported, why = cli_text(backend, r.stdout, root / "out.json")
+    if r.returncode != 0 or text is None:
+        log(f"{backend} failed (exit {r.returncode}: {why or r.stderr.strip()[-300:] or 'no reply'}); leaving it for review")
+        return None
+    verdict = parse_verdict(text, kind)
+    if verdict is None:
+        log(f"{backend} reply was not a valid verdict ({text[:120]!r}); leaving it for review")
+        return None
+    verdict["model"] = f"claude-cli:{reported or model or 'claude'}" if backend == "claude" else f"{backend}:{model or backend}"
+    return verdict
+
+
+def run_llm(backend: str | None, model: str | None, system: str, jobs: list[tuple[str, str]]) -> list[dict | None]:
     if not jobs:
         return []
-    import anthropic
+    if backend == "api":
+        import anthropic
 
-    client = anthropic.Anthropic()
-    log(f"asking {model} about {len(jobs)} case(s)")
+        client, model = anthropic.Anthropic(), model or "claude-opus-5"
+        ask = lambda j: ask_api(client, model, system, *j)  # noqa: E731
+    else:
+        ask = lambda j: ask_cli(backend, model, system, *j)  # noqa: E731
+    log(f"asking {backend}{f' ({model})' if model else ''} about {len(jobs)} case(s)")
     # ponytail: synchronous calls on a small pool; switch to the Batches API
-    # (50% cheaper, but no server-side fallbacks) once runs reach thousands of cases.
+    # (50% cheaper, but no server-side fallbacks) once api runs reach thousands of cases.
     with ThreadPoolExecutor(max_workers=8) as pool:
-        return list(pool.map(lambda j: ask_claude(client, model, system, *j), jobs))
+        return list(pool.map(ask, jobs))
 
 
 # --------------------------------------------------------------------------
@@ -505,9 +612,11 @@ def main() -> None:
     ap.add_argument("--jobs", type=int, default=-1)
     ap.add_argument("--no-merge", action="store_true")
     ap.add_argument("--no-unitrefine", action="store_true")
-    ap.add_argument("--llm", action="store_true")
-    ap.add_argument("--llm-model", default="claude-opus-5")
+    ap.add_argument("--llm", nargs="?", const="claude", choices=BACKENDS)
+    ap.add_argument("--llm-model")
     args = ap.parse_args()
+    if args.llm in LOGIN and not shutil.which(args.llm):
+        raise SystemExit(f"--llm {args.llm}: `{args.llm}` not found on PATH; {LOGIN[args.llm]}")
 
     import spikeinterface
     import spikeinterface.core as sc
@@ -567,7 +676,7 @@ def main() -> None:
         for g, _ in llm_merge:
             evals[g[0]] = eval_line(sorrel_call(args.data_dir, "eval", {"merge": list(g)}))
     messages = [merge_message(evals[g[0]], p) for g, p in llm_merge]
-    verdicts = run_claude(args.llm_model, system, [("merge", m) for m in messages])
+    verdicts = run_llm(args.llm, args.llm_model, system, [("merge", m) for m in messages])
     vetoed = []
     for (group, _), verdict, message in zip(llm_merge, verdicts, messages):
         record = {"units": group, "verdict": verdict, "llm_input": message}
@@ -592,7 +701,7 @@ def main() -> None:
         for u in group:
             tags[u] |= group_tags
         applied.append(group)
-    log(f"{len(applied)} merge(s), {len(vetoed)} vetoed by Claude")
+    log(f"{len(applied)} merge(s), {len(vetoed)} vetoed by the LLM")
 
     # Re-measure merged units: labels must describe the merged neuron.
     members = {u: [u] for u in (int(x) for x in analyzer.unit_ids)}
@@ -670,7 +779,7 @@ def main() -> None:
             if len(m) > 1 and m[0] not in evals:
                 evals[m[0]] = eval_line(sorrel_call(args.data_dir, "eval", {"merge": list(m)}))
         messages = [unit_message(card_head, rows, r, evals) for r in recs]
-    verdicts = run_claude(args.llm_model, system, [("unit", m) for m in messages])
+    verdicts = run_llm(args.llm, args.llm_model, system, [("unit", m) for m in messages])
     for u, verdict, message in zip(llm_units, verdicts, messages):
         label, t = decided[u]
         evidence["units"][str(u)]["llm"] = verdict
