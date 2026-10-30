@@ -155,6 +155,15 @@
               "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
             ];
             checksum_globs = ["*.tar.gz" "*.zip" "*.AppImage" "*.whl"];
+            # A standalone sorrel.exe on the release page (checksummed and
+            # signed like the rest); winget and Chocolatey keep using the zip.
+            extract = [
+              {
+                archive = "sorrel-{version}-x86_64-windows.zip";
+                member = "sorrel.exe";
+                asset = "sorrel-{version}-x86_64-windows.exe";
+              }
+            ];
             build_commands = [
               "git archive --format=tar --prefix=\"sorrel-$VERSION/\" HEAD | gzip -n > \"release/sorrel-$VERSION.tar.gz\""
             ];
@@ -180,7 +189,7 @@
           license_url = "https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT";
           archive_pattern = "sorrel-{version}-{arch}-windows.zip";
           # chocolatey isn't in nixpkgs yet, and the dev shell no longer ships simit.
-          nix_tool = "github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=32322b53b0837137c7b31cb6d8a41b76ef0ec9b2";
+          nix_tool = "github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=0dd5b690b2d69f6eba7e8f90102dec8d089db9b9";
           api_key_secret = "CHOCOLATEY_API_KEY";
           dependencies = [{id = "uv";}];
         };
@@ -334,7 +343,7 @@
 
       releaseSmoke = pkgs.writeShellApplication {
         name = "sorrel-release-smoke";
-        runtimeInputs = with pkgs; [coreutils file findutils gnugrep gzip gnutar unzip];
+        runtimeInputs = with pkgs; [coreutils diffutils file findutils gnugrep gzip gnutar unzip];
         text = ''
           exec bash ${./release/smoke.sh} "$@"
         '';
