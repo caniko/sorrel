@@ -112,6 +112,35 @@ def test_llm_backends() -> None:
     _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "crates" / "sorrel" / "src"))
     import sorrel_auto as sa
 
+    # --llm=api preflight: env credential, else the active `ant` profile's file.
+    with tempfile.TemporaryDirectory() as cfg:
+        c = Path(cfg)
+        bare = {"ANTHROPIC_CONFIG_DIR": cfg}
+        assert not sa.api_credential(bare), "ant installed but not logged in"
+        assert sa.api_credential({**bare, "ANTHROPIC_API_KEY": "k"})
+        (c / "credentials").mkdir()
+        (c / "credentials" / "default.json").write_text("{}")
+        assert sa.api_credential(bare)
+        (c / "active_config").write_text("work\n")
+        assert not sa.api_credential(bare), "active profile has no credentials"
+        assert sa.api_credential({**bare, "ANTHROPIC_PROFILE": "default"})
+    # An unresolvable credential at request time (the SDK raises TypeError)
+    # leaves every case in review instead of aborting the run.
+    import anthropic
+
+    class NoAuth:
+        class beta:
+            class messages:
+                @staticmethod
+                def create(**_):
+                    raise TypeError("Could not resolve authentication method")
+
+    real, anthropic.Anthropic = anthropic.Anthropic, NoAuth
+    try:
+        assert sa.run_llm("api", None, "sys", [("unit", "m1"), ("unit", "m2")]) == [None, None]
+    finally:
+        anthropic.Anthropic = real
+
     pv = sa.parse_verdict
     ok = {"label": "good", "confidence": 0.9, "reasons": ["r"]}
     assert pv(json.dumps(ok), "unit") == ok

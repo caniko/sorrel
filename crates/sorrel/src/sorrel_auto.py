@@ -553,6 +553,26 @@ def ask_cli(backend: str, model: str | None, system: str, kind: str, message: st
     return verdict
 
 
+def api_credential(env=os.environ) -> bool:
+    """Whether the Anthropic SDK will find a credential: an env credential, or
+    the active `ant auth login` profile's stored credentials (the SDK's
+    documented chain; `ant auth status` must not be scripted against).
+    ponytail: workload-identity federation env vars are not checked."""
+    if env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN"):
+        return True
+    if env.get("ANTHROPIC_CONFIG_DIR"):
+        base = Path(env["ANTHROPIC_CONFIG_DIR"])
+    elif sys.platform == "win32":
+        base = Path(env.get("APPDATA", "")) / "Anthropic"
+    else:
+        base = Path(env.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "anthropic"
+    profile = env.get("ANTHROPIC_PROFILE")
+    if not profile:
+        active = base / "active_config"
+        profile = (active.read_text().strip() if active.is_file() else "") or "default"
+    return (base / "credentials" / f"{profile}.json").is_file()
+
+
 def run_llm(backend: str | None, model: str | None, system: str, jobs: list[tuple[str, str | None]]) -> list[dict | None]:
     """One verdict per (kind, message) job; None for a job without a message or
     whose call raised, so one bad case never loses the others' paid verdicts."""
@@ -561,8 +581,15 @@ def run_llm(backend: str | None, model: str | None, system: str, jobs: list[tupl
     if backend == "api":
         import anthropic
 
-        client, model = anthropic.Anthropic(), model or "claude-opus-5"
-        ask = lambda j: ask_api(client, model, system, *j)  # noqa: E731
+        model = model or "claude-opus-5"
+        clients = []
+
+        def ask(j):
+            # Built on first use, inside `safe`: a credential the SDK cannot
+            # resolve leaves the cases in review instead of aborting the run.
+            if not clients:
+                clients.append(anthropic.Anthropic())
+            return ask_api(clients[0], model, system, *j)
     else:
         ask = lambda j: ask_cli(backend, model, system, *j)  # noqa: E731
 
@@ -643,9 +670,8 @@ def main() -> None:
     args = ap.parse_args()
     if args.llm in LOGIN and not shutil.which(args.llm):
         raise SystemExit(f"--llm {args.llm}: `{args.llm}` not found on PATH; {LOGIN[args.llm]}")
-    # ponytail: `ant auth login` credential storage is not probed; an `ant` binary counts.
-    if args.llm == "api" and not (os.environ.get("ANTHROPIC_API_KEY") or shutil.which("ant")):
-        raise SystemExit("--llm=api: set ANTHROPIC_API_KEY (or install and log in `ant`)")
+    if args.llm == "api" and not api_credential():
+        raise SystemExit("--llm=api: no Anthropic credential; set ANTHROPIC_API_KEY or run `ant auth login`")
 
     import spikeinterface
     import spikeinterface.core as sc

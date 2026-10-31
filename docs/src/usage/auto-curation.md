@@ -199,7 +199,8 @@ malformed backend reply) is only logged: it gets no verdict and keeps its
 `review:*` tags. A merged unit with any member card missing is not asked about
 at all. `--llm` cannot be combined with `--reuse`, and with `--discard-journal`
 set the journal aside first (`sorrel open --discard-journal`). `--llm=api`
-needs `ANTHROPIC_API_KEY` (or an `ant` binary) and fails before the analysis
+needs `ANTHROPIC_API_KEY` or an active `ant auth login` profile (its stored
+credentials, not just the `ant` binary) and fails before the analysis
 otherwise. Each run sets an existing `evidence.json` aside as
 `evidence.json.<unix seconds>` first, so a rerun cannot overwrite paid
 verdicts.
