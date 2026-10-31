@@ -7,6 +7,22 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+
+- `sorrel auto --llm` no longer aborts the whole run, losing every paid
+  verdict, when one case has no card or one call fails. That case stays in
+  review. An existing `evidence.json` is renamed aside on every run.
+- `sorrel auto` refuses `--llm` together with `--discard-journal` or
+  `--reuse`, and `--llm=api` checks for credentials before the analysis.
+  On Windows the CLI backends use UTF-8 pipes and resolve npm `.cmd` shims.
+- `brief` relation lines, `eval` and `probe` report presence over the same
+  50 bins as QC, and keep every active rule threshold when rounding.
+- A rule op `||>` is rejected instead of never firing, and so is a NaN or
+  infinite rule value.
+- An agent edit validated before the human switched to propose-only is no
+  longer applied.
+- Sparse phy templates that name a channel twice keep both columns.
+
 ## [0.3.0] - 2026-10-31
 
 ### Breaking
