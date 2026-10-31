@@ -39,7 +39,6 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - GitHub releases include a standalone `sorrel-<VERSION>-x86_64-windows.exe`
   next to the zip, checksummed in `SHA256SUMS.txt` and signed like the other
   assets.
-
 - `sorrel auto --llm` runs on the agent CLIs you are logged in to: bare
   `--llm` uses `claude`, `--llm=codex` and `--llm=opencode` the others, and
   `--llm=api` keeps the Anthropic API. Tools are disabled and each case runs
