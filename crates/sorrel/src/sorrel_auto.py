@@ -261,14 +261,17 @@ def finite(v):
 def sorrel_call(data_dir: str, tool: str, arguments: dict) -> str:
     """One MCP tool (`brief`, `eval`) through `sorrel call`, with the binary and
     open arguments `sorrel auto` passed in the environment. It goes through a
-    running host, else opens the dataset itself. Fails loudly: a missing brief
-    leaves units in review."""
+    running host, else opens the dataset itself. Fails loudly: with no brief no
+    case can be judged."""
     exe = os.environ.get("SORREL_BIN")
     if not exe:
         raise SystemExit("--llm needs the sorrel binary: run through `sorrel auto` (SORREL_BIN unset)")
     open_args = json.loads(os.environ.get("SORREL_OPEN_ARGS", "[]"))
     cmd = [exe, "call", *open_args, data_dir, tool, json.dumps(arguments)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=600)
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f"sorrel call {tool} {arguments} timed out after 600 s")
     if r.returncode:
         raise SystemExit(f"sorrel call {tool} {arguments} failed ({r.returncode}): {r.stderr.strip()}")
     return r.stdout
@@ -284,25 +287,33 @@ def split_brief(text: str) -> tuple[str, str, dict[int, str]]:
     for line in lines[1:]:
         if "\t" not in line:
             break
-        rows[int(line.split("\t", 1)[0])] = line
+        try:
+            rows[int(line.split("\t", 1)[0])] = line
+        except ValueError:
+            log(f"brief: skipping malformed card row {line[:60]!r}")
     return header.rstrip("\n"), (lines[0] if lines else ""), rows
 
 
-def eval_line(text: str) -> str:
-    """The one-line merge counterfactual the `eval` tool returns."""
+def eval_line(text: str) -> str | None:
+    """The one-line merge counterfactual the `eval` tool returns, or None (the
+    case then stays in review)."""
     line = text.strip()
     if not line or "\n" in line:
-        raise SystemExit(f"eval returned no single counterfactual line: {text[-200:]!r}")
+        log(f"eval returned no single counterfactual line ({text[-200:]!r}); leaving it for review")
+        return None
     return line
 
 
-def unit_message(card_head: str, rows: dict[int, str], record: dict, evals: dict[int, str]) -> str:
+def unit_message(card_head: str, rows: dict[int, str], record: dict, evals: dict[int, str | None]) -> str | None:
     """User message for one (possibly merged) unit: its card row(s), the merge
-    counterfactual when it is a merge of several units, the classifier outputs."""
+    counterfactual when it is a merge of several units, the classifier outputs.
+    None (no LLM call, the unit stays in review) unless every member has a card
+    and a merge has its counterfactual: no partial judgement."""
     members = record.get("members", [])
-    cards = [rows[m] for m in members if m in rows]
-    if not cards:
-        raise SystemExit(f"the brief returned no card for unit(s) {members}")
+    if not members or any(m not in rows for m in members) or (len(members) > 1 and not evals.get(members[0])):
+        log(f"no complete evidence for unit(s) {members}; leaving it for review")
+        return None
+    cards = [rows[m] for m in members]
     classifiers = {k: v for k, v in record.items() if k != "members"}
     msg = "Decide this unit.\n"
     if len(members) > 1:
@@ -462,22 +473,25 @@ def cli_argv(backend: str, model: str | None, system: str, kind: str, message: s
     scratch dir: the CLI runs in the empty `root/cwd` and reads `root/schema.json`
     / `root/mcp.json` and writes `root/out.json` beside it.
     ponytail: the system prompt is one argv string for claude (Linux caps a
-    single arg at 128 KiB); switch to a prompt file if a brief header outgrows it."""
+    single arg at 128 KiB, Windows' whole command line at 32 KiB); switch to a
+    prompt file if a brief header outgrows it. argv[0] is the resolved path so
+    npm `.cmd` shims work on Windows."""
     cwd, m = root / "cwd", (["-m", model] if model else [])
+    exe = shutil.which(backend) or backend
     if backend == "claude":
         # Empty MCP set, project-only settings and an empty cwd keep the user's
         # own Claude Code context (~50k tokens) out of every call.
-        argv = ["claude", "-p", "--output-format", "json", "--json-schema", json.dumps(SCHEMAS[kind]),
+        argv = [exe, "-p", "--output-format", "json", "--json-schema", json.dumps(SCHEMAS[kind]),
                 "--system-prompt", system, "--tools", "", "--no-session-persistence", "--strict-mcp-config",
                 "--mcp-config", str(root / "mcp.json"), "--setting-sources", "project", "--disable-slash-commands"]
         return argv + (["--model", model] if model else []), message, {}, cwd
     if backend == "codex":  # no system-prompt flag
-        argv = ["codex", "exec", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "--output-schema",
+        argv = [exe, "exec", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "--output-schema",
                 str(root / "schema.json"), "-o", str(root / "out.json"), "-C", str(cwd), "--json", *m, "-"]
         return argv, f"{system}\n\n{message}", {}, cwd
     # opencode: no schema, system or stdin; tools denied through its inline permission config
     prompt = f"{system}\n\n{message}\n\nReply with ONLY a JSON object matching this schema: {json.dumps(SCHEMAS[kind])}"
-    return ["opencode", "run", "--format", "json", *m, prompt], "", {"OPENCODE_PERMISSION": '{"*":"deny"}'}, cwd
+    return [exe, "run", "--format", "json", *m, prompt], "", {"OPENCODE_PERMISSION": '{"*":"deny"}'}, cwd
 
 
 def cli_text(backend: str, stdout: str, out_file: Path) -> tuple[str | None, str | None, str | None]:
@@ -516,14 +530,14 @@ def ask_cli(backend: str, model: str | None, system: str, kind: str, message: st
     caller then falls back to review tags).
     ponytail: a process per case, 8 in parallel; a persistent session per
     backend is the upgrade if process start-up dominates."""
-    with tempfile.TemporaryDirectory(prefix="sorrel-llm-") as d:
+    with tempfile.TemporaryDirectory(prefix="sorrel-llm-", ignore_cleanup_errors=True) as d:
         root = Path(d)
         argv, stdin, extra, cwd = cli_argv(backend, model, system, kind, message, root)
         cwd.mkdir()
         (root / "schema.json").write_text(json.dumps(SCHEMAS[kind]))
         (root / "mcp.json").write_text('{"mcpServers":{}}')
         try:
-            r = subprocess.run(argv, input=stdin, cwd=cwd, env={**os.environ, **extra}, capture_output=True, text=True, timeout=600)
+            r = subprocess.run(argv, input=stdin, cwd=cwd, env={**os.environ, **extra}, capture_output=True, encoding="utf-8", errors="replace", timeout=600)
         except (subprocess.TimeoutExpired, OSError) as e:
             log(f"{backend} failed ({type(e).__name__}: {e}); leaving it for review")
             return None
@@ -539,21 +553,60 @@ def ask_cli(backend: str, model: str | None, system: str, kind: str, message: st
     return verdict
 
 
-def run_llm(backend: str | None, model: str | None, system: str, jobs: list[tuple[str, str]]) -> list[dict | None]:
+def api_credential(env=os.environ) -> bool:
+    """Whether the Anthropic SDK will find a credential: an env credential, or
+    the active `ant auth login` profile's stored credentials (the SDK's
+    documented chain; `ant auth status` must not be scripted against).
+    ponytail: workload-identity federation env vars are not checked."""
+    if env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN"):
+        return True
+    if env.get("ANTHROPIC_CONFIG_DIR"):
+        base = Path(env["ANTHROPIC_CONFIG_DIR"])
+    elif sys.platform == "win32":
+        base = Path(env.get("APPDATA", "")) / "Anthropic"
+    else:
+        base = Path(env.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "anthropic"
+    profile = env.get("ANTHROPIC_PROFILE")
+    if not profile:
+        active = base / "active_config"
+        profile = (active.read_text().strip() if active.is_file() else "") or "default"
+    return (base / "credentials" / f"{profile}.json").is_file()
+
+
+def run_llm(backend: str | None, model: str | None, system: str, jobs: list[tuple[str, str | None]]) -> list[dict | None]:
+    """One verdict per (kind, message) job; None for a job without a message or
+    whose call raised, so one bad case never loses the others' paid verdicts."""
     if not jobs:
         return []
     if backend == "api":
         import anthropic
 
-        client, model = anthropic.Anthropic(), model or "claude-opus-5"
-        ask = lambda j: ask_api(client, model, system, *j)  # noqa: E731
+        model = model or "claude-opus-5"
+        clients = []
+
+        def ask(j):
+            # Built on first use, inside `safe`: a credential the SDK cannot
+            # resolve leaves the cases in review instead of aborting the run.
+            if not clients:
+                clients.append(anthropic.Anthropic())
+            return ask_api(clients[0], model, system, *j)
     else:
         ask = lambda j: ask_cli(backend, model, system, *j)  # noqa: E731
-    log(f"asking {backend}{f' ({model})' if model else ''} about {len(jobs)} case(s)")
+
+    def safe(j):
+        if j[1] is None:
+            return None
+        try:
+            return ask(j)
+        except Exception as e:  # noqa: BLE001
+            log(f"{backend} call failed ({type(e).__name__}: {e}); leaving it for review")
+            return None
+
+    log(f"asking {backend}{f' ({model})' if model else ''} about {sum(j[1] is not None for j in jobs)} case(s)")
     # ponytail: synchronous calls on a small pool; switch to the Batches API
     # (50% cheaper, but no server-side fallbacks) once api runs reach thousands of cases.
     with ThreadPoolExecutor(max_workers=8) as pool:
-        return list(pool.map(ask, jobs))
+        return list(pool.map(safe, jobs))
 
 
 # --------------------------------------------------------------------------
@@ -617,6 +670,8 @@ def main() -> None:
     args = ap.parse_args()
     if args.llm in LOGIN and not shutil.which(args.llm):
         raise SystemExit(f"--llm {args.llm}: `{args.llm}` not found on PATH; {LOGIN[args.llm]}")
+    if args.llm == "api" and not api_credential():
+        raise SystemExit("--llm=api: no Anthropic credential; set ANTHROPIC_API_KEY or run `ant auth login`")
 
     import spikeinterface
     import spikeinterface.core as sc
@@ -661,12 +716,13 @@ def main() -> None:
 
     llm_merge = [(g, p) for g, p in merges if len(p) < len(PRESETS)] if args.llm else []
     system, evals = RUBRIC, {}
+    # Set a previous run's evidence.json aside (renamed, never deleted: its paid
+    # verdicts survive a rerun) before anything writes it; the brief's `ev`
+    # column would also read it stale.
+    old = out / "evidence.json"
+    if old.exists():
+        old.rename(out / f"evidence.json.{int(time.time())}")
     if args.llm:
-        # The brief's `ev` column reads a previous run's evidence.json, so set
-        # it aside (renamed, never deleted: its paid verdicts survive a crash).
-        old = out / "evidence.json"
-        if old.exists():
-            old.rename(out / f"evidence.json.{int(time.time())}")
         # ponytail: header from the unfiltered level-0 brief (merges are judged
         # before the classifiers pick the unsure units); one `sorrel call`
         # process per merge group, a batched call if runs show hundreds.
@@ -675,7 +731,7 @@ def main() -> None:
         evidence["llm_header"] = header
         for g, _ in llm_merge:
             evals[g[0]] = eval_line(sorrel_call(args.data_dir, "eval", {"merge": list(g)}))
-    messages = [merge_message(evals[g[0]], p) for g, p in llm_merge]
+    messages = [merge_message(evals[g[0]], p) if evals.get(g[0]) else None for g, p in llm_merge]
     verdicts = run_llm(args.llm, args.llm_model, system, [("merge", m) for m in messages])
     vetoed = []
     for (group, _), verdict, message in zip(llm_merge, verdicts, messages):
@@ -765,6 +821,7 @@ def main() -> None:
         if unsure and args.llm:
             llm_units.append(u)
 
+    (out / "evidence.json").write_text(json.dumps(evidence, indent=1, default=str))  # merge verdicts survive a crash below
     messages = []
     if llm_units:
         # Merged units are not in the dataset `sorrel call` opens: ask for
@@ -776,7 +833,7 @@ def main() -> None:
         )
         for r in recs:
             m = r["members"]
-            if len(m) > 1 and m[0] not in evals:
+            if len(m) > 1 and m[0] not in evals:  # None = tried, unusable
                 evals[m[0]] = eval_line(sorrel_call(args.data_dir, "eval", {"merge": list(m)}))
         messages = [unit_message(card_head, rows, r, evals) for r in recs]
     verdicts = run_llm(args.llm, args.llm_model, system, [("unit", m) for m in messages])

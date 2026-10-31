@@ -1016,7 +1016,9 @@ fn read_optional_templates(
                     continue; // -1 wraps to u32::MAX; also out-of-range
                 }
                 for s in 0..ns {
-                    dense[(t * ns + s) * n_channels + ch as usize] = flat[(t * ns + s) * local + l];
+                    // += : a repeated index sums, so zero padding adds nothing.
+                    dense[(t * ns + s) * n_channels + ch as usize] +=
+                        flat[(t * ns + s) * local + l];
                 }
             }
         }

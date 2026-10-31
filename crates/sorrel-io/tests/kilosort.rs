@@ -843,14 +843,15 @@ fn sparse_templates_are_densified_via_template_ind() {
         "n_channels_dat = 3\nsample_rate = 1000.\n",
     )
     .unwrap();
-    // 2 templates x 2 samples x 2 local columns; template 0 -> channels
-    // [2, 0], template 1 -> [-1, 1] (-1 = unused column, skipped).
-    let vals: [f32; 8] = [1., 2., 3., 4., 5., 6., 7., 8.];
+    // 2 templates x 2 samples x 3 local columns; template 0 -> channels
+    // [2, 0, 0] (zero-padded repeat of 0), template 1 -> [-1, 1, 1] (-1 =
+    // unused column, skipped; repeated 1 sums).
+    let vals: [f32; 12] = [1., 2., 0., 3., 4., 0., 5., 6., 7., 8., 9., 10.];
     let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-    write_npy_v1_3d(&root.join("templates.npy"), "<f4", 2, 2, 2, &bytes);
-    let ind: [i64; 4] = [2, 0, -1, 1];
+    write_npy_v1_3d(&root.join("templates.npy"), "<f4", 2, 2, 3, &bytes);
+    let ind: [i64; 6] = [2, 0, 0, -1, 1, 1];
     let ind_bytes: Vec<u8> = ind.iter().flat_map(|v| v.to_le_bytes()).collect();
-    write_npy_v1_2d(&root.join("template_ind.npy"), "<i8", 2, 2, &ind_bytes);
+    write_npy_v1_2d(&root.join("template_ind.npy"), "<i8", 2, 3, &ind_bytes);
 
     let p = KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
     use sorrel_io::HasTemplateWaveforms;
@@ -858,6 +859,6 @@ fn sparse_templates_are_densified_via_template_ind() {
     // [template][sample][channel]
     assert_eq!(
         p.template_waveforms(),
-        &[2., 0., 1., 4., 0., 3., 0., 6., 0., 0., 8., 0.]
+        &[2., 0., 1., 4., 0., 3., 0., 13., 0., 0., 19., 0.]
     );
 }

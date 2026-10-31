@@ -218,13 +218,17 @@ pub fn footprint(
     let prop: Vec<(f64, f64)> = active
         .iter()
         .map(|&c| {
-            let t = (0..n_samples).fold(0, |b, s| {
-                if template[s * n_channels + c] < template[b * n_channels + c] {
-                    s
-                } else {
-                    b
-                }
-            });
+            // Positive-going channels (same rule as `waveform_landmarks`) are
+            // timed at their maximum.
+            let v = |s: usize| template[s * n_channels + c];
+            let (lo, hi) =
+                (0..n_samples).fold((f32::MAX, f32::MIN), |(l, h), s| (l.min(v(s)), h.max(v(s))));
+            let sign = if hi.abs() > INVERT_RATIO * lo.abs() {
+                -1.0
+            } else {
+                1.0
+            };
+            let t = (0..n_samples).fold(0, |b, s| if sign * v(s) < sign * v(b) { s } else { b });
             (dist(positions[c], positions[pk]), t as f64 * ms)
         })
         .collect();
@@ -411,6 +415,14 @@ mod tests {
         assert!((f.propagation_ms_per_100um - 0.333).abs() < 0.02, "{f:?}");
         assert_eq!(f.n_active, 16);
         assert!(footprint(&tpl, 40, 16, &pos[..8], 30_000.0).is_none());
+    }
+
+    #[test]
+    fn positive_going_channels_are_timed_at_their_maximum() {
+        let (mut tpl, pos) = probe_template(|d| (-d / 400.0).exp(), |d| 5 + (d / 10.0) as usize);
+        tpl.iter_mut().for_each(|x| *x = -*x);
+        let f = footprint(&tpl, 40, 16, &pos, 30_000.0).unwrap();
+        assert!((f.propagation_ms_per_100um - 0.333).abs() < 0.02, "{f:?}");
     }
 
     #[test]

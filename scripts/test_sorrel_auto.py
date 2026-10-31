@@ -71,12 +71,13 @@ def test_brief_cases() -> None:
     assert "merge of 3,7" in merged and "3\tgood" in merged and "7\tmua" in merged and "\neval: z=1\n" in merged
     assert sa.eval_line("merge {3,4}: rpc 0,0→.05\n") == "merge {3,4}: rpc 0,0→.05"
     assert sa.merge_message("eval: m", {"slay", "similarity_correlograms"}).endswith("proposed_by: similarity_correlograms,slay")
-    try:
-        sa.unit_message(card_head, rows, {**rec, "members": [99]}, {})
-    except SystemExit:
-        pass
-    else:
-        raise AssertionError("a unit without a card must fail loudly")
+    # a unit missing a card (or one member of a merge, or its eval) is left for review, never judged partially
+    assert sa.unit_message(card_head, rows, {**rec, "members": [99]}, {}) is None
+    assert sa.unit_message(card_head, rows, {**rec, "members": [3, 99]}, {3: "eval: z=1"}) is None
+    assert sa.unit_message(card_head, rows, {**rec, "members": [3, 7]}, {3: None}) is None
+    assert sa.eval_line("two\nlines") is None and sa.eval_line("") is None
+    _, _, ok_rows = sa.split_brief(BRIEF.replace("7\tmua", "x\tbad\n7\tmua"))
+    assert sorted(ok_rows) == [3, 7], ok_rows
 
 
 FAKE = """#!/usr/bin/env python3
@@ -105,10 +106,40 @@ def test_llm_backends() -> None:
     import contextlib
     import io
     import os
+    import shutil
     import sys as _sys
 
     _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "crates" / "sorrel" / "src"))
     import sorrel_auto as sa
+
+    # --llm=api preflight: env credential, else the active `ant` profile's file.
+    with tempfile.TemporaryDirectory() as cfg:
+        c = Path(cfg)
+        bare = {"ANTHROPIC_CONFIG_DIR": cfg}
+        assert not sa.api_credential(bare), "ant installed but not logged in"
+        assert sa.api_credential({**bare, "ANTHROPIC_API_KEY": "k"})
+        (c / "credentials").mkdir()
+        (c / "credentials" / "default.json").write_text("{}")
+        assert sa.api_credential(bare)
+        (c / "active_config").write_text("work\n")
+        assert not sa.api_credential(bare), "active profile has no credentials"
+        assert sa.api_credential({**bare, "ANTHROPIC_PROFILE": "default"})
+    # An unresolvable credential at request time (the SDK raises TypeError)
+    # leaves every case in review instead of aborting the run.
+    import anthropic
+
+    class NoAuth:
+        class beta:
+            class messages:
+                @staticmethod
+                def create(**_):
+                    raise TypeError("Could not resolve authentication method")
+
+    real, anthropic.Anthropic = anthropic.Anthropic, NoAuth
+    try:
+        assert sa.run_llm("api", None, "sys", [("unit", "m1"), ("unit", "m2")]) == [None, None]
+    finally:
+        anthropic.Anthropic = real
 
     pv = sa.parse_verdict
     ok = {"label": "good", "confidence": 0.9, "reasons": ["r"]}
@@ -172,6 +203,23 @@ def test_llm_backends() -> None:
                     assert a[:3] == ["run", "--format", "json"]
                     assert a[-1].startswith("SYS\n\nMSG") and "JSON object matching this schema" in a[-1]
                     assert r["perm"] == '{"*":"deny"}'
+            exe = sa.cli_argv("claude", None, "S", "unit", "M", Path("."))[0][0]
+            assert exe == shutil.which("claude") and Path(exe).is_absolute(), exe
+            # one raising call becomes None; a job without a message is never asked
+            real = sa.ask_cli
+
+            def flaky(backend, model, system, kind, message):
+                if message == "boom":
+                    raise RuntimeError("x")
+                return {"label": "good", "confidence": 1.0, "reasons": [], "model": "m"}
+
+            sa.ask_cli = flaky
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    got = sa.run_llm("claude", None, "SYS", [("unit", "a"), ("unit", "boom"), ("unit", None)])
+            finally:
+                sa.ask_cli = real
+            assert [g and g["label"] for g in got] == ["good", None, None], got
             for backend, msg in [("claude", "Not logged in"), ("codex", "codex not logged in"), ("opencode", "opencode no auth")]:
                 v, _, err = ask(backend, None, "fail")
                 assert v is None and msg in err, (backend, v, err)

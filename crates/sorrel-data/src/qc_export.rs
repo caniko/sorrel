@@ -316,9 +316,8 @@ pub fn collect_qc_rows_with<P: DataProvider>(
     positions: Option<&[[f32; 2]]>,
 ) -> Vec<QcRow> {
     use sorrel_compute::{
-        amplitude_drift_correlation, amplitude_drift_slope, amplitude_snr, burst_index, footprint,
-        hartigan_dip, isi_violation_rate, isi_violations, longest_silent_gap_frac, mean_amplitude,
-        peak_channel, presence_ratio, refractory_contamination, sliding_refractory_argmin,
+        amplitude_drift_slope, burst_index, footprint, hartigan_dip, isi_violation_rate,
+        isi_violations, mean_amplitude, peak_channel, sliding_refractory_argmin,
         waveform_landmarks,
     };
     let sr = session.provider.sample_rate().max(1.0);
@@ -352,13 +351,6 @@ pub fn collect_qc_rows_with<P: DataProvider>(
         } else {
             0.0
         };
-        let _contam = refractory_contamination(times, refractory_samples, total_samples.0, sr);
-        let _ = (
-            amplitude_snr,
-            amplitude_drift_correlation,
-            presence_ratio,
-            longest_silent_gap_frac,
-        );
         let (iso2, l_ratio, nn, d_prime, silhouette) = match q.isolation {
             Some(iso) => (
                 iso.isolation_distance_sq,

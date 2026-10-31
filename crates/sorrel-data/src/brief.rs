@@ -424,7 +424,7 @@ fn ledger_line(u: &Unit, mode: &[(&str, usize)], extra: &[(String, f32)]) -> Str
         "{}\t{}\t{}\t{}\t{}\t{}\n",
         u.id,
         r.n_spikes,
-        quantise(r.firing_rate_hz, &[]),
+        quantise(r.firing_rate_hz, &thresholds_with("firing_rate", extra)),
         u.label,
         quantise(
             r.composite_quality,
@@ -609,7 +609,9 @@ pub fn render_brief<P: DataProvider>(
     // Priority order: most flags first, then id.
     let mut order: Vec<&Unit> = units.iter().collect();
     order.sort_by_key(|u| (std::cmp::Reverse(u.flags.len()), u.id));
-    let listed = |u: &&&Unit| !u.flags.is_empty() || u.row.composite_quality < Q_CLEAN;
+    let listed = |u: &&&Unit| {
+        !u.flags.is_empty() || u.row.composite_quality.is_nan() || u.row.composite_quality < Q_CLEAN
+    };
 
     let mut omitted = Vec::new();
     let ledger_head = "id\tn\tfr\tlab\tq\tflags\n";
@@ -801,6 +803,33 @@ mod tests {
         let th = thresholds_with("firing_rate", &set.thresholds());
         let kept: f32 = quantise(v, &th).parse().unwrap();
         assert!(kept > 1.234, "{kept}");
+        // The ledger fr column and the evaluate/probe renderers use the same set.
+        let row = QcRow {
+            cluster_id: 3,
+            firing_rate_hz: v,
+            ..QcRow::default()
+        };
+        let unit = Unit {
+            id: 3,
+            row: &row,
+            flags: vec![],
+            label: "good",
+        };
+        let fr = |extra: &[(String, f32)]| -> f32 {
+            ledger_line(&unit, &[], extra)
+                .split('\t')
+                .nth(2)
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        assert!(fr(&[]) < 1.234 && fr(&set.thresholds()) > 1.234);
+        let q = |extra: &[(String, f32)]| -> f32 {
+            crate::evaluate::qm(v, "firing_rate", extra)
+                .parse()
+                .unwrap()
+        };
+        assert!(q(&[]) < 1.234 && q(&set.thresholds()) > 1.234);
     }
 
     #[test]

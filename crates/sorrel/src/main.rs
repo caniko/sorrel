@@ -153,7 +153,8 @@ enum Cmd {
             num_args = 0..=1,
             require_equals = true,
             default_missing_value = "claude",
-            value_name = "BACKEND"
+            value_name = "BACKEND",
+            conflicts_with = "reuse"
         )]
         llm: Option<LlmBackend>,
         /// Model for --llm (default: the backend's own, `claude-opus-5` for api)
@@ -1148,6 +1149,15 @@ fn uv_on_path(path: &std::ffi::OsStr) -> bool {
     std::env::split_paths(path).any(|d| d.join(&uv).is_file())
 }
 
+/// `--discard-journal` would set the journal aside again on every `sorrel call`
+/// the `--llm` stage makes, so it must happen beforehand.
+fn auto_llm_journal_ok(llm: bool, discard_journal: bool) -> Result<()> {
+    if llm && discard_journal {
+        bail!("sorrel auto --llm: set the journal aside first (`sorrel open --discard-journal`) or drop --llm");
+    }
+    Ok(())
+}
+
 /// Run the embedded `sorrel_auto.py` into `out`: with `uv run --script` when uv is
 /// on PATH (its PEP 723 header pins the dependencies), else with
 /// `$SORREL_PYTHON` / `python` (Windows) or `python3`, which must already have
@@ -2107,6 +2117,7 @@ fn main() -> Result<()> {
         }) => {
             let out = open.root().join("sorrel_auto");
             if !reuse {
+                auto_llm_journal_ok(llm.is_some(), open.discard_journal)?;
                 let mut flags = vec![];
                 if let Some(backend) = llm {
                     let name = clap::ValueEnum::to_possible_value(&backend)
@@ -2264,6 +2275,12 @@ mod tests {
         );
         assert!(parse(&["auto", "DIR", "--llm=gpt"]).is_err());
         assert!(parse(&["auto", "DIR", "--llm-model", "m"]).is_err());
+        // a reused curation.json makes no LLM calls
+        assert!(parse(&["auto", "DIR", "--llm", "--reuse"]).is_err());
+        assert!(parse(&["auto", "DIR", "--reuse"]).is_ok());
+        assert!(auto_llm_journal_ok(true, true).is_err());
+        assert!(auto_llm_journal_ok(true, false).is_ok());
+        assert!(auto_llm_journal_ok(false, true).is_ok());
     }
 
     #[test]

@@ -193,9 +193,21 @@ and open arguments (`SORREL_BIN`, `SORREL_OPEN_ARGS`), so the sidecar runs
 `sorrel call DIR brief` and `sorrel call DIR eval` on the dataset exactly as
 `sorrel auto` opens it. They run before `sorrel auto` opens the session, so the
 journal is not locked; with a host running, `sorrel call` goes through it. If a
-call fails, the `--llm` stage fails with its stderr and nothing is applied.
+call fails, the `--llm` stage fails with its stderr and nothing is applied. A
+single case that cannot be judged (a missing card or `eval` line, a failed or
+malformed backend reply) is only logged: it gets no verdict and keeps its
+`review:*` tags. A merged unit with any member card missing is not asked about
+at all. `--llm` cannot be combined with `--reuse`, and with `--discard-journal`
+set the journal aside first (`sorrel open --discard-journal`). `--llm=api`
+needs `ANTHROPIC_API_KEY` or an active `ant auth login` profile (its stored
+credentials, not just the `ant` binary) and fails before the analysis
+otherwise. Each run sets an existing `evidence.json` aside as
+`evidence.json.<unix seconds>` first, so a rerun cannot overwrite paid
+verdicts.
 
-- **System prompt** (cached once for all cases): the rubric plus the brief
+- **System prompt** (cached once for all cases with `--llm=api`; the CLI
+  backends re-send it with every case, about 3 KB per case, until a
+  persistent-session backend replaces the process per case): the rubric plus the brief
   header, which has the recording, the population quantiles of every metric, the
   flag thresholds and the legend for the cards.
 - **One message per unit**: the unit's card row (every metric, the flags it
@@ -209,8 +221,8 @@ call fails, the `--llm` stage fails with its stderr and nothing is applied.
 Amplitudes are in the brief's own units, which its header states (template
 units for Kilosort; `--gain-to-uv` scales only the SpikeInterface side). A unit
 message is a few hundred bytes where the raw arrays it replaces (25-point
-template, 30-bin ACG, 8-channel footprint, deciles; JSON) took 1-2 KB, and the
-header is paid once, not per case.
+template, 30-bin ACG, 8-channel footprint, deciles; JSON) took 1-2 KB; the
+header is paid once with `api` and per case with the CLI backends.
 
 The reply is a JSON verdict (label or merge/no-merge, a confidence and up to
 three reasons). Its `model` names the backend: `claude-cli:<model>`,
