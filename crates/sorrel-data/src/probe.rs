@@ -102,12 +102,11 @@ pub fn parse(q: &str) -> Result<Query, String> {
         "ccg" => {
             want(2, &["win", "bin"])?;
             let (win, bin) = span()?;
-            Ok(Query::Ccg {
-                a: id(pos[0])?,
-                b: id(pos[1])?,
-                win,
-                bin,
-            })
+            let (a, b) = (id(pos[0])?, id(pos[1])?);
+            if a == b {
+                return Err("ccg of a unit with itself is its acg; use acg".into());
+            }
+            Ok(Query::Ccg { a, b, win, bin })
         }
         "compare" => {
             want(2, &[])?;
@@ -178,6 +177,7 @@ pub fn merge_line<P: DataProvider>(
     session: &Session<P>,
     merges: &[MergeCandidate],
     ids: &[u32],
+    extra: &[(String, f32)],
 ) -> Result<String, String> {
     let mut ids = ids.to_vec();
     ids.sort_unstable();
@@ -190,7 +190,12 @@ pub fn merge_line<P: DataProvider>(
         .map(|c| cl(session, c))
         .collect::<Result<Vec<_>, _>>()?;
     let ev = eval_merge(session, &ids);
-    Ok(render_merge("merge", &ev, &merge_edges(merges, &ids)))
+    Ok(render_merge(
+        "merge",
+        &ev,
+        &merge_edges(merges, &ids),
+        extra,
+    ))
 }
 
 /// Answer `q`. `split` adds a handle to `handles`.
@@ -218,6 +223,7 @@ pub fn run<P: DataProvider>(
                 &h,
                 b as f32 * 1000.0 / sr,
                 *win,
+                &handles.extra,
             ))
         }
         Query::Ccg { a, b, win, bin } => {
@@ -267,7 +273,7 @@ pub fn run<P: DataProvider>(
             let line = handles.line(session, &id, &[])?;
             Ok(used.map_or(line.clone(), |x| format!("{line} [at {}]", qn(x))))
         }
-        Query::Merge(ids) => merge_line(session, merges, ids),
+        Query::Merge(ids) => merge_line(session, merges, ids, &handles.extra),
         Query::Handle(h) => handles.line(session, h, merges),
     }
 }
@@ -282,6 +288,7 @@ fn rates(counts: &[u32], n: usize, bin_ms: f32) -> String {
 }
 
 /// ACG detail from the centred two-sided histogram `h`.
+#[allow(clippy::too_many_arguments)]
 pub fn acg_text(
     c: u32,
     times: &[SampleIndex],
@@ -290,6 +297,7 @@ pub fn acg_text(
     h: &[u32],
     bin_ms: f32,
     win_ms: f32,
+    extra: &[(String, f32)],
 ) -> String {
     let (cont, rp) = sliding_refractory_argmin(
         times,
@@ -312,7 +320,11 @@ pub fn acg_text(
     format!(
         "acg {c} n {} win {win_ms}ms bin {bin_ms:.2}ms: rp {rp} rpc {} burst {}\nsax(log lag 0-{}ms) {letters}\nrate Hz bins 0..{}: {}",
         times.len(),
-        qm(if rp == "-" { f32::NAN } else { cont }, "rp_contamination"),
+        qm(
+            if rp == "-" { f32::NAN } else { cont },
+            "rp_contamination",
+            extra
+        ),
         qn(burst_index(h, bin_ms)),
         edges.last().copied().unwrap_or(0.0),
         first.len(),
@@ -684,6 +696,7 @@ mod tests {
             "acg",
             "acg x",
             "acg 1 2",
+            "ccg 3 3",
             "acg 1 win=abc",
             "acg 1 foo=2",
             "acg 1 win=5 bin=9",
@@ -703,7 +716,7 @@ mod tests {
         let t = train(5_000);
         let total = t.last().unwrap().0 + 1000;
         let h = auto_correlogram(&t, 1500, 100);
-        let text = acg_text(3, &t, SR, total, &h, 1.0 * 30.0 / 30.0, 50.0);
+        let text = acg_text(3, &t, SR, total, &h, 1.0, 50.0, &[]);
         assert!(field(&text, "rpc") < 0.05, "{text}");
         assert!(
             text.contains("\nsax(log lag 0-50ms) ") && text.contains("\nrate Hz bins 0..6: "),

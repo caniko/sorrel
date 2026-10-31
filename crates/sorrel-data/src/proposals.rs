@@ -94,8 +94,13 @@ pub struct Proposal {
 /// indices): changes whenever a merge or split changes the membership.
 pub fn spike_basis<P: DataProvider>(session: &Session<P>, cluster: ClusterId) -> String {
     let globals = crate::proposers::cluster_globals(session, cluster);
+    basis_of(&globals)
+}
+
+/// [`spike_basis`] of a cluster whose global spike indices are `globals`.
+pub fn basis_of(globals: &[u32]) -> String {
     let mut hasher = blake3::Hasher::new();
-    for g in &globals {
+    for g in globals {
         hasher.update(&g.to_le_bytes());
     }
     format!("{}:{}", globals.len(), hasher.finalize().to_hex())
@@ -340,6 +345,18 @@ mod tests {
             n_samples: SampleIndex(1000),
         };
         Session::new(prov, Journal::open(&dir.join("j.journal")).unwrap())
+    }
+
+    /// The batch pass (one scan for all clusters) gives the exact basis string
+    /// the per-cluster scan stamps into the audit log.
+    #[test]
+    fn batch_bases_equal_per_cluster_bases() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = session(dir.path());
+        let all = crate::proposers::all_cluster_globals(&s);
+        for c in 0..s.n_clusters() {
+            assert_eq!(basis_of(&all[c as usize]), spike_basis(&s, ClusterId(c)));
+        }
     }
 
     #[test]

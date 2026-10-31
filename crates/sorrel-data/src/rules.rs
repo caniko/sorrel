@@ -96,15 +96,18 @@ impl RuleSet {
 
     fn validate(&self) -> Result<()> {
         for r in &self.rules {
-            for (metric, op, _) in r.conds() {
+            for (metric, op, t) in r.conds() {
                 if !QcRow::METRICS.contains(&metric) {
                     bail!(
                         "unknown metric {metric:?}; expected one of {}",
                         QcRow::METRICS.join(", ")
                     );
                 }
-                compare(op.trim_start_matches('|'), 0.0, 0.0)
+                compare(op.strip_prefix('|').unwrap_or(op), 0.0, 0.0)
                     .with_context(|| format!("rule on {metric:?}"))?;
+                if !t.is_finite() {
+                    bail!("rule on {metric:?}: value {t} is not finite");
+                }
             }
             label_op(&r.label)?;
         }
@@ -506,5 +509,13 @@ mod tests {
             .contains(&("drift_correlation".into(), -0.5)));
         assert!(RuleSet::parse("[[rule]]\nmetric = \"n_spikes\"\nop = \"<\"\nvalue = 1\nlabel = \"good\"\nall = [{ metric = \"x\", op = \"<\", value = 1 }]\n").is_err());
         assert!(cond_holds("|<", -0.2, 0.5) && !cond_holds("|>", f32::NAN, 0.0));
+        let one = |op: &str, v: &str| {
+            RuleSet::parse(&format!(
+                "[[rule]]\nmetric = \"firing_rate\"\nop = \"{op}\"\nvalue = {v}\nlabel = \"good\"\n"
+            ))
+        };
+        assert!(one("|>", "1").is_ok());
+        assert!(one("||>", "1").is_err(), "only one leading bar");
+        assert!(one(">", "nan").is_err() && one(">", "inf").is_err());
     }
 }

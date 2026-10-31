@@ -709,6 +709,7 @@ fn apply_split<P: DataProvider + ApplyPhyLabel>(
         by,
     };
     host.apply_if(agent, cmd, |s| {
+        refuse_if_propose_only(host)?;
         if proposals::spike_basis(s, cluster) != basis {
             bail!(
                 "cluster {} changed since its spikes were read; read them again and retry",
@@ -823,8 +824,26 @@ fn suggestions<'a, P: DataProvider, F>(
     (m, s)
 }
 
+/// Hand the active rule thresholds to `env.handles`, so rendered lines keep
+/// every rule decision through quantising.
+fn sync_thresholds<F>(env: &mut Env<F>) {
+    env.handles.extra = active_rules(env.save_dir, &env.rules)
+        .map(|r| r.thresholds())
+        .unwrap_or_default();
+}
+
+/// Refuse inside an apply: the human may have switched to propose-only since
+/// the policy was read.
+fn refuse_if_propose_only<P: DataProvider + ApplyPhyLabel>(host: &SessionHost<P>) -> Result<()> {
+    if host.policy() == AgentPolicy::ProposeOnly {
+        bail!("the human switched to propose-only; nothing applied");
+    }
+    Ok(())
+}
+
 /// Bring the cached suggestions and the handle table up to date.
 fn refresh_handles<P: DataProvider, F>(session: &Session<P>, env: &mut Env<F>) {
+    sync_thresholds(env);
     let _ = suggestions(session, env);
     if let Some((_, m, s)) = &env.suggest {
         env.handles.refresh(session, m, s);
@@ -967,6 +986,7 @@ where
             .ok_or_else(|| ToolError::Failed("nested batch".into()))?,
     };
     let ev = host.apply_if(env.agent(), cmd, |s| {
+        refuse_if_propose_only(host)?;
         if s.version() != version {
             bail!("the session changed since this was validated; nothing applied, read it again and retry");
         }
@@ -1418,6 +1438,7 @@ where
             }))
         }
         "eval" => {
+            sync_thresholds(env);
             let _ = suggestions(session, env);
             let Some((_, merges, _)) = &env.suggest else {
                 return fail("suggest cache missing");
@@ -1432,7 +1453,8 @@ where
                     .map_err(ToolError::Failed)?,
                 (None, Some(_)) => {
                     let ids = arg_u32_list(args, "merge")?;
-                    crate::probe::merge_line(session, merges, &ids).map_err(ToolError::Failed)?
+                    crate::probe::merge_line(session, merges, &ids, &env.handles.extra)
+                        .map_err(ToolError::Failed)?
                 }
                 _ => return fail("eval takes {merge:[ids]} or {candidate:\"s12.1\"|\"m3\"}"),
             };
@@ -1453,6 +1475,7 @@ where
                 return fail(format!("probe takes 1..={MAX_QUERIES} queries"));
             }
             let parsed: Vec<_> = qs.iter().map(|q| parse(q)).collect();
+            sync_thresholds(env);
             if parsed
                 .iter()
                 .any(|p| matches!(p, Ok(Query::Merge(_) | Query::Handle(_))))
@@ -2479,6 +2502,33 @@ mod tests {
         let mut env = Env::new(dir.path(), false, label);
         let r = handle_line(&h, &mut env, &call(10, "selection", json!({}))).unwrap();
         assert_eq!(r["result"]["isError"], true);
+    }
+
+    /// The human flips to propose-only after validation: a batch or split
+    /// that was validated under Direct must refuse and apply nothing.
+    #[test]
+    fn policy_flip_after_validation_refuses_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SessionHost::new(mock_session(dir.path()));
+        let mut env = Env::new(dir.path(), false, label);
+        let version = h.read().version();
+        h.set_policy(AgentPolicy::ProposeOnly);
+        let relabel = CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: crate::command::PhyLabelOp::SetGood,
+        };
+        let e = apply_all(&h, &mut env, version, vec![relabel]).unwrap_err();
+        assert!(err_msg(e).contains("propose-only"));
+        let basis = proposals::spike_basis(&h.read(), ClusterId(0));
+        let e = apply_split(&h, env.agent(), ClusterId(0), vec![0], &basis).unwrap_err();
+        assert!(format!("{e:#}").contains("propose-only"));
+        assert_eq!(h.read().version(), version, "nothing applied");
+        h.set_policy(AgentPolicy::Direct);
+        let relabel = CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: crate::command::PhyLabelOp::SetGood,
+        };
+        assert!(apply_all(&h, &mut env, version, vec![relabel]).is_ok());
     }
 
     /// Under propose-only, edit tools queue proposals (a merge keeps its

@@ -12,8 +12,8 @@
 //! shoulders average under [`MIN_SHOULDER`] counts per bin (the z is then
 //! noise, e.g. 99 from a std floor).
 
-use crate::brief::{quantise, thresholds};
-use crate::proposals::spike_basis;
+use crate::brief::{quantise, thresholds_with};
+use crate::proposals::{basis_of, spike_basis};
 use crate::session::Session;
 use crate::suggest::{MergeCandidate, SplitCandidate};
 use serde::Serialize;
@@ -25,7 +25,8 @@ use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
-const PRESENCE_BINS: usize = 20;
+/// Same as QC (`quality_ext`), so `pres` matches the ledger.
+const PRESENCE_BINS: usize = 50;
 /// Pairwise CCGs are O(k^2); past this many parts only the totals are given.
 const MAX_PAIR_PARTS: usize = 6;
 pub const STALE: &str = "call brief level 3 again";
@@ -252,8 +253,9 @@ fn short(s: String) -> String {
         s
     }
 }
-pub(crate) fn qm(v: f32, metric: &str) -> String {
-    short(quantise(v, &thresholds(metric)))
+/// `extra`: further (metric, threshold) pairs (the active rules) to keep.
+pub(crate) fn qm(v: f32, metric: &str, extra: &[(String, f32)]) -> String {
+    short(quantise(v, &thresholds_with(metric, extra)))
 }
 pub(crate) fn qn(v: f32) -> String {
     short(quantise(v, &[]))
@@ -262,7 +264,12 @@ pub(crate) fn qn(v: f32) -> String {
 /// `m2 {4,9}: rpc .03,.02→.04 pres .52,.47→.98 cut .2,.1→.05 | 4-9 dip_z -4.1
 /// sync_z .3 ks .08 sim .93 d 12um pc .8`. With candidate `edges`, only the
 /// pairs that are edges (best four) are listed, with their score causes.
-pub fn render_merge(label: &str, ev: &MergeEval, edges: &[MergeCandidate]) -> String {
+pub fn render_merge(
+    label: &str,
+    ev: &MergeEval,
+    edges: &[MergeCandidate],
+    extra: &[(String, f32)],
+) -> String {
     let set: Vec<String> = ev.ids.iter().map(u32::to_string).collect();
     let mut s = format!("{label} {{{}}}:", set.join(","));
     let cols: [Col; 3] = [
@@ -271,12 +278,12 @@ pub fn render_merge(label: &str, ev: &MergeEval, edges: &[MergeCandidate]) -> St
         ("cut", "amplitude_cutoff", |u| u.amplitude_cutoff),
     ];
     for (name, metric, f) in cols {
-        let parts: Vec<String> = ev.parts.iter().map(|u| qm(f(u), metric)).collect();
+        let parts: Vec<String> = ev.parts.iter().map(|u| qm(f(u), metric, extra)).collect();
         let _ = write!(
             s,
             " {name} {}→{}",
             parts.join(","),
-            qm(f(&ev.merged), metric)
+            qm(f(&ev.merged), metric, extra)
         );
     }
     let edge = |p: &PairStats| {
@@ -318,7 +325,14 @@ pub fn render_merge(label: &str, ev: &MergeEval, edges: &[MergeCandidate]) -> St
 }
 
 /// `s12.1 kmeans sc .62: parts 1200/300 amp 80,140 rpc .02,.3 dip_z -3.9 bic 41`.
-pub fn render_split(handle: &str, method: &str, score: f32, bic: f32, ev: &SplitEval) -> String {
+pub fn render_split(
+    handle: &str,
+    method: &str,
+    score: f32,
+    bic: f32,
+    ev: &SplitEval,
+    extra: &[(String, f32)],
+) -> String {
     let two = |f: &dyn Fn(usize) -> String| format!("{},{}", f(0), f(1));
     format!(
         "{handle} {method} sc {}: parts {}/{} amp {} rpc {} dip_z {} sync_z {} bic {}",
@@ -326,7 +340,7 @@ pub fn render_split(handle: &str, method: &str, score: f32, bic: f32, ev: &Split
         ev.parts[0].n,
         ev.parts[1].n,
         two(&|i| qn(ev.mean_amp[i])),
-        two(&|i| qm(ev.parts[i].rp_contamination, "rp_contamination")),
+        two(&|i| qm(ev.parts[i].rp_contamination, "rp_contamination", extra)),
         qn(ev.dip_z),
         qn(ev.sync_z),
         qn(bic)
@@ -369,6 +383,9 @@ pub struct Handles {
     comps: BTreeMap<String, CompHandle>,
     /// Ids issued by the latest rebuild (the ones worth listing).
     current: BTreeSet<String>,
+    /// Active rule thresholds the rendered lines must not quantise across;
+    /// the server refreshes it before rendering.
+    pub extra: Vec<(String, f32)>,
 }
 
 fn find(p: &mut BTreeMap<u32, u32>, x: u32) -> u32 {
@@ -425,8 +442,6 @@ fn components(edges: &[(u32, u32, f32)]) -> Vec<Vec<u32>> {
 
 impl Handles {
     /// Rebuild from the current suggestions if the session changed.
-    // ponytail: spike_basis scans every spike per handle; cache per cluster
-    // if a recording with thousands of candidates makes refresh slow.
     pub fn refresh<P: DataProvider>(
         &mut self,
         session: &Session<P>,
@@ -437,18 +452,20 @@ impl Handles {
             return;
         }
         self.version = Some(session.version());
+        // One pass over the spikes for every basis this rebuild needs.
+        let globals = crate::proposers::all_cluster_globals(session);
+        let basis = |c: ClusterId| basis_of(&globals[c.idx()]);
         self.current.clear();
         // Stale split handles stay (resolving refuses them by basis), so
         // their ids are never reissued. ponytail: grows by one entry per
         // retired candidate; fine for a session's lifetime.
-        self.comps.retain(|_, c| {
-            (c.members.iter().zip(&c.bases)).all(|(m, b)| spike_basis(session, *m) == *b)
-        });
+        self.comps
+            .retain(|_, c| (c.members.iter().zip(&c.bases)).all(|(m, b)| basis(*m) == *b));
         for s in splits
             .iter()
             .filter(|s| !s.bipartition_minor_idx.is_empty())
         {
-            let basis = spike_basis(session, s.cluster);
+            let basis = basis(s.cluster);
             let id = self.split_id(s.cluster, &s.bipartition_minor_idx, &basis);
             self.current.insert(id.clone());
             self.splits.insert(
@@ -475,7 +492,7 @@ impl Handles {
                     format!("m{}", self.next_m)
                 }
             };
-            let bases = members.iter().map(|&c| spike_basis(session, c)).collect();
+            let bases = members.iter().map(|&c| basis(c)).collect();
             self.current.insert(id.clone());
             self.comps.insert(id, CompHandle { members, bases });
         }
@@ -566,11 +583,16 @@ impl Handles {
             let (cluster, minor, _) = self.resolve_split(session, id)?;
             let h = &self.splits[id];
             let ev = eval_split(session, cluster, &minor);
-            return Ok(render_split(id, h.method, h.score, h.bic, &ev));
+            return Ok(render_split(id, h.method, h.score, h.bic, &ev, &self.extra));
         }
         let members = self.resolve_merge(session, id)?;
         let edges = merge_edges(merges, &members);
-        Ok(render_merge(id, &eval_merge(session, &members), &edges))
+        Ok(render_merge(
+            id,
+            &eval_merge(session, &members),
+            &edges,
+            &self.extra,
+        ))
     }
 
     /// Split handle (and its line) the latest rebuild issued for `cluster`.
@@ -723,6 +745,7 @@ mod tests {
                 ..ev
             },
             &[],
+            &[],
         );
         assert!(
             line.starts_with("merge {4,9}: rpc ") && line.contains("| 4-9 dip_z"),
@@ -738,7 +761,7 @@ mod tests {
         let ev = eval_split_trains(&t, &a, &minor, SR, total);
         assert!(ev.dip_z < -5.0, "{ev:?}");
         assert_eq!((ev.parts[0].n, ev.parts[1].n), (5500, 5500));
-        assert!(render_split("s1.1", "gmm", 0.62, 12.0, &ev)
+        assert!(render_split("s1.1", "gmm", 0.62, 12.0, &ev, &[])
             .starts_with("s1.1 gmm sc .62: parts 5500/5500"));
     }
 }
