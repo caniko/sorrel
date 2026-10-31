@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-31
+
 ### Breaking
 
 - The MCP `render` and `features` tools are removed; agents read `brief`.
@@ -557,7 +559,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Downstream dry-runs can fail until their local path dependencies have been
   published in order. See `RELEASE.md` for the publish sequence.
 
-[Unreleased]: https://github.com/caniko/sorrel/compare/0.2.4...HEAD
+[Unreleased]: https://github.com/caniko/sorrel/compare/0.3.0...HEAD
+[0.3.0]: https://github.com/caniko/sorrel/compare/0.2.4...0.3.0
 [0.2.4]: https://github.com/caniko/sorrel/compare/0.2.3...0.2.4
 [0.2.3]: https://github.com/caniko/sorrel/compare/0.2.2...0.2.3
 [0.2.2]: https://github.com/caniko/sorrel/compare/0.2.1...0.2.2
