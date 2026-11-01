@@ -20,7 +20,11 @@ serde.workspace = true
 rmp-serde.workspace = true
 blake3.workspace = true
 xxhash-rust.workspace = true
-piying = { version = "=0.2.0", features = ["remote", "serde-codec"] }
+piying = { version = "=0.3.0", default-features = false, features = [
+  "macros",
+  "remote",
+  "serde-codec",
+] }
 libp2p = { version = "0.57", features = [
   "tokio",
   "tcp",
