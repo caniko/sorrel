@@ -519,6 +519,24 @@
         "type": "github"
       }
     },
+    "plinth": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792264902,
+        "narHash": "sha256-jVORzmyKgCmbwqR/XTAHjKGNJJOqN7V77VGkNcqPjeI=",
+        "ref": "trunk",
+        "rev": "e02e06eace3fc87d1d951cc49d460c35ef8ca8ad",
+        "revCount": 399,
+        "type": "git",
+        "url": "https://github.com/caniko/plinth.git"
+      },
+      "original": {
+        "ref": "trunk",
+        "rev": "e02e06eace3fc87d1d951cc49d460c35ef8ca8ad",
+        "type": "git",
+        "url": "https://github.com/caniko/plinth.git"
+      }
+    },
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
@@ -533,6 +551,7 @@
           "harbor-rs",
           "nixpkgs"
         ],
+        "plinth": "plinth",
         "rust-overlay": [
           "harbor-rs",
           "rust-overlay"

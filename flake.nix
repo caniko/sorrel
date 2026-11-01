@@ -17,6 +17,12 @@
     flake-utils.url = "github:numtide/flake-utils";
     treefmt-nix.follows = "harbor-rs/treefmt-nix";
     git-hooks.follows = "harbor-rs/git-hooks";
+
+    # Static project-site generator for the landing page (built via crane below).
+    plinth = {
+      url = "git+https://github.com/caniko/plinth.git?ref=trunk&rev=e02e06eace3fc87d1d951cc49d460c35ef8ca8ad";
+      flake = false;
+    };
   };
 
   outputs = {
@@ -29,6 +35,7 @@
     rust-overlay,
     treefmt-nix,
     git-hooks,
+    plinth,
     ...
   }:
     {
@@ -401,8 +408,20 @@
         '';
       };
 
+      plinthProjectArgs = {
+        pname = "sorrel-plinth-project";
+        src = plinth;
+        strictDeps = true;
+        cargoExtraArgs = "--locked --package plinth-project --bin plinth-project";
+        doCheck = false;
+      };
+      plinthProject = craneLib.buildPackage (plinthProjectArgs
+        // {
+          cargoArtifacts = craneLib.buildDepsOnly plinthProjectArgs;
+        });
+
       siteOutputs = import ./nix/site.nix {
-        inherit pkgs;
+        inherit pkgs plinthProject;
         root = ./.;
       };
       inherit (siteOutputs) website docs site;
@@ -449,7 +468,7 @@
         };
 
       devShells = import ./nix/devshell.nix {
-        inherit pkgs harbor-rs craneLib cross cargoConfig deps;
+        inherit pkgs harbor-rs craneLib cross cargoConfig deps plinthProject;
         checks = self.checks.${system};
         preCommitEnabledPackages = pre-commit-check.enabledPackages;
         inherit (pre-commit-check) shellHook;

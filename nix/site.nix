@@ -1,5 +1,6 @@
 {
   pkgs,
+  plinthProject,
   root,
 }: let
   inherit ((builtins.fromTOML (builtins.readFile (root + "/Cargo.toml"))).workspace.package) version;
@@ -8,14 +9,16 @@
     inherit version;
     src = pkgs.lib.fileset.toSource {
       inherit root;
-      fileset = pkgs.lib.fileset.maybeMissing (root + "/website");
+      fileset = pkgs.lib.fileset.unions [
+        (root + "/website/plinth-project.toml")
+        (root + "/assets/showcase")
+        (root + "/assets/icon/sorrel.svg")
+      ];
     };
-    # zola initialises its HTTP client at startup, even without load_data.
-    nativeBuildInputs = [pkgs.zola pkgs.cacert];
+    nativeBuildInputs = [plinthProject];
     phases = ["buildPhase" "installPhase"];
     buildPhase = ''
-      cp -r --no-preserve=mode $src/website site
-      cd site && zola build
+      plinth-project build --config $src/website/plinth-project.toml --out public
     '';
     installPhase = ''
       cp -r public $out
