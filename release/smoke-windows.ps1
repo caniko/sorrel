@@ -269,6 +269,77 @@ Assert-Ok 'wheel-exe' (Invoke-Native 'wheel-exe' (Join-Path $venv 'Scripts\sorre
 $got = (Get-Content (Join-Path $OutDir 'wheel-exe.out.txt') -Raw).Trim()
 if ($got -ne "sorrel $version") { throw "wheel sorrel.exe --version is '$got', expected 'sorrel $version'" }
 
+# 8a. Windows integration: embedded resources, the console-free launcher and
+#     the Start-menu shortcut. (Own block: kept apart from the steps above.)
+$exeW = Join-Path $BuildDir 'sorrelw.exe'
+if (-not (Test-Path $exeW)) { throw "missing $exeW" }
+foreach ($f in $exe, $exeW) {
+    $vi = (Get-Item $f).VersionInfo
+    if ($vi.ProductVersion -ne $version) { throw "$f ProductVersion is '$($vi.ProductVersion)', expected '$version'" }
+    if ($vi.ProductName -ne 'Sorrel') { throw "$f ProductName is '$($vi.ProductName)', expected 'Sorrel'" }
+    Write-Host "version info: $(Split-Path $f -Leaf) ProductName=$($vi.ProductName) ProductVersion=$($vi.ProductVersion) FileDescription=$($vi.FileDescription) Company=$($vi.CompanyName)"
+}
+
+# sorrelw.exe starts sorrel.exe with CREATE_NO_WINDOW and null stdio; the GUI runs
+# in-process there. It must stay alive and own no console window.
+Add-Type -TypeDefinition @'
+using System; using System.Collections.Generic; using System.Runtime.InteropServices; using System.Text;
+public static class SorrelWin {
+    delegate bool EnumProc(IntPtr h, IntPtr p);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc f, IntPtr p);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+    // "pid:class" of every visible top-level window
+    public static List<string> Visible() {
+        var l = new List<string>();
+        EnumWindows((h, p) => {
+            if (!IsWindowVisible(h)) return true;
+            uint pid; GetWindowThreadProcessId(h, out pid);
+            var c = new StringBuilder(256); GetClassName(h, c, 256);
+            l.Add(pid + ":" + c); return true;
+        }, IntPtr.Zero);
+        return l;
+    }
+}
+'@
+$dataW = New-DataCopy 'sorrelw'
+$before = @(Get-Process sorrel -ErrorAction SilentlyContinue | ForEach-Object Id)
+$w = Start-Process -FilePath $exeW -ArgumentList @('run', '--standalone', $dataW) -PassThru
+$guiW = $null
+try {
+    Start-Sleep -Seconds 15
+    $guiW = @(Get-Process sorrel -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.Id }) | Select-Object -First 1
+    if (-not $guiW) { throw 'sorrelw.exe left no running sorrel process after 15 s' }
+    $guiW.Refresh()
+    $kids = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($guiW.Id)" | ForEach-Object { "$($_.Name)#$($_.ProcessId)" })
+    $mine = @($guiW.Id) + @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($guiW.Id)" | ForEach-Object ProcessId)
+    $wins = [SorrelWin]::Visible()
+    $consoleWins = @($wins | Where-Object { $_ -match '^(\d+):ConsoleWindowClass$' -and $mine -contains [int]$Matches[1] })
+    Write-Host "sorrelw: sorrel pid $($guiW.Id) alive, MainWindowHandle=$($guiW.MainWindowHandle), children: $($kids -join ', '), console windows of it: $($consoleWins.Count)"
+    "pid=$($guiW.Id) mainWindow=$($guiW.MainWindowHandle) children=$($kids -join ',') visible=$($wins -join ',')" |
+        Set-Content (Join-Path $OutDir 'sorrelw.txt')
+    if ($consoleWins.Count) { throw "sorrelw.exe left a visible console window: $($consoleWins -join ', ')" }
+    if ($guiW.MainWindowHandle -eq 0) { Write-Warning 'sorrel has no main window yet (see gui.png / sorrelw.txt)' }
+}
+finally {
+    if ($guiW -and -not $guiW.HasExited) { Stop-Process -Id $guiW.Id -Force }
+    if (-not $w.HasExited) { Stop-Process -Id $w.Id -Force }
+}
+
+# `sorrel install-shortcut` makes the Start-menu .lnk to the sibling sorrelw.exe.
+$lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Sorrel.lnk'
+Remove-Item $lnk -ErrorAction SilentlyContinue
+Assert-Ok 'install-shortcut' (Invoke-Native 'install-shortcut' $exe @('install-shortcut'))
+if (-not (Test-Path $lnk)) { throw "install-shortcut did not create $lnk" }
+$sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+if ($sc.TargetPath -ne $exeW) { throw "shortcut targets '$($sc.TargetPath)', expected '$exeW'" }
+if ($sc.IconLocation -notlike "$exeW*") { throw "shortcut icon is '$($sc.IconLocation)'" }
+Write-Host "shortcut: $lnk -> $($sc.TargetPath) (icon $($sc.IconLocation))"
+Assert-Ok 'remove-shortcut' (Invoke-Native 'remove-shortcut' $exe @('install-shortcut', '--remove'))
+if (Test-Path $lnk) { throw "install-shortcut --remove left $lnk" }
+Write-Host 'shortcut removed'
+
 # 9. Microsoft Defender: winget-pkgs validation scans the installed package
 #    (Validation-Defender-Error), so reproduce that here on fresh signatures.
 #    -DisableRemediation reports without quarantining; exit 2 = threat found.
