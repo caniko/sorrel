@@ -178,6 +178,11 @@ fn walk(
         if name.starts_with(".sorrel") {
             continue; // derived cache, remote mirror
         }
+        // The journal's writer lock (and its pid file) belong to this process;
+        // on Windows the lock is mandatory, so even hashing it fails.
+        if name.ends_with(".lock") || name.ends_with(".lock.pid") {
+            continue;
+        }
         let ty = entry.file_type()?;
         if ty.is_dir() {
             walk(root, &path, exclude, out, by_path)?;
@@ -427,4 +432,24 @@ pub fn share(served: Box<dyn Served>, root: PathBuf, dat: DatSource, mode: Mode)
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// piying finds remote handlers in a `linkme` slice. A linker that garbage-
+    /// collects the registrations (GNU ld on x86_64-pc-windows-gnu without
+    /// `--no-gc-sections`) leaves it empty, and the guest's first message fails
+    /// with "unknown message 'sorrel/hello/1'". The Windows smoke runs the real
+    /// share/join; this is the same check for a cross-built test binary (wine).
+    #[test]
+    fn hello_is_registered_with_piying() {
+        use piying::remote::_internal::REMOTE_MESSAGES;
+        assert!(
+            REMOTE_MESSAGES
+                .iter()
+                .any(|(id, _)| id.message_remote_id == "sorrel/hello/1"),
+            "{} remote messages registered",
+            REMOTE_MESSAGES.len()
+        );
+    }
 }

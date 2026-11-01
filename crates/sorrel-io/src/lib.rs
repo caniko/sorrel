@@ -9,6 +9,7 @@ pub mod curation_json;
 pub mod detect;
 pub mod events;
 pub mod extras;
+pub mod fsutil;
 pub mod kilosort;
 pub mod ks4_rez;
 pub mod mda;

@@ -137,8 +137,7 @@ impl Sink {
         if self.0.is_some() {
             return Ok(());
         }
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
+        sorrel_io::fsutil::replace_file(&tmp, path)
     }
 }
 
@@ -461,7 +460,13 @@ fn capture_root(root: &Path, names: &[String], link: &[String]) -> Result<()> {
             let _ = std::fs::remove_file(&to);
             if !(link.contains(n) && std::fs::hard_link(&from, &to).is_ok()) {
                 std::fs::copy(&from, &to)
-                    .and_then(|_| std::fs::File::open(&to)?.sync_all())
+                    // Write access: FlushFileBuffers refuses a read-only handle on Windows.
+                    .and_then(|_| {
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&to)?
+                            .sync_all()
+                    })
                     .with_context(|| format!("capture {n} into {}", snap.display()))?;
             }
         }
@@ -527,7 +532,7 @@ fn publish_staged(root: &Path, arrays: bool, names: &[String]) -> Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
-        std::fs::rename(&tmp, &manifest).context("publish rewrite manifest")?;
+        sorrel_io::fsutil::replace_file(&tmp, &manifest).context("publish rewrite manifest")?;
         sync_dir(root);
         Ok(())
     };

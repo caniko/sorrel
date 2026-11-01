@@ -89,8 +89,7 @@ where
             copy_phy_files(&src, out, &rewritten)?;
             for n in &rewritten {
                 let (from, to) = (out.join(format!("{n}.tmp")), out.join(n));
-                std::fs::rename(&from, &to)
-                    .with_context(|| format!("rename {} -> {}", from.display(), to.display()))?;
+                sorrel_io::fsutil::replace_file(&from, &to)?;
             }
         }
         None => write_arrays(session, out)?,
@@ -288,6 +287,5 @@ fn atomically(path: &Path, write: impl FnOnce(&Path) -> std::io::Result<()>) -> 
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("write {}", tmp.display()));
     }
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
+    sorrel_io::fsutil::replace_file(&tmp, path)
 }

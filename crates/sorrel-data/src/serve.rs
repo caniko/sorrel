@@ -1670,7 +1670,8 @@ fn write_mcp_json(
     kind: &str,
 ) -> std::io::Result<PathBuf> {
     let path = mcp_json_path(save_dir)?;
-    let dataset = canonical(save_dir).to_string_lossy().into_owned();
+    // Not `mcp_json_path`'s hash key: that stays on the verbatim form.
+    let dataset = sorrel_io::fsutil::display_path(&canonical(save_dir)).to_string();
     write_private_json(
         &path,
         &json!({"port": port, "token": token, "pid": std::process::id(), "nonce": nonce,
@@ -1900,7 +1901,9 @@ fn list_hosts_in(dir: &Path) -> Vec<HostRecord> {
             let port = u16::try_from(v["port"].as_u64()?).ok()?;
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
             Some(HostRecord {
-                dataset: v["dataset"].as_str()?.into(),
+                // Older listener files may still hold a `\\?\` path.
+                dataset: sorrel_io::fsutil::simplified(Path::new(v["dataset"].as_str()?))
+                    .to_path_buf(),
                 port,
                 pid: u32::try_from(v["pid"].as_u64()?).ok()?,
                 kind: v["kind"].as_str()?.to_owned(),
@@ -1929,6 +1932,11 @@ pub(crate) fn connect_authed(
     let mut stream = match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(None),
+        // Windows does not answer a SYN to a closed loopback port with an
+        // immediate reset: it retries and times out, so a stale file looks
+        // like this. A live listener accepts at once.
+        // ponytail: a Windows host with a full backlog reads as stale too.
+        Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::TimedOut => return Ok(None),
         Err(e) => bail!("sorrel host on port {port} did not accept the connection: {e}"),
     };
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -2756,7 +2764,10 @@ mod tests {
         assert!(path.starts_with(user.path()) && !path.starts_with(dir.path()));
         let hosts = list_hosts();
         assert_eq!(hosts.len(), 1);
-        assert_eq!(hosts[0].dataset, dir.path().canonicalize().unwrap());
+        assert_eq!(
+            hosts[0].dataset,
+            sorrel_io::fsutil::simplified(&dir.path().canonicalize().unwrap())
+        );
         assert_eq!((hosts[0].kind.as_str(), hosts[0].port), ("gui", 1));
     }
 

@@ -28,9 +28,53 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   - **Split preview:** a lasso shows the inside and outside parts in ISI, Waveforms and Quality before you split.
   - **Ghosts:** hovering a Similar, Suggest or History row previews the merge or the state before that edit.
   - **Colour:** Features can be coloured by time or depth.
+- `sorrelw.exe`, a Windows launcher without a console window: it starts the
+  sibling `sorrel.exe` with the same arguments and exits. It ships in the
+  zip and as a standalone `sorrel-<VERSION>-x86_64-windows-gui.exe`; on Linux
+  and macOS it just execs `sorrel`.
+- `sorrel install-shortcut [--remove]` adds or deletes the Start-menu
+  shortcut to `sorrelw.exe` (Windows only). The Chocolatey package makes its
+  own, and winget lists both executables.
+- The Windows executables embed the app icon, version information and a
+  manifest (long paths, UTF-8 code page, per-monitor DPI). The window has the
+  app icon on every platform, and the Linux packages install it with the
+  menu entry.
+- Windows documentation: Start menu, SmartScreen and download verification,
+  uninstall and PowerShell completions.
+- The Windows tests (including the save tests) run on a hosted
+  `windows-2025` runner in CI.
 
 ### Fixed
 
+- A cluster made by a split now shows up in `list_clusters`, can be relabelled
+  and is written to `cluster_group.tsv`, live, after `save` and after a
+  reopen. It had no label slot, so everything that reads labels skipped it.
+- `sorrel share`/`join` work in the Windows binary: GNU ld dropped the piying
+  handler registrations (`hello: unknown message 'sorrel/hello/1'`). The
+  Windows build now links with `--no-gc-sections`.
+- Saving a Kilosort/phy dataset no longer fails on Windows with "user-mapped
+  section" (os error 1224): the provider kept `spike_times.npy` and
+  `spike_clusters.npy` mapped after loading, and the save renames a new
+  `spike_clusters.npy` over it. A cache entry that is still mapped is skipped
+  by eviction and replacement, and retried by the next GC.
+- `join` refuses a host path that is absolute, has a drive (`C:\x`), a
+  backslash, a colon or a `..`, which could write outside the join directory
+  on Windows.
+- A save, export or journal write that Windows refuses because phy, Python or
+  an Explorer preview holds the file now says to close that program and try
+  again.
+- The listener file and `sorrel status` no longer show
+  `\\?\C:\...` paths.
+- The "already open" message names the owning pid on Windows: it is kept in
+  `<journal>.lock.pid`, since the locked `.lock` file cannot be read there.
+- `sorrel auto --llm` on Windows: an npm `.cmd` shim no longer re-parses the
+  system prompt (it goes in a file for `claude`, and opencode gets its prompt as
+  an attached file), and the Anthropic credential check also looks in
+  `~/.config/anthropic`.
+- `share` no longer tries to send the host's journal lock file, which Windows
+  will not let a second handle read.
+- `sorrel-relay` warns on Windows that its key file is not ACL-restricted; the
+  relay is documented as a Linux/macOS server.
 - `sorrel auto --llm` no longer aborts the whole run, losing every paid
   verdict, when one case has no card or one call fails. That case stays in
   review. An existing `evidence.json` is renamed aside on every run.

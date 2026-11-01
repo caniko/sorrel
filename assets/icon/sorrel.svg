@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Sorrel: a sorrel (Rumex) leaf whose midline is an extracellular spike. -->
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#161b22"/>
+  <path d="M128 22 C164 66 198 108 196 150 C195 172 194 190 206 214 C178 200 152 186 128 180 C104 186 78 200 50 214 C62 190 61 172 60 150 C58 108 92 66 128 22 Z" fill="#59a14f"/>
+  <path d="M128 180 L128 238" stroke="#59a14f" stroke-width="12" stroke-linecap="round"/>
+  <path d="M68 118 L104 118 L114 186 L128 92 L138 128 L148 118 L188 118" fill="none" stroke="#f0f6fc" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

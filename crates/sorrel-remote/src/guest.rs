@@ -178,8 +178,20 @@ fn pushable_tail(tail: &[sorrel_data::Record]) -> Result<Vec<&sorrel_data::Curat
         .collect()
 }
 
+/// A host path is relative, written with `/`, and every component is a plain
+/// name. `:` and `\` are refused outright: on Windows `into.join("C:\\x")`
+/// or `join("\\x")` would leave `into`, and `a:b` names an NTFS stream.
+fn is_safe_rel(p: &str) -> bool {
+    use std::path::Component;
+    !p.is_empty()
+        && !p.contains([':', '\\'])
+        && Path::new(p)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+}
+
 async fn sync_file(host: &RemoteActorRef<HostActor>, into: &Path, f: &FileEntry) -> Result<()> {
-    if f.path.contains("..") || f.path.starts_with('/') {
+    if !is_safe_rel(&f.path) {
         bail!("host sent unsafe path {}", f.path);
     }
     let dest = into.join(&f.path);
@@ -236,6 +248,16 @@ fn blake3_of(path: &Path) -> Result<[u8; 32]> {
 mod tests {
     use super::*;
     use sorrel_data::{Actor, CurationCommand, PhyLabelOp};
+
+    #[test]
+    fn unsafe_host_paths_are_refused_on_every_platform() {
+        for bad in [
+            "C:\\x", "\\x", "/x", "a/../b", "a\\..\\b", "a:b", "..", "", "./a",
+        ] {
+            assert!(!is_safe_rel(bad), "{bad:?} must be refused");
+        }
+        assert!(is_safe_rel("a/b.npy") && is_safe_rel("params.py"));
+    }
 
     /// A `Head` anywhere in the offline tail refuses the whole tail, so no
     /// leading edit is forwarded before the join fails.

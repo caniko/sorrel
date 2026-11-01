@@ -194,13 +194,20 @@ fn lock_path(journal: &Path) -> PathBuf {
     p.into()
 }
 
+/// `<lock>.pid`: the holder's pid, unlocked so a busy opener can read it.
+fn pid_path(lock: &Path) -> PathBuf {
+    let mut p = lock.as_os_str().to_owned();
+    p.push(".pid");
+    p.into()
+}
+
 /// Take the exclusive writer lock for `journal` (`<journal>.lock`, kept
 /// across renames of the journal itself). Fails with [`JournalBusy`].
 /// ponytail: the lock file is left behind on drop (deleting it races a
 /// concurrent opener); advisory locks, so only sorrel's own opens honour it.
 pub(crate) fn lock_journal(journal: &Path) -> Result<File> {
     let lp = lock_path(journal);
-    let mut f = OpenOptions::new()
+    let f = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
@@ -210,13 +217,14 @@ pub(crate) fn lock_journal(journal: &Path) -> Result<File> {
     let locked = f.try_lock();
     match locked {
         Ok(()) => {
-            f.set_len(0)?;
-            // Best effort: the pid is only for the busy message.
-            let _ = write!(f, "{}", std::process::id()).and_then(|()| f.flush());
+            // Best effort: the pid is only for the busy message. It lives
+            // beside the lock, not in it: a Windows lock is mandatory, so
+            // no other process could read the locked file.
+            let _ = std::fs::write(pid_path(&lp), std::process::id().to_string());
             Ok(f)
         }
         Err(std::fs::TryLockError::WouldBlock) => {
-            let pid = std::fs::read_to_string(&lp)
+            let pid = std::fs::read_to_string(pid_path(&lp))
                 .ok()
                 .and_then(|s| s.trim().parse().ok());
             Err(JournalBusy {
@@ -282,7 +290,7 @@ impl Journal {
             f.write_all(&header(expected_baseline, n_clusters))?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        sorrel_io::fsutil::replace_file(&tmp, path)
             .with_context(|| format!("create journal {}", path.display()))?;
         sync_dir(path);
         Self::reopen(lock, path, expected_baseline, n_clusters, 0)
@@ -295,10 +303,14 @@ impl Journal {
         n_clusters: u32,
         n_records: u64,
     ) -> Result<Self> {
-        let file = OpenOptions::new()
-            .append(true)
+        // Not `append(true)`: on Windows that omits the write-data right, so
+        // `set_len` (the cut-back of a failed append) is refused. The lock
+        // makes this the only writer, so the cursor stays at the end.
+        let mut file = OpenOptions::new()
+            .write(true)
             .open(path)
             .with_context(|| format!("reopen journal {}", path.display()))?;
+        file.seek(SeekFrom::End(0))?;
         Ok(Self {
             path: path.to_path_buf(),
             len: file.metadata()?.len(),
@@ -373,7 +385,8 @@ impl Journal {
             if let Err(t) = self
                 .file
                 .set_len(self.len)
-                .and_then(|()| self.file.sync_all())
+                .and_then(|()| self.file.seek(SeekFrom::Start(self.len)))
+                .and_then(|_| self.file.sync_all())
             {
                 self.broken = true;
                 log::error!(
@@ -581,7 +594,8 @@ fn upgrade_legacy(path: &Path, baseline: u64, n_clusters: u32, version: u32) -> 
         }
         f.into_inner()?.sync_all()?;
     }
-    std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
+    sorrel_io::fsutil::replace_file(&tmp, path)
+        .with_context(|| format!("replace {}", path.display()))?;
     sync_dir(path);
     log::info!(
         "upgraded journal {} to v3 (original kept as {})",

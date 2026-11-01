@@ -172,7 +172,7 @@ impl Shell {
                     serde_json::json!({
                         "pid": std::process::id(),
                         "tabs": self.tabs.iter().enumerate().map(|(i, t)| serde_json::json!({
-                            "dataset": t.dataset().display().to_string(),
+                            "dataset": sorrel_io::fsutil::display_path(t.dataset()).to_string(),
                             "label": t.label(),
                             "dirty": t.dirty(),
                             "active": i == self.active,

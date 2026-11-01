@@ -8,10 +8,14 @@ checkout on a windows runner, after the Nix output `.#sorrel-windows-smoke`
 Steps: version, gpu-check, headless qc + report on release/fixtures/tiny-phy,
 MCP over stdio (`sorrel mcp`), MCP attached to a `run --headless` host through its
 %LOCALAPPDATA% listener file, `sorrel auto` launching its sidecar through uv.exe,
-GUI start + screenshot, wheel install in a venv, Microsoft Defender scan of
-BuildDir. (`sorrel rescue` is not run: the fixture has no amplitudes.npy or
-spike_templates.npy, which it needs.) Any failure exits non-zero;
-logs and gui.png land in OutDir for the runner to upload.
+a save round-trip through a headless host (relabel, split, save, reopen; the
+regression gate for mapped files blocking the rename of spike_clusters.npy),
+export-phy, --discard-journal, `status` and `call`, `sorrel auto --llm` argv
+through fake npm `.cmd` shims, `sorrel rescue`, `share`/`join` over loopback,
+GUI start + screenshot, the bare-`sorrel` / `sorrel open` handoff, wheel
+install in a venv, Microsoft Defender scan of BuildDir. Any failure exits
+non-zero; logs, JSON evidence and gui.png land in OutDir for the runner to
+upload.
 #>
 param(
     [string]$BuildDir = $env:SIMIT_TARGET_SMOKE_DIR,
@@ -90,9 +94,9 @@ $py = if (Get-Command py -ErrorAction SilentlyContinue) { 'py' } else { 'python'
 # MCP helpers: newline-delimited JSON-RPC in from a file (so stdin closes and
 # the server exits), replies parsed from stdout. The request file, the raw
 # replies and stderr stay in OutDir as <Name>.in.jsonl / .out.txt / .err.txt.
-function New-DataCopy([string]$Tag) {
+function New-DataCopy([string]$Tag, [string]$Fixture = 'tiny-phy') {
     $d = Join-Path ([IO.Path]::GetTempPath()) "sorrel-smoke-$Tag-$PID"
-    Copy-Item (Join-Path $repo 'release\fixtures\tiny-phy') $d -Recurse
+    Copy-Item (Join-Path $repo "release\fixtures\$Fixture") $d -Recurse
     return $d
 }
 function Rpc([int]$Id, [string]$Method, $Params = @{}) {
@@ -137,7 +141,8 @@ $nClusters = @(Get-Content (Join-Path $qc 'cluster_qc.tsv') | Select-Object -Ski
 if ($nClusters -lt 1) { throw 'qc found no clusters in tiny-phy' }
 $dataA = New-DataCopy 'mcp'
 $r = Invoke-Mcp 'mcp-stdio' $dataA @(
-    (Rpc-Init 1), $rpcInitialized, (Rpc 2 'tools/list'), (Rpc-Call 3 'list_clusters'))
+    (Rpc-Init 1), $rpcInitialized, (Rpc 2 'tools/list'), (Rpc-Call 3 'list_clusters'),
+    (Rpc-Call 4 'relabel' @{ cluster = 0; label = 'good' }), (Rpc-Call 5 'save'))
 $init = Get-Result $r 1
 if ($init.serverInfo.name -ne 'sorrel' -or $init.serverInfo.version -ne $version) {
     throw "MCP serverInfo is $($init.serverInfo | ConvertTo-Json -Compress), expected sorrel $version"
@@ -149,6 +154,12 @@ foreach ($t in 'list_clusters', 'relabel', 'export_phy') {
 $rows = Get-Clusters $r 3
 if ($rows.Count -ne $nClusters) { throw "list_clusters returned $($rows.Count) clusters, qc found $nClusters" }
 Write-Host "MCP stdio: sorrel $($init.serverInfo.version), $($tools.Count) tools, $($rows.Count) clusters"
+# The in-process server saves too: the relabel must reach cluster_group.tsv.
+Get-Result $r 4 | Out-Null
+Get-Result $r 5 | Out-Null
+$groupA = Get-Content (Join-Path $dataA 'cluster_group.tsv') -Raw
+if ($groupA -notmatch '(?m)^0\s+good') { throw "cluster_group.tsv lacks cluster 0 good after the stdio save:`n$groupA" }
+Write-Host "MCP stdio save: cluster 0 good in cluster_group.tsv"
 
 # `sorrel mcp config` prints the entry an agent needs to launch this exe.
 Assert-Ok 'mcp-config' (Invoke-Native 'mcp-config' $exe @('mcp', 'config', '--client', 'json', $dataA))
@@ -182,6 +193,7 @@ try {
     if (Test-Path (Join-Path $dataB '.sorrel\mcp.json')) { throw 'token file was written inside the dataset directory' }
     $listener = Get-Content $portFile.FullName -Raw | ConvertFrom-Json
     if ($listener.kind -ne 'headless') { throw "listener kind is '$($listener.kind)', expected 'headless'" }
+    if (([string]$listener.dataset).StartsWith('\\?\')) { throw "listener dataset is a verbatim path: $($listener.dataset)" }
     # Evidence without the token.
     $listener | Select-Object port, pid, kind, dataset | ConvertTo-Json | Set-Content (Join-Path $OutDir 'headless-listener.json')
 
@@ -207,6 +219,120 @@ finally {
     Get-Content (Join-Path $OutDir 'headless.out.txt'), (Join-Path $OutDir 'headless.err.txt') -ErrorAction SilentlyContinue | Write-Host
 }
 
+# 5b. Host helpers for the steps below: `run --headless` plus its listener file.
+$mcpDir = Join-Path $env:LOCALAPPDATA 'sorrel\mcp'
+function Start-Headless([string]$Data, [string]$Tag) {
+    $known = @(Get-ChildItem $mcpDir -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object Name)
+    $proc = Start-Process -FilePath $exe -ArgumentList @('run', '--headless', $Data) -PassThru `
+        -RedirectStandardOutput (Join-Path $OutDir "host-$Tag.out.txt") `
+        -RedirectStandardError (Join-Path $OutDir "host-$Tag.err.txt")
+    $file = $null
+    $deadline = (Get-Date).AddSeconds(30)
+    while (-not $file -and (Get-Date) -lt $deadline) {
+        if ($proc.HasExited) { throw "headless host $Tag exited with code $($proc.ExitCode)" }
+        $file = Get-ChildItem $mcpDir -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -eq '.json' -and $known -notcontains $_.Name } |
+            Select-Object -First 1
+        if (-not $file) { Start-Sleep -Milliseconds 500 }
+    }
+    if (-not $file) { Stop-Process -Id $proc.Id -Force; throw "headless host $Tag wrote no token file within 30 s" }
+    @{ Proc = $proc; File = $file; Tag = $Tag }
+}
+function Stop-Headless($Host_) {
+    if (-not $Host_) { return }
+    if (-not $Host_.Proc.HasExited) { Stop-Process -Id $Host_.Proc.Id -Force }
+    $null = $Host_.Proc.WaitForExit(15000) # the OS frees its journal lock on exit
+    Remove-Item $Host_.File.FullName -ErrorAction SilentlyContinue
+    Get-Content (Join-Path $OutDir "host-$($Host_.Tag).out.txt"), (Join-Path $OutDir "host-$($Host_.Tag).err.txt") -ErrorAction SilentlyContinue | Write-Host
+}
+# A `list_clusters` TSV printed by `sorrel call` (header once).
+function Get-CallClusters([string]$Name) {
+    ,@((Get-Content (Join-Path $OutDir "$Name.out.txt") | Where-Object { $_.Trim() }) | ConvertFrom-Csv -Delimiter "`t")
+}
+
+# 5c. Save round-trip: the regression gate for the mapped spike_clusters.npy.
+#     The host keeps its provider alive while `save` replaces spike_clusters.npy
+#     (tmp + rename). A leftover mapping of the old file makes Windows refuse
+#     that rename (os error 1224). A relabel alone never rewrites the array, so
+#     the split is what exercises it.
+$dataS = New-DataCopy 'save'
+$clustersFile = Join-Path $dataS 'spike_clusters.npy'
+$hashBefore = (Get-FileHash $clustersFile).Hash
+$hostS = Start-Headless $dataS 'save'
+try {
+    $r = Invoke-Mcp 'save-list' $dataS @((Rpc-Init 1), $rpcInitialized, (Rpc-Call 2 'list_clusters'))
+    $nBefore = (Get-Clusters $r 2).Count
+    $r = Invoke-Mcp 'save-relabel' $dataS @((Rpc-Init 1), $rpcInitialized,
+        (Rpc-Call 2 'relabel' @{ cluster = 0; label = 'good' }), (Rpc-Call 3 'save'))
+    Get-Result $r 2 | Out-Null
+    Get-Result $r 3 | Out-Null
+    $group = Get-Content (Join-Path $dataS 'cluster_group.tsv') -Raw
+    if ($group -notmatch '(?m)^0\s+good') { throw "cluster_group.tsv lacks cluster 0 good after save:`n$group" }
+    $r = Invoke-Mcp 'save-split' $dataS @((Rpc-Init 1), $rpcInitialized,
+        (Rpc-Call 2 'split' @{ cluster = 1; spike_idx = @(0..9) }), (Rpc-Call 3 'save'),
+        (Rpc-Call 4 'list_clusters'))
+    Get-Result $r 2 | Out-Null
+    Get-Result $r 3 | Out-Null
+    $live = Get-Clusters $r 4
+    if ($live.Count -ne $nBefore + 1) { throw "the host lists $($live.Count) clusters after the split, expected $($nBefore + 1)" }
+}
+finally { Stop-Headless $hostS }
+$hashAfter = (Get-FileHash $clustersFile).Hash
+if ($hashAfter -eq $hashBefore) { throw 'spike_clusters.npy was not rewritten by the save while the provider was alive' }
+if (Get-ChildItem $dataS -Filter '*.tmp' -ErrorAction SilentlyContinue) { throw 'save left .tmp files behind' }
+if (Test-Path (Join-Path $dataS 'sorrel_rewrite.pending')) { throw 'save left sorrel_rewrite.pending behind' }
+# Reopen with the host gone: the label and the split come back from disk.
+Assert-Ok 'save-reopen' (Invoke-Native 'save-reopen' $exe @('call', $dataS, 'list_clusters'))
+$reopened = Get-CallClusters 'save-reopen'
+# The split is checked on the files save wrote (cluster_info.tsv lists the new cluster) and on the reopened list.
+$infoRows = @(Get-Content (Join-Path $dataS 'cluster_info.tsv') | Select-Object -Skip 1 | Where-Object { $_.Trim() }).Count
+if ($infoRows -ne $nBefore + 1) { throw "cluster_info.tsv lists $infoRows clusters after the split + save, expected $($nBefore + 1)" }
+if ($reopened.Count -ne $nBefore + 1) { throw "reopened dataset lists $($reopened.Count) clusters, expected $($nBefore + 1)" }
+if ((Get-Label $reopened 0) -ne 'good') { throw "cluster 0 reopened as '$(Get-Label $reopened 0)', expected 'good'" }
+@{ before = $hashBefore; after = $hashAfter; info_rows = $infoRows; live = $live.Count; reopened = $reopened.Count; cluster0 = (Get-Label $reopened 0) } |
+    ConvertTo-Json | Set-Content (Join-Path $OutDir 'save-roundtrip.json')
+Write-Host "save round-trip: spike_clusters.npy $($hashBefore.Substring(0, 8)) -> $($hashAfter.Substring(0, 8)), cluster 0 good, $infoRows clusters in cluster_info.tsv, $($live.Count) listed live, $($reopened.Count) after reopen"
+
+# 5d. export-phy, then the export opens; --discard-journal on reopen.
+$exportDir = Join-Path ([IO.Path]::GetTempPath()) "sorrel-smoke-export-$PID"
+Assert-Ok 'export-phy' (Invoke-Native 'export-phy' $exe @('export-phy', $dataS, '--out', $exportDir))
+foreach ($f in 'spike_times.npy', 'spike_clusters.npy', 'params.py') {
+    if (-not (Test-Path (Join-Path $exportDir $f))) { throw "export-phy wrote no $f" }
+}
+$exportQc = Join-Path $OutDir 'export-qc'
+Assert-Ok 'export-qc' (Invoke-Native 'export-qc' $exe @('qc', $exportDir, '--out', $exportQc))
+$nExport = @(Get-Content (Join-Path $exportQc 'cluster_qc.tsv') | Select-Object -Skip 1 | Where-Object { $_.Trim() }).Count
+if ($nExport -lt $nBefore) { throw "qc of the export found $nExport clusters, expected at least $nBefore" }
+Assert-Ok 'discard-journal' (Invoke-Native 'discard-journal' $exe @('qc', $dataS, '--out', (Join-Path $OutDir 'discard-qc'), '--discard-journal'))
+$aside = @(Get-ChildItem $dataS | Where-Object { $_.Name -match '^sorrel\.journal\.\d+' })
+if (-not $aside) { throw '--discard-journal did not set the journal aside' }
+Write-Host "export-phy: $nExport clusters; --discard-journal set aside $($aside.Name -join ', ')"
+
+# 5e. `status` and `call` against a live host. The registry and `status` must show
+#     plain `C:\...` paths, not the verbatim `\\?\C:\...` that canonicalize returns.
+$dataH = New-DataCopy 'status'
+$hostH = Start-Headless $dataH 'status'
+try {
+    Assert-Ok 'status-json' (Invoke-Native 'status-json' $exe @('status', '--json'))
+    $st = Get-Content (Join-Path $OutDir 'status-json.out.txt') -Raw | ConvertFrom-Json
+    $mine = @($st.hosts | Where-Object { (Split-Path $_.dataset -Leaf) -eq (Split-Path $dataH -Leaf) })
+    if ($mine.Count -ne 1) { throw "status lists $($mine.Count) hosts for the dataset, expected 1" }
+    if (([string]$mine[0].dataset).StartsWith('\\?\')) { throw "status shows a verbatim path: $($mine[0].dataset)" }
+    if ($mine[0].kind -ne 'headless' -or -not $mine[0].alive -or $mine[0].pid -ne $hostH.Proc.Id) {
+        throw "unexpected host record: $($mine[0] | ConvertTo-Json -Compress)"
+    }
+    Assert-Ok 'status-text' (Invoke-Native 'status-text' $exe @('status', $dataH))
+    if ((Get-Content (Join-Path $OutDir 'status-text.out.txt') -Raw) -match [regex]::Escape('\\?\')) { throw 'status text shows a verbatim path' }
+    # While the host runs, `call` goes through it (in-process would hit the journal lock).
+    Assert-Ok 'call-list' (Invoke-Native 'call-list' $exe @('call', $dataH, 'list_clusters'))
+    if ((Get-CallClusters 'call-list').Count -ne $nClusters) { throw "call list_clusters returned the wrong cluster count (expected $nClusters)" }
+    Assert-Ok 'call-relabel' (Invoke-Native 'call-relabel' $exe @('call', $dataH, 'relabel', '{"cluster":0,"label":"mua"}'))
+    Assert-Ok 'call-list2' (Invoke-Native 'call-list2' $exe @('call', $dataH, 'list_clusters'))
+    if ((Get-Label (Get-CallClusters 'call-list2') 0) -ne 'mua') { throw 'call relabel did not stick in the host' }
+    Write-Host "status/call: host pid $($hostH.Proc.Id) listed alive, plain path $($mine[0].dataset)"
+}
+finally { Stop-Headless $hostH }
+
 # 6. `sorrel auto` must launch its SpikeInterface sidecar through uv.exe. The
 #    fixture has no channel_positions.npy, so the sidecar cannot finish; the
 #    proof is that it ran far enough to import SpikeInterface (uv resolved the
@@ -229,6 +355,98 @@ if (-not (Test-Path (Join-Path $dataC 'sorrel_auto\sorrel_auto.py'))) { throw 's
 if ($autoLog -notmatch '\[sorrel-auto\]') { throw 'the sidecar never logged: uv did not run it (see auto.err.txt)' }
 if ($autoCode -ne 0 -and $autoLog -notmatch 'channel_positions\.npy') {
     throw "sorrel auto failed with exit code $autoCode for a reason other than the fixture's missing channel_positions.npy"
+}
+
+# 6b. `sorrel auto --llm` runs claude/codex/opencode; npm installs those as `.cmd`
+#     shims, and cmd.exe re-parses every argument (`"`, %, ^, &, |, newlines). The
+#     fake shims below dump what their program received; release/smoke-llm-shim.py
+#     calls the sidecar's own ask_cli with hostile prompts and compares the dump
+#     with the argv and stdin it intended. (`sorrel auto --llm` cannot be driven
+#     end to end here: the fixture cannot finish the SpikeInterface analysis that
+#     precedes the LLM calls, so the sidecar's spawn code is run directly.)
+$shimDir = Join-Path ([IO.Path]::GetTempPath()) "sorrel-shim-$PID"
+New-Item -ItemType Directory $shimDir | Out-Null
+Copy-Item (Join-Path $repo 'release\smoke-argv-dump.py') (Join-Path $shimDir 'argv_dump.py')
+$pyExe = (& $py -c 'import sys; print(sys.executable)').Trim()
+foreach ($n in 'claude', 'codex', 'opencode') {
+    [IO.File]::WriteAllText((Join-Path $shimDir "$n.cmd"), "@`"$pyExe`" `"%~dp0argv_dump.py`" %*`r`n", [Text.Encoding]::ASCII)
+}
+$oldPath = $env:PATH
+$env:PATH = "$shimDir$([IO.Path]::PathSeparator)$env:PATH"
+try {
+    Assert-Ok 'llm-shim' (Invoke-Native 'llm-shim' (Get-Command uv).Source @('run', '--no-project', '--with', 'numpy', 'python',
+        (Join-Path $repo 'release\smoke-llm-shim.py'), (Join-Path $dataC 'sorrel_auto\sorrel_auto.py'), $OutDir) -TimeoutSec 600)
+}
+finally { $env:PATH = $oldPath }
+foreach ($n in 'claude', 'codex', 'opencode') {
+    if (-not (Test-Path (Join-Path $OutDir "$n.json"))) { throw "the $n.cmd shim never ran" }
+}
+
+# 6c. rescue on release/fixtures/rescue-phy (amplitudes, spike_templates and templates
+#     present, sparse enough for noise windows). Unit 0 has 10 spikes in the recording
+#     that its phy files omit; a dry run must find them (and only report: nothing is written).
+$dataR = New-DataCopy 'rescue' 'rescue-phy'
+Assert-Ok 'rescue' (Invoke-Native 'rescue' $exe @('rescue', $dataR, '--units', 'all') -TimeoutSec 600)
+$rescueOut = Get-Content (Join-Path $OutDir 'rescue.out.txt') -Raw
+if ($rescueOut -notmatch 'spikes found \(dry run\)') { throw "rescue printed no dry-run summary:`n$rescueOut" }
+$rescued = [int]([regex]::Match($rescueOut, '(\d+) spikes found').Groups[1].Value)
+if ($rescued -lt 1) { throw "rescue found $rescued missed spikes in rescue-phy, expected at least 1:`n$rescueOut" }
+Write-Host "rescue: $rescued missed spikes found (dry run)"
+
+# 6d. share/join over loopback: no relay needed. The host serves on a TCP port, the
+#     guest dials 127.0.0.1 with the pairing code, and its phy files must arrive
+#     byte for byte (blake3-verified by sorrel itself; compared again here).
+#     piying finds its remote handlers in a linkme slice that GNU ld's --gc-sections empties on
+#     the x86_64-pc-windows-gnu build ("hello: unknown message 'sorrel/hello/1'") unless the
+#     link passes --no-gc-sections (flake.nix); this step is the gate for that.
+$shareJoin = @{ ok = $false; error = $null }
+$dataSh = New-DataCopy 'share'
+$guestDir = Join-Path ([IO.Path]::GetTempPath()) "sorrel-guest-$PID"
+$port = Get-Random -Minimum 20000 -Maximum 40000
+$share = Start-Process -FilePath $exe -ArgumentList @('share', $dataSh, '--port', $port) -PassThru `
+    -RedirectStandardOutput (Join-Path $OutDir 'share.out.txt') -RedirectStandardError (Join-Path $OutDir 'share.err.txt')
+$join = $null
+try {
+    $code = $null
+    $deadline = (Get-Date).AddSeconds(60)
+    while (-not $code -and (Get-Date) -lt $deadline) {
+        if ($share.HasExited) { throw "sorrel share exited with code $($share.ExitCode)" }
+        $m = Select-String -Path (Join-Path $OutDir 'share.out.txt') -Pattern '^pairing code:\s+(.+?)\s*$' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($m) { $code = $m.Matches[0].Groups[1].Value } else { Start-Sleep -Milliseconds 500 }
+    }
+    if (-not $code) { throw 'sorrel share printed no pairing code within 60 s' }
+    $join = Start-Process -FilePath $exe -PassThru `
+        -ArgumentList @('join', "`"$code`"", '--direct', "/ip4/127.0.0.1/tcp/$port", '--into', $guestDir) `
+        -RedirectStandardOutput (Join-Path $OutDir 'join.out.txt') -RedirectStandardError (Join-Path $OutDir 'join.err.txt')
+    $synced = $false
+    $deadline = (Get-Date).AddSeconds(120)
+    while (-not $synced -and (Get-Date) -lt $deadline) {
+        if ($join.HasExited) { throw "sorrel join exited with code $($join.ExitCode) before syncing" }
+        $synced = (Test-Path (Join-Path $guestDir 'spike_times.npy')) -and (Test-Path (Join-Path $guestDir 'spike_clusters.npy')) -and
+            (Test-Path (Join-Path $guestDir 'params.py'))
+        if (-not $synced) { Start-Sleep -Milliseconds 500 }
+    }
+    if (-not $synced) { throw "the guest synced no files into $guestDir within 120 s" }
+    Start-Sleep -Seconds 2 # the last file is renamed into place just before the files appear complete
+    foreach ($f in 'spike_times.npy', 'spike_clusters.npy', 'params.py') {
+        if ((Get-FileHash (Join-Path $guestDir $f)).Hash -ne (Get-FileHash (Join-Path $dataSh $f)).Hash) {
+            throw "guest $f differs from the host's"
+        }
+    }
+    $shareJoin.ok = $true
+    Write-Host "share/join: guest synced $((Get-ChildItem $guestDir -File).Count) files over 127.0.0.1:$port"
+}
+catch {
+    $shareJoin.error = "$_"
+    $joinErr = Get-Content (Join-Path $OutDir 'join.err.txt') -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($joinErr) { $shareJoin.join_stderr = "$joinErr" }
+    throw "share/join over loopback failed: $_ $joinErr"
+}
+finally {
+    foreach ($p in $join, $share) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force } }
+    Get-Content (Join-Path $OutDir 'share.out.txt'), (Join-Path $OutDir 'join.out.txt') -ErrorAction SilentlyContinue | Write-Host
+    $shareJoin | ConvertTo-Json | Set-Content (Join-Path $OutDir 'share-join.json')
 }
 
 # 7. GUI: default backend selection, must survive $GuiSeconds
@@ -256,6 +474,61 @@ Get-Content $guiLog | Write-Host
 # A panic on a worker thread leaves the process alive; still a failure.
 if (Select-String -Path $guiLog -Pattern 'panicked at' -Quiet) { throw 'GUI log contains a panic' }
 
+# 7b. Launcher handoff. Without a terminal on stderr, bare `sorrel` and `sorrel open`
+#     run the GUI in their own process instead of detaching, so that process is the
+#     one window; every later `sorrel open` hands its dataset to it as a tab. The
+#     window's registry file is %LOCALAPPDATA%\sorrel\gui.json.
+$guiJson = Join-Path $env:LOCALAPPDATA 'sorrel\gui.json'
+Remove-Item $guiJson -ErrorAction SilentlyContinue
+$dataG1 = New-DataCopy 'tab1'
+$dataG2 = New-DataCopy 'tab2'
+$launcher = Start-Process -FilePath $exe -PassThru `
+    -RedirectStandardOutput (Join-Path $OutDir 'launcher.out.txt') -RedirectStandardError (Join-Path $OutDir 'launcher.err.txt')
+try {
+    $deadline = (Get-Date).AddSeconds(60)
+    while (-not (Test-Path $guiJson) -and (Get-Date) -lt $deadline) {
+        if ($launcher.HasExited) { throw "bare sorrel exited with code $($launcher.ExitCode) instead of staying up as the GUI" }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not (Test-Path $guiJson)) { throw "bare sorrel never wrote $guiJson" }
+    $gj = Get-Content $guiJson -Raw | ConvertFrom-Json
+    if ($gj.pid -ne $launcher.Id) { throw "gui.json names pid $($gj.pid), expected the launcher $($launcher.Id)" }
+    $gj | Select-Object port, pid | ConvertTo-Json | Set-Content (Join-Path $OutDir 'gui-instance.json')
+    # A second bare `sorrel` focuses the window and exits.
+    Assert-Ok 'bare-again' (Invoke-Native 'bare-again' $exe @())
+    Assert-Ok 'open-tab1' (Invoke-Native 'open-tab1' $exe @('open', $dataG1))
+    Assert-Ok 'open-tab2' (Invoke-Native 'open-tab2' $exe @('open', $dataG2))
+    foreach ($n in 'open-tab1', 'open-tab2') {
+        if ((Get-Content (Join-Path $OutDir "$n.out.txt") -Raw) -notmatch 'opened in the running sorrel window') {
+            throw "$n did not hand off to the running window"
+        }
+    }
+    $leaves = @((Split-Path $dataG1 -Leaf), (Split-Path $dataG2 -Leaf))
+    $tabs = @()
+    $deadline = (Get-Date).AddSeconds(90)
+    while ((Get-Date) -lt $deadline) {
+        if ($launcher.HasExited) { throw "the GUI exited with code $($launcher.ExitCode) while opening tabs" }
+        Invoke-Native 'status-gui' $exe @('status', '--json') | Out-Null
+        $gst = Get-Content (Join-Path $OutDir 'status-gui.out.txt') -Raw | ConvertFrom-Json
+        $tabs = @($gst.gui.tabs | ForEach-Object { Split-Path $_.dataset -Leaf })
+        if (@($leaves | Where-Object { $tabs -contains $_ }).Count -eq 2) { break }
+        Start-Sleep -Seconds 1
+    }
+    if (@($leaves | Where-Object { $tabs -contains $_ }).Count -ne 2) {
+        throw "the running window shows tabs [$($tabs -join ', ')], expected both $($leaves -join ', ')"
+    }
+    if (@($gst.gui.tabs | Where-Object { ([string]$_.dataset).StartsWith('\\?\') })) { throw 'status shows a verbatim tab path' }
+    if ($gst.gui.pid -ne $launcher.Id) { throw "status names GUI pid $($gst.gui.pid), expected $($launcher.Id)" }
+    Write-Host "launcher: pid $($launcher.Id) is the GUI with tabs [$($tabs -join ', ')]"
+}
+finally {
+    if (-not $launcher.HasExited) { Stop-Process -Id $launcher.Id -Force }
+    $null = $launcher.WaitForExit(15000)
+    Remove-Item $guiJson -ErrorAction SilentlyContinue # a killed GUI cannot delete it
+    Get-Content (Join-Path $OutDir 'launcher.out.txt'), (Join-Path $OutDir 'launcher.err.txt') -ErrorAction SilentlyContinue | Write-Host
+}
+if (Select-String -Path (Join-Path $OutDir 'launcher.err.txt') -Pattern 'panicked at' -Quiet) { throw 'launcher GUI log contains a panic' }
+
 # 8. Python wheel in a fresh venv
 $wheel = Get-ChildItem $BuildDir -Filter 'sorrel_ephys-*-win_amd64.whl' | Select-Object -First 1
 if (-not $wheel) { throw "no sorrel_ephys wheel in $BuildDir" }
@@ -268,6 +541,77 @@ Assert-Ok 'import' (Invoke-Native 'import' $vpy @('-c',
 Assert-Ok 'wheel-exe' (Invoke-Native 'wheel-exe' (Join-Path $venv 'Scripts\sorrel.exe') @('--version'))
 $got = (Get-Content (Join-Path $OutDir 'wheel-exe.out.txt') -Raw).Trim()
 if ($got -ne "sorrel $version") { throw "wheel sorrel.exe --version is '$got', expected 'sorrel $version'" }
+
+# 8a. Windows integration: embedded resources, the console-free launcher and
+#     the Start-menu shortcut. (Own block: kept apart from the steps above.)
+$exeW = Join-Path $BuildDir 'sorrelw.exe'
+if (-not (Test-Path $exeW)) { throw "missing $exeW" }
+foreach ($f in $exe, $exeW) {
+    $vi = (Get-Item $f).VersionInfo
+    if ($vi.ProductVersion -ne $version) { throw "$f ProductVersion is '$($vi.ProductVersion)', expected '$version'" }
+    if ($vi.ProductName -ne 'Sorrel') { throw "$f ProductName is '$($vi.ProductName)', expected 'Sorrel'" }
+    Write-Host "version info: $(Split-Path $f -Leaf) ProductName=$($vi.ProductName) ProductVersion=$($vi.ProductVersion) FileDescription=$($vi.FileDescription) Company=$($vi.CompanyName)"
+}
+
+# sorrelw.exe starts sorrel.exe with CREATE_NO_WINDOW and null stdio; the GUI runs
+# in-process there. It must stay alive and own no console window.
+Add-Type -TypeDefinition @'
+using System; using System.Collections.Generic; using System.Runtime.InteropServices; using System.Text;
+public static class SorrelWin {
+    delegate bool EnumProc(IntPtr h, IntPtr p);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc f, IntPtr p);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+    // "pid:class" of every visible top-level window
+    public static List<string> Visible() {
+        var l = new List<string>();
+        EnumWindows((h, p) => {
+            if (!IsWindowVisible(h)) return true;
+            uint pid; GetWindowThreadProcessId(h, out pid);
+            var c = new StringBuilder(256); GetClassName(h, c, 256);
+            l.Add(pid + ":" + c); return true;
+        }, IntPtr.Zero);
+        return l;
+    }
+}
+'@
+$dataW = New-DataCopy 'sorrelw'
+$before = @(Get-Process sorrel -ErrorAction SilentlyContinue | ForEach-Object Id)
+$w = Start-Process -FilePath $exeW -ArgumentList @('run', '--standalone', $dataW) -PassThru
+$guiW = $null
+try {
+    Start-Sleep -Seconds 15
+    $guiW = @(Get-Process sorrel -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.Id }) | Select-Object -First 1
+    if (-not $guiW) { throw 'sorrelw.exe left no running sorrel process after 15 s' }
+    $guiW.Refresh()
+    $kids = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($guiW.Id)" | ForEach-Object { "$($_.Name)#$($_.ProcessId)" })
+    $mine = @($guiW.Id) + @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($guiW.Id)" | ForEach-Object ProcessId)
+    $wins = [SorrelWin]::Visible()
+    $consoleWins = @($wins | Where-Object { $_ -match '^(\d+):ConsoleWindowClass$' -and $mine -contains [int]$Matches[1] })
+    Write-Host "sorrelw: sorrel pid $($guiW.Id) alive, MainWindowHandle=$($guiW.MainWindowHandle), children: $($kids -join ', '), console windows of it: $($consoleWins.Count)"
+    "pid=$($guiW.Id) mainWindow=$($guiW.MainWindowHandle) children=$($kids -join ',') visible=$($wins -join ',')" |
+        Set-Content (Join-Path $OutDir 'sorrelw.txt')
+    if ($consoleWins.Count) { throw "sorrelw.exe left a visible console window: $($consoleWins -join ', ')" }
+    if ($guiW.MainWindowHandle -eq 0) { Write-Warning 'sorrel has no main window yet (see gui.png / sorrelw.txt)' }
+}
+finally {
+    if ($guiW -and -not $guiW.HasExited) { Stop-Process -Id $guiW.Id -Force }
+    if (-not $w.HasExited) { Stop-Process -Id $w.Id -Force }
+}
+
+# `sorrel install-shortcut` makes the Start-menu .lnk to the sibling sorrelw.exe.
+$lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Sorrel.lnk'
+Remove-Item $lnk -ErrorAction SilentlyContinue
+Assert-Ok 'install-shortcut' (Invoke-Native 'install-shortcut' $exe @('install-shortcut'))
+if (-not (Test-Path $lnk)) { throw "install-shortcut did not create $lnk" }
+$sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+if ($sc.TargetPath -ne $exeW) { throw "shortcut targets '$($sc.TargetPath)', expected '$exeW'" }
+if ($sc.IconLocation -notlike "$exeW*") { throw "shortcut icon is '$($sc.IconLocation)'" }
+Write-Host "shortcut: $lnk -> $($sc.TargetPath) (icon $($sc.IconLocation))"
+Assert-Ok 'remove-shortcut' (Invoke-Native 'remove-shortcut' $exe @('install-shortcut', '--remove'))
+if (Test-Path $lnk) { throw "install-shortcut --remove left $lnk" }
+Write-Host 'shortcut removed'
 
 # 9. Microsoft Defender: winget-pkgs validation scans the installed package
 #    (Validation-Defender-Error), so reproduce that here on fresh signatures.

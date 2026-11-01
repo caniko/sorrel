@@ -81,6 +81,16 @@
               };
             }
           ];
+          # sorrel's #[cfg(windows)] paths and the save tests need a real
+          # Windows run; the Nix tests above only cover Linux.
+          native_tests = [
+            {
+              id = "windows";
+              runner = "windows-2025";
+              # One failing binary must not hide the rest.
+              args = "--workspace --locked --no-fail-fast";
+            }
+          ];
           # Public caches only; the private macOS SDK cache is a release concern.
           cache = {
             substituters = [
@@ -155,13 +165,19 @@
               "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
             ];
             checksum_globs = ["*.tar.gz" "*.zip" "*.AppImage" "*.whl"];
-            # A standalone sorrel.exe on the release page (checksummed and
-            # signed like the rest); winget and Chocolatey keep using the zip.
+            # Standalone sorrel.exe and sorrelw.exe (the console-free launcher)
+            # on the release page, checksummed and signed like the rest;
+            # winget and Chocolatey keep using the zip.
             extract = [
               {
                 archive = "sorrel-{version}-x86_64-windows.zip";
                 member = "sorrel.exe";
                 asset = "sorrel-{version}-x86_64-windows.exe";
+              }
+              {
+                archive = "sorrel-{version}-x86_64-windows.zip";
+                member = "sorrelw.exe";
+                asset = "sorrel-{version}-x86_64-windows-gui.exe";
               }
             ];
             build_commands = [
@@ -179,6 +195,15 @@
           short_description = "Native GUI for curating spike-sorted electrophysiology data";
           # `sorrel auto` runs its SpikeInterface sidecar through uv.
           dependencies = ["astral-sh.uv"];
+          # sorrelw.exe is the console-free launcher; without an alias winget
+          # links it under its own name.
+          files = [
+            {
+              path = "sorrel.exe";
+              alias = "sorrel";
+            }
+            {path = "sorrelw.exe";}
+          ];
         };
         chocolatey = {
           name = "sorrel";
@@ -189,9 +214,19 @@
           license_url = "https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT";
           archive_pattern = "sorrel-{version}-{arch}-windows.zip";
           # chocolatey isn't in nixpkgs yet, and the dev shell no longer ships simit.
-          nix_tool = "github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=0dd5b690b2d69f6eba7e8f90102dec8d089db9b9";
+          nix_tool = "github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=e8a983ef50d28464bd7943d1396ce839e38ca4e9";
           api_key_secret = "CHOCOLATEY_API_KEY";
           dependencies = [{id = "uv";}];
+          # Start-menu entry for the launcher (its exe embeds the icon) and a
+          # GUI shim so `sorrelw` returns at once from a terminal.
+          shortcuts = [
+            {
+              name = "Sorrel";
+              target = "sorrelw.exe";
+              icon = "sorrelw.exe,0";
+            }
+          ];
+          gui_exes = ["sorrelw.exe"];
         };
       };
     }
@@ -217,6 +252,8 @@
       srcFilter = path: type:
         (craneLib.filterCargoSources path type)
         || pkgs.lib.hasSuffix ".wgsl" path
+        # Window icon (include_bytes!) and the Windows resources build.rs embeds.
+        || pkgs.lib.hasInfix "crates/sorrel/assets" path
         # BIP-39 list embedded by sorrel-remote's pairing codes.
         || pkgs.lib.hasSuffix "sorrel-remote/wordlist.txt" path
         # SpikeInterface sidecar `sorrel auto` embeds with include_str!.
@@ -278,6 +315,12 @@
             # winpthreads' <sched.h>; harbor-rs only puts winpthreads on the
             # link path.
             CFLAGS_x86_64_pc_windows_gnu = "-I${cross.winpthreads}/include";
+            # piying finds its remote handlers in a linkme slice, and GNU ld's
+            # --gc-sections (rustc passes it) drops the `#[used]` registrations
+            # from COFF, leaving the slice empty: `share`/`join` then fail with
+            # "unknown message 'sorrel/hello/1'". This replaces harbor-rs's
+            # value, so keep its -L.
+            CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-L ${cross.winpthreads}/lib -C link-arg=-Wl,--no-gc-sections";
             doCheck = false;
           };
           darwin-aarch64 = {
@@ -381,6 +424,7 @@
             pkgs.runCommand "sorrel-windows-smoke-${sorrelVersion}" {} ''
               mkdir -p $out
               cp ${self.packages.${system}.sorrel-windows}/bin/sorrel.exe $out/
+              cp ${self.packages.${system}.sorrel-windows}/bin/sorrelw.exe $out/
               cp ${wheel}/${wheel.file} $out/
             '';
         };
