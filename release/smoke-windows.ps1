@@ -141,7 +141,8 @@ $nClusters = @(Get-Content (Join-Path $qc 'cluster_qc.tsv') | Select-Object -Ski
 if ($nClusters -lt 1) { throw 'qc found no clusters in tiny-phy' }
 $dataA = New-DataCopy 'mcp'
 $r = Invoke-Mcp 'mcp-stdio' $dataA @(
-    (Rpc-Init 1), $rpcInitialized, (Rpc 2 'tools/list'), (Rpc-Call 3 'list_clusters'))
+    (Rpc-Init 1), $rpcInitialized, (Rpc 2 'tools/list'), (Rpc-Call 3 'list_clusters'),
+    (Rpc-Call 4 'relabel' @{ cluster = 0; label = 'good' }), (Rpc-Call 5 'save'))
 $init = Get-Result $r 1
 if ($init.serverInfo.name -ne 'sorrel' -or $init.serverInfo.version -ne $version) {
     throw "MCP serverInfo is $($init.serverInfo | ConvertTo-Json -Compress), expected sorrel $version"
@@ -153,6 +154,12 @@ foreach ($t in 'list_clusters', 'relabel', 'export_phy') {
 $rows = Get-Clusters $r 3
 if ($rows.Count -ne $nClusters) { throw "list_clusters returned $($rows.Count) clusters, qc found $nClusters" }
 Write-Host "MCP stdio: sorrel $($init.serverInfo.version), $($tools.Count) tools, $($rows.Count) clusters"
+# The in-process server saves too: the relabel must reach cluster_group.tsv.
+Get-Result $r 4 | Out-Null
+Get-Result $r 5 | Out-Null
+$groupA = Get-Content (Join-Path $dataA 'cluster_group.tsv') -Raw
+if ($groupA -notmatch '(?m)^0\s+good') { throw "cluster_group.tsv lacks cluster 0 good after the stdio save:`n$groupA" }
+Write-Host "MCP stdio save: cluster 0 good in cluster_group.tsv"
 
 # `sorrel mcp config` prints the entry an agent needs to launch this exe.
 Assert-Ok 'mcp-config' (Invoke-Native 'mcp-config' $exe @('mcp', 'config', '--client', 'json', $dataA))
@@ -262,10 +269,12 @@ try {
     $group = Get-Content (Join-Path $dataS 'cluster_group.tsv') -Raw
     if ($group -notmatch '(?m)^0\s+good') { throw "cluster_group.tsv lacks cluster 0 good after save:`n$group" }
     $r = Invoke-Mcp 'save-split' $dataS @((Rpc-Init 1), $rpcInitialized,
-        (Rpc-Call 2 'split' @{ cluster = 1; spike_idx = @(0..9) }), (Rpc-Call 3 'save'))
+        (Rpc-Call 2 'split' @{ cluster = 1; spike_idx = @(0..9) }), (Rpc-Call 3 'save'),
+        (Rpc-Call 4 'list_clusters'))
     Get-Result $r 2 | Out-Null
     Get-Result $r 3 | Out-Null
-    # (The live host's list_clusters does not show the new cluster until reopen.)
+    $live = Get-Clusters $r 4
+    if ($live.Count -ne $nBefore + 1) { throw "the host lists $($live.Count) clusters after the split, expected $($nBefore + 1)" }
 }
 finally { Stop-Headless $hostS }
 $hashAfter = (Get-FileHash $clustersFile).Hash
@@ -275,15 +284,14 @@ if (Test-Path (Join-Path $dataS 'sorrel_rewrite.pending')) { throw 'save left so
 # Reopen with the host gone: the label and the split come back from disk.
 Assert-Ok 'save-reopen' (Invoke-Native 'save-reopen' $exe @('call', $dataS, 'list_clusters'))
 $reopened = Get-CallClusters 'save-reopen'
-# The split is checked on the files save wrote: cluster_info.tsv lists the new cluster. (A reopened
-# `list_clusters` does not show a split-off cluster after a second save, on Linux too: not asserted.)
+# The split is checked on the files save wrote (cluster_info.tsv lists the new cluster) and on the reopened list.
 $infoRows = @(Get-Content (Join-Path $dataS 'cluster_info.tsv') | Select-Object -Skip 1 | Where-Object { $_.Trim() }).Count
 if ($infoRows -ne $nBefore + 1) { throw "cluster_info.tsv lists $infoRows clusters after the split + save, expected $($nBefore + 1)" }
-if ($reopened.Count -lt $nBefore) { throw "reopened dataset has $($reopened.Count) clusters, expected at least $nBefore" }
+if ($reopened.Count -ne $nBefore + 1) { throw "reopened dataset lists $($reopened.Count) clusters, expected $($nBefore + 1)" }
 if ((Get-Label $reopened 0) -ne 'good') { throw "cluster 0 reopened as '$(Get-Label $reopened 0)', expected 'good'" }
-@{ before = $hashBefore; after = $hashAfter; info_rows = $infoRows; reopened = $reopened.Count; cluster0 = (Get-Label $reopened 0) } |
+@{ before = $hashBefore; after = $hashAfter; info_rows = $infoRows; live = $live.Count; reopened = $reopened.Count; cluster0 = (Get-Label $reopened 0) } |
     ConvertTo-Json | Set-Content (Join-Path $OutDir 'save-roundtrip.json')
-Write-Host "save round-trip: spike_clusters.npy $($hashBefore.Substring(0, 8)) -> $($hashAfter.Substring(0, 8)), cluster 0 good, $infoRows clusters in cluster_info.tsv, $($reopened.Count) listed after reopen"
+Write-Host "save round-trip: spike_clusters.npy $($hashBefore.Substring(0, 8)) -> $($hashAfter.Substring(0, 8)), cluster 0 good, $infoRows clusters in cluster_info.tsv, $($live.Count) listed live, $($reopened.Count) after reopen"
 
 # 5d. export-phy, then the export opens; --discard-journal on reopen.
 $exportDir = Join-Path ([IO.Path]::GetTempPath()) "sorrel-smoke-export-$PID"
@@ -375,20 +383,22 @@ foreach ($n in 'claude', 'codex', 'opencode') {
 }
 
 # 6c. rescue on release/fixtures/rescue-phy (amplitudes, spike_templates and templates
-#     present, sparse enough for noise windows). A dry run: it must finish and report.
+#     present, sparse enough for noise windows). Unit 0 has 10 spikes in the recording
+#     that its phy files omit; a dry run must find them (and only report: nothing is written).
 $dataR = New-DataCopy 'rescue' 'rescue-phy'
-Assert-Ok 'rescue' (Invoke-Native 'rescue' $exe @('rescue', $dataR, '--units', 'all', '--channels-per-unit', '1') -TimeoutSec 600)
+Assert-Ok 'rescue' (Invoke-Native 'rescue' $exe @('rescue', $dataR, '--units', 'all') -TimeoutSec 600)
 $rescueOut = Get-Content (Join-Path $OutDir 'rescue.out.txt') -Raw
 if ($rescueOut -notmatch 'spikes found \(dry run\)') { throw "rescue printed no dry-run summary:`n$rescueOut" }
+$rescued = [int]([regex]::Match($rescueOut, '(\d+) spikes found').Groups[1].Value)
+if ($rescued -lt 1) { throw "rescue found $rescued missed spikes in rescue-phy, expected at least 1:`n$rescueOut" }
+Write-Host "rescue: $rescued missed spikes found (dry run)"
 
 # 6d. share/join over loopback: no relay needed. The host serves on a TCP port, the
 #     guest dials 127.0.0.1 with the pairing code, and its phy files must arrive
 #     byte for byte (blake3-verified by sorrel itself; compared again here).
-#     KNOWN GAP, so this step records its result instead of failing the smoke: on the
-#     cross-built sorrel.exe the guest connects and then gets "hello: unknown message
-#     'sorrel/hello/1' for actor 'sorrel/host/1'" (piying registers remote messages in a
-#     linkme distributed slice, which looks empty in the x86_64-pc-windows-gnu binary;
-#     the same code syncs fine on Linux). Make this throw again once that is fixed.
+#     piying finds its remote handlers in a linkme slice that GNU ld's --gc-sections empties on
+#     the x86_64-pc-windows-gnu build ("hello: unknown message 'sorrel/hello/1'") unless the
+#     link passes --no-gc-sections (flake.nix); this step is the gate for that.
 $shareJoin = @{ ok = $false; error = $null }
 $dataSh = New-DataCopy 'share'
 $guestDir = Join-Path ([IO.Path]::GetTempPath()) "sorrel-guest-$PID"
@@ -431,7 +441,7 @@ catch {
     $shareJoin.error = "$_"
     $joinErr = Get-Content (Join-Path $OutDir 'join.err.txt') -ErrorAction SilentlyContinue | Select-Object -Last 1
     if ($joinErr) { $shareJoin.join_stderr = "$joinErr" }
-    Write-Warning "share/join over loopback FAILED (known gap, not gating): $_ $joinErr"
+    throw "share/join over loopback failed: $_ $joinErr"
 }
 finally {
     foreach ($p in $join, $share) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force } }
