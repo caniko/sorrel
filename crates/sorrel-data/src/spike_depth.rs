@@ -120,13 +120,18 @@ where
         // `spike_positions`; rows added by `add_spikes` lie past its end.
         // An added spike lies past the file's rows; the generic `positions`
         // spike attribute (the same file) holds what the rescue predicted.
+        // Only for a row past the file, and only when the file itself was
+        // valid (`spike_xy`): a malformed file still loads as an attribute.
+        let row = rows.get(g).and_then(|r| r.get()).map(|r| r as usize);
         let from_sp = spike_xy
-            .and_then(|xy| xy.get(rows.get(g)?.get()? as usize).copied())
-            .or_else(|| {
-                let a = session
-                    .cluster_index()
-                    .spike_attribute("positions", g as u32)?;
-                Some([*a.first()?, *a.get(1)?])
+            .and_then(|xy| match row {
+                Some(r) if r < xy.len() => xy.get(r).copied(),
+                _ => {
+                    let a = session
+                        .cluster_index()
+                        .spike_attribute("positions", g as u32)?;
+                    (a.len() == 2).then(|| [a[0], a[1]])
+                }
             })
             .filter(|p| p.iter().all(|v| v.is_finite()));
         any_sp |= from_sp.is_some();

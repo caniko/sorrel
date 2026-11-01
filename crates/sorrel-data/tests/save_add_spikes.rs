@@ -125,6 +125,13 @@ fn open(root: &Path) -> Session<KilosortProvider> {
 /// New spikes at t=40 (cluster 1) and t=100 (cluster 2, ties after the
 /// original), landing at global rows 2 and 5 of 8.
 fn add_two(s: &mut Session<KilosortProvider>) {
+    add_two_with(s, Vec::new());
+}
+
+/// [`add_two`] with extra spike attributes beside `depth`.
+fn add_two_with(s: &mut Session<KilosortProvider>, extra: Vec<(String, u32, Vec<f32>)>) {
+    let mut attributes = vec![("depth".into(), 1, vec![500., 501.])];
+    attributes.extend(extra);
     s.dispatch(CurationCommand::AddSpikes(SpikeBatch {
         times: vec![40, 100],
         clusters: vec![ClusterId(1), ClusterId(2)],
@@ -132,7 +139,7 @@ fn add_two(s: &mut Session<KilosortProvider>) {
         amplitudes: vec![9., 8.],
         pc_features: vec![900., 901., 910., 911.],
         template_features: vec![7., 7.5, 8., 8.5],
-        attributes: vec![("depth".into(), 1, vec![500., 501.])],
+        attributes,
     }))
     .unwrap();
 }
@@ -283,6 +290,44 @@ fn spike_positions_survive_a_save_with_added_spikes() {
     assert_eq!(all.len(), 8);
     assert!(all.contains(&140.) && all.contains(&141.), "{all:?}");
     assert!(all.iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn a_malformed_positions_file_never_feeds_depth() {
+    // Three columns: the provider rejects it as positions, but it still loads
+    // as a generic 3-wide `positions` attribute. Depth must not read it.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_fixture(root);
+    let bad: Vec<f32> = (0..18).map(|i| 1000. + i as f32).collect();
+    write_npy(
+        &root.join("spike_positions.npy"),
+        "<f4",
+        &[6, 3],
+        &f32s(&bad),
+    );
+    // Channel geometry (depths 0..30 µm), so the PC fallback has an answer.
+    let geom: Vec<f32> = (0..4).flat_map(|c| [0., 10. * c as f32]).collect();
+    write_npy(
+        &root.join("channel_positions.npy"),
+        "<f4",
+        &[4, 2],
+        &f32s(&geom),
+    );
+    let mut s = open(root);
+    let p = sorrel_io::HasPcFeatures::spike_positions(&s.provider);
+    assert!(p.is_none(), "rejected as positions");
+    add_two_with(&mut s, vec![("positions".into(), 3, vec![7.; 6])]);
+    let d = sorrel_data::spike_depths(&s).expect("the PC estimate");
+    assert_ne!(d.source, sorrel_data::DepthSource::SpikePositions);
+    assert!(d.x.is_none());
+    let all: Vec<f32> = d.per_cluster.into_iter().flatten().collect();
+    assert_eq!(all.len(), 8);
+    assert!(
+        all.iter()
+            .all(|v| !v.is_finite() || (0.0..=30.0).contains(v)),
+        "{all:?}"
+    );
 }
 
 #[test]
