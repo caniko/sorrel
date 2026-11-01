@@ -44,6 +44,11 @@ pub enum Snippet {
     ColourField(String),
     /// `:cm name`: phy colormap.
     Colormap(String),
+    /// `:max`: maximize the pane under the pointer (Features if none), or
+    /// restore.
+    Maximize,
+    /// `:pop`: move that pane to its own window.
+    PopOut,
 }
 
 /// Parse one snippet; the leading `:` is optional. Errors are shown to the
@@ -86,6 +91,8 @@ pub fn parse(text: &str) -> Result<Snippet, String> {
                     .ok_or(":km takes k from 2 to 8, or auto")?,
             )),
         }),
+        "max" => Snippet::Maximize,
+        "pop" => Snippet::PopOut,
         "frb" => Snippet::RateBinSize(number("a bin size in seconds")?),
         "frmin" | "frmax" => {
             let t = (!rest.is_empty())
@@ -182,6 +189,8 @@ mod tests {
         assert_eq!(parse(":km 3"), Ok(Snippet::KMeans(Some(Some(3)))));
         assert_eq!(parse(":km auto"), Ok(Snippet::KMeans(Some(None))));
         assert!(parse(":km 1").is_err());
+        assert_eq!(parse(":max"), Ok(Snippet::Maximize));
+        assert_eq!(parse(":pop"), Ok(Snippet::PopOut));
         assert_eq!(parse(":frb 2.5"), Ok(Snippet::RateBinSize(2.5)));
         assert_eq!(parse(":frmin 10"), Ok(Snippet::RateXMin(Some(10.0))));
         assert_eq!(parse(":frmax"), Ok(Snippet::RateXMax(None)));

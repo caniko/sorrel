@@ -19,12 +19,17 @@ use sorrel_data::Session;
 use sorrel_io::{ClusterId, DataProvider};
 use sorrel_render::{extract_snippet, TracePreproc};
 
+use crate::brush::{BrushSource, Brushes, HoverSpike, SpikeBrush, TimeBrush};
 use crate::jobs::{JobCtx, Memo};
 use crate::lasso::Lasso;
 use crate::theme::{selection_colour, Theme};
 use crate::views::{axes_data_rect, draw_axes_grid, waveform_window_samples};
 use crate::wgpu_raster::pack_rgba;
 use crate::wgpu_scatter::{ScatterCallback, ScatterVertex};
+use crate::widgets::{
+    ink_key, ink_packed, nearest_within, ring, selection_key, sync_spike_brush, time_alpha,
+    time_brush_gesture, time_key, time_overlays, InkLayer,
+};
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum AmpKind {
@@ -114,9 +119,12 @@ pub struct AmplitudeViewState {
     preview_gen: u64,
     vertices_gen: u64,
     pz: crate::panzoom::PanZoom,
+    /// What the lasso / threshold last wrote to the spike brush.
+    brush_key: Option<u64>,
+    ink: InkLayer,
 }
 
-type VertexKey = (u64, bool, Option<u32>, u64);
+type VertexKey = (u64, bool, Option<u32>, u64, Option<(u32, u32, bool)>);
 
 impl AmplitudeViewState {
     /// Highlight a proposed split (`(cluster, local spike indices)` as in
@@ -183,6 +191,7 @@ pub fn amplitude_view<P: DataProvider>(
     shanks: &[u32],
     feature: Option<(u32, usize)>,
     reorder: bool,
+    brushes: &mut Brushes,
 ) -> Option<AmpAction> {
     let theme = Theme::from_ui(ui);
     if selection.is_empty() {
@@ -233,9 +242,14 @@ pub fn amplitude_view<P: DataProvider>(
     let hint = match (state.lasso.is_active(), state.can_split()) {
         (_, true) => "k splits · Esc clears",
         (true, false) => "Ctrl+click to add points",
-        _ => "Ctrl+click: lasso · Alt+right-drag: threshold · Alt+click: seek the trace",
+        _ => "Ctrl+click: lasso · Shift+drag: time range · Alt+right-drag: threshold",
     };
-    ui.add(egui::Label::new(egui::RichText::new(hint).weak()).truncate());
+    // A truncated hint keeps its full gesture list on hover.
+    ui.add(egui::Label::new(egui::RichText::new(hint).weak()).truncate())
+        .on_hover_text(
+            "Ctrl+click: lasso · Alt+right-drag: threshold · Alt+click: seek\n\
+             Shift+drag: time range · Shift+click clears it",
+        );
 
     let set = current.clone().or_else(|| state.memo.last().cloned())?;
     if set.points.iter().all(|p| p.slot == BACKGROUND) {
@@ -281,6 +295,7 @@ pub fn amplitude_view<P: DataProvider>(
         dark,
         state.threshold.map(f32::to_bits),
         state.preview_gen,
+        time_key(brushes.time),
     );
     if !matches!(&state.vertices, Some((k, ..)) if *k == key) {
         let preview = state
@@ -288,7 +303,7 @@ pub fn amplitude_view<P: DataProvider>(
             .as_ref()
             .and_then(|(c, idx)| Some((selection.iter().position(|s| s == c)? as u16, idx)));
         state.vertices_gen += 1;
-        let v = vertices(&set, dark, state.threshold, preview);
+        let v = vertices(&set, dark, state.threshold, preview, brushes.time);
         state.vertices = Some((key, state.vertices_gen, Arc::new(v)));
     }
     if let Some((_, upload_gen, v)) = &state.vertices {
@@ -328,13 +343,15 @@ pub fn amplitude_view<P: DataProvider>(
             y.0 + (data.bottom() - p.y) / data.height() * (y.1 - y.0),
         ]
     };
-    state.pz.interact(&resp, data);
     let mut action = None;
     let (alt, sr) = (
         ui.input(|i| i.modifiers.alt),
         session.provider.sample_rate().max(1.0),
     );
-    if !state.lasso.interact(0, &resp, to_data) {
+    let ev = state.lasso.interact(0, &resp, to_data, to_screen);
+    if !ev.consumed {
+        state.pz.interact(&resp, data);
+        time_brush_gesture(&resp, brushes, data, x, true);
         if alt && resp.dragged_by(egui::PointerButton::Secondary) {
             if let Some(p) = resp.interact_pointer_pos() {
                 state.threshold = Some(to_data(p)[1]);
@@ -346,6 +363,83 @@ pub fn amplitude_view<P: DataProvider>(
         }
     }
     state.lasso.paint(&painter, to_screen, theme.text);
+    // A1: the lasso / threshold is the spike brush (only once the set is
+    // current: local indices of an older version would name other spikes).
+    if current.is_some() {
+        let armed = state.can_split();
+        let source = if state.lasso.is_closed() {
+            BrushSource::AmplitudeLasso
+        } else {
+            BrushSource::AmplitudeThreshold
+        };
+        sync_spike_brush(
+            brushes,
+            &mut state.brush_key,
+            armed.then(|| selection_key(set.generation, &state.lasso, state.threshold)),
+            &[BrushSource::AmplitudeLasso, BrushSource::AmplitudeThreshold],
+            || {
+                let hits = split_hits(&set, &state.lasso, state.threshold, selection);
+                SpikeBrush::new(source, session.version(), hits)
+            },
+        );
+    }
+    // Brushed spikes on top in ink, and the hovered one ringed.
+    let ink = ink_packed(dark);
+    let sb = brushes.spikes.as_ref();
+    state.ink.paint(
+        ui,
+        data,
+        "amplitude-ink",
+        ink_key(set.generation, dark, brushes),
+        x,
+        y,
+        || {
+            let Some(sb) = sb else { return Vec::new() };
+            set.points
+                .iter()
+                .filter(|p| {
+                    p.slot != BACKGROUND && sb.contains(selection[p.slot as usize], p.local)
+                })
+                .filter(|p| time_alpha(brushes.time, p.t, 255).is_some())
+                .map(|p| ScatterVertex {
+                    pos: [p.t, p.a],
+                    color: ink,
+                })
+                .collect()
+        },
+    );
+    let pointer = resp.hover_pos().filter(|p| data.contains(*p));
+    if let Some(p) = pointer {
+        // ponytail: O(n) scan of the displayed points (<= ~15k) per hovered
+        // frame; a grid index if Amplitudes ever shows millions.
+        let hit = nearest_within(
+            set.points
+                .iter()
+                .filter(|p| p.slot != BACKGROUND)
+                .filter(|q| time_alpha(brushes.time, q.t, 255).is_some())
+                .map(|q| (q, to_screen([q.t, q.a]))),
+            p,
+            6.0,
+        );
+        if let Some(q) = hit {
+            let c = selection[q.slot as usize];
+            let sample = session.spike_times(c).get(q.local as usize).map(|t| t.0);
+            brushes.hover_next = sample.map(|sample| HoverSpike {
+                cluster: c,
+                local: q.local,
+                sample,
+            });
+        }
+    }
+    if let Some(h) = brushes.hover {
+        let ringed = set.points.iter().find(|p| {
+            p.slot != BACKGROUND && p.local == h.local && selection[p.slot as usize] == h.cluster
+        });
+        if let Some(q) = ringed {
+            ring(&painter, ui, to_screen([q.t, q.a]));
+        }
+    }
+    time_overlays(ui, &painter.with_clip_rect(data), data, x, brushes, sr);
     if let Some(th) = state.threshold {
         let sy = to_screen([0.0, th]).y;
         painter.hline(
@@ -403,6 +497,7 @@ fn vertices(
     dark: bool,
     threshold: Option<f32>,
     preview: Option<(u16, &std::collections::HashSet<u32>)>,
+    time: Option<TimeBrush>,
 ) -> Vec<ScatterVertex> {
     let grey = if dark { 150 } else { 110 };
     let previewed =
@@ -421,24 +516,29 @@ fn vertices(
         })
         .collect();
     order.sort_by_key(|p| (p.slot != BACKGROUND, previewed(p)));
+    // Points outside the time brush fade (or vanish with `only`).
     order
         .into_iter()
-        .map(|p| ScatterVertex {
-            pos: [p.t, p.a],
-            color: if p.slot == BACKGROUND {
-                pack_rgba(grey, grey, grey, 110)
+        .filter_map(|p| {
+            let a = |a| time_alpha(time, p.t, a);
+            let color = if p.slot == BACKGROUND {
+                pack_rgba(grey, grey, grey, a(110)?)
             } else if previewed(p) {
                 if dark {
-                    pack_rgba(255, 255, 255, 240)
+                    pack_rgba(255, 255, 255, a(240)?)
                 } else {
-                    pack_rgba(20, 20, 20, 240)
+                    pack_rgba(20, 20, 20, a(240)?)
                 }
             } else if threshold.is_some_and(|th| p.a < th) {
-                pack_rgba(255, 140, 0, 230)
+                pack_rgba(255, 140, 0, a(230)?)
             } else {
                 let c = selection_colour(p.slot as usize);
-                pack_rgba(c.r(), c.g(), c.b(), 220)
-            },
+                pack_rgba(c.r(), c.g(), c.b(), a(220)?)
+            };
+            Some(ScatterVertex {
+                pos: [p.t, p.a],
+                color,
+            })
         })
         .collect()
 }
@@ -446,7 +546,8 @@ fn vertices(
 /// One horizontal amplitude histogram per selected cluster, overlaid.
 fn histograms(painter: &egui::Painter, set: &AmpSet, rect: Rect, y: (f32, f32)) {
     const BINS: usize = 50;
-    let mut per: HashMap<u16, [u32; BINS]> = HashMap::new();
+    // Ordered, so overlapping histograms always draw the same way round.
+    let mut per: std::collections::BTreeMap<u16, [u32; BINS]> = Default::default();
     for p in set.points.iter().filter(|p| p.slot != BACKGROUND) {
         let b = ((p.a - y.0) / (y.1 - y.0) * BINS as f32).floor();
         if (0.0..BINS as f32).contains(&b) {
@@ -692,10 +793,7 @@ mod tests {
             split_hits(&set, &Lasso::default(), Some(10.0), &c),
             vec![(ClusterId(4), vec![0, 2])]
         );
-        let lasso = Lasso {
-            cell: 0,
-            points: vec![[0.0, 40.0], [2.0, 40.0], [2.0, 60.0], [0.0, 60.0]],
-        };
+        let lasso = Lasso::new(0, vec![[0.0, 40.0], [2.0, 40.0], [2.0, 60.0], [0.0, 60.0]]);
         assert_eq!(
             split_hits(&set, &lasso, Some(10.0), &c),
             vec![(ClusterId(4), vec![1])]

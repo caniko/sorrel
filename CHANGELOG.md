@@ -7,6 +7,28 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- **Features view v2.**
+  - **Lasso, in every lasso view:** Ctrl-drag draws it freehand, simplified to at most 64 nodes. On a closed lasso you can drag a node, double-click an edge to insert one, or right-click a node to delete it.
+  - **k-means collision:** the matrix and per-cell badges count the other parts' spikes and the other clusters' spikes inside a part's hull in all 16 projections.
+  - **Layouts:** compact, regular and expansive, matched to the pane's size.
+- **Features 3D.** A GPU view with an orbit camera.
+  - **Axis triples:** the triples of the channel set's dimensions (time, PCs and spike depth) are ranked by silhouette, and the focused 2D plot's two axes can be pinned.
+  - **Hulls:** each cluster gets a hull, styled by whether the sorter or Sorrel made it. Split children show their parent's hull from before the split, and the lasso shows as a prism.
+- **Pane controls.** Any pane can be maximized (button, `Ctrl+Shift+M`, `:max`) or popped out into its own window (button, `:pop`). `F11` toggles full screen.
+- **Waveforms ↔ Features.**
+  - **Channels:** Shift-click a Waveforms box or a Probe site to edit the Features channel set; Ctrl-click and Ctrl-right-click set channels A and B. The grid's A and B follow the best-separating pair.
+  - **Alternatives:** an alternatives strip ranks the other projections.
+  - **Highlight:** Waveforms outlines the focused plot's channels and draws the lassoed spikes and the PC shapes.
+- **Cross-talk between views.**
+  - **Spike brush:** one set of spikes, picked by a lasso, a k-means part, an amplitude threshold or the ISI refractory band, is drawn in every spike view.
+  - **Time range:** Shift-drag along a time axis.
+  - **Hover:** the spike under the pointer is marked in the other views.
+  - **Split preview:** a lasso shows the inside and outside parts in ISI, Waveforms and Quality before you split.
+  - **Ghosts:** hovering a Similar, Suggest or History row previews the merge or the state before that edit.
+  - **Colour:** Features can be coloured by time or depth.
+
 ### Fixed
 
 - `sorrel auto --llm` no longer aborts the whole run, losing every paid

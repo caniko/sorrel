@@ -5,11 +5,12 @@
 
 use std::sync::Arc;
 
-use egui::{Sense, Stroke, Ui};
+use egui::{Sense, Shape, Stroke, Ui};
 use sorrel_compute::{isi_histogram_range, isi_violations};
-use sorrel_data::Session;
-use sorrel_io::{ClusterId, DataProvider};
+use sorrel_data::{preview_split, Session, SplitPreview};
+use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 
+use crate::brush::{BrushSource, Brushes, SpikeBrush};
 use crate::correlogram_view::{band_fill, wheel_scale};
 use crate::prefs::IsiParams;
 use crate::theme::{contrast_text, selection_colour, Theme};
@@ -27,6 +28,85 @@ type IsiKey = (Vec<ClusterId>, u64, u64, u64, usize);
 struct IsiEntry {
     key: IsiKey,
     hists: Arc<Vec<Vec<u32>>>,
+}
+
+/// The shaded band's width and the violation legend's window.
+const REFRACTORY_MS: f32 = 1.0;
+
+/// Local indices of every spike that is part of an ISI below `refractory`
+/// samples (both members of each pair, ascending), and the pair count.
+pub(crate) fn isi_violators(times: &[SampleIndex], refractory: u64) -> (Vec<u32>, usize) {
+    let mut out: Vec<u32> = Vec::new();
+    let mut pairs = 0;
+    for (i, w) in times.windows(2).enumerate() {
+        if w[1].0.saturating_sub(w[0].0) < refractory {
+            pairs += 1;
+            // Consecutive pairs share a member: push it once.
+            if out.last() != Some(&(i as u32)) {
+                out.push(i as u32);
+            }
+            out.push(i as u32 + 1);
+        }
+    }
+    (out, pairs)
+}
+
+/// The cluster the split what-if is about: the first selected cluster that
+/// the spike brush covers, when the brush is a lasso / k-means part (not ISI
+/// violators) and leaves at least one spike outside. Returns the brushed
+/// local indices.
+pub(crate) fn split_target(
+    brushes: &Brushes,
+    selection: &[ClusterId],
+    session_n: impl Fn(ClusterId) -> usize,
+) -> Option<(ClusterId, std::sync::Arc<[u32]>)> {
+    let b = brushes.spikes.as_ref()?;
+    if b.source == BrushSource::IsiViolators {
+        return None;
+    }
+    selection.iter().find_map(|&c| {
+        let (_, idx) = b.spikes.iter().find(|(bc, _)| *bc == c)?;
+        (idx.len() < session_n(c)).then(|| (c, std::sync::Arc::clone(idx)))
+    })
+}
+
+type SplitMemo =
+    std::sync::Arc<std::sync::Mutex<crate::jobs::Memo<SplitKey, std::sync::Arc<SplitPreview>>>>;
+type SplitKey = ((BrushSource, u64, usize, usize), ClusterId);
+
+/// The what-if for the current brush, computed off the UI thread. Shared by
+/// the ISI and Quality panes (one memo in egui's temp memory, keyed by the
+/// brush). `None` while it computes or when no brush qualifies.
+/// ponytail: not cancelled before a curation write (the Memo is not owned by
+/// the app); the job is O(spikes of one cluster) and holds a read lock briefly.
+pub(crate) fn split_preview<P: DataProvider>(
+    ui: &Ui,
+    session: &Session<P>,
+    jobs: &crate::jobs::JobCtx<Session<P>>,
+    brushes: &Brushes,
+    selection: &[ClusterId],
+) -> Option<std::sync::Arc<SplitPreview>> {
+    let (c, idx) = split_target(brushes, selection, |c| session.spike_times(c).len())?;
+    let key = (brushes.spikes.as_ref()?.key(), c);
+    let id = egui::Id::new("split_whatif_memo");
+    let memo: SplitMemo = ui.data_mut(|d| {
+        d.get_temp_mut_or_insert_with(id, SplitMemo::default)
+            .clone()
+    });
+    let mut memo = memo.lock().unwrap_or_else(|p| p.into_inner());
+    memo.ensure(key, &jobs.session, jobs.repaint(), move |s, _| {
+        std::sync::Arc::new(preview_split(s, c, &idx))
+    })
+    .cloned()
+}
+
+/// Refractory share of a spike train, for captions.
+fn refractory_pct(times: &[SampleIndex], refractory: u64) -> f32 {
+    if times.is_empty() {
+        0.0
+    } else {
+        isi_violations(times, refractory) as f32 / times.len() as f32 * 100.0
+    }
 }
 
 /// phy status text: `[x_min ms, x_max ms]`.
@@ -98,6 +178,8 @@ pub fn isi_view<P: DataProvider>(
     session: &Session<P>,
     selection: &[ClusterId],
     p: &mut IsiParams,
+    brushes: &mut Brushes,
+    jobs: &crate::jobs::JobCtx<Session<P>>,
 ) {
     let theme = Theme::from_ui(ui);
     if selection.is_empty() {
@@ -144,7 +226,8 @@ pub fn isi_view<P: DataProvider>(
     };
 
     // Legend row: one chip per cluster with its <1 ms violations.
-    let refractory_samples = (sr * 0.001).round() as u64;
+    let refractory_samples = (sr * REFRACTORY_MS / 1e3).round() as u64;
+    let mut clicked: Vec<ClusterId> = Vec::new();
     ui.horizontal_wrapped(|ui| {
         for (slot, &c) in shown.iter().enumerate() {
             let n = session.spike_times(c).len();
@@ -162,12 +245,36 @@ pub fn isi_view<P: DataProvider>(
             let g = ui
                 .painter()
                 .layout_no_wrap(text, egui::FontId::proportional(TICK_PX), fg);
-            let (r, _) = ui.allocate_exact_size(g.size() + egui::vec2(10.0, 4.0), Sense::hover());
+            let (r, resp) =
+                ui.allocate_exact_size(g.size() + egui::vec2(10.0, 4.0), Sense::click());
             ui.painter().rect_filled(r, 3.0, bg);
             ui.painter().galley(r.min + egui::vec2(5.0, 2.0), g, fg);
+            resp.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    true,
+                    format!("isi violators c{c}"),
+                )
+            });
+            if resp
+                .on_hover_text("Click to brush this cluster's violating spikes")
+                .clicked()
+            {
+                clicked.push(c);
+            }
         }
     });
 
+    let split =
+        split_preview(ui, session, jobs, brushes, shown).filter(|sp| shown.contains(&sp.cluster));
+    if let Some(sp) = &split {
+        // Above the plot: the plot fills what is left of the pane.
+        ui.weak(format!(
+            "if split: inside {:.1} % · outside {:.1} % refractory  (dashed inside · dotted outside)",
+            refractory_pct(&sp.inside_times, refractory_samples),
+            refractory_pct(&sp.outside_times, refractory_samples),
+        ));
+    }
     let (rect, _resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width().max(120.0), fill_height(ui).max(160.0)),
         Sense::hover(),
@@ -216,6 +323,59 @@ pub fn isi_view<P: DataProvider>(
             egui::FontId::proportional(TICK_PX),
             theme.danger,
         );
+        // The band is a button: click brushes every violating spike of the
+        // shown clusters.
+        let band_rect =
+            egui::Rect::from_min_max(egui::pos2(x0, data.top()), egui::pos2(x1, data.bottom()));
+        let resp = ui.interact(band_rect, ui.id().with("isi_band"), Sense::click());
+        resp.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "isi violators")
+        });
+        let all: Vec<(ClusterId, Vec<u32>, usize)> = shown
+            .iter()
+            .map(|&c| {
+                let (v, pairs) = isi_violators(session.spike_times(c), refractory_samples);
+                (c, v, pairs)
+            })
+            .collect();
+        let picked = brushes
+            .spikes
+            .as_ref()
+            .is_some_and(|b| b.source == BrushSource::IsiViolators);
+        if resp.hovered() || picked {
+            dp.rect_stroke(
+                band_rect,
+                0.0,
+                Stroke::new(1.5_f32, theme.text),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let (n, m) = all
+            .iter()
+            .fold((0, 0), |a, (_, v, p)| (a.0 + v.len(), a.1 + p));
+        let resp = resp.on_hover_text(format!(
+            "{n} spikes in {m} violating pairs · click to brush"
+        ));
+        if resp.clicked() {
+            brush_violators(
+                brushes,
+                session.version(),
+                all.into_iter().map(|(c, v, _)| (c, v)),
+            );
+        }
+    }
+
+    if !clicked.is_empty() {
+        brush_violators(
+            brushes,
+            session.version(),
+            clicked.iter().map(|&c| {
+                (
+                    c,
+                    isi_violators(session.spike_times(c), refractory_samples).0,
+                )
+            }),
+        );
     }
 
     // Step outlines, one per cluster, on a shared count axis.
@@ -235,11 +395,94 @@ pub fn isi_view<P: DataProvider>(
             Stroke::new(2.0_f32, selection_colour(slot)),
         ));
     }
+
+    // Split what-if: inside dashed, outside dotted, in the cluster colour,
+    // each part's own counts on the same axis.
+    if let Some(sp) = split {
+        if let Some(slot) = shown.iter().position(|&c| c == sp.cluster) {
+            let colour = selection_colour(slot);
+            let step = |h: &[u32]| {
+                let mut pts = Vec::with_capacity(h.len() * 2);
+                for (i, &count) in h.iter().enumerate() {
+                    let x0 = data.left() + bw * i as f32;
+                    pts.push(egui::pos2(x0, y_of(count)));
+                    pts.push(egui::pos2(x0 + bw, y_of(count)));
+                }
+                pts
+            };
+            // Parts' histograms, cached per preview and bin range.
+            let hid = egui::Id::new("isi_split_hists");
+            let hkey = (Arc::as_ptr(&sp) as usize, lo, hi, p.n_bins);
+            let h = match ui
+                .data(|d| d.get_temp::<((usize, u64, u64, usize), Arc<(Vec<u32>, Vec<u32>)>)>(hid))
+            {
+                Some((k, h)) if k == hkey => h,
+                _ => {
+                    let h = Arc::new((
+                        isi_histogram_range(&sp.inside_times, lo, hi, p.n_bins),
+                        isi_histogram_range(&sp.outside_times, lo, hi, p.n_bins),
+                    ));
+                    ui.data_mut(|d| d.insert_temp(hid, (hkey, Arc::clone(&h))));
+                    h
+                }
+            };
+            dp.extend(Shape::dashed_line(
+                &step(&h.0),
+                Stroke::new(2.0_f32, colour),
+                6.0,
+                4.0,
+            ));
+            dp.extend(Shape::dotted_line(&step(&h.1), colour, 4.0, 1.2));
+        }
+    }
+}
+
+fn brush_violators(
+    brushes: &mut Brushes,
+    version: u64,
+    per_cluster: impl Iterator<Item = (ClusterId, Vec<u32>)>,
+) {
+    // No violators (a clean cluster): keep whatever brush is up.
+    if let Some(b) = SpikeBrush::new(BrushSource::IsiViolators, version, per_cluster) {
+        brushes.spikes = Some(b);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn violators_include_both_members_once() {
+        let t = |v: &[u64]| v.iter().map(|&x| SampleIndex(x)).collect::<Vec<_>>();
+        // Refractory 10: pairs (0,1), (3,4) and (4,5) are < 10 apart; 4 is shared.
+        let times = t(&[0, 5, 100, 200, 203, 207, 400]);
+        let (v, pairs) = isi_violators(&times, 10);
+        assert_eq!((v, pairs), (vec![0, 1, 3, 4, 5], 3));
+        assert_eq!(isi_violators(&times, 3), (vec![], 0), "strictly below");
+        assert_eq!(isi_violators(&times[..1], 10), (vec![], 0));
+        assert_eq!(isi_violations(&times, 10), 3, "same rule as the legend");
+    }
+
+    #[test]
+    fn split_target_needs_a_part_brush_and_a_remainder() {
+        let (a, b) = (ClusterId(1), ClusterId(2));
+        let mk = |src, c, idx: Vec<u32>| Brushes {
+            spikes: SpikeBrush::new(src, 0, [(c, idx)]),
+            ..Default::default()
+        };
+        let n = |_| 10;
+        let br = mk(BrushSource::FeatureLasso, b, vec![1, 2]);
+        assert_eq!(split_target(&br, &[a, b], n).map(|t| t.0), Some(b));
+        assert!(split_target(&br, &[a], n).is_none(), "cluster not selected");
+        let isi = mk(BrushSource::IsiViolators, b, vec![1, 2]);
+        assert!(split_target(&isi, &[b], n).is_none());
+        let all = mk(BrushSource::KMeansPart, b, (0..10).collect());
+        assert!(
+            split_target(&all, &[b], n).is_none(),
+            "nothing left outside"
+        );
+    }
 
     #[test]
     fn caption_matches_phy_status() {

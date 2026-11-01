@@ -260,7 +260,6 @@ pub fn cluster_scatter_view<P: DataProvider>(
         egui::FontId::proportional(crate::views::TICK_PX),
         theme.caption,
     );
-    state.pz.interact(&resp, data);
     let dp = painter.with_clip_rect(data);
     let to_screen = |p: [f32; 2]| {
         Pos2::new(
@@ -325,16 +324,21 @@ pub fn cluster_scatter_view<P: DataProvider>(
 
     *scheme_delta += crate::theme::scheme_wheel(ui, &resp);
     state.lasso.paint(&painter, to_screen, theme.text);
-    if state.lasso.interact(0, &resp, to_data) {
-        if state.lasso.is_closed() {
-            let inside: Vec<ClusterId> = pts
-                .iter()
-                .filter(|p| state.lasso.contains([p.1, p.2]))
-                .map(|p| p.0)
-                .collect();
-            return (!inside.is_empty()).then_some(inside);
+    let ev = state.lasso.interact(0, &resp, to_data, to_screen);
+    if !ev.consumed {
+        state.pz.interact(&resp, data);
+    }
+    if ev.consumed {
+        // Select on release, not on every frame of a node drag.
+        if resp.dragged() || !state.lasso.is_closed() {
+            return None;
         }
-        return None;
+        let inside: Vec<ClusterId> = pts
+            .iter()
+            .filter(|p| state.lasso.contains([p.1, p.2]))
+            .map(|p| p.0)
+            .collect();
+        return (!inside.is_empty()).then_some(inside);
     }
     if resp.clicked() {
         let c = hovered?;

@@ -6,10 +6,12 @@
 
 pub mod amplitude_view;
 pub mod app;
+pub mod brush;
 pub mod cluster_scatter;
 pub mod cluster_view;
 pub mod correlogram_view;
 pub mod feature_view;
+pub mod feature_view3d;
 pub mod history_view;
 pub mod intent;
 pub mod isi_view;
@@ -31,11 +33,12 @@ pub mod views;
 pub mod waveform_view;
 pub mod wgpu_raster;
 pub mod wgpu_scatter;
+pub mod wgpu_scene3d;
 pub mod wgpu_trace;
 pub mod widgets;
 
 pub use app::SorrelApp;
-pub use feature_view::FeatureViewState;
+pub use feature_view::{ChannelEdit, FeatureLink, FeatureViewState};
 pub use intent::Intent;
 pub use jobs::{Job, JobCtx, Memo};
 pub use layout::Pane;

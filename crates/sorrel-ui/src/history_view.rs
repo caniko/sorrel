@@ -3,6 +3,7 @@
 //! under the node it left from, the checked-out node is highlighted, and
 //! saves are marked. Clicking a row checks it out.
 
+use crate::brush::{Brushes, Ghost};
 use egui::Ui;
 use sorrel_data::{actor_name, describe_command, Session};
 use sorrel_io::DataProvider;
@@ -36,6 +37,8 @@ pub(crate) fn rows<P: DataProvider>(session: &Session<P>) -> Vec<Row> {
     out
 }
 
+const HOVER_HINT: &str = "hover: shows the clusters before this edit in Features 3D";
+
 /// `HH:MM:SS` (UTC) of a Unix-millisecond timestamp; empty for 0 (nodes
 /// upgraded from a v2 journal have no time).
 fn clock(ts_ms: u64) -> String {
@@ -47,12 +50,17 @@ fn clock(ts_ms: u64) -> String {
 }
 
 /// Draw the tree; returns the node a click asked to check out.
-pub fn history_view<P: DataProvider>(ui: &mut Ui, session: &Session<P>) -> Option<Option<u64>> {
+pub fn history_view<P: DataProvider>(
+    ui: &mut Ui,
+    session: &Session<P>,
+    brushes: &mut Brushes,
+) -> Option<Option<u64>> {
     let theme = crate::theme::Theme::from_ui(ui);
     let head = session.head();
     let saved: Vec<Option<u64>> = session.seals().iter().map(|s| s.0).collect();
     ui.weak("click a row to go back to it · nothing is ever discarded");
     let mut picked = None;
+    let mut hovered = None;
     for (node, indent, branches) in rows(session) {
         ui.horizontal(|ui| {
             ui.add_space(14.0 * indent as f32);
@@ -73,8 +81,15 @@ pub fn history_view<P: DataProvider>(ui: &mut Ui, session: &Session<P>) -> Optio
                 b if b > 1 => format!("{what}  ({b} branches)"),
                 _ => what,
             };
-            if ui.selectable_label(node == head, text).clicked() && node != head {
+            let row = ui.selectable_label(node == head, text);
+            if row.clicked() && node != head {
                 picked = Some(node);
+            }
+            // The root (the sort as loaded) has no edit before it to ghost.
+            if let (Some(n), true) = (node, row.contains_pointer()) {
+                hovered = Some(n);
+                brushes.ghost_next = Some(Ghost::History(n));
+                row.on_hover_text(HOVER_HINT);
             }
             if saved.contains(&node) {
                 ui.label(egui::RichText::new("saved").color(theme.good).small());
@@ -83,6 +98,10 @@ pub fn history_view<P: DataProvider>(ui: &mut Ui, session: &Session<P>) -> Optio
                 ui.label(egui::RichText::new(when).color(theme.caption).small());
             }
         });
+    }
+    if hovered.is_some() {
+        ui.add_space(4.0);
+        ui.weak(HOVER_HINT);
     }
     picked
 }

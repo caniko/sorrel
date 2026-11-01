@@ -241,6 +241,7 @@ pub fn correlogram_grid_view<P: DataProvider>(
     cache: &mut CcgCache,
     jobs: &JobCtx<Session<P>>,
     p: &mut CcgParams,
+    brushes: &crate::brush::Brushes,
 ) {
     let theme = Theme::from_ui(ui);
     if selection.is_empty() {
@@ -266,6 +267,17 @@ pub fn correlogram_grid_view<P: DataProvider>(
             selection.len()
         ));
     }
+    // A merge candidate hovered in Similar / Suggest joins as a grey ghost
+    // row and column (last, so it is part of the cache key's cluster list).
+    let n_real = shown.len();
+    let ghost = match brushes.ghost {
+        Some(crate::brush::Ghost::Merge(g)) if n_real < MAX_CLUSTERS && !shown.contains(&g) => {
+            Some(g)
+        }
+        _ => None,
+    };
+    let with_ghost: Vec<ClusterId> = shown.iter().copied().chain(ghost).collect();
+    let shown = &with_ghost[..];
     let Some(data) = cache.ensure(session, shown, p, jobs) else {
         ui.horizontal(|ui| {
             ui.spinner();
@@ -326,6 +338,7 @@ pub fn correlogram_grid_view<P: DataProvider>(
                 global_max,
                 bin_s,
                 half,
+                n_real,
             );
         });
 }
@@ -347,6 +360,7 @@ fn grid<P: DataProvider>(
     global_max: u32,
     bin_s: f64,
     half: usize,
+    n_real: usize,
 ) {
     let n = shown.len();
     let nb = data.counts[0][0].len();
@@ -358,6 +372,14 @@ fn grid<P: DataProvider>(
     let xt = [-tick_ms, 0.0, tick_ms];
     let hover = resp.hover_pos();
     let mut tip = None;
+    let ghost_grey = Color32::from_gray(if theme.dark { 130 } else { 150 });
+    let name = |c: ClusterId, i: usize| {
+        if i >= n_real {
+            format!("c{c} (ghost)")
+        } else {
+            format!("c{c}")
+        }
+    };
     for (ri, &c_row) in shown.iter().enumerate() {
         for (ci, &c_col) in shown.iter().enumerate() {
             let (left_col, bottom_row) = (ci == 0, ri == n - 1);
@@ -379,13 +401,17 @@ fn grid<P: DataProvider>(
             let max_count = h.iter().copied().max().unwrap_or(0);
             let baseline = ccg_baseline(data.n_used[ri], data.n_used[ci], bin_s, data.duration_s);
             let y_top = y_top(max_count, global_max, baseline, p.uniform);
-            let colour = selection_colour(ri);
+            let colour = if ri >= n_real {
+                ghost_grey
+            } else {
+                selection_colour(ri)
+            };
 
             // Header strip: label chip, plus a sparse note when it fits.
             let chip = chip(
                 &painter,
                 cell.left_top() + egui::vec2(4.0, 3.0),
-                &format!("c{c_row}×c{c_col}"),
+                &format!("{}×{}", name(c_row, ri), name(c_col, ci)),
                 colour,
             );
             if max_count < 5 {
@@ -507,7 +533,9 @@ fn grid<P: DataProvider>(
                 let k = (((pos.x - data_rect.left()) / bw) as usize).min(nb - 1);
                 let lag = (k as f32 - half as f32) * bin_ms;
                 tip = Some(format!(
-                    "c{c_row}×c{c_col} · lag {lag:+.1} ms · count {}",
+                    "{}×{} · lag {lag:+.1} ms · count {}",
+                    name(c_row, ri),
+                    name(c_col, ci),
                     h[k]
                 ));
             }

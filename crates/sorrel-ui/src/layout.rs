@@ -248,6 +248,222 @@ pub fn add_pane(tree: &mut Tree<Pane>, pane: Pane, into: Option<TileId>) {
     }
 }
 
+/// Panes taken out of the tile tree's normal flow: one maximized over the
+/// whole central area, any number shown in their own OS windows. Plain state
+/// so the transitions are unit-testable; drawing is [`show_tiles`] and
+/// [`show_popouts`].
+#[derive(Default)]
+pub struct Detached {
+    pub maximized: Option<TileId>,
+    pub popped: Vec<Pane>,
+    /// The pane the pointer was last over: what `:max`, `:pop` and
+    /// Ctrl+Shift+M act on (Features when no pane was hovered yet).
+    pub hovered: Option<TileId>,
+}
+
+impl Detached {
+    fn pane_of(tree: &Tree<Pane>, tile: TileId) -> Option<Pane> {
+        match tree.tiles.get(tile) {
+            Some(Tile::Pane(p)) => Some(*p),
+            _ => None,
+        }
+    }
+
+    fn target(&self, tree: &Tree<Pane>) -> Option<TileId> {
+        self.hovered
+            .filter(|&t| Self::pane_of(tree, t).is_some())
+            .or_else(|| tree.tiles.find_pane(&Pane::Features))
+    }
+
+    /// Maximize `tile`, or restore if it already is. A popped-out pane stays
+    /// in its window.
+    pub fn toggle_maximize(&mut self, tree: &Tree<Pane>, tile: TileId) {
+        if self.maximized == Some(tile) {
+            self.maximized = None;
+        } else if Self::pane_of(tree, tile).is_some_and(|p| !self.popped.contains(&p)) {
+            self.maximized = Some(tile);
+        }
+    }
+
+    /// `:max` / Ctrl+Shift+M: restore, else maximize the targeted pane.
+    pub fn toggle_maximize_target(&mut self, tree: &Tree<Pane>) {
+        if let Some(t) = self.maximized.or_else(|| self.target(tree)) {
+            self.toggle_maximize(tree, t);
+        }
+    }
+
+    pub fn pop_out(&mut self, tree: &Tree<Pane>, pane: Pane) {
+        if tree.tiles.find_pane(&pane).is_none() || self.popped.contains(&pane) {
+            return;
+        }
+        self.popped.push(pane);
+        // Maximizing a pane and then popping it out leaves the tree intact.
+        if self
+            .maximized
+            .is_some_and(|t| Self::pane_of(tree, t) == Some(pane))
+        {
+            self.maximized = None;
+        }
+    }
+
+    /// `:pop`: pop out the targeted pane.
+    pub fn pop_out_target(&mut self, tree: &Tree<Pane>) {
+        if let Some(pane) = self.target(tree).and_then(|t| Self::pane_of(tree, t)) {
+            self.pop_out(tree, pane);
+        }
+    }
+
+    pub fn bring_back(&mut self, pane: Pane) {
+        self.popped.retain(|&p| p != pane);
+    }
+
+    /// Forget panes the tree no longer has (closed tab, new layout).
+    pub fn prune(&mut self, tree: &Tree<Pane>) {
+        self.popped.retain(|p| tree.tiles.find_pane(p).is_some());
+        if self
+            .maximized
+            .is_some_and(|t| Self::pane_of(tree, t).is_none())
+        {
+            self.maximized = None;
+        }
+    }
+}
+
+/// A small painted icon button (egui's bundled fonts have no ⛶ / ⧉), named
+/// for screen readers and AccessKit-driven tests.
+fn icon_button(ui: &mut Ui, name: &str, popout: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+    if ui.is_rect_visible(rect) {
+        let v = ui.style().interact(&resp);
+        if resp.hovered() {
+            ui.painter().rect_filled(rect, 3.0, v.bg_fill);
+        }
+        let c = rect.center();
+        let sq = |dx: f32, dy: f32, s: f32| {
+            egui::Rect::from_center_size(c + egui::vec2(dx, dy), egui::vec2(s, s))
+        };
+        let stroke = egui::Stroke::new(1.3_f32, v.fg_stroke.color);
+        let paint = ui.painter();
+        if popout {
+            paint.rect_stroke(sq(-2.0, 2.0, 8.0), 1.0, stroke, egui::StrokeKind::Inside);
+            paint.rect_stroke(sq(2.0, -2.0, 8.0), 1.0, stroke, egui::StrokeKind::Inside);
+        } else {
+            paint.rect_stroke(sq(0.0, 0.0, 11.0), 1.0, stroke, egui::StrokeKind::Inside);
+        }
+    }
+    resp.on_hover_text(name)
+}
+
+/// Draw the tile tree, or only the maximized pane under a slim header
+/// ("<Pane> · maximized", Restore, pop out). A maximized tile that vanished
+/// is cleared and the tree draws as usual.
+pub fn show_tiles<P: DataProvider>(
+    tree: &mut Tree<Pane>,
+    b: &mut ViewBehavior<'_, P>,
+    ui: &mut Ui,
+) {
+    let max = b
+        .detached
+        .maximized
+        .and_then(|t| Detached::pane_of(tree, t).map(|p| (t, p)));
+    let Some((tile, mut pane)) = max else {
+        b.detached.maximized = None;
+        tree.ui(b, ui);
+        return;
+    };
+    ui.horizontal(|ui| {
+        ui.strong(format!("{} · maximized", pane.title()));
+        if ui
+            .button("Restore")
+            .on_hover_text("Back to the full layout (Esc)")
+            .clicked()
+        {
+            b.actions.push(ViewAction::ToggleMaximize(tile));
+        }
+        if icon_button(ui, "pop out pane", true).clicked() {
+            b.actions.push(ViewAction::PopOut(pane));
+        }
+    });
+    ui.separator();
+    // `pane_ui` draws into `max_rect`, which a tile normally gets exactly.
+    let rect = ui.available_rect_before_wrap();
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+    let _ = b.pane_ui(&mut child, tile, &mut pane);
+}
+
+/// One native window per popped pane, drawn with the same behaviour (and so
+/// the same borrows of app state) as the tree. Closing the OS window brings
+/// the pane back; the close request belongs to that viewport, so the shell's
+/// quit handling on the root viewport never sees it.
+pub fn show_popouts<P: DataProvider>(
+    ctx: &egui::Context,
+    tree: &Tree<Pane>,
+    dataset: &str,
+    b: &mut ViewBehavior<'_, P>,
+) {
+    for mut pane in b.detached.popped.clone() {
+        let Some(tile) = tree.tiles.find_pane(&pane) else {
+            continue;
+        };
+        let id = egui::ViewportId::from_hash_of(("sorrel-popout", dataset, pane));
+        let builder = egui::ViewportBuilder::default()
+            .with_title(format!("{} — Sorrel", pane.title()))
+            .with_inner_size([900.0, 640.0]);
+        b.in_popout = true;
+        let closed = ctx.show_viewport_immediate(id, builder, |ui, class| {
+            if class == egui::ViewportClass::EmbeddedWindow {
+                // No native windows here (tests, exotic backends): a floating
+                // egui window; its close is the placeholder's button.
+                ui.allocate_ui(egui::vec2(640.0, 440.0), |ui| {
+                    let _ = b.pane_ui(ui, tile, &mut pane);
+                });
+                return false;
+            }
+            toggle_fullscreen_on_f11(ui.ctx());
+            // Only the focused window receives key events, so a chord is
+            // handled once, by whichever window has focus. Esc here runs the
+            // normal cancel chain (lasso first) and never closes the window.
+            let typing = ui.ctx().egui_wants_keyboard_input();
+            let keys = ui.input(|i| key_intents(&i.events, typing));
+            b.actions.extend(keys.into_iter().map(ViewAction::Intent));
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                let _ = b.pane_ui(ui, tile, &mut pane);
+            });
+            ui.input(|i| i.viewport().close_requested())
+        });
+        b.in_popout = false;
+        if closed {
+            b.actions.push(ViewAction::BringBack(pane));
+        }
+    }
+}
+
+/// The intents for this viewport's key presses; the main window and pop-outs
+/// share it. Plain keys are dropped while a text field has focus.
+pub fn key_intents(events: &[egui::Event], text_input_active: bool) -> Vec<crate::intent::Intent> {
+    events
+        .iter()
+        .filter_map(|ev| match ev {
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => crate::intent::from_key_in_context(*key, *modifiers, text_input_active),
+            _ => None,
+        })
+        .collect()
+}
+
+/// F11 toggles full screen on the viewport the key was pressed in.
+pub fn toggle_fullscreen_on_f11(ctx: &egui::Context) {
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
+        let on = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));
+    }
+}
+
 /// Side effects a pane wants the app to apply after the frame — views only
 /// read the session, so mutations are queued here.
 pub enum ViewAction {
@@ -263,14 +479,20 @@ pub enum ViewAction {
         cluster: ClusterId,
         add: bool,
     },
-    /// Waveforms ctrl+click on a channel box: pin it as the FeatureView's
-    /// first (`secondary == false`) or second channel (phy `select_channel`).
-    SelectChannel {
-        channel: u32,
-        secondary: bool,
-    },
+    /// Waveforms click on a channel box: edit the FeatureView's channel set
+    /// (Shift toggles, Ctrl sets A, Ctrl+right sets B; phy `select_channel`).
+    Channel(crate::feature_view::ChannelEdit),
     /// Open a closed pane in the tab group that asked for it.
     AddPane(Pane, TileId),
+    /// Tab-bar button, header button, `:max`: maximize this pane's tile, or
+    /// restore when it already is.
+    ToggleMaximize(TileId),
+    /// Move the pane to its own OS window.
+    PopOut(Pane),
+    /// Pop-out closed or "Bring back" clicked.
+    BringBack(Pane),
+    /// A key chord pressed in a pop-out window, run like the main window's.
+    Intent(crate::intent::Intent),
     /// phy `screenshot`: save this pane's area of the window as a PNG.
     Screenshot(Pane, egui::Rect),
     /// Proposals card: accept or reject proposal `id`.
@@ -360,6 +582,9 @@ pub struct ViewBehavior<'a, P: DataProvider> {
     pub channel_positions: &'a [[f32; 2]],
     pub waveform_cache: &'a mut WaveformCache,
     pub feature_state: &'a mut FeatureViewState,
+    /// `feature_state.link()`, taken once per frame: what the Features pane
+    /// shares with the Waveforms pane (channel set, focus, linked spikes).
+    pub feature_link: &'a crate::feature_view::FeatureLink,
     pub amplitude_state: &'a mut AmplitudeViewState,
     pub raster_cache: &'a mut RasterCache,
     pub suggest_cache: &'a mut SuggestCache,
@@ -402,6 +627,14 @@ pub struct ViewBehavior<'a, P: DataProvider> {
     pub spike_reorder: bool,
     /// Pane whose screenshot was asked for from its tab menu.
     pub screenshot: &'a mut Option<Pane>,
+    /// Maximized and popped-out panes; also records the pane under the pointer.
+    pub detached: &'a mut Detached,
+    /// Cross-view brushes (spikes, time range, hovered spike, ghost): read
+    /// the current values, write `spikes` / `time` / `*_next`.
+    pub brushes: &'a mut crate::brush::Brushes,
+    /// Set while a pop-out window draws its pane, so the pane is not replaced
+    /// by the "In its own window" placeholder there.
+    pub in_popout: bool,
     pub actions: Vec<ViewAction>,
 }
 
@@ -510,6 +743,7 @@ impl<P: DataProvider> ViewBehavior<'_, P> {
             .iter()
             .enumerate()
             .map(|(slot, &c)| TraceMarker {
+                cluster: c,
                 colour: selection_colour(slot),
                 times: session.spike_times(c),
                 channel: self.waveform_cache.peak_channel(slot),
@@ -533,6 +767,7 @@ impl<P: DataProvider> ViewBehavior<'_, P> {
             in_window.dedup();
             for c in in_window.into_iter().filter(|c| !selected.contains(c)) {
                 markers.push(TraceMarker {
+                    cluster: c,
                     colour: ui.visuals().weak_text_color(),
                     times: session.spike_times(c),
                     channel: session
@@ -559,6 +794,7 @@ impl<P: DataProvider> ViewBehavior<'_, P> {
                 &[]
             },
             self.trace.cache,
+            &mut *self.brushes,
         );
         if let Some(nav) = nav {
             let old_len = *self.trace.window_len;
@@ -592,7 +828,22 @@ impl<P: DataProvider> ViewBehavior<'_, P> {
 }
 
 impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
-    fn pane_ui(&mut self, ui: &mut Ui, _tile_id: TileId, pane: &mut Pane) -> UiResponse {
+    fn pane_ui(&mut self, ui: &mut Ui, tile_id: TileId, pane: &mut Pane) -> UiResponse {
+        if !self.in_popout {
+            if self.detached.popped.contains(pane) {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() * 0.3);
+                    ui.weak("In its own window");
+                    if ui.button("Bring back").clicked() {
+                        self.actions.push(ViewAction::BringBack(*pane));
+                    }
+                });
+                return UiResponse::None;
+            }
+            if ui.rect_contains_pointer(ui.max_rect()) {
+                self.detached.hovered = Some(tile_id);
+            }
+        }
         if *self.screenshot == Some(*pane) {
             *self.screenshot = None;
             self.actions
@@ -625,6 +876,8 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                 self.trace.shanks,
                 self.waveform_cache,
                 &mut self.view_params.waveform,
+                self.feature_link,
+                &*self.brushes,
                 &mut self.actions,
             ),
             Pane::SpikeData => {
@@ -635,6 +888,7 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                     self.spike_attrs,
                     self.jobs,
                     self.spike_reorder,
+                    &mut *self.brushes,
                 ) {
                     self.actions.push(ViewAction::Split(splits));
                 }
@@ -687,6 +941,7 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                     shanks,
                     feature,
                     self.spike_reorder,
+                    &mut *self.brushes,
                 ) {
                     Some(AmpAction::Split(splits)) => self.actions.push(ViewAction::Split(splits)),
                     Some(AmpAction::Seek(sample)) => self.actions.push(ViewAction::Seek(sample)),
@@ -694,13 +949,16 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                 }
             }
             Pane::Isi => {
-                let p = &mut self.view_params.isi;
-                scroll(ui, *pane, &mut |ui| isi_view(ui, session, selected, p));
+                let (p, brushes, jobs) = (&mut self.view_params.isi, &mut *self.brushes, self.jobs);
+                scroll(ui, *pane, &mut |ui| {
+                    isi_view(ui, session, selected, p, brushes, jobs)
+                });
             }
             Pane::Ccg => {
                 let (cache, p, jobs) = (&mut *self.ccg_cache, &mut self.view_params.ccg, self.jobs);
+                let brushes = &*self.brushes;
                 scroll(ui, *pane, &mut |ui| {
-                    correlogram_grid_view(ui, session, selected, cache, jobs, p)
+                    correlogram_grid_view(ui, session, selected, cache, jobs, p, brushes)
                 });
             }
             Pane::Features => {
@@ -720,8 +978,14 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                     cfg,
                     shanks,
                     self.spike_reorder,
+                    self.brushes,
+                    self.depths,
+                    (*self.trace.window_start, *self.trace.window_len),
                 ) {
                     self.actions.push(ViewAction::Split(splits));
+                }
+                if let Some(sample) = self.feature_state.seek.take() {
+                    self.actions.push(ViewAction::Seek(sample));
                 }
             }
             Pane::Raster => {
@@ -734,6 +998,7 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                     self.raster_cache,
                     (self.colours, self.colours_gen),
                     &mut self.scheme_delta,
+                    &mut *self.brushes,
                 ) {
                     Some(RasterClick::Seek(sample)) => self.actions.push(ViewAction::Seek(sample)),
                     Some(RasterClick::Select(c, add)) => {
@@ -752,19 +1017,36 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                     None => {}
                 }
             }
-            Pane::Rate => firing_rate_view(ui, session, selected, &mut self.view_params.rate),
-            Pane::Probe => probe_view(
+            Pane::Rate => firing_rate_view(
                 ui,
                 session,
                 selected,
-                self.channel_positions,
-                self.waveform_cache,
+                &mut self.view_params.rate,
+                &mut *self.brushes,
             ),
+            Pane::Probe => {
+                if let Some(edit) = probe_view(
+                    ui,
+                    session,
+                    selected,
+                    self.channel_positions,
+                    self.waveform_cache,
+                    self.feature_link,
+                ) {
+                    self.actions.push(ViewAction::Channel(edit));
+                }
+            }
             Pane::Similar => {
                 let hidden = &mut self.view_params.hidden_cols;
-                if let Some((cluster, add)) =
-                    similarity_view(ui, session, selected, &mut self.similar, hidden)
-                {
+                if let Some((cluster, add)) = similarity_view(
+                    ui,
+                    session,
+                    selected,
+                    &mut self.similar,
+                    hidden,
+                    self.jobs,
+                    self.brushes,
+                ) {
                     self.actions
                         .push(ViewAction::SelectSimilar { cluster, add });
                 }
@@ -774,19 +1056,20 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
             }),
             Pane::Quality => {
                 let cache = &mut *self.quality_cache;
-                let jobs = self.jobs;
+                let (jobs, brushes) = (self.jobs, &*self.brushes);
                 scroll(ui, *pane, &mut |ui| {
-                    quality_view(ui, session, selected, cache, jobs)
+                    quality_view(ui, session, selected, cache, jobs, brushes)
                 });
             }
             Pane::Suggest => {
                 self.suggest_cache.selection = selected.to_vec();
+                let brushes = &mut *self.brushes;
                 let label_str = self.label_str;
                 let jobs = self.jobs;
                 let action = egui::ScrollArea::vertical()
                     .id_salt(pane.title())
                     .show(ui, |ui| {
-                        suggest_view(ui, session, self.suggest_cache, label_str, jobs)
+                        suggest_view(ui, session, self.suggest_cache, label_str, jobs, brushes)
                     })
                     .inner;
                 if let Some(act) = action {
@@ -800,13 +1083,16 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
             }
             Pane::History => {
                 let actions = &mut self.actions;
+                let brushes = &mut *self.brushes;
                 scroll(ui, *pane, &mut |ui| {
-                    if let Some(node) = crate::history_view::history_view(ui, session) {
+                    if let Some(node) = crate::history_view::history_view(ui, session, brushes) {
                         actions.push(ViewAction::Checkout(node));
                     }
                 });
             }
-            Pane::DriftMap => drift_map_view(ui, session, selected, self.depths),
+            Pane::DriftMap => {
+                drift_map_view(ui, session, selected, self.depths, &mut *self.brushes)
+            }
             Pane::ContamTime => contamination_over_time_view(ui, session, selected),
             Pane::Psth => psth_view(
                 ui,
@@ -817,9 +1103,14 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                 self.psth_cache,
             ),
             Pane::TemplateFeatures => {
-                if let Some(splits) =
-                    template_feature_view(ui, session, selected, self.template_features, self.jobs)
-                {
+                if let Some(splits) = template_feature_view(
+                    ui,
+                    session,
+                    selected,
+                    self.template_features,
+                    self.jobs,
+                    &mut *self.brushes,
+                ) {
                     self.actions.push(ViewAction::Split(splits));
                 }
             }
@@ -942,12 +1233,23 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
 
     fn top_bar_right_ui(
         &mut self,
-        _tiles: &Tiles<Pane>,
+        tiles: &Tiles<Pane>,
         ui: &mut Ui,
         tile_id: TileId,
-        _tabs: &egui_tiles::Tabs,
+        tabs: &egui_tiles::Tabs,
         _scroll_offset: &mut f32,
     ) {
+        // Right to left: pop out, maximize, then "+".
+        if let Some((active, Tile::Pane(pane))) =
+            tabs.active.and_then(|a| tiles.get(a).map(|t| (a, t)))
+        {
+            if icon_button(ui, "pop out pane", true).clicked() {
+                self.actions.push(ViewAction::PopOut(*pane));
+            }
+            if icon_button(ui, "maximize pane", false).clicked() {
+                self.actions.push(ViewAction::ToggleMaximize(active));
+            }
+        }
         if self.closed.is_empty() {
             return;
         }
@@ -1004,6 +1306,60 @@ mod tests {
         add_pane(&mut tree, Pane::Trace, None);
         assert!(tree.root().is_some());
         assert_eq!(missing_panes(&tree).len(), Pane::ALL.len() - 1);
+    }
+
+    #[test]
+    fn maximize_and_pop_out_transitions() {
+        let mut tree = default_tree();
+        let mut d = Detached::default();
+        let features = tree.tiles.find_pane(&Pane::Features).unwrap();
+        // No hovered pane yet: the target is Features, and it toggles.
+        d.toggle_maximize_target(&tree);
+        assert_eq!(d.maximized, Some(features));
+        d.toggle_maximize_target(&tree);
+        assert_eq!(d.maximized, None);
+        // Popping out the maximized pane restores the tree first.
+        d.toggle_maximize(&tree, features);
+        d.pop_out(&tree, Pane::Features);
+        assert_eq!((d.maximized, &d.popped[..]), (None, &[Pane::Features][..]));
+        // A popped pane cannot be maximized, and popping twice is a no-op.
+        d.toggle_maximize(&tree, features);
+        d.pop_out(&tree, Pane::Features);
+        assert_eq!((d.maximized, d.popped.len()), (None, 1));
+        d.bring_back(Pane::Features);
+        assert!(d.popped.is_empty());
+        // Closing a tab drops its pop-out and maximize state.
+        d.pop_out(&tree, Pane::Ccg);
+        d.toggle_maximize(&tree, features);
+        tree.remove_recursively(tree.tiles.find_pane(&Pane::Ccg).unwrap());
+        tree.remove_recursively(features);
+        d.prune(&tree);
+        assert!(d.popped.is_empty() && d.maximized.is_none());
+    }
+
+    #[test]
+    fn key_intents_route_chords_and_ignore_releases_and_typing() {
+        use crate::intent::Intent;
+        let key = |key, pressed, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        };
+        let none = egui::Modifiers::NONE;
+        let events = [
+            key(egui::Key::K, true, none),
+            key(egui::Key::K, false, none),
+            key(egui::Key::Escape, true, none),
+            egui::Event::Text("k".into()),
+        ];
+        assert_eq!(
+            key_intents(&events, false),
+            vec![Intent::Split, Intent::Cancel]
+        );
+        // Typing in a text field: plain K is dropped, Esc still cancels.
+        assert_eq!(key_intents(&events, true), vec![Intent::Cancel]);
     }
 
     #[test]

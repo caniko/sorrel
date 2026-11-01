@@ -1,7 +1,7 @@
 use crate::amplitude_view::AmplitudeViewState;
 use crate::cluster_view::{cluster_table, ClusterRows, ClusterTableState, RowInputs, TableCtx};
 use crate::feature_view::FeatureViewState;
-use crate::intent::{from_key_in_context, Intent, MoveTarget};
+use crate::intent::{Intent, MoveTarget};
 use crate::jobs::{read, write, Job, JobCtx};
 use crate::layout::{self, Pane, TraceControls, ViewAction, ViewBehavior};
 use crate::prefs::UiPrefs;
@@ -198,6 +198,10 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     /// Dockable view layout — every view is a tile the user can drag,
     /// split, close and reopen.
     tree: egui_tiles::Tree<Pane>,
+    /// Maximized pane and pop-out windows (not persisted).
+    detached: layout::Detached,
+    /// Cross-view brushes (spike set, time range, hover, ghost).
+    brushes: crate::brush::Brushes,
     /// Probe geometry — set by the binary when the backend exposes it.
     /// Empty means the WaveformView falls back to single-channel layout.
     channel_positions: Vec<[f32; 2]>,
@@ -367,6 +371,8 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             status: None,
             trace_cfg: TracePreproc::Off,
             tree: layout::default_tree(),
+            detached: Default::default(),
+            brushes: Default::default(),
             channel_positions: Vec::new(),
             view_params: Default::default(),
             channel_shanks: Vec::new(),
@@ -1024,6 +1030,8 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 self.window_start = sample.min(max);
             }
             Snippet::KMeans(k) => self.feature_state.request_kmeans(k),
+            Snippet::Maximize => self.detached.toggle_maximize_target(&self.tree),
+            Snippet::PopOut => self.detached.pop_out_target(&self.tree),
             Snippet::RateBins(n) => self.view_params.rate.n_bins = n,
             Snippet::RateBinSize(secs) => {
                 let s = read(&self.session);
@@ -1362,6 +1370,11 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 "drag a tab",
                 "rearrange views · × closes · View menu reopens",
             ),
+            (
+                "tab-bar maximize · pop-out buttons",
+                "fill the window with one view · move it to its own window",
+            ),
+            ("F11", "full screen for the window it is pressed in"),
         ]
         .map(|(k, v)| (k.to_string(), v))
         .to_vec();
@@ -1620,9 +1633,14 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 } else if self.feature_state.lasso_active() {
                     self.feature_state.cancel_lasso();
                     self.status = toast("lasso cancelled");
+                } else if self.brushes.cancel() {
+                    self.status = toast("brush cleared");
+                } else if self.detached.maximized.take().is_some() {
+                    // Lowest priority: a dialog or lasso consumes Esc first.
                 }
             }
             Intent::ToggleHelp => self.show_help = !self.show_help,
+            Intent::ToggleMaximize => self.detached.toggle_maximize_target(&self.tree),
             Intent::SplitInit => {
                 let cmds: Vec<CurationCommand> = {
                     let s = read(&self.session);
@@ -1766,6 +1784,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             ui.separator();
             ui.label(format!("{} selected", self.selection.len()));
             ui.separator();
+            crate::brush::chips(ui, &mut self.brushes);
 
             let undo_tip = undo
                 .as_ref()
@@ -1962,6 +1981,12 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
 
     fn apply_view_action(&mut self, action: ViewAction) {
         match action {
+            // A pop-out's keys, with the same modal rule as the main window.
+            ViewAction::Intent(it) => {
+                if self.pending_confirm.is_none() || matches!(it, Intent::Cancel) {
+                    self.dispatch_intent(it);
+                }
+            }
             ViewAction::Seek(sample) => {
                 let max = read(&self.session)
                     .provider
@@ -1979,10 +2004,11 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     self.selection.set_similar(&[cluster]);
                 }
             }
-            ViewAction::SelectChannel { channel, secondary } => {
-                self.feature_state.select_channel(channel, secondary);
-            }
+            ViewAction::Channel(edit) => self.feature_state.edit_channels(edit),
             ViewAction::AddPane(pane, into) => layout::add_pane(&mut self.tree, pane, Some(into)),
+            ViewAction::ToggleMaximize(tile) => self.detached.toggle_maximize(&self.tree, tile),
+            ViewAction::PopOut(pane) => self.detached.pop_out(&self.tree, pane),
+            ViewAction::BringBack(pane) => self.detached.bring_back(pane),
             ViewAction::Screenshot(pane, rect) => self.pending_screenshots.push((pane, rect)),
             ViewAction::Decide { id, accept } => self.decide_proposal(id, accept),
             ViewAction::Checkout(node) => {
@@ -2194,20 +2220,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
         }
 
         let text_input_active = ctx.egui_wants_keyboard_input();
-        let input_intents: Vec<Intent> = ctx.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|ev| match ev {
-                    egui::Event::Key {
-                        key,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => from_key_in_context(*key, *modifiers, text_input_active),
-                    _ => None,
-                })
-                .collect()
-        });
+        let input_intents = ctx.input(|i| layout::key_intents(&i.events, text_input_active));
         let dialog_open = self.pending_confirm.is_some();
         for it in input_intents {
             if dialog_open && !matches!(it, Intent::Cancel) {
@@ -2388,6 +2401,8 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                     self.scheme_colours = Some((scheme_key, self.scheme_gen, colours));
                 }
                 let (_, colours_gen, colours) = self.scheme_colours.as_ref().expect("just built");
+                self.brushes.sync(session.version());
+                let feature_link = self.feature_state.link();
                 let mut behavior = ViewBehavior {
                     session: &session,
                     selection: &selected,
@@ -2396,6 +2411,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                     channel_positions: &self.channel_positions,
                     waveform_cache: &mut self.waveform_cache,
                     feature_state: &mut self.feature_state,
+                    feature_link: &feature_link,
                     amplitude_state: &mut self.amplitude_state,
                     cluster_scatter: &mut self.cluster_scatter,
                     template_features: &mut self.template_features,
@@ -2437,9 +2453,19 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                     },
                     closed,
                     active_tabs,
+                    detached: &mut self.detached,
+                    brushes: &mut self.brushes,
+                    in_popout: false,
                     actions: Vec::new(),
                 };
-                self.tree.ui(&mut behavior, ui);
+                layout::show_tiles(&mut self.tree, &mut behavior, ui);
+                let dataset = self.save_dir.as_deref().map(|p| p.display().to_string());
+                layout::show_popouts(
+                    &ctx,
+                    &self.tree,
+                    dataset.as_deref().unwrap_or_default(),
+                    &mut behavior,
+                );
                 (behavior.actions, behavior.scheme_delta)
             };
             let (actions, scheme_delta) = actions;
@@ -2449,6 +2475,10 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
             }
             for action in actions {
                 self.apply_view_action(action);
+            }
+            self.detached.prune(&self.tree);
+            if self.brushes.end_frame() {
+                ctx.request_repaint();
             }
         });
     }

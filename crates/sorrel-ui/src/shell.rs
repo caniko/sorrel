@@ -90,6 +90,7 @@ impl Shell {
             TracePipeline::install(rs);
             RasterPipeline::install(rs);
             ScatterPipeline::install(rs);
+            crate::wgpu_scene3d::Scene3dPipeline::install(rs);
         }
         let recents = cc
             .storage
@@ -192,6 +193,7 @@ impl Shell {
     /// consuming them here keeps the active tab from seeing them.
     fn shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, Modifiers};
+        crate::layout::toggle_fullscreen_on_f11(ctx);
         let (open, close, next, prev) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::COMMAND, Key::O),

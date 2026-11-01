@@ -3,11 +3,106 @@
 //! The same table as the ClusterView ([`cluster_table`]) restricted to the
 //! ranked list, with a `similarity` column sorted best-first by default.
 
+use crate::brush::{Brushes, Ghost};
 use crate::cluster_view::{cluster_table, ClusterRows, ClusterTableState, RowClick, TableCtx};
+use crate::jobs::{JobCtx, Memo};
 use crate::theme::{selection_colour, Theme};
 use egui::Ui;
-use sorrel_data::Session;
+use sorrel_data::{preview_merge, Session};
 use sorrel_io::{ClusterId, DataProvider};
+use std::collections::HashMap;
+
+/// What merging one candidate into the target does to the target's quality
+/// (`preview_merge` deltas).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MergeTip {
+    pub composite: f32,
+    pub contamination: f32,
+    pub warns: bool,
+}
+
+impl MergeTip {
+    /// "composite +0.04\ncontamination +0.8 %" (contamination is a fraction).
+    pub(crate) fn text(&self) -> String {
+        format!(
+            "composite {:+.2}\ncontamination {:+.1} %",
+            self.composite,
+            self.contamination * 100.0
+        )
+    }
+}
+
+/// Merge previews per hovered candidate row, one [`Memo`] each keyed by
+/// (session version, target), so a row is computed once and not per frame.
+#[derive(Default)]
+pub struct MergeTips(HashMap<ClusterId, Memo<(u64, ClusterId), MergeTip>>);
+
+impl MergeTips {
+    /// A row for candidate `c` is hovered: ghost it and show what merging it
+    /// into `target` would do, in the warn colour when it looks risky.
+    pub(crate) fn hover<P: DataProvider>(
+        &mut self,
+        ui: &Ui,
+        jobs: &JobCtx<Session<P>>,
+        version: u64,
+        target: ClusterId,
+        c: ClusterId,
+        brushes: &mut Brushes,
+    ) {
+        if c == target {
+            return;
+        }
+        brushes.ghost_next = Some(Ghost::Merge(c));
+        let tip = self
+            .0
+            .entry(c)
+            .or_default()
+            .ensure(
+                (version, target),
+                &jobs.session,
+                jobs.repaint(),
+                move |s, _| {
+                    let p = preview_merge(s, &[c], target);
+                    MergeTip {
+                        composite: p.composite_delta(),
+                        contamination: p.contamination_delta(),
+                        warns: p.warns(),
+                    }
+                },
+            )
+            .copied();
+        let theme = Theme::from_ui(ui);
+        let (body, colour) = match tip {
+            Some(t) => (t.text(), if t.warns { theme.warn } else { theme.text }),
+            None => ("computing…".to_owned(), theme.caption),
+        };
+        egui::Tooltip::always_open(
+            ui.ctx().clone(),
+            ui.layer_id(),
+            egui::Id::new("merge_tip"),
+            egui::PopupAnchor::Pointer,
+        )
+        .show(|ui| {
+            ui.colored_label(colour, format!("merge c{c} into c{target}: {body}"));
+        });
+    }
+}
+
+/// The candidate to ghost for a Suggest merge row `(a, b)`: the one that
+/// isn't selected, merged into the first selected cluster. `None` unless
+/// exactly one of the pair is selected.
+pub(crate) fn ghost_pair(
+    sel: &[ClusterId],
+    a: ClusterId,
+    b: ClusterId,
+) -> Option<(ClusterId, ClusterId)> {
+    let target = *sel.first()?;
+    match (sel.contains(&a), sel.contains(&b)) {
+        (true, false) => Some((target, b)),
+        (false, true) => Some((target, a)),
+        _ => None,
+    }
+}
 
 /// Similarity list memo and the table state of the Similar pane.
 pub struct SimilarityState {
@@ -18,6 +113,7 @@ pub struct SimilarityState {
     /// Key the table was last drawn for, so `visible` is trusted only
     /// while it belongs to the current scores.
     drawn: Option<(Vec<ClusterId>, u64)>,
+    tips: MergeTips,
 }
 
 impl Default for SimilarityState {
@@ -27,6 +123,7 @@ impl Default for SimilarityState {
             scores: Vec::new(),
             table: ClusterTableState::similarity(),
             drawn: None,
+            tips: MergeTips::default(),
         }
     }
 }
@@ -78,6 +175,8 @@ pub fn similarity_view<P: DataProvider>(
     selected: &[ClusterId],
     pane: &mut SimilarityPane,
     hidden: &mut Vec<String>,
+    jobs: &JobCtx<Session<P>>,
+    brushes: &mut Brushes,
 ) -> Option<(ClusterId, bool)> {
     let theme = Theme::from_ui(ui);
     let Some(&reference) = pane.best.last() else {
@@ -99,8 +198,10 @@ pub fn similarity_view<P: DataProvider>(
         ui.colored_label(selection_colour(slot), "■");
         ui.heading(format!("Most similar to cluster {reference}"));
     });
-    ui.weak("click: compare · Ctrl+click: add")
-        .on_hover_text("click a row to compare · Cmd/Ctrl-click to add to the selection");
+    ui.weak("click: compare · Ctrl+click: add").on_hover_text(
+        "click a row to compare · Cmd/Ctrl-click to add to the selection · \
+             hover: ghosts it in Features, Waveforms and CCG, with the merge preview",
+    );
     ui.separator();
     let click = cluster_table(
         ui,
@@ -116,9 +217,42 @@ pub fn similarity_view<P: DataProvider>(
         },
     );
     pane.state.drawn = pane.state.key.clone();
+    // Hovering a row ghosts that cluster as a merge into the first selected one.
+    if let (Some(c), Some(&target)) = (pane.state.table.hovered, selected.first()) {
+        pane.state
+            .tips
+            .hover(ui, jobs, session.version(), target, c, brushes);
+    }
     match click? {
         RowClick::Toggle(c) => Some((c, true)),
         // Shift-click has no range meaning here; treat it as a plain pick.
         RowClick::Replace(c) | RowClick::Extend(c) => Some((c, false)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ghost_pair_is_the_unselected_one_into_the_first_selected() {
+        let c = ClusterId;
+        let sel = [c(3), c(8)];
+        assert_eq!(ghost_pair(&sel, c(8), c(5)), Some((c(3), c(5))));
+        assert_eq!(ghost_pair(&sel, c(5), c(3)), Some((c(3), c(5))));
+        // Both selected, or neither: nothing to preview.
+        assert_eq!(ghost_pair(&sel, c(3), c(8)), None);
+        assert_eq!(ghost_pair(&sel, c(1), c(2)), None);
+        assert_eq!(ghost_pair(&[], c(1), c(2)), None);
+    }
+
+    #[test]
+    fn tip_text_reads_deltas() {
+        let t = MergeTip {
+            composite: 0.04,
+            contamination: 0.008,
+            warns: false,
+        };
+        assert_eq!(t.text(), "composite +0.04\ncontamination +0.8 %");
     }
 }
