@@ -2410,6 +2410,7 @@ pub fn drift_map_view<P: DataProvider>(
         }
     };
     let (y_unit, y_name) = match depths.map(|d| d.source) {
+        Some(DepthSource::SpikePositions) => (" µm", "depth (spike_positions.npy)"),
         Some(DepthSource::PcWeighted) => (" µm", "depth (PC-weighted)"),
         Some(DepthSource::TemplatePeak) => (" µm", "depth (template peak)"),
         None => (" amp", "amplitude"),

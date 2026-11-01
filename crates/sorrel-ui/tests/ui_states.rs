@@ -34,6 +34,9 @@ type App = SorrelApp<KilosortProvider>;
 fn no_gpu() -> bool {
     static ERR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let err = ERR.get_or_init(|| {
+        // Every History row reads 15:06:40 UTC (read when a session opens;
+        // set here, before any test builds one).
+        std::env::set_var("SORREL_FIXED_CLOCK_MS", "1793200000000");
         if let Some(icd) = std::env::var_os("SORREL_LAVAPIPE_ICD") {
             std::env::set_var("VK_DRIVER_FILES", &icd);
             std::env::set_var("VK_ICD_FILENAMES", &icd);
@@ -2333,8 +2336,7 @@ fn xtalk_features_ghost() {
 }
 
 /// `snap` with the pointer kept at `at` (the state under test is a hover).
-/// `slack` pixels may differ: the History row prints the edit's wall-clock
-/// time, which no fixture can pin.
+/// `slack` pixels may differ.
 fn snap_hovered(
     h: &mut Harness<'static, App>,
     state: &str,
@@ -2391,10 +2393,7 @@ fn xtalk_history_ghost() {
             h.state().brushes().ghost
         );
         h.get_by_label_contains("before #");
-        // The History row prints the edit's wall-clock time (HH:MM:SS), which
-        // no fixture pins: up to ~1.4k pixels of glyphs change between runs.
-        // The ghost itself is asserted above through the brush state.
-        snap_hovered(&mut h, "xtalk_history_ghost", name, at, 2500);
+        snap_hovered(&mut h, "xtalk_history_ghost", name, at, 0);
         h
     });
 }
@@ -2525,6 +2524,90 @@ fn xtalk_brush_cleared_with_the_selection() {
             h.state().brushes().spikes.is_none(),
             "no selection, no Features brush"
         );
+        h
+    });
+}
+
+#[test]
+fn xtalk_merge_hulls() {
+    if no_gpu() {
+        return;
+    }
+    // Cross-talk: a merged unit shows its sources as dashed "before merge"
+    // hulls in the Features 3-D view without hovering its History row.
+    each_theme(|theme, name| {
+        let mut h = wide_fixture(&format!("xtalk-mhulls-{name}"), theme);
+        h.key_press(egui::Key::ArrowDown);
+        settle(&mut h);
+        h.get_all_by_label("1")
+            .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+            .expect("cluster 1 row")
+            .click_modifiers(egui::Modifiers::COMMAND);
+        settle(&mut h);
+        // G merges c0 and c1; the merged unit stays selected.
+        h.key_press(egui::Key::G);
+        settle(&mut h);
+        click_tab(&mut h, "Features");
+        h.get_by_label("3D").click();
+        settle(&mut h);
+        h.get_by_label("feature 3d canvas");
+        assert!(
+            h.state().brushes().ghost.is_none(),
+            "no hover drives the hulls"
+        );
+        h.get_by_label_contains("before merge (c");
+        snap(&mut h, "xtalk_merge_hulls", name);
+        h
+    });
+}
+
+#[test]
+fn xtalk_3d_positions() {
+    if no_gpu() {
+        return;
+    }
+    // A Kilosort 4 `spike_positions.npy` gives Features 3-D an x axis next to
+    // depth: pick a ranked triple holding both and snapshot it.
+    each_theme(|theme, name| {
+        let root = dataset(&format!("xtalk-3d-positions-{name}"), 3);
+        let clusters = npy::read_1d_u32(&root.join("spike_clusters.npy")).unwrap();
+        // Units sit on a diagonal of the probe plane, with a deterministic jitter.
+        let xy: Vec<f32> = clusters
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &u)| {
+                let jitter = |k: usize| ((i * k) % 11) as f32 - 5.0;
+                [30.0 * u as f32 + jitter(7), 60.0 * u as f32 + jitter(13)]
+            })
+            .collect();
+        npy::write_f32_atomic(&root.join("spike_positions.npy"), &[clusters.len(), 2], &xy)
+            .unwrap();
+        let mut h = harness_sized(theme, [2200.0, 1100.0], move || {
+            let (session, positions) = open(&root);
+            let mut app = SorrelApp::new(session, label_str);
+            configure(&mut app, &root, positions);
+            app
+        });
+        settle(&mut h);
+        select_two_and_open_features(&mut h);
+        h.get_by_label("3D").click();
+        settle(&mut h);
+        h.get_by_label("feature 3d canvas");
+        // Entering 3-D pins the focused plot's pair; unpin to list every triple.
+        h.get_by_label("pin focused plot").click();
+        settle(&mut h);
+        let row = h
+            .get_all_by_label_contains("axes ")
+            .find(|n| {
+                n.accesskit_node().label().is_some_and(|l| {
+                    let dims: Vec<_> = l.trim_start_matches("axes ").split(" · ").collect();
+                    dims.contains(&"depth") && dims.contains(&"x")
+                })
+            })
+            .expect("a triple with depth and x");
+        row.click_accesskit();
+        settle(&mut h);
+        snap(&mut h, "xtalk_3d_positions", name);
         h
     });
 }

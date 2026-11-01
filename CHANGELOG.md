@@ -16,6 +16,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **Features 3D.** A GPU view with an orbit camera.
   - **Axis triples:** the triples of the channel set's dimensions (time, PCs and spike depth) are ranked by silhouette, and the focused 2D plot's two axes can be pinned.
   - **Hulls:** each cluster gets a hull, styled by whether the sorter or Sorrel made it. Split children show their parent's hull from before the split, and the lasso shows as a prism.
+  - **Pre-merge hulls:** a merged unit shows its sources as grey dashed hulls (legend "before merge (c1 + c2)") without hovering its History row.
+- **Kilosort 4 spike positions.** `spike_positions.npy` is read when present (finite, one row per spike, else ignored with a warning). Its y is the best per-spike depth for the Drift map, and its x joins depth in the Features 3D triples.
 - **Pane controls.** Any pane can be maximized (button, `Ctrl+Shift+M`, `:max`) or popped out into its own window (button, `:pop`). `F11` toggles full screen.
 - **Waveforms ↔ Features.**
   - **Channels:** Shift-click a Waveforms box or a Probe site to edit the Features channel set; Ctrl-click and Ctrl-right-click set channels A and B. The grid's A and B follow the best-separating pair.
