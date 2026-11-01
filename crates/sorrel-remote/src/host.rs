@@ -433,3 +433,23 @@ pub fn share(served: Box<dyn Served>, root: PathBuf, dat: DatSource, mode: Mode)
         Ok(())
     })
 }
+
+#[cfg(test)]
+mod tests {
+    /// piying finds remote handlers in a `linkme` slice. A linker that garbage-
+    /// collects the registrations (GNU ld on x86_64-pc-windows-gnu without
+    /// `--no-gc-sections`) leaves it empty, and the guest's first message fails
+    /// with "unknown message 'sorrel/hello/1'". The Windows smoke runs the real
+    /// share/join; this is the same check for a cross-built test binary (wine).
+    #[test]
+    fn hello_is_registered_with_piying() {
+        use piying::remote::_internal::REMOTE_MESSAGES;
+        assert!(
+            REMOTE_MESSAGES
+                .iter()
+                .any(|(id, _)| id.message_remote_id == "sorrel/hello/1"),
+            "{} remote messages registered",
+            REMOTE_MESSAGES.len()
+        );
+    }
+}
