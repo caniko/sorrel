@@ -173,6 +173,11 @@ pub struct Session<P: DataProvider> {
     /// durable and before the in-memory state moves. Used to stream records
     /// to a remote host; `None` for ordinary local sessions.
     record_sink: Option<RecordSink>,
+    /// Test-only clock: `SORREL_FIXED_CLOCK_MS`, read once by
+    /// [`Session::new`], is the `ts_ms` of every node this session appends
+    /// (instead of the wall clock), so History rows and UI snapshots are
+    /// reproducible. `None` (the variable unset or not a number) = real time.
+    fixed_clock_ms: Option<u64>,
     /// Test seam: make every forward apply fail.
     #[cfg(test)]
     fail_apply: bool,
@@ -213,6 +218,9 @@ impl<P: DataProvider> Session<P> {
             top_artifacts: None,
             cache_invalidations: VecDeque::new(),
             record_sink: None,
+            fixed_clock_ms: std::env::var("SORREL_FIXED_CLOCK_MS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
             #[cfg(test)]
             fail_apply: false,
         }
@@ -1011,6 +1019,26 @@ impl<P: DataProvider> Session<P> {
         (!out.is_empty()).then_some(out)
     }
 
+    /// The latest node on the head's path that merged into `cluster` (as the
+    /// target, alone or inside a batch): feed it to [`Self::pre_edit_spikes`]
+    /// for the clusters as they were before the merge. `None` when no merge
+    /// on the path targets it.
+    pub fn last_merge_into(&self, cluster: ClusterId) -> Option<u64> {
+        fn hits(cmd: &CurationCommand, c: ClusterId) -> bool {
+            match cmd {
+                CurationCommand::Merge { sources, target } => {
+                    *target == c && sources.iter().any(|s| s != target)
+                }
+                CurationCommand::Batch { children } => children.iter().any(|k| hits(k, c)),
+                _ => false,
+            }
+        }
+        self.path(self.head)
+            .into_iter()
+            .rev()
+            .find(|&n| hits(&self.nodes[n as usize].cmd, cluster))
+    }
+
     /// Whether [`Self::pre_edit_spikes`] has an answer for `node`, without
     /// copying any membership (the History hover asks every frame).
     pub fn has_pre_edit(&self, node: u64) -> bool {
@@ -1270,9 +1298,11 @@ impl<P: DataProvider> Session<P> {
             id,
             parent: self.head,
             actor,
-            ts_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis() as u64),
+            ts_ms: self.fixed_clock_ms.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64)
+            }),
             cmd,
         };
         self.journal.append(&rec)?;
@@ -3028,5 +3058,36 @@ mod tests {
         for n in [batch, merge, 999] {
             assert_eq!(s.has_pre_edit(n), s.pre_edit_spikes(n).is_some());
         }
+    }
+
+    #[test]
+    fn last_merge_into_finds_the_latest_on_path_merge_targeting_the_cluster() {
+        let (mut s, _d) = fresh_session();
+        let (a, b, c) = (ClusterId(0), ClusterId(1), ClusterId(2));
+        let merge = |sources, target| CurationCommand::Merge { sources, target };
+        assert_eq!(s.last_merge_into(b), None);
+        s.dispatch(merge(vec![a], b)).unwrap();
+        let first = s.head().unwrap();
+        assert_eq!(s.last_merge_into(b), Some(first));
+        // A source or an untouched cluster was not merged into.
+        assert_eq!((s.last_merge_into(a), s.last_merge_into(c)), (None, None));
+        // The latest merge wins, also inside a batch.
+        s.dispatch(CurationCommand::Batch {
+            children: vec![
+                CurationCommand::Relabel {
+                    cluster: c,
+                    op: PhyLabelOp::SetGood,
+                },
+                merge(vec![c], b),
+            ],
+        })
+        .unwrap();
+        let second = s.head().unwrap();
+        assert_eq!(s.last_merge_into(b), Some(second));
+        // Undone merges are off the path.
+        s.dispatch(CurationCommand::Undo).unwrap();
+        assert_eq!(s.last_merge_into(b), Some(first));
+        s.dispatch(CurationCommand::Undo).unwrap();
+        assert_eq!(s.last_merge_into(b), None);
     }
 }
