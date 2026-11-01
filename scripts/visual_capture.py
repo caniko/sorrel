@@ -158,6 +158,9 @@ def app_environment(display: str, runtime_dir: str) -> dict[str, str]:
     environment.pop("WAYLAND_DISPLAY", None)
     environment["DISPLAY"] = display
     environment["XDG_RUNTIME_DIR"] = runtime_dir
+    # eframe saves app.ron (recents, window, egui memory) on exit: keep the
+    # capture's state out of the user's real ~/.local/share/sorrel.
+    environment["XDG_DATA_HOME"] = str(Path(runtime_dir) / "data")
     environment["WINIT_UNIX_BACKEND"] = "x11"
     environment["WGPU_BACKEND"] = "vulkan"
     environment["LIBGL_ALWAYS_SOFTWARE"] = "1"

@@ -2349,6 +2349,9 @@ fn snap_hovered(
     h.run_ok();
     h.hover_at(at);
     h.run_ok();
+    if let Some(dir) = std::env::var_os("SORREL_DESIGN_DIR") {
+        design::dump(h, Path::new(&dir), state, theme);
+    }
     h.snapshot_options(
         format!("{state}_{theme}"),
         &egui_kittest::SnapshotOptions::new().failed_pixel_count_threshold(slack),
