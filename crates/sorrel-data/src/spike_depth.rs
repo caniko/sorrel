@@ -74,7 +74,10 @@ where
     let y = |ch: u32| positions.get(ch as usize).map(|p| p[1]).unwrap_or(0.0);
     let (n_pcs, n_ch_tpl) = session.pc_shape();
     let pc_ind = session.provider.pc_feature_ind();
-    let has_pcs = n_pcs > 0 && n_ch_tpl > 0 && !pc_ind.is_empty();
+    // The PC and template estimates need channel geometry: without it every
+    // channel would read depth 0, so a spike with no position stays NaN.
+    let geometry = !positions.is_empty();
+    let has_pcs = geometry && n_pcs > 0 && n_ch_tpl > 0 && !pc_ind.is_empty();
 
     // Template peak-channel depth, computed once per template on demand.
     let (n_templates, n_samples, n_chan) = session.template_shape();
@@ -115,7 +118,17 @@ where
         let template = session.spike_templates(c).get(local).copied();
         // `rows[g]` is the spike's original NPY row, the index into
         // `spike_positions`; rows added by `add_spikes` lie past its end.
-        let from_sp = spike_xy.and_then(|xy| xy.get(rows.get(g)?.get()? as usize).copied());
+        // An added spike lies past the file's rows; the generic `positions`
+        // spike attribute (the same file) holds what the rescue predicted.
+        let from_sp = spike_xy
+            .and_then(|xy| xy.get(rows.get(g)?.get()? as usize).copied())
+            .or_else(|| {
+                let a = session
+                    .cluster_index()
+                    .spike_attribute("positions", g as u32)?;
+                Some([*a.first()?, *a.get(1)?])
+            })
+            .filter(|p| p.iter().all(|v| v.is_finite()));
         any_sp |= from_sp.is_some();
         let from_pc = if has_pcs {
             template.and_then(|t| {
@@ -130,7 +143,7 @@ where
         let d = from_sp
             .map(|p| p[1])
             .or(from_pc)
-            .or_else(|| template.and_then(&mut template_depth))
+            .or_else(|| template.filter(|_| geometry).and_then(&mut template_depth))
             .unwrap_or(f32::NAN);
         if d.is_finite() {
             min = min.min(d);

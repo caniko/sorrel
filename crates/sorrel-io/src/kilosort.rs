@@ -976,8 +976,10 @@ fn read_optional_pc_features(view: &RootView, n_spikes: usize) -> Result<PcFeatu
 }
 
 /// Kilosort 4 `spike_positions.npy`: `(n_spikes, 2)` `[x, y]` µm. A missing
-/// file is silent; an unreadable, mis-sized or non-finite one is ignored with
-/// a warning (depth then falls back to the PCs or templates).
+/// file is silent; an unreadable or mis-sized one is ignored with a warning
+/// (depth then falls back to the PCs or templates). Non-finite rows are kept:
+/// a save after a rescue writes NaN for the added spikes, which have no
+/// position, and depth falls back per spike.
 fn read_spike_positions(path: &Path, n_spikes: usize) -> Option<Vec<[f32; 2]>> {
     if !path.exists() {
         return None;
@@ -985,9 +987,9 @@ fn read_spike_positions(path: &Path, n_spikes: usize) -> Option<Vec<[f32; 2]>> {
     let (flat, (rows, cols)) = read_2d_f32(path)
         .map_err(|e| log::warn!("{}: {e}", path.display()))
         .ok()?;
-    if rows != n_spikes || cols != 2 || !flat.iter().all(|v| v.is_finite()) {
+    if rows != n_spikes || cols != 2 || !flat.iter().any(|v| v.is_finite()) {
         log::warn!(
-            "{}: need finite ({n_spikes}, 2) values, got ({rows}, {cols}); ignored",
+            "{}: need ({n_spikes}, 2) values with some finite, got ({rows}, {cols}); ignored",
             path.display()
         );
         return None;

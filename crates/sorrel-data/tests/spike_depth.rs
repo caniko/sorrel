@@ -14,6 +14,9 @@ struct Stub {
     spikes: Vec<Vec<SampleIndex>>,
     rows: Vec<Vec<u32>>,
     xy: Option<Vec<[f32; 2]>>,
+    /// Channel geometry; empty for a Kilosort directory without
+    /// `channel_positions.npy`.
+    geometry: Vec<[f32; 2]>,
 }
 
 fn stub(with_positions: bool) -> Stub {
@@ -30,6 +33,7 @@ fn stub(with_positions: bool) -> Stub {
                 .map(|g| [10.0 * g as f32, 1000.0 + g as f32])
                 .collect()
         }),
+        geometry: vec![[0.0, 0.0]],
     }
 }
 
@@ -68,7 +72,7 @@ impl ApplyPhyLabel for Stub {
 }
 impl HasGeometry for Stub {
     fn channel_positions(&self) -> &[[f32; 2]] {
-        &[[0.0, 0.0]]
+        &self.geometry
     }
 }
 impl HasPcFeatures for Stub {
@@ -90,9 +94,13 @@ impl HasPcFeatures for Stub {
 }
 
 fn session(with_positions: bool) -> Session<Stub> {
+    session_of(stub(with_positions))
+}
+
+fn session_of(stub: Stub) -> Session<Stub> {
     let dir = tempfile::tempdir().unwrap();
     let journal = Journal::open_or_create(&dir.path().join("j.journal"), 0, 3).unwrap();
-    let mut s = Session::new(stub(with_positions), journal);
+    let mut s = Session::new(stub, journal);
     s.seed_pc_features();
     s
 }
@@ -116,4 +124,23 @@ fn spike_positions_are_the_best_depth_and_map_to_cluster_and_local() {
 fn without_positions_nothing_is_invented() {
     // No PCs, templates or positions: no depth source at all.
     assert!(spike_depths(&session(false)).is_none());
+}
+
+#[test]
+fn a_spike_without_a_position_is_nan_not_depth_zero() {
+    // Row 3 (cluster 2's only spike) has no position: NaN, as a save after a
+    // rescue writes for added spikes. With no channel geometry there is no
+    // PC or template estimate either, so it stays NaN rather than reading 0.
+    let mut st = stub(true);
+    st.xy.as_mut().unwrap()[3] = [f32::NAN; 2];
+    st.geometry.clear();
+    let d = spike_depths(&session_of(st)).unwrap();
+    assert_eq!(d.source, DepthSource::SpikePositions);
+    assert!(d.per_cluster[2][0].is_nan(), "{:?}", d.per_cluster[2]);
+    assert!(d.x.as_ref().unwrap()[2][0].is_nan());
+    assert_eq!(
+        (d.min, d.max),
+        (1000.0, 1005.0),
+        "the NaN spike sets no bound"
+    );
 }

@@ -238,6 +238,54 @@ fn save_and_reseal_rewrites_every_array_aligned() {
 }
 
 #[test]
+fn spike_positions_survive_a_save_with_added_spikes() {
+    // Kilosort 4's spike_positions.npy is the generic `positions` spike
+    // attribute: a rescue supplies the added spikes' rows and the save keeps
+    // the file aligned.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_fixture(root);
+    let xy: Vec<f32> = (0..6).flat_map(|i| [i as f32, 100. + i as f32]).collect();
+    write_npy(
+        &root.join("spike_positions.npy"),
+        "<f4",
+        &[6, 2],
+        &f32s(&xy),
+    );
+    let mut s = open(root);
+    s.dispatch(CurationCommand::AddSpikes(SpikeBatch {
+        times: vec![40, 100],
+        clusters: vec![ClusterId(1), ClusterId(2)],
+        templates: vec![1, 1],
+        amplitudes: vec![9., 8.],
+        pc_features: vec![900., 901., 910., 911.],
+        template_features: vec![7., 7.5, 8., 8.5],
+        attributes: vec![
+            ("depth".into(), 1, vec![500., 501.]),
+            ("positions".into(), 2, vec![40., 140., 41., 141.]),
+        ],
+    }))
+    .unwrap();
+    save_and_seal(&mut s, root, label_str).unwrap();
+    let (pos, shape) = read_npy_f32_flat(&root.join("spike_positions.npy")).unwrap();
+    assert_eq!(shape, [8, 2]);
+    assert_eq!(&pos[0..4], [0., 100., 1., 101.]);
+    assert_eq!(&pos[4..6], [40., 140.]); // added, global row 2
+    assert_eq!(&pos[6..8], [2., 102.]); // original row 2 = g 3
+    assert_eq!(&pos[10..12], [41., 141.]); // added, global row 5
+    drop(s);
+    // Reopened, the journal replays the rescue onto the sealed originals; the
+    // added spikes' depths are the positions the rescue gave them.
+    let s2 = open(root);
+    let d = sorrel_data::spike_depths(&s2).expect("positions are a depth source");
+    assert_eq!(d.source, sorrel_data::DepthSource::SpikePositions);
+    let all: Vec<f32> = d.per_cluster.iter().flatten().copied().collect();
+    assert_eq!(all.len(), 8);
+    assert!(all.contains(&140.) && all.contains(&141.), "{all:?}");
+    assert!(all.iter().all(|v| v.is_finite()));
+}
+
+#[test]
 fn unknown_per_spike_array_blocks_the_save() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
