@@ -48,6 +48,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 
+- A popped-out pane's window was destroyed and recreated whenever the main
+  window was hidden (minimized, or covered by a full-screen pop-out), so `F11`
+  in a pop-out never stuck. Pop-outs now stay alive, and remember full screen.
 - A cluster made by a split now shows up in `list_clusters`, can be relabelled
   and is written to `cluster_group.tsv`, live, after `save` and after a
   reopen. It had no label slot, so everything that reads labels skipped it.
