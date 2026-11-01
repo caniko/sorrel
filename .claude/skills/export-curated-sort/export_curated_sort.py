@@ -40,6 +40,7 @@ OPTIONAL = ["cluster_group.tsv", "template_ind.npy", "pc_features.npy", "pc_feat
             "template_features.npy", "template_feature_ind.npy", "similar_templates.npy",
             "channel_shanks.npy", "whitening_mat_inv.npy", "cluster_KSLabel.tsv",
             "cluster_ContamPct.tsv", "cluster_Amplitude.tsv"]
+SCRUB_META = (b"fileName", b"userNotes")  # SpikeGLX .meta keys that hold local paths and free text
 KEEP_PARAMS = ["n_channels_dat", "dtype", "offset", "sample_rate", "hp_filtered"]
 # Hidden knob for the self-check: chunk size in bytes.
 CHUNK = int(os.environ.get("SORREL_EXPORT_CHUNK_BYTES", 64 << 20))
@@ -72,7 +73,9 @@ def pmap(fn, items, workers):
         pend = deque()
         for it in items:
             pend.append(ex.submit(fn, it))
-            if len(pend) >= 2 * workers:
+            # Window = workers, not 2x: a queued result is a whole decoded chunk in this process,
+            # which the per-worker memory budget (n_workers) does not count.
+            if len(pend) >= workers:
                 yield pend.popleft().result()
         while pend:
             yield pend.popleft().result()
@@ -121,6 +124,19 @@ def scrubbed_params(p):
     lines = ["dat_path = 'recording.bin'", "offset = 0"]
     lines += [f"{k} = {p[k]!r}" for k in KEEP_PARAMS if k in p and k != "offset"]
     return ("\n".join(lines) + "\n").encode()
+
+
+def scrubbed_meta(path):
+    """The SpikeGLX .meta with the values of SCRUB_META blanked (every other key kept).
+    Returns (bytes, names of the keys that were blanked)."""
+    out, hit = [], []
+    for line in Path(path).read_bytes().splitlines(keepends=True):
+        eol = line[len(line.rstrip(b"\r\n")):]
+        key, sep, val = line.rstrip(b"\r\n").partition(b"=")
+        if sep and key in SCRUB_META and val:
+            line, hit = key + sep + eol, hit + [key.decode()]
+        out.append(line)
+    return b"".join(out), hit
 
 
 def find_dat(p, phy, override):
@@ -313,6 +329,7 @@ def pack(a):
     t0 = time.time()
     phy, out = Path(a.phy_dir).resolve(), Path(a.out_dir)
     phy.is_dir() or die(f"{a.phy_dir} is not a directory")
+    out.resolve().is_relative_to(phy) and die(f"OUT_DIR {out} is inside PHY_DIR; pick a folder outside it")
     miss = [n for n in REQUIRED if not (phy / n).is_file()]
     miss and die(f"missing required files: {', '.join(miss)}")
     name = a.name or phy.name
@@ -341,8 +358,10 @@ def pack(a):
 
     items = [(n, phy / n) for n in REQUIRED[1:] + OPTIONAL if (phy / n).is_file()]
     items.insert(0, ("params.py", scrubbed_params(p)))
+    scrubbed = []
     if meta.is_file():
-        items.append(("recording.meta", meta))
+        blob, scrubbed = scrubbed_meta(meta)
+        items.append(("recording.meta", blob))
     files = {}
     for n, s in items:
         files[n] = {"size": len(s) if isinstance(s, bytes) else s.stat().st_size,
@@ -379,7 +398,7 @@ def pack(a):
         rz, tz = offs[-1], (work / "phy.tar.zst").stat().st_size
         man = {"tool": "export_curated_sort", "version": VERSION,
                "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-               "source_dir": phy.name, "files": files, "excluded": excluded, "custom_label_files": custom,
+               "source_dir": phy.name, "files": files, "meta_scrubbed": scrubbed, "excluded": excluded, "custom_label_files": custom,
                "checks": {**chk, "warnings": warns, "raw_verified": True, "phy_tar_verified": True},
                "raw": {"filter": filt, "candidates": cand, "level": a.level, "workers": workers,
                        "seconds": round(raw_secs, 1), "n_chunks": len(bounds) - 1, "sha256": sha,
@@ -412,6 +431,7 @@ def pack(a):
         print(f"  {n:28s} {f['size']:>14,d} B")
     print(f"  recording.bin                {body:>14,d} B  ({n_samples} samples x {C} ch {dtype})")
     print(f"excluded: {', '.join(excluded) or '-'}")
+    print(f"recording.meta values blanked: {', '.join(scrubbed) or '-'}")
     print(f"custom label files (ask the user): {', '.join(custom) or '-'}")
     print(f"raw: filter {filt}, candidates {cand}, {body / rz:.2f}x, {workers} workers, {raw_secs:.0f} s")
     print(f"phy.tar.zst: {small:,d} -> {tz:,d} B ({small / tz:.2f}x)")
@@ -433,8 +453,9 @@ def unpack(a):
         print("note: no .sha256 beside the package, outer hash not checked", file=sys.stderr)
     out.mkdir(parents=True, exist_ok=True)
     any(out.iterdir()) and die(f"{out} is not empty")
+    # Everything is built and verified in a temp subdir and moved into OUT_DIR last, so a
+    # failure leaves OUT_DIR empty and a retry works.
     tmp = out / ".unpack-tmp"
-    ok = False
     try:
         tmp.mkdir()
         with tarfile.open(pkg) as tf:
@@ -445,19 +466,20 @@ def unpack(a):
             tf.extractall(tmp, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
         man, info = (json.loads((tmp / n).read_text()) for n in ("MANIFEST.json", "raw.json"))
         need_space(out, man["original_bytes"] + (64 << 20))
-        read_phy_tar(tmp / "phy.tar.zst", {n: f["sha256"] for n, f in man["files"].items()}, out)
+        stage = tmp / "phy"
+        stage.mkdir()
+        read_phy_tar(tmp / "phy.tar.zst", {n: f["sha256"] for n, f in man["files"].items()}, stage)
         workers = n_workers(a.jobs, 1, CHUNK)
-        with open(out / "recording.bin", "wb") as fo:
+        with open(stage / "recording.bin", "wb") as fo:
             got = decode_stream(tmp / "raw.zst.bin", info, workers, fo)
         got == info["sha256"] == man["raw"]["sha256"] or die("recording sha256 mismatch: package is corrupt")
-        chk = check(out, info["n_samples"], info["sample_rate"])
+        chk = check(stage, info["n_samples"], info["sample_rate"])
         bad = [k for k in COUNTS if chk[k] != man["checks"][k]]
         bad and die(f"counts differ from the manifest: {bad}")
-        ok = True
+        for f in stage.iterdir():
+            os.replace(f, out / f.name)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-        if not ok:
-            (out / "recording.bin").unlink(missing_ok=True)
     print(f"unpacked to {out}: recording.bin verified (sha256 {got[:12]}...)")
     print("counts: " + ", ".join(f"{k}={chk[k]}" for k in COUNTS))
 

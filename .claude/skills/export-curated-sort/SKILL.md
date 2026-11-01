@@ -37,8 +37,11 @@ and the check result. Upload only `OUT_DIR/NAME.sorrel-upload.tar`; keep the
 - `params.py` rewritten to `dat_path = 'recording.bin'`, `offset = 0` plus the
   five keys needed to read it (the original path holds your username).
 - The raw recording, filtered and compressed in chunks (`raw.zst.bin`).
-- A SpikeGLX `.meta` next to the raw file, if any. It carries the gain
-  calibration but also the probe serial numbers; tell the user.
+- A SpikeGLX `.meta` next to the raw file, if any, as `recording.meta`. It carries
+  the gain calibration but also the probe serial numbers; tell the user. The
+  values of `fileName` (a local path) and `userNotes` (free text) are blanked,
+  every other key is kept, and the manifest lists the blanked keys in
+  `meta_scrubbed`.
 
 ## What stays out
 
@@ -66,5 +69,7 @@ uv run .claude/skills/export-curated-sort/export_curated_sort.py unpack PKG OUT_
 ```
 
 rebuilds the phy folder (with `recording.bin`) in a new, empty `OUT_DIR`, verifies
-everything and prints the counts. Self-check of the tool:
+everything and prints the counts. It works in a temp subfolder and moves the files
+into `OUT_DIR` only after every check passed, so a failure leaves `OUT_DIR` empty.
+`pack` refuses an `OUT_DIR` inside `PHY_DIR`. Self-check of the tool:
 `uv run .claude/skills/export-curated-sort/test_export_curated_sort.py`.

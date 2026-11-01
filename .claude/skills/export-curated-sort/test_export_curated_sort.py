@@ -72,7 +72,8 @@ def make_phy(root, dtype, dat_in_phy, header=0):
     (phy / "phy.log").write_text("merge /home/someuser\n")
     (phy / ".phy").mkdir()
     (phy / ".phy" / "state.json").write_text("{}")
-    (dat.with_suffix(".meta")).write_text("imDatPrb_sn=1234\nimSampRate=30000\n")
+    (dat.with_suffix(".meta")).write_text("imDatPrb_sn=1234\nimSampRate=30000\nfileName=C:\\Users\\someuser\\rec.bin\r\nuserNotes=someuser note\n"
+        "~imroTbl=(0,384)(0 0 0 500 250 1)\nimAiRangeMax=0.6\n")
     return phy, dat, data.tobytes()
 
 
@@ -102,7 +103,11 @@ def roundtrip(root, dtype, dat_in_phy, header, filters):
     assert (un / "recording.bin").read_bytes() == raw and not DECOYS & {p.name for p in un.iterdir()}
     for n in ALLOWED:
         assert (un / n).read_bytes() == (phy / n).read_bytes(), n
-    assert (un / "recording.meta").read_bytes() == dat.with_suffix(".meta").read_bytes()
+    # The meta is scrubbed (path and notes blanked), every other key, the gain ones included, survives.
+    want = dat.with_suffix(".meta").read_bytes().replace(b"C:\\Users\\someuser\\rec.bin", b"").replace(b"someuser note", b"")
+    assert (un / "recording.meta").read_bytes() == want and b"someuser" not in want
+    assert b"~imroTbl=(0,384)(0 0 0 500 250 1)" in want and b"imAiRangeMax=0.6" in want
+    assert man["meta_scrubbed"] == ["fileName", "userNotes"], man["meta_scrubbed"]
     params = (un / "params.py").read_text()
     assert "/" not in params and "someuser" not in params and "dat_path = 'recording.bin'" in params
     return base, pkg, man
@@ -129,7 +134,13 @@ def main():
             f.seek(-1, 1)
             f.write(bytes([b[0] ^ 0xFF]))
         r = run("unpack", bad, base / "bad-un", ok=False)
-        assert "error" in r.stderr and not (base / "bad-un" / "recording.bin").exists(), r.stderr
+        assert "error" in r.stderr and not any((base / "bad-un").iterdir()), r.stderr  # nothing left behind
+        shutil.copy(pkg, bad)  # a retry into the same OUT_DIR with a good package works
+        run("unpack", bad, base / "bad-un")
+        assert (base / "bad-un" / "recording.bin").is_file() and not (base / "bad-un" / ".unpack-tmp").exists()
+        with open(bad, "r+b") as f:
+            f.seek(m.offset_data + m.size // 2)
+            f.write(bytes([b[0] ^ 0xFF]))
         # With the original .sha256 beside it the outer hash catches it first.
         shutil.copy(str(pkg) + ".sha256", str(bad) + ".sha256")
         assert "sha256" in run("unpack", bad, base / "bad-un2", ok=False).stderr
@@ -137,8 +148,11 @@ def main():
         # float32 with a 64-byte header and the bin elsewhere (--dat): shuffle/none only.
         _, _, man2 = roundtrip(root, np.float32, False, 64, ["shuffle", "none"])
 
-        # A missing required file is an error.
+        # OUT_DIR inside PHY_DIR is refused.
         phy = root / "int16-0" / "phy"
+        assert "inside PHY_DIR" in run("pack", phy, phy / "out", ok=False).stderr and not (phy / "out").exists()
+
+        # A missing required file is an error.
         (phy / "amplitudes.npy").rename(phy / "amp.bak")
         assert "amplitudes.npy" in run("pack", phy, root / "out-missing", ok=False).stderr
     finally:
