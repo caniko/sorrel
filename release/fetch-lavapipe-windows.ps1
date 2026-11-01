@@ -7,12 +7,16 @@ PNGs) plus the Khronos Vulkan loader, which a hosted runner without a GPU
 driver lacks. Put -Dir on PATH so `vulkan-1.dll` is found, and point
 `VK_DRIVER_FILES` (or `SORREL_LAVAPIPE_ICD`) at the printed ICD.
 
-  pwsh release/fetch-lavapipe-windows.ps1 [-Dir DIR]   # prints DIR\lvp_icd.x86_64.json
+  pwsh release/fetch-lavapipe-windows.ps1 [-Dir DIR] [-Register]   # prints DIR\lvp_icd.x86_64.json
+
+-Register adds the ICD to HKLM\SOFTWARE\Khronos\Vulkan\Drivers (needs admin,
+as on a hosted runner; remove the value to undo). The loader ignores
+`VK_DRIVER_FILES` in an elevated process, so CI needs this.
 
 Mesa: pal1000/mesa-dist-win, MSVC release. Loader: LunarG Vulkan Runtime
 components. Bump each version with its sha256.
 #>
-param([string]$Dir = (Join-Path ([IO.Path]::GetTempPath()) 'sorrel-lavapipe'))
+param([string]$Dir = (Join-Path ([IO.Path]::GetTempPath()) 'sorrel-lavapipe'), [switch]$Register)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $Mesa = '26.2.4'
@@ -47,4 +51,9 @@ if (-not (Test-Path (Join-Path $Dir 'vulkan-1.dll'))) {
     Remove-Item $zip, $tmp -Recurse -Force
 }
 if (-not (Test-Path $icd)) { throw "$icd missing after extraction" }
+if ($Register) {
+    $key = 'HKLM:\SOFTWARE\Khronos\Vulkan\Drivers'
+    New-Item -Path $key -Force | Out-Null
+    New-ItemProperty -Path $key -Name $icd -Value 0 -PropertyType DWord -Force | Out-Null
+}
 $icd

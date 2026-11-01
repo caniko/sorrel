@@ -95,7 +95,7 @@
               # runner lacks) and fail instead of skipping without it.
               setup = ''
                 lava="$RUNNER_TEMP\\lavapipe"
-                pwsh -NoProfile -File release/fetch-lavapipe-windows.ps1 -Dir "$lava"
+                pwsh -NoProfile -File release/fetch-lavapipe-windows.ps1 -Dir "$lava" -Register
                 echo "SORREL_LAVAPIPE_ICD=$lava\\lvp_icd.x86_64.json" >> "$GITHUB_ENV"
                 echo "$lava" >> "$GITHUB_PATH"
               '';

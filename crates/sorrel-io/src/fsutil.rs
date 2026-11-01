@@ -49,24 +49,32 @@ pub fn replace_file_io(from: &Path, to: &Path) -> std::io::Result<()> {
     replace_file(from, to).map_err(|e| std::io::Error::other(format!("{e:#}")))
 }
 
-/// Drop the inherited ACEs of `path` and grant only the current user, like
-/// Unix mode 0600. Shells out to `icacls`, which ships with Windows.
+/// Leave only the current user on `path`'s ACL, like Unix mode 0600: drop the
+/// inherited ACEs, grant the user full control, then remove the explicit
+/// SYSTEM and Administrators ACEs an elevated process's default DACL adds.
+/// Shells out to `icacls`, which ships with Windows.
 #[cfg(windows)]
 pub fn restrict_to_current_user(path: &Path) -> Result<()> {
     use anyhow::Context;
     let user = std::env::var("USERNAME").context("USERNAME is not set")?;
-    let out = std::process::Command::new("icacls")
-        .arg(path)
-        .args(["/inheritance:r", "/grant:r"])
-        .arg(format!("{user}:F"))
-        .output()
-        .context("run icacls")?;
-    anyhow::ensure!(
-        out.status.success(),
-        "icacls {}: {}",
-        path.display(),
-        String::from_utf8_lossy(&out.stdout).trim()
-    );
+    let grant = format!("{user}:F");
+    // SIDs, so the names do not depend on the Windows language.
+    for args in [
+        ["/inheritance:r", "/grant:r", grant.as_str()].as_slice(),
+        ["/remove:g", "*S-1-5-18", "*S-1-5-32-544"].as_slice(),
+    ] {
+        let out = std::process::Command::new("icacls")
+            .arg(path)
+            .args(args)
+            .output()
+            .context("run icacls")?;
+        anyhow::ensure!(
+            out.status.success(),
+            "icacls {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stdout).trim()
+        );
+    }
     Ok(())
 }
 

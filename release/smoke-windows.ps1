@@ -614,15 +614,20 @@ Write-Host 'shortcut removed'
 #     fallback, but a hosted runner has no GPU driver, so DX12/WARP is all steps 2
 #     and 7 ever reach. Point the loader at the pinned Mesa lavapipe (the Windows
 #     build of the dev shell's, with the Khronos loader) and require the compute kernels to pass on it.
-$lvpIcd = (& (Join-Path $repo 'release\fetch-lavapipe-windows.ps1') -Dir (Join-Path ([IO.Path]::GetTempPath()) 'sorrel-lavapipe') | Select-Object -Last 1)
+#     The runner is elevated, and the loader then ignores VK_DRIVER_FILES, so the ICD
+#     is registered under HKLM and removed again afterwards.
+$lvpIcd = (& (Join-Path $repo 'release\fetch-lavapipe-windows.ps1') -Dir (Join-Path ([IO.Path]::GetTempPath()) 'sorrel-lavapipe') -Register | Select-Object -Last 1)
 Write-Host "lavapipe ICD: $lvpIcd"
 $oldPath = $env:PATH
 $env:PATH = "$(Split-Path $lvpIcd)$([IO.Path]::PathSeparator)$env:PATH" # vulkan-1.dll, the loader
 $env:VK_DRIVER_FILES = $lvpIcd
 $env:WGPU_BACKEND = 'vulkan'
+$env:VK_LOADER_DEBUG = 'error,warn,driver' # lands in gpu-check-vulkan.err.txt
 try { $vkCode = Invoke-Native 'gpu-check-vulkan' $exe @('gpu-check') }
 finally {
     $env:PATH = $oldPath
+    Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Khronos\Vulkan\Drivers' -Name $lvpIcd -ErrorAction SilentlyContinue
+    Remove-Item Env:VK_LOADER_DEBUG -ErrorAction SilentlyContinue
     Remove-Item Env:VK_DRIVER_FILES -ErrorAction SilentlyContinue
     Remove-Item Env:WGPU_BACKEND -ErrorAction SilentlyContinue
 }
