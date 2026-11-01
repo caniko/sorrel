@@ -969,6 +969,39 @@ impl<P: DataProvider> Session<P> {
             .collect()
     }
 
+    /// The clusters `node` changed, each with the global spike indices it held
+    /// just before the node was applied: a merge's sources and target, a
+    /// split's source, a batch's children (the first state seen per cluster).
+    /// `None` for a node off the head path or one that moves no spikes.
+    pub fn pre_edit_spikes(&self, node: u64) -> Option<Vec<(ClusterId, Vec<u32>)>> {
+        fn collect<L: Copy>(inv: &InverseOp<L>, out: &mut Vec<(ClusterId, Vec<u32>)>) {
+            let mut push = |c: ClusterId, g: &[u32]| {
+                if !out.iter().any(|(o, _)| *o == c) {
+                    out.push((c, g.to_vec()));
+                }
+            };
+            match inv {
+                InverseOp::Merge { record, .. } => {
+                    record.memberships().for_each(|(c, g)| push(c, g));
+                }
+                InverseOp::Split { record, .. } => {
+                    let (c, g) = record.pre_source_membership();
+                    push(c, g);
+                }
+                // ponytail: a cluster a child split off is recorded as it stood
+                // after that split, not as nonexistent; only the source counts.
+                InverseOp::Batch { inverses } => {
+                    inverses.iter().for_each(|k| collect(k, out));
+                }
+                _ => {}
+            }
+        }
+        let inv = self.nodes.get(node as usize)?.inverse.as_ref()?;
+        let mut out = Vec::new();
+        collect(inv, &mut out);
+        (!out.is_empty()).then_some(out)
+    }
+
     /// Node ids from the root down to `node` (empty for the root).
     fn path(&self, mut node: Option<u64>) -> Vec<u64> {
         let mut out = Vec::new();
@@ -2828,5 +2861,74 @@ mod tests {
         ));
         drop(j);
         assert_eq!(reopen(dir.path()).history_len(), 1);
+    }
+
+    #[test]
+    fn pre_edit_spikes_match_the_memberships_before_each_edit() {
+        let (mut s, _d) = fresh_session();
+        let members = |s: &Session<MockProvider>, cs: &[u32]| -> Vec<(ClusterId, Vec<u32>)> {
+            cs.iter()
+                .map(|&c| {
+                    let c = ClusterId(c);
+                    (c, s.cluster_index().global_indices(c).to_vec())
+                })
+                .collect()
+        };
+        let sorted = |mut v: Vec<(ClusterId, Vec<u32>)>| {
+            v.sort_by_key(|(c, _)| *c);
+            v
+        };
+        let before_split = members(&s, &[0]);
+        s.dispatch(CurationCommand::Split {
+            cluster: ClusterId(0),
+            spike_idx: vec![0, 2],
+            new_cluster: ClusterId(0),
+            by: Method::Manual,
+        })
+        .unwrap();
+        let split = s.head().unwrap();
+        assert_eq!(s.pre_edit_spikes(split), Some(before_split));
+
+        let before_merge = members(&s, &[1, 2]);
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(1)],
+            target: ClusterId(2),
+        })
+        .unwrap();
+        let merge = s.head().unwrap();
+        assert_eq!(s.pre_edit_spikes(merge).map(sorted), Some(before_merge));
+        // Earlier nodes on the head path keep their record.
+        assert!(s.pre_edit_spikes(split).is_some());
+
+        // A batch is the union of its children's first states.
+        let before_batch = members(&s, &[0, 1, 2]);
+        s.dispatch(CurationCommand::Batch {
+            children: vec![
+                CurationCommand::Merge {
+                    sources: vec![ClusterId(0)],
+                    target: ClusterId(2),
+                },
+                CurationCommand::Merge {
+                    sources: vec![ClusterId(2)],
+                    target: ClusterId(1),
+                },
+            ],
+        })
+        .unwrap();
+        let batch = s.head().unwrap();
+        assert_eq!(s.pre_edit_spikes(batch).map(sorted), Some(before_batch));
+
+        // Nodes that move no spikes, unknown nodes and undone nodes: None.
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetGood,
+        })
+        .unwrap();
+        assert_eq!(s.pre_edit_spikes(s.head().unwrap()), None);
+        assert_eq!(s.pre_edit_spikes(999), None);
+        s.dispatch(CurationCommand::Undo).unwrap();
+        s.dispatch(CurationCommand::Undo).unwrap();
+        assert_eq!(s.pre_edit_spikes(batch), None, "off the head path");
+        assert!(s.pre_edit_spikes(merge).is_some());
     }
 }

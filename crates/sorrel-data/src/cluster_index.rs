@@ -1030,6 +1030,16 @@ pub struct MergeRecord {
     snapshots: Vec<ClusterSnapshot>,
 }
 
+impl MergeRecord {
+    /// Each touched cluster (target first) with the global spike indices it
+    /// held just before the merge.
+    pub(crate) fn memberships(&self) -> impl Iterator<Item = (ClusterId, &[u32])> {
+        self.snapshots
+            .iter()
+            .map(|s| (s.cluster, &s.global_indices[..]))
+    }
+}
+
 /// Reversible record of a split.
 #[derive(Clone, Debug)]
 pub struct SplitRecord {
@@ -1037,6 +1047,13 @@ pub struct SplitRecord {
     pub new_cluster: ClusterId,
     pre_source: ClusterSnapshot,
     pre_new: ClusterSnapshot,
+}
+
+impl SplitRecord {
+    /// The split source with the global spike indices it held before the split.
+    pub(crate) fn pre_source_membership(&self) -> (ClusterId, &[u32]) {
+        (self.source, &self.pre_source.global_indices)
+    }
 }
 
 #[cfg(test)]
