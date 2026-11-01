@@ -10,7 +10,9 @@ use egui_kittest::{Harness, SnapshotResults};
 use sorrel_data::{Journal, Session};
 use sorrel_io::kilosort::{KilosortOpenParams, PhyLabel};
 use sorrel_io::npy;
+use sorrel_io::ClusterId;
 use sorrel_io::{DataProvider, HasGeometry, KilosortProvider};
+use sorrel_ui::brush::{BrushSource, Ghost};
 use sorrel_ui::{RasterPipeline, ScatterPipeline, Shell, SorrelApp, TracePipeline};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -2201,6 +2203,292 @@ fn xtalk_merge_ghost() {
         // the row's tooltip names the merge.
         h.get_by_label_contains("merge c");
         snap(&mut h, "xtalk_merge_ghost", name);
+        h
+    });
+}
+
+/// The wide (2200 x 1100) harness: Features, Waveforms and the history /
+/// similar group all fit side by side.
+fn wide_fixture(slot: &str, theme: egui::Theme) -> Harness<'static, App> {
+    let root = dataset(slot, 3);
+    let mut h = harness_sized(theme, [2200.0, 1100.0], move || {
+        let (session, positions) = open(&root);
+        let mut app = SorrelApp::new(session, label_str);
+        configure(&mut app, &root, positions);
+        app
+    });
+    settle(&mut h);
+    h
+}
+
+/// The tab-bar button `label` of the `n`-th tab group, left to right.
+fn group_button<'a>(
+    h: &'a Harness<'static, App>,
+    label: &'a str,
+    n: usize,
+) -> egui_kittest::Node<'a> {
+    let mut all: Vec<_> = h.get_all_by_label(label).collect();
+    all.sort_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x));
+    all.into_iter().nth(n).expect("the group's tab-bar button")
+}
+
+/// Pop `Similar` out of the compare group (the second), then show Features
+/// there: the popped tab stays active until another is clicked.
+fn pop_out_similar(h: &mut Harness<'static, App>) {
+    click_tab(h, "Similar");
+    group_button(h, "pop out pane", 1).click();
+    settle(h);
+    click_tab(h, "Features");
+}
+
+/// The Similar row whose label is `label`, in the popped-out Similar window.
+/// The embedded window floats over the cluster table, so its label overlaps
+/// the table's own; the window's header puts it higher.
+fn similar_row(h: &Harness<'static, App>, label: &str) -> egui::Rect {
+    h.get_all_by_label(label)
+        .map(|n| n.rect())
+        .min_by(|a, b| a.min.y.total_cmp(&b.min.y))
+        .expect("a Similar row")
+}
+
+#[test]
+fn pane_popout() {
+    if no_gpu() {
+        return;
+    }
+    // Pop-out: the tab-bar button moves the pane to its own window (an
+    // embedded egui window under kittest) and leaves a placeholder with
+    // "Bring back" in the tree; Bring back undoes it.
+    each_theme(|theme, name| {
+        let mut h = wide_fixture(&format!("popout-{name}"), theme);
+        select_two_and_open_features(&mut h);
+        assert!(h.query_by_label("In its own window").is_none());
+        // Features sits in the second group (shape, compare, assess).
+        group_button(&h, "pop out pane", 1).click();
+        settle(&mut h);
+        h.get_by_label("In its own window");
+        h.get_by_label("Bring back");
+        h.get_by_label("Features — Sorrel");
+        assert!(
+            h.get_all_by_label_contains("feature cell").count() > 0,
+            "the pane is drawn in its window"
+        );
+        snap(&mut h, "pane_popout", name);
+        h.get_by_label("Bring back").click();
+        settle(&mut h);
+        assert!(h.query_by_label("In its own window").is_none());
+        assert!(h.query_by_label("Features — Sorrel").is_none());
+        h.get_by_label("feature cell 1");
+        // Similar popped out leaves Features in the main window.
+        pop_out_similar(&mut h);
+        h.get_by_label("Similar — Sorrel");
+        h.get_by_label("feature cell 1");
+        snap(&mut h, "pane_popout_similar", name);
+        h
+    });
+}
+
+#[test]
+fn xtalk_features_ghost() {
+    if no_gpu() {
+        return;
+    }
+    // Cross-talk: hovering a Similar row ghosts that cluster in Features even
+    // though the two share a tab group (Similar is popped out): grey points
+    // and "cN (ghost)".
+    each_theme(|theme, name| {
+        let mut h = wide_fixture(&format!("xtalk-fghost-{name}"), theme);
+        // c0 + c1 selected, c2 the ghost: the fixture's units are zero off
+        // their own channels, so c2 shows as a grey blob at the origin of the
+        // cells that pair c0's channel with c1's.
+        h.key_press(egui::Key::ArrowDown);
+        settle(&mut h);
+        h.get_all_by_label("1")
+            .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+            .expect("cluster 1 row")
+            .click_modifiers(egui::Modifiers::COMMAND);
+        click_tab(&mut h, "Features");
+        pop_out_similar(&mut h);
+        h.get_by_label("feature cell 1");
+        assert!(h.state().brushes().ghost.is_none(), "nothing hovered yet");
+        let at = similar_row(&h, "noise").center();
+        // Hover is promoted at the end of the frame: one frame to write it,
+        // one to read it.
+        h.hover_at(at);
+        settle(&mut h);
+        h.hover_at(at);
+        settle(&mut h);
+        assert!(
+            matches!(h.state().brushes().ghost, Some(Ghost::Merge(c)) if c == ClusterId(2)),
+            "a Similar row hover is a merge ghost of c2, got {:?}",
+            h.state().brushes().ghost
+        );
+        // Snap removes the cursor, which would drop the hover: keep the
+        // ghost by snapshotting before the pointer leaves.
+        snap_hovered(&mut h, "xtalk_features_ghost", name, at, 0);
+        h
+    });
+}
+
+/// `snap` with the pointer kept at `at` (the state under test is a hover).
+/// `slack` pixels may differ: the History row prints the edit's wall-clock
+/// time, which no fixture can pin.
+fn snap_hovered(
+    h: &mut Harness<'static, App>,
+    state: &str,
+    theme: &str,
+    at: egui::Pos2,
+    slack: usize,
+) {
+    settle(h);
+    h.hover_at(at);
+    h.run_ok();
+    h.hover_at(at);
+    h.run_ok();
+    h.snapshot_options(
+        format!("{state}_{theme}"),
+        &egui_kittest::SnapshotOptions::new().failed_pixel_count_threshold(slack),
+    );
+}
+
+#[test]
+fn xtalk_history_ghost() {
+    if no_gpu() {
+        return;
+    }
+    // Cross-talk: hovering a History row draws that edit's "before #n"
+    // clusters as hulls in the Features 3-D view, with a legend entry.
+    each_theme(|theme, name| {
+        let mut h = wide_fixture(&format!("xtalk-hghost-{name}"), theme);
+        select_two_and_open_features(&mut h);
+        lasso_and_split(&mut h);
+        h.key_press(egui::Key::K);
+        settle(&mut h);
+        h.get_by_label("3D").click();
+        settle(&mut h);
+        h.get_by_label("feature 3d canvas");
+        // History sits in the third tab group, beside Features' group.
+        click_tab(&mut h, "History");
+        assert!(h.query_by_label_contains("before #").is_none());
+        let row = h
+            .get_all_by_label_contains("split cluster")
+            .find(|n| {
+                n.accesskit_node()
+                    .label()
+                    .is_some_and(|l| l.starts_with("split cluster"))
+            })
+            .expect("the split's History row");
+        let at = row.rect().center();
+        h.hover_at(at);
+        settle(&mut h);
+        h.hover_at(at);
+        settle(&mut h);
+        assert!(
+            matches!(h.state().brushes().ghost, Some(Ghost::History(_))),
+            "a History row hover is a history ghost, got {:?}",
+            h.state().brushes().ghost
+        );
+        h.get_by_label_contains("before #");
+        snap_hovered(&mut h, "xtalk_history_ghost", name, at, 400);
+        h
+    });
+}
+
+#[test]
+fn xtalk_hover_spike() {
+    if no_gpu() {
+        return;
+    }
+    // Cross-talk: the spike under the pointer in a Features cell is written
+    // to the shared hover, and Waveforms (visible beside it) draws that spike
+    // as a bold accent waveform.
+    each_theme(|theme, name| {
+        let mut h = wide_fixture(&format!("xtalk-hover-{name}"), theme);
+        select_two_and_open_features(&mut h);
+        assert!(h.state().brushes().hover.is_none());
+        let cell = h.get_by_label("feature cell 1").rect();
+        // Scan the cell on a coarse grid until the 6 px pick lands on a
+        // spike; hover is promoted at the end of the frame, so two frames.
+        let step = 4.0;
+        let mut found = None;
+        let mut tried = 0;
+        'scan: for iy in 0..(cell.height() / step) as usize {
+            for ix in 0..(cell.width() / step) as usize {
+                tried += 1;
+                let p = cell.min + egui::vec2(ix as f32, iy as f32) * step;
+                h.hover_at(p);
+                h.run_ok();
+                h.run_ok();
+                if h.state().brushes().hover.is_some() {
+                    found = Some(p);
+                    break 'scan;
+                }
+            }
+        }
+        let at = found.unwrap_or_else(|| {
+            panic!("no spike under any of {tried} pointer positions in feature cell 1 ({cell:?})")
+        });
+        let hover = h.state().brushes().hover.unwrap();
+        assert!(hover.sample > 0, "a real spike: {hover:?}");
+        snap_hovered(&mut h, "xtalk_hover_spike", name, at, 0);
+        assert!(h.state().brushes().hover.is_some(), "still hovered");
+        h
+    });
+}
+
+#[test]
+fn xtalk_amplitudes_ink() {
+    if no_gpu() {
+        return;
+    }
+    // Cross-talk: a Features lasso is the app-wide spike brush; Amplitudes
+    // (same tab group, opened afterwards) draws those spikes in ink.
+    each_theme(|theme, name| {
+        let mut h = wide_fixture(&format!("xtalk-amp-ink-{name}"), theme);
+        select_two_and_open_features(&mut h);
+        lasso_points(&mut h, 4);
+        let brush = h.state().brushes().spikes.clone().expect("a spike brush");
+        assert_eq!(brush.source, BrushSource::FeatureLasso);
+        assert!(!brush.is_empty());
+        click_tab(&mut h, "Amplitudes");
+        h.get_by_label("amplitude plot");
+        h.get_by_label_contains("brush:");
+        snap(&mut h, "xtalk_amplitudes_ink", name);
+        assert!(
+            h.state().brushes().spikes.is_some(),
+            "the brush survives the tab switch"
+        );
+        h
+    });
+}
+
+#[test]
+fn xtalk_isi_tooltip() {
+    if no_gpu() {
+        return;
+    }
+    // Cross-talk: hovering the ISI refractory band says how many spikes a
+    // click would brush.
+    each_theme(|theme, name| {
+        let root = dataset(&format!("xtalk-isi-tip-{name}"), 3);
+        add_isi_doublets(&root);
+        let mut h = harness_sized(theme, [2200.0, 1100.0], move || {
+            let (session, positions) = open(&root);
+            let mut app = SorrelApp::new(session, label_str);
+            configure(&mut app, &root, positions);
+            app
+        });
+        settle(&mut h);
+        select_two_and_open_features(&mut h);
+        click_tab(&mut h, "ISI");
+        let band = h.get_by_label("isi violators").rect();
+        let at = band.center();
+        h.hover_at(at);
+        settle(&mut h);
+        h.hover_at(at);
+        settle(&mut h);
+        h.get_by_label_contains("violating pairs");
+        snap_hovered(&mut h, "xtalk_isi_tooltip", name, at, 0);
         h
     });
 }

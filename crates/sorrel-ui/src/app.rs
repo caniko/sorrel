@@ -493,6 +493,12 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         &self.session
     }
 
+    /// Cross-view brush state, for tests that assert what one view wrote.
+    #[doc(hidden)]
+    pub fn brushes(&self) -> &crate::brush::Brushes {
+        &self.brushes
+    }
+
     /// The host that owns the session; other frontends (MCP, remote) edit
     /// through it.
     pub fn host(&self) -> &Arc<SessionHost<P>> {
