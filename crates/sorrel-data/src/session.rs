@@ -1039,6 +1039,34 @@ impl<P: DataProvider> Session<P> {
             .find(|&n| hits(&self.nodes[n as usize].cmd, cluster))
     }
 
+    /// The clusters as they were just before the *last* merge into `cluster`
+    /// inside `node` (a lone merge, or the final such child of a batch: an
+    /// earlier child may already have merged into a source, and the pre-state
+    /// of the whole batch would then split those spikes the wrong way).
+    /// `None` when `node` is off the head's path or never merged into it.
+    pub fn pre_merge_spikes(
+        &self,
+        node: u64,
+        cluster: ClusterId,
+    ) -> Option<Vec<(ClusterId, Vec<u32>)>> {
+        fn last<L: Copy>(
+            inv: &InverseOp<L>,
+            c: ClusterId,
+        ) -> Option<&crate::cluster_index::MergeRecord> {
+            match inv {
+                // The record's first snapshot is the target's.
+                InverseOp::Merge { record, .. } => {
+                    (record.memberships().next()?.0 == c).then_some(record)
+                }
+                InverseOp::Batch { inverses } => inverses.iter().rev().find_map(|k| last(k, c)),
+                _ => None,
+            }
+        }
+        let inv = self.nodes.get(node as usize)?.inverse.as_ref()?;
+        let record = last(inv, cluster)?;
+        Some(record.memberships().map(|(c, g)| (c, g.to_vec())).collect())
+    }
+
     /// Whether [`Self::pre_edit_spikes`] has an answer for `node`, without
     /// copying any membership (the History hover asks every frame).
     pub fn has_pre_edit(&self, node: u64) -> bool {
@@ -3089,5 +3117,47 @@ mod tests {
         assert_eq!(s.last_merge_into(b), Some(first));
         s.dispatch(CurationCommand::Undo).unwrap();
         assert_eq!(s.last_merge_into(b), None);
+    }
+
+    #[test]
+    fn pre_merge_spikes_is_the_state_just_before_the_last_merge_into_it() {
+        // A batch merges a into b, then b into c. Before the final merge b
+        // already held a's spikes; the pre-state of the whole batch would
+        // list them under a instead.
+        let (mut s, _d) = fresh_session();
+        let (a, b, c) = (ClusterId(0), ClusterId(1), ClusterId(2));
+        let g = |s: &Session<MockProvider>, k| s.cluster_index().global_indices(k).to_vec();
+        let (ga, gb, gc) = (g(&s, a), g(&s, b), g(&s, c));
+        let merge = |sources, target| CurationCommand::Merge { sources, target };
+        s.dispatch(CurationCommand::Batch {
+            children: vec![merge(vec![a], b), merge(vec![b], c)],
+        })
+        .unwrap();
+        let node = s.last_merge_into(c).unwrap();
+        let mut b_before: Vec<u32> = ga.iter().chain(&gb).copied().collect();
+        b_before.sort_unstable();
+        let pre = s.pre_merge_spikes(node, c).unwrap();
+        let of = |k| {
+            let mut v = pre.iter().find(|(x, _)| *x == k).unwrap().1.clone();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(pre[0].0, c, "target first");
+        assert_eq!(of(c), gc);
+        assert_eq!(of(b), b_before, "b already holds a's spikes");
+        assert!(
+            pre.iter().all(|(k, _)| *k != a),
+            "a is not a source of that merge"
+        );
+        // Each spike once.
+        let mut all: Vec<u32> = pre.iter().flat_map(|(_, v)| v.clone()).collect();
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n);
+        // Not a merge target here, or off the path: no answer.
+        assert!(s.pre_merge_spikes(node, a).is_none());
+        s.dispatch(CurationCommand::Undo).unwrap();
+        assert!(s.pre_merge_spikes(node, c).is_none());
     }
 }

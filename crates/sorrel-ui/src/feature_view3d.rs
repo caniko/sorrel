@@ -926,12 +926,14 @@ pub(crate) fn feature_3d<P: DataProvider>(
     };
     // The nodes whose pre-edit clusters are drawn as dashed hulls: the
     // hovered History row, else the latest merge into each selected unit.
-    let (hist_nodes, hist_is_merge): (Vec<u64>, bool) = match brushes.ghost {
-        Some(Ghost::History(n)) => (vec![n], false),
+    // A merge node is paired with its target: in a batch the hull is the
+    // state just before the last merge into that unit, not before the batch.
+    let (hist_nodes, hist_is_merge): (Vec<(u64, Option<ClusterId>)>, bool) = match brushes.ghost {
+        Some(Ghost::History(n)) => (vec![(n, None)], false),
         _ => {
-            let mut v: Vec<u64> = selection
+            let mut v: Vec<(u64, Option<ClusterId>)> = selection
                 .iter()
-                .filter_map(|&c| session.last_merge_into(c))
+                .filter_map(|&c| Some((session.last_merge_into(c)?, Some(c))))
                 .collect();
             v.sort_unstable();
             v.dedup();
@@ -990,7 +992,10 @@ pub(crate) fn feature_3d<P: DataProvider>(
             let mut v: Vec<(ClusterId, Vec<u32>)> = Vec::new();
             for b in hist_nodes
                 .iter()
-                .filter_map(|&n| session.pre_edit_spikes(n))
+                .filter_map(|&(n, into)| match into {
+                    Some(c) => session.pre_merge_spikes(n, c),
+                    None => session.pre_edit_spikes(n),
+                })
                 .flatten()
             {
                 if !v.iter().any(|(c, _)| *c == b.0) {
@@ -1005,7 +1010,7 @@ pub(crate) fn feature_3d<P: DataProvider>(
             .collect();
         let before = before_points(set, &globals, &pre);
         let before_label = (!pre.is_empty()).then(|| match (hist_is_merge, hist_nodes.first()) {
-            (false, Some(n)) => format!("before #{n}"),
+            (false, Some((n, _))) => format!("before #{n}"),
             _ => {
                 let names: Vec<String> = pre.iter().map(|(c, _)| format!("c{}", c.0)).collect();
                 format!("before merge ({})", names.join(" + "))
