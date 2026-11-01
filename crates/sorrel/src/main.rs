@@ -233,12 +233,29 @@ enum Cmd {
         #[command(subcommand)]
         sub: Option<McpCmd>,
     },
-    /// Compare two cluster_group.tsv files: confusion table, kappa, disagreements
+    /// Compare two cluster_group.tsv files (confusion table, kappa,
+    /// disagreements), or with `--root`, two curated directories spike by
+    /// spike (the bench score)
     Diff {
+        /// cluster_group.tsv, or the truth directory
         a: PathBuf,
+        /// cluster_group.tsv, or the directory under test
         b: PathBuf,
         #[arg(long)]
         json: bool,
+        /// Directory mode: the sort both started from (a `sorrel blind` input)
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Directory mode: minimum Jaccard overlap to count a unit as recovered
+        #[arg(long = "match", value_name = "JACCARD", default_value_t = 0.8)]
+        match_jaccard: f64,
+        /// Directory mode: root clusters with fewer spikes are left out of the
+        /// merge and split scores
+        #[arg(long, value_name = "N", default_value_t = 10)]
+        min_spikes: usize,
+        /// Directory mode: root cluster ids (one per line) to leave out of scoring
+        #[arg(long, value_name = "FILE")]
+        disputed: Option<PathBuf>,
     },
     /// Inspect or replay a curation journal
     Journal {
@@ -1460,6 +1477,23 @@ fn diff_tsvs(a: &Path, b: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn diff_dirs(
+    truth: &Path,
+    test: &Path,
+    root: &Path,
+    opts: &sorrel_data::diff::SpikeDiffOpts,
+    json: bool,
+) -> Result<()> {
+    let d = sorrel_data::diff::diff_dirs(truth, test, root, opts)?;
+    if json {
+        serde_json::to_writer_pretty(std::io::stdout().lock(), &d)?;
+        println!();
+    } else {
+        print!("{}", d.render());
+    }
+    Ok(())
+}
+
 fn journal_dump(path: &Path, json: bool) -> Result<()> {
     let records = Journal::read_only_records(path)?;
     if json {
@@ -2218,7 +2252,30 @@ fn main() -> Result<()> {
                 },
             )
         }
-        Some(Cmd::Diff { a, b, json }) => diff_tsvs(&a, &b, json),
+        Some(Cmd::Diff {
+            a,
+            b,
+            json,
+            root,
+            match_jaccard,
+            min_spikes,
+            disputed,
+        }) => match (root, a.is_dir() && b.is_dir()) {
+            (Some(root), true) => {
+                let opts = sorrel_data::diff::SpikeDiffOpts {
+                    match_jaccard,
+                    min_spikes,
+                    disputed: disputed
+                        .map(|p| sorrel_data::diff::read_disputed(&p))
+                        .transpose()?
+                        .unwrap_or_default(),
+                    ..Default::default()
+                };
+                diff_dirs(&a, &b, &root, &opts, json)
+            }
+            (None, false) if disputed.is_none() => diff_tsvs(&a, &b, json),
+            _ => bail!("sorrel diff: two directories need --root DIR; two files take no --root or --disputed"),
+        },
         Some(Cmd::Mcp { open, sub }) => match (sub, open.root.is_some()) {
             (Some(McpCmd::Tools { json }), _) => mcp_tools(json),
             (Some(McpCmd::Config { client, dir }), _) => mcp_config(client, dir),
