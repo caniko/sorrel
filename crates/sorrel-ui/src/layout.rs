@@ -426,6 +426,11 @@ pub fn show_popouts<P: DataProvider>(
                 return false;
             }
             toggle_fullscreen_on_f11(ui.ctx());
+            b.actions.extend(
+                screenshot_events(ui.ctx())
+                    .into_iter()
+                    .map(|(pane, image)| ViewAction::SaveScreenshot(pane, image)),
+            );
             // Only the focused window receives key events, so a chord is
             // handled once, by whichever window has focus. Esc here runs the
             // normal cancel chain (lasso first) and never closes the window.
@@ -456,6 +461,39 @@ pub fn key_intents(events: &[egui::Event], text_input_active: bool) -> Vec<crate
                 modifiers,
                 ..
             } => crate::intent::from_key_in_context(*key, *modifiers, text_input_active),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The pane screenshots delivered to the viewport `ctx` is drawing, each
+/// cropped to the rect it asked for. A screenshot event belongs to the
+/// viewport it was requested from; the rect is in that viewport's
+/// coordinates, so a pop-out's crop is never taken from the main window.
+pub fn screenshot_events(ctx: &egui::Context) -> Vec<(Pane, egui::ColorImage)> {
+    let (vp, ppp) = (ctx.viewport_id(), ctx.pixels_per_point());
+    ctx.input(|i| screenshots_in(&i.events, vp, ppp))
+}
+
+fn screenshots_in(
+    events: &[egui::Event],
+    viewport: egui::ViewportId,
+    ppp: f32,
+) -> Vec<(Pane, egui::ColorImage)> {
+    events
+        .iter()
+        .filter_map(|ev| match ev {
+            egui::Event::Screenshot {
+                viewport_id,
+                user_data,
+                image,
+            } if *viewport_id == viewport => {
+                let &(pane, rect) = user_data
+                    .data
+                    .as_ref()?
+                    .downcast_ref::<(Pane, egui::Rect)>()?;
+                Some((pane, image.region(&rect, Some(ppp))))
+            }
             _ => None,
         })
         .collect()
@@ -499,7 +537,11 @@ pub enum ViewAction {
     /// A key chord pressed in a pop-out window, run like the main window's.
     Intent(crate::intent::Intent),
     /// phy `screenshot`: save this pane's area of the window as a PNG.
-    Screenshot(Pane, egui::Rect),
+    /// `rect` is in the coordinates of the viewport that drew the pane (the
+    /// main window or a pop-out), which the screenshot is requested from.
+    Screenshot(Pane, egui::Rect, egui::ViewportId),
+    /// A pop-out's pane screenshot, cropped, ready to save.
+    SaveScreenshot(Pane, egui::ColorImage),
     /// Proposals card: accept or reject proposal `id`.
     Decide {
         id: u64,
@@ -851,8 +893,11 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
         }
         if *self.screenshot == Some(*pane) {
             *self.screenshot = None;
-            self.actions
-                .push(ViewAction::Screenshot(*pane, ui.max_rect()));
+            self.actions.push(ViewAction::Screenshot(
+                *pane,
+                ui.max_rect(),
+                ui.ctx().viewport_id(),
+            ));
         }
         let frozen = self.frozen.get(pane).cloned();
         // Inner padding: views draw edge to edge in the rect they are given.
@@ -1274,6 +1319,30 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screenshots_belong_to_the_requesting_viewport() {
+        let (root, popout) = (
+            egui::ViewportId::ROOT,
+            egui::ViewportId::from_hash_of("popout"),
+        );
+        let shot = |viewport_id| egui::Event::Screenshot {
+            viewport_id,
+            user_data: egui::UserData::new((
+                Pane::Ccg,
+                egui::Rect::from_min_size(egui::pos2(1.0, 1.0), egui::vec2(2.0, 3.0)),
+            )),
+            image: std::sync::Arc::new(egui::ColorImage::filled([8, 8], egui::Color32::RED)),
+        };
+        let events = [shot(root), shot(popout)];
+        // Each viewport crops its own frame, once.
+        for vp in [root, popout] {
+            let got = screenshots_in(&events, vp, 1.0);
+            assert_eq!(got.len(), 1);
+            assert_eq!((got[0].0, got[0].1.size), (Pane::Ccg, [2, 3]));
+        }
+        assert!(screenshots_in(&events, egui::ViewportId::from_hash_of("other"), 1.0).is_empty());
+    }
 
     #[test]
     fn default_tree_has_every_pane_exactly_once() {

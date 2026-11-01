@@ -329,16 +329,7 @@ pub fn cluster_scatter_view<P: DataProvider>(
         state.pz.interact(&resp, data);
     }
     if ev.consumed {
-        // Select on release, not on every frame of a node drag.
-        if resp.dragged() || !state.lasso.is_closed() {
-            return None;
-        }
-        let inside: Vec<ClusterId> = pts
-            .iter()
-            .filter(|p| state.lasso.contains([p.1, p.2]))
-            .map(|p| p.0)
-            .collect();
-        return (!inside.is_empty()).then_some(inside);
+        return lasso_pick(ev.drawn && !resp.dragged(), &state.lasso, &pts);
     }
     if resp.clicked() {
         let c = hovered?;
@@ -359,6 +350,25 @@ pub fn cluster_scatter_view<P: DataProvider>(
     None
 }
 
+/// The clusters inside the lasso, when `drawn`: a Ctrl gesture (stroke
+/// release, node click) finished it. Moving, inserting or deleting a node of
+/// a closed lasso leaves the selection alone.
+fn lasso_pick(
+    drawn: bool,
+    lasso: &Lasso,
+    pts: &[(ClusterId, f32, f32, f32)],
+) -> Option<Vec<ClusterId>> {
+    if !drawn {
+        return None;
+    }
+    let inside: Vec<ClusterId> = pts
+        .iter()
+        .filter(|p| lasso.contains([p.1, p.2]))
+        .map(|p| p.0)
+        .collect();
+    (!inside.is_empty()).then_some(inside)
+}
+
 fn col_index(c: Column) -> usize {
     match c {
         Column::NSpikes => 0,
@@ -372,6 +382,18 @@ fn col_index(c: Column) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_drawn_lasso_selects() {
+        let lasso = Lasso::new(0, vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]]);
+        let pts = [(ClusterId(1), 1.0, 1.0, 0.0), (ClusterId(2), 9.0, 9.0, 0.0)];
+        assert_eq!(lasso_pick(true, &lasso, &pts), Some(vec![ClusterId(1)]));
+        // A node edit of the closed lasso: not drawn, so no selection.
+        assert_eq!(lasso_pick(false, &lasso, &pts), None);
+        // An open lasso encloses nothing.
+        let open = Lasso::new(0, vec![[0.0, 0.0], [4.0, 0.0]]);
+        assert_eq!(lasso_pick(true, &open, &pts), None);
+    }
 
     #[test]
     fn columns_round_trip_phy_names() {

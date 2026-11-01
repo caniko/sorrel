@@ -123,6 +123,23 @@ struct LinkedSnippets {
 // move it onto a crate::jobs worker if lists ever grow.
 const MAX_LINKED_PER_CLUSTER: usize = 100;
 
+/// The link's spikes, unless made against an older curation version
+/// (Features not redrawn since): the indices now name other spikes.
+fn link_spikes(link: &FeatureLink, version: u64) -> &[(ClusterId, std::sync::Arc<[u32]>)] {
+    if link.version == version {
+        &link.spikes
+    } else {
+        &[]
+    }
+}
+
+/// At most `cap` of `idx`, spread over the whole list (a stride would keep
+/// only the first `cap` of 101..=2*cap entries).
+fn spread(idx: &[u32], cap: usize) -> impl Iterator<Item = u32> + '_ {
+    let take = idx.len().min(cap);
+    (0..take).map(move |i| idx[i * idx.len() / take])
+}
+
 impl Default for WaveformCache {
     fn default() -> Self {
         Self {
@@ -327,7 +344,7 @@ impl WaveformCache {
             self.cfg,
             &self.shanks,
             session,
-            &link.spikes,
+            link_spikes(link, session.version()),
             pre,
             post,
         );
@@ -405,10 +422,8 @@ impl WaveformCache {
             .flat_map(|(c, idx)| {
                 let bucket = session.spike_times(*c);
                 // Evenly thinned: a brush can hold thousands.
-                idx.iter()
-                    .step_by((idx.len() / MAX_LINKED_PER_CLUSTER).max(1))
-                    .take(MAX_LINKED_PER_CLUSTER)
-                    .filter_map(move |&i| bucket.get(i as usize).copied())
+                spread(idx, MAX_LINKED_PER_CLUSTER)
+                    .filter_map(move |i| bucket.get(i as usize).copied())
             })
             .collect();
         let sr = session.provider.sample_rate();
@@ -816,9 +831,17 @@ pub fn waveform_view<P: DataProvider>(
     // Spike brush: the split what-if's inside part (lasso / k-means) or the
     // ISI violators of every selected cluster, drawn as ink; and the merge
     // ghost's mean.
+    // Only a brush of this curation version: its indices are bucket
+    // positions (`Brushes::sync` drops older ones at the start of a frame).
+    let current = brushes.synced.is_none_or(|v| v == session.version());
+    let brush = brushes
+        .spikes
+        .as_ref()
+        .filter(|b| b.version == session.version());
     let whatif =
-        crate::isi_view::split_target(brushes, selection, |c| session.spike_times(c).len());
-    let brushed: Vec<_> = match (&brushes.spikes, &whatif) {
+        crate::isi_view::split_target(brushes, selection, |c| session.spike_times(c).len())
+            .filter(|_| brush.is_some());
+    let brushed: Vec<_> = match (brush, &whatif) {
         (_, Some((c, idx))) => vec![(*c, std::sync::Arc::clone(idx))],
         (Some(b), None) if b.source == crate::brush::BrushSource::IsiViolators => b
             .spikes
@@ -833,10 +856,10 @@ pub fn waveform_view<P: DataProvider>(
     // the selected clusters' (bold accent).
     let hovered = brushes
         .hover
-        .filter(|h| selection.contains(&h.cluster))
+        .filter(|h| current && selection.contains(&h.cluster))
         .map(|h| (h.cluster, h.local));
     cache.ensure_hovered(session, hovered, pre, post);
-    match (&brushes.spikes, &whatif) {
+    match (brush, &whatif) {
         (Some(b), Some((c, _))) if selection.contains(c) => {
             let slot = selection.iter().position(|x| x == c).unwrap_or(0);
             cache.ensure_whatif(session, b, *c, slot, nc, snippet_len);
@@ -1526,6 +1549,33 @@ pub(crate) fn signed_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spread_covers_the_whole_list() {
+        let idx: Vec<u32> = (0..150).collect();
+        let got: Vec<u32> = spread(&idx, 100).collect();
+        assert_eq!(got.len(), 100);
+        assert!(got.windows(2).all(|w| w[0] < w[1]), "ordered, distinct");
+        assert!(
+            got[0] == 0 && got[99] >= 145,
+            "reaches the tail: {}",
+            got[99]
+        );
+        let short: Vec<u32> = spread(&idx[..7], 100).collect();
+        assert_eq!(short, idx[..7]);
+        assert_eq!(spread(&[], 100).count(), 0);
+    }
+
+    #[test]
+    fn a_link_from_an_older_version_yields_no_spikes() {
+        let link = FeatureLink {
+            spikes: vec![(ClusterId(1), std::sync::Arc::from([4u32, 5]))],
+            version: 3,
+            ..Default::default()
+        };
+        assert_eq!(link_spikes(&link, 3).len(), 1);
+        assert!(link_spikes(&link, 4).is_empty(), "after a curation edit");
+    }
 
     #[test]
     fn nearest_channels_stay_on_the_shank() {

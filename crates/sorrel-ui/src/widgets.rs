@@ -240,15 +240,23 @@ pub fn trace_view<P: DataProvider>(
     // row with a solid tick through it. Brushed spikes get an ink tick on
     // top; every tick is a click target for the sticky pick below.
     let w_end = window_start + window_len as u64;
-    let ink_stroke = Stroke::new(2.0_f32, ink(theme.dark));
+    let ink_colour = ink(theme.dark);
     // `(spike, x, tick top, tick bottom)`.
     let mut ticks: Vec<(HoverSpike, f32, f32, f32)> = Vec::new();
+    let sr = session.provider.sample_rate().max(1.0);
     for m in markers {
         let lo = m.times.partition_point(|t| t.0 < window_start);
         let hi = m.times.partition_point(|t| t.0 < w_end);
-        let stroke = Stroke::new(1.5_f32, m.colour);
         let brushed = brushes.spikes.as_ref().map_or(&[][..], |b| b.of(m.cluster));
         for (local, t) in m.times.iter().enumerate().take(hi).skip(lo) {
+            // Time brush: fade outside the range, hide (and unpickable)
+            // when `only`.
+            let Some(fade) = time_alpha(brushes.time, t.0 as f32 / sr, 255) else {
+                continue;
+            };
+            let fade = fade as f32 / 255.0;
+            let colour = m.colour.gamma_multiply(fade);
+            let stroke = Stroke::new(1.5_f32, colour);
             let x = plot.left() + (t.0 - window_start) as f32 / window_len as f32 * plot.width();
             let (y0, y1) = match m.channel {
                 Some(ch) if (ch as u32) < n_channels => {
@@ -258,10 +266,13 @@ pub fn trace_view<P: DataProvider>(
                 _ => (plot.top(), plot.bottom()),
             };
             let band = egui::Rect::from_min_max(egui::pos2(x - 2.5, y0), egui::pos2(x + 2.5, y1));
-            painter.rect_filled(band, 0.0, m.colour.gamma_multiply(0.3));
+            painter.rect_filled(band, 0.0, colour.gamma_multiply(0.3));
             painter.line_segment([egui::pos2(x, y0), egui::pos2(x, y1)], stroke);
             if brushed.binary_search(&(local as u32)).is_ok() {
-                painter.line_segment([egui::pos2(x, y0), egui::pos2(x, y1)], ink_stroke);
+                painter.line_segment(
+                    [egui::pos2(x, y0), egui::pos2(x, y1)],
+                    Stroke::new(2.0_f32, ink_colour.gamma_multiply(fade)),
+                );
             }
             let hover = HoverSpike {
                 cluster: m.cluster,
@@ -271,7 +282,6 @@ pub fn trace_view<P: DataProvider>(
             ticks.push((hover, x, y0, y1));
         }
     }
-    let sr = session.provider.sample_rate().max(1.0);
     time_overlays(
         ui,
         &painter,

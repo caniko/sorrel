@@ -32,27 +32,40 @@ impl MergeTip {
     }
 }
 
-/// Merge previews per hovered candidate row, one [`Memo`] each keyed by
-/// (session version, target), so a row is computed once and not per frame.
+/// Merge preview of the hovered row, a [`Memo`] keyed by (session version,
+/// target), so it is computed once and not per frame. Only the hovered
+/// source keeps a memo: moving to another row drops (and so cancels) the
+/// previous one's scan, and the map is cleared when nothing is hovered.
 #[derive(Default)]
 pub struct MergeTips(HashMap<ClusterId, Memo<(u64, ClusterId), MergeTip>>);
 
 impl MergeTips {
-    /// A row for candidate `c` is hovered: ghost it and show what merging it
-    /// into `target` would do, in the warn colour when it looks risky.
+    /// No row is hovered: cancel and drop every preview scan.
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// A row merging `source` into `target` is hovered: show what that does,
+    /// in the warn colour when it looks risky, and ghost `ghost` (if any).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn hover<P: DataProvider>(
         &mut self,
         ui: &Ui,
         jobs: &JobCtx<Session<P>>,
         version: u64,
+        source: ClusterId,
         target: ClusterId,
-        c: ClusterId,
+        ghost: Option<ClusterId>,
         brushes: &mut Brushes,
     ) {
-        if c == target {
+        if source == target {
             return;
         }
-        brushes.ghost_next = Some(Ghost::Merge(c));
+        if let Some(g) = ghost {
+            brushes.ghost_next = Some(Ghost::Merge(g));
+        }
+        let c = source;
+        self.0.retain(|&k, _| k == c);
         let tip = self
             .0
             .entry(c)
@@ -88,18 +101,12 @@ impl MergeTips {
     }
 }
 
-/// The candidate to ghost for a Suggest merge row `(a, b)`: the one that
-/// isn't selected, merged into the first selected cluster. `None` unless
-/// exactly one of the pair is selected.
-pub(crate) fn ghost_pair(
-    sel: &[ClusterId],
-    a: ClusterId,
-    b: ClusterId,
-) -> Option<(ClusterId, ClusterId)> {
-    let target = *sel.first()?;
+/// The cluster to ghost for a Suggest merge row `a` into `b`: the one that
+/// isn't selected. `None` unless exactly one of the pair is selected.
+pub(crate) fn ghost_of(sel: &[ClusterId], a: ClusterId, b: ClusterId) -> Option<ClusterId> {
     match (sel.contains(&a), sel.contains(&b)) {
-        (true, false) => Some((target, b)),
-        (false, true) => Some((target, a)),
+        (true, false) => Some(b),
+        (false, true) => Some(a),
         _ => None,
     }
 }
@@ -218,10 +225,13 @@ pub fn similarity_view<P: DataProvider>(
     );
     pane.state.drawn = pane.state.key.clone();
     // Hovering a row ghosts that cluster as a merge into the first selected one.
-    if let (Some(c), Some(&target)) = (pane.state.table.hovered, selected.first()) {
-        pane.state
-            .tips
-            .hover(ui, jobs, session.version(), target, c, brushes);
+    match (pane.state.table.hovered, selected.first()) {
+        (Some(c), Some(&target)) => {
+            pane.state
+                .tips
+                .hover(ui, jobs, session.version(), c, target, Some(c), brushes)
+        }
+        _ => pane.state.tips.clear(),
     }
     match click? {
         RowClick::Toggle(c) => Some((c, true)),
@@ -235,15 +245,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ghost_pair_is_the_unselected_one_into_the_first_selected() {
+    fn ghost_of_is_the_unselected_end_of_the_row() {
         let c = ClusterId;
         let sel = [c(3), c(8)];
-        assert_eq!(ghost_pair(&sel, c(8), c(5)), Some((c(3), c(5))));
-        assert_eq!(ghost_pair(&sel, c(5), c(3)), Some((c(3), c(5))));
-        // Both selected, or neither: nothing to preview.
-        assert_eq!(ghost_pair(&sel, c(3), c(8)), None);
-        assert_eq!(ghost_pair(&sel, c(1), c(2)), None);
-        assert_eq!(ghost_pair(&[], c(1), c(2)), None);
+        // The row merges a into b whichever end is selected.
+        assert_eq!(ghost_of(&sel, c(8), c(5)), Some(c(5)));
+        assert_eq!(ghost_of(&sel, c(5), c(3)), Some(c(5)));
+        // Both selected, or neither: tooltip only, no ghost.
+        assert_eq!(ghost_of(&sel, c(3), c(8)), None);
+        assert_eq!(ghost_of(&sel, c(1), c(2)), None);
+        assert_eq!(ghost_of(&[], c(1), c(2)), None);
     }
 
     #[test]

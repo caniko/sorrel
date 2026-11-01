@@ -38,6 +38,10 @@ pub(crate) fn rows<P: DataProvider>(session: &Session<P>) -> Vec<Row> {
 }
 
 const HOVER_HINT: &str = "hover: shows the clusters before this edit in Features 3D";
+/// For rows without a ghost: off the current branch (its pre-edit
+/// memberships are gone) or an edit that moves no spikes.
+const NO_GHOST_HINT: &str =
+    "the before-edit ghost is only shown for spike-moving edits on the current branch";
 
 /// `HH:MM:SS` (UTC) of a Unix-millisecond timestamp; empty for 0 (nodes
 /// upgraded from a v2 journal have no time).
@@ -87,9 +91,15 @@ pub fn history_view<P: DataProvider>(
             }
             // The root (the sort as loaded) has no edit before it to ghost.
             if let (Some(n), true) = (node, row.contains_pointer()) {
-                hovered = Some(n);
-                brushes.ghost_next = Some(Ghost::History(n));
-                row.on_hover_text(HOVER_HINT);
+                // Only publish what Features 3D can resolve.
+                let hint = if session.has_pre_edit(n) {
+                    brushes.ghost_next = Some(Ghost::History(n));
+                    HOVER_HINT
+                } else {
+                    NO_GHOST_HINT
+                };
+                hovered = Some(hint);
+                row.on_hover_text(hint);
             }
             if saved.contains(&node) {
                 ui.label(egui::RichText::new("saved").color(theme.good).small());
@@ -99,9 +109,9 @@ pub fn history_view<P: DataProvider>(
             }
         });
     }
-    if hovered.is_some() {
+    if let Some(hint) = hovered {
         ui.add_space(4.0);
-        ui.weak(HOVER_HINT);
+        ui.weak(hint);
     }
     picked
 }

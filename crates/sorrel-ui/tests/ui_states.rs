@@ -2395,7 +2395,10 @@ fn xtalk_history_ghost() {
             h.state().brushes().ghost
         );
         h.get_by_label_contains("before #");
-        snap_hovered(&mut h, "xtalk_history_ghost", name, at, 400);
+        // The History row prints the edit's wall-clock time (HH:MM:SS), which
+        // no fixture pins: up to ~1.4k pixels of glyphs change between runs.
+        // The ghost itself is asserted above through the brush state.
+        snap_hovered(&mut h, "xtalk_history_ghost", name, at, 2500);
         h
     });
 }

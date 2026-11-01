@@ -34,6 +34,9 @@ pub trait Tab {
     fn request_close(&mut self);
     fn close_state(&self) -> CloseState;
     fn on_exit(&mut self);
+    /// Called every frame while the tab is not the active one, to keep its
+    /// pop-out windows alive (egui drops a viewport that is not shown).
+    fn popouts(&mut self, _ctx: &egui::Context) {}
 }
 
 /// What to open: `sorrel open`'s arguments, relative to `cwd`.
@@ -429,6 +432,11 @@ impl eframe::App for Shell {
             }
             None => {
                 egui::CentralPanel::default().show_inside(root_ui, |ui| self.launcher(ui));
+            }
+        }
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            if i != self.active {
+                tab.popouts(&ctx);
             }
         }
     }

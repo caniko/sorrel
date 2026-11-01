@@ -37,11 +37,15 @@ pub struct Lasso {
 }
 
 /// What `interact` did: `changed` the polygon, or `consumed` the input (the
-/// caller must then skip its own pan/zoom/double-click handling).
+/// caller must then skip its own pan/zoom/double-click handling). `drawn`
+/// is set when a Ctrl gesture (stroke release, node click) shaped the
+/// lasso, as opposed to an unmodified edit of a closed one (node move,
+/// insert, delete); selecting what is inside belongs to `drawn` only.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LassoEvent {
     pub changed: bool,
     pub consumed: bool,
+    pub drawn: bool,
 }
 
 impl Lasso {
@@ -120,6 +124,7 @@ impl Lasso {
                         ..Self::default()
                     };
                     ev.changed = true;
+                    ev.drawn = true;
                 }
             }
             return ev;
@@ -131,6 +136,7 @@ impl Lasso {
                 return LassoEvent {
                     changed: true,
                     consumed: true,
+                    ..LassoEvent::default()
                 };
             }
             if let (true, Some(p)) = (resp.clicked(), at) {
@@ -142,6 +148,7 @@ impl Lasso {
                     return LassoEvent {
                         changed: true,
                         consumed: true,
+                        drawn: true,
                     };
                 }
             }

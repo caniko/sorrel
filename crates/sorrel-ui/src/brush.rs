@@ -17,6 +17,7 @@
 //! session version they were made against and [`Brushes::sync`] drops stale
 //! ones.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use sorrel_io::ClusterId;
@@ -54,7 +55,11 @@ pub struct SpikeBrush {
     pub spikes: Vec<(ClusterId, Arc<[u32]>)>,
     /// Session version the indices refer to.
     pub version: u64,
+    /// Unique per built brush (see [`Self::key`]).
+    generation: u64,
 }
+
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 impl SpikeBrush {
     /// Build a brush; sorts and dedups each cluster's indices and drops
@@ -72,10 +77,11 @@ impl SpikeBrush {
                 (!v.is_empty()).then(|| (c, Arc::from(v)))
             })
             .collect();
-        (!spikes.is_empty()).then_some(Self {
+        (!spikes.is_empty()).then(|| Self {
             source,
             spikes,
             version,
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -99,10 +105,16 @@ impl SpikeBrush {
         self.len() == 0
     }
 
-    /// Identity for caches: changes whenever the brush is replaced.
+    /// Identity for caches: changes whenever a brush is built anew (a clone
+    /// keeps it). The last field is the unique generation, not an address a
+    /// later allocation could reuse.
     pub fn key(&self) -> (BrushSource, u64, usize, usize) {
-        let first = self.spikes.first().map_or(0, |(_, v)| v.as_ptr() as usize);
-        (self.source, self.version, self.len(), first)
+        (
+            self.source,
+            self.version,
+            self.len(),
+            self.generation as usize,
+        )
     }
 }
 
@@ -159,14 +171,21 @@ pub struct Brushes {
     /// Written by panes this frame; promoted by [`Brushes::end_frame`].
     pub hover_next: Option<HoverSpike>,
     pub ghost_next: Option<Ghost>,
+    /// The session version of the last [`Brushes::sync`].
+    pub(crate) synced: Option<u64>,
 }
 
 impl Brushes {
     /// Start of frame: drop a spike brush made against an older session
-    /// version (its local indices no longer mean the same spikes).
+    /// version (its local indices no longer mean the same spikes), and the
+    /// hovered spike with it (a bucket index too).
     pub fn sync(&mut self, version: u64) {
         if self.spikes.as_ref().is_some_and(|b| b.version != version) {
             self.spikes = None;
+        }
+        if self.synced.replace(version).is_some_and(|v| v != version) {
+            self.hover = None;
+            self.hover_next = None;
         }
     }
 
@@ -246,8 +265,25 @@ mod tests {
         };
         all.sync(7);
         assert!(all.spikes.is_some(), "same version keeps it");
+        all.hover = Some(HoverSpike {
+            cluster: ClusterId(1),
+            local: 3,
+            sample: 9,
+        });
         all.sync(8);
         assert!(all.spikes.is_none(), "an edit drops it");
+        assert!(all.hover.is_none(), "and the hovered bucket index");
+    }
+
+    #[test]
+    fn key_is_unique_per_built_brush_and_kept_by_clones() {
+        let make =
+            || SpikeBrush::new(BrushSource::KMeansPart, 1, [(ClusterId(1), vec![0, 1])]).unwrap();
+        let (a, b) = (make(), make());
+        assert_ne!(a.key(), b.key(), "same content, different brush");
+        assert_eq!(a.key(), a.clone().key());
+        drop(a);
+        assert_ne!(b.key(), make().key(), "no reuse after a drop");
     }
 
     #[test]

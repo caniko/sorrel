@@ -592,6 +592,10 @@ fn build_scene(inp: &SceneInput) -> (Scene3d, Scene3d, Scene3d) {
                 .is_some_and(|&c| b.contains(c, p.local))
         });
         if brushed {
+            // The part's hull is independent of the ink layer.
+            if members[i] {
+                part_pts.push(pos);
+            }
             ink.push(Point3 {
                 pos,
                 color: rgba(palette.part, 240.0 / 255.0 * fade),
@@ -828,9 +832,14 @@ pub(crate) fn feature_3d<P: DataProvider>(
         if matches!(session.origin(c), UnitOrigin::Auto) || parents.iter().any(|p| p.0 == parent) {
             continue;
         }
+        // Before the split: the children and what the parent kept.
         let siblings = (0..session.n_clusters())
             .map(ClusterId)
-            .filter(|&c2| c2 == c || session.parents(c2).contains(&parent))
+            .filter(|&c2| {
+                c2 == c
+                    || session.parents(c2).contains(&parent)
+                    || (c2 == parent && !session.spike_times(c2).is_empty())
+            })
             .collect();
         parents.push((parent, siblings));
     }
@@ -1878,6 +1887,70 @@ mod tests {
             by_time.0.points[0].color,
             scene(BrushInput::default()).0.points[0].color
         );
+    }
+
+    #[test]
+    fn the_part_hull_survives_the_part_being_the_brush() {
+        let (set, _) = with_locals_and_depths(2, &[0, 1]);
+        let styles = [
+            Style {
+                colour: Color32::RED,
+                filled: true,
+            },
+            Style {
+                colour: Color32::BLUE,
+                filled: true,
+            },
+        ];
+        let palette = Palette {
+            cube: Color32::GRAY,
+            ghost: Color32::GRAY,
+            strong: Color32::WHITE,
+            accent: Color32::LIGHT_BLUE,
+            part: Color32::WHITE,
+            dark: true,
+        };
+        let part: Vec<usize> = (0..set.points.len())
+            .filter(|&i| set.points[i].slot == 0)
+            .collect();
+        let selection = [ClusterId(0), ClusterId(1)];
+        let lines = |km_part: Option<&[usize]>, brush: Option<&crate::brush::SpikeBrush>| {
+            let overlay = Overlay {
+                km_part,
+                lasso: None,
+                km_parts: None,
+                focus: (Dim::Time, Dim::Time),
+            };
+            build_scene(&SceneInput {
+                set: &set,
+                triple: [1, 2, 3],
+                styles: &styles,
+                ghosts: &[],
+                overlay: &overlay,
+                palette: &palette,
+                brush: BrushInput {
+                    spikes: brush.map(|b| (b, &selection[..])),
+                    ..Default::default()
+                },
+            })
+            .0
+            .lines
+            .len()
+        };
+        // The brush is exactly the part's members, as for a k-means preview.
+        let members: Vec<u32> = part.iter().map(|&i| set.points[i].local).collect();
+        let b = crate::brush::SpikeBrush::new(
+            crate::brush::BrushSource::KMeansPart,
+            0,
+            [(ClusterId(0), members)],
+        )
+        .unwrap();
+        let (plain, with_part) = (lines(None, Some(&b)), lines(Some(&part), Some(&b)));
+        assert!(
+            with_part > plain,
+            "dotted part hull: {with_part} vs {plain}"
+        );
+        assert_eq!(with_part, lines(Some(&part), None), "same with no brush");
     }
 
     #[test]

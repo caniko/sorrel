@@ -57,6 +57,9 @@ pub struct FeatureLink {
     /// Closed-lasso hits or the previewed part's members per cluster, as
     /// local spike indices, at most 100 per cluster (evenly thinned).
     pub spikes: Vec<(ClusterId, std::sync::Arc<[u32]>)>,
+    /// Session version `spikes` was made against (a later one renumbers the
+    /// buckets, so Waveforms ignores them).
+    pub version: u64,
     /// PC1 and PC2 temporal shapes on each highlighted channel.
     pub basis: Vec<(u32, std::sync::Arc<[Vec<f32>; 2]>)>,
 }
@@ -563,6 +566,8 @@ pub struct KmState {
     lasso_auto: bool,
     /// The split preview shows a k-means part (not a proposal).
     previewing: bool,
+    /// Generation of the feature set the previewed part was fitted on.
+    preview_set: u64,
     /// Bring the lasso's cell into view on the next frame.
     scroll_to_lasso: bool,
     memo: Memo<KmKey, Option<Arc<KmFit>>>,
@@ -1092,6 +1097,26 @@ impl FeatureViewState {
         self.clear_km_preview();
     }
 
+    /// A hand edit makes the lasso the user's: auto-run leaves it, and it no
+    /// longer wraps the previewed k-means part, so that preview ends and the
+    /// brush follows the polygon.
+    fn lasso_edited(&mut self) {
+        self.km.lasso_auto = false;
+        self.clear_km_preview();
+    }
+
+    /// The previewed k-means part's exact members for a split on `set`, while
+    /// the lasso is still its auto lasso.
+    fn km_members(&self, set: &FeatureSet) -> Option<Vec<(ClusterId, Vec<u32>)>> {
+        let (c, members) = self.preview.as_ref()?;
+        if !(self.km.previewing && self.km.lasso_auto && self.km.preview_set == set.generation) {
+            return None;
+        }
+        let mut v: Vec<u32> = members.iter().copied().collect();
+        v.sort_unstable();
+        Some(vec![(*c, v)])
+    }
+
     /// Drop the k-means highlight (not a proposal's) with the lasso it drew.
     fn clear_km_preview(&mut self) {
         if self.km.previewing {
@@ -1099,6 +1124,11 @@ impl FeatureViewState {
             self.preview_gen += 1;
             self.km.previewing = false;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_lasso(&mut self) {
+        self.lasso = Lasso::new(0, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
     }
 
     pub fn lasso_active(&self) -> bool {
@@ -1612,6 +1642,10 @@ pub fn feature_view<P: DataProvider>(
 
     // With the grid beside it (Expansive) the focused 2-D cell wins.
     let from_triple = state.mode == ViewMode::Three && layout != Layout::Expansive;
+    // Computed PCs: a closed lasso previews and splits every spike, not the
+    // display sample. `want_full` follows the lasso (it drops with it, in
+    // `cancel_lasso` or here) and the brush waits for the full set.
+    state.want_full = computed && state.lasso.is_closed();
     sync_brush(state, &set, selection, session.version(), brushes);
     if let Some(h) = state.hover_out.take() {
         brushes.hover_next = Some(h);
@@ -1628,20 +1662,30 @@ pub fn feature_view<P: DataProvider>(
         shanks,
         from_triple,
         brushes,
+        session.version(),
     );
     state.stamp_lasso(&cur, current.is_some());
-    if state.split_requested && state.lasso.is_closed() {
-        match current.filter(|s| s.full || !s.computed) {
-            Some(set) => {
-                state.split_requested = false;
-                state.want_full = false;
-                let splits = lasso_hits(&set, &state.lasso, selection);
-                state.cancel_lasso();
-                return Some(splits);
-            }
-            // Computed PCs: project every lassoed spike, then split.
-            None => state.want_full = true,
+    // Computed PCs wait for the full set (`want_full`, above) to split.
+    if let Some(set) = current
+        .filter(|s| s.full || !s.computed)
+        .filter(|_| state.split_requested && state.lasso.is_closed())
+    {
+        // The previewed part's members while the lasso is its auto lasso,
+        // else the polygon's hits. A part fitted on the sample is refitted on
+        // the full set first (the fit is in flight unless it failed).
+        let fit_pending = state.km.previewing
+            && state.km.lasso_auto
+            && state.km.preview_set != set.generation
+            && !matches!(&state.km.fit, Some((k, _)) if *k == km_key);
+        if fit_pending {
+            return None;
         }
+        state.split_requested = false;
+        let splits = state
+            .km_members(&set)
+            .unwrap_or_else(|| lasso_hits(&set, &state.lasso, selection));
+        state.cancel_lasso();
+        return Some(splits);
     }
     None
 }
@@ -1780,6 +1824,11 @@ fn sync_brush(
     version: u64,
     brushes: &mut Brushes,
 ) {
+    // A sampled set (computed PCs) holds only some of the spikes the split
+    // would move: keep the old brush until the full set is in.
+    if set.computed && !set.full {
+        return;
+    }
     let want = want_brush(state, set);
     match brush_action(&mut state.brush_written, want) {
         BrushAction::Keep => {}
@@ -2371,6 +2420,7 @@ fn refresh_link<P: DataProvider>(
     shanks: &[u32],
     from_triple: bool,
     brushes: &Brushes,
+    version: u64,
 ) {
     let (dx, dy) = GRID[state.focus / 4][state.focus % 4];
     // The 3-D scene's triple, else the focused cell's channels.
@@ -2406,6 +2456,8 @@ fn refresh_link<P: DataProvider>(
     let link_key = h.finish();
     if link_key != state.link_key || state.link.set.is_empty() {
         state.link_key = link_key;
+        // The indices address the buckets of this curation version only.
+        state.link.version = version;
         // Whatever brush exists shows in Waveforms, from any view.
         state.link.spikes = match (&brushes.spikes, &state.preview, own_lasso) {
             (Some(b), ..) => b.spikes.iter().map(|(c, v)| (*c, thin(v))).collect(),
@@ -2902,11 +2954,8 @@ fn draw_cell<P: DataProvider>(
             state.lasso.interact(cell, &resp, to_data, to_screen)
         };
         if ev.changed {
-            // A hand-edited lasso is the user's: auto-run leaves it.
-            state.km.lasso_auto = false;
-            if !state.lasso.is_active() {
-                state.clear_km_preview();
-            } else if state.lasso.cell == cell {
+            state.lasso_edited();
+            if state.lasso.is_active() && state.lasso.cell == cell {
                 state.focus = cell;
             }
         }
@@ -3241,7 +3290,9 @@ fn kmeans_update<P: DataProvider>(
     anchor: ClusterId,
     jobs: &JobCtx<Session<P>>,
 ) {
-    if !(state.km.requested || state.km.auto_run) {
+    // A previewed part is refitted on a new set (computed PCs: the full one)
+    // so the brush and the split keep naming the part's members.
+    if !(state.km.requested || state.km.auto_run || state.km.previewing) {
         return;
     }
     let (s, k) = (Arc::clone(set), state.km.k);
@@ -3256,12 +3307,21 @@ fn kmeans_update<P: DataProvider>(
         state.km.fit = Some((key, fit.clone()));
         if state.km.applied != Some(key) {
             let take = state.km.requested || !state.lasso.is_active() || state.km.lasso_auto;
+            // Same cluster and k on another set (the full one): keep the part.
+            let same_fit = !state.km.requested
+                && state.km.lasso_auto
+                && state
+                    .km
+                    .applied
+                    .is_some_and(|a| (a.1, a.2) == (key.1, key.2));
             if let (true, Some(fit)) = (take, fit) {
                 // The smallest part a lasso could be drawn around.
-                state.km.part = (0..fit.parts.len())
-                    .rev()
-                    .find(|&i| fit.lassos[i].is_active())
-                    .unwrap_or(fit.parts.len() - 1);
+                if !same_fit {
+                    state.km.part = (0..fit.parts.len())
+                        .rev()
+                        .find(|&i| fit.lassos[i].is_active())
+                        .unwrap_or(fit.parts.len() - 1);
+                }
                 apply_part(state, set, &fit, anchor);
             }
             state.km.applied = Some(key);
@@ -3375,6 +3435,7 @@ fn apply_part(state: &mut FeatureViewState, set: &FeatureSet, fit: &KmFit, ancho
     ));
     state.preview_gen += 1;
     state.km.previewing = true;
+    state.km.preview_set = set.generation;
     state.km.scroll_to_lasso = true;
 }
 
@@ -4240,6 +4301,64 @@ mod tests {
         let lasso = Lasso::new(1, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
         let hits = lasso_hits(&set, &lasso, &[ClusterId(7), ClusterId(9)]);
         assert_eq!(hits, vec![(ClusterId(7), vec![0]), (ClusterId(9), vec![0])]);
+    }
+
+    fn one_point_set(computed: bool, full: bool) -> FeatureSet {
+        let points = vec![FeaturePoint {
+            local: 3,
+            slot: 0,
+            t: 0.0,
+        }];
+        let mut set = FeatureSet::new(
+            vec![0, 1],
+            computed,
+            full,
+            points,
+            vec![0.5, 0.5, 0.0, 0.0],
+            1.0,
+        );
+        set.bounds = vec![(-1.0, 1.0); 4];
+        set
+    }
+
+    #[test]
+    fn k_splits_the_previewed_part_until_the_lasso_is_hand_edited() {
+        let set = one_point_set(false, true);
+        let mut st = FeatureViewState::default();
+        assert!(st.km_members(&set).is_none());
+        st.preview = Some((ClusterId(4), [9, 2, 5].into_iter().collect()));
+        st.km.previewing = true;
+        st.km.lasso_auto = true;
+        st.km.preview_set = set.generation;
+        assert_eq!(
+            st.km_members(&set),
+            Some(vec![(ClusterId(4), vec![2, 5, 9])]),
+            "the part's members, whatever the hull holds"
+        );
+        // Fitted on another set (the sample): not this set's members.
+        assert!(st.km_members(&one_point_set(false, true)).is_none());
+        st.lasso_edited();
+        assert!(st.preview.is_none() && !st.km.previewing && !st.km.lasso_auto);
+        assert!(st.km_members(&set).is_none());
+    }
+
+    #[test]
+    fn computed_lasso_publishes_its_brush_only_from_the_full_set() {
+        let (mut st, mut b) = (FeatureViewState::default(), Brushes::default());
+        st.lasso = Lasso::new(0, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+        sync_brush(
+            &mut st,
+            &one_point_set(true, false),
+            &[ClusterId(7)],
+            2,
+            &mut b,
+        );
+        assert!(b.spikes.is_none(), "the sample is not the lassoed set");
+        let full = one_point_set(true, true);
+        sync_brush(&mut st, &full, &[ClusterId(7)], 2, &mut b);
+        let brush = b.spikes.as_ref().expect("published from the full set");
+        assert_eq!(brush.of(ClusterId(7)), &[3]);
+        assert_eq!(brush.source, BrushSource::FeatureLasso);
     }
 
     /// Three channels; clusters 0 and 1 differ only on channels 20 (PC1) and

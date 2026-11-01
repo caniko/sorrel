@@ -11,7 +11,7 @@ use sorrel_data::{
     cluster_quality, preview_merge, DepthSource, MergeCandidate, Session, SpikeDepths,
     SplitCandidate, SuggestConfig,
 };
-use sorrel_io::{ClusterId, DataProvider, Events};
+use sorrel_io::{ClusterId, DataProvider, Events, SampleIndex};
 
 use crate::theme::{selection_colour, Theme};
 
@@ -785,6 +785,27 @@ pub fn raster_view<P: DataProvider>(
         .add(eframe::egui_wgpu::Callback::new_paint_callback(
             data, callback,
         ));
+    // Time brush on the GPU dots: cover the time outside the range with the
+    // plot background (opaque when `only`, 80 % when fading) instead of
+    // re-colouring and re-uploading tens of millions of vertices on every
+    // drag frame. The selected and brushed ticks below fade per spike.
+    if let Some(tb) = brushes.time {
+        let px = |t: f32| data.left() + (t - v0) / v_span * data.width();
+        let (a, b) = (
+            px(tb.start).clamp(data.left(), data.right()),
+            px(tb.end).clamp(data.left(), data.right()),
+        );
+        let cover = theme
+            .plot_bg
+            .gamma_multiply(if tb.only { 1.0 } else { 0.8 });
+        for (l, r) in [(data.left(), a), (b, data.right())] {
+            dp.rect_filled(
+                egui::Rect::from_x_y_ranges(l..=r, data.y_range()),
+                0.0,
+                cover,
+            );
+        }
+    }
 
     // Selected clusters in their slot colour, drawn as 2 px ticks over the
     // neutral GPU dots.
@@ -805,11 +826,15 @@ pub fn raster_view<P: DataProvider>(
         let yc = row_y(row as f32 + 0.5);
         let colour = selection_colour(slot);
         for t in session.spike_times(c).iter().step_by(stride) {
-            let x = data.left() + (t.as_f32() * inv_sr - v0) / v_span * data.width();
+            let ts = t.as_f32() * inv_sr;
+            let Some(a) = crate::widgets::time_alpha(brushes.time, ts, 255) else {
+                continue;
+            };
+            let x = data.left() + (ts - v0) / v_span * data.width();
             dp.rect_filled(
                 egui::Rect::from_center_size(egui::pos2(x, yc), egui::vec2(2.0, tick_h)),
                 0.0,
-                colour,
+                colour.gamma_multiply(a as f32 / 255.0),
             );
         }
     }
@@ -834,11 +859,14 @@ pub fn raster_view<P: DataProvider>(
             let hi = locals.partition_point(|&l| at(l) <= v1);
             let yc = row_y(row as f32 + 0.5);
             for &l in locals[lo..hi].iter().step_by(((hi - lo) / 20_000).max(1)) {
+                let Some(a) = crate::widgets::time_alpha(brushes.time, at(l), 255) else {
+                    continue;
+                };
                 let x = data.left() + (at(l) - v0) / v_span * data.width();
                 dp.rect_filled(
                     egui::Rect::from_center_size(egui::pos2(x, yc), egui::vec2(2.0, ink_h)),
                     0.0,
-                    ink,
+                    ink.gamma_multiply(a as f32 / 255.0),
                 );
             }
         }
@@ -925,6 +953,30 @@ pub enum RasterClick {
 
 // ---- FiringRateView -----------------------------------------------------
 
+/// Spike counts of `bins` bins of `bin_s` seconds from `x0`. With an
+/// `only` time brush, spikes outside it are not counted.
+fn rate_counts(
+    times: &[SampleIndex],
+    sr: f32,
+    x0: f32,
+    bin_s: f32,
+    bins: usize,
+    time: Option<crate::brush::TimeBrush>,
+) -> Vec<u32> {
+    let mut h = vec![0u32; bins];
+    for &t in times {
+        let ts = t.0 as f64 / sr as f64;
+        if time.is_some_and(|b| b.only && !b.contains(ts as f32)) {
+            continue;
+        }
+        let u = (ts - x0 as f64) / bin_s as f64;
+        if u >= 0.0 && (u as usize) < bins {
+            h[u as usize] += 1;
+        }
+    }
+    h
+}
+
 /// Per-cluster firing rate over the recording, plotted as overlaid line
 /// graphs colour-coded by cluster. Useful for spotting drift, electrode
 /// failure, and post-stimulus modulation — all phy parity.
@@ -971,13 +1023,7 @@ pub fn firing_rate_view<P: DataProvider>(
     let mut max_count = 1u32;
     for &c in selection {
         let times = session.spike_times(c);
-        let mut h = vec![0u32; bins];
-        for &t in times {
-            let u = (t.0 as f64 / sr as f64 - x0 as f64) / bin_s as f64;
-            if u >= 0.0 && (u as usize) < bins {
-                h[u as usize] += 1;
-            }
-        }
+        let h = rate_counts(times, sr, x0, bin_s, bins, brushes.time);
         if let Some(&m) = h.iter().max() {
             if m > max_count {
                 max_count = m;
@@ -1028,6 +1074,22 @@ pub fn firing_rate_view<P: DataProvider>(
     for (ci, hist) in histograms.iter().enumerate() {
         let rates: Vec<f32> = hist.iter().map(|&c| c as f32 / bin_s).collect();
         step_hist(&dp, data, &rates, y_top, selection_colour(ci), fill);
+    }
+    // Time brush: fade the bins outside the range (with `only` they were
+    // never counted).
+    if let Some(tb) = brushes.time.filter(|tb| !tb.only) {
+        let px = |t: f32| data.left() + (t - x0) / (x1 - x0).max(1e-9) * data.width();
+        let (a, b) = (
+            px(tb.start).clamp(data.left(), data.right()),
+            px(tb.end).clamp(data.left(), data.right()),
+        );
+        for (l, r) in [(data.left(), a), (b, data.right())] {
+            dp.rect_filled(
+                egui::Rect::from_x_y_ranges(l..=r, data.y_range()),
+                0.0,
+                theme.plot_bg.gamma_multiply(0.8),
+            );
+        }
     }
     crate::widgets::time_overlays(ui, &dp, data, (x0, x1), brushes, sr);
 }
@@ -1237,6 +1299,29 @@ pub(crate) fn probe_site_edit(
         Some(ChannelEdit::Toggle(ch))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::rate_counts;
+    use crate::brush::TimeBrush;
+    use sorrel_io::SampleIndex;
+
+    #[test]
+    fn only_counts_in_range_spikes() {
+        // 10 Hz sampling: spikes at 0.5 s, 1.5 s, 2.5 s; 3 bins of 1 s.
+        let t = [5, 15, 25].map(SampleIndex);
+        let all = rate_counts(&t[..], 10.0, 0.0, 1.0, 3, None);
+        assert_eq!(all, [1, 1, 1]);
+        let tb = TimeBrush {
+            start: 1.0,
+            end: 2.0,
+            only: true,
+        };
+        assert_eq!(rate_counts(&t, 10.0, 0.0, 1.0, 3, Some(tb)), [0, 1, 0]);
+        let fade = TimeBrush { only: false, ..tb };
+        assert_eq!(rate_counts(&t, 10.0, 0.0, 1.0, 3, Some(fade)), all);
     }
 }
 
@@ -1735,13 +1820,19 @@ where
                     &sel,
                     &mut hovered,
                 );
-                // Hover ghosts the pair member that isn't selected, merged into the first selected.
-                if let Some((target, c)) =
-                    hovered.and_then(|(a, b)| crate::similarity_view::ghost_pair(&sel, a, b))
-                {
-                    cache
-                        .tips
-                        .hover(ui, jobs, session.version(), target, c, brushes);
+                // The row merges a into b: preview exactly that, ghosting
+                // the end that isn't selected.
+                match hovered {
+                    Some((a, b)) => cache.tips.hover(
+                        ui,
+                        jobs,
+                        session.version(),
+                        a,
+                        b,
+                        crate::similarity_view::ghost_of(&sel, a, b),
+                        brushes,
+                    ),
+                    None => cache.tips.clear(),
                 }
                 if action.is_none() {
                     action = merge_action;

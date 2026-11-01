@@ -239,8 +239,8 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     scheme: crate::theme::ColourScheme,
     scheme_colours: Option<SchemeColours>,
     scheme_gen: u64,
-    /// Pane rects waiting for a viewport screenshot.
-    pending_screenshots: Vec<(Pane, egui::Rect)>,
+    /// Pane rects waiting for a screenshot of their viewport.
+    pending_screenshots: Vec<(Pane, egui::Rect, egui::ViewportId)>,
     raster_cache: RasterCache,
     suggest_cache: SuggestCache,
     ccg_cache: CcgCache,
@@ -1638,6 +1638,17 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     self.status = toast("amplitude split cancelled");
                 } else if self.feature_state.lasso_active() {
                     self.feature_state.cancel_lasso();
+                    // The lasso's brush goes with it; sync_brush only runs
+                    // when Features draws.
+                    if self.brushes.spikes.as_ref().is_some_and(|b| {
+                        matches!(
+                            b.source,
+                            crate::brush::BrushSource::FeatureLasso
+                                | crate::brush::BrushSource::KMeansPart
+                        )
+                    }) {
+                        self.brushes.spikes = None;
+                    }
                     self.status = toast("lasso cancelled");
                 } else if self.brushes.cancel() {
                     self.status = toast("brush cleared");
@@ -2015,7 +2026,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             ViewAction::ToggleMaximize(tile) => self.detached.toggle_maximize(&self.tree, tile),
             ViewAction::PopOut(pane) => self.detached.pop_out(&self.tree, pane),
             ViewAction::BringBack(pane) => self.detached.bring_back(pane),
-            ViewAction::Screenshot(pane, rect) => self.pending_screenshots.push((pane, rect)),
+            ViewAction::Screenshot(pane, rect, viewport) => {
+                self.pending_screenshots.push((pane, rect, viewport))
+            }
+            ViewAction::SaveScreenshot(pane, image) => self.finish_screenshot(pane, &image),
             ViewAction::Decide { id, accept } => self.decide_proposal(id, accept),
             ViewAction::Checkout(node) => {
                 self.cancel_jobs();
@@ -2168,6 +2182,190 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     }
 }
 
+impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
+    /// The tile tree (when `ui` is given) and the pop-out windows, with the
+    /// view actions they queued applied. `ui` is `None` for an inactive
+    /// dataset tab, which keeps only its pop-outs alive.
+    fn tiles_and_popouts(&mut self, ctx: &egui::Context, ui: Option<&mut egui::Ui>) {
+        // Every view is a tile; views only read the session and queue
+        // side effects as actions, applied once the read lock is gone.
+        let selected: Vec<ClusterId> = self.selection.iter().copied().collect();
+        let proposals = self.host.proposals();
+        let closed = layout::missing_panes(&self.tree);
+        let active_tabs = layout::active_tabs(&self.tree);
+        let jobs = JobCtx {
+            session: Arc::clone(&self.session),
+            egui: ctx.clone(),
+        };
+        let actions = {
+            let session = read(&self.session);
+            // Depths are backend-specific and walk every spike, so they
+            // come from a worker and are memoised per curation version.
+            let depths_arc = self.depth_fn.and_then(|f| {
+                self.depth_memo
+                    .ensure(
+                        session.version(),
+                        &self.session,
+                        jobs.repaint(),
+                        move |s, _| Arc::new(f(s)),
+                    )
+                    .cloned()
+            });
+            let depths: Option<&SpikeDepths> = depths_arc.as_deref().and_then(|d| d.as_ref());
+            // Waveforms follow the trace pane's HP/CMR toggles.
+            self.waveform_cache.set_preproc(
+                self.trace_cfg,
+                if self.per_shank_cmr {
+                    &self.channel_shanks
+                } else {
+                    &[]
+                },
+            );
+            // Colour-scheme colours for unselected clusters, per curation
+            // version and scheme.
+            let scheme_key = (session.version(), self.scheme, depths.is_some());
+            if self
+                .scheme_colours
+                .as_ref()
+                .is_none_or(|(k, ..)| *k != scheme_key)
+            {
+                let n = session.n_clusters();
+                let duration = (session.provider.n_samples().0 as f32
+                    / session.provider.sample_rate().max(1.0))
+                .max(1e-3);
+                let ids = (0..n).map(ClusterId);
+                let groups: Vec<&str> = ids
+                    .clone()
+                    .map(|c| session.label(c).map_or("", |l| (self.label_str)(&l)))
+                    .collect();
+                let fr: Vec<f32> = ids
+                    .clone()
+                    .map(|c| session.spike_times(c).len() as f32 / duration)
+                    .collect();
+                let depth: Vec<f32> = ids
+                    .map(|c| {
+                        let d = depths.and_then(|d| d.per_cluster.get(c.idx()));
+                        d.filter(|d| !d.is_empty())
+                            .map_or(f32::NAN, |d| d.iter().sum::<f32>() / d.len() as f32)
+                    })
+                    .collect();
+                let colours = crate::theme::scheme_colours(self.scheme, &groups, &depth, &fr);
+                self.scheme_gen += 1;
+                self.scheme_colours = Some((scheme_key, self.scheme_gen, colours));
+            }
+            let (_, colours_gen, colours) = self.scheme_colours.as_ref().expect("just built");
+            self.brushes.sync(session.version());
+            let feature_link = self.feature_state.link();
+            let mut behavior = ViewBehavior {
+                session: &session,
+                selection: &selected,
+                proposals: &proposals,
+                label_str: self.label_str,
+                channel_positions: &self.channel_positions,
+                waveform_cache: &mut self.waveform_cache,
+                feature_state: &mut self.feature_state,
+                feature_link: &feature_link,
+                amplitude_state: &mut self.amplitude_state,
+                cluster_scatter: &mut self.cluster_scatter,
+                template_features: &mut self.template_features,
+                frozen: &mut self.frozen,
+                screenshot: &mut self.screenshot_pane,
+                table_order: &self.table_state.visible,
+                template_grid: &mut self.template_grid,
+                trace_image: &mut self.trace_image,
+                spike_attrs: &mut self.spike_attrs,
+                colours,
+                colours_gen: *colours_gen,
+                scheme_delta: 0,
+                spike_reorder: self.spike_reorder,
+                raster_cache: &mut self.raster_cache,
+                suggest_cache: &mut self.suggest_cache,
+                ccg_cache: &mut self.ccg_cache,
+                view_params: &mut self.view_params,
+                similar: SimilarityPane {
+                    state: &mut self.similarity,
+                    rows: &self.cluster_rows,
+                    best: self.selection.best(),
+                },
+                quality_cache: &mut self.quality_cache,
+                jobs: &jobs,
+                events: self.events.as_deref(),
+                depths,
+                psth_state: &mut self.psth_state,
+                psth_cache: &mut self.psth_cache,
+                trace: TraceControls {
+                    window_start: &mut self.window_start,
+                    window_len: &mut self.window_len,
+                    target_points: self.target_points,
+                    cfg: &mut self.trace_cfg,
+                    gpu: self.gpu_preproc.as_ref(),
+                    cache: &mut self.trace_cache,
+                    shanks: &self.channel_shanks,
+                    per_shank: &mut self.per_shank_cmr,
+                    display: self.trace_display,
+                },
+                closed,
+                active_tabs,
+                detached: &mut self.detached,
+                brushes: &mut self.brushes,
+                in_popout: false,
+                actions: Vec::new(),
+            };
+            if let Some(ui) = ui {
+                layout::show_tiles(&mut self.tree, &mut behavior, ui);
+            }
+            let dataset = self.save_dir.as_deref().map(|p| p.display().to_string());
+            layout::show_popouts(
+                ctx,
+                &self.tree,
+                dataset.as_deref().unwrap_or_default(),
+                &mut behavior,
+            );
+            (behavior.actions, behavior.scheme_delta)
+        };
+        let (actions, scheme_delta) = actions;
+        if scheme_delta != 0 {
+            self.scheme = self.scheme.step(scheme_delta);
+            self.status = toast(format!("colour scheme: {}", self.scheme.name()));
+        }
+        for action in actions {
+            self.apply_view_action(action);
+        }
+        self.detached.prune(&self.tree);
+        if self.brushes.end_frame() {
+            ctx.request_repaint();
+        }
+    }
+
+    /// An inactive dataset tab: egui closes a viewport that is not shown
+    /// every frame, so the shell calls this to keep the tab's pop-outs open.
+    pub fn show_popouts_only(&mut self, ctx: &egui::Context) {
+        if self.loading.is_some() || self.detached.popped.is_empty() {
+            return;
+        }
+        self.send_screenshot_requests(ctx);
+        self.tiles_and_popouts(ctx, None);
+    }
+
+    /// phy `screenshot`: ask the pane's own viewport for its frame; the
+    /// image comes back as an event in that viewport.
+    fn send_screenshot_requests(&mut self, ctx: &egui::Context) {
+        for (pane, rect, viewport) in self.pending_screenshots.drain(..) {
+            ctx.send_viewport_cmd_to(
+                viewport,
+                egui::ViewportCommand::Screenshot(egui::UserData::new((pane, rect))),
+            );
+        }
+    }
+
+    fn finish_screenshot(&mut self, pane: Pane, image: &egui::ColorImage) {
+        self.status = toast(match self.save_screenshot(pane, image) {
+            Ok(path) => format!("screenshot saved to {}", path.display()),
+            Err(e) => format!("screenshot failed: {e}"),
+        });
+    }
+}
+
 impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root_ui.ctx().clone();
@@ -2193,36 +2391,9 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
         // shortcuts (Cmd/Ctrl-S/Z/Shift-Z) still fire. While a confirm
         // dialog is open only Esc gets through — the modal owns the keys.
         // phy `screenshot`: ask for the frame, then crop and save the pane.
-        for (pane, rect) in self.pending_screenshots.drain(..) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new((
-                pane, rect,
-            ))));
-        }
-        let shots: Vec<(Pane, egui::Rect, std::sync::Arc<egui::ColorImage>)> = ctx.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|ev| match ev {
-                    egui::Event::Screenshot {
-                        user_data, image, ..
-                    } => {
-                        let &(pane, rect) = user_data
-                            .data
-                            .as_ref()?
-                            .downcast_ref::<(Pane, egui::Rect)>()?;
-                        Some((pane, rect, image.clone()))
-                    }
-                    _ => None,
-                })
-                .collect()
-        });
-        for (pane, rect, image) in shots {
-            let ppp = ctx.pixels_per_point();
-            self.status = toast(
-                match self.save_screenshot(pane, &image.region(&rect, Some(ppp))) {
-                    Ok(path) => format!("screenshot saved to {}", path.display()),
-                    Err(e) => format!("screenshot failed: {e}"),
-                },
-            );
+        self.send_screenshot_requests(&ctx);
+        for (pane, image) in layout::screenshot_events(&ctx) {
+            self.finish_screenshot(pane, &image);
         }
 
         let text_input_active = ctx.egui_wants_keyboard_input();
@@ -2339,154 +2510,8 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                 }
             });
 
-        egui::CentralPanel::default().show_inside(root_ui, |ui| {
-            // Every view is a tile; views only read the session and queue
-            // side effects as actions, applied once the read lock is gone.
-            let selected: Vec<ClusterId> = self.selection.iter().copied().collect();
-            let proposals = self.host.proposals();
-            let closed = layout::missing_panes(&self.tree);
-            let active_tabs = layout::active_tabs(&self.tree);
-            let jobs = JobCtx {
-                session: Arc::clone(&self.session),
-                egui: ctx.clone(),
-            };
-            let actions = {
-                let session = read(&self.session);
-                // Depths are backend-specific and walk every spike, so they
-                // come from a worker and are memoised per curation version.
-                let depths_arc = self.depth_fn.and_then(|f| {
-                    self.depth_memo
-                        .ensure(
-                            session.version(),
-                            &self.session,
-                            jobs.repaint(),
-                            move |s, _| Arc::new(f(s)),
-                        )
-                        .cloned()
-                });
-                let depths: Option<&SpikeDepths> = depths_arc.as_deref().and_then(|d| d.as_ref());
-                // Waveforms follow the trace pane's HP/CMR toggles.
-                self.waveform_cache.set_preproc(
-                    self.trace_cfg,
-                    if self.per_shank_cmr {
-                        &self.channel_shanks
-                    } else {
-                        &[]
-                    },
-                );
-                // Colour-scheme colours for unselected clusters, per curation
-                // version and scheme.
-                let scheme_key = (session.version(), self.scheme, depths.is_some());
-                if self
-                    .scheme_colours
-                    .as_ref()
-                    .is_none_or(|(k, ..)| *k != scheme_key)
-                {
-                    let n = session.n_clusters();
-                    let duration = (session.provider.n_samples().0 as f32
-                        / session.provider.sample_rate().max(1.0))
-                    .max(1e-3);
-                    let ids = (0..n).map(ClusterId);
-                    let groups: Vec<&str> = ids
-                        .clone()
-                        .map(|c| session.label(c).map_or("", |l| (self.label_str)(&l)))
-                        .collect();
-                    let fr: Vec<f32> = ids
-                        .clone()
-                        .map(|c| session.spike_times(c).len() as f32 / duration)
-                        .collect();
-                    let depth: Vec<f32> = ids
-                        .map(|c| {
-                            let d = depths.and_then(|d| d.per_cluster.get(c.idx()));
-                            d.filter(|d| !d.is_empty())
-                                .map_or(f32::NAN, |d| d.iter().sum::<f32>() / d.len() as f32)
-                        })
-                        .collect();
-                    let colours = crate::theme::scheme_colours(self.scheme, &groups, &depth, &fr);
-                    self.scheme_gen += 1;
-                    self.scheme_colours = Some((scheme_key, self.scheme_gen, colours));
-                }
-                let (_, colours_gen, colours) = self.scheme_colours.as_ref().expect("just built");
-                self.brushes.sync(session.version());
-                let feature_link = self.feature_state.link();
-                let mut behavior = ViewBehavior {
-                    session: &session,
-                    selection: &selected,
-                    proposals: &proposals,
-                    label_str: self.label_str,
-                    channel_positions: &self.channel_positions,
-                    waveform_cache: &mut self.waveform_cache,
-                    feature_state: &mut self.feature_state,
-                    feature_link: &feature_link,
-                    amplitude_state: &mut self.amplitude_state,
-                    cluster_scatter: &mut self.cluster_scatter,
-                    template_features: &mut self.template_features,
-                    frozen: &mut self.frozen,
-                    screenshot: &mut self.screenshot_pane,
-                    table_order: &self.table_state.visible,
-                    template_grid: &mut self.template_grid,
-                    trace_image: &mut self.trace_image,
-                    spike_attrs: &mut self.spike_attrs,
-                    colours,
-                    colours_gen: *colours_gen,
-                    scheme_delta: 0,
-                    spike_reorder: self.spike_reorder,
-                    raster_cache: &mut self.raster_cache,
-                    suggest_cache: &mut self.suggest_cache,
-                    ccg_cache: &mut self.ccg_cache,
-                    view_params: &mut self.view_params,
-                    similar: SimilarityPane {
-                        state: &mut self.similarity,
-                        rows: &self.cluster_rows,
-                        best: self.selection.best(),
-                    },
-                    quality_cache: &mut self.quality_cache,
-                    jobs: &jobs,
-                    events: self.events.as_deref(),
-                    depths,
-                    psth_state: &mut self.psth_state,
-                    psth_cache: &mut self.psth_cache,
-                    trace: TraceControls {
-                        window_start: &mut self.window_start,
-                        window_len: &mut self.window_len,
-                        target_points: self.target_points,
-                        cfg: &mut self.trace_cfg,
-                        gpu: self.gpu_preproc.as_ref(),
-                        cache: &mut self.trace_cache,
-                        shanks: &self.channel_shanks,
-                        per_shank: &mut self.per_shank_cmr,
-                        display: self.trace_display,
-                    },
-                    closed,
-                    active_tabs,
-                    detached: &mut self.detached,
-                    brushes: &mut self.brushes,
-                    in_popout: false,
-                    actions: Vec::new(),
-                };
-                layout::show_tiles(&mut self.tree, &mut behavior, ui);
-                let dataset = self.save_dir.as_deref().map(|p| p.display().to_string());
-                layout::show_popouts(
-                    &ctx,
-                    &self.tree,
-                    dataset.as_deref().unwrap_or_default(),
-                    &mut behavior,
-                );
-                (behavior.actions, behavior.scheme_delta)
-            };
-            let (actions, scheme_delta) = actions;
-            if scheme_delta != 0 {
-                self.scheme = self.scheme.step(scheme_delta);
-                self.status = toast(format!("colour scheme: {}", self.scheme.name()));
-            }
-            for action in actions {
-                self.apply_view_action(action);
-            }
-            self.detached.prune(&self.tree);
-            if self.brushes.end_frame() {
-                ctx.request_repaint();
-            }
-        });
+        egui::CentralPanel::default()
+            .show_inside(root_ui, |ui| self.tiles_and_popouts(&ctx, Some(ui)));
     }
 
     fn on_exit(&mut self) {
@@ -2527,6 +2552,9 @@ impl<P: DataProvider + ApplyPhyLabel> crate::shell::Tab for SorrelApp<P> {
     }
     fn on_exit(&mut self) {
         eframe::App::on_exit(self);
+    }
+    fn popouts(&mut self, ctx: &egui::Context) {
+        self.show_popouts_only(ctx);
     }
 }
 
@@ -3187,6 +3215,22 @@ mod tests {
         };
         assert!(app.commit(cmd));
         assert!(history_len(&app) > baseline);
+    }
+
+    #[test]
+    fn esc_cancelling_a_features_lasso_clears_its_brush_only() {
+        use crate::brush::{BrushSource, SpikeBrush};
+        let (mut app, _d) = make_app();
+        let brush = |source| SpikeBrush::new(source, 0, [(ClusterId(0), vec![1, 2])]);
+        app.feature_state.set_test_lasso();
+        app.brushes.spikes = brush(BrushSource::KMeansPart);
+        app.dispatch_intent(Intent::Cancel);
+        assert!(!app.feature_state.lasso_active() && app.brushes.spikes.is_none());
+        // Another view's brush is not the lasso's to drop.
+        app.feature_state.set_test_lasso();
+        app.brushes.spikes = brush(BrushSource::IsiViolators);
+        app.dispatch_intent(Intent::Cancel);
+        assert!(!app.feature_state.lasso_active() && app.brushes.spikes.is_some());
     }
 
     #[test]
