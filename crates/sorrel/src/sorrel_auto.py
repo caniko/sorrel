@@ -146,10 +146,11 @@ def load(args):
         file_offset=int(offset),
     )
     gain = args.gain_to_uv or meta.get("gain_to_uv")
-    if gain:
-        rec.set_channel_gains(float(gain))
-        rec.set_channel_offsets(0.0)
-    else:
+    # Without a gain the analyzer cannot return uV templates (template metrics
+    # raise), so fall back to 1 uV per bit: ADC units stand in for uV.
+    rec.set_channel_gains(float(gain or 1.0))
+    rec.set_channel_offsets(0.0)
+    if not gain:
         log(
             "WARNING: no --gain-to-uv; amplitudes stay in ADC units, so Bombcell's "
             "uV amplitude threshold is meaningless for this run"

@@ -7,7 +7,7 @@ checkout on a windows runner, after the Nix output `.#sorrel-windows-smoke`
 
 Steps: version, gpu-check, headless qc + report on release/fixtures/tiny-phy,
 MCP over stdio (`sorrel mcp`), MCP attached to a `run --headless` host through its
-%LOCALAPPDATA% listener file, `sorrel auto` launching its sidecar through uv.exe,
+%LOCALAPPDATA% listener file, an offline `sorrel auto --dry-run` through uv.exe,
 a save round-trip through a headless host (relabel, split, save, reopen; the
 regression gate for mapped files blocking the rename of spike_clusters.npy),
 export-phy, --discard-journal, `status` and `call`, `sorrel auto --llm` argv
@@ -333,13 +333,10 @@ try {
 }
 finally { Stop-Headless $hostH }
 
-# 6. `sorrel auto` must launch its SpikeInterface sidecar through uv.exe. The
-#    fixture has no channel_positions.npy, so the sidecar cannot finish; the
-#    proof is that it ran far enough to import SpikeInterface (uv resolved the
-#    PEP 723 dependencies), read the raw file and log, and only then died on
-#    the missing file. A plain `python` has no SpikeInterface, so it cannot get
-#    that far. `sorrel rescue` is not run: it needs amplitudes.npy and
-#    spike_templates.npy, which the fixture lacks.
+# 6. `sorrel auto --dry-run --no-unitrefine` (the offline Bombcell path) must run end
+#    to end: uv.exe resolves the PEP 723 dependencies, SpikeInterface builds the
+#    analyzer from the fixture's raw file and probe geometry, and the sidecar's
+#    curation.json is imported (dry run) with a decision per cluster.
 Assert-Ok 'pip-uv' (Invoke-Native 'pip-uv' $py @('-m', 'pip', 'install', 'uv'))
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     $scripts = (& $py -c 'import sysconfig; print(sysconfig.get_path("scripts"))').Trim()
@@ -348,22 +345,22 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
 Write-Host "uv: $((Get-Command uv).Source)"
 Remove-Item Env:SORREL_PYTHON -ErrorAction SilentlyContinue
 $dataC = New-DataCopy 'auto'
-$autoCode = Invoke-Native 'auto' $exe @('auto', $dataC, '--dry-run', '--no-unitrefine') -TimeoutSec 600
+Assert-Ok 'auto' (Invoke-Native 'auto' $exe @('auto', $dataC, '--dry-run', '--no-unitrefine') -TimeoutSec 900)
 $autoLog = (Get-Content (Join-Path $OutDir 'auto.out.txt'), (Join-Path $OutDir 'auto.err.txt') -Raw) -join "`n"
-if ($autoLog -match 'spawn the sorrel_auto\.py sidecar') { throw 'sorrel auto could not launch uv or python' }
 if (-not (Test-Path (Join-Path $dataC 'sorrel_auto\sorrel_auto.py'))) { throw 'sorrel auto did not write the sidecar script' }
-if ($autoLog -notmatch '\[sorrel-auto\]') { throw 'the sidecar never logged: uv did not run it (see auto.err.txt)' }
-if ($autoCode -ne 0 -and $autoLog -notmatch 'channel_positions\.npy') {
-    throw "sorrel auto failed with exit code $autoCode for a reason other than the fixture's missing channel_positions.npy"
-}
+if ($autoLog -match 'Traceback') { throw 'the sidecar raised (see auto.err.txt)' }
+$cur = Get-Content (Join-Path $dataC 'sorrel_auto\curation.json') -Raw | ConvertFrom-Json
+if (-not $cur) { throw 'sorrel auto wrote no curation.json' }
+if ($autoLog -notmatch "(?m)^(\d+) relabels, \d+ merges, \d+ retags") { throw "sorrel auto reported no decisions:`n$autoLog" }
+if ([int]$Matches[1] -lt 1) { throw 'sorrel auto labelled no cluster' }
+Write-Host "auto: $($Matches[0])"
 
 # 6b. `sorrel auto --llm` runs claude/codex/opencode; npm installs those as `.cmd`
 #     shims, and cmd.exe re-parses every argument (`"`, %, ^, &, |, newlines). The
 #     fake shims below dump what their program received; release/smoke-llm-shim.py
 #     calls the sidecar's own ask_cli with hostile prompts and compares the dump
-#     with the argv and stdin it intended. (`sorrel auto --llm` cannot be driven
-#     end to end here: the fixture cannot finish the SpikeInterface analysis that
-#     precedes the LLM calls, so the sidecar's spawn code is run directly.)
+#     with the argv and stdin it intended. (`sorrel auto --llm` is not driven
+#     end to end here: it needs a real LLM CLI, so the sidecar's spawn code is run directly.)
 $shimDir = Join-Path ([IO.Path]::GetTempPath()) "sorrel-shim-$PID"
 New-Item -ItemType Directory $shimDir | Out-Null
 Copy-Item (Join-Path $repo 'release\smoke-argv-dump.py') (Join-Path $shimDir 'argv_dump.py')
@@ -612,6 +609,28 @@ Write-Host "shortcut: $lnk -> $($sc.TargetPath) (icon $($sc.IconLocation))"
 Assert-Ok 'remove-shortcut' (Invoke-Native 'remove-shortcut' $exe @('install-shortcut', '--remove'))
 if (Test-Path $lnk) { throw "install-shortcut --remove left $lnk" }
 Write-Host 'shortcut removed'
+
+# 8b. Windows coverage. Vulkan: the install docs offer `WGPU_BACKEND=vulkan` as the
+#     fallback, but a hosted runner has no GPU driver, so DX12/WARP is all steps 2
+#     and 7 ever reach. Point the loader at the pinned Mesa lavapipe (the Windows
+#     build of the dev shell's, with the Khronos loader) and require the compute kernels to pass on it.
+$lvpIcd = (& (Join-Path $repo 'release\fetch-lavapipe-windows.ps1') -Dir (Join-Path ([IO.Path]::GetTempPath()) 'sorrel-lavapipe') | Select-Object -Last 1)
+Write-Host "lavapipe ICD: $lvpIcd"
+$oldPath = $env:PATH
+$env:PATH = "$(Split-Path $lvpIcd)$([IO.Path]::PathSeparator)$env:PATH" # vulkan-1.dll, the loader
+$env:VK_DRIVER_FILES = $lvpIcd
+$env:WGPU_BACKEND = 'vulkan'
+try { $vkCode = Invoke-Native 'gpu-check-vulkan' $exe @('gpu-check') }
+finally {
+    $env:PATH = $oldPath
+    Remove-Item Env:VK_DRIVER_FILES -ErrorAction SilentlyContinue
+    Remove-Item Env:WGPU_BACKEND -ErrorAction SilentlyContinue
+}
+Assert-Ok 'gpu-check-vulkan' $vkCode
+$vkOut = Get-Content (Join-Path $OutDir 'gpu-check-vulkan.out.txt') -Raw
+if ($vkOut -notmatch '(?m)^preferred adapter: llvmpipe .*\(Vulkan\)') { throw "gpu-check did not prefer lavapipe on Vulkan:`n$vkOut" }
+if ($vkOut -notmatch 'kernels: PASS') { throw "gpu-check kernels did not pass on Vulkan:`n$vkOut" }
+Write-Host "vulkan: $(($vkOut -split "`r?`n" | Where-Object { $_ -match '^preferred adapter' }) -join '')"
 
 # 9. Microsoft Defender: winget-pkgs validation scans the installed package
 #    (Validation-Defender-Error), so reproduce that here on fresh signatures.

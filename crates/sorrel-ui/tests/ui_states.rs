@@ -26,14 +26,10 @@ type App = SorrelApp<KilosortProvider>;
 /// Snapshots render on the dev shell's pinned lavapipe (`SORREL_LAVAPIPE_ICD`)
 /// so atlas and GPU-less CI runners rasterise identically. The Vulkan loader
 /// reads the driver list once, so every test starts here. Outside the dev
-/// shell with no GPU the tests skip, like sorrel-gpu's.
+/// shell with no GPU the tests skip, like sorrel-gpu's. The Windows native-test
+/// job points `SORREL_LAVAPIPE_ICD` at `release/fetch-lavapipe-windows.ps1`'s
+/// Mesa build and sets `SORREL_REQUIRE_GPU`, so there they cannot skip.
 fn no_gpu() -> bool {
-    // The reference PNGs are lavapipe output; a Windows runner has only
-    // WARP/DX12, which neither matches them nor passes `vulkan_only`.
-    if cfg!(windows) {
-        eprintln!("skipping UI snapshot test: snapshots are rasterised on lavapipe");
-        return true;
-    }
     static ERR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let err = ERR.get_or_init(|| {
         if let Some(icd) = std::env::var_os("SORREL_LAVAPIPE_ICD") {
