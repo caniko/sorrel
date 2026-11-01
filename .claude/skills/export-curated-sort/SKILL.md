@@ -18,7 +18,17 @@ uv run .claude/skills/export-curated-sort/export_curated_sort.py pack PHY_DIR OU
 No uv: `pip install numpy zstandard`, then `python .claude/skills/export-curated-sort/export_curated_sort.py pack PHY_DIR OUT_DIR`.
 
 `PHY_DIR` is the phy folder (it holds `params.py`) after you saved the curation
-in phy. It is only read. Options: `--name NAME`, `--level 19` (zstd level),
+in phy. It is only read. Several recordings go in one call: list every phy folder,
+then `OUT_DIR` last; each becomes its own package, named after the folder (widened
+with parent folder names when they collide, as `kilosort4` folders do).
+
+Recordings where Kilosort found **no units** (missing or empty `spike_times` /
+`spike_templates`) are excluded: there is nothing to compare against, so no package
+is written for them and the summary lists them as excluded. Pass all candidate
+folders and let the tool drop the empty ones. A folder that fails a check is
+reported and skipped, the rest still pack, and the command exits non-zero.
+
+Options: `--name NAME` (single folder only), `--level 19` (zstd level),
 `--jobs N` (default: CPUs, capped by free memory), `--dat PATH` (raw file when
 `params.py` points somewhere else). Level 19 on a large recording takes a while;
 it is the smallest upload, so let it run.

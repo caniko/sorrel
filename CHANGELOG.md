@@ -50,7 +50,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   - **`sorrel diff TRUTH TEST --root INPUT`:** a spike-level score of two curations of one sort: unit recovery, merges, splits, noise exclusion and ARI, keyed by root cluster.
   - **`scripts/bench_curation.py`:** runs `sorrel auto --llm` and the MCP review agent against the human curation, with a sealed holdout and blinded adjudication.
   - **Prompts:** `SORREL_RUBRIC` and `SORREL_REVIEW` override the rubric and review instructions (the MCP `review` prompt and `sorrel auto --llm` share one source), and `sorrel agent-guide --prompt review` prints the effective text.
-  - **Skill:** `export-curated-sort` packages a phy-curated sort for the bench.
+  - **Skill:** `export-curated-sort` packages phy-curated sorts for the bench, one package per recording; recordings where the sorter found no units are excluded.
 
 ### Fixed
 

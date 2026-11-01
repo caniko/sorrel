@@ -152,6 +152,28 @@ def main():
         phy = root / "int16-0" / "phy"
         assert "inside PHY_DIR" in run("pack", phy, phy / "out", ok=False).stderr and not (phy / "out").exists()
 
+        # Sorts where Kilosort found no units are excluded, alone or in a batch, and leave no package:
+        # empty spike arrays, and no spike arrays at all (both seen from Kilosort 4).
+        empty = []
+        for i, drop in enumerate((False, True)):
+            e = root / f"rec{i}" / "kilosort4"
+            shutil.copytree(phy, e)
+            for f in ("spike_times.npy", "spike_templates.npy", "spike_clusters.npy", "amplitudes.npy"):
+                (e / f).unlink() if drop else np.save(e / f, np.empty(0, np.uint32))
+            empty.append(e)
+        alone = run("pack", empty[0], root / "out-empty")
+        assert "excluded" in alone.stdout and not (root / "out-empty").exists(), alone.stdout
+        good = root / "rec2" / "kilosort4"
+        shutil.copytree(phy, good)
+        batch = run("pack", *empty, good, root / "out-batch", "--level", 3)
+        assert "1 packaged, 2 excluded" in batch.stdout, batch.stdout
+        assert sorted(p.name for p in (root / "out-batch").iterdir()) == [
+            "rec2_kilosort4.sorrel-upload.tar", "rec2_kilosort4.sorrel-upload.tar.sha256"]
+        # A broken folder in a batch fails on its own; the rest still packs, and the exit is non-zero.
+        (good / "amplitudes.npy").rename(good / "amp.bak")
+        r = run("pack", empty[0], good, root / "out-batch2", ok=False)
+        assert "0 packaged, 1 excluded" in r.stdout and "1 failed" in r.stdout, r.stdout
+
         # A missing required file is an error.
         (phy / "amplitudes.npy").rename(phy / "amp.bak")
         assert "amplitudes.npy" in run("pack", phy, root / "out-missing", ok=False).stderr

@@ -325,14 +325,66 @@ def need_space(path, nbytes):
         die(f"{path} has {free >> 20} MiB free, need about {nbytes >> 20} MiB")
 
 
+def n_sorted_spikes(phy):
+    """Spikes the sorter assigned to a unit; 0 when it found none, which Kilosort 4 shows
+    as missing or empty spike arrays. Reads only the .npy headers."""
+    n = []
+    for f in ("spike_times.npy", "spike_templates.npy"):
+        try:
+            with open(phy / f, "rb") as fh:
+                v = np.lib.format.read_magic(fh)
+                shape = (np.lib.format.read_array_header_1_0 if v == (1, 0) else
+                         np.lib.format.read_array_header_2_0)(fh)[0]
+        except FileNotFoundError:
+            return 0
+        n.append(int(np.prod(shape)))
+    return min(n)
+
+
+def unique_names(phys):
+    """Package names: the folder name, widened with parent folders until the batch is unique
+    (Kilosort/phy folders are often all called `kilosort4` or `phy`)."""
+    for depth in range(1, max(len(p.parts) for p in phys) + 1):
+        names = [re.sub(r"[^\w.-]", "_", "_".join(p.parts[-depth:]).lstrip("/\\")) for p in phys]
+        if len(set(names)) == len(names):
+            return names
+    die("cannot derive unique package names; pack the folders one at a time with --name")
+
+
 def pack(a):
+    phys = [Path(d).resolve() for d in a.phy_dir]
+    len(phys) == 1 or not a.name or die("--name works with a single PHY_DIR")
+    len(set(phys)) == len(phys) or die("the same PHY_DIR is listed twice")
+    names = [a.name] if a.name else unique_names(phys)
+    packed, excluded, failed = [], [], []
+    for phy, name in zip(phys, names):
+        if len(phys) > 1:
+            print(f"== {phy.name} -> {name}")
+        try:
+            (packed if pack_one(a, phy, Path(a.out_dir), name) else excluded).append(name)
+        except (SystemExit, Exception) as e:  # one bad folder must not stop the batch
+            if len(phys) == 1:
+                raise
+            print(e.code if isinstance(e, SystemExit) else f"error: {type(e).__name__}: {e}", file=sys.stderr)
+            failed.append(name)
+    print(f"\nsummary: {len(packed)} packaged, {len(excluded)} excluded (no units from the sorter), "
+          f"{len(failed)} failed")
+    for label, xs in (("excluded", excluded), ("failed", failed)):
+        xs and print(f"{label}: {', '.join(xs)}")
+    failed and sys.exit(1)
+
+
+def pack_one(a, phy, out, name):
+    """Package one phy folder; False (nothing written) when the sorter found no units."""
     t0 = time.time()
-    phy, out = Path(a.phy_dir).resolve(), Path(a.out_dir)
-    phy.is_dir() or die(f"{a.phy_dir} is not a directory")
+    phy.is_dir() or die(f"{phy} is not a directory")
     out.resolve().is_relative_to(phy) and die(f"OUT_DIR {out} is inside PHY_DIR; pick a folder outside it")
+    if (phy / "params.py").is_file() and not n_sorted_spikes(phy):
+        print(f"excluded {phy.name}: the sorter found no units (no spikes in spike_times/spike_templates); "
+              "nothing to compare against, so no package")
+        return False
     miss = [n for n in REQUIRED if not (phy / n).is_file()]
     miss and die(f"missing required files: {', '.join(miss)}")
-    name = a.name or phy.name
     re.fullmatch(r"[\w.-]+", name) or die(f"--name {name!r} must be letters, digits, '.', '_' or '-'")
     1 <= a.level <= 22 or die("--level must be 1..22")
     warns = []
@@ -440,6 +492,7 @@ def pack(a):
     print("check: PASSED (raw decoded + sha256 equal, phy.tar.zst member sha256s equal)")
     for w in warns:
         print(f"WARNING: {w}")
+    return True
 
 
 def unpack(a):
@@ -488,9 +541,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("pack")
-    p.add_argument("phy_dir")
+    p.add_argument("phy_dir", nargs="+", help="one or more phy folders")
     p.add_argument("out_dir")
-    p.add_argument("--name")
+    p.add_argument("--name", help="package name (single PHY_DIR only)")
     p.add_argument("--level", type=int, default=19)
     p.add_argument("--jobs", type=int)
     p.add_argument("--dat")
