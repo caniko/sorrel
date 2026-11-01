@@ -33,4 +33,4 @@ jobs:
       - name: Native tests windows
         shell: bash
         timeout-minutes: 60
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast

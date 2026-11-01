@@ -87,6 +87,8 @@
             {
               id = "windows";
               runner = "windows-2025";
+              # One failing binary must not hide the rest.
+              args = "--workspace --locked --no-fail-fast";
             }
           ];
           # Public caches only; the private macOS SDK cache is a release concern.
