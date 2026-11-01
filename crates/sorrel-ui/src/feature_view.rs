@@ -1685,7 +1685,10 @@ fn ghost_cells<P: DataProvider>(
         } else {
             pack_rgba(110, 110, 110, 128)
         };
-        let order = display_order(&loaded, N_DISPLAY, false, &|_| false);
+        // Only the candidate itself: the loaded set also carries the other
+        // spikes as background, which the background layer already draws.
+        let mut order = display_order(&loaded, N_DISPLAY, false, &|_| false);
+        order.retain(|&i| loaded.points[i].slot != BACKGROUND);
         let cells = GRID
             .iter()
             .flatten()

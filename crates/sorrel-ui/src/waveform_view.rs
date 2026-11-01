@@ -83,6 +83,8 @@ pub struct WaveformCache {
     linked: Option<LinkedSnippets>,
     /// Snippets of the spike brush's split what-if part / ISI violators.
     brushed: Option<LinkedSnippets>,
+    /// Snippet of the spike hovered in another view, drawn bold.
+    hovered: Option<LinkedSnippets>,
     /// The split what-if: `(cluster slot, inside means, outside means)`,
     /// `[channel][sample]`, with the key they were computed for.
     whatif: Option<(WhatIfKey, usize, WhatIfMeans)>,
@@ -134,6 +136,7 @@ impl Default for WaveformCache {
             frozen: None,
             linked: None,
             brushed: None,
+            hovered: None,
             whatif: None,
             ghost: None,
             ghost_on: false,
@@ -166,6 +169,7 @@ impl WaveformCache {
             self.key = None;
             self.linked = None;
             self.brushed = None;
+            self.hovered = None;
         }
         self.cfg = cfg;
     }
@@ -343,6 +347,33 @@ impl WaveformCache {
             &self.shanks,
             session,
             spikes,
+            pre,
+            post,
+        );
+    }
+
+    /// The hovered spike (a one-spike list, or none) through the same path.
+    fn ensure_hovered<P: DataProvider>(
+        &mut self,
+        session: &Session<P>,
+        spike: Option<(ClusterId, u32)>,
+        pre: u32,
+        post: u32,
+    ) {
+        // `ensure_snips` compares the lists by `Arc` identity: keep the one
+        // already held while the same spike stays hovered.
+        let held = self.hovered.as_ref().map(|l| l.spikes.clone());
+        let spikes: Vec<_> = match (spike, held) {
+            (Some((c, l)), Some(h)) if h.iter().any(|(hc, hi)| *hc == c && **hi == [l]) => h,
+            (Some((c, l)), _) => vec![(c, std::sync::Arc::from([l]))],
+            (None, _) => Vec::new(),
+        };
+        Self::ensure_snips(
+            &mut self.hovered,
+            self.cfg,
+            &self.shanks,
+            session,
+            &spikes,
             pre,
             post,
         );
@@ -798,6 +829,13 @@ pub fn waveform_view<P: DataProvider>(
         _ => Vec::new(),
     };
     cache.ensure_brushed(session, &brushed, pre, post);
+    // The spike hovered in Features / Amplitudes / ..., when it is one of
+    // the selected clusters' (bold accent).
+    let hovered = brushes
+        .hover
+        .filter(|h| selection.contains(&h.cluster))
+        .map(|h| (h.cluster, h.local));
+    cache.ensure_hovered(session, hovered, pre, post);
     match (&brushes.spikes, &whatif) {
         (Some(b), Some((c, _))) if selection.contains(c) => {
             let slot = selection.iter().position(|x| x == c).unwrap_or(0);
@@ -1314,6 +1352,16 @@ impl<P: DataProvider> Ctx<'_, P> {
                     .collect();
                 painter.add(egui::Shape::line(pts, Stroke::new(0.8_f32, ink)));
             }
+        }
+        // The spike hovered in another view: one bold accent waveform.
+        for snip in self.cache.hovered.iter().flat_map(|l| &l.snips) {
+            let pts: Vec<Pos2> = (0..self.snippet_len)
+                .map(|t| {
+                    let x = sub.left() + sub.width() * t as f32 / last;
+                    Pos2::new(x, base - snip[t * self.nc + ch] * y_scale)
+                })
+                .collect();
+            painter.add(egui::Shape::line(pts, Stroke::new(2.0_f32, self.accent)));
         }
         for (k, &ci) in present.iter().enumerate() {
             let Some(mean) = cache.means.get(ci).and_then(|m| m.get(ch)) else {

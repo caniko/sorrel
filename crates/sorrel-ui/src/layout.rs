@@ -415,7 +415,12 @@ pub fn show_popouts<P: DataProvider>(
             if class == egui::ViewportClass::EmbeddedWindow {
                 // No native windows here (tests, exotic backends): a floating
                 // egui window; its close is the placeholder's button.
-                ui.allocate_ui(egui::vec2(640.0, 440.0), |ui| {
+                // allocate_ui keeps only the content's used rect, which can be
+                // empty (plots fill what they are given): pin the size so the
+                // window frames the pane and receives the pointer over it.
+                let size = egui::vec2(640.0, 440.0);
+                ui.allocate_ui(size, |ui| {
+                    ui.set_min_size(size);
                     let _ = b.pane_ui(ui, tile, &mut pane);
                 });
                 return false;
