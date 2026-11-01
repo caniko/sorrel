@@ -212,7 +212,7 @@
           license_url = "https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT";
           archive_pattern = "sorrel-{version}-{arch}-windows.zip";
           # chocolatey isn't in nixpkgs yet, and the dev shell no longer ships simit.
-          nix_tool = "github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=222c26fd351dcc7c74492c024059294def0bbc5c";
+          nix_tool = "github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=e8a983ef50d28464bd7943d1396ce839e38ca4e9";
           api_key_secret = "CHOCOLATEY_API_KEY";
           dependencies = [{id = "uv";}];
           # Start-menu entry for the launcher (its exe embeds the icon) and a
