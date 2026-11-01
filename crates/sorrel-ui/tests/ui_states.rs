@@ -28,6 +28,12 @@ type App = SorrelApp<KilosortProvider>;
 /// reads the driver list once, so every test starts here. Outside the dev
 /// shell with no GPU the tests skip, like sorrel-gpu's.
 fn no_gpu() -> bool {
+    // The reference PNGs are lavapipe output; a Windows runner has only
+    // WARP/DX12, which neither matches them nor passes `vulkan_only`.
+    if cfg!(windows) {
+        eprintln!("skipping UI snapshot test: snapshots are rasterised on lavapipe");
+        return true;
+    }
     static ERR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let err = ERR.get_or_init(|| {
         if let Some(icd) = std::env::var_os("SORREL_LAVAPIPE_ICD") {

@@ -14,12 +14,12 @@
     system,
     rustTarget,
     format ? "tar.gz",
-    binary ? "sorrel",
+    binaries ? ["sorrel"],
   }:
     mkReleaseArchive {
       inherit pkgs pname version package system rustTarget format;
       name = "sorrel-${version}-${system}.${format}";
-      entries.${binary} = "bin/${binary}";
+      entries = pkgs.lib.genAttrs binaries (b: "bin/${b}");
     };
 
   # `pip install sorrel-ephys` wheels: the `_native` extension plus the GUI binary.
@@ -88,7 +88,7 @@ in
         system = "x86_64-windows";
         rustTarget = "x86_64-pc-windows-gnu";
         format = "zip";
-        binary = "sorrel.exe";
+        binaries = ["sorrel.exe" "sorrelw.exe"];
       };
       darwin-aarch64 = archive {
         package = packages.sorrel-darwin-aarch64;

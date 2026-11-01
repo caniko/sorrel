@@ -24,13 +24,15 @@
       --fish <("$out/bin/sorrel" completions fish)
   '';
 
-  # Also installs the menu entry, so every Nix install (profile, Home
+  # Also installs the menu entry and its icon, so every Nix install (profile, Home
   # Manager, NixOS) gets one.
   rpathFixup = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
     patchelf --add-rpath "${pkgs.lib.makeLibraryPath runtimeLibs}" \
       "$out/bin/sorrel"
     install -Dm644 ${import ./desktop.nix {inherit pkgs;}} \
       "$out/share/applications/sorrel.desktop"
+    install -Dm644 ${../assets/icon/sorrel-256.png} \
+      "$out/share/icons/hicolor/256x256/apps/sorrel.png"
   '';
 
   sorrelHdf5 =
