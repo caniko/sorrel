@@ -969,6 +969,64 @@ impl<P: DataProvider> Session<P> {
             .collect()
     }
 
+    /// The clusters `node` changed, each with the global spike indices it held
+    /// just before the node was applied: a merge's sources and target, a
+    /// split's source, a batch's children (the first state seen per cluster).
+    /// `None` for a node off the head path or one that moves no spikes.
+    pub fn pre_edit_spikes(&self, node: u64) -> Option<Vec<(ClusterId, Vec<u32>)>> {
+        // Children run in order, so the first snapshot of a cluster is its
+        // entry state; a cluster a child split off did not exist at entry, and
+        // a later child's snapshot of it holds spikes already listed under
+        // their source.
+        fn collect<L: Copy>(
+            inv: &InverseOp<L>,
+            out: &mut Vec<(ClusterId, Vec<u32>)>,
+            born: &mut Vec<ClusterId>,
+        ) {
+            let mut push = |c: ClusterId, g: &[u32]| {
+                if !born.contains(&c) && !out.iter().any(|(o, _)| *o == c) {
+                    out.push((c, g.to_vec()));
+                }
+            };
+            match inv {
+                InverseOp::Merge { record, .. } => {
+                    record.memberships().for_each(|(c, g)| push(c, g));
+                }
+                InverseOp::Split { record, .. } => {
+                    let (c, g) = record.pre_source_membership();
+                    push(c, g);
+                    if !out.iter().any(|(o, _)| *o == record.new_cluster) {
+                        born.push(record.new_cluster);
+                    }
+                }
+                InverseOp::Batch { inverses } => {
+                    inverses.iter().for_each(|k| collect(k, out, born));
+                }
+                _ => {}
+            }
+        }
+        let inv = self.nodes.get(node as usize)?.inverse.as_ref()?;
+        let mut out = Vec::new();
+        collect(inv, &mut out, &mut Vec::new());
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// Whether [`Self::pre_edit_spikes`] has an answer for `node`, without
+    /// copying any membership (the History hover asks every frame).
+    pub fn has_pre_edit(&self, node: u64) -> bool {
+        fn moves<L: Copy>(inv: &InverseOp<L>) -> bool {
+            match inv {
+                InverseOp::Merge { .. } | InverseOp::Split { .. } => true,
+                InverseOp::Batch { inverses } => inverses.iter().any(moves),
+                _ => false,
+            }
+        }
+        self.nodes
+            .get(node as usize)
+            .and_then(|n| n.inverse.as_ref())
+            .is_some_and(moves)
+    }
+
     /// Node ids from the root down to `node` (empty for the root).
     fn path(&self, mut node: Option<u64>) -> Vec<u64> {
         let mut out = Vec::new();
@@ -2836,5 +2894,139 @@ mod tests {
         ));
         drop(j);
         assert_eq!(reopen(dir.path()).history_len(), 1);
+    }
+
+    /// Every spike once, each cluster as it stood at batch entry.
+    #[test]
+    fn pre_edit_spikes_of_a_batch_are_its_entry_state_with_no_duplicates() {
+        let (mut s, _d) = fresh_session();
+        let entry: Vec<(ClusterId, Vec<u32>)> = [0, 1, 2]
+            .map(|c| {
+                (
+                    ClusterId(c),
+                    s.cluster_index().global_indices(ClusterId(c)).to_vec(),
+                )
+            })
+            .to_vec();
+        let check = |s: &Session<MockProvider>, node, touched: &[u32]| {
+            let mut got = s.pre_edit_spikes(node).unwrap();
+            got.sort_by_key(|(c, _)| *c);
+            let want: Vec<_> = entry
+                .iter()
+                .filter(|(c, _)| touched.contains(&c.0))
+                .cloned()
+                .collect();
+            assert_eq!(got, want);
+            let mut all: Vec<u32> = got.iter().flat_map(|(_, g)| g.clone()).collect();
+            all.sort_unstable();
+            all.dedup();
+            assert_eq!(all.len(), got.iter().map(|(_, g)| g.len()).sum::<usize>());
+        };
+        // merge 0 -> 1, then 1 -> 2: the second snapshot of 1 already holds 0.
+        s.dispatch(CurationCommand::Batch {
+            children: vec![
+                CurationCommand::Merge {
+                    sources: vec![ClusterId(0)],
+                    target: ClusterId(1),
+                },
+                CurationCommand::Merge {
+                    sources: vec![ClusterId(1)],
+                    target: ClusterId(2),
+                },
+            ],
+        })
+        .unwrap();
+        check(&s, s.head().unwrap(), &[0, 1, 2]);
+        s.dispatch(CurationCommand::Undo).unwrap();
+        // split 0 (the new cluster is 3), then merge the new cluster into 1:
+        // 3 did not exist at entry, so it is not listed (its spikes are 0's).
+        s.dispatch(CurationCommand::Batch {
+            children: vec![
+                CurationCommand::Split {
+                    cluster: ClusterId(0),
+                    spike_idx: vec![0, 2],
+                    new_cluster: ClusterId(3),
+                    by: Method::Manual,
+                },
+                CurationCommand::Merge {
+                    sources: vec![ClusterId(3)],
+                    target: ClusterId(1),
+                },
+            ],
+        })
+        .unwrap();
+        check(&s, s.head().unwrap(), &[0, 1]);
+    }
+
+    #[test]
+    fn pre_edit_spikes_match_the_memberships_before_each_edit() {
+        let (mut s, _d) = fresh_session();
+        let members = |s: &Session<MockProvider>, cs: &[u32]| -> Vec<(ClusterId, Vec<u32>)> {
+            cs.iter()
+                .map(|&c| {
+                    let c = ClusterId(c);
+                    (c, s.cluster_index().global_indices(c).to_vec())
+                })
+                .collect()
+        };
+        let sorted = |mut v: Vec<(ClusterId, Vec<u32>)>| {
+            v.sort_by_key(|(c, _)| *c);
+            v
+        };
+        let before_split = members(&s, &[0]);
+        s.dispatch(CurationCommand::Split {
+            cluster: ClusterId(0),
+            spike_idx: vec![0, 2],
+            new_cluster: ClusterId(0),
+            by: Method::Manual,
+        })
+        .unwrap();
+        let split = s.head().unwrap();
+        assert_eq!(s.pre_edit_spikes(split), Some(before_split));
+
+        let before_merge = members(&s, &[1, 2]);
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![ClusterId(1)],
+            target: ClusterId(2),
+        })
+        .unwrap();
+        let merge = s.head().unwrap();
+        assert_eq!(s.pre_edit_spikes(merge).map(sorted), Some(before_merge));
+        // Earlier nodes on the head path keep their record.
+        assert!(s.pre_edit_spikes(split).is_some());
+
+        // A batch is the union of its children's first states.
+        let before_batch = members(&s, &[0, 1, 2]);
+        s.dispatch(CurationCommand::Batch {
+            children: vec![
+                CurationCommand::Merge {
+                    sources: vec![ClusterId(0)],
+                    target: ClusterId(2),
+                },
+                CurationCommand::Merge {
+                    sources: vec![ClusterId(2)],
+                    target: ClusterId(1),
+                },
+            ],
+        })
+        .unwrap();
+        let batch = s.head().unwrap();
+        assert_eq!(s.pre_edit_spikes(batch).map(sorted), Some(before_batch));
+
+        // Nodes that move no spikes, unknown nodes and undone nodes: None.
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetGood,
+        })
+        .unwrap();
+        assert_eq!(s.pre_edit_spikes(s.head().unwrap()), None);
+        assert_eq!(s.pre_edit_spikes(999), None);
+        s.dispatch(CurationCommand::Undo).unwrap();
+        s.dispatch(CurationCommand::Undo).unwrap();
+        assert_eq!(s.pre_edit_spikes(batch), None, "off the head path");
+        assert!(s.pre_edit_spikes(merge).is_some());
+        for n in [batch, merge, 999] {
+            assert_eq!(s.has_pre_edit(n), s.pre_edit_spikes(n).is_some());
+        }
     }
 }

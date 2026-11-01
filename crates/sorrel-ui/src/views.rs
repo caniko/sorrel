@@ -11,7 +11,7 @@ use sorrel_data::{
     cluster_quality, preview_merge, DepthSource, MergeCandidate, Session, SpikeDepths,
     SplitCandidate, SuggestConfig,
 };
-use sorrel_io::{ClusterId, DataProvider, Events};
+use sorrel_io::{ClusterId, DataProvider, Events, SampleIndex};
 
 use crate::theme::{selection_colour, Theme};
 
@@ -695,6 +695,7 @@ impl RasterCache {
 /// window to that time.
 ///
 /// Returns the time (in samples) the user clicked, if any.
+#[allow(clippy::too_many_arguments)]
 pub fn raster_view<P: DataProvider>(
     ui: &mut Ui,
     session: &Session<P>,
@@ -703,6 +704,7 @@ pub fn raster_view<P: DataProvider>(
     cache: &mut RasterCache,
     colours: (&[Option<Color32>], u64),
     scheme_delta: &mut i32,
+    brushes: &mut crate::brush::Brushes,
 ) -> Option<RasterClick> {
     let theme = Theme::from_ui(ui);
     cache.ensure(session, theme.dark, colours.0, colours.1);
@@ -731,7 +733,8 @@ pub fn raster_view<P: DataProvider>(
     let (rect, resp) = alloc_plot(ui, egui::vec2(120.0, 160.0), Sense::click_and_drag());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "raster plot"));
     let resp = resp.on_hover_text(
-        "Click to seek the trace to that time. Drag pans, wheel zooms, double-click resets.",
+        "Click to seek the trace to that time. Drag pans, wheel zooms, double-click resets. \
+         Shift+drag sets a time range (Esc clears).",
     );
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme.plot_bg);
@@ -782,6 +785,27 @@ pub fn raster_view<P: DataProvider>(
         .add(eframe::egui_wgpu::Callback::new_paint_callback(
             data, callback,
         ));
+    // Time brush on the GPU dots: cover the time outside the range with the
+    // plot background (opaque when `only`, 80 % when fading) instead of
+    // re-colouring and re-uploading tens of millions of vertices on every
+    // drag frame. The selected and brushed ticks below fade per spike.
+    if let Some(tb) = brushes.time {
+        let px = |t: f32| data.left() + (t - v0) / v_span * data.width();
+        let (a, b) = (
+            px(tb.start).clamp(data.left(), data.right()),
+            px(tb.end).clamp(data.left(), data.right()),
+        );
+        let cover = theme
+            .plot_bg
+            .gamma_multiply(if tb.only { 1.0 } else { 0.8 });
+        for (l, r) in [(data.left(), a), (b, data.right())] {
+            dp.rect_filled(
+                egui::Rect::from_x_y_ranges(l..=r, data.y_range()),
+                0.0,
+                cover,
+            );
+        }
+    }
 
     // Selected clusters in their slot colour, drawn as 2 px ticks over the
     // neutral GPU dots.
@@ -802,14 +826,52 @@ pub fn raster_view<P: DataProvider>(
         let yc = row_y(row as f32 + 0.5);
         let colour = selection_colour(slot);
         for t in session.spike_times(c).iter().step_by(stride) {
-            let x = data.left() + (t.as_f32() * inv_sr - v0) / v_span * data.width();
+            let ts = t.as_f32() * inv_sr;
+            let Some(a) = crate::widgets::time_alpha(brushes.time, ts, 255) else {
+                continue;
+            };
+            let x = data.left() + (ts - v0) / v_span * data.width();
             dp.rect_filled(
                 egui::Rect::from_center_size(egui::pos2(x, yc), egui::vec2(2.0, tick_h)),
                 0.0,
-                colour,
+                colour.gamma_multiply(a as f32 / 255.0),
             );
         }
     }
+
+    // Brushed spikes: full-height ink ticks over the slot-coloured ones.
+    // ponytail: drawn per frame from the visible slice of each cluster's
+    // brush (<= 20k ticks); the GPU buffer is a single slot, so an ink
+    // layer would need its own pipeline.
+    if let Some(sb) = &brushes.spikes {
+        let ink = crate::widgets::ink(theme.dark);
+        let ink_h = row_h.clamp(3.0, 28.0);
+        for (c, locals) in &sb.spikes {
+            let times = session.spike_times(*c);
+            let Some(&row) = cache.rows.get(c.idx()).filter(|&&r| r >= 0) else {
+                continue;
+            };
+            if locals.last().is_none_or(|&l| l as usize >= times.len()) {
+                continue;
+            }
+            let at = |l: u32| times[l as usize].as_f32() * inv_sr;
+            let lo = locals.partition_point(|&l| at(l) < v0);
+            let hi = locals.partition_point(|&l| at(l) <= v1);
+            let yc = row_y(row as f32 + 0.5);
+            for &l in locals[lo..hi].iter().step_by(((hi - lo) / 20_000).max(1)) {
+                let Some(a) = crate::widgets::time_alpha(brushes.time, at(l), 255) else {
+                    continue;
+                };
+                let x = data.left() + (at(l) - v0) / v_span * data.width();
+                dp.rect_filled(
+                    egui::Rect::from_center_size(egui::pos2(x, yc), egui::vec2(2.0, ink_h)),
+                    0.0,
+                    ink.gamma_multiply(a as f32 / 255.0),
+                );
+            }
+        }
+    }
+    crate::widgets::time_overlays(ui, &dp, data, (v0, v1), brushes, 1.0 / inv_sr);
 
     // Gutter: the cluster id of every Nth row (every row when they fit),
     // plus every selected row in its slot colour.
@@ -852,6 +914,9 @@ pub fn raster_view<P: DataProvider>(
     // Click → seek. Map x in the data area to time, return as samples.
     *scheme_delta += crate::theme::scheme_wheel(ui, &resp);
     cache.pz.interact(&resp, data);
+    // Shift+click keeps adding a cluster here, so only Esc and the chip
+    // clear the range.
+    crate::widgets::time_brush_gesture(&resp, brushes, data, (v0, v1), false);
     // phy: Ctrl+click selects the row's cluster, Shift+click adds it.
     let mut seek_to = None;
     if resp.clicked() {
@@ -888,6 +953,30 @@ pub enum RasterClick {
 
 // ---- FiringRateView -----------------------------------------------------
 
+/// Spike counts of `bins` bins of `bin_s` seconds from `x0`. With an
+/// `only` time brush, spikes outside it are not counted.
+fn rate_counts(
+    times: &[SampleIndex],
+    sr: f32,
+    x0: f32,
+    bin_s: f32,
+    bins: usize,
+    time: Option<crate::brush::TimeBrush>,
+) -> Vec<u32> {
+    let mut h = vec![0u32; bins];
+    for &t in times {
+        let ts = t.0 as f64 / sr as f64;
+        if time.is_some_and(|b| b.only && !b.contains(ts as f32)) {
+            continue;
+        }
+        let u = (ts - x0 as f64) / bin_s as f64;
+        if u >= 0.0 && (u as usize) < bins {
+            h[u as usize] += 1;
+        }
+    }
+    h
+}
+
 /// Per-cluster firing rate over the recording, plotted as overlaid line
 /// graphs colour-coded by cluster. Useful for spotting drift, electrode
 /// failure, and post-stimulus modulation — all phy parity.
@@ -896,6 +985,7 @@ pub fn firing_rate_view<P: DataProvider>(
     session: &Session<P>,
     selection: &[ClusterId],
     params: &mut crate::prefs::RateParams,
+    brushes: &mut crate::brush::Brushes,
 ) {
     let theme = Theme::from_ui(ui);
     if selection.is_empty() {
@@ -933,13 +1023,7 @@ pub fn firing_rate_view<P: DataProvider>(
     let mut max_count = 1u32;
     for &c in selection {
         let times = session.spike_times(c);
-        let mut h = vec![0u32; bins];
-        for &t in times {
-            let u = (t.0 as f64 / sr as f64 - x0 as f64) / bin_s as f64;
-            if u >= 0.0 && (u as usize) < bins {
-                h[u as usize] += 1;
-            }
-        }
+        let h = rate_counts(times, sr, x0, bin_s, bins, brushes.time);
         if let Some(&m) = h.iter().max() {
             if m > max_count {
                 max_count = m;
@@ -961,14 +1045,18 @@ pub fn firing_rate_view<P: DataProvider>(
             legend(selection)
         ),
     );
-    let (rect, resp) = alloc_plot(ui, egui::vec2(160.0, 160.0), Sense::drag());
+    let (rect, resp) = alloc_plot(ui, egui::vec2(160.0, 160.0), Sense::click_and_drag());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "rate plot"));
-    let resp = resp.on_hover_text("Drag pans, wheel zooms in time, double-click resets.");
+    let resp = resp.on_hover_text(
+        "Drag pans, wheel zooms in time, double-click resets. \
+         Shift+drag sets a time range, Shift+click clears it.",
+    );
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme.plot_bg);
     let data = axes_data_rect(rect, true);
     // Only time pans and zooms; y always fits the visible bins.
     params.pz.interact(&resp, data);
+    crate::widgets::time_brush_gesture(&resp, brushes, data, (x0, x1), true);
 
     // 15% headroom above the tallest bin.
     let y_top = max_count as f32 / bin_s * 1.15;
@@ -987,6 +1075,23 @@ pub fn firing_rate_view<P: DataProvider>(
         let rates: Vec<f32> = hist.iter().map(|&c| c as f32 / bin_s).collect();
         step_hist(&dp, data, &rates, y_top, selection_colour(ci), fill);
     }
+    // Time brush: fade the bins outside the range (with `only` they were
+    // never counted).
+    if let Some(tb) = brushes.time.filter(|tb| !tb.only) {
+        let px = |t: f32| data.left() + (t - x0) / (x1 - x0).max(1e-9) * data.width();
+        let (a, b) = (
+            px(tb.start).clamp(data.left(), data.right()),
+            px(tb.end).clamp(data.left(), data.right()),
+        );
+        for (l, r) in [(data.left(), a), (b, data.right())] {
+            dp.rect_filled(
+                egui::Rect::from_x_y_ranges(l..=r, data.y_range()),
+                0.0,
+                theme.plot_bg.gamma_multiply(0.8),
+            );
+        }
+    }
+    crate::widgets::time_overlays(ui, &dp, data, (x0, x1), brushes, sr);
 }
 
 // ---- ProbeView ----------------------------------------------------------
@@ -995,13 +1100,18 @@ pub fn firing_rate_view<P: DataProvider>(
 /// cluster, the [`WaveformCache`] gives the peak channel and a
 /// colour-matching ring is drawn at that position. The cache is refreshed
 /// here too, so the rings never lag behind the selection.
+///
+/// Also the Features channel picker: the set's channels get a selection
+/// ring (A and B a badge), the focused plot's a strong ring, and a click
+/// on a site edits the set (see [`probe_site_edit`]). Returns that edit.
 pub fn probe_view<P: DataProvider>(
     ui: &mut Ui,
     session: &Session<P>,
     selection: &[ClusterId],
     channel_positions: &[[f32; 2]],
     waveforms: &mut WaveformCache,
-) {
+    link: &crate::feature_view::FeatureLink,
+) -> Option<crate::feature_view::ChannelEdit> {
     let theme = Theme::from_ui(ui);
     let pre = waveform_window_samples(session.provider.sample_rate());
     waveforms.ensure(session, selection, pre, pre);
@@ -1011,7 +1121,7 @@ pub fn probe_view<P: DataProvider>(
             &theme,
             "channel_positions.npy not loaded — probe layout unavailable",
         );
-        return;
+        return None;
     }
 
     // Probe extents → screen rect with a small margin.
@@ -1038,6 +1148,11 @@ pub fn probe_view<P: DataProvider>(
             y_min,
             y_max,
         ),
+    );
+    ui.label(
+        egui::RichText::new("Shift+click: toggle in set\nCtrl+click A · Ctrl+right B")
+            .size(CAPTION_PX)
+            .color(theme.caption),
     );
     let (rect, _resp) = alloc_plot(ui, egui::vec2(160.0, 220.0), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -1099,6 +1214,56 @@ pub fn probe_view<P: DataProvider>(
         }
     }
 
+    // Features channel set: a selection ring on every member, a strong ring
+    // on the focused plot's channels, an A / B badge on the first two. Each
+    // on-screen site is a button (AccessKit label); a 384-site probe only
+    // pays for the sites in view.
+    let sel = ui.visuals().selection;
+    let m = ui.input(|i| i.modifiers);
+    let hit = (min_dy * s).clamp(4.0, 14.0);
+    let mut edit = None;
+    for (ch, &[x, y]) in channel_positions.iter().enumerate() {
+        let c = project(x, y);
+        if !painter.clip_rect().contains(c) {
+            continue;
+        }
+        let r = ui.interact(
+            egui::Rect::from_center_size(c, egui::Vec2::splat(hit)),
+            ui.id().with(("probe_site", ch)),
+            Sense::click(),
+        );
+        r.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("probe site ch{ch}"))
+        });
+        let (left, right) = (
+            r.clicked_by(egui::PointerButton::Primary),
+            r.clicked_by(egui::PointerButton::Secondary),
+        );
+        edit = edit.or(probe_site_edit(m, left, right, ch as u32));
+        let mark = crate::waveform_view::box_mark(link, ch as u32);
+        if mark.in_set {
+            painter.circle_stroke(c, 5.5, Stroke::new(1.5_f32, sel.bg_fill));
+        }
+        if mark.highlighted {
+            painter.circle_stroke(c, 10.5, Stroke::new(1.8_f32, theme.text));
+        }
+        if let Some(letter) = mark.badge {
+            let badge =
+                egui::Rect::from_min_size(c + egui::vec2(8.0, -19.0), egui::vec2(12.0, 12.0));
+            painter.rect_filled(badge, 2.0, sel.bg_fill);
+            painter.text(
+                badge.center(),
+                egui::Align2::CENTER_CENTER,
+                letter,
+                egui::FontId::proportional(TICK_PX),
+                sel.stroke.color,
+            );
+        }
+        if r.hovered() {
+            r.on_hover_text(format!("ch{ch}"));
+        }
+    }
+
     // Ring each selected cluster's peak channel in its slot colour.
     for (ci, peak) in peaks.iter().enumerate() {
         let Some(ch) = *peak else { continue };
@@ -1112,6 +1277,99 @@ pub fn probe_view<P: DataProvider>(
         if !label_all {
             label(ch, px, colour);
         }
+    }
+    edit
+}
+
+/// What a click on a probe site asks of the Features channel set, with the
+/// same gestures as Waveforms: Shift+click toggles it, Ctrl+click makes it
+/// A, Ctrl+right-click makes it B.
+pub(crate) fn probe_site_edit(
+    m: egui::Modifiers,
+    left: bool,
+    right: bool,
+    ch: u32,
+) -> Option<crate::feature_view::ChannelEdit> {
+    use crate::feature_view::ChannelEdit;
+    if m.command && right {
+        Some(ChannelEdit::SetB(ch))
+    } else if m.command && left {
+        Some(ChannelEdit::SetA(ch))
+    } else if m.shift && left {
+        Some(ChannelEdit::Toggle(ch))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::rate_counts;
+    use crate::brush::TimeBrush;
+    use sorrel_io::SampleIndex;
+
+    #[test]
+    fn only_counts_in_range_spikes() {
+        // 10 Hz sampling: spikes at 0.5 s, 1.5 s, 2.5 s; 3 bins of 1 s.
+        let t = [5, 15, 25].map(SampleIndex);
+        let all = rate_counts(&t[..], 10.0, 0.0, 1.0, 3, None);
+        assert_eq!(all, [1, 1, 1]);
+        let tb = TimeBrush {
+            start: 1.0,
+            end: 2.0,
+            only: true,
+        };
+        assert_eq!(rate_counts(&t, 10.0, 0.0, 1.0, 3, Some(tb)), [0, 1, 0]);
+        let fade = TimeBrush { only: false, ..tb };
+        assert_eq!(rate_counts(&t, 10.0, 0.0, 1.0, 3, Some(fade)), all);
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::probe_site_edit;
+    use crate::feature_view::{ChannelEdit, FeatureLink};
+    use crate::waveform_view::box_mark;
+    use egui::Modifiers;
+
+    #[test]
+    fn gestures_match_waveforms() {
+        let (none, shift, ctrl) = (
+            Modifiers::NONE,
+            Modifiers::SHIFT,
+            Modifiers::COMMAND | Modifiers::CTRL,
+        );
+        assert_eq!(probe_site_edit(none, true, false, 5), None);
+        assert_eq!(
+            probe_site_edit(shift, true, false, 5),
+            Some(ChannelEdit::Toggle(5))
+        );
+        assert_eq!(probe_site_edit(shift, false, true, 5), None);
+        assert_eq!(
+            probe_site_edit(ctrl, true, false, 5),
+            Some(ChannelEdit::SetA(5))
+        );
+        assert_eq!(
+            probe_site_edit(ctrl, false, true, 5),
+            Some(ChannelEdit::SetB(5))
+        );
+    }
+
+    #[test]
+    fn sites_get_badge_and_rings_from_the_link() {
+        let link = FeatureLink {
+            set: vec![4, 2, 7],
+            highlight: vec![2, 7],
+            ..Default::default()
+        };
+        let m = |ch| {
+            let m = box_mark(&link, ch);
+            (m.badge, m.in_set, m.highlighted)
+        };
+        assert_eq!(m(4), (Some('A'), true, false));
+        assert_eq!(m(2), (Some('B'), true, true));
+        assert_eq!(m(7), (None, true, true));
+        assert_eq!(m(0), (None, false, false));
     }
 }
 
@@ -1417,6 +1675,7 @@ pub struct SuggestCache {
     /// Current selection, set by the caller each frame so rows involving
     /// it are tinted in the cluster's slot colour.
     pub selection: Vec<ClusterId>,
+    tips: crate::similarity_view::MergeTips,
 }
 
 impl SuggestCache {
@@ -1496,6 +1755,7 @@ pub fn suggest_view<P, F>(
     cache: &mut SuggestCache,
     label_str: F,
     jobs: &crate::jobs::JobCtx<Session<P>>,
+    brushes: &mut crate::brush::Brushes,
 ) -> Option<SuggestAction>
 where
     P: DataProvider,
@@ -1552,8 +1812,28 @@ where
                      or seed amplitudes for stronger evidence.",
                 );
             } else {
-                let merge_action =
-                    render_merge_table(ui, &result.merges, &result.merge_previews, &sel);
+                let mut hovered = None;
+                let merge_action = render_merge_table(
+                    ui,
+                    &result.merges,
+                    &result.merge_previews,
+                    &sel,
+                    &mut hovered,
+                );
+                // The row merges a into b: preview exactly that, ghosting
+                // the end that isn't selected.
+                match hovered {
+                    Some((a, b)) => cache.tips.hover(
+                        ui,
+                        jobs,
+                        session.version(),
+                        a,
+                        b,
+                        crate::similarity_view::ghost_of(&sel, a, b),
+                        brushes,
+                    ),
+                    None => cache.tips.clear(),
+                }
                 if action.is_none() {
                     action = merge_action;
                 }
@@ -1595,6 +1875,7 @@ pub(crate) fn render_merge_table(
     merges: &[MergeCandidate],
     previews: &[MergePreviewSummary],
     sel: &[ClusterId],
+    hovered: &mut Option<(ClusterId, ClusterId)>,
 ) -> Option<SuggestAction> {
     let theme = Theme::from_ui(ui);
     use egui_extras::{Column, TableBuilder};
@@ -1708,6 +1989,10 @@ pub(crate) fn render_merge_table(
                             }
                         });
                     });
+                    let r = row.response();
+                    if r.ctx.rect_contains_pointer(r.layer_id, r.rect) {
+                        *hovered = Some((m.a, m.b));
+                    }
                 });
             }
         });
@@ -1905,12 +2190,15 @@ pub fn quality_view<P: DataProvider>(
     selection: &[ClusterId],
     cache: &mut QualityCache,
     jobs: &crate::jobs::JobCtx<Session<P>>,
+    brushes: &crate::brush::Brushes,
 ) {
     let theme = Theme::from_ui(ui);
     if selection.is_empty() {
         ui.label("no selection");
         return;
     }
+    // Split what-if for a lasso / k-means brush: delta rows under its cluster.
+    let split = crate::isi_view::split_preview(ui, session, jobs, brushes, selection);
     let Some(rows) = cache.ensure(session, selection, jobs) else {
         ui.horizontal(|ui| {
             ui.spinner();
@@ -1944,12 +2232,15 @@ pub fn quality_view<P: DataProvider>(
         }
         // Right-aligned cells make `Column::auto` grow to the pane width, so
         // size each column to its header instead.
+        let n_cols = heads.len();
         let mut tb = TableBuilder::new(ui)
             .striped(true)
             .resizable(false)
-            .column(Column::exact(48.0));
-        for name in &heads {
-            tb = tb.column(Column::exact((name.len() as f32 * 6.5 + 6.0).max(44.0)));
+            .column(Column::exact(if split.is_some() { 112.0 } else { 48.0 }));
+        for (i, name) in heads.iter().enumerate() {
+            // Composite also holds the "if split" delta and score side by side.
+            let min = if i == 0 && split.is_some() { 112.0 } else { 44.0 };
+            tb = tb.column(Column::exact((name.len() as f32 * 6.5 + 6.0).max(min)));
         }
         tb.header(24.0, |mut h| {
             h.col(|ui| {
@@ -2038,6 +2329,39 @@ pub fn quality_view<P: DataProvider>(
                         });
                     }
                 });
+                if let Some(sp) = split.as_ref().filter(|sp| sp.cluster == c) {
+                    for (name, part) in [("inside", &sp.inside), ("outside", &sp.outside)] {
+                        let (score, d) = (part.composite(), part.composite() - composite);
+                        let tone = if d >= 0.0 { theme.good } else { theme.danger };
+                        let fill = |ui: &mut Ui| {
+                            ui.painter()
+                                .rect_filled(ui.max_rect(), 0.0, tone.gamma_multiply(0.14));
+                        };
+                        body.row(22.0, |mut row| {
+                            row.col(|ui| {
+                                fill(ui);
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(format!("if split · {name}"))
+                                        .size(CAPTION_PX)
+                                        .color(theme.caption),
+                                )
+                                .on_hover_text(
+                                    "Composite score of this part if the brushed spikes were split off",
+                                );
+                            });
+                            // Score and delta share the composite column (the
+                            // next column's header is a sub-score).
+                            row.col(|ui| {
+                                fill(ui);
+                                num_cell(ui, format!("{score:.2} ({d:+.2})"), Some(tone));
+                            });
+                            for _ in 1..n_cols {
+                                row.col(fill);
+                            }
+                        });
+                    }
+                }
             }
         });
     });
@@ -2071,6 +2395,7 @@ pub fn drift_map_view<P: DataProvider>(
     session: &Session<P>,
     selection: &[ClusterId],
     depths: Option<&SpikeDepths>,
+    brushes: &mut crate::brush::Brushes,
 ) {
     let theme = Theme::from_ui(ui);
     if selection.is_empty() {
@@ -2145,7 +2470,9 @@ pub fn drift_map_view<P: DataProvider>(
         &theme,
         format!("{y_name} over time · {total_spikes} spikes · regression line per cluster"),
     );
-    let (rect, _resp) = alloc_plot(ui, egui::vec2(160.0, 180.0), Sense::hover());
+    let (rect, resp) = alloc_plot(ui, egui::vec2(160.0, 180.0), Sense::click_and_drag());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "drift plot"));
+    let resp = resp.on_hover_text("Shift+drag sets a time range, Shift+click clears it.");
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme.plot_bg);
     let data = axes_data_rect(rect, true);
@@ -2160,6 +2487,8 @@ pub fn drift_map_view<P: DataProvider>(
     );
     let painter = painter.with_clip_rect(data);
     let mut max_drift = 0.0f32;
+    let x_axis = (t_min, t_min + t_span);
+    crate::widgets::time_brush_gesture(&resp, brushes, data, x_axis, true);
 
     const POINT_BUDGET: usize = 30_000;
     let stride = ((total_spikes as f32 / POINT_BUDGET as f32).ceil() as usize).max(1);
@@ -2215,14 +2544,50 @@ pub fn drift_map_view<P: DataProvider>(
             continue;
         }
         let colour = selection_colour(slot);
-        let faint = Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), 90);
         for i in (0..times.len().min(amps.len())).step_by(stride) {
             let t = times[i].as_f32() * inv_sr;
+            // Outside the time brush: faded, or gone with `only`.
+            let Some(a) = crate::widgets::time_alpha(brushes.time, t, 90) else {
+                continue;
+            };
+            let faint = Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), a);
             let x = data.left() + (t - t_min) / t_span * data.width();
             let y = data.bottom() - (amps[i] - a_min) / a_span * data.height();
             painter.circle_filled(egui::pos2(x, y), 1.6, faint);
         }
     }
+    // Brushed spikes in ink on top, and the hovered one ringed.
+    let at = |c: ClusterId, i: usize| {
+        let (t, a) = (*session.spike_times(c).get(i)?, *ys(c).get(i)?);
+        let t = t.as_f32() * inv_sr;
+        Some((
+            t,
+            egui::pos2(
+                data.left() + (t - t_min) / t_span * data.width(),
+                data.bottom() - (a - a_min) / a_span * data.height(),
+            ),
+        ))
+    };
+    if let Some(sb) = &brushes.spikes {
+        let ink = crate::widgets::ink(theme.dark);
+        for &c in selection {
+            let locals = sb.of(c);
+            for &l in locals.iter().step_by((locals.len() / 5_000).max(1)) {
+                if let Some((t, p)) = at(c, l as usize) {
+                    if crate::widgets::time_alpha(brushes.time, t, 255).is_some() {
+                        painter.circle_filled(p, 2.2, ink);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(h) = brushes.hover.filter(|h| selection.contains(&h.cluster)) {
+        if let Some((_, p)) = at(h.cluster, h.local as usize) {
+            crate::widgets::ring(&painter, ui, p);
+        }
+    }
+    let sr = session.provider.sample_rate().max(1.0);
+    crate::widgets::time_overlays(ui, &painter, data, x_axis, brushes, sr);
     let flat_below = if depths.is_some() { 0.5 } else { a_span * 0.02 };
     if max_drift < flat_below {
         painter.text(

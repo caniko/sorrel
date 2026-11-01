@@ -131,6 +131,9 @@ pub struct WaveformParams {
     pub probe_scale: [f32; 2],
     /// Amplitude factor (`ctrl+up/down`).
     pub amp_scale: f32,
+    /// Draw the focused feature plot's PC1/PC2 temporal shapes on its
+    /// channels (cross-talk with the Features pane).
+    pub pc_shapes: bool,
 }
 
 impl Default for WaveformParams {
@@ -143,6 +146,7 @@ impl Default for WaveformParams {
             box_scale: [1.0, 1.0],
             probe_scale: [1.0, 1.0],
             amp_scale: 1.0,
+            pc_shapes: true,
         }
     }
 }

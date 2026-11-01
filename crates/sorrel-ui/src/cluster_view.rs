@@ -636,6 +636,8 @@ pub struct ClusterTableState {
     /// and Shift-click walk this, so "next" means the next row the user
     /// sees, not the next cluster id.
     pub visible: Vec<ClusterId>,
+    /// The row under the pointer in the last drawn frame (Similar ghost hover).
+    pub hovered: Option<ClusterId>,
     /// Anchor the table last scrolled to; scroll again only when it
     /// changes so the wheel isn't fought every frame.
     last_scrolled: Option<ClusterId>,
@@ -654,6 +656,7 @@ impl Default for ClusterTableState {
             hide_noise: false,
             review_only: false,
             visible: Vec::new(),
+            hovered: None,
             last_scrolled: None,
             metric_names: Vec::new(),
         }
@@ -1044,6 +1047,7 @@ pub fn cluster_table<P: DataProvider>(
     let is_similar = similar.is_some();
     let sort_col = state.sort_by.clone();
     let up = !state.sort_descending;
+    let mut hovered = None;
     let mut draw = |ui: &mut Ui| {
         let mut clicked: Option<ClusterColumn> = None;
         let mut picked: Option<RowClick> = None;
@@ -1241,6 +1245,10 @@ pub fn cluster_table<P: DataProvider>(
                             }
                         });
                     }
+                    let r = row.response();
+                    if r.ctx.rect_contains_pointer(r.layer_id, r.rect) {
+                        hovered = Some(i);
+                    }
                     // Whole-row click (phy semantics): plain replaces,
                     // Cmd/Ctrl toggles, Shift extends in table order.
                     if row.response().clicked() {
@@ -1270,6 +1278,7 @@ pub fn cluster_table<P: DataProvider>(
         state.toggle_sort(col);
     }
     state.visible = visible;
+    state.hovered = hovered;
     picked
 }
 

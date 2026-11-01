@@ -59,13 +59,89 @@ pub fn preview_merge<P: DataProvider>(
     );
     // Isolation requires the live PC features and a "is in cluster" mask
     // that treats every spike currently in any of `all` as in-cluster.
-    post.isolation = preview_isolation(session, &all);
+    post.isolation = preview_isolation(session, |_, c| all.contains(&c));
 
     MergePreview {
         sources: sources.to_vec(),
         target,
         pre,
         post,
+    }
+}
+
+/// What splitting `cluster` by a spike set would leave behind: the quality
+/// of the part that moves out (`inside`, the future new cluster), the part
+/// that stays (`outside`) and the cluster as it is now (`parent`), plus both
+/// parts' spike trains for ISI histograms.
+#[derive(Clone, Debug)]
+pub struct SplitPreview {
+    pub cluster: ClusterId,
+    pub inside: QualityBreakdown,
+    pub outside: QualityBreakdown,
+    pub parent: QualityBreakdown,
+    pub inside_times: Vec<SampleIndex>,
+    pub outside_times: Vec<SampleIndex>,
+}
+
+/// Preview `CurationCommand::Split { cluster, spike_idx: inside_local }`
+/// without applying it: same borrow-only approach as [`preview_merge`].
+/// `inside_local` indexes the cluster's time-sorted bucket; out-of-range
+/// indices are ignored (as the real split does).
+pub fn preview_split<P: DataProvider>(
+    session: &Session<P>,
+    cluster: ClusterId,
+    inside_local: &[u32],
+) -> SplitPreview {
+    let sr = session.provider.sample_rate().max(1.0);
+    let refractory_samples = (sr * REFRACTORY_SECONDS).round() as u64;
+    let total = session.provider.n_samples().0;
+    let times = session.spike_times(cluster);
+    let amps = session.spike_amplitudes(cluster);
+    let has_amps = amps.len() == times.len();
+
+    let mut is_in = vec![false; times.len()];
+    for &i in inside_local {
+        if let Some(f) = is_in.get_mut(i as usize) {
+            *f = true;
+        }
+    }
+    let pick = |want: bool| -> (Vec<SampleIndex>, Vec<f32>) {
+        let keep = (0..times.len()).filter(|&i| is_in[i] == want);
+        let t = keep.clone().map(|i| times[i]).collect();
+        let a = if has_amps {
+            keep.map(|i| amps[i]).collect()
+        } else {
+            Vec::new()
+        };
+        (t, a)
+    };
+    // Global spike index -> 0 elsewhere, 1 inside, 2 outside (the bucket is
+    // the cluster's spikes in global order, the same walk `split` does).
+    let mut part = vec![0u8; session.spike_clusters_global().len()];
+    let mut local = 0usize;
+    for (g, &c) in session.spike_clusters_global().iter().enumerate() {
+        if c == cluster {
+            part[g] = if is_in.get(local).copied().unwrap_or(false) {
+                1
+            } else {
+                2
+            };
+            local += 1;
+        }
+    }
+    let quality = |(t, a): &(Vec<SampleIndex>, Vec<f32>), parts: &[u8]| {
+        let mut q = quality_breakdown(t, a, refractory_samples, total, sr, PRESENCE_BINS);
+        q.isolation = preview_isolation(session, |g, _| parts.contains(&part[g]));
+        q
+    };
+    let (inside, outside) = (pick(true), pick(false));
+    SplitPreview {
+        cluster,
+        inside: quality(&inside, &[1]),
+        outside: quality(&outside, &[2]),
+        parent: crate::quality_ext::cluster_quality(session, cluster),
+        inside_times: inside.0,
+        outside_times: outside.0,
     }
 }
 
@@ -139,12 +215,12 @@ fn merge_spike_data<P: DataProvider>(
     (times, amps)
 }
 
-/// Compute isolation for the *hypothetical merged cluster* — the
-/// in-cluster mask is the union of every spike that currently belongs to
-/// any cluster in `merged`.
+/// Compute isolation for a *hypothetical cluster*: `is_member(global spike
+/// index, its current cluster)` says which spikes are in-cluster (a merge
+/// passes the union of its clusters, a split one part of a cluster).
 fn preview_isolation<P: DataProvider>(
     session: &Session<P>,
-    merged: &[ClusterId],
+    is_member: impl Fn(usize, ClusterId) -> bool,
 ) -> Option<IsolationMetrics> {
     let (n_pcs, n_chans) = session.pc_shape();
     if n_pcs == 0 || n_chans == 0 {
@@ -160,8 +236,8 @@ fn preview_isolation<P: DataProvider>(
     }
     let mut n_in = 0usize;
     let mut n_out = 0usize;
-    for &c in spike_clusters {
-        if merged.contains(&c) {
+    for (g, &c) in spike_clusters.iter().enumerate() {
+        if is_member(g, c) {
             n_in += 1;
         } else {
             n_out += 1;
@@ -177,7 +253,7 @@ fn preview_isolation<P: DataProvider>(
     let mut is_in: Vec<bool> = Vec::with_capacity(n_in + bg_keep);
 
     for (g, &c) in spike_clusters.iter().enumerate() {
-        if !merged.contains(&c) {
+        if !is_member(g, c) {
             continue;
         }
         let Some(feats) = session.pc_feature_for(g as u32) else {
@@ -193,7 +269,7 @@ fn preview_isolation<P: DataProvider>(
     }
     let mut bg_seen = 0usize;
     for (g, &c) in spike_clusters.iter().enumerate() {
-        if merged.contains(&c) {
+        if is_member(g, c) {
             continue;
         }
         let take = bg_seen.checked_rem(bg_stride) == Some(0);
@@ -280,6 +356,11 @@ mod tests {
         }
         fn initial_labels(&self) -> Vec<u8> {
             vec![0; self.spikes.len()]
+        }
+    }
+    impl crate::session::ApplyPhyLabel for MockProvider {
+        fn label_from_op(_: crate::command::PhyLabelOp) -> u8 {
+            0
         }
     }
     impl HasAmplitudes for MockProvider {
@@ -373,5 +454,56 @@ mod tests {
         let (s, _d) = make_session(prov);
         let p = preview_merge(&s, &[ClusterId(1)], ClusterId(0));
         assert!(p.post.isolation.is_none());
+    }
+    #[test]
+    fn preview_split_matches_an_applied_split() {
+        use crate::command::CurationCommand;
+        // 60 spikes at 1 kHz-ish spacing with a few close pairs and a
+        // two-level amplitude pattern; split out every third spike.
+        let make = || {
+            let times: Vec<SampleIndex> = (0..60u64)
+                .map(|i| SampleIndex(i * 150 + if i % 7 == 0 { 1 } else { 0 }))
+                .collect();
+            let amps: Vec<f32> = (0..60).map(|i| 4.0 + (i % 5) as f32 * 0.5).collect();
+            MockProvider {
+                spikes: vec![times, vec![SampleIndex(77), SampleIndex(5000)]],
+                amps: vec![amps, vec![3.0, 3.0]],
+                n_samples: SampleIndex(10_000),
+            }
+        };
+        let inside: Vec<u32> = (0..60).step_by(3).collect();
+        let (s, _d) = make_session(make());
+        let before = s.spike_times(ClusterId(0)).to_vec();
+        let p = preview_split(&s, ClusterId(0), &inside);
+        assert_eq!(s.spike_times(ClusterId(0)), &before[..], "borrow-only");
+        assert_eq!((p.inside_times.len(), p.outside_times.len()), (20, 40));
+
+        let (mut real, _d2) = make_session(make());
+        real.dispatch(CurationCommand::Split {
+            cluster: ClusterId(0),
+            spike_idx: inside,
+            new_cluster: ClusterId(2),
+            by: crate::command::Method::legacy(),
+        })
+        .unwrap();
+        let same = |a: &QualityBreakdown, b: &QualityBreakdown| {
+            assert_eq!(a.n_spikes, b.n_spikes);
+            assert_eq!(a.raw_isi_violations, b.raw_isi_violations);
+            assert!((a.composite() - b.composite()).abs() < 1e-6);
+            assert!((a.raw_contamination - b.raw_contamination).abs() < 1e-6);
+        };
+        same(
+            &p.inside,
+            &crate::quality_ext::cluster_quality(&real, ClusterId(2)),
+        );
+        same(
+            &p.outside,
+            &crate::quality_ext::cluster_quality(&real, ClusterId(0)),
+        );
+        same(
+            &p.parent,
+            &crate::quality_ext::cluster_quality(&s, ClusterId(0)),
+        );
+        assert_eq!(p.inside_times, real.spike_times(ClusterId(2)));
     }
 }

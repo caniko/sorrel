@@ -48,7 +48,7 @@ pub use open::{
 };
 #[cfg(feature = "phy-export")]
 pub use phy_export::export_phy;
-pub use preview::{preview_merge, MergeDelta, MergePreview};
+pub use preview::{preview_merge, preview_split, MergeDelta, MergePreview, SplitPreview};
 pub use proposers::{
     attention_all, attention_with, kmeans_split, kmeans_split_proposal, outlier_proposal,
     outlier_split, KmeansSplit,

@@ -260,7 +260,6 @@ pub fn cluster_scatter_view<P: DataProvider>(
         egui::FontId::proportional(crate::views::TICK_PX),
         theme.caption,
     );
-    state.pz.interact(&resp, data);
     let dp = painter.with_clip_rect(data);
     let to_screen = |p: [f32; 2]| {
         Pos2::new(
@@ -325,16 +324,12 @@ pub fn cluster_scatter_view<P: DataProvider>(
 
     *scheme_delta += crate::theme::scheme_wheel(ui, &resp);
     state.lasso.paint(&painter, to_screen, theme.text);
-    if state.lasso.interact(0, &resp, to_data) {
-        if state.lasso.is_closed() {
-            let inside: Vec<ClusterId> = pts
-                .iter()
-                .filter(|p| state.lasso.contains([p.1, p.2]))
-                .map(|p| p.0)
-                .collect();
-            return (!inside.is_empty()).then_some(inside);
-        }
-        return None;
+    let ev = state.lasso.interact(0, &resp, to_data, to_screen);
+    if !ev.consumed {
+        state.pz.interact(&resp, data);
+    }
+    if ev.consumed {
+        return lasso_pick(ev.drawn && !resp.dragged(), &state.lasso, &pts);
     }
     if resp.clicked() {
         let c = hovered?;
@@ -355,6 +350,25 @@ pub fn cluster_scatter_view<P: DataProvider>(
     None
 }
 
+/// The clusters inside the lasso, when `drawn`: a Ctrl gesture (stroke
+/// release, node click) finished it. Moving, inserting or deleting a node of
+/// a closed lasso leaves the selection alone.
+fn lasso_pick(
+    drawn: bool,
+    lasso: &Lasso,
+    pts: &[(ClusterId, f32, f32, f32)],
+) -> Option<Vec<ClusterId>> {
+    if !drawn {
+        return None;
+    }
+    let inside: Vec<ClusterId> = pts
+        .iter()
+        .filter(|p| lasso.contains([p.1, p.2]))
+        .map(|p| p.0)
+        .collect();
+    (!inside.is_empty()).then_some(inside)
+}
+
 fn col_index(c: Column) -> usize {
     match c {
         Column::NSpikes => 0,
@@ -368,6 +382,18 @@ fn col_index(c: Column) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_drawn_lasso_selects() {
+        let lasso = Lasso::new(0, vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]]);
+        let pts = [(ClusterId(1), 1.0, 1.0, 0.0), (ClusterId(2), 9.0, 9.0, 0.0)];
+        assert_eq!(lasso_pick(true, &lasso, &pts), Some(vec![ClusterId(1)]));
+        // A node edit of the closed lasso: not drawn, so no selection.
+        assert_eq!(lasso_pick(false, &lasso, &pts), None);
+        // An open lasso encloses nothing.
+        let open = Lasso::new(0, vec![[0.0, 0.0], [4.0, 0.0]]);
+        assert_eq!(lasso_pick(true, &open, &pts), None);
+    }
 
     #[test]
     fn columns_round_trip_phy_names() {

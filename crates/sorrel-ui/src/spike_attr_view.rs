@@ -11,12 +11,17 @@ use egui::{Pos2, Sense, Ui};
 use sorrel_data::Session;
 use sorrel_io::{ClusterId, DataProvider};
 
+use crate::brush::{BrushSource, Brushes, HoverSpike, SpikeBrush};
 use crate::jobs::{JobCtx, Memo};
 use crate::lasso::Lasso;
 use crate::theme::{selection_colour, Theme};
 use crate::views::{axes_data_rect, draw_axes_grid};
 use crate::wgpu_raster::pack_rgba;
 use crate::wgpu_scatter::{ScatterCallback, ScatterVertex};
+use crate::widgets::{
+    fresh_generation, ink_key, ink_packed, nearest_within, ring, selection_key, sync_spike_brush,
+    time_alpha, time_brush_gesture, time_key, time_overlays, InkLayer,
+};
 
 const N_BACKGROUND: usize = 2500;
 const BACKGROUND: u16 = u16::MAX;
@@ -40,8 +45,14 @@ pub struct SpikeAttrState {
     split_requested: bool,
     pz: crate::panzoom::PanZoom,
     memo: Memo<AttrKey, Arc<AttrSet>>,
-    vertices: Option<(u64, bool, Arc<Vec<ScatterVertex>>)>,
+    /// `(set generation, dark, time brush)`, the upload generation, vertices.
+    vertices: Option<(VertexKey, u64, Arc<Vec<ScatterVertex>>)>,
+    /// What the lasso last wrote to the spike brush.
+    brush_key: Option<u64>,
+    ink: InkLayer,
 }
+
+type VertexKey = (u64, bool, Option<(u32, u32, bool)>);
 
 impl SpikeAttrState {
     pub fn lasso_closed(&self) -> bool {
@@ -120,6 +131,7 @@ pub fn spike_attr_view<P: DataProvider>(
     state: &mut SpikeAttrState,
     jobs: &JobCtx<Session<P>>,
     reorder: bool,
+    brushes: &mut Brushes,
 ) -> Option<Vec<(ClusterId, Vec<u32>)>> {
     let theme = Theme::from_ui(ui);
     let names: Vec<(String, usize)> = session
@@ -156,7 +168,7 @@ pub fn spike_attr_view<P: DataProvider>(
         ui.weak(if state.lasso.is_closed() {
             "k splits · Esc clears"
         } else {
-            "Ctrl+click: lasso"
+            "Ctrl+click: lasso · Shift+drag: time range (1-D) · Shift+click clears"
         });
     });
     let key: AttrKey = (selection.to_vec(), session.version(), name.clone(), reorder);
@@ -201,34 +213,40 @@ pub fn spike_attr_view<P: DataProvider>(
     };
     draw_axes_grid(&painter, rect, x, y, &xl, &yl, &theme);
     let data = axes_data_rect(rect, true);
-    state.pz.interact(&resp, data);
     let dark = ui.visuals().dark_mode;
-    if !matches!(&state.vertices, Some((g, d, _)) if *g == set.generation && *d == dark) {
+    // Only a 1-D attribute has a time axis to brush.
+    let time = brushes.time.filter(|_| !set.two_d);
+    let vkey: VertexKey = (set.generation, dark, time_key(time));
+    if !matches!(&state.vertices, Some((k, ..)) if *k == vkey) {
         let grey = if dark { 150 } else { 110 };
         let mut order: Vec<&Point> = set.points.iter().collect();
         order.sort_by_key(|p| p.1 != BACKGROUND);
         let v = order
             .into_iter()
-            .map(|p| ScatterVertex {
-                pos: [p.2, p.3],
-                color: if p.1 == BACKGROUND {
-                    pack_rgba(grey, grey, grey, 110)
+            .filter_map(|p| {
+                let a = |a| time_alpha(time, p.2, a);
+                let color = if p.1 == BACKGROUND {
+                    pack_rgba(grey, grey, grey, a(110)?)
                 } else {
                     let c = selection_colour(p.1 as usize);
-                    pack_rgba(c.r(), c.g(), c.b(), 220)
-                },
+                    pack_rgba(c.r(), c.g(), c.b(), a(220)?)
+                };
+                Some(ScatterVertex {
+                    pos: [p.2, p.3],
+                    color,
+                })
             })
             .collect();
-        state.vertices = Some((set.generation, dark, Arc::new(v)));
+        state.vertices = Some((vkey, fresh_generation(), Arc::new(v)));
     }
-    if let Some((g, d, v)) = &state.vertices {
+    if let Some((_, upload_gen, v)) = &state.vertices {
         ui.painter()
             .add(eframe::egui_wgpu::Callback::new_paint_callback(
                 data,
                 ScatterCallback {
                     id: ui.id().with("spike-attr-scatter").value(),
                     vertices: Arc::clone(v),
-                    generation: g * 2 + *d as u64,
+                    generation: *upload_gen,
                     x,
                     y,
                     radius: 1.5,
@@ -248,26 +266,110 @@ pub fn spike_attr_view<P: DataProvider>(
             y.0 + (data.bottom() - p.y) / data.height() * (y.1 - y.0),
         ]
     };
-    state.lasso.interact(0, &resp, to_data);
+    if !state.lasso.interact(0, &resp, to_data, to_screen).consumed {
+        state.pz.interact(&resp, data);
+        if !set.two_d {
+            time_brush_gesture(&resp, brushes, data, x, true);
+        }
+    }
     state.lasso.paint(&painter, to_screen, theme.text);
+    // A1: the lasso is the spike brush (once the set is current).
+    if current.is_some() {
+        sync_spike_brush(
+            brushes,
+            &mut state.brush_key,
+            state
+                .lasso
+                .is_closed()
+                .then(|| selection_key(set.generation, &state.lasso, None)),
+            &[BrushSource::SpikeDataLasso],
+            || {
+                let hits = split_hits(&set, &state.lasso, selection);
+                SpikeBrush::new(BrushSource::SpikeDataLasso, session.version(), hits)
+            },
+        );
+    }
+    // Brushed spikes on top in ink.
+    let ink = ink_packed(dark);
+    let sb = brushes.spikes.as_ref();
+    state.ink.paint(
+        ui,
+        data,
+        "spike-attr-ink",
+        ink_key(set.generation, dark, brushes),
+        x,
+        y,
+        || {
+            let Some(sb) = sb else { return Vec::new() };
+            set.points
+                .iter()
+                .filter(|p| p.1 != BACKGROUND && sb.contains(selection[p.1 as usize], p.0))
+                .filter(|p| set.two_d || time_alpha(time, p.2, 255).is_some())
+                .map(|p| ScatterVertex {
+                    pos: [p.2, p.3],
+                    color: ink,
+                })
+                .collect()
+        },
+    );
+    // A2: hovering a spike writes the hover; one from elsewhere gets a ring.
+    if let Some(p) = resp.hover_pos().filter(|p| data.contains(*p)) {
+        // ponytail: O(n) scan of the loaded points per hovered frame.
+        let hit = nearest_within(
+            set.points
+                .iter()
+                .filter(|q| q.1 != BACKGROUND && time_alpha(time, q.2, 255).is_some())
+                .map(|q| (q, to_screen([q.2, q.3]))),
+            p,
+            6.0,
+        );
+        if let Some(q) = hit {
+            let c = selection[q.1 as usize];
+            brushes.hover_next = session
+                .spike_times(c)
+                .get(q.0 as usize)
+                .map(|t| HoverSpike {
+                    cluster: c,
+                    local: q.0,
+                    sample: t.0,
+                });
+        }
+    }
+    if let Some(h) = brushes.hover {
+        let ringed = set
+            .points
+            .iter()
+            .find(|p| p.1 != BACKGROUND && p.0 == h.local && selection[p.1 as usize] == h.cluster);
+        if let Some(q) = ringed {
+            ring(&painter, ui, to_screen([q.2, q.3]));
+        }
+    }
+    if !set.two_d {
+        let sr = session.provider.sample_rate().max(1.0);
+        time_overlays(ui, &painter.with_clip_rect(data), data, x, brushes, sr);
+    }
 
     if state.split_requested && state.lasso.is_closed() && current.is_some() {
         state.split_requested = false;
-        let mut hits: Vec<Vec<u32>> = vec![Vec::new(); selection.len()];
-        for p in set.points.iter().filter(|p| p.1 != BACKGROUND) {
-            if state.lasso.contains([p.2, p.3]) {
-                hits[p.1 as usize].push(p.0);
-            }
-        }
+        let hits = split_hits(&set, &state.lasso, selection);
         state.lasso.clear();
-        return Some(
-            selection
-                .iter()
-                .copied()
-                .zip(hits)
-                .filter(|(_, h)| !h.is_empty())
-                .collect(),
-        );
+        return Some(hits);
     }
     None
+}
+
+/// Spikes inside the lasso, as `(cluster, local indices)`.
+fn split_hits(set: &AttrSet, lasso: &Lasso, selection: &[ClusterId]) -> Vec<(ClusterId, Vec<u32>)> {
+    let mut hits: Vec<Vec<u32>> = vec![Vec::new(); selection.len()];
+    for p in set.points.iter().filter(|p| p.1 != BACKGROUND) {
+        if lasso.contains([p.2, p.3]) {
+            hits[p.1 as usize].push(p.0);
+        }
+    }
+    selection
+        .iter()
+        .copied()
+        .zip(hits)
+        .filter(|(_, h)| !h.is_empty())
+        .collect()
 }

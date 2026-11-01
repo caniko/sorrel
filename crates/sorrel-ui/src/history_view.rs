@@ -3,6 +3,7 @@
 //! under the node it left from, the checked-out node is highlighted, and
 //! saves are marked. Clicking a row checks it out.
 
+use crate::brush::{Brushes, Ghost};
 use egui::Ui;
 use sorrel_data::{actor_name, describe_command, Session};
 use sorrel_io::DataProvider;
@@ -36,6 +37,12 @@ pub(crate) fn rows<P: DataProvider>(session: &Session<P>) -> Vec<Row> {
     out
 }
 
+const HOVER_HINT: &str = "hover: shows the clusters before this edit in Features 3D";
+/// For rows without a ghost: off the current branch (its pre-edit
+/// memberships are gone) or an edit that moves no spikes.
+const NO_GHOST_HINT: &str =
+    "the before-edit ghost is only shown for spike-moving edits on the current branch";
+
 /// `HH:MM:SS` (UTC) of a Unix-millisecond timestamp; empty for 0 (nodes
 /// upgraded from a v2 journal have no time).
 fn clock(ts_ms: u64) -> String {
@@ -47,12 +54,17 @@ fn clock(ts_ms: u64) -> String {
 }
 
 /// Draw the tree; returns the node a click asked to check out.
-pub fn history_view<P: DataProvider>(ui: &mut Ui, session: &Session<P>) -> Option<Option<u64>> {
+pub fn history_view<P: DataProvider>(
+    ui: &mut Ui,
+    session: &Session<P>,
+    brushes: &mut Brushes,
+) -> Option<Option<u64>> {
     let theme = crate::theme::Theme::from_ui(ui);
     let head = session.head();
     let saved: Vec<Option<u64>> = session.seals().iter().map(|s| s.0).collect();
     ui.weak("click a row to go back to it · nothing is ever discarded");
     let mut picked = None;
+    let mut hovered = None;
     for (node, indent, branches) in rows(session) {
         ui.horizontal(|ui| {
             ui.add_space(14.0 * indent as f32);
@@ -73,8 +85,21 @@ pub fn history_view<P: DataProvider>(ui: &mut Ui, session: &Session<P>) -> Optio
                 b if b > 1 => format!("{what}  ({b} branches)"),
                 _ => what,
             };
-            if ui.selectable_label(node == head, text).clicked() && node != head {
+            let row = ui.selectable_label(node == head, text);
+            if row.clicked() && node != head {
                 picked = Some(node);
+            }
+            // The root (the sort as loaded) has no edit before it to ghost.
+            if let (Some(n), true) = (node, row.contains_pointer()) {
+                // Only publish what Features 3D can resolve.
+                let hint = if session.has_pre_edit(n) {
+                    brushes.ghost_next = Some(Ghost::History(n));
+                    HOVER_HINT
+                } else {
+                    NO_GHOST_HINT
+                };
+                hovered = Some(hint);
+                row.on_hover_text(hint);
             }
             if saved.contains(&node) {
                 ui.label(egui::RichText::new("saved").color(theme.good).small());
@@ -83,6 +108,10 @@ pub fn history_view<P: DataProvider>(ui: &mut Ui, session: &Session<P>) -> Optio
                 ui.label(egui::RichText::new(when).color(theme.caption).small());
             }
         });
+    }
+    if let Some(hint) = hovered {
+        ui.add_space(4.0);
+        ui.weak(hint);
     }
     picked
 }

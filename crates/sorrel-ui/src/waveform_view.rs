@@ -10,6 +10,7 @@ use sorrel_data::Session;
 use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 use sorrel_render::{extract_snippet, snippet_window, TracePreproc};
 
+use crate::feature_view::{ChannelEdit, FeatureLink};
 use crate::layout::ViewAction;
 use crate::prefs::{WaveformMode, WaveformParams};
 use crate::theme::{selection_colour, Theme};
@@ -78,6 +79,65 @@ pub struct WaveformCache {
     /// y range frozen on first draw (phy v2.1 `data_bounds or ...`):
     /// `(mode, n_channels, lo, hi)`. Resets on mode change and `R`.
     frozen: Option<(WaveformMode, usize, f32, f32)>,
+    /// Snippets of the lassoed / k-means spikes the Features pane links in.
+    linked: Option<LinkedSnippets>,
+    /// Snippets of the spike brush's split what-if part / ISI violators.
+    brushed: Option<LinkedSnippets>,
+    /// Snippet of the spike hovered in another view, drawn bold.
+    hovered: Option<LinkedSnippets>,
+    /// The split what-if: `(cluster slot, inside means, outside means)`,
+    /// `[channel][sample]`, with the key they were computed for.
+    whatif: Option<(WhatIfKey, usize, WhatIfMeans)>,
+    /// Merge ghost: its mean through the same extraction path, as a
+    /// one-cluster cache of its own (the main key stays the selection's).
+    ghost: Option<Box<WaveformCache>>,
+    /// Whether the ghost is drawn this frame.
+    ghost_on: bool,
+}
+
+/// `[inside, outside]`, each `[channel][sample]`.
+type WhatIfMeans = [Vec<Vec<f32>>; 2];
+
+type WhatIfKey = (
+    Option<WaveformKey>,
+    (crate::brush::BrushSource, u64, usize, usize),
+    ClusterId,
+);
+
+/// Snippets for `FeatureLink::spikes`, extracted once per link identity.
+#[derive(Debug)]
+struct LinkedSnippets {
+    spikes: Vec<(ClusterId, std::sync::Arc<[u32]>)>,
+    pre: u32,
+    post: u32,
+    cfg: TracePreproc,
+    version: u64,
+    /// `[spike][sample_in_snippet * n_channels + channel]`
+    snips: Vec<Vec<f32>>,
+}
+
+/// Linked spikes extracted per cluster.
+// ponytail: the Features pane already caps its list at 100; this repeats the
+// guard so a stray huge list cannot stall a paint. Extraction is synchronous
+// like the main cache (same cost: <= 100 snippets per cluster, once per link);
+// move it onto a crate::jobs worker if lists ever grow.
+const MAX_LINKED_PER_CLUSTER: usize = 100;
+
+/// The link's spikes, unless made against an older curation version
+/// (Features not redrawn since): the indices now name other spikes.
+fn link_spikes(link: &FeatureLink, version: u64) -> &[(ClusterId, std::sync::Arc<[u32]>)] {
+    if link.version == version {
+        &link.spikes
+    } else {
+        &[]
+    }
+}
+
+/// At most `cap` of `idx`, spread over the whole list (a stride would keep
+/// only the first `cap` of 101..=2*cap entries).
+fn spread(idx: &[u32], cap: usize) -> impl Iterator<Item = u32> + '_ {
+    let take = idx.len().min(cap);
+    (0..take).map(move |i| idx[i * idx.len() / take])
 }
 
 impl Default for WaveformCache {
@@ -91,6 +151,12 @@ impl Default for WaveformCache {
             means: Vec::new(),
             templates: Vec::new(),
             frozen: None,
+            linked: None,
+            brushed: None,
+            hovered: None,
+            whatif: None,
+            ghost: None,
+            ghost_on: false,
         }
     }
 }
@@ -118,6 +184,9 @@ impl WaveformCache {
         if self.shanks != shanks {
             self.shanks = shanks.to_vec();
             self.key = None;
+            self.linked = None;
+            self.brushed = None;
+            self.hovered = None;
         }
         self.cfg = cfg;
     }
@@ -126,6 +195,19 @@ impl WaveformCache {
     /// invalidates the key.
     pub(crate) fn set_n_spikes(&mut self, n: usize) {
         self.n_spikes = n.max(1);
+    }
+
+    fn whatif_on(&self) -> bool {
+        self.whatif.is_some()
+    }
+
+    /// The ghost cluster's `[channel][sample]` mean while it is drawn.
+    fn ghost_mean(&self) -> Option<&[Vec<f32>]> {
+        self.ghost
+            .as_ref()
+            .filter(|_| self.ghost_on)
+            .and_then(|g| g.means.first())
+            .map(Vec::as_slice)
     }
 
     /// Peak channel (argmax of |mean|) of the cluster at `slot` in the
@@ -218,24 +300,7 @@ impl WaveformCache {
         // Per-cluster mean waveform per channel.
         let mut means: Vec<Vec<Vec<f32>>> = Vec::with_capacity(selection.len());
         for cluster_snips in &snippets {
-            if cluster_snips.is_empty() || nc == 0 {
-                means.push(vec![vec![0.0; snippet_len]; nc]);
-                continue;
-            }
-            let mut sum = vec![vec![0.0f64; snippet_len]; nc];
-            let count = cluster_snips.len() as f64;
-            for snip in cluster_snips {
-                for (t, channel_values) in snip.chunks_exact(nc).enumerate().take(snippet_len) {
-                    for (ch, channel_sum) in sum.iter_mut().enumerate().take(nc) {
-                        channel_sum[t] += channel_values[ch] as f64;
-                    }
-                }
-            }
-            let cluster_means: Vec<Vec<f32>> = sum
-                .into_iter()
-                .map(|row| row.into_iter().map(|v| (v / count) as f32).collect())
-                .collect();
-            means.push(cluster_means);
+            means.push(mean_of(cluster_snips.iter(), nc, snippet_len));
         }
 
         // Templates each cluster uses, by share of its spikes.
@@ -261,6 +326,193 @@ impl WaveformCache {
         }
         self.snippets = snippets;
         self.means = means;
+    }
+
+    /// Extract the linked spikes' snippets when the link (compared by `Arc`
+    /// identity), window, preprocessing or curation version changed. Local
+    /// indices address the cluster's time-sorted bucket, as in
+    /// `CurationCommand::Split`.
+    pub(crate) fn ensure_linked<P: DataProvider>(
+        &mut self,
+        session: &Session<P>,
+        link: &FeatureLink,
+        pre: u32,
+        post: u32,
+    ) {
+        Self::ensure_snips(
+            &mut self.linked,
+            self.cfg,
+            &self.shanks,
+            session,
+            link_spikes(link, session.version()),
+            pre,
+            post,
+        );
+    }
+
+    /// Same extraction for the spike brush's what-if part or violators.
+    fn ensure_brushed<P: DataProvider>(
+        &mut self,
+        session: &Session<P>,
+        spikes: &[(ClusterId, std::sync::Arc<[u32]>)],
+        pre: u32,
+        post: u32,
+    ) {
+        Self::ensure_snips(
+            &mut self.brushed,
+            self.cfg,
+            &self.shanks,
+            session,
+            spikes,
+            pre,
+            post,
+        );
+    }
+
+    /// The hovered spike (a one-spike list, or none) through the same path.
+    fn ensure_hovered<P: DataProvider>(
+        &mut self,
+        session: &Session<P>,
+        spike: Option<(ClusterId, u32)>,
+        pre: u32,
+        post: u32,
+    ) {
+        // `ensure_snips` compares the lists by `Arc` identity: keep the one
+        // already held while the same spike stays hovered.
+        let held = self.hovered.as_ref().map(|l| l.spikes.clone());
+        let spikes: Vec<_> = match (spike, held) {
+            (Some((c, l)), Some(h)) if h.iter().any(|(hc, hi)| *hc == c && **hi == [l]) => h,
+            (Some((c, l)), _) => vec![(c, std::sync::Arc::from([l]))],
+            (None, _) => Vec::new(),
+        };
+        Self::ensure_snips(
+            &mut self.hovered,
+            self.cfg,
+            &self.shanks,
+            session,
+            &spikes,
+            pre,
+            post,
+        );
+    }
+
+    fn ensure_snips<P: DataProvider>(
+        slot: &mut Option<LinkedSnippets>,
+        cfg: TracePreproc,
+        shanks: &[u32],
+        session: &Session<P>,
+        spikes: &[(ClusterId, std::sync::Arc<[u32]>)],
+        pre: u32,
+        post: u32,
+    ) {
+        let version = session.version();
+        if let Some(l) = &*slot {
+            let same = l.spikes.len() == spikes.len()
+                && l.spikes
+                    .iter()
+                    .zip(spikes)
+                    .all(|(a, b)| a.0 == b.0 && std::sync::Arc::ptr_eq(&a.1, &b.1));
+            if same && l.pre == pre && l.post == post && l.cfg == cfg && l.version == version {
+                return;
+            }
+        }
+        let nc = session.provider.n_channels() as usize;
+        let times: Vec<SampleIndex> = spikes
+            .iter()
+            .flat_map(|(c, idx)| {
+                let bucket = session.spike_times(*c);
+                // Evenly thinned: a brush can hold thousands.
+                spread(idx, MAX_LINKED_PER_CLUSTER)
+                    .filter_map(move |i| bucket.get(i as usize).copied())
+            })
+            .collect();
+        let sr = session.provider.sample_rate();
+        let windows: Vec<(SampleIndex, u32)> = times
+            .iter()
+            .map(|&t| {
+                let (start, len, _) = snippet_window(sr, t, pre, post, cfg);
+                (start, len)
+            })
+            .collect();
+        session.provider.prefetch(&windows);
+        let snips = times
+            .iter()
+            .filter_map(|&t| {
+                let mut s = extract_snippet(&session.provider, t, pre, post, cfg, shanks)?;
+                subtract_median_baseline(&mut s, nc);
+                Some(s)
+            })
+            .collect();
+        // Bytes still in flight (remote guest): keep what we have but leave
+        // the link identity empty so the extraction reruns once they land.
+        let incomplete = session.provider.pending_fetches() > 0;
+        *slot = Some(LinkedSnippets {
+            spikes: if incomplete {
+                Vec::new()
+            } else {
+                spikes.to_vec()
+            },
+            pre,
+            post,
+            cfg,
+            version,
+            snips,
+        });
+    }
+
+    /// The split what-if's inside / outside means for `cluster` (selection
+    /// `slot`), from the brushed snippets and the main cache's sample.
+    /// Outside = the cluster's sampled spikes that are not brushed; the
+    /// sample is `step_by(stride)` of the bucket, so snippet `j` is local
+    /// `j * stride` (ponytail: a snippet whose extraction failed shifts the
+    /// rest by one; harmless for a mean over <= 100 spikes).
+    fn ensure_whatif<P: DataProvider>(
+        &mut self,
+        session: &Session<P>,
+        brush: &crate::brush::SpikeBrush,
+        cluster: ClusterId,
+        slot: usize,
+        nc: usize,
+        snippet_len: usize,
+    ) {
+        let key = (self.key.clone(), brush.key(), cluster);
+        if self.whatif.as_ref().is_some_and(|w| w.0 == key) {
+            return;
+        }
+        let inside = self.brushed.iter().flat_map(|l| &l.snips);
+        let stride = (session.spike_times(cluster).len() / self.n_spikes.max(1)).max(1);
+        let outside = self
+            .snippets
+            .get(slot)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter(|(j, _)| !brush.contains(cluster, (j * stride) as u32));
+        let means = [
+            mean_of(inside, nc, snippet_len),
+            mean_of(outside.map(|(_, s)| s), nc, snippet_len),
+        ];
+        self.whatif = Some((key, slot, means));
+    }
+
+    /// The merge ghost's `[channel][sample]` mean, extracted once per
+    /// (cluster, window, curation version) like any selected cluster.
+    fn ensure_ghost<P: DataProvider>(
+        &mut self,
+        session: &Session<P>,
+        c: Option<ClusterId>,
+        pre: u32,
+        post: u32,
+    ) {
+        self.ghost_on = c.is_some();
+        let Some(c) = c else { return };
+        let g = self.ghost.get_or_insert_with(Default::default);
+        (g.cfg, g.n_spikes) = (self.cfg, self.n_spikes);
+        if g.shanks != self.shanks {
+            g.shanks = self.shanks.clone();
+            g.key = None;
+        }
+        g.ensure(session, &[c], pre, post);
     }
 
     /// Frozen y range for `mode`, computing it with `f` the first time (and
@@ -442,13 +694,89 @@ fn handle_keys(i: &mut egui::InputState, p: &mut WaveformParams, has_templates: 
     reset
 }
 
+/// How the Features link marks one channel box.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BoxMark {
+    /// `A` / `B` badge: the first / second channel of the link's set.
+    pub badge: Option<char>,
+    /// Member of the channel set (outlined).
+    pub in_set: bool,
+    /// One of the focused feature plot's channels (strong outline).
+    pub highlighted: bool,
+    /// Some channels are highlighted and this is not one of them.
+    pub dimmed: bool,
+}
+
+pub(crate) fn box_mark(link: &FeatureLink, ch: u32) -> BoxMark {
+    let highlighted = link.highlight.contains(&ch);
+    BoxMark {
+        badge: match link.set.iter().position(|&c| c == ch) {
+            Some(0) => Some('A'),
+            Some(1) => Some('B'),
+            _ => None,
+        },
+        in_set: link.set.contains(&ch),
+        highlighted,
+        dimmed: !link.highlight.is_empty() && !highlighted,
+    }
+}
+
+/// Toolbar hint: the channel set and the gestures that edit it.
+/// What the Features overlays on the highlighted channels mean.
+fn link_legend(link: &FeatureLink, pc_shapes: bool) -> String {
+    let mut parts = vec!["outlined: the focused feature plot's channels (others dimmed)"];
+    if !link.spikes.is_empty() {
+        parts.push("thin white / black: the lassoed or k-means spikes");
+    }
+    if pc_shapes && !link.basis.is_empty() {
+        parts.push("dashed: PC1 shape · dotted: PC2 shape");
+    }
+    parts.join("\n")
+}
+
+pub(crate) fn link_hint(set: &[u32]) -> String {
+    let gestures = "Shift+click toggles · Ctrl+click A · Ctrl+right-click B";
+    if set.is_empty() {
+        return gestures.into();
+    }
+    let chans: Vec<String> = set.iter().map(u32::to_string).collect();
+    format!("set ch {} · {gestures}", chans.join(" · "))
+}
+
+/// Per-channel mean of `snips` (`[sample * nc + channel]` each); zeros when
+/// there are none.
+fn mean_of<'a>(
+    snips: impl Iterator<Item = &'a Vec<f32>>,
+    nc: usize,
+    snippet_len: usize,
+) -> Vec<Vec<f32>> {
+    let mut sum = vec![vec![0.0f64; snippet_len]; nc];
+    let mut count = 0usize;
+    for snip in snips {
+        count += 1;
+        for (t, channel_values) in snip.chunks_exact(nc.max(1)).enumerate().take(snippet_len) {
+            for (ch, channel_sum) in sum.iter_mut().enumerate() {
+                channel_sum[t] += channel_values[ch] as f64;
+            }
+        }
+    }
+    let count = count.max(1) as f64;
+    sum.into_iter()
+        .map(|row| row.into_iter().map(|v| (v / count) as f32).collect())
+        .collect()
+}
+
 // ---- Drawing -----------------------------------------------------------
 
 /// Multi-cluster waveform view. Shows each selected cluster's best channels
 /// (see [`nearest_channels`]) at their probe positions, or a single peak
 /// channel when no probe geometry is available. Caches the extracted
 /// snippets so cluster-switching stalls happen at most once per change.
-/// Ctrl+click on a channel box queues [`ViewAction::SelectChannel`].
+/// Clicks on a channel box queue a [`ViewAction::Channel`]: Shift+click
+/// toggles it in the Features channel set, Ctrl+click / Ctrl+right-click set
+/// channel A / B. `link` is the Features pane's cross-talk state (see
+/// [`FeatureLink`]): it marks the set, dims all but the focused plot's
+/// channels, and adds the linked spikes and PC shapes.
 #[allow(clippy::too_many_arguments)]
 pub fn waveform_view<P: DataProvider>(
     ui: &mut Ui,
@@ -458,6 +786,8 @@ pub fn waveform_view<P: DataProvider>(
     shanks: &[u32],
     cache: &mut WaveformCache,
     params: &mut WaveformParams,
+    link: &FeatureLink,
+    brushes: &crate::brush::Brushes,
     actions: &mut Vec<ViewAction>,
 ) {
     if selection.is_empty() {
@@ -497,6 +827,50 @@ pub fn waveform_view<P: DataProvider>(
 
     cache.set_n_spikes(params.n_spikes);
     cache.ensure(session, selection, pre, post);
+    cache.ensure_linked(session, link, pre, post);
+    // Spike brush: the split what-if's inside part (lasso / k-means) or the
+    // ISI violators of every selected cluster, drawn as ink; and the merge
+    // ghost's mean.
+    // Only a brush of this curation version: its indices are bucket
+    // positions (`Brushes::sync` drops older ones at the start of a frame).
+    let current = brushes.synced.is_none_or(|v| v == session.version());
+    let brush = brushes
+        .spikes
+        .as_ref()
+        .filter(|b| b.version == session.version());
+    let whatif =
+        crate::isi_view::split_target(brushes, selection, |c| session.spike_times(c).len())
+            .filter(|_| brush.is_some());
+    let brushed: Vec<_> = match (brush, &whatif) {
+        (_, Some((c, idx))) => vec![(*c, std::sync::Arc::clone(idx))],
+        (Some(b), None) if b.source == crate::brush::BrushSource::IsiViolators => b
+            .spikes
+            .iter()
+            .filter(|(c, _)| selection.contains(c))
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    };
+    cache.ensure_brushed(session, &brushed, pre, post);
+    // The spike hovered in Features / Amplitudes / ..., when it is one of
+    // the selected clusters' (bold accent).
+    let hovered = brushes
+        .hover
+        .filter(|h| current && selection.contains(&h.cluster))
+        .map(|h| (h.cluster, h.local));
+    cache.ensure_hovered(session, hovered, pre, post);
+    match (brush, &whatif) {
+        (Some(b), Some((c, _))) if selection.contains(c) => {
+            let slot = selection.iter().position(|x| x == c).unwrap_or(0);
+            cache.ensure_whatif(session, b, *c, slot, nc, snippet_len);
+        }
+        _ => cache.whatif = None,
+    }
+    let ghost = match brushes.ghost {
+        Some(crate::brush::Ghost::Merge(g)) if !selection.contains(&g) => Some(g),
+        _ => None,
+    };
+    cache.ensure_ghost(session, ghost, pre, post);
     let peaks = channel_peak_abs(&cache.means, nc);
     let geometry_available = geometry.len() == nc;
 
@@ -555,6 +929,10 @@ pub fn waveform_view<P: DataProvider>(
             .on_hover_text("spikes sampled per cluster (phy n_spikes_waveforms)");
             ui.checkbox(&mut params.overlap, "overlap")
                 .on_hover_text("o: superimpose the selected clusters (off = side-by-side slots)");
+            ui.checkbox(&mut params.pc_shapes, "PC shapes")
+                .on_hover_text(
+                "dashed PC1 / dotted PC2 temporal shape of the focused Features plot's channels",
+            );
         },
         |ui| {
             ui.weak(format!("source: {hp} (follows the trace pane)"));
@@ -567,6 +945,8 @@ pub fn waveform_view<P: DataProvider>(
                 .on_hover_text("ctrl+l");
         },
     );
+    ui.add(egui::Label::new(egui::RichText::new(link_hint(&link.set)).small().weak()).truncate())
+        .on_hover_text(link_legend(link, params.pc_shapes));
     // V6.2 legend: swatch + cluster id per selection slot.
     ui.horizontal_wrapped(|ui| {
         for (slot, c) in selection.iter().enumerate() {
@@ -582,17 +962,16 @@ pub fn waveform_view<P: DataProvider>(
         cache,
         theme: &theme,
         params,
+        link,
+        accent: ui.visuals().hyperlink_color,
         mode,
         nc,
         snippet_len,
         sr,
     };
     if geometry_available && !chans.is_empty() {
-        if let Some((channel, secondary)) = ctx.probe_layout(ui, geometry, &chans, &per_cluster) {
-            actions.push(ViewAction::SelectChannel {
-                channel: channel as u32,
-                secondary,
-            });
+        if let Some(edit) = ctx.probe_layout(ui, geometry, &chans, &per_cluster) {
+            actions.push(ViewAction::Channel(edit));
         }
     } else {
         ctx.single_channel(ui, &peaks);
@@ -606,6 +985,9 @@ struct Ctx<'a, P: DataProvider> {
     cache: &'a mut WaveformCache,
     theme: &'a Theme,
     params: &'a WaveformParams,
+    link: &'a FeatureLink,
+    /// PC shape colour (`hyperlink_color`).
+    accent: Color32,
     mode: WaveformMode,
     nc: usize,
     snippet_len: usize,
@@ -666,17 +1048,18 @@ impl<P: DataProvider> Ctx<'_, P> {
         );
         let all: Vec<usize> = (0..self.selection.len()).collect();
         // No geometry: superimpose every cluster on the one channel.
-        self.draw_box(&painter, data, peak_ch, &all, true, (lo, hi), 2.0);
+        let mark = BoxMark::default();
+        self.draw_box(&painter, data, peak_ch, &all, true, (lo, hi), 2.0, mark);
     }
 
-    /// Returns the ctrl+clicked channel and whether it was a right click.
+    /// Returns the channel edit a click on a box asks for.
     fn probe_layout(
         &mut self,
         ui: &mut Ui,
         geometry: &[[f32; 2]],
         chans: &[usize],
         per_cluster: &[Vec<usize>],
-    ) -> Option<(usize, bool)> {
+    ) -> Option<ChannelEdit> {
         let theme = self.theme;
         let peaks = channel_peak_abs(&self.cache.means, self.nc);
         if chans.iter().all(|&c| peaks[c] <= 0.0) && self.mode != WaveformMode::Templates {
@@ -757,19 +1140,27 @@ impl<P: DataProvider> Ctx<'_, P> {
                 Stroke::new(0.5_f32, grid_colour(theme)),
                 egui::StrokeKind::Inside,
             );
-            self.draw_box(&painter, sub, ch, &present, p.overlap, (lo, hi), 1.5);
+            let mark = box_mark(self.link, ch as u32);
+            self.draw_box(&painter, sub, ch, &present, p.overlap, (lo, hi), 1.5, mark);
             if p.show_labels {
-                // Corner chip over a translucent backing, clear of the traces.
+                // Corner chip over a translucent backing, clear of the traces;
+                // weak when another channel is focused.
+                let col = if mark.dimmed {
+                    theme.caption.gamma_multiply(0.5)
+                } else {
+                    theme.caption
+                };
                 let g = painter.layout_no_wrap(
                     format!("ch{ch}"),
                     egui::FontId::proportional(TICK_PX),
-                    theme.caption,
+                    col,
                 );
                 let chip =
                     egui::Rect::from_min_size(sub.left_top(), g.size() + egui::vec2(6.0, 2.0));
                 painter.rect_filled(chip, 2.0, theme.panel.gamma_multiply(0.85));
-                painter.galley(chip.min + egui::vec2(3.0, 1.0), g, theme.caption);
+                painter.galley(chip.min + egui::vec2(3.0, 1.0), g, col);
             }
+            self.draw_link_frame(&painter, sub, mark, ui.visuals().selection);
         }
 
         // One shared scale bar for every tile (same x and y scale).
@@ -794,19 +1185,56 @@ impl<P: DataProvider> Ctx<'_, P> {
             theme,
         );
 
-        // Ctrl+click a box: pick it as the FeatureView channel.
+        // Shift+click toggles a box in the Features channel set; Ctrl+click /
+        // Ctrl+right-click set its first / second channel (phy `select_channel`).
         let (left, right) = (
             resp.clicked_by(egui::PointerButton::Primary),
             resp.clicked_by(egui::PointerButton::Secondary),
         );
-        if (left || right) && ui.input(|i| i.modifiers.command) {
-            let pos = resp.interact_pointer_pos()?;
-            return boxes
-                .iter()
-                .find(|(_, r)| r.contains(pos))
-                .map(|&(ch, _)| (ch, right));
+        let m = ui.input(|i| i.modifiers);
+        let edit: fn(u32) -> ChannelEdit = if m.command && right {
+            ChannelEdit::SetB
+        } else if m.command && left {
+            ChannelEdit::SetA
+        } else if m.shift && left {
+            ChannelEdit::Toggle
+        } else {
+            return None;
+        };
+        let pos = resp.interact_pointer_pos()?;
+        let (ch, _) = boxes.iter().find(|(_, r)| r.contains(pos))?;
+        Some(edit(*ch as u32))
+    }
+
+    /// Outlines and A/B badge for a box's role in the Features link.
+    fn draw_link_frame(
+        &self,
+        painter: &egui::Painter,
+        sub: egui::Rect,
+        mark: BoxMark,
+        sel: egui::style::Selection,
+    ) {
+        use egui::StrokeKind::Inside;
+        if mark.in_set {
+            painter.rect_stroke(sub, 0.0, Stroke::new(1.5_f32, sel.bg_fill), Inside);
         }
-        None
+        if mark.highlighted {
+            painter.rect_stroke(sub, 0.0, Stroke::new(2.0_f32, self.theme.text), Inside);
+        }
+        if let Some(letter) = mark.badge {
+            let badge = egui::Rect::from_min_size(
+                sub.right_top() + egui::vec2(-15.0, 3.0),
+                egui::vec2(12.0, 12.0),
+            );
+            painter.rect_filled(badge, 2.0, sel.bg_fill);
+            painter.text(
+                badge.center(),
+                egui::Align2::CENTER_CENTER,
+                letter,
+                egui::FontId::proportional(TICK_PX),
+                sel.stroke.color,
+            );
+        }
     }
 
     /// One channel box: baseline, 1 ms ticks, then the clusters in `present`
@@ -822,8 +1250,11 @@ impl<P: DataProvider> Ctx<'_, P> {
         overlap: bool,
         (lo, hi): (f32, f32),
         mean_width: f32,
+        mark: BoxMark,
     ) {
         let theme = self.theme;
+        // Cluster curves fade when another channel is the focused plot's.
+        let fade = if mark.dimmed { 0.4 } else { 1.0 };
         let painter = painter.with_clip_rect(sub);
         let y_unit = sub.height() / (hi - lo);
         let base = sub.bottom() + lo * y_unit;
@@ -873,7 +1304,7 @@ impl<P: DataProvider> Ctx<'_, P> {
                     let Some(w) = self.session.template_waveform(tid) else {
                         continue;
                     };
-                    let a = (255.0 * (0.2 + 0.8 * share)) as u8;
+                    let a = (255.0 * (0.2 + 0.8 * share) * fade) as u8;
                     let pts: Vec<Pos2> = (0..ns)
                         .map(|s| map(k, s as f32 / (ns as f32 - 1.0).max(1.0), w[s * nch + ch]))
                         .collect();
@@ -893,7 +1324,12 @@ impl<P: DataProvider> Ctx<'_, P> {
                 let c = selection_colour(ci);
                 let faint = Stroke::new(
                     0.75_f32,
-                    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha),
+                    Color32::from_rgba_unmultiplied(
+                        c.r(),
+                        c.g(),
+                        c.b(),
+                        (alpha as f32 * fade) as u8,
+                    ),
                 );
                 for snip in cache.snippets.get(ci).into_iter().flatten() {
                     let pts: Vec<Pos2> = (0..self.snippet_len)
@@ -902,6 +1338,53 @@ impl<P: DataProvider> Ctx<'_, P> {
                     painter.add(egui::Shape::line(pts, faint));
                 }
             }
+        }
+        // Lassoed / k-means spikes from the Features pane, under the means;
+        // only on the focused plot's channels when there is one.
+        if !mark.dimmed {
+            let ink = if theme.dark {
+                Color32::from_white_alpha(140)
+            } else {
+                Color32::from_black_alpha(140)
+            };
+            let thin = Stroke::new(0.8_f32, ink);
+            for snip in self.cache.linked.iter().flat_map(|l| &l.snips) {
+                let pts: Vec<Pos2> = (0..self.snippet_len)
+                    .map(|t| {
+                        let x = sub.left() + sub.width() * t as f32 / last;
+                        Pos2::new(x, base - snip[t * self.nc + ch] * y_scale)
+                    })
+                    .collect();
+                painter.add(egui::Shape::line(pts, thin));
+            }
+        }
+        // Brushed spikes (ISI violators; the split's inside part draws as
+        // the dashed mean below), thin ink under the means.
+        if !self.cache.whatif_on() {
+            let ink = if theme.dark {
+                Color32::from_white_alpha(200)
+            } else {
+                Color32::from_black_alpha(200)
+            };
+            for snip in self.cache.brushed.iter().flat_map(|l| &l.snips) {
+                let pts: Vec<Pos2> = (0..self.snippet_len)
+                    .map(|t| {
+                        let x = sub.left() + sub.width() * t as f32 / last;
+                        Pos2::new(x, base - snip[t * self.nc + ch] * y_scale)
+                    })
+                    .collect();
+                painter.add(egui::Shape::line(pts, Stroke::new(0.8_f32, ink)));
+            }
+        }
+        // The spike hovered in another view: one bold accent waveform.
+        for snip in self.cache.hovered.iter().flat_map(|l| &l.snips) {
+            let pts: Vec<Pos2> = (0..self.snippet_len)
+                .map(|t| {
+                    let x = sub.left() + sub.width() * t as f32 / last;
+                    Pos2::new(x, base - snip[t * self.nc + ch] * y_scale)
+                })
+                .collect();
+            painter.add(egui::Shape::line(pts, Stroke::new(2.0_f32, self.accent)));
         }
         for (k, &ci) in present.iter().enumerate() {
             let Some(mean) = cache.means.get(ci).and_then(|m| m.get(ch)) else {
@@ -914,8 +1397,91 @@ impl<P: DataProvider> Ctx<'_, P> {
                 .collect();
             painter.add(egui::Shape::line(
                 pts,
-                Stroke::new(mean_width, selection_colour(ci)),
+                Stroke::new(mean_width, selection_colour(ci).gamma_multiply(fade)),
             ));
+            // Split what-if: inside dashed, outside dotted, same colour.
+            if let Some((_, slot, [inside, outside])) = &cache.whatif {
+                if *slot == ci {
+                    let col = selection_colour(ci).gamma_multiply(fade);
+                    let line = |m: &Vec<Vec<f32>>| -> Vec<Pos2> {
+                        m.get(ch)
+                            .map(|m| {
+                                m.iter()
+                                    .enumerate()
+                                    .map(|(t, &v)| map(k, t as f32 / last, v))
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
+                    painter.extend(egui::Shape::dashed_line(
+                        &line(inside),
+                        Stroke::new(mean_width, col),
+                        5.0,
+                        3.0,
+                    ));
+                    painter.extend(egui::Shape::dotted_line(
+                        &line(outside),
+                        col,
+                        3.0,
+                        mean_width * 0.5,
+                    ));
+                }
+            }
+            // Merge ghost: its mean, grey and dashed, in every slot.
+            if let Some(gm) = cache.ghost_mean().and_then(|m| m.get(ch)) {
+                let pts: Vec<Pos2> = gm
+                    .iter()
+                    .enumerate()
+                    .map(|(t, &v)| map(k, t as f32 / last, v))
+                    .collect();
+                painter.extend(egui::Shape::dashed_line(
+                    &pts,
+                    Stroke::new(
+                        mean_width,
+                        Color32::from_gray(if theme.dark { 150 } else { 120 }),
+                    ),
+                    5.0,
+                    3.0,
+                ));
+            }
+        }
+        // Hundreds of overlapping spikes saturate even at `fade`, so a veil
+        // of the plot background is what makes a dimmed box read as dimmed.
+        if mark.dimmed {
+            painter.rect_filled(sub, 0.0, theme.plot_bg.gamma_multiply(0.6));
+        }
+        // The focused feature plot's PC1 (dashed) / PC2 (dotted) shapes on
+        // its own channels, scaled so the larger peak fills ~0.6 of the box.
+        if mark.highlighted && self.params.pc_shapes {
+            let basis = self.link.basis.iter().find(|(c, _)| *c as usize == ch);
+            let Some((_, pcs)) = basis else { return };
+            let peak = pcs
+                .iter()
+                .flatten()
+                .fold(0.0f32, |m, &v| m.max(v.abs()))
+                .max(f32::MIN_POSITIVE);
+            let colour = self.accent;
+            for (pc, (dash, gap)) in pcs.iter().zip([(4.0, 3.0), (1.0, 3.0)]) {
+                // Stretched over the box whatever the basis length.
+                let n = pc.len();
+                let pts: Vec<Pos2> = pc
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| {
+                        let frac = i as f32 / (n as f32 - 1.0).max(1.0);
+                        Pos2::new(
+                            sub.left() + sub.width() * frac,
+                            base - v / peak * 0.3 * sub.height(),
+                        )
+                    })
+                    .collect();
+                painter.extend(egui::Shape::dashed_line(
+                    &pts,
+                    Stroke::new(1.2_f32, colour),
+                    dash,
+                    gap,
+                ));
+            }
         }
     }
 }
@@ -985,6 +1551,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn spread_covers_the_whole_list() {
+        let idx: Vec<u32> = (0..150).collect();
+        let got: Vec<u32> = spread(&idx, 100).collect();
+        assert_eq!(got.len(), 100);
+        assert!(got.windows(2).all(|w| w[0] < w[1]), "ordered, distinct");
+        assert!(
+            got[0] == 0 && got[99] >= 145,
+            "reaches the tail: {}",
+            got[99]
+        );
+        let short: Vec<u32> = spread(&idx[..7], 100).collect();
+        assert_eq!(short, idx[..7]);
+        assert_eq!(spread(&[], 100).count(), 0);
+    }
+
+    #[test]
+    fn a_link_from_an_older_version_yields_no_spikes() {
+        let link = FeatureLink {
+            spikes: vec![(ClusterId(1), std::sync::Arc::from([4u32, 5]))],
+            version: 3,
+            ..Default::default()
+        };
+        assert_eq!(link_spikes(&link, 3).len(), 1);
+        assert!(link_spikes(&link, 4).is_empty(), "after a curation edit");
+    }
+
+    #[test]
     fn nearest_channels_stay_on_the_shank() {
         // Two shanks of 20 channels; same y, shank 1 shifted in x so its
         // channels are closer to some of shank 0's than shank 0's own.
@@ -1004,6 +1597,42 @@ mod tests {
         assert_eq!(flat, vec![9, 10, 30]);
         // Edge of the shank: fewer neighbours than asked.
         assert_eq!(nearest_channels(0, &geometry[..3], &[], 12), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn link_marks_badges_outlines_and_dimming() {
+        let none = FeatureLink::default();
+        assert_eq!(box_mark(&none, 3), BoxMark::default());
+        let link = FeatureLink {
+            set: vec![3, 5, 7],
+            highlight: vec![3, 5],
+            ..Default::default()
+        };
+        let (a, b, c, other) = (
+            box_mark(&link, 3),
+            box_mark(&link, 5),
+            box_mark(&link, 7),
+            box_mark(&link, 1),
+        );
+        assert_eq!((a.badge, b.badge, c.badge), (Some('A'), Some('B'), None));
+        assert!(a.highlighted && b.highlighted && !c.highlighted);
+        assert!(c.in_set && c.dimmed && !a.dimmed);
+        assert!(!other.in_set && other.dimmed && other.badge.is_none());
+        // Without a focused plot nothing is dimmed.
+        let unfocused = FeatureLink {
+            highlight: vec![],
+            ..link
+        };
+        assert!(!box_mark(&unfocused, 1).dimmed);
+    }
+
+    #[test]
+    fn hint_lists_the_set_then_the_gestures() {
+        assert_eq!(
+            link_hint(&[3, 5, 7, 11]),
+            "set ch 3 · 5 · 7 · 11 · Shift+click toggles · Ctrl+click A · Ctrl+right-click B"
+        );
+        assert!(link_hint(&[]).starts_with("Shift+click"));
     }
 
     #[test]

@@ -34,6 +34,9 @@ pub trait Tab {
     fn request_close(&mut self);
     fn close_state(&self) -> CloseState;
     fn on_exit(&mut self);
+    /// Called every frame while the tab is not the active one, to keep its
+    /// pop-out windows alive (egui drops a viewport that is not shown).
+    fn popouts(&mut self, _ctx: &egui::Context) {}
 }
 
 /// What to open: `sorrel open`'s arguments, relative to `cwd`.
@@ -90,6 +93,7 @@ impl Shell {
             TracePipeline::install(rs);
             RasterPipeline::install(rs);
             ScatterPipeline::install(rs);
+            crate::wgpu_scene3d::Scene3dPipeline::install(rs);
         }
         let recents = cc
             .storage
@@ -192,6 +196,7 @@ impl Shell {
     /// consuming them here keeps the active tab from seeing them.
     fn shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, Modifiers};
+        crate::layout::toggle_fullscreen_on_f11(ctx);
         let (open, close, next, prev) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::COMMAND, Key::O),
@@ -427,6 +432,11 @@ impl eframe::App for Shell {
             }
             None => {
                 egui::CentralPanel::default().show_inside(root_ui, |ui| self.launcher(ui));
+            }
+        }
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            if i != self.active {
+                tab.popouts(&ctx);
             }
         }
     }

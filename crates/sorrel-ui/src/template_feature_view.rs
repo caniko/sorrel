@@ -11,12 +11,14 @@ use egui::{Pos2, Sense, Ui};
 use sorrel_data::Session;
 use sorrel_io::{ClusterId, DataProvider};
 
+use crate::brush::{BrushSource, Brushes, SpikeBrush};
 use crate::jobs::{JobCtx, Memo};
 use crate::lasso::Lasso;
 use crate::theme::{selection_colour, Theme};
 use crate::views::{axes_data_rect, draw_axes_grid};
 use crate::wgpu_raster::pack_rgba;
 use crate::wgpu_scatter::{ScatterCallback, ScatterVertex};
+use crate::widgets::{ink_key, ink_packed, ring, selection_key, sync_spike_brush, InkLayer};
 
 const N_BACKGROUND: usize = 2500;
 const BACKGROUND: u16 = u16::MAX;
@@ -37,6 +39,9 @@ pub struct TemplateFeatureState {
     pz: crate::panzoom::PanZoom,
     memo: Memo<(Vec<ClusterId>, u64), Option<Arc<TfSet>>>,
     vertices: Option<(u64, bool, Arc<Vec<ScatterVertex>>)>,
+    /// What the lasso last wrote to the spike brush.
+    brush_key: Option<u64>,
+    ink: InkLayer,
 }
 
 impl TemplateFeatureState {
@@ -115,6 +120,7 @@ pub fn template_feature_view<P: DataProvider>(
     selection: &[ClusterId],
     state: &mut TemplateFeatureState,
     jobs: &JobCtx<Session<P>>,
+    brushes: &mut Brushes,
 ) -> Option<Vec<(ClusterId, Vec<u32>)>> {
     let theme = Theme::from_ui(ui);
     if !session.cluster_index().has_template_features() {
@@ -181,7 +187,6 @@ pub fn template_feature_view<P: DataProvider>(
         &theme,
     );
     let data = axes_data_rect(rect, true);
-    state.pz.interact(&resp, data);
     let dark = ui.visuals().dark_mode;
     if !matches!(&state.vertices, Some((g, d, _)) if *g == set.generation && *d == dark) {
         let grey = if dark { 150 } else { 110 };
@@ -228,26 +233,79 @@ pub fn template_feature_view<P: DataProvider>(
             y.0 + (data.bottom() - p.y) / data.height() * (y.1 - y.0),
         ]
     };
-    state.lasso.interact(0, &resp, to_data);
+    if !state.lasso.interact(0, &resp, to_data, to_screen).consumed {
+        state.pz.interact(&resp, data);
+    }
     state.lasso.paint(&painter, to_screen, theme.text);
+    // A1: the lasso is the spike brush (once the set is current).
+    if current.is_some() {
+        sync_spike_brush(
+            brushes,
+            &mut state.brush_key,
+            state
+                .lasso
+                .is_closed()
+                .then(|| selection_key(set.generation, &state.lasso, None)),
+            &[BrushSource::TemplateFeatureLasso],
+            || {
+                let hits = split_hits(&set, &state.lasso, selection);
+                SpikeBrush::new(BrushSource::TemplateFeatureLasso, session.version(), hits)
+            },
+        );
+    }
+    // Brushed spikes on top in ink; a spike hovered elsewhere is ringed.
+    let ink = ink_packed(dark);
+    let sb = brushes.spikes.as_ref();
+    state.ink.paint(
+        ui,
+        data,
+        "template-feature-ink",
+        ink_key(set.generation, dark, brushes),
+        x,
+        y,
+        || {
+            let Some(sb) = sb else { return Vec::new() };
+            set.points
+                .iter()
+                .filter(|p| p.1 != BACKGROUND && sb.contains(selection[p.1 as usize], p.0))
+                .map(|p| ScatterVertex {
+                    pos: [p.2, p.3],
+                    color: ink,
+                })
+                .collect()
+        },
+    );
+    if let Some(h) = brushes.hover {
+        let ringed = set
+            .points
+            .iter()
+            .find(|p| p.1 != BACKGROUND && p.0 == h.local && selection[p.1 as usize] == h.cluster);
+        if let Some(q) = ringed {
+            ring(&painter, ui, to_screen([q.2, q.3]));
+        }
+    }
 
     if state.split_requested && state.lasso.is_closed() && current.is_some() {
         state.split_requested = false;
-        let mut hits: [Vec<u32>; 2] = Default::default();
-        for p in set.points.iter().filter(|p| p.1 != BACKGROUND) {
-            if state.lasso.contains([p.2, p.3]) {
-                hits[p.1 as usize].push(p.0);
-            }
-        }
+        let hits = split_hits(&set, &state.lasso, selection);
         state.lasso.clear();
-        return Some(
-            selection
-                .iter()
-                .copied()
-                .zip(hits)
-                .filter(|(_, h)| !h.is_empty())
-                .collect(),
-        );
+        return Some(hits);
     }
     None
+}
+
+/// Spikes inside the lasso, as `(cluster, local indices)`.
+fn split_hits(set: &TfSet, lasso: &Lasso, selection: &[ClusterId]) -> Vec<(ClusterId, Vec<u32>)> {
+    let mut hits: [Vec<u32>; 2] = Default::default();
+    for p in set.points.iter().filter(|p| p.1 != BACKGROUND) {
+        if lasso.contains([p.2, p.3]) {
+            hits[p.1 as usize].push(p.0);
+        }
+    }
+    selection
+        .iter()
+        .copied()
+        .zip(hits)
+        .filter(|(_, h)| !h.is_empty())
+        .collect()
 }

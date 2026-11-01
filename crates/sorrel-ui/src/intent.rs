@@ -64,6 +64,8 @@ pub enum Intent {
     Cancel,
     /// Toggle the keyboard/mouse help overlay.
     ToggleHelp,
+    /// Ctrl+Shift+M: maximize the pane under the pointer, or restore.
+    ToggleMaximize,
     /// phy `split` (`k`): split off the spikes inside the Features lasso.
     Split,
     /// phy `split_init` (Shift+Ctrl+K): one cluster per original template.
@@ -479,11 +481,18 @@ pub const KEYMAP: &[Binding] = &[
     bind(K::F1, NONE, Intent::ToggleHelp, Views, "show this help"),
     bind(K::Q, CTRL, Intent::Quit, Views, "quit"),
     bind(
+        K::M,
+        CTRL | SHIFT,
+        Intent::ToggleMaximize,
+        Views,
+        "maximize or restore the pane under the pointer (:max, :pop pops it out)",
+    ),
+    bind(
         K::Escape,
         NONE,
         Intent::Cancel,
         Views,
-        "close a dialog, the snippet bar or the lasso",
+        "close a dialog, the snippet bar or the lasso; restore a maximized pane",
     ),
 ];
 
