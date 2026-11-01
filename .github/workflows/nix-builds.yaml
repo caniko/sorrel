@@ -58,11 +58,11 @@ jobs:
 
       - name: Restore grouped-build engine
         id: simit-engine-cache
-        if: ${{ (vars.SIMIT_CI_ENGINE_REVISION || '78b775803103ae960faf475ad46070d771fddc91') != '' }}
+        if: ${{ (vars.SIMIT_CI_ENGINE_REVISION || '0e0a1b3153649aa22148540bf87eff3d7dbf6bb4') != '' }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/simit-engine-cache
-          key: simit-engine-v1-${{ (vars.SIMIT_CI_ENGINE_REVISION || '78b775803103ae960faf475ad46070d771fddc91') }}-${{ runner.os }}-${{ runner.arch }}
+          key: simit-engine-v1-${{ (vars.SIMIT_CI_ENGINE_REVISION || '0e0a1b3153649aa22148540bf87eff3d7dbf6bb4') }}-${{ runner.os }}-${{ runner.arch }}
       - name: Import grouped-build engine
         if: ${{ steps.simit-engine-cache.outputs.cache-hit == 'true' }}
         shell: bash
@@ -80,7 +80,7 @@ jobs:
       - name: Provision grouped-build Rust engine
         shell: bash
         env:
-          SIMIT_CI_ENGINE_REVISION: ${{ (vars.SIMIT_CI_ENGINE_REVISION || '78b775803103ae960faf475ad46070d771fddc91') }}
+          SIMIT_CI_ENGINE_REVISION: ${{ (vars.SIMIT_CI_ENGINE_REVISION || '0e0a1b3153649aa22148540bf87eff3d7dbf6bb4') }}
           BASH_ENV: ''
           ENV: ''
           NIX_CONFIG: 'experimental-features = nix-command flakes'
@@ -102,7 +102,7 @@ jobs:
           printf '%s\n' "SIMIT_CI_ENGINE=$engine_path/bin/simit" >> "$GITHUB_ENV"
       - name: Export grouped-build engine
         id: simit-engine-cache-save
-        if: ${{ (vars.SIMIT_CI_ENGINE_REVISION || '78b775803103ae960faf475ad46070d771fddc91') != '' && steps.simit-engine-cache.outputs.cache-hit != 'true' }}
+        if: ${{ (vars.SIMIT_CI_ENGINE_REVISION || '0e0a1b3153649aa22148540bf87eff3d7dbf6bb4') != '' && steps.simit-engine-cache.outputs.cache-hit != 'true' }}
         shell: bash
         env:
           BASH_ENV: ''
@@ -124,7 +124,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/simit-engine-cache
-          key: simit-engine-v1-${{ (vars.SIMIT_CI_ENGINE_REVISION || '78b775803103ae960faf475ad46070d771fddc91') }}-${{ runner.os }}-${{ runner.arch }}
+          key: simit-engine-v1-${{ (vars.SIMIT_CI_ENGINE_REVISION || '0e0a1b3153649aa22148540bf87eff3d7dbf6bb4') }}-${{ runner.os }}-${{ runner.arch }}
       - name: Build Nix group
         shell: bash
         env:

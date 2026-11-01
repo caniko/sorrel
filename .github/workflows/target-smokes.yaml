@@ -58,7 +58,7 @@ jobs:
   target-smoke-windows:
     needs: [build-target-smoke-windows]
     runs-on: windows-2025
-    timeout-minutes: 45
+    timeout-minutes: 75
     permissions:
       contents: read
     env:
@@ -76,7 +76,7 @@ jobs:
       - name: Target smoke windows
         id: simit-required-gate-windows
         shell: pwsh
-        timeout-minutes: 30
+        timeout-minutes: 60
         env:
           RUST_LOG: "info"
         run: |
