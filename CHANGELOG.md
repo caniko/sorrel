@@ -21,8 +21,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   app icon on every platform, and the Linux packages install it with the
   menu entry.
 - Windows documentation: Start menu, SmartScreen and download verification,
-  uninstall, PowerShell completions, and the code signing policy
-  ([SignPath Foundation](docs/src/project/code-signing.md)).
+  uninstall and PowerShell completions.
 - The Windows tests (including the save tests) run on a hosted
   `windows-2025` runner in CI.
 

@@ -97,7 +97,7 @@ keep them in one folder.
 **SmartScreen.** The executables are not code-signed yet, so Windows
 SmartScreen may warn about an _unknown publisher_ when you run a download
 (click _More info_, then _Run anyway_). Signing is planned through
-[SignPath Foundation](../project/code-signing.md). Until then, check a
+SignPath Foundation (see the [Code signing policy](../project/code-signing.md)). Until then, check a
 download before you run it. Every release lists `SHA256SUMS.txt`, signed
 with minisign (`SHA256SUMS.txt.minisig`; the public key is
 [`keys/minisign.pub`](https://github.com/caniko/sorrel/blob/trunk/keys/minisign.pub)),
