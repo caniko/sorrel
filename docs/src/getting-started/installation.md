@@ -4,6 +4,11 @@ Sorrel is a Rust workspace and a Nix flake. The default build is pure Rust;
 the NWB and Kilosort 4 `rez.mat` backends are gated behind an `hdf5`
 feature that links against `libhdf5`.
 
+Prebuilt binaries are on the
+[GitHub releases page](https://github.com/caniko/sorrel/releases), and are
+also published to winget, Chocolatey, PyPI and crates.io. Release binaries
+follow the [code signing policy](../project/code-signing.md).
+
 ## With Cargo
 
 ```bash
