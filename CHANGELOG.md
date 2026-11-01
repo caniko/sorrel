@@ -45,6 +45,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   uninstall and PowerShell completions.
 - The Windows tests (including the save tests) run on a hosted
   `windows-2025` runner in CI.
+- **Double-blind curation bench.**
+  - **`sorrel blind`:** splits a curated session (or, with `--phy-curated`, a Kilosort sort curated in phy) into the sorter's own output and the human's final state plus `provenance.json`.
+  - **`sorrel diff TRUTH TEST --root INPUT`:** a spike-level score of two curations of one sort: unit recovery, merges, splits, noise exclusion and ARI, keyed by root cluster.
+  - **`scripts/bench_curation.py`:** runs `sorrel auto --llm` and the MCP review agent against the human curation, with a sealed holdout and blinded adjudication.
+  - **Prompts:** `SORREL_RUBRIC` and `SORREL_REVIEW` override the rubric and review instructions (the MCP `review` prompt and `sorrel auto --llm` share one source), and `sorrel agent-guide --prompt review` prints the effective text.
+  - **Skill:** `export-curated-sort` packages a phy-curated sort for the bench.
 
 ### Fixed
 
