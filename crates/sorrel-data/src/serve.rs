@@ -1932,6 +1932,11 @@ pub(crate) fn connect_authed(
     let mut stream = match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(None),
+        // Windows does not answer a SYN to a closed loopback port with an
+        // immediate reset: it retries and times out, so a stale file looks
+        // like this. A live listener accepts at once.
+        // ponytail: a Windows host with a full backlog reads as stale too.
+        Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::TimedOut => return Ok(None),
         Err(e) => bail!("sorrel host on port {port} did not accept the connection: {e}"),
     };
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;

@@ -1,0 +1,2 @@
+# Generated fixtures are compared byte for byte; keep LF on Windows checkouts.
+/release/fixtures/** -text

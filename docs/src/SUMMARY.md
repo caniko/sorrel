@@ -29,6 +29,10 @@
 - [Derived Cache](./architecture/cache.md)
 - [GPU Compute](./architecture/gpu.md)
 
+# Project
+
+- [Code signing policy](./project/code-signing.md)
+
 # Reference
 
 - [Sorrel improvement research](./reference/sorrel-improvement-research.md)

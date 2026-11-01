@@ -49,6 +49,8 @@
     mkdir -p AppDir
     install -m755 ${x86_64}/bin/sorrel AppDir/AppRun
     install -m644 ${desktop} AppDir/sorrel.desktop
+    install -m644 ${../assets/icon/sorrel-256.png} AppDir/sorrel.png
+    ln -s sorrel.png AppDir/.DirIcon
     mksquashfs AppDir $out -offset $(stat -L -c%s ${appimageRuntime}) -all-root -no-recovery
     dd if=${appimageRuntime} of=$out conv=notrunc status=none
     chmod 755 $out

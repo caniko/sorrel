@@ -29,4 +29,5 @@ monomorphised Rust core and a wgpu-backed renderer.
 sorting)` for SpikeInterface users.
 
 Source code is hosted at
-[github.com/caniko/sorrel](https://github.com/caniko/sorrel).
+[github.com/caniko/sorrel](https://github.com/caniko/sorrel). Release
+binaries follow the [code signing policy](./project/code-signing.md).

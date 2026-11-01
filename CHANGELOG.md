@@ -7,6 +7,24 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- `sorrelw.exe`, a Windows launcher without a console window: it starts the
+  sibling `sorrel.exe` with the same arguments and exits. It ships in the
+  zip and as a standalone `sorrel-<VERSION>-x86_64-windows-gui.exe`; on Linux
+  and macOS it just execs `sorrel`.
+- `sorrel install-shortcut [--remove]` adds or deletes the Start-menu
+  shortcut to `sorrelw.exe` (Windows only). The Chocolatey package makes its
+  own, and winget lists both executables.
+- The Windows executables embed the app icon, version information and a
+  manifest (long paths, UTF-8 code page, per-monitor DPI). The window has the
+  app icon on every platform, and the Linux packages install it with the
+  menu entry.
+- Windows documentation: Start menu, SmartScreen and download verification,
+  uninstall and PowerShell completions.
+- The Windows tests (including the save tests) run on a hosted
+  `windows-2025` runner in CI.
+
 ### Fixed
 
 - A cluster made by a split now shows up in `list_clusters`, can be relabelled

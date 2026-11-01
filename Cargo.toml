@@ -19,6 +19,7 @@ exclude = ["crates/sorrel-py"]
 [workspace.package]
 version = "0.3.0"
 edition = "2021"
+authors = ["Can H. Tartanoglu"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/caniko/sorrel"
 
