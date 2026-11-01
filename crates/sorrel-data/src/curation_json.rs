@@ -37,9 +37,7 @@ where
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&doc)?)
         .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
+    sorrel_io::fsutil::replace_file(&tmp, path)
 }
 
 /// The in-memory document; split out so tests and `serve` can inspect it.

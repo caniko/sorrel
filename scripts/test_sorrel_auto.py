@@ -84,7 +84,8 @@ FAKE = """#!/usr/bin/env python3
 import json, os, sys
 name, a = os.path.basename(sys.argv[0]), sys.argv[1:]
 stdin = "" if name == "opencode" else sys.stdin.read()
-rec = {"argv": a, "stdin": stdin, "cwd": os.getcwd(), "listing": os.listdir("."), "perm": os.environ.get("OPENCODE_PERMISSION")}
+sysf = a[a.index("--system-prompt-file") + 1] if "--system-prompt-file" in a else None
+rec = {"argv": a, "stdin": stdin, "system": open(sysf).read() if sysf else None, "cwd": os.getcwd(), "listing": os.listdir("."), "perm": os.environ.get("OPENCODE_PERMISSION")}
 json.dump(rec, open(os.environ["FAKE_RECORD"], "w"))
 fail, V = os.environ["FAKE_MODE"] == "fail", {"label": "mua", "confidence": 1.7, "reasons": ["a", "b", "c", "d"]}
 if name == "claude":
@@ -191,7 +192,7 @@ def test_llm_backends() -> None:
                 assert (a[a.index(flag) + 1] == model) if model else flag not in a
                 if backend == "claude":
                     assert a[:3] == ["-p", "--output-format", "json"] and json.loads(a[a.index("--json-schema") + 1]) == sa.UNIT_SCHEMA
-                    assert a[a.index("--tools") + 1] == "" and a[a.index("--system-prompt") + 1] == "SYS"
+                    assert a[a.index("--tools") + 1] == "" and r["system"] == "SYS" and "--system-prompt" not in a
                     assert a[a.index("--setting-sources") + 1] == "project" and a[a.index("--mcp-config") + 1].endswith("mcp.json")
                     for flag in ("--no-session-persistence", "--strict-mcp-config", "--disable-slash-commands"):
                         assert flag in a, flag
@@ -205,6 +206,25 @@ def test_llm_backends() -> None:
                     assert r["perm"] == '{"*":"deny"}'
             exe = sa.cli_argv("claude", None, "S", "unit", "M", Path("."))[0][0]
             assert exe == shutil.which("claude") and Path(exe).is_absolute(), exe
+            # cmd.exe re-parses a .cmd/.bat shim's command line: the argv holds no
+            # character it would act on, apart from the schema's own quotes.
+            for kind, schema in sa.SCHEMAS.items():
+                compact = json.dumps(schema, separators=(",", ":"))
+                assert not set(compact) & set("%^&|<>!\n\r"), (kind, compact)
+            with tempfile.TemporaryDirectory() as t:
+                for backend in ("claude", "codex", "opencode"):
+                    argv = sa.cli_argv(backend, "m", "S<>&|%^\nS", "unit", "M<>&|%^\nM", Path(t))[0]
+                    bad = [x for x in argv if set(x) & set("%^&|<>\n\r") and backend != "opencode"]
+                    assert not bad, (backend, bad)
+                shim = Path(t) / "opencode.cmd"
+                shim.write_text("")
+                real_which, sa.shutil.which = sa.shutil.which, lambda _n: str(shim)
+                try:
+                    argv = sa.cli_argv("opencode", None, "S%&", "unit", "M|^", Path(t))[0]
+                finally:
+                    sa.shutil.which = real_which
+                assert not [x for x in argv if set(x) & set("%^&|<>\n\r")], argv
+                assert "S%&" in (Path(t) / "prompt.md").read_text() and argv[-2] == "-f"
             # one raising call becomes None; a job without a message is never asked
             real = sa.ask_cli
 
