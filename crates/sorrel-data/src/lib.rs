@@ -61,9 +61,9 @@ pub use report::{render_cluster_svgs, render_report, write_report, ClusterSvgs, 
 pub use rules::{apply_rules, Rule, RuleSet};
 pub use save::{save_and_seal, save_session, save_to_phy};
 pub use serve::{
-    actor_name, attach, call_once, handle_line, list_hosts, read_mcp_json, serve, spawn_listener,
-    tool_list, user_dir, Env, HostRecord, ListenerHandle, SharedSelection, Ui, PROTOCOL_VERSION,
-    RUBRIC,
+    actor_name, attach, call_once, effective_prompts, handle_line, list_hosts, prompt_rev,
+    read_mcp_json, review_prompt, serve, spawn_listener, tool_list, user_dir, Env, HostRecord,
+    ListenerHandle, SharedSelection, Ui, PROTOCOL_VERSION, RUBRIC,
 };
 pub use session::Session;
 pub use spike_depth::{pc_weighted_depth, spike_depths, DepthSource, SpikeDepths};

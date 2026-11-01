@@ -17,6 +17,7 @@ for every unit.
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -264,7 +265,8 @@ def main() -> None:
     cmd = [sys.executable, str(Path(__file__).resolve().parents[1] / "crates" / "sorrel" / "src" / "sorrel_auto.py"), "--data-dir", str(phy), "--out", str(out), "--gain-to-uv", "1.0", "--jobs", "1"]
     if "--unitrefine" not in sys.argv:
         cmd.append("--no-unitrefine")
-    subprocess.run(cmd, check=True)
+    # `sorrel auto` passes the rubric (SORREL_RUBRIC) and its revision; without --llm the sidecar only records the revision.
+    subprocess.run(cmd, check=True, env={**os.environ, "SORREL_RUBRIC": "test rubric", "SORREL_PROMPT_REV": "test-rev"})
 
     doc = json.loads((out / "curation.json").read_text())
     scur.validate_curation_dict(doc)
@@ -276,7 +278,7 @@ def main() -> None:
     assert any({split_a, split_b} <= g for g in merged), f"oversplit not merged: {doc['merges']}"
     redundant = {u for u, l in by_unit.items() if "redundant" in l["tags"]}
     assert redundant & {orig, dup}, f"duplicate not flagged: {redundant}"
-    assert (out / "evidence.json").exists()
+    assert json.loads((out / "evidence.json").read_text())["prompt_rev"] == "test-rev"
     print(f"ok: {len(doc['merges'])} merge(s), redundant {sorted(redundant)}, output in {out}")
 
 

@@ -46,8 +46,9 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// The curation rubric: what a careful human curator decides, stated in the
 /// descriptor names of `brief` / `cluster_qc.tsv`. The `review` prompt serves
-/// it, and `sorrel auto` hands it to `sorrel_auto.py` (env `SORREL_RUBRIC`)
-/// as the `--llm` system prompt, so it must stand alone.
+/// it, and `sorrel auto` hands it to `sorrel_auto.py` (env `SORREL_RUBRIC`, set
+/// by [`effective_prompts`]) as the `--llm` system prompt, so it must stand
+/// alone.
 pub const RUBRIC: &str = "You review automatically sorted extracellular units (Kilosort 4, \
 SpikeInterface metrics) and decide what a careful human curator would decide. \
 Judge the evidence, not any classifier's authority. Evidence is numbers: \
@@ -87,7 +88,7 @@ Amplitudes are in uV when the input says so, otherwise in ADC units. Give a \
 confidence in [0, 1] (0.5 = coin flip) and at most three short reasons: flag \
 codes, rule names or at most eight words.";
 
-const REVIEW_INSTRUCTIONS: &str =
+pub const REVIEW_INSTRUCTIONS: &str =
     "You are reviewing a spike sort in Sorrel. Review the policy, not every \
 unit: your cost should depend on how many units are borderline, not on how many \
 there are. Never transcribe spike indices; act on handles (s12.1, m3) and cluster \
@@ -321,11 +322,42 @@ fn prompts_list() -> Value {
         "arguments": []}]})
 }
 
-fn prompt_get(name: &str) -> Option<Value> {
-    matches!(name, "review" | "triage").then(|| {
-        json!({"description": "Review a spike sort", "messages": [{"role": "user",
-            "content": {"type": "text", "text": format!("{REVIEW_INSTRUCTIONS}{RUBRIC}")}}]})
-    })
+/// `value` as text: the file's contents when it names a file, else itself;
+/// `default` when unset.
+fn resolve_text(value: Option<&str>, default: &str) -> Result<String> {
+    match value {
+        None => Ok(default.to_owned()),
+        Some(v) if Path::new(v).is_file() => {
+            std::fs::read_to_string(v).map_err(|e| anyhow::anyhow!("read prompt file {v}: {e}"))
+        }
+        Some(v) => Ok(v.to_owned()),
+    }
+}
+
+/// `(rubric, review instructions)` in force: the built-in text unless env
+/// `SORREL_RUBRIC` / `SORREL_REVIEW` (a file path or the text itself) overrides
+/// it, so a prompt variant is a plain file. The one place both the MCP
+/// `review` prompt and `sorrel auto` take their prompts from.
+pub fn effective_prompts() -> Result<(String, String)> {
+    let env = |k| std::env::var(k).ok();
+    Ok((
+        resolve_text(env("SORREL_RUBRIC").as_deref(), RUBRIC)?,
+        resolve_text(env("SORREL_REVIEW").as_deref(), REVIEW_INSTRUCTIONS)?,
+    ))
+}
+
+/// What the `review` / `triage` prompt serves: instructions, then rubric.
+pub fn review_prompt() -> Result<String> {
+    let (rubric, review) = effective_prompts()?;
+    Ok(format!("{review}{rubric}"))
+}
+
+/// Identity of the effective prompts (xxh3 hex of rubric and instructions),
+/// recorded with every bench run so a result names the text that produced it.
+pub fn prompt_rev() -> Result<String> {
+    let (rubric, review) = effective_prompts()?;
+    let h = xxhash_rust::xxh3::xxh3_64(format!("{rubric}\0{review}").as_bytes());
+    Ok(format!("{h:016x}"))
 }
 
 /// Serve `host` over stdio until `input` closes. `reseal_on_save` follows
@@ -409,7 +441,15 @@ fn respond(
         "prompts/list" => Ok(prompts_list()),
         "prompts/get" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-            prompt_get(name).ok_or_else(|| (-32602, format!("unknown prompt {name}")))
+            match name {
+                "review" | "triage" => review_prompt()
+                    .map(|text| {
+                        json!({"description": "Review a spike sort", "messages": [{"role": "user",
+                            "content": {"type": "text", "text": text}}]})
+                    })
+                    .map_err(|e| (-32603, format!("{e:#}"))),
+                _ => Err((-32602, format!("unknown prompt {name}"))),
+            }
         }
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
@@ -2020,6 +2060,16 @@ mod tests {
     use crate::qc_export::tests::MockProvider;
     use sorrel_io::SampleIndex;
     use std::io::Cursor;
+
+    #[test]
+    fn prompt_override_is_a_file_or_literal_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("rubric.txt");
+        std::fs::write(&f, "from file").unwrap();
+        assert_eq!(resolve_text(None, "dflt").unwrap(), "dflt");
+        assert_eq!(resolve_text(Some("literal"), "dflt").unwrap(), "literal");
+        assert_eq!(resolve_text(f.to_str(), "dflt").unwrap(), "from file");
+    }
 
     /// Point this test thread's `user_dir()` at a fresh directory.
     fn scoped_user_dir() -> tempfile::TempDir {

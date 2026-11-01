@@ -99,7 +99,12 @@ enum Cmd {
     },
     /// Print a primer for LLM agents, with the live command list, MCP tools
     /// and running hosts
-    AgentGuide,
+    AgentGuide {
+        /// Print only the effective text of this MCP prompt (`review`, alias
+        /// `triage`), as `prompts/get` serves it, instead of the primer
+        #[arg(long, value_name = "NAME", value_parser = ["review", "triage"])]
+        prompt: Option<String>,
+    },
     /// Print a shell completion script
     Completions { shell: clap_complete::Shell },
     /// Windows: add a Start-menu shortcut to `sorrelw.exe` (`--remove` deletes it)
@@ -1211,6 +1216,8 @@ fn run_auto_sidecar(open: &OpenArgs, out: &Path, flags: &[String]) -> Result<()>
     args.extend(shared.iter().map(Into::into));
     args.extend(flags.iter().map(Into::into));
 
+    // One prompt source with the MCP `review` prompt; a path override is resolved to text.
+    let (rubric, _) = serve::effective_prompts()?;
     let uv = std::env::var_os("PATH").is_some_and(|path| uv_on_path(&path));
     let mut cmd = if uv && std::env::var_os("SORREL_PYTHON").is_none() {
         let mut c = std::process::Command::new("uv");
@@ -1227,6 +1234,8 @@ fn run_auto_sidecar(open: &OpenArgs, out: &Path, flags: &[String]) -> Result<()>
         .args(&args)
         .env("SORREL_BIN", std::env::current_exe()?)
         .env("SORREL_OPEN_ARGS", serde_json::to_string(&brief_args)?)
+        .env("SORREL_RUBRIC", rubric)
+        .env("SORREL_PROMPT_REV", serve::prompt_rev()?)
         .status()
         .context("spawn the sorrel_auto.py sidecar (install uv, or set SORREL_PYTHON)")?;
     if !status.success() {
@@ -2118,8 +2127,11 @@ fn main() -> Result<()> {
             args,
             raw,
         }) => run_call(&open, &tool, args.as_deref(), raw),
-        Some(Cmd::AgentGuide) => {
-            print!("{}", agent_guide());
+        Some(Cmd::AgentGuide { prompt }) => {
+            match prompt {
+                Some(_) => print!("{}", serve::review_prompt()?),
+                None => print!("{}", agent_guide()),
+            }
             Ok(())
         }
         Some(Cmd::Completions { shell }) => {
@@ -2461,7 +2473,7 @@ mod tests {
         ));
         assert!(matches!(
             parse(&["agent-guide"]).unwrap().cmd,
-            Some(Cmd::AgentGuide)
+            Some(Cmd::AgentGuide { prompt: None })
         ));
     }
 
