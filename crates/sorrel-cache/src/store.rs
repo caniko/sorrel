@@ -87,6 +87,8 @@ impl CacheStore {
         let archived = match rkyv::access::<A::Archived, RkyvError>(&mmap) {
             Ok(archived) => NonNull::from(archived),
             Err(_) => {
+                // Windows refuses to delete a mapped file.
+                drop(mmap);
                 self.evict_file(&path)?;
                 return Ok(None);
             }
@@ -122,7 +124,16 @@ impl CacheStore {
                 .open(&tmp_path)?;
             tmp.write_all(&bytes)?;
             tmp.sync_all()?;
-            fs::rename(&tmp_path, &path)?;
+            match fs::rename(&tmp_path, &path) {
+                Ok(()) => {}
+                // Windows: a reader still maps the entry. Its key is a
+                // content fingerprint, so the old file is as good; keep it.
+                Err(err) if is_busy(&err) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Ok(());
+                }
+                Err(err) => return Err(err.into()),
+            }
             sync_dir(dir)?;
             self.append_index(key, bytes.len() as u64)?;
             Ok(())
@@ -182,9 +193,22 @@ impl CacheStore {
                 Ok(true)
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            // Still mapped (Windows): skipped, the next GC retries.
+            Err(err) if is_busy(&err) => Ok(false),
             Err(err) => Err(err.into()),
         }
     }
+}
+
+/// Windows error codes for a file a reader still maps or holds: 5 access
+/// denied, 32 sharing violation, 1224 user-mapped section.
+fn busy_code(code: Option<i32>) -> bool {
+    matches!(code, Some(5 | 32 | 1224))
+}
+
+/// Never true off Windows, where deleting or replacing a mapped file works.
+pub(crate) fn is_busy(err: &std::io::Error) -> bool {
+    cfg!(windows) && busy_code(err.raw_os_error())
 }
 
 /// Guard for a bytechecked archived value borrowed from an owned mmap.
@@ -256,5 +280,14 @@ fn assert_safe_cache_root(path: &Path) -> Result<(), CacheError> {
         Ok(())
     } else {
         Err(CacheError::UnsafeClearPath(path.to_path_buf()))
+    }
+}
+
+#[cfg(test)]
+mod busy_tests {
+    #[test]
+    fn busy_codes_are_the_windows_mapped_file_errors() {
+        assert!([5, 32, 1224].into_iter().all(|c| super::busy_code(Some(c))));
+        assert!(!super::busy_code(Some(2)) && !super::busy_code(None));
     }
 }

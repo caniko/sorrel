@@ -206,6 +206,8 @@ fn evict_file(path: &Path, len: u64, summary: &mut GcSummary) -> Result<(), Cach
             Ok(())
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // Still mapped by a reader (Windows): left for the next GC.
+        Err(err) if crate::store::is_busy(&err) => Ok(()),
         Err(err) => Err(err.into()),
     }
 }

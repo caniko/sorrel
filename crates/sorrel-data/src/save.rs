@@ -137,8 +137,7 @@ impl Sink {
         if self.0.is_some() {
             return Ok(());
         }
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
+        sorrel_io::fsutil::replace_file(&tmp, path)
     }
 }
 
@@ -527,7 +526,7 @@ fn publish_staged(root: &Path, arrays: bool, names: &[String]) -> Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
-        std::fs::rename(&tmp, &manifest).context("publish rewrite manifest")?;
+        sorrel_io::fsutil::replace_file(&tmp, &manifest).context("publish rewrite manifest")?;
         sync_dir(root);
         Ok(())
     };
