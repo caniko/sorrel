@@ -8,6 +8,13 @@ fn main() {
         return;
     }
     let env = |k: &str| std::env::var(k).unwrap_or_default();
+    // GNU ld's --gc-sections only roots SEC_KEEP and .ctors/.dtors/.vectors COFF
+    // sections, so it drops linkme's `.linkme_*$b` elements and piying's remote
+    // message slice ends up empty. See https://github.com/dtolnay/linkme/issues/25
+    // and https://github.com/rust-lang/rust/issues/145362.
+    if env("CARGO_CFG_TARGET_ENV") == "gnu" {
+        println!("cargo:rustc-link-arg-bins=-Wl,--no-gc-sections");
+    }
     let dir = std::path::PathBuf::from(env("CARGO_MANIFEST_DIR")).join("assets");
     let version = env("CARGO_PKG_VERSION");
     // 0.3.1-rc1 -> 0,3,1,0: the numeric prefix of each dotted part.

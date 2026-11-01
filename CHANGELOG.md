@@ -33,6 +33,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - `sorrel share`/`join` work in the Windows binary: GNU ld dropped the piying
   handler registrations (`hello: unknown message 'sorrel/hello/1'`). The
   Windows build now links with `--no-gc-sections`.
+- windows-gnu builds of the `sorrel` and `sorrelw` binaries keep the linkme
+  registrations on every build path (plain cargo and `cargo install` too),
+  not only the Nix release build: `--no-gc-sections` now comes from the build
+  script.
 - Saving a Kilosort/phy dataset no longer fails on Windows with "user-mapped
   section" (os error 1224): the provider kept `spike_times.npy` and
   `spike_clusters.npy` mapped after loading, and the save renames a new
