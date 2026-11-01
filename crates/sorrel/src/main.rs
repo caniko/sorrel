@@ -1597,6 +1597,14 @@ fn tab_opener() -> Opener {
     })
 }
 
+/// Whether winit will pick its Wayland backend: a Wayland session, unless
+/// `WINIT_UNIX_BACKEND=x11` forces X11 (XWayland).
+fn wayland_session() -> bool {
+    cfg!(target_os = "linux")
+        && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|d| !d.is_empty())
+        && std::env::var("WINIT_UNIX_BACKEND").map_or(true, |b| b != "x11")
+}
+
 /// The 256 px app icon (copy of `assets/icon/sorrel-256.png`, kept in the crate
 /// so `cargo package` is self-contained).
 fn window_icon() -> egui::IconData {
@@ -1610,6 +1618,14 @@ fn run_shell(opener: Opener, first: Option<OpenRequest>, register: bool) -> Resu
     let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
         setup.instance_descriptor.flags = sorrel_gpu::instance_flags();
+    }
+    // Wayland sends no frame callbacks to a covered surface, so a vsync
+    // (FIFO) present on the main window blocks the event loop while e.g. a
+    // full-screen pop-out covers it, freezing every window. Mailbox (or
+    // immediate where there is none) never waits; egui still only repaints
+    // on input, so this costs no idle frames.
+    if wayland_session() {
+        wgpu_options.present_mode = eframe::egui_wgpu::wgpu::PresentMode::AutoNoVsync;
     }
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
