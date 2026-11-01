@@ -1676,7 +1676,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             }
             // phy asks every view for its lasso; the first armed one splits.
             Intent::Split => {
-                if self.feature_state.lasso_closed() {
+                if self.feature_state.can_split() {
                     self.feature_state.request_split();
                 } else if self.amplitude_state.can_split() {
                     self.amplitude_state.request_split();

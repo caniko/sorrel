@@ -526,6 +526,8 @@ pub struct FeatureViewState {
     link_key: u64,
     /// One least-squares basis job per highlighted channel.
     basis_jobs: HashMap<u32, BasisMemo>,
+    /// Channel edits made before the first feature set loaded.
+    pending_edits: Vec<ChannelEdit>,
 }
 
 /// Selected spikes inside a closed lasso.
@@ -1083,6 +1085,7 @@ impl Default for FeatureViewState {
             link: FeatureLink::default(),
             link_key: 0,
             basis_jobs: HashMap::new(),
+            pending_edits: Vec::new(),
         }
     }
 }
@@ -1131,8 +1134,17 @@ impl FeatureViewState {
         self.lasso = Lasso::new(0, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
     }
 
+    /// Replay the channel edits made before the first set loaded, on top of
+    /// its automatic channels.
+    fn apply_pending_edits(&mut self) {
+        for e in std::mem::take(&mut self.pending_edits) {
+            self.edit_channels(e);
+        }
+    }
+
+    /// A lasso or a k-means part preview Esc would cancel.
     pub fn lasso_active(&self) -> bool {
-        self.lasso.is_active()
+        self.lasso.is_active() || self.km_armed()
     }
 
     pub fn lasso_closed(&self) -> bool {
@@ -1163,7 +1175,18 @@ impl FeatureViewState {
 
     /// phy `split` (`k`): the next frame splits off the lassoed spikes.
     pub fn request_split(&mut self) {
-        self.split_requested = self.lasso.is_closed();
+        self.split_requested = self.can_split();
+    }
+
+    /// A previewed k-means part with its auto lasso splits by membership, so
+    /// it needs no hull (a part of under three spikes has none).
+    fn km_armed(&self) -> bool {
+        self.km.previewing && self.km.lasso_auto && self.preview.is_some()
+    }
+
+    /// `k` has something to split: a closed lasso or an armed k-means part.
+    pub fn can_split(&self) -> bool {
+        self.lasso.is_closed() || self.km_armed()
     }
 
     /// phy `toggle_automatic_channel_selection` (`c`): fix A and B, with the
@@ -1182,13 +1205,19 @@ impl FeatureViewState {
         self.fixed_channels.is_some()
     }
 
-    /// Change the channel set (Waveforms clicks, the toolbar chips).
+    /// Change the channel set (Waveforms clicks, the toolbar chips). Before
+    /// Features has loaded a set there is no automatic pair to edit, so the
+    /// edit waits for it (see [`Self::apply_pending_edits`]).
     pub fn edit_channels(&mut self, e: ChannelEdit) {
         let mut set = self
             .shown_channels
             .clone()
             .or_else(|| self.edited.clone())
             .unwrap_or_default();
+        if set.len() < 2 && !matches!(e, ChannelEdit::Reset) {
+            self.pending_edits.push(e);
+            return;
+        }
         match e {
             ChannelEdit::Reset => {
                 self.edited = None;
@@ -1491,6 +1520,16 @@ pub fn feature_view<P: DataProvider>(
     if selection.is_empty() {
         ui.label("no selection");
         state.link = FeatureLink::default();
+        // sync_brush never runs here, so take back a brush this view owns.
+        state.brush_written = None;
+        if brushes.spikes.as_ref().is_some_and(|b| {
+            matches!(
+                b.source,
+                BrushSource::FeatureLasso | BrushSource::KMeansPart
+            )
+        }) {
+            brushes.spikes = None;
+        }
         return None;
     }
     let computed = !session.has_pc_features();
@@ -1542,6 +1581,7 @@ pub fn feature_view<P: DataProvider>(
         }
     };
     state.shown_channels = Some(set.channels.clone());
+    state.apply_pending_edits();
     let cur = lasso_key(&bound_key, &set.channels);
     // A lasso from before a selection/channel change must not hit the new
     // set's points.
@@ -1645,7 +1685,7 @@ pub fn feature_view<P: DataProvider>(
     // Computed PCs: a closed lasso previews and splits every spike, not the
     // display sample. `want_full` follows the lasso (it drops with it, in
     // `cancel_lasso` or here) and the brush waits for the full set.
-    state.want_full = computed && state.lasso.is_closed();
+    state.want_full = computed && state.can_split();
     sync_brush(state, &set, selection, session.version(), brushes);
     if let Some(h) = state.hover_out.take() {
         brushes.hover_next = Some(h);
@@ -1668,7 +1708,7 @@ pub fn feature_view<P: DataProvider>(
     // Computed PCs wait for the full set (`want_full`, above) to split.
     if let Some(set) = current
         .filter(|s| s.full || !s.computed)
-        .filter(|_| state.split_requested && state.lasso.is_closed())
+        .filter(|_| state.split_requested && state.can_split())
     {
         // The previewed part's members while the lasso is its auto lasso,
         // else the polygon's hits. A part fitted on the sample is refitted on
@@ -4340,6 +4380,37 @@ mod tests {
         st.lasso_edited();
         assert!(st.preview.is_none() && !st.km.previewing && !st.km.lasso_auto);
         assert!(st.km_members(&set).is_none());
+    }
+
+    #[test]
+    fn a_previewed_part_without_a_hull_still_splits() {
+        // A part of under three spikes gets no lasso, but `k` still splits it.
+        let mut st = FeatureViewState::default();
+        assert!(!st.can_split() && !st.lasso_active());
+        st.preview = Some((ClusterId(4), [1, 2].into_iter().collect()));
+        st.km.previewing = true;
+        st.km.lasso_auto = true;
+        assert!(!st.lasso.is_closed());
+        assert!(st.can_split() && st.lasso_active(), "armed by the part");
+        st.request_split();
+        assert!(st.split_requested);
+        st.cancel_lasso();
+        assert!(!st.can_split() && !st.lasso_active());
+    }
+
+    #[test]
+    fn a_channel_pick_before_features_loads_waits_for_the_automatic_pair() {
+        // Waveforms Ctrl+click before Features ever drew: no pair to edit yet.
+        let mut st = FeatureViewState::default();
+        st.edit_channels(ChannelEdit::SetA(9));
+        assert_eq!(st.fixed_channels, None, "not [9, 9]");
+        assert_eq!(st.edited, None);
+        // The first set lands with its automatic channels; the pick applies.
+        st.shown_channels = Some(vec![3, 5, 7]);
+        st.apply_pending_edits();
+        assert_eq!(st.fixed_channels, Some([9, 5]));
+        assert_eq!(st.edited.as_deref(), Some(&[9, 5, 3, 7][..]));
+        assert!(st.pending_edits.is_empty());
     }
 
     #[test]

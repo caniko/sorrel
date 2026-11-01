@@ -2501,3 +2501,34 @@ fn xtalk_isi_tooltip() {
         h
     });
 }
+
+#[test]
+fn xtalk_brush_cleared_with_the_selection() {
+    if no_gpu() {
+        return;
+    }
+    // Deselecting every cluster takes back the Features lasso's brush, and
+    // Amplitudes (whose kept set still has the old slots) must not panic.
+    each_theme(|theme, name| {
+        let mut h = wide_fixture(&format!("xtalk-desel-{name}"), theme);
+        select_two_and_open_features(&mut h);
+        lasso_points(&mut h, 4);
+        settle(&mut h);
+        assert!(h.state().brushes().spikes.is_some(), "the lasso is a brush");
+        click_tab(&mut h, "Amplitudes");
+        for id in ["2", "0"] {
+            h.get_all_by_label(id)
+                .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+                .expect("cluster row")
+                .click_modifiers(egui::Modifiers::COMMAND);
+            settle(&mut h);
+        }
+        click_tab(&mut h, "Features");
+        settle(&mut h);
+        assert!(
+            h.state().brushes().spikes.is_none(),
+            "no selection, no Features brush"
+        );
+        h
+    });
+}

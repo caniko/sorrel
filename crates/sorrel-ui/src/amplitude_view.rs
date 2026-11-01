@@ -398,7 +398,11 @@ pub fn amplitude_view<P: DataProvider>(
             set.points
                 .iter()
                 .filter(|p| {
-                    p.slot != BACKGROUND && sb.contains(selection[p.slot as usize], p.local)
+                    // `get`: a set kept from an older selection may have more slots.
+                    p.slot != BACKGROUND
+                        && selection
+                            .get(p.slot as usize)
+                            .is_some_and(|&c| sb.contains(c, p.local))
                 })
                 .filter(|p| time_alpha(brushes.time, p.t, 255).is_some())
                 .map(|p| ScatterVertex {
@@ -421,8 +425,11 @@ pub fn amplitude_view<P: DataProvider>(
             p,
             6.0,
         );
-        if let Some(q) = hit {
-            let c = selection[q.slot as usize];
+        // A set kept from an older selection has stale slots: no hover then.
+        if let Some((q, &c)) = hit
+            .filter(|_| current.is_some())
+            .and_then(|q| Some((q, selection.get(q.slot as usize)?)))
+        {
             let sample = session.spike_times(c).get(q.local as usize).map(|t| t.0);
             brushes.hover_next = sample.map(|sample| HoverSpike {
                 cluster: c,
@@ -433,7 +440,9 @@ pub fn amplitude_view<P: DataProvider>(
     }
     if let Some(h) = brushes.hover {
         let ringed = set.points.iter().find(|p| {
-            p.slot != BACKGROUND && p.local == h.local && selection[p.slot as usize] == h.cluster
+            p.slot != BACKGROUND
+                && p.local == h.local
+                && selection.get(p.slot as usize) == Some(&h.cluster)
         });
         if let Some(q) = ringed {
             ring(&painter, ui, to_screen([q.t, q.a]));
