@@ -73,7 +73,8 @@
               runner = "windows-2025";
               shell = "pwsh";
               run = "./release/smoke-windows.ps1";
-              timeout_minutes = 30;
+              # Includes the full `sorrel auto` run: uv installs SpikeInterface cold.
+              timeout_minutes = 60;
               env.RUST_LOG = "info";
               artifacts = {
                 name = "windows-smoke";
@@ -89,6 +90,17 @@
               runner = "windows-2025";
               # One failing binary must not hide the rest.
               args = "--workspace --locked --no-fail-fast";
+              # The UI snapshot tests render on lavapipe: fetch the Windows
+              # build of the dev shell's pinned Mesa (and the Vulkan loader the
+              # runner lacks) and fail instead of skipping without it.
+              setup = ''
+                lava="$RUNNER_TEMP\\lavapipe"
+                pwsh -NoProfile -File release/fetch-lavapipe-windows.ps1 -Dir "$lava" -Register
+                echo "SORREL_LAVAPIPE_ICD=$lava\\lvp_icd.x86_64.json" >> "$GITHUB_ENV"
+                echo "$lava" >> "$GITHUB_PATH"
+              '';
+              env.SORREL_REQUIRE_GPU = "1";
+              timeout_minutes = 90;
             }
           ];
           # Public caches only; the private macOS SDK cache is a release concern.
@@ -117,7 +129,7 @@
             push_branches = ["trunk"];
             timeout_minutes = 120;
             # The simit that generated the workflows; vars.SIMIT_CI_ENGINE_REVISION overrides.
-            engine_revision = "78b775803103ae960faf475ad46070d771fddc91";
+            engine_revision = "0e0a1b3153649aa22148540bf87eff3d7dbf6bb4";
           };
         };
         # Linux closures only: the darwin build depends on the private macOS
@@ -214,7 +226,7 @@
           license_url = "https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT";
           archive_pattern = "sorrel-{version}-{arch}-windows.zip";
           # chocolatey isn't in nixpkgs yet, and the dev shell no longer ships simit.
-          nix_tool = "github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=e8a983ef50d28464bd7943d1396ce839e38ca4e9";
+          nix_tool = "github:caniko/nixpkgs/add-chocolatey-scoop#chocolatey git+https://github.com/caniko/simit.git?rev=0e0a1b3153649aa22148540bf87eff3d7dbf6bb4";
           api_key_secret = "CHOCOLATEY_API_KEY";
           dependencies = [{id = "uv";}];
           # Start-menu entry for the launcher (its exe embeds the icon) and a

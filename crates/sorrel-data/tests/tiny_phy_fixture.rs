@@ -129,7 +129,7 @@ fn files(sh: &Shape) -> Vec<(&'static str, Vec<u8>)> {
     let times = le(&mut spikes.iter().map(|s| s.0.to_le_bytes().to_vec()));
     let clusters = le(&mut spikes.iter().map(|s| s.1.to_le_bytes().to_vec()));
     let mut out = vec![
-        ("spike_times.npy", npy("<i64", &times, spikes.len())),
+        ("spike_times.npy", npy("<i8", &times, spikes.len())),
         ("spike_clusters.npy", npy("<u4", &clusters, spikes.len())),
         (
             "params.py",
@@ -144,6 +144,18 @@ fn files(sh: &Shape) -> Vec<(&'static str, Vec<u8>)> {
             dat.iter().flat_map(|v| v.to_le_bytes()).collect(),
         ),
     ];
+    if !sh.rescue {
+        // `sorrel auto` (SpikeInterface) needs the probe geometry: the channels on
+        // a 20 um column, far enough apart to count as real positions.
+        let pos: Vec<u8> = (0..N_CH)
+            .flat_map(|c| [0.0f32, 20.0 * c as f32])
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        out.push((
+            "channel_positions.npy",
+            npy_shape("<f4", &pos, &format!("{N_CH}, 2")),
+        ));
+    }
     if sh.rescue {
         // Template k = unit k's waveform.
         const N_T: usize = 82;

@@ -172,7 +172,7 @@ fn set_aside(path: &Path) -> Result<()> {
         })
         .find(|p| !p.exists())
         .expect("an unused name");
-    std::fs::rename(path, &to)
+    sorrel_io::fsutil::replace_file(path, &to)
         .with_context(|| format!("move {} aside to {}", path.display(), to.display()))?;
     log::warn!("moved {} aside to {}", path.display(), to.display());
     Ok(())

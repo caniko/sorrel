@@ -1,7 +1,8 @@
 //! `sorrel-relay [--listen MULTIADDR] [--identity FILE]`
 //!
 //! See `sorrel_remote::relay`. The identity file keeps the relay's PeerId
-//! stable across restarts; it is created with mode 0600 on first run.
+//! stable across restarts; it is created on first run readable by the current user only (mode 0600,
+//! or an ACL on Windows).
 
 use std::path::PathBuf;
 
@@ -26,26 +27,7 @@ fn load_or_create_key(path: &PathBuf) -> Result<Keypair> {
     }
     let key = Keypair::generate_ed25519();
     let bytes = key.to_protobuf_encoding()?;
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?
-            .write_all(&bytes)?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, &bytes)?;
-        eprintln!(
-            "warning: {} is not ACL-restricted on this platform; anyone who can read it can \
-             impersonate this relay. Run the relay on Linux or macOS.",
-            path.display()
-        );
-    }
+    sorrel_io::fsutil::write_private_new(path, &bytes)?;
     Ok(key)
 }
 

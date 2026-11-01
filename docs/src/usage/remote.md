@@ -81,6 +81,6 @@ hostname with WebSockets enabled) and publish
 id stable across restarts. Circuit byte and duration limits are disabled;
 rate limits are off, so keep the relay for people you know.
 
-The relay is a server meant for Linux or macOS. On Windows it still runs, but
-the identity file is not ACL-restricted (Unix gets mode 0600), so the relay
-warns at start-up; do not host a shared relay there.
+The relay is a server meant for Linux or macOS. On Windows it still runs: the
+identity file is restricted to the current user with `icacls` (Unix gets mode
+0600), and the relay warns if that fails. Do not host a shared relay there.

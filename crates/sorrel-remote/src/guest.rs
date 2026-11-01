@@ -233,7 +233,7 @@ async fn sync_file(host: &RemoteActorRef<HostActor>, into: &Path, f: &FileEntry)
     if *hasher.finalize().as_bytes() != f.blake3 {
         bail!("{}: hash mismatch after download", f.path);
     }
-    std::fs::rename(&tmp, &dest)?;
+    sorrel_io::fsutil::replace_file(&tmp, &dest)?;
     println!("synced {} ({} KiB)", f.path, f.len >> 10);
     Ok(())
 }
