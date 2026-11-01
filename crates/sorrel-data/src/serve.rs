@@ -1698,7 +1698,7 @@ pub(crate) fn write_private_json(path: &Path, body: &Value) -> std::io::Result<(
     let mut f = opts.open(&tmp)?;
     f.write_all(body.to_string().as_bytes())?;
     f.sync_all()?;
-    std::fs::rename(&tmp, path)
+    sorrel_io::fsutil::replace_file_io(&tmp, path)
 }
 
 /// Shared tail of a listener handle's `Drop`: stop the accept loop, remove

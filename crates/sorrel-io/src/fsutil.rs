@@ -43,9 +43,93 @@ pub fn replace_file(from: &Path, to: &Path) -> Result<()> {
     })
 }
 
+/// [`replace_file`] for callers that return `io::Result`; the hint stays in
+/// the message.
+pub fn replace_file_io(from: &Path, to: &Path) -> std::io::Result<()> {
+    replace_file(from, to).map_err(|e| std::io::Error::other(format!("{e:#}")))
+}
+
+/// Drop the inherited ACEs of `path` and grant only the current user, like
+/// Unix mode 0600. Shells out to `icacls`, which ships with Windows.
+#[cfg(windows)]
+pub fn restrict_to_current_user(path: &Path) -> Result<()> {
+    use anyhow::Context;
+    let user = std::env::var("USERNAME").context("USERNAME is not set")?;
+    let out = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("{user}:F"))
+        .output()
+        .context("run icacls")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "icacls {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stdout).trim()
+    );
+    Ok(())
+}
+
+/// Create `path` (which must not exist) readable by the current user only
+/// (mode 0600; on Windows an ACL, set before the bytes are written) and write
+/// `bytes`. A Windows ACL failure is a warning, not an error.
+pub fn write_private_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts.open(path)?;
+    #[cfg(windows)]
+    if let Err(e) = restrict_to_current_user(path) {
+        log::warn!(
+            "{} is not ACL-restricted ({e:#}); anyone who can read it can use its contents",
+            path.display()
+        );
+    }
+    f.write_all(bytes)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The file holds one explicit ACE (the current user) and inherits none.
+    #[test]
+    fn private_file_has_no_inherited_aces() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("relay.key");
+        write_private_new(&p, b"secret").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"secret");
+        assert!(write_private_new(&p, b"x").is_err(), "must not overwrite");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("icacls")
+                .arg(&p)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            // `path  DOMAIN\user:(F)`, then one line per further ACE; `(I)` marks inherited.
+            let aces: Vec<&str> = text.lines().filter(|l| l.contains(":(")).collect();
+            assert!(!text.contains("(I)"), "inherited ACEs remain:\n{text}");
+            assert_eq!(aces.len(), 1, "expected one ACE:\n{text}");
+            let user = std::env::var("USERNAME").unwrap().to_lowercase();
+            assert!(
+                aces[0].to_lowercase().contains(&user),
+                "not the current user:\n{text}"
+            );
+            assert!(aces[0].contains("(F)"), "{text}");
+        }
+    }
 
     #[test]
     fn busy_codes_and_plain_rename() {

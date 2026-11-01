@@ -213,7 +213,7 @@ impl UiPrefs {
         let json = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, json)?;
-        std::fs::rename(tmp, path)
+        sorrel_io::fsutil::replace_file_io(&tmp, &path)
     }
 }
 
