@@ -38,7 +38,14 @@ fn load_or_create_key(path: &PathBuf) -> Result<Keypair> {
             .write_all(&bytes)?;
     }
     #[cfg(not(unix))]
-    std::fs::write(path, &bytes)?;
+    {
+        std::fs::write(path, &bytes)?;
+        eprintln!(
+            "warning: {} is not ACL-restricted on this platform; anyone who can read it can \
+             impersonate this relay. Run the relay on Linux or macOS.",
+            path.display()
+        );
+    }
     Ok(key)
 }
 

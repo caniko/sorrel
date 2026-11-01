@@ -472,26 +472,38 @@ def cli_argv(backend: str, model: str | None, system: str, kind: str, message: s
     """(argv, stdin text, extra env, cwd) for one case. `root` is the case's
     scratch dir: the CLI runs in the empty `root/cwd` and reads `root/schema.json`
     / `root/mcp.json` and writes `root/out.json` beside it.
-    ponytail: the system prompt is one argv string for claude (Linux caps a
-    single arg at 128 KiB, Windows' whole command line at 32 KiB); switch to a
-    prompt file if a brief header outgrows it. argv[0] is the resolved path so
-    npm `.cmd` shims work on Windows."""
+    argv[0] is the resolved path so npm `.cmd` shims work on Windows. cmd.exe
+    re-parses a shim's whole command line (`"` toggles quoting; `%`, `^`, `&`,
+    `|`, `<`, `>` and newlines act), so prompts never go in argv: claude reads
+    the system prompt from `root/system.md` and the message from stdin, codex
+    everything from files and stdin, opencode (no stdin) the prompt from an
+    attached file when the exe is a shim.
+    ponytail: claude's `--json-schema` has no file form, so the schema stays in
+    argv. It is compact JSON of constants with none of the characters above
+    (checked by test_sorrel_auto.py); a CLI that gains a schema-file flag
+    should switch to it. A model name or temp path holding `%^&|<>` would still
+    break a shim. opencode's `-f` path is untested against the real CLI."""
     cwd, m = root / "cwd", (["-m", model] if model else [])
     exe = shutil.which(backend) or backend
+    shim = exe.lower().endswith((".cmd", ".bat"))
     if backend == "claude":
         # Empty MCP set, project-only settings and an empty cwd keep the user's
         # own Claude Code context (~50k tokens) out of every call.
-        argv = [exe, "-p", "--output-format", "json", "--json-schema", json.dumps(SCHEMAS[kind]),
-                "--system-prompt", system, "--tools", "", "--no-session-persistence", "--strict-mcp-config",
+        argv = [exe, "-p", "--output-format", "json", "--json-schema", json.dumps(SCHEMAS[kind], separators=(",", ":")),
+                "--system-prompt-file", str(root / "system.md"), "--tools", "", "--no-session-persistence", "--strict-mcp-config",
                 "--mcp-config", str(root / "mcp.json"), "--setting-sources", "project", "--disable-slash-commands"]
         return argv + (["--model", model] if model else []), message, {}, cwd
     if backend == "codex":  # no system-prompt flag
         argv = [exe, "exec", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "--output-schema",
                 str(root / "schema.json"), "-o", str(root / "out.json"), "-C", str(cwd), "--json", *m, "-"]
         return argv, f"{system}\n\n{message}", {}, cwd
-    # opencode: no schema, system or stdin; tools denied through its inline permission config
+    # opencode: no schema, system or documented stdin; tools denied through its inline permission config
     prompt = f"{system}\n\n{message}\n\nReply with ONLY a JSON object matching this schema: {json.dumps(SCHEMAS[kind])}"
-    return [exe, "run", "--format", "json", *m, prompt], "", {"OPENCODE_PERMISSION": '{"*":"deny"}'}, cwd
+    env = {"OPENCODE_PERMISSION": '{"*":"deny"}'}
+    if shim:  # the message comes first: `-f` takes every positional after it
+        (root / "prompt.md").write_text(prompt, encoding="utf-8")
+        return [exe, "run", "Follow the instructions in the attached file.", "--format", "json", *m, "-f", str(root / "prompt.md")], "", env, cwd
+    return [exe, "run", "--format", "json", *m, prompt], "", env, cwd
 
 
 def cli_text(backend: str, stdout: str, out_file: Path) -> tuple[str | None, str | None, str | None]:
@@ -536,6 +548,7 @@ def ask_cli(backend: str, model: str | None, system: str, kind: str, message: st
         cwd.mkdir()
         (root / "schema.json").write_text(json.dumps(SCHEMAS[kind]))
         (root / "mcp.json").write_text('{"mcpServers":{}}')
+        (root / "system.md").write_text(system, encoding="utf-8")
         try:
             r = subprocess.run(argv, input=stdin, cwd=cwd, env={**os.environ, **extra}, capture_output=True, encoding="utf-8", errors="replace", timeout=600)
         except (subprocess.TimeoutExpired, OSError) as e:
@@ -560,17 +573,26 @@ def api_credential(env=os.environ) -> bool:
     ponytail: workload-identity federation env vars are not checked."""
     if env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN"):
         return True
+    # Documented lookup: $ANTHROPIC_CONFIG_DIR, then ~/.config/anthropic (Linux,
+    # macOS; $XDG_CONFIG_HOME honoured) or %APPDATA%\Anthropic (Windows). The
+    # Windows ~/.config/anthropic fallback is a hedge for tools that use the
+    # XDG layout there too.
     if env.get("ANTHROPIC_CONFIG_DIR"):
-        base = Path(env["ANTHROPIC_CONFIG_DIR"])
+        bases = [Path(env["ANTHROPIC_CONFIG_DIR"])]
     elif sys.platform == "win32":
-        base = Path(env.get("APPDATA", "")) / "Anthropic"
+        bases = [Path(env["APPDATA"]) / "Anthropic"] if env.get("APPDATA") else []
+        home = env.get("USERPROFILE") or str(Path.home())
+        bases.append(Path(home) / ".config" / "anthropic")
     else:
-        base = Path(env.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "anthropic"
-    profile = env.get("ANTHROPIC_PROFILE")
-    if not profile:
-        active = base / "active_config"
-        profile = (active.read_text().strip() if active.is_file() else "") or "default"
-    return (base / "credentials" / f"{profile}.json").is_file()
+        bases = [Path(env.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "anthropic"]
+    for base in bases:
+        profile = env.get("ANTHROPIC_PROFILE")
+        if not profile:
+            active = base / "active_config"
+            profile = (active.read_text().strip() if active.is_file() else "") or "default"
+        if (base / "credentials" / f"{profile}.json").is_file():
+            return True
+    return False
 
 
 def run_llm(backend: str | None, model: str | None, system: str, jobs: list[tuple[str, str | None]]) -> list[dict | None]:
