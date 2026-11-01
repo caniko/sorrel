@@ -265,7 +265,12 @@ fn validate_kind(kind: &str) -> Result<(), CacheError> {
 }
 
 pub(crate) fn sync_dir(path: &Path) -> Result<(), CacheError> {
+    // A directory cannot be opened as a file on Windows (and NTFS journals
+    // its metadata), so there it is a no-op.
+    #[cfg(not(windows))]
     File::open(path)?.sync_all()?;
+    #[cfg(windows)]
+    let _ = path;
     Ok(())
 }
 
