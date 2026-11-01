@@ -41,9 +41,31 @@ fn write_sort(root: &Path) {
     .unwrap();
     std::fs::write(
         root.join("cluster_KSLabel.tsv"),
-        "cluster_id\tKSLabel\n0\tunsorted\n",
+        "cluster_id\tKSLabel\n0\tunsorted\n9\tgood\n",
     )
     .unwrap();
+}
+
+/// Editor and atomic-save leftovers a blind input must not pick up.
+fn write_decoys(root: &Path) {
+    for d in ["spike_clusters.npy.tmp", "curation.json.tmp", "notes.bak"] {
+        std::fs::write(root.join(d), "decoy").unwrap();
+    }
+}
+
+/// Every entry of the input is a regular file, and params.py holds no absolute path.
+fn assert_self_contained(input: &Path) {
+    for e in std::fs::read_dir(input).unwrap() {
+        let e = e.unwrap();
+        assert!(e.file_type().unwrap().is_file(), "{:?}", e.file_name());
+    }
+    let params = std::fs::read_to_string(input.join("params.py")).unwrap();
+    assert!(
+        !params
+            .lines()
+            .any(|l| l.contains("dat_path") && (l.contains('/') || l.contains('\\'))),
+        "{params}"
+    );
 }
 
 fn label_str(l: &PhyLabel) -> &'static str {
@@ -107,6 +129,7 @@ fn blind_pair_scores_exactly_the_injected_edits() {
         std::fs::create_dir_all(root.join(d)).unwrap();
         std::fs::write(root.join(d).join("x"), "x").unwrap();
     }
+    write_decoys(&root);
     assert!(root.join("sorrel.journal").exists() && root.join("cluster_group.tsv").exists());
 
     // Blind input: opens as a fresh phy directory sealed to the same baseline.
@@ -134,10 +157,12 @@ fn blind_pair_scores_exactly_the_injected_edits() {
         ],
         "{files:?}"
     );
-    assert!(std::fs::symlink_metadata(input.join("recording.dat"))
-        .unwrap()
-        .file_type()
-        .is_symlink());
+    assert_self_contained(&input);
+    // The sorter's rows only: id 9 is not a root cluster.
+    assert_eq!(
+        std::fs::read_to_string(input.join("cluster_KSLabel.tsv")).unwrap(),
+        "cluster_id\tKSLabel\n0\tunsorted\n"
+    );
     assert_eq!(
         baseline_hash(&std::fs::read(input.join("spike_clusters.npy")).unwrap()),
         baseline
@@ -244,6 +269,7 @@ fn phy_curated_pair_takes_the_sort_from_spike_templates() {
     )
     .unwrap();
     std::fs::write(root.join("phy.log"), "Merge clusters 0, 1 to 5.\n").unwrap();
+    write_decoys(&root);
     let mut params = std::fs::read_to_string(root.join("params.py")).unwrap();
     params.push_str("dat_path = r'/elsewhere/recording.dat'\n");
     std::fs::write(root.join("params.py"), params).unwrap();
@@ -256,6 +282,17 @@ fn phy_curated_pair_takes_the_sort_from_spike_templates() {
     for name in ["phy.log", "cluster_group.tsv"] {
         assert!(!input.join(name).exists(), "{name} leaked");
     }
+    assert_self_contained(&input);
+    assert_eq!(
+        std::fs::read_to_string(input.join("cluster_KSLabel.tsv")).unwrap(),
+        "cluster_id\tKSLabel\n0\tunsorted\n"
+    );
+    let prov: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(truth.join("provenance.json")).unwrap()).unwrap();
+    assert_eq!(
+        (prov["pure_manual"].as_bool(), prov["curated"].as_bool()),
+        (Some(true), Some(true))
+    );
     // The relocated recording opens, and nothing is written beside the source.
     let s = open(&input);
     assert_eq!(s.n_clusters(), 5);
@@ -269,5 +306,52 @@ fn phy_curated_pair_takes_the_sort_from_spike_templates() {
             ("missed_split", vec![2]),
             ("exclusion", vec![4]),
         ]
+    );
+}
+
+/// An uncurated export with sorrel's leftovers, and a raw recording that lives
+/// outside the sort directory: the input still holds its own copy of it.
+#[test]
+fn phy_curated_pair_flags_provenance_and_keeps_the_raw_inside() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, input, truth, elsewhere) = (
+        tmp.path().join("sort"),
+        tmp.path().join("in"),
+        tmp.path().join("truth"),
+        tmp.path().join("elsewhere"),
+    );
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    write_sort(&root);
+    std::fs::copy(
+        root.join("spike_clusters.npy"),
+        root.join("spike_templates.npy"),
+    )
+    .unwrap();
+    std::fs::create_dir(root.join("sorrel_auto")).unwrap();
+    write_decoys(&root);
+    let raw = elsewhere.join("raw.dat");
+    std::fs::rename(root.join("recording.dat"), &raw).unwrap();
+    let mut params = std::fs::read_to_string(root.join("params.py")).unwrap();
+    params.push_str(&format!("dat_path = r'{}'\n", raw.display()));
+    std::fs::write(root.join("params.py"), params).unwrap();
+
+    write_phy_curated_pair(&root, None, &input, &truth).unwrap();
+    assert_self_contained(&input);
+    assert!(input.join("raw.dat").is_file());
+    assert!(!input.join("recording.dat").exists());
+    assert!(std::fs::read_to_string(input.join("params.py"))
+        .unwrap()
+        .ends_with("dat_path = \"raw.dat\"\n"));
+    open(&input); // opens from the input alone
+    let prov: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(truth.join("provenance.json")).unwrap()).unwrap();
+    assert_eq!(
+        (
+            prov["pure_manual"].as_bool(),
+            prov["anchored"].as_bool(),
+            prov["curated"].as_bool()
+        ),
+        (Some(false), Some(true), Some(false))
     );
 }

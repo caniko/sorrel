@@ -46,6 +46,14 @@ fn blind_then_diff_scores_the_curation_against_the_sort() {
         &["blind", &ds_s, "--input", &input, "--truth", &truth],
     ));
     assert!(!t.join("in/sorrel.journal").exists() && !t.join("in/cluster_group.tsv").exists());
+    // A non-empty truth is refused before any input is written.
+    let in2 = s(&t.join("in2"));
+    assert!(
+        !sorrel(t, &["blind", &ds_s, "--input", &in2, "--truth", &truth])
+            .status
+            .success()
+    );
+    assert!(!t.join("in2").exists());
     let prov: serde_json::Value =
         serde_json::from_slice(&std::fs::read(t.join("truth/provenance.json")).unwrap()).unwrap();
     assert_eq!(prov["n_applied"], 1);

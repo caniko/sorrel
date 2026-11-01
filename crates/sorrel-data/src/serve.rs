@@ -323,10 +323,10 @@ fn prompts_list() -> Value {
 }
 
 /// `value` as text: the file's contents when it names a file, else itself;
-/// `default` when unset.
+/// `default` when unset or empty.
 fn resolve_text(value: Option<&str>, default: &str) -> Result<String> {
     match value {
-        None => Ok(default.to_owned()),
+        None | Some("") => Ok(default.to_owned()),
         Some(v) if Path::new(v).is_file() => {
             std::fs::read_to_string(v).map_err(|e| anyhow::anyhow!("read prompt file {v}: {e}"))
         }
@@ -2067,6 +2067,7 @@ mod tests {
         let f = dir.path().join("rubric.txt");
         std::fs::write(&f, "from file").unwrap();
         assert_eq!(resolve_text(None, "dflt").unwrap(), "dflt");
+        assert_eq!(resolve_text(Some(""), "dflt").unwrap(), "dflt");
         assert_eq!(resolve_text(Some("literal"), "dflt").unwrap(), "literal");
         assert_eq!(resolve_text(f.to_str(), "dflt").unwrap(), "from file");
     }

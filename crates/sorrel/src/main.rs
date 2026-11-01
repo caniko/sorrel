@@ -1034,6 +1034,9 @@ impl SessionVisitor for Blind {
             bail!("sorrel blind supports phy/Kilosort directories");
         }
         let session = seeded(session, seed)?;
+        if self.truth.exists() && std::fs::read_dir(&self.truth)?.next().is_some() {
+            bail!("{} is not empty", self.truth.display());
+        }
         let files = sorrel_data::write_blind_input(
             &ctx.save_dir,
             self.dat.as_deref(),
@@ -1041,9 +1044,6 @@ impl SessionVisitor for Blind {
             "spike_clusters.npy",
             session.journal().baseline(),
         )?;
-        if self.truth.exists() && std::fs::read_dir(&self.truth)?.next().is_some() {
-            bail!("{} is not empty", self.truth.display());
-        }
         std::fs::create_dir_all(&self.truth)
             .with_context(|| format!("create {}", self.truth.display()))?;
         save_to_phy(&session, &self.truth, phy_label_str)?;
@@ -2346,7 +2346,10 @@ fn main() -> Result<()> {
             truth,
             phy_curated: true,
         }) => {
-            let dir = open.root.as_deref().expect("DATA_DIR is required");
+            let dir = open
+                .root
+                .as_deref()
+                .context("sorrel blind --phy-curated needs DATA_DIR")?;
             let files =
                 sorrel_data::write_phy_curated_pair(dir, open.dat.as_deref(), &input, &truth)?;
             println!(

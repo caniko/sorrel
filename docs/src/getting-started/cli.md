@@ -103,10 +103,16 @@ instructions for `sorrel mcp`, `sorrel auto --llm` and this command.
 ## Blind bench
 
 `sorrel blind <DATA_DIR> --input <IN> --truth <TRUTH>` splits a curated session
-into a double-blind pair. `IN` is the sorter's own output (the root files, hard
-links; the raw recording is a symlink) with no journal, `cluster_*` file,
-`curation.json`, `sorrel_auto/`, `.phy/`, `mcp/`, `.sorrel/` or
-`sorrel_original/`, and is checked against the journal's baseline hash. `TRUTH`
+into a double-blind pair. `IN` is the sorter's own output, an allowlist of the
+root files (`spike_*`, `templates`, `channel_*`, `pc_features` and the like, and
+`params.py`) with the raw recording and its `.ch`/`.meta` inside it as regular
+files under their own names (`params.py` is pointed at them), so nothing in `IN`
+leads back to `DATA_DIR`. Files under 64 MiB are copied, larger ones hard-linked
+(a copy where that fails). The sorter's `cluster_KSLabel/ContamPct/Amplitude.tsv`
+are rewritten to the root cluster ids. There is no journal, other `cluster_*`
+file, `curation.json`, `phy.log`, `sorrel_auto/`, `.phy/`, `mcp/`, `.sorrel/` or
+`sorrel_original/`, and `spike_clusters.npy` is checked against the journal's
+baseline hash. `TRUTH`
 holds the journal head (`spike_clusters.npy`, `cluster_group.tsv`,
 `curation.json`) and `provenance.json` (edits by actor and method, `pure_manual`,
 `anchored`, journal hash, seal state). Both directories must be empty or absent.
@@ -115,7 +121,11 @@ With `--phy-curated` the session is a Kilosort sort curated in phy instead:
 `spike_templates.npy` (which phy never rewrites) becomes `IN`'s
 `spike_clusters.npy`, and `TRUTH` takes the top-level `spike_clusters.npy` and
 `cluster_group.tsv`. `phy.log`, which lists the human's merges, is never copied.
-phy keeps no actor history, so `provenance.json` assumes the curation is manual.
+phy keeps no actor history, so `provenance.json` assumes the curation is manual
+unless `DATA_DIR` holds a sorrel journal, `sorrel_original/` or `sorrel_auto/`
+(then `pure_manual` is false and `anchored` true). `curated` is false, with a
+warning, when `spike_clusters.npy` equals `spike_templates.npy` and the labels are
+the sorter's.
 `DATA_DIR` is only read. If params.py names a `dat_path` that doesn't exist,
 the copy points at the recording of the same name next to it.
 

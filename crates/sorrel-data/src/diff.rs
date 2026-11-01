@@ -303,8 +303,11 @@ pub fn diff_spikes(
     // One pass: the sparse (root, truth, test) table everything derives from.
     // A disputed root's spikes are left out entirely (unit sizes shrink too).
     let mut triples: HashMap<(u32, u32, u32), u32> = HashMap::new();
+    let mut disputed_seen = HashSet::new();
     for ((&r, &t), &s) in root.iter().zip(truth.clusters).zip(test.clusters) {
-        if !opts.disputed.contains(&r) {
+        if opts.disputed.contains(&r) {
+            disputed_seen.insert(r);
+        } else {
             *triples.entry((r, t, s)).or_insert(0) += 1;
         }
     }
@@ -495,7 +498,7 @@ pub fn diff_spikes(
     Ok(SpikeDiff {
         n_spikes,
         n_root_clusters: roots.len() as u32,
-        n_disputed: opts.disputed.len() as u32,
+        n_disputed: disputed_seen.len() as u32,
         match_jaccard: opts.match_jaccard,
         min_spikes: opts.min_spikes as u64,
         units,
@@ -723,7 +726,7 @@ mod tests {
     fn disputed_roots_are_not_scored() {
         let (root, truth, labels) = scenario();
         let opts = SpikeDiffOpts {
-            disputed: [0, 1, 2, 3, 4].into(),
+            disputed: [0, 1, 2, 3, 4, 99].into(),
             ..Default::default()
         };
         let d = diff_spikes(
@@ -740,5 +743,6 @@ mod tests {
         )
         .unwrap();
         assert!(d.misses.is_empty() && d.n_spikes == 0 && d.ari == 1.0);
+        assert_eq!(d.n_disputed, 5, "an id absent from the root is not counted");
     }
 }
