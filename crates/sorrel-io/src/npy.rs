@@ -389,8 +389,7 @@ fn write_atomic<F: FnOnce(&mut std::io::BufWriter<File>) -> std::io::Result<()>>
     write_payload: F,
 ) -> Result<()> {
     let tmp = write_tmp(path, descr, shape, write_payload)?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
+    crate::fsutil::replace_file(&tmp, path)
 }
 
 /// A `.npy` opened for row access in any dtype: rows are raw byte slices of

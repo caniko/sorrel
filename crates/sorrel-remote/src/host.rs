@@ -178,6 +178,11 @@ fn walk(
         if name.starts_with(".sorrel") {
             continue; // derived cache, remote mirror
         }
+        // The journal's writer lock (and its pid file) belong to this process;
+        // on Windows the lock is mandatory, so even hashing it fails.
+        if name.ends_with(".lock") || name.ends_with(".lock.pid") {
+            continue;
+        }
         let ty = entry.file_type()?;
         if ty.is_dir() {
             walk(root, &path, exclude, out, by_path)?;

@@ -17,7 +17,7 @@ guest:  sorrel join "<six words>" --direct MULTIADDR  # or: --relay MULTIADDR
   files that already match.
 - **The raw recording is never copied.** The guest keeps a sparse mirror
   under `.sorrel/remote/recording.dat` and fetches the byte ranges the trace
-  and waveform views ask for. Windows render grey until they arrive;
+  and waveform views ask for. Time windows render grey until they arrive;
   neighbouring windows are prefetched.
 - **Curation commands** stream back to the host as journal records. Each
   carries the `(baseline, record count)` cursor it was applied against; the
@@ -80,3 +80,7 @@ hostname with WebSockets enabled) and publish
 `/dns4/<hostname>/tcp/443/wss/p2p/<RelayId>`. The identity file keeps the
 id stable across restarts. Circuit byte and duration limits are disabled;
 rate limits are off, so keep the relay for people you know.
+
+The relay is a server meant for Linux or macOS. On Windows it still runs, but
+the identity file is not ACL-restricted (Unix gets mode 0600), so the relay
+warns at start-up; do not host a shared relay there.

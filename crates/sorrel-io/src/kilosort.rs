@@ -61,10 +61,10 @@ pub struct KilosortProvider {
     n_samples: SampleIndex,
     dtype: TraceDtype,
 
-    // mmaps kept alive for the lifetime of the provider; the slices below
-    // borrow into them via raw pointers cast back inside accessor methods.
-    _spike_times_mmap: Mmap,
-    _spike_clusters_mmap: Mmap,
+    // The trace map stays alive for the provider's lifetime; the raw slices
+    // below borrow into it. spike_times/spike_clusters are copied into Vecs
+    // and unmapped at once: save renames `spike_clusters.npy.tmp` over the
+    // file, which Windows refuses while it is mapped (os error 1224).
     _trace_mmap: Mmap,
 
     // Per-cluster spike-time vectors (we re-bucket once at load time so the
@@ -207,11 +207,15 @@ impl KilosortProvider {
         }
         let n_spikes = st_hdr.elem_count();
 
-        let st_mmap = unsafe { Mmap::map(&File::open(&spike_times_path)?)? };
-        let sc_mmap = unsafe { Mmap::map(&File::open(&spike_clusters_path)?)? };
-
-        let times = read_u64_array(&st_mmap, &st_hdr, n_spikes)?;
-        let clusters = read_u32_array(&sc_mmap, &sc_hdr, n_spikes)?;
+        // Mapped only for these two reads (dropped before the block ends).
+        let (times, clusters) = {
+            let st_mmap = unsafe { Mmap::map(&File::open(&spike_times_path)?)? };
+            let sc_mmap = unsafe { Mmap::map(&File::open(&spike_clusters_path)?)? };
+            (
+                read_u64_array(&st_mmap, &st_hdr, n_spikes)?,
+                read_u32_array(&sc_mmap, &sc_hdr, n_spikes)?,
+            )
+        };
 
         let max_cluster = clusters.iter().copied().max().unwrap_or(0);
         let n_clusters = (max_cluster as usize) + 1;
@@ -422,8 +426,6 @@ impl KilosortProvider {
             n_channels,
             n_samples,
             dtype,
-            _spike_times_mmap: st_mmap,
-            _spike_clusters_mmap: sc_mmap,
             _trace_mmap: trace_mmap,
             spikes_per_cluster,
             amps_per_cluster,
@@ -1361,7 +1363,7 @@ pub fn roll_forward_pending(root: &Path) -> Result<()> {
             .filter(|(a, b)| bare(a) && bare(b))
             .with_context(|| format!("{}: malformed line {line:?}", manifest.display()))?;
         if root.join(tmp).exists() {
-            std::fs::rename(root.join(tmp), root.join(fin))
+            crate::fsutil::replace_file(&root.join(tmp), &root.join(fin))
                 .with_context(|| format!("roll forward {tmp} -> {fin}"))?;
         }
     }

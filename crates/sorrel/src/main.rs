@@ -1090,7 +1090,7 @@ where
     P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
 {
     save_dir_session(session, &ctx.save_dir, ctx.reseal_on_save, phy_label_str)?;
-    println!("saved → {}", ctx.save_dir.display());
+    println!("saved → {}", sorrel_io::fsutil::display_path(&ctx.save_dir));
     Ok(())
 }
 
@@ -1409,7 +1409,7 @@ impl SessionVisitor for Headless {
         println!(
             "sorrel host on 127.0.0.1:{}; connect an agent with `sorrel mcp {}`; Ctrl-C stops",
             listener.port(),
-            ctx.save_dir.display()
+            sorrel_io::fsutil::display_path(&ctx.save_dir)
         );
         // Ctrl-C returns, dropping the listener so it removes its registry file.
         sorrel_remote::wait_for_ctrl_c();
@@ -1721,7 +1721,7 @@ fn require_exists(open: &OpenArgs) -> Result<()> {
     anyhow::ensure!(
         open.root().exists(),
         "{} does not exist",
-        open.root().display()
+        sorrel_io::fsutil::display_path(open.root())
     );
     Ok(())
 }
@@ -1961,6 +1961,8 @@ fn run_status(dir: Option<&Path>, json: bool) -> Result<()> {
             ..Default::default()
         }))
     });
+    // `list_hosts` paths carry no `\\?\` prefix, so compare without it.
+    let canon = |p: &Path| sorrel_io::fsutil::simplified(&canon(p)).to_path_buf();
     let hosts: Vec<_> = sorrel_data::list_hosts()
         .into_iter()
         .filter(|h| want.as_ref().is_none_or(|w| canon(&h.dataset) == *w))

@@ -27,6 +27,29 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 
+- Saving a Kilosort/phy dataset no longer fails on Windows with "user-mapped
+  section" (os error 1224): the provider kept `spike_times.npy` and
+  `spike_clusters.npy` mapped after loading, and the save renames a new
+  `spike_clusters.npy` over it. A cache entry that is still mapped is skipped
+  by eviction and replacement, and retried by the next GC.
+- `join` refuses a host path that is absolute, has a drive (`C:\x`), a
+  backslash, a colon or a `..`, which could write outside the join directory
+  on Windows.
+- A save, export or journal write that Windows refuses because phy, Python or
+  an Explorer preview holds the file now says to close that program and try
+  again.
+- The listener file and `sorrel status` no longer show
+  `\\?\C:\...` paths.
+- The "already open" message names the owning pid on Windows: it is kept in
+  `<journal>.lock.pid`, since the locked `.lock` file cannot be read there.
+- `sorrel auto --llm` on Windows: an npm `.cmd` shim no longer re-parses the
+  system prompt (it goes in a file for `claude`, and opencode gets its prompt as
+  an attached file), and the Anthropic credential check also looks in
+  `~/.config/anthropic`.
+- `share` no longer tries to send the host's journal lock file, which Windows
+  will not let a second handle read.
+- `sorrel-relay` warns on Windows that its key file is not ACL-restricted; the
+  relay is documented as a Linux/macOS server.
 - `sorrel auto --llm` no longer aborts the whole run, losing every paid
   verdict, when one case has no card or one call fails. That case stays in
   review. An existing `evidence.json` is renamed aside on every run.
