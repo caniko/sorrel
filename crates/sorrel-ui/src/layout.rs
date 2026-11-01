@@ -259,9 +259,22 @@ pub struct Detached {
     /// The pane the pointer was last over: what `:max`, `:pop` and
     /// Ctrl+Shift+M act on (Features when no pane was hovered yet).
     pub hovered: Option<TileId>,
+    /// Pop-outs in full screen (F11). The state lives here, not only in the
+    /// window: egui may recreate an immediate viewport's window, and the
+    /// builder passed each frame must then bring it back the same way.
+    pub fullscreen: Vec<Pane>,
 }
 
 impl Detached {
+    /// F11 in `pane`'s pop-out.
+    fn toggle_fullscreen(&mut self, pane: Pane) {
+        if let Some(i) = self.fullscreen.iter().position(|&p| p == pane) {
+            self.fullscreen.remove(i);
+        } else {
+            self.fullscreen.push(pane);
+        }
+    }
+
     fn pane_of(tree: &Tree<Pane>, tile: TileId) -> Option<Pane> {
         match tree.tiles.get(tile) {
             Some(Tile::Pane(p)) => Some(*p),
@@ -315,6 +328,7 @@ impl Detached {
 
     pub fn bring_back(&mut self, pane: Pane) {
         self.popped.retain(|&p| p != pane);
+        self.fullscreen.retain(|&p| p != pane);
     }
 
     /// Forget panes the tree no longer has (closed tab, new layout).
@@ -409,7 +423,8 @@ pub fn show_popouts<P: DataProvider>(
         let id = egui::ViewportId::from_hash_of(("sorrel-popout", dataset, pane));
         let builder = egui::ViewportBuilder::default()
             .with_title(format!("{} — Sorrel", pane.title()))
-            .with_inner_size([900.0, 640.0]);
+            .with_inner_size([900.0, 640.0])
+            .with_fullscreen(b.detached.fullscreen.contains(&pane));
         b.in_popout = true;
         let closed = ctx.show_viewport_immediate(id, builder, |ui, class| {
             if class == egui::ViewportClass::EmbeddedWindow {
@@ -425,7 +440,11 @@ pub fn show_popouts<P: DataProvider>(
                 });
                 return false;
             }
-            toggle_fullscreen_on_f11(ui.ctx());
+            // F11 flips the stored state; the builder above applies it.
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
+                b.detached.toggle_fullscreen(pane);
+                ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+            }
             b.actions.extend(
                 screenshot_events(ui.ctx())
                     .into_iter()
@@ -1400,8 +1419,15 @@ mod tests {
         d.toggle_maximize(&tree, features);
         d.pop_out(&tree, Pane::Features);
         assert_eq!((d.maximized, d.popped.len()), (None, 1));
+        // F11 in a pop-out is remembered per pane (a recreated window comes
+        // back full screen); bringing the pane back forgets it.
+        d.toggle_fullscreen(Pane::Features);
+        assert_eq!(d.fullscreen, [Pane::Features]);
+        d.toggle_fullscreen(Pane::Features);
+        assert!(d.fullscreen.is_empty());
+        d.toggle_fullscreen(Pane::Features);
         d.bring_back(Pane::Features);
-        assert!(d.popped.is_empty());
+        assert!(d.popped.is_empty() && d.fullscreen.is_empty());
         // Closing a tab drops its pop-out and maximize state.
         d.pop_out(&tree, Pane::Ccg);
         d.toggle_maximize(&tree, features);

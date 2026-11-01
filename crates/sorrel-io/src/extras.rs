@@ -86,6 +86,13 @@ pub trait HasPcFeatures: DataProvider {
         Vec::new()
     }
 
+    /// Kilosort 4 `spike_positions.npy` as `[x, y]` µm per *original NPY row*
+    /// (the rows [`Self::spike_pc_indices`] holds). `None` when the file is
+    /// absent, mis-sized or not finite.
+    fn spike_positions(&self) -> Option<&[[f32; 2]]> {
+        None
+    }
+
     /// phylib `spike_reorder.npy`: for each row, the row whose time the
     /// Amplitude and Feature time axes show while reordering is on.
     fn spike_reorder(&self) -> Option<std::sync::Arc<[u32]>> {

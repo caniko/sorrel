@@ -173,6 +173,11 @@ pub struct Session<P: DataProvider> {
     /// durable and before the in-memory state moves. Used to stream records
     /// to a remote host; `None` for ordinary local sessions.
     record_sink: Option<RecordSink>,
+    /// Test-only clock: `SORREL_FIXED_CLOCK_MS`, read once by
+    /// [`Session::new`], is the `ts_ms` of every node this session appends
+    /// (instead of the wall clock), so History rows and UI snapshots are
+    /// reproducible. `None` (the variable unset or not a number) = real time.
+    fixed_clock_ms: Option<u64>,
     /// Test seam: make every forward apply fail.
     #[cfg(test)]
     fail_apply: bool,
@@ -213,6 +218,9 @@ impl<P: DataProvider> Session<P> {
             top_artifacts: None,
             cache_invalidations: VecDeque::new(),
             record_sink: None,
+            fixed_clock_ms: std::env::var("SORREL_FIXED_CLOCK_MS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
             #[cfg(test)]
             fail_apply: false,
         }
@@ -1011,6 +1019,54 @@ impl<P: DataProvider> Session<P> {
         (!out.is_empty()).then_some(out)
     }
 
+    /// The latest node on the head's path that merged into `cluster` (as the
+    /// target, alone or inside a batch): feed it to [`Self::pre_edit_spikes`]
+    /// for the clusters as they were before the merge. `None` when no merge
+    /// on the path targets it.
+    pub fn last_merge_into(&self, cluster: ClusterId) -> Option<u64> {
+        fn hits(cmd: &CurationCommand, c: ClusterId) -> bool {
+            match cmd {
+                CurationCommand::Merge { sources, target } => {
+                    *target == c && sources.iter().any(|s| s != target)
+                }
+                CurationCommand::Batch { children } => children.iter().any(|k| hits(k, c)),
+                _ => false,
+            }
+        }
+        self.path(self.head)
+            .into_iter()
+            .rev()
+            .find(|&n| hits(&self.nodes[n as usize].cmd, cluster))
+    }
+
+    /// The clusters as they were just before the *last* merge into `cluster`
+    /// inside `node` (a lone merge, or the final such child of a batch: an
+    /// earlier child may already have merged into a source, and the pre-state
+    /// of the whole batch would then split those spikes the wrong way).
+    /// `None` when `node` is off the head's path or never merged into it.
+    pub fn pre_merge_spikes(
+        &self,
+        node: u64,
+        cluster: ClusterId,
+    ) -> Option<Vec<(ClusterId, Vec<u32>)>> {
+        fn last<L: Copy>(
+            inv: &InverseOp<L>,
+            c: ClusterId,
+        ) -> Option<&crate::cluster_index::MergeRecord> {
+            match inv {
+                // The record's first snapshot is the target's.
+                InverseOp::Merge { record, .. } => {
+                    (record.memberships().next()?.0 == c).then_some(record)
+                }
+                InverseOp::Batch { inverses } => inverses.iter().rev().find_map(|k| last(k, c)),
+                _ => None,
+            }
+        }
+        let inv = self.nodes.get(node as usize)?.inverse.as_ref()?;
+        let record = last(inv, cluster)?;
+        Some(record.memberships().map(|(c, g)| (c, g.to_vec())).collect())
+    }
+
     /// Whether [`Self::pre_edit_spikes`] has an answer for `node`, without
     /// copying any membership (the History hover asks every frame).
     pub fn has_pre_edit(&self, node: u64) -> bool {
@@ -1270,9 +1326,11 @@ impl<P: DataProvider> Session<P> {
             id,
             parent: self.head,
             actor,
-            ts_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis() as u64),
+            ts_ms: self.fixed_clock_ms.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64)
+            }),
             cmd,
         };
         self.journal.append(&rec)?;
@@ -3028,5 +3086,78 @@ mod tests {
         for n in [batch, merge, 999] {
             assert_eq!(s.has_pre_edit(n), s.pre_edit_spikes(n).is_some());
         }
+    }
+
+    #[test]
+    fn last_merge_into_finds_the_latest_on_path_merge_targeting_the_cluster() {
+        let (mut s, _d) = fresh_session();
+        let (a, b, c) = (ClusterId(0), ClusterId(1), ClusterId(2));
+        let merge = |sources, target| CurationCommand::Merge { sources, target };
+        assert_eq!(s.last_merge_into(b), None);
+        s.dispatch(merge(vec![a], b)).unwrap();
+        let first = s.head().unwrap();
+        assert_eq!(s.last_merge_into(b), Some(first));
+        // A source or an untouched cluster was not merged into.
+        assert_eq!((s.last_merge_into(a), s.last_merge_into(c)), (None, None));
+        // The latest merge wins, also inside a batch.
+        s.dispatch(CurationCommand::Batch {
+            children: vec![
+                CurationCommand::Relabel {
+                    cluster: c,
+                    op: PhyLabelOp::SetGood,
+                },
+                merge(vec![c], b),
+            ],
+        })
+        .unwrap();
+        let second = s.head().unwrap();
+        assert_eq!(s.last_merge_into(b), Some(second));
+        // Undone merges are off the path.
+        s.dispatch(CurationCommand::Undo).unwrap();
+        assert_eq!(s.last_merge_into(b), Some(first));
+        s.dispatch(CurationCommand::Undo).unwrap();
+        assert_eq!(s.last_merge_into(b), None);
+    }
+
+    #[test]
+    fn pre_merge_spikes_is_the_state_just_before_the_last_merge_into_it() {
+        // A batch merges a into b, then b into c. Before the final merge b
+        // already held a's spikes; the pre-state of the whole batch would
+        // list them under a instead.
+        let (mut s, _d) = fresh_session();
+        let (a, b, c) = (ClusterId(0), ClusterId(1), ClusterId(2));
+        let g = |s: &Session<MockProvider>, k| s.cluster_index().global_indices(k).to_vec();
+        let (ga, gb, gc) = (g(&s, a), g(&s, b), g(&s, c));
+        let merge = |sources, target| CurationCommand::Merge { sources, target };
+        s.dispatch(CurationCommand::Batch {
+            children: vec![merge(vec![a], b), merge(vec![b], c)],
+        })
+        .unwrap();
+        let node = s.last_merge_into(c).unwrap();
+        let mut b_before: Vec<u32> = ga.iter().chain(&gb).copied().collect();
+        b_before.sort_unstable();
+        let pre = s.pre_merge_spikes(node, c).unwrap();
+        let of = |k| {
+            let mut v = pre.iter().find(|(x, _)| *x == k).unwrap().1.clone();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(pre[0].0, c, "target first");
+        assert_eq!(of(c), gc);
+        assert_eq!(of(b), b_before, "b already holds a's spikes");
+        assert!(
+            pre.iter().all(|(k, _)| *k != a),
+            "a is not a source of that merge"
+        );
+        // Each spike once.
+        let mut all: Vec<u32> = pre.iter().flat_map(|(_, v)| v.clone()).collect();
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n);
+        // Not a merge target here, or off the path: no answer.
+        assert!(s.pre_merge_spikes(node, a).is_none());
+        s.dispatch(CurationCommand::Undo).unwrap();
+        assert!(s.pre_merge_spikes(node, c).is_none());
     }
 }

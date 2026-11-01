@@ -2243,11 +2243,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     .map(|c| session.spike_times(c).len() as f32 / duration)
                     .collect();
                 let depth: Vec<f32> = ids
-                    .map(|c| {
-                        let d = depths.and_then(|d| d.per_cluster.get(c.idx()));
-                        d.filter(|d| !d.is_empty())
-                            .map_or(f32::NAN, |d| d.iter().sum::<f32>() / d.len() as f32)
-                    })
+                    .map(|c| depths.and_then(|d| d.cluster_mean(c)).unwrap_or(f32::NAN))
                     .collect();
                 let colours = crate::theme::scheme_colours(self.scheme, &groups, &depth, &fr);
                 self.scheme_gen += 1;

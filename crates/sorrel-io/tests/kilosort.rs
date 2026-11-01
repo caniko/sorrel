@@ -862,3 +862,43 @@ fn sparse_templates_are_densified_via_template_ind() {
         &[2., 0., 1., 4., 0., 3., 0., 13., 0., 0., 19., 0.]
     );
 }
+
+#[test]
+fn spike_positions_load_f32_and_f64_and_ignore_a_bad_row_count() {
+    use sorrel_io::HasPcFeatures;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_full_phy_fixture(root);
+    let open = || KilosortProvider::open(root, KilosortOpenParams::default()).unwrap();
+    let path = root.join("spike_positions.npy");
+    let xy = |n: usize| (0..n).map(|i| [i as f64, 10.0 * i as f64 + 0.5]);
+    let bytes32 = |n| -> Vec<u8> {
+        xy(n)
+            .flatten()
+            .flat_map(|v| (v as f32).to_le_bytes())
+            .collect()
+    };
+    let bytes64 = |n| -> Vec<u8> { xy(n).flatten().flat_map(|v| v.to_le_bytes()).collect() };
+
+    assert!(open().spike_positions().is_none());
+    let want: Vec<[f32; 2]> = xy(6).map(|[x, y]| [x as f32, y as f32]).collect();
+    write_npy_v1_2d(&path, "<f4", 6, 2, &bytes32(6));
+    assert_eq!(open().spike_positions(), Some(&want[..]));
+    write_npy_v1_2d(&path, "<f8", 6, 2, &bytes64(6));
+    assert_eq!(open().spike_positions(), Some(&want[..]));
+
+    // Wrong row count, wrong width, or nothing finite: ignored, no error.
+    write_npy_v1_2d(&path, "<f4", 5, 2, &bytes32(5));
+    assert!(open().spike_positions().is_none());
+    write_npy_v1_2d(&path, "<f4", 3, 4, &bytes32(6)[..48]);
+    assert!(open().spike_positions().is_none());
+    let all_nan: Vec<u8> = (0..12).flat_map(|_| f32::NAN.to_le_bytes()).collect();
+    write_npy_v1_2d(&path, "<f4", 6, 2, &all_nan);
+    assert!(open().spike_positions().is_none());
+    // A NaN row is one spike without a position, not a broken file.
+    let mut nan = bytes32(6);
+    nan[..4].copy_from_slice(&f32::NAN.to_le_bytes());
+    write_npy_v1_2d(&path, "<f4", 6, 2, &nan);
+    let got = open().spike_positions().unwrap().to_vec();
+    assert!(got[0][0].is_nan() && got[1..] == want[1..]);
+}

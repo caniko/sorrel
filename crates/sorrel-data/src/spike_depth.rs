@@ -2,6 +2,10 @@
 //!
 //! Sources, best first:
 //!
+//! 0. **`spike_positions.npy`** (Kilosort 4): the sorter's own `[x, y]` µm
+//!    per spike; `y` is the depth and `x` is exposed alongside
+//!    ([`SpikeDepths::x`]). Spikes without a row (added by `add_spikes`)
+//!    fall through to the sources below.
 //! 1. **PC-weighted centre of mass**: Kilosort's first principal component
 //!    per channel is a signed projection of the spike on the template's
 //!    channels; `max(pc0, 0)²` weights over those channels' `y` positions
@@ -10,15 +14,16 @@
 //! 2. **Template peak channel** (`y` of the channel with the largest
 //!    peak-to-peak in the template): coarse, one value per template.
 //!
-//! `spike_positions.npy` (Kilosort 4) would be a third source; it is not
-//! read yet. Neither NWB nor SortingAnalyzer carry PC features today, so
-//! they get the template fallback or `None`.
+//! Neither NWB nor SortingAnalyzer carry PC features or spike positions
+//! today, so they get the template fallback or `None`.
 
 use crate::session::Session;
 use sorrel_io::{ClusterId, DataProvider, HasGeometry, HasPcFeatures};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DepthSource {
+    /// Kilosort 4 `spike_positions.npy` (y is the depth).
+    SpikePositions,
     PcWeighted,
     TemplatePeak,
 }
@@ -28,9 +33,26 @@ pub struct SpikeDepths {
     /// `per_cluster[c][i]` is the depth (µm) of the i-th time-sorted spike
     /// of cluster `c`, parallel to `Session::spike_times(c)`.
     pub per_cluster: Vec<Vec<f32>>,
+    /// `x[c][i]` is the x (µm) of the same spike, NaN where it has none;
+    /// `Some` only for [`DepthSource::SpikePositions`].
+    pub x: Option<Vec<Vec<f32>>>,
     pub source: DepthSource,
     pub min: f32,
     pub max: f32,
+}
+
+impl SpikeDepths {
+    /// Mean depth of `cluster` over the spikes that have one (a spike with
+    /// no position and no fallback is NaN); `None` when none has.
+    pub fn cluster_mean(&self, cluster: ClusterId) -> Option<f32> {
+        let (sum, n) = self
+            .per_cluster
+            .get(cluster.idx())?
+            .iter()
+            .filter(|v| v.is_finite())
+            .fold((0.0f64, 0usize), |(s, n), &v| (s + v as f64, n + 1));
+        (n > 0).then(|| (sum / n as f64) as f32)
+    }
 }
 
 /// Centre of mass of `channel_y` weighted by `max(pc0, 0)²`; `None` when no
@@ -52,20 +74,24 @@ pub fn pc_weighted_depth(
     (den > 0.0).then(|| num / den)
 }
 
-/// Depth per spike for every cluster, or `None` when neither PC features
-/// nor templates with geometry are available.
+/// Depth per spike for every cluster, or `None` when no spike positions, PC
+/// features or templates with geometry are available.
 pub fn spike_depths<P>(session: &Session<P>) -> Option<SpikeDepths>
 where
     P: DataProvider + HasPcFeatures + HasGeometry,
 {
     let positions = session.provider.channel_positions();
-    if positions.is_empty() {
+    let spike_xy = session.provider.spike_positions();
+    if positions.is_empty() && spike_xy.is_none() {
         return None;
     }
     let y = |ch: u32| positions.get(ch as usize).map(|p| p[1]).unwrap_or(0.0);
     let (n_pcs, n_ch_tpl) = session.pc_shape();
     let pc_ind = session.provider.pc_feature_ind();
-    let has_pcs = n_pcs > 0 && n_ch_tpl > 0 && !pc_ind.is_empty();
+    // The PC and template estimates need channel geometry: without it every
+    // channel would read depth 0, so a spike with no position stays NaN.
+    let geometry = !positions.is_empty();
+    let has_pcs = geometry && n_pcs > 0 && n_ch_tpl > 0 && !pc_ind.is_empty();
 
     // Template peak-channel depth, computed once per template on demand.
     let (n_templates, n_samples, n_chan) = session.template_shape();
@@ -87,7 +113,7 @@ where
         }
         *slot
     };
-    if !has_pcs && n_templates == 0 {
+    if !has_pcs && n_templates == 0 && spike_xy.is_none() {
         return None;
     }
 
@@ -97,11 +123,32 @@ where
     let mut per_cluster: Vec<Vec<f32>> = (0..session.n_clusters())
         .map(|c| Vec::with_capacity(session.spike_times(ClusterId(c)).len()))
         .collect();
-    let mut any_pc = false;
+    let mut x_per_cluster = vec![Vec::new(); per_cluster.len()];
+    let rows = session.cluster_index().spike_pc_indices();
+    let (mut any_sp, mut any_pc) = (false, false);
     let (mut min, mut max) = (f32::MAX, f32::MIN);
     for (g, &c) in clusters.iter().enumerate() {
         let local = per_cluster[c.idx()].len();
         let template = session.spike_templates(c).get(local).copied();
+        // `rows[g]` is the spike's original NPY row, the index into
+        // `spike_positions`; rows added by `add_spikes` lie past its end.
+        // An added spike lies past the file's rows; the generic `positions`
+        // spike attribute (the same file) holds what the rescue predicted.
+        // Only for a row past the file, and only when the file itself was
+        // valid (`spike_xy`): a malformed file still loads as an attribute.
+        let row = rows.get(g).and_then(|r| r.get()).map(|r| r as usize);
+        let from_sp = spike_xy
+            .and_then(|xy| match row {
+                Some(r) if r < xy.len() => xy.get(r).copied(),
+                _ => {
+                    let a = session
+                        .cluster_index()
+                        .spike_attribute("positions", g as u32)?;
+                    (a.len() == 2).then(|| [a[0], a[1]])
+                }
+            })
+            .filter(|p| p.iter().all(|v| v.is_finite()));
+        any_sp |= from_sp.is_some();
         let from_pc = if has_pcs {
             template.and_then(|t| {
                 let pcs = session.pc_feature_for(g as u32)?;
@@ -112,21 +159,29 @@ where
             None
         };
         any_pc |= from_pc.is_some();
-        let d = from_pc
-            .or_else(|| template.and_then(&mut template_depth))
+        let d = from_sp
+            .map(|p| p[1])
+            .or(from_pc)
+            .or_else(|| template.filter(|_| geometry).and_then(&mut template_depth))
             .unwrap_or(f32::NAN);
         if d.is_finite() {
             min = min.min(d);
             max = max.max(d);
         }
         per_cluster[c.idx()].push(d);
+        if spike_xy.is_some() {
+            x_per_cluster[c.idx()].push(from_sp.map_or(f32::NAN, |p| p[0]));
+        }
     }
     if min > max {
         return None;
     }
     Some(SpikeDepths {
         per_cluster,
-        source: if any_pc {
+        x: any_sp.then_some(x_per_cluster),
+        source: if any_sp {
+            DepthSource::SpikePositions
+        } else if any_pc {
             DepthSource::PcWeighted
         } else {
             DepthSource::TemplatePeak

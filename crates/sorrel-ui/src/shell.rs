@@ -377,6 +377,15 @@ impl eframe::App for Shell {
     // Also runs while the window is hidden, so `sorrel open` still lands.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_instance(ctx);
+        // eframe skips `ui` while the main window is hidden (minimized, or
+        // covered by a full-screen pop-out), and egui closes any immediate
+        // viewport not shown that frame: the pop-out window was destroyed and
+        // recreated. Keep every tab's pop-outs alive from here instead.
+        if !ctx.input(|i| i.viewport().visible().unwrap_or(true)) {
+            for tab in &mut self.tabs {
+                tab.popouts(ctx);
+            }
+        }
     }
 
     fn ui(&mut self, root_ui: &mut egui::Ui, frame: &mut eframe::Frame) {

@@ -9,7 +9,8 @@
 //!   leaves only the third axis to choose;
 //! * a convex hull per selected cluster: filled for sorter-made (`Auto`)
 //!   units, wireframe for Sorrel-made ones;
-//! * the pre-split parent of a split child as a dashed grey hull;
+//! * the pre-split parent of a split child as a dashed grey hull and the sources of a merged
+//!   unit as dashed grey hulls;
 //! * brushes: brushed spikes in ink, the hovered spike ringed (and picked
 //!   from here), spikes outside the time brush faded; a merge candidate
 //!   previewed from Similar and a history node's "before #n" clusters as
@@ -167,6 +168,8 @@ struct Built {
     bg: Arc<Scene3d>,
     /// Brushed spikes, drawn last and a little bigger.
     ink: Arc<Scene3d>,
+    /// Legend text of the dashed "before" hulls; `None` when there are none.
+    before: Option<String>,
 }
 
 static GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -185,27 +188,27 @@ impl View3dState {
 }
 
 /// `set` with a pseudo channel last whose PC1 is spike depth (µm) and whose PC2
-/// is unused (NaN: no provider exposes spike x positions yet), so the space
-/// axes are ordinary dims of the triples. `selection` maps the points' slots
-/// to clusters. Background points have no depth (NaN): they drop out of any
-/// triple holding it.
-// ponytail: depth only; a spike_positions x would fill the PC2 column and
-// `dead_dim` goes away.
+/// is spike x (µm; NaN when the data has no `spike_positions.npy`), so the
+/// space axes are ordinary dims of the triples. `selection` maps the points'
+/// slots to clusters. Background points have no depth (NaN): they drop out of
+/// any triple holding it.
 fn with_space(set: &FeatureSet, selection: &[ClusterId], depths: &SpikeDepths) -> FeatureSet {
     let n = set.n();
     let mut feats = Vec::with_capacity(set.points.len() * 2 * (n + 1));
     for (i, p) in set.points.iter().enumerate() {
-        let depth = selection
-            .get(p.slot as usize)
-            .and_then(|c| depths.per_cluster.get(c.idx()))
-            .and_then(|d| d.get(p.local as usize))
-            .copied()
-            .unwrap_or(f32::NAN);
+        let at = |v: &[Vec<f32>]| {
+            selection
+                .get(p.slot as usize)
+                .and_then(|c| v.get(c.idx()))
+                .and_then(|d| d.get(p.local as usize))
+                .copied()
+                .unwrap_or(f32::NAN)
+        };
         let row = set.row(i);
         feats.extend_from_slice(&row[..n]);
-        feats.push(depth);
+        feats.push(at(&depths.per_cluster));
         feats.extend_from_slice(&row[n..]);
-        feats.push(f32::NAN);
+        feats.push(depths.x.as_deref().map_or(f32::NAN, at));
     }
     let channels = set.channels.iter().copied().chain([SPACE_CH]).collect();
     FeatureSet::new(
@@ -218,7 +221,7 @@ fn with_space(set: &FeatureSet, selection: &[ClusterId], depths: &SpikeDepths) -
     )
 }
 
-/// The space dims of `set`: `(depth, unused x)`.
+/// The space dims of `set`: `(depth, x)`.
 fn space_dims(set: &FeatureSet) -> Option<(Dim, Dim)> {
     let ch = (set.channels.last() == Some(&SPACE_CH)).then(|| (set.n() - 1) as u8)?;
     Some((Dim::Pc { ch, pc: 0 }, Dim::Pc { ch, pc: 1 }))
@@ -267,9 +270,11 @@ fn scene_pos(set: &FeatureSet, from: &FeatureSet, t: Triple, i: usize) -> Option
 }
 
 /// The triples of `set`: every choice of three of its dims except those with
-/// a dim that holds no data (the space family's x).
+/// a dim that holds no data (the space family's x without `spike_positions.npy`).
 fn set_triples(set: &FeatureSet) -> Vec<Triple> {
-    let dead = space_dims(set).map(|(_, x)| set.dim_idx(x));
+    let dead = space_dims(set)
+        .filter(|&(_, x)| !(0..set.points.len()).any(|i| set.value(i, x).is_finite()))
+        .map(|(_, x)| set.dim_idx(x));
     let mut all = triples(set.n_dims());
     all.retain(|t| dead.is_none_or(|d| !t.contains(&d)));
     all
@@ -688,6 +693,29 @@ fn build_scene(inp: &SceneInput) -> (Scene3d, Scene3d, Scene3d) {
     )
 }
 
+/// For each pre-edit cluster of `pre` (global spike indices), the indices of
+/// `set`'s points holding those spikes. `globals[slot]` is the global spike
+/// index of each local spike of the set's selection slot `slot`.
+fn before_points(
+    set: &FeatureSet,
+    globals: &[&[u32]],
+    pre: &[(ClusterId, Vec<u32>)],
+) -> Vec<Vec<usize>> {
+    let mut at: HashMap<u32, usize> = HashMap::new();
+    for (i, p) in set.points.iter().enumerate() {
+        let Some(&g) = globals
+            .get(p.slot as usize)
+            .and_then(|g| g.get(p.local as usize))
+        else {
+            continue; // background
+        };
+        at.insert(g, i);
+    }
+    pre.iter()
+        .map(|(_, gs)| gs.iter().filter_map(|g| at.get(g).copied()).collect())
+        .collect()
+}
+
 fn hash_overlay(h: &mut impl Hasher, overlay: &Overlay, set: &FeatureSet) {
     overlay.km_part.hash(h);
     if let Some((dx, dy, poly)) = overlay.lasso {
@@ -728,6 +756,7 @@ fn short_label(set: &FeatureSet, t: Triple) -> String {
     t.map(|d| match set.dim(d) {
         Dim::Time => "t".to_owned(),
         _ if space_dims(set).is_some_and(|s| s.0 == set.dim(d)) => "depth".to_owned(),
+        _ if space_dims(set).is_some_and(|s| s.1 == set.dim(d)) => "x".to_owned(),
         Dim::Pc { ch, pc } => format!("{}·{}", set.channels[ch as usize], pc + 1),
     })
     .join("  ")
@@ -832,11 +861,12 @@ pub(crate) fn feature_3d<P: DataProvider>(
     let mut parents: Vec<(ClusterId, Vec<ClusterId>)> = Vec::new();
     for &c in selection {
         let &[parent] = session.parents(c) else {
-            // ponytail: a merged unit has several parents; its pre-merge
-            // hulls come from the History hover ("before #n"), not here.
-            continue;
+            continue; // merged units draw "before merge" hulls below
         };
-        if matches!(session.origin(c), UnitOrigin::Auto) || parents.iter().any(|p| p.0 == parent) {
+        if matches!(session.origin(c), UnitOrigin::Auto)
+            || session.last_merge_into(c).is_some()
+            || parents.iter().any(|p| p.0 == parent)
+        {
             continue;
         }
         // Before the split: the children and what the parent kept.
@@ -894,30 +924,22 @@ pub(crate) fn feature_3d<P: DataProvider>(
         }
         _ => None,
     };
-    // A history node's clusters before it: the shown points of each, by
-    // global spike index.
-    let history = match brushes.ghost {
-        Some(Ghost::History(n)) => session.pre_edit_spikes(n).map(|b| (n, b)),
-        _ => None,
-    };
-    let before: Vec<Vec<usize>> = history.as_ref().map_or_else(Vec::new, |(_, b)| {
-        let mut at: HashMap<u32, usize> = HashMap::new();
-        for (i, p) in set.points.iter().enumerate() {
-            let Some(&c) = selection.get(p.slot as usize) else {
-                continue; // background
-            };
-            if let Some(&g) = session
-                .cluster_index()
-                .global_indices(c)
-                .get(p.local as usize)
-            {
-                at.insert(g, i);
-            }
+    // The nodes whose pre-edit clusters are drawn as dashed hulls: the
+    // hovered History row, else the latest merge into each selected unit.
+    // A merge node is paired with its target: in a batch the hull is the
+    // state just before the last merge into that unit, not before the batch.
+    let (hist_nodes, hist_is_merge): (Vec<(u64, Option<ClusterId>)>, bool) = match brushes.ghost {
+        Some(Ghost::History(n)) => (vec![(n, None)], false),
+        _ => {
+            let mut v: Vec<(u64, Option<ClusterId>)> = selection
+                .iter()
+                .filter_map(|&c| Some((session.last_merge_into(c)?, Some(c))))
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            (v, true)
         }
-        b.iter()
-            .map(|(_, globals)| globals.iter().filter_map(|g| at.get(g).copied()).collect())
-            .collect()
-    });
+    };
 
     // Scene, rebuilt only when what it shows changes.
     let dark = theme.dark;
@@ -939,7 +961,7 @@ pub(crate) fn feature_3d<P: DataProvider>(
     merge_ghost
         .iter()
         .for_each(|(c, g)| (c, g.generation).hash(&mut h));
-    history.as_ref().map(|(n, _)| n).hash(&mut h);
+    hist_nodes.hash(&mut h);
     hash_brushes(&mut h, brushes);
     let scene_key = h.finish();
     if state.scene.as_ref().is_none_or(|b| b.key != scene_key) {
@@ -965,6 +987,35 @@ pub(crate) fn feature_3d<P: DataProvider>(
             .map(|(sel, _, g)| with(sel, g))
             .chain(merge_ghost.iter().map(|(c, g)| with(&[*c], g)))
             .collect();
+        // The shown points of each pre-edit cluster, copied only on a rebuild.
+        let pre: Vec<(ClusterId, Vec<u32>)> = {
+            let mut v: Vec<(ClusterId, Vec<u32>)> = Vec::new();
+            for b in hist_nodes
+                .iter()
+                .filter_map(|&(n, into)| match into {
+                    Some(c) => session.pre_merge_spikes(n, c),
+                    None => session.pre_edit_spikes(n),
+                })
+                .flatten()
+            {
+                if !v.iter().any(|(c, _)| *c == b.0) {
+                    v.push(b);
+                }
+            }
+            v
+        };
+        let globals: Vec<&[u32]> = selection
+            .iter()
+            .map(|&c| session.cluster_index().global_indices(c))
+            .collect();
+        let before = before_points(set, &globals, &pre);
+        let before_label = (!pre.is_empty()).then(|| match (hist_is_merge, hist_nodes.first()) {
+            (false, Some((n, _))) => format!("before #{n}"),
+            _ => {
+                let names: Vec<String> = pre.iter().map(|(c, _)| format!("c{}", c.0)).collect();
+                format!("before merge ({})", names.join(" + "))
+            }
+        });
         let (fg, bg, ink) = build_scene(&SceneInput {
             set,
             triple,
@@ -985,6 +1036,7 @@ pub(crate) fn feature_3d<P: DataProvider>(
             fg: Arc::new(fg),
             bg: Arc::new(bg),
             ink: Arc::new(ink),
+            before: before_label,
         });
     }
 
@@ -1018,8 +1070,8 @@ pub(crate) fn feature_3d<P: DataProvider>(
             format!("ghost c{}", c.0),
         ));
     }
-    if let Some((n, _)) = history.as_ref().filter(|_| !before.is_empty()) {
-        legend.push((Swatch::Dashed(visuals.text_color()), format!("before #{n}")));
+    if let Some(text) = state.scene.as_ref().and_then(|b| b.before.clone()) {
+        legend.push((Swatch::Dashed(visuals.text_color()), text));
     }
     if let Some(b) = &brushes.spikes {
         legend.push((
@@ -1772,6 +1824,7 @@ mod tests {
         let per = |base: f32| (0..80).map(|i| base + i as f32 * 0.1).collect();
         let depths = SpikeDepths {
             per_cluster: vec![per(100.0), per(500.0)],
+            x: None,
             source: sorrel_data::DepthSource::PcWeighted,
             min: 100.0,
             max: 508.0,
@@ -1812,6 +1865,79 @@ mod tests {
         // Without depths the set is untouched.
         assert!(space_dims(&set).is_none());
         assert_eq!(set_triples(&set).len(), 10);
+    }
+
+    #[test]
+    fn spike_x_joins_the_triples_next_to_depth() {
+        let (set, mut depths) = with_locals_and_depths(2, &[]);
+        let per = |base: f32| (0..80).map(|i| base - i as f32 * 0.5).collect();
+        depths.x = Some(vec![per(10.0), per(60.0)]);
+        let ext = with_space(&set, &[ClusterId(0), ClusterId(1)], &depths);
+        let (_, x) = space_dims(&ext).unwrap();
+        assert_eq!(ext.value(3, x), 10.0 - 3.0 * 0.5);
+        // Every triple is offered, including those with x: C(7, 3).
+        let xi = ext.dim_idx(x);
+        let all = scored(&ext, Source::Clusters);
+        assert_eq!(all.len(), 35);
+        assert!(all.iter().any(|(t, _)| t.contains(&xi)));
+        assert!(all.iter().all(|s| s.1.is_finite()));
+        // x is the best axis next to depth here, so the top triple has it.
+        assert!(all[0].0.contains(&xi), "{:?}", all[0]);
+    }
+
+    #[test]
+    fn pre_merge_hulls_cover_the_shown_points_of_each_source() {
+        let (set, _) = with_locals_and_depths(2, &[0, 1]);
+        // Slot 0 holds global spikes 0..80, slot 1 holds 100..180.
+        let (g0, g1): (Vec<u32>, Vec<u32>) = ((0..80).collect(), (100..180).collect());
+        let globals = [&g0[..], &g1[..]];
+        // Before the merge: c8 held spikes 0..40 and c9 held 100..140 plus a
+        // spike (999) the view does not show.
+        let mut c9: Vec<u32> = (100..140).collect();
+        c9.push(999);
+        let pre = [(ClusterId(8), (0..40).collect()), (ClusterId(9), c9)];
+        let before = before_points(&set, &globals, &pre);
+        assert_eq!(before.iter().map(Vec::len).collect::<Vec<_>>(), [40, 40]);
+        assert!(before[0].iter().all(|&i| set.points[i].slot == 0));
+        assert!(before[1].iter().all(|&i| set.points[i].slot == 1));
+        // Each source adds a dashed hull to the scene; the points stay put.
+        let style = || Style {
+            colour: Color32::RED,
+            filled: true,
+        };
+        let styles = [style(), style()];
+        let palette = Palette {
+            cube: Color32::GRAY,
+            ghost: Color32::GRAY,
+            strong: Color32::WHITE,
+            accent: Color32::LIGHT_BLUE,
+            part: Color32::WHITE,
+            dark: true,
+        };
+        let overlay = Overlay {
+            km_part: None,
+            lasso: None,
+            km_parts: None,
+            focus: (Dim::Time, Dim::Time),
+        };
+        let scene = |before: &[Vec<usize>]| {
+            build_scene(&SceneInput {
+                set: &set,
+                triple: [1, 2, 3],
+                styles: &styles,
+                ghosts: &[],
+                overlay: &overlay,
+                palette: &palette,
+                brush: BrushInput {
+                    before,
+                    ..Default::default()
+                },
+            })
+            .0
+        };
+        let (plain, hulled) = (scene(&[]), scene(&before));
+        assert_eq!(plain.points.len(), hulled.points.len());
+        assert!(hulled.lines.len() > plain.lines.len());
     }
 
     #[test]

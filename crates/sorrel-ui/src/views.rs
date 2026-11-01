@@ -1303,6 +1303,21 @@ pub(crate) fn probe_site_edit(
 }
 
 #[cfg(test)]
+mod ols_tests {
+    use super::ols;
+
+    #[test]
+    fn a_missing_depth_does_not_poison_the_drift_line() {
+        // y = 2x + 1 with one NaN depth: the caller filters it, the fit holds.
+        let pts = [(0.0, 1.0), (1.0, f64::NAN), (2.0, 5.0), (3.0, 7.0)];
+        let (m, b) = ols(pts.into_iter().filter(|p| p.1.is_finite())).unwrap();
+        assert!((m - 2.0).abs() < 1e-9 && (b - 1.0).abs() < 1e-9);
+        assert!(ols([(1.0, 1.0), (1.0, 2.0), (1.0, 3.0)].into_iter()).is_none());
+        assert!(ols([(0.0, 1.0), (1.0, 2.0)].into_iter()).is_none());
+    }
+}
+
+#[cfg(test)]
 mod rate_tests {
     use super::rate_counts;
     use crate::brush::TimeBrush;
@@ -2382,6 +2397,23 @@ pub(crate) fn score_cell(ui: &mut Ui, theme: &Theme, s: f32, bold: bool, tip: St
 
 // ---- DriftMapView (amp vs time scatter colour-coded by density) ---------
 
+/// Least-squares `(slope, intercept)` of `y` on `x`; `None` under three
+/// points or with no spread in `x`.
+fn ols(pts: impl Iterator<Item = (f64, f64)>) -> Option<(f64, f64)> {
+    let pts: Vec<(f64, f64)> = pts.collect();
+    if pts.len() < 3 {
+        return None;
+    }
+    let n = pts.len() as f64;
+    let (mx, my) = pts
+        .iter()
+        .fold((0.0, 0.0), |(a, b), (x, y)| (a + x / n, b + y / n));
+    let (num, den) = pts.iter().fold((0.0, 0.0), |(num, den), (x, y)| {
+        (num + (x - mx) * (y - my), den + (x - mx) * (x - mx))
+    });
+    (den > 0.0).then(|| (num / den, my - num / den * mx))
+}
+
 /// Per-spike amplitude (y) vs spike time (x) scatter, with point density
 /// reflected in alpha. The single most useful drift diagnostic in phylib —
 /// a healthy cluster paints a flat horizontal cloud; a drifting cluster
@@ -2410,6 +2442,7 @@ pub fn drift_map_view<P: DataProvider>(
         }
     };
     let (y_unit, y_name) = match depths.map(|d| d.source) {
+        Some(DepthSource::SpikePositions) => (" µm", "depth (spike_positions.npy)"),
         Some(DepthSource::PcWeighted) => (" µm", "depth (PC-weighted)"),
         Some(DepthSource::TemplatePeak) => (" µm", "depth (template peak)"),
         None => (" amp", "amplitude"),
@@ -2501,28 +2534,16 @@ pub fn drift_map_view<P: DataProvider>(
             continue;
         }
         let colour = selection_colour(slot);
-        let n = times.len().min(amps.len());
-        // OLS regression line on (t, a). cheap.
-        let nf = n as f64;
-        let mean_t: f64 = times[..n]
+        // OLS regression line on (t, a) over the spikes that have a value
+        // (a spike without a depth is NaN and would make the line NaN).
+        let Some((slope, intercept)) = ols(times
             .iter()
-            .map(|&t| t.as_f64() * inv_sr as f64)
-            .sum::<f64>()
-            / nf;
-        let mean_a: f64 = amps[..n].iter().map(|&a| a as f64).sum::<f64>() / nf;
-        let mut num = 0.0_f64;
-        let mut denom = 0.0_f64;
-        for i in 0..n {
-            let dt = times[i].as_f64() * inv_sr as f64 - mean_t;
-            let da = amps[i] as f64 - mean_a;
-            num += dt * da;
-            denom += dt * dt;
-        }
-        if denom <= 0.0 {
+            .zip(amps)
+            .filter(|(_, a)| a.is_finite())
+            .map(|(t, &a)| (t.as_f64() * inv_sr as f64, a as f64)))
+        else {
             continue;
-        }
-        let slope = num / denom;
-        let intercept = mean_a - slope * mean_t;
+        };
         let predict = |t: f64| (slope * t + intercept) as f32;
         let xy = |t: f32, a: f32| {
             egui::pos2(

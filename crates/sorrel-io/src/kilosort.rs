@@ -95,6 +95,8 @@ pub struct KilosortProvider {
     /// phylib spike attributes and `spike_reorder.npy`.
     spike_attributes: Vec<(String, std::sync::Arc<[f32]>, usize)>,
     spike_reorder: Option<std::sync::Arc<[u32]>>,
+    /// `spike_positions.npy` `[x, y]` µm per original NPY row.
+    spike_positions: Option<Vec<[f32; 2]>>,
     /// Per-cluster, time-sorted, original NPY row indices into pc_features.
     /// Doubles as the row index into `amplitudes.npy`/`spike_times.npy`/etc.
     pc_indices_per_cluster: Vec<Vec<u32>>,
@@ -296,6 +298,7 @@ impl KilosortProvider {
         let (pc_features, pc_shape, pc_feature_ind) = read_optional_pc_features(&view, n_spikes)?;
         let template_features = read_optional_template_features(&view, n_spikes)?;
         let spike_attributes = read_spike_attributes(&view, n_spikes);
+        let spike_positions = read_spike_positions(&view.path("spike_positions.npy"), n_spikes);
         let spike_reorder = read_1d_u32(&view.path("spike_reorder.npy"))
             .ok()
             .filter(|r| r.len() == n_spikes && r.iter().all(|&i| (i as usize) < n_spikes))
@@ -443,6 +446,7 @@ impl KilosortProvider {
             template_features,
             spike_attributes,
             spike_reorder,
+            spike_positions,
             pc_indices_per_cluster,
             template_waveforms: template_waveforms.into(),
             template_shape,
@@ -659,6 +663,9 @@ impl HasPcFeatures for KilosortProvider {
     }
     fn spike_reorder(&self) -> Option<std::sync::Arc<[u32]>> {
         self.spike_reorder.clone()
+    }
+    fn spike_positions(&self) -> Option<&[[f32; 2]]> {
+        self.spike_positions.as_deref()
     }
 }
 
@@ -966,6 +973,28 @@ fn read_optional_pc_features(view: &RootView, n_spikes: usize) -> Result<PcFeatu
     }
 
     Ok((flat, (n_pcs, n_chans_per_template), ind_flat))
+}
+
+/// Kilosort 4 `spike_positions.npy`: `(n_spikes, 2)` `[x, y]` µm. A missing
+/// file is silent; an unreadable or mis-sized one is ignored with a warning
+/// (depth then falls back to the PCs or templates). Non-finite rows are kept:
+/// a save after a rescue writes NaN for the added spikes, which have no
+/// position, and depth falls back per spike.
+fn read_spike_positions(path: &Path, n_spikes: usize) -> Option<Vec<[f32; 2]>> {
+    if !path.exists() {
+        return None;
+    }
+    let (flat, (rows, cols)) = read_2d_f32(path)
+        .map_err(|e| log::warn!("{}: {e}", path.display()))
+        .ok()?;
+    if rows != n_spikes || cols != 2 || !flat.iter().any(|v| v.is_finite()) {
+        log::warn!(
+            "{}: need ({n_spikes}, 2) values with some finite, got ({rows}, {cols}); ignored",
+            path.display()
+        );
+        return None;
+    }
+    Some(flat.as_chunks::<2>().0.to_vec())
 }
 
 /// Read a `(N, 2)` channel_positions array if the file exists.
