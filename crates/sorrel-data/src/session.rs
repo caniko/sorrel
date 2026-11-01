@@ -1497,6 +1497,9 @@ impl<P: DataProvider> Session<P> {
                 self.swap_tags(child, inherited);
                 set_slot(&mut self.origins, child, UnitOrigin::Sorrel(by.clone()));
                 set_slot(&mut self.parents, child, vec![*cluster]);
+                // A label slot for the child, unsorted until reviewed: without one
+                // `label(child)` is `None`, so the unit is neither listed nor saved.
+                set_slot(&mut self.labels, child, P::Label::default());
                 set_slot(&mut self.notes, child, String::new());
                 if *self.origin(*cluster) == UnitOrigin::Auto {
                     let mut marked = parent_tags.clone();
@@ -1561,6 +1564,7 @@ impl<P: DataProvider> Session<P> {
                 self.swap_tags(child, Vec::new());
                 set_slot(&mut self.origins, child, UnitOrigin::Auto);
                 set_slot(&mut self.parents, child, Vec::new());
+                self.labels.truncate(child.idx());
                 set_slot(&mut self.notes, child, String::new());
                 self.swap_tags(record.source, parent_tags);
                 self.cluster_index.unsplit(record);
@@ -2027,6 +2031,9 @@ mod tests {
             &[SampleIndex(10), SampleIndex(150)]
         );
         assert_eq!(s.spike_times(ClusterId(n_before)), &[SampleIndex(30)]);
+        // The child has a label slot, so it is listed and saved.
+        assert_eq!(s.labels().len() as u32, s.n_clusters());
+        assert_eq!(s.label(ClusterId(n_before)), Some(MockLabel::Unsorted));
     }
 
     #[test]
@@ -2043,6 +2050,7 @@ mod tests {
         .unwrap();
         s.dispatch(CurationCommand::Undo).unwrap();
         assert_eq!(s.n_clusters(), n_before);
+        assert_eq!(s.labels().len() as u32, n_before);
         assert_eq!(s.spike_times(ClusterId(0)), &pre[..]);
     }
 

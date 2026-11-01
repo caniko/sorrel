@@ -27,6 +27,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 
+- A cluster made by a split now shows up in `list_clusters`, can be relabelled
+  and is written to `cluster_group.tsv`, live, after `save` and after a
+  reopen. It had no label slot, so everything that reads labels skipped it.
+- `sorrel share`/`join` work in the Windows binary: GNU ld dropped the piying
+  handler registrations (`hello: unknown message 'sorrel/hello/1'`). The
+  Windows build now links with `--no-gc-sections`.
 - Saving a Kilosort/phy dataset no longer fails on Windows with "user-mapped
   section" (os error 1224): the provider kept `spike_times.npy` and
   `spike_clusters.npy` mapped after loading, and the save renames a new

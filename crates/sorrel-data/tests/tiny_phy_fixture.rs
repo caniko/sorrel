@@ -20,20 +20,46 @@ struct Shape {
     n_samples: usize,
     n_spikes: usize,
     rescue: bool,
+    /// Every n-th spike of unit 0 is in the recording but left out of the phy
+    /// files (0 = none): the missed spikes `sorrel rescue` must find. Only unit
+    /// 0 has any: another unit's leftover spikes would show up in the shifted
+    /// null of every unit and keep the FDR from ever passing.
+    omit_every: usize,
+}
+
+/// Unit `k`'s weight on channel `ch`. `TINY` units sit on channel `k`; `RESCUE`
+/// units use sign patterns whose 4-channel median is 0, so the common median
+/// reference leaves the waveform alone.
+fn weight(sh: &Shape, k: usize, ch: usize) -> f32 {
+    const W: [[f32; N_CH]; N_CLUSTERS] = [
+        [1.0, 0.7, -0.7, -1.0],
+        [1.0, -1.0, 0.7, -0.7],
+        [1.0, -0.7, -1.0, 0.7],
+    ];
+    if sh.rescue {
+        W[k][ch]
+    } else {
+        f32::from(u8::from(k == ch))
+    }
 }
 const TINY: Shape = Shape {
     dir: "tiny-phy",
     n_samples: 45_000, // 1.5 s at 30 kHz
     n_spikes: 2000,
     rescue: false,
+    omit_every: 0,
 };
 /// Rescue draws noise windows (261 samples) free of the unit's own spikes
-/// on its channel, which `TINY`'s one spike per ~67 samples never leaves.
+/// on its channels, which `TINY`'s one spike per ~67 samples never leaves.
+/// Its units span all four channels ([`weight`]): the shifted null shifts each
+/// channel separately, which only breaks a spike that needs several channels
+/// to line up (a one-channel unit's missed spikes would sit in the null too).
 const RESCUE: Shape = Shape {
     dir: "rescue-phy",
     n_samples: 20_000,
     n_spikes: 120,
     rescue: true,
+    omit_every: 4,
 };
 
 struct Rng(u64);
@@ -64,8 +90,8 @@ fn npy_shape(descr: &str, data: &[u8], shape: &str) -> Vec<u8> {
     out
 }
 
-/// File name -> bytes. Unit `k` is a negative biphasic-ish dip on channel
-/// `k` (amplitude 250 + 100 k counts) over uniform noise.
+/// File name -> bytes. Unit `k` is a negative biphasic-ish dip (amplitude
+/// 250 + 100 k counts, spread over channels by [`weight`]) over uniform noise.
 fn files(sh: &Shape) -> Vec<(&'static str, Vec<u8>)> {
     let (n_samples, n_spikes) = (sh.n_samples, sh.n_spikes);
     let mut rng = Rng(0x5eed_5044_1234_abcd);
@@ -87,10 +113,18 @@ fn files(sh: &Shape) -> Vec<(&'static str, Vec<u8>)> {
         let amp = 250.0 + 100.0 * k as f32;
         for j in 0..24usize {
             let x = (j as f32 - 8.0) / 4.0;
-            let v = (-amp * (-x * x).exp() + 0.35 * amp * (-(x - 2.0) * (x - 2.0)).exp()) as i16;
-            dat[(t as usize - 8 + j) * N_CH + k as usize] += v;
+            let v = -amp * (-x * x).exp() + 0.35 * amp * (-(x - 2.0) * (x - 2.0)).exp();
+            for ch in 0..N_CH {
+                dat[(t as usize - 8 + j) * N_CH + ch] += (v * weight(sh, k as usize, ch)) as i16;
+            }
         }
     }
+    // The phy files list what is left; the recording above keeps the omitted spikes.
+    let mut i = 0;
+    spikes.retain(|s| {
+        i += usize::from(s.1 == 0);
+        sh.omit_every == 0 || s.1 != 0 || i % sh.omit_every != 0
+    });
     let le = |it: &mut dyn Iterator<Item = Vec<u8>>| it.flatten().collect::<Vec<u8>>();
     let times = le(&mut spikes.iter().map(|s| s.0.to_le_bytes().to_vec()));
     let clusters = le(&mut spikes.iter().map(|s| s.1.to_le_bytes().to_vec()));
@@ -111,15 +145,17 @@ fn files(sh: &Shape) -> Vec<(&'static str, Vec<u8>)> {
         ),
     ];
     if sh.rescue {
-        // Template k = unit k, with unit k's waveform on channel k only.
+        // Template k = unit k's waveform.
         const N_T: usize = 82;
         let amp = |k: usize| 250.0 + 100.0 * k as f32;
         let mut tpl = vec![0f32; N_CLUSTERS * N_T * N_CH];
         for k in 0..N_CLUSTERS {
             for j in 0..24usize {
                 let x = (j as f32 - 8.0) / 4.0;
-                tpl[(k * N_T + 20 + j) * N_CH + k] =
-                    -amp(k) * (-x * x).exp() + 0.35 * amp(k) * (-(x - 2.0) * (x - 2.0)).exp();
+                let v = -amp(k) * (-x * x).exp() + 0.35 * amp(k) * (-(x - 2.0) * (x - 2.0)).exp();
+                for ch in 0..N_CH {
+                    tpl[(k * N_T + 20 + j) * N_CH + ch] = v * weight(sh, k, ch);
+                }
             }
         }
         let f32s =
@@ -177,8 +213,10 @@ fn check(sh: &Shape) {
     }
     let p = KilosortProvider::open(&dir, KilosortOpenParams::default()).unwrap();
     assert_eq!(p.n_clusters() as usize, N_CLUSTERS);
-    assert_eq!(
-        p.spike_times(ClusterId(0)).len(),
-        sh.n_spikes / N_CLUSTERS + usize::from(!sh.n_spikes.is_multiple_of(N_CLUSTERS))
-    );
+    let listed: usize = (0..N_CLUSTERS as u32)
+        .map(|c| p.spike_times(ClusterId(c)).len())
+        .sum();
+    let unit0 = sh.n_spikes / N_CLUSTERS + usize::from(!sh.n_spikes.is_multiple_of(N_CLUSTERS));
+    let omitted = unit0.checked_div(sh.omit_every).unwrap_or(0);
+    assert_eq!(listed, sh.n_spikes - omitted);
 }

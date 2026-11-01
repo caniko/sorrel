@@ -315,6 +315,12 @@
             # winpthreads' <sched.h>; harbor-rs only puts winpthreads on the
             # link path.
             CFLAGS_x86_64_pc_windows_gnu = "-I${cross.winpthreads}/include";
+            # piying finds its remote handlers in a linkme slice, and GNU ld's
+            # --gc-sections (rustc passes it) drops the `#[used]` registrations
+            # from COFF, leaving the slice empty: `share`/`join` then fail with
+            # "unknown message 'sorrel/hello/1'". This replaces harbor-rs's
+            # value, so keep its -L.
+            CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-L ${cross.winpthreads}/lib -C link-arg=-Wl,--no-gc-sections";
             doCheck = false;
           };
           darwin-aarch64 = {
