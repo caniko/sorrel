@@ -257,6 +257,25 @@ enum Cmd {
         #[arg(long, value_name = "FILE")]
         disputed: Option<PathBuf>,
     },
+    /// Write a double-blind bench pair from a curated session: --input is the
+    /// sorter's output with no curation, --truth the curated head plus
+    /// provenance.json
+    Blind {
+        #[command(flatten)]
+        open: OpenArgs,
+        /// Blind input directory (must be empty or absent)
+        #[arg(long, value_name = "DIR")]
+        input: PathBuf,
+        /// Truth directory: spike_clusters.npy, cluster_group.tsv, curation.json
+        /// and provenance.json of the head
+        #[arg(long, value_name = "DIR")]
+        truth: PathBuf,
+        /// The sort was curated in phy, not sorrel: spike_templates.npy is the
+        /// sorter's clustering, spike_clusters.npy and cluster_group.tsv the
+        /// human's. DATA_DIR is only read.
+        #[arg(long)]
+        phy_curated: bool,
+    },
     /// Inspect or replay a curation journal
     Journal {
         #[command(subcommand)]
@@ -995,6 +1014,51 @@ impl SessionVisitor for Replay {
             "replayed {} journal records into {}",
             session.history_len(),
             self.0.display()
+        );
+        Ok(())
+    }
+}
+
+/// `sorrel blind`: the double-blind bench pair of a curated session.
+struct Blind {
+    dat: Option<PathBuf>,
+    input: PathBuf,
+    truth: PathBuf,
+}
+impl SessionVisitor for Blind {
+    fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
+    where
+        P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
+    {
+        if !ctx.reseal_on_save {
+            bail!("sorrel blind supports phy/Kilosort directories");
+        }
+        let session = seeded(session, seed)?;
+        let files = sorrel_data::write_blind_input(
+            &ctx.save_dir,
+            self.dat.as_deref(),
+            &self.input,
+            "spike_clusters.npy",
+            session.journal().baseline(),
+        )?;
+        if self.truth.exists() && std::fs::read_dir(&self.truth)?.next().is_some() {
+            bail!("{} is not empty", self.truth.display());
+        }
+        std::fs::create_dir_all(&self.truth)
+            .with_context(|| format!("create {}", self.truth.display()))?;
+        save_to_phy(&session, &self.truth, phy_label_str)?;
+        let prov = sorrel_data::provenance(&session)?;
+        std::fs::write(
+            self.truth.join("provenance.json"),
+            serde_json::to_vec_pretty(&prov)?,
+        )?;
+        println!(
+            "blind input {} ({} files), truth {} (pure_manual {}, anchored {})",
+            self.input.display(),
+            files.len(),
+            self.truth.display(),
+            prov.pure_manual,
+            prov.anchored
         );
         Ok(())
     }
@@ -2276,6 +2340,33 @@ fn main() -> Result<()> {
             (None, false) if disputed.is_none() => diff_tsvs(&a, &b, json),
             _ => bail!("sorrel diff: two directories need --root DIR; two files take no --root or --disputed"),
         },
+        Some(Cmd::Blind {
+            open,
+            input,
+            truth,
+            phy_curated: true,
+        }) => {
+            let dir = open.root.as_deref().expect("DATA_DIR is required");
+            let files =
+                sorrel_data::write_phy_curated_pair(dir, open.dat.as_deref(), &input, &truth)?;
+            println!(
+                "blind input {} ({} files), truth {} (phy-curated)",
+                input.display(),
+                files.len(),
+                truth.display()
+            );
+            Ok(())
+        }
+        Some(Cmd::Blind {
+            open, input, truth, ..
+        }) => with_session(
+            &open,
+            Blind {
+                dat: open.dat.clone(),
+                input,
+                truth,
+            },
+        ),
         Some(Cmd::Mcp { open, sub }) => match (sub, open.root.is_some()) {
             (Some(McpCmd::Tools { json }), _) => mcp_tools(json),
             (Some(McpCmd::Config { client, dir }), _) => mcp_config(client, dir),
