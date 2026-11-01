@@ -338,9 +338,16 @@ fn source_labels(set: &FeatureSet, source: Source, parts: Option<&[Vec<usize>]>)
     )
 }
 
+/// Points a hull is built from at most (before the 95% trim).
+const HULL_SAMPLE: usize = 2500;
+
 /// The 95% of `pts` nearest their per-axis median, axes scaled by their
 /// spread (the 3-D twin of `auto_lasso`'s trimming).
-fn trimmed(mut pts: Vec<[f32; 3]>) -> Vec<[f32; 3]> {
+fn trimmed(pts: Vec<[f32; 3]>) -> Vec<[f32; 3]> {
+    // `convex_hull_3d` is O(n·h) and runs on the UI thread: an even sample of
+    // a large unit (pc_features.npy keeps every spike) bounds it.
+    let stride = pts.len().div_ceil(HULL_SAMPLE).max(1);
+    let mut pts: Vec<[f32; 3]> = pts.into_iter().step_by(stride).collect();
     if pts.len() < 4 {
         return pts; // no hull anyway; the median of nothing is undefined
     }
@@ -1887,6 +1894,24 @@ mod tests {
             by_time.0.points[0].color,
             scene(BrushInput::default()).0.points[0].color
         );
+    }
+
+    #[test]
+    fn hull_input_is_capped_for_large_units() {
+        // 300k points (a big unit with pc_features.npy): the hull sees a
+        // bounded, evenly spread sample, and it is built quickly.
+        let pts: Vec<[f32; 3]> = (0..300_000)
+            .map(|i| {
+                let t = i as f32 * 0.618_034;
+                [t.sin(), (t * 1.3).cos(), (t * 0.7).sin() * (t * 0.2).cos()]
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let kept = trimmed(pts);
+        assert!(kept.len() <= HULL_SAMPLE && kept.len() > HULL_SAMPLE / 2);
+        assert!(!convex_hull_3d(&kept).is_empty());
+        assert!(start.elapsed().as_secs_f32() < 2.0, "{:?}", start.elapsed());
+        assert_eq!(trimmed(vec![[0.0; 3]; 3]).len(), 3, "too few for a hull");
     }
 
     #[test]
