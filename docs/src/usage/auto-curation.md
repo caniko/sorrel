@@ -20,7 +20,9 @@ record who decided what. Clusters that still need a person get a
 SpikeInterface ≥ 0.105. The script needs either
 [uv](https://docs.astral.sh/uv/) on `PATH`, which installs the pinned
 dependencies on first use, or `SORREL_PYTHON` pointing to an interpreter
-that already has them.
+that already has them. Without either, sorrel falls back to `python3` on
+Linux and macOS and to `python` on Windows. The winget and Chocolatey
+packages install uv for you.
 
 1. **Load.** It loads the raw recording from `params.py` (or `--dat`,
    `--spikeglx-meta`), applies a 300 Hz high-pass and median CMR, and builds

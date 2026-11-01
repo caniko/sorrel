@@ -22,6 +22,10 @@
 - [Agents & Headless Mode](./usage/agents.md)
 - [History](./usage/history.md)
 
+# Project
+
+- [Code signing policy](./project/code-signing.md)
+
 # Architecture
 
 - [Workspace Layout](./architecture/workspace-layout.md)
