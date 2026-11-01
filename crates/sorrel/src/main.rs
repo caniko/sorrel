@@ -102,6 +102,11 @@ enum Cmd {
     AgentGuide,
     /// Print a shell completion script
     Completions { shell: clap_complete::Shell },
+    /// Windows: add a Start-menu shortcut to `sorrelw.exe` (`--remove` deletes it)
+    InstallShortcut {
+        #[arg(long)]
+        remove: bool,
+    },
     /// Headless: run every metric and write cluster_qc.tsv + cluster_qc.json
     Qc {
         #[command(flatten)]
@@ -1592,6 +1597,13 @@ fn tab_opener() -> Opener {
     })
 }
 
+/// The 256 px app icon (copy of `assets/icon/sorrel-256.png`, kept in the crate
+/// so `cargo package` is self-contained).
+fn window_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/sorrel-256.png"))
+        .expect("embedded icon is a valid PNG")
+}
+
 /// The window. `register` makes it the instance `sorrel open` hands datasets
 /// to; `first` is opened at startup.
 fn run_shell(opener: Opener, first: Option<OpenRequest>, register: bool) -> Result<()> {
@@ -1602,7 +1614,8 @@ fn run_shell(opener: Opener, first: Option<OpenRequest>, register: bool) -> Resu
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_app_id("sorrel"),
+            .with_app_id("sorrel")
+            .with_icon(window_icon()),
         wgpu_options,
         ..Default::default()
     };
@@ -2046,6 +2059,44 @@ fn agent_guide() -> String {
     s
 }
 
+/// `sorrel install-shortcut`: `%APPDATA%\...\Start Menu\Programs\Sorrel.lnk`
+/// -> the sibling `sorrelw.exe`, icon included. For winget and zip installs;
+/// the Chocolatey package makes its own.
+fn install_shortcut(remove: bool) -> Result<()> {
+    anyhow::ensure!(cfg!(windows), "install-shortcut is Windows only");
+    let appdata = std::env::var_os("APPDATA").context("APPDATA is not set")?;
+    let lnk = PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Sorrel.lnk");
+    if remove {
+        match std::fs::remove_file(&lnk) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("remove {}", lnk.display()))
+            }
+            _ => println!("removed {}", lnk.display()),
+        }
+        return Ok(());
+    }
+    let target = std::env::current_exe()?.with_file_name("sorrelw.exe");
+    anyhow::ensure!(target.exists(), "{} does not exist", target.display());
+    // Paths go through the environment, never into the script text.
+    let script = "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:SORREL_LNK); \
+        $s.TargetPath = $env:SORREL_TARGET; $s.IconLocation = $env:SORREL_TARGET + ',0'; \
+        $s.Description = 'Sorrel spike-sorting curation'; $s.Save()";
+    std::fs::create_dir_all(lnk.parent().context("shortcut path has no parent")?)?;
+    let status = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("SORREL_LNK", &lnk)
+        .env("SORREL_TARGET", &target)
+        .status()
+        .context("run powershell")?;
+    anyhow::ensure!(
+        status.success() && lnk.exists(),
+        "powershell could not create {}",
+        lnk.display()
+    );
+    println!("created {} -> {}", lnk.display(), target.display());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
@@ -2080,6 +2131,7 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Some(Cmd::InstallShortcut { remove }) => install_shortcut(remove),
         Some(Cmd::Qc { open, out }) => with_session(&open, Qc(out)),
         Some(Cmd::Suggest { open, json }) => with_session(&open, Suggest { json }),
         Some(Cmd::Apply {
@@ -2206,6 +2258,26 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The crate-local icon decodes, and still equals the canonical asset
+    /// (absent in a packaged crate).
+    #[test]
+    fn window_icon_is_the_app_icon() {
+        let icon = window_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        let canonical =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/icon/sorrel-256.png");
+        if let Ok(bytes) = std::fs::read(canonical) {
+            assert_eq!(&bytes[..], include_bytes!("../assets/sorrel-256.png"));
+        }
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn install_shortcut_is_windows_only() {
+        let e = install_shortcut(false).unwrap_err();
+        assert!(e.to_string().contains("Windows only"), "{e}");
+    }
 
     /// `sorrel mcp` on a dataset another process has open names the owner
     /// instead of becoming a second writer.

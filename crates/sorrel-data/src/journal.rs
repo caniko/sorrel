@@ -303,10 +303,14 @@ impl Journal {
         n_clusters: u32,
         n_records: u64,
     ) -> Result<Self> {
-        let file = OpenOptions::new()
-            .append(true)
+        // Not `append(true)`: on Windows that omits the write-data right, so
+        // `set_len` (the cut-back of a failed append) is refused. The lock
+        // makes this the only writer, so the cursor stays at the end.
+        let mut file = OpenOptions::new()
+            .write(true)
             .open(path)
             .with_context(|| format!("reopen journal {}", path.display()))?;
+        file.seek(SeekFrom::End(0))?;
         Ok(Self {
             path: path.to_path_buf(),
             len: file.metadata()?.len(),
@@ -381,7 +385,8 @@ impl Journal {
             if let Err(t) = self
                 .file
                 .set_len(self.len)
-                .and_then(|()| self.file.sync_all())
+                .and_then(|()| self.file.seek(SeekFrom::Start(self.len)))
+                .and_then(|_| self.file.sync_all())
             {
                 self.broken = true;
                 log::error!(

@@ -20,6 +20,7 @@ or a single file (`*.nwb`, `rez.mat`).
 | `call <DATA_DIR> [OPTIONS] <TOOL> [ARGS_JSON]`                                                                                | Run one MCP tool from a shell. See [Call](#call).                                                                                                                                                                                                          |
 | `agent-guide`                                                                                                                 | Print a primer for LLM agents, with the live command list, MCP tools and running hosts. See [Agent guide](#agent-guide).                                                                                                                                   |
 | `completions <SHELL>`                                                                                                         | Print a completion script for `bash`, `zsh`, `fish`, `elvish` or `powershell`. See [Completions](#completions).                                                                                                                                            |
+| `install-shortcut [--remove]`                                                                                                 | Windows only: create (or delete) the Start-menu shortcut `Sorrel.lnk`, which runs `sorrelw.exe` with the app icon. See [Windows](installation.md#windows).                                                                                                 |
 | `qc <DATA_DIR> --out DIR [OPTIONS]`                                                                                           | Run every metric on the current curation and write `cluster_qc.tsv` + `cluster_qc.json` into `DIR`.                                                                                                                                                        |
 | `suggest <DATA_DIR> [--json] [OPTIONS]`                                                                                       | Rank merge and split suggestions; a table by default, `{"merges": [...], "splits": [...]}` with `--json`.                                                                                                                                                  |
 | `apply <DATA_DIR> (--rules FILE \| --curation FILE) [--dry-run] [--save]`                                                     | Label clusters from QC-metric threshold rules, or import a SpikeInterface `curation.json` (labels, `tags`, merges), as one undoable batch; see `docs/src/usage/rules-example.toml`.                                                                        |
@@ -102,6 +103,19 @@ script for the shell. For bash:
 ```bash
 sorrel completions bash > ~/.local/share/bash-completion/completions/sorrel
 ```
+
+For PowerShell, put `sorrel completions powershell | Out-String | Invoke-Expression`
+in `$PROFILE`.
+
+## Install shortcut
+
+`sorrel install-shortcut` creates `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Sorrel.lnk`
+for the current user. It targets `sorrelw.exe` in the folder of the running
+`sorrel.exe` and uses its icon, through PowerShell's `WScript.Shell`.
+`--remove` deletes the shortcut. It is for winget and zip installs; the
+Chocolatey package creates its own entry. On other systems the command fails
+with "Windows only". `sorrelw` is `sorrel` without a console window; see
+[Windows](installation.md#windows).
 
 ## Open options
 

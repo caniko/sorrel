@@ -1,6 +1,7 @@
 [package]
 name = "sorrel"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,6 +10,11 @@ description = "Native high-performance GUI for manual curation of spike-sorted e
 [[bin]]
 name = "sorrel"
 path = "src/main.rs"
+
+# GUI-subsystem launcher: no console window on Windows (see the file).
+[[bin]]
+name = "sorrelw"
+path = "src/bin/sorrelw.rs"
 
 [dependencies]
 sorrel-io.workspace = true
@@ -39,6 +45,10 @@ default = ["phy-export"]
 # `sorrel export-phy`, the serve tool and the GUI button.
 phy-export = ["sorrel-data/phy-export"]
 hdf5 = ["sorrel-io/hdf5", "sorrel-data/hdf5"]
+
+# Windows icon, version info and manifest (build.rs; a no-op off Windows).
+[build-dependencies]
+embed-resource = "3"
 
 [dev-dependencies]
 tempfile.workspace = true

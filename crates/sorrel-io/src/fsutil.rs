@@ -70,9 +70,10 @@ mod tests {
         #[cfg(windows)]
         {
             assert_eq!(display_path(Path::new(r"\\?\C:\x")).to_string(), r"C:\x");
+            // Verbatim UNC stays as it is.
             assert_eq!(
                 display_path(Path::new(r"\\?\UNC\h\s")).to_string(),
-                r"\\h\s"
+                r"\\?\UNC\h\s"
             );
         }
     }

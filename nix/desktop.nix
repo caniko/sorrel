@@ -6,6 +6,7 @@ pkgs.writeText "sorrel.desktop" ''
   Name=Sorrel
   Comment=Spike-sorting curation
   Exec=sorrel
+  Icon=sorrel
   Terminal=false
   Categories=Science;
 ''

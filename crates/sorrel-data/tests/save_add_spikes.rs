@@ -141,12 +141,14 @@ fn label_str(l: &PhyLabel) -> &'static str {
     l.as_str()
 }
 
-/// Every top-level file's bytes.
+/// Every top-level file's bytes. Not the journal lock: Windows refuses reads
+/// of the file its owner has locked.
 fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
     std::fs::read_dir(root)
         .unwrap()
         .flatten()
         .filter(|e| e.file_type().unwrap().is_file())
+        .filter(|e| !e.file_name().to_string_lossy().ends_with(".lock"))
         .map(|e| {
             (
                 e.file_name().into_string().unwrap(),

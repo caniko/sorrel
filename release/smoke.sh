@@ -12,6 +12,7 @@ expected=(
   "sorrel-${VERSION}-aarch64-linux.tar.gz"
   "sorrel-${VERSION}-x86_64-windows.zip"
   "sorrel-${VERSION}-x86_64-windows.exe"
+  "sorrel-${VERSION}-x86_64-windows-gui.exe"
   "sorrel-${VERSION}-aarch64-darwin.tar.gz"
   "sorrel-${VERSION}-x86_64.AppImage"
   "sorrel-${VERSION}.tar.gz"
@@ -33,7 +34,9 @@ tar -tzf "sorrel-${VERSION}-x86_64-linux.tar.gz" | grep -Fx './sorrel' >/dev/nul
 tar -tzf "sorrel-${VERSION}-aarch64-linux.tar.gz" | grep -Fx './sorrel' >/dev/null
 tar -tzf "sorrel-${VERSION}-aarch64-darwin.tar.gz" | grep -Fx './sorrel' >/dev/null
 unzip -Z1 "sorrel-${VERSION}-x86_64-windows.zip" | grep -Fx 'sorrel.exe' >/dev/null
+unzip -Z1 "sorrel-${VERSION}-x86_64-windows.zip" | grep -Fx 'sorrelw.exe' >/dev/null
 unzip -p "sorrel-${VERSION}-x86_64-windows.zip" sorrel.exe | cmp - "sorrel-${VERSION}-x86_64-windows.exe"
+unzip -p "sorrel-${VERSION}-x86_64-windows.zip" sorrelw.exe | cmp - "sorrel-${VERSION}-x86_64-windows-gui.exe"
 tar -tzf "sorrel-${VERSION}.tar.gz" | grep -Fx "sorrel-${VERSION}/Cargo.toml" >/dev/null
 
 for wheel in sorrel_ephys-"${VERSION}"-cp38-abi3-*.whl; do
