@@ -1597,12 +1597,12 @@ fn tab_opener() -> Opener {
     })
 }
 
-/// Whether winit will pick its Wayland backend: a Wayland session, unless
-/// `WINIT_UNIX_BACKEND=x11` forces X11 (XWayland).
+/// Whether winit will pick its Wayland backend. winit 0.30 decides from the
+/// environment alone (no `WINIT_UNIX_BACKEND` override since 0.29): Wayland
+/// whenever a non-empty `WAYLAND_DISPLAY` or `WAYLAND_SOCKET` is set.
 fn wayland_session() -> bool {
-    cfg!(target_os = "linux")
-        && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|d| !d.is_empty())
-        && std::env::var("WINIT_UNIX_BACKEND").map_or(true, |b| b != "x11")
+    let set = |k| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    cfg!(target_os = "linux") && (set("WAYLAND_DISPLAY") || set("WAYLAND_SOCKET"))
 }
 
 /// The 256 px app icon (copy of `assets/icon/sorrel-256.png`, kept in the crate
@@ -1624,6 +1624,10 @@ fn run_shell(opener: Opener, first: Option<OpenRequest>, register: bool) -> Resu
     // full-screen pop-out covers it, freezing every window. Mailbox (or
     // immediate where there is none) never waits; egui still only repaints
     // on input, so this costs no idle frames.
+    // ponytail: AutoNoVsync falls back to FIFO on a surface that offers
+    // nothing else. Mesa's Wayland WSI (RADV, ANV, radeonsi, lavapipe…)
+    // offers immediate and mailbox, so only a FIFO-only driver still stalls;
+    // skip painting a covered main window if one turns up.
     if wayland_session() {
         wgpu_options.present_mode = eframe::egui_wgpu::wgpu::PresentMode::AutoNoVsync;
     }
