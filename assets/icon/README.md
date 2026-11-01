@@ -1,6 +1,6 @@
 # Sorrel app icon
 
-A sorrel (*Rumex*) leaf whose midrib is an extracellular spike.
+A sorrel (_Rumex_) leaf whose midrib is an extracellular spike.
 
 - `sorrel.svg` is the source; `design/icon.fig` holds the same mark for OpenPencil.
 - `sorrel-<N>.png` and the multi-size `sorrel.ico` are generated from it:
