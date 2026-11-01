@@ -30,7 +30,7 @@ if a[0] == "blind":
     s, i, t = Path(a[1]), Path(a[a.index("--input") + 1]), Path(a[a.index("--truth") + 1])
     i.mkdir(parents=True); t.mkdir(parents=True)
     (i / "spike_clusters.npy").write_text("x"); (i / "params.py").write_text("p")
-    (t / "provenance.json").write_text(json.dumps({{"pure_manual": not (s / "IMPURE").exists(), "anchored": False}}))
+    (t / "provenance.json").write_text(json.dumps({{"pure_manual": not (s / "IMPURE").exists(), "anchored": False, "curated": not (s / "UNCURATED").exists()}}))
 elif a[0] == "agent-guide":
     print("REVIEW GUIDE")
 elif a[0] == "auto":
@@ -54,8 +54,8 @@ from pathlib import Path
 a, prompt = sys.argv[1:], sys.stdin.read()
 cfg = json.loads(Path(a[a.index("--mcp-config") + 1]).read_text())
 with open(os.environ["STUB_LOG"], "a") as f:
-    f.write(json.dumps({{"tool": "claude", "argv": a, "stdin": prompt, "cfg": cfg, "cwd_files": os.listdir("."),
-                         "env": os.environ.get("SORREL_REVIEW")}}) + "\n")
+    f.write(json.dumps({{"tool": "claude", "argv": a, "stdin": prompt, "cfg": cfg, "cwd_files": os.listdir("."), "cwd": os.getcwd(),
+                         "env": os.environ.get("SORREL_REVIEW"), "rubric": os.environ.get("SORREL_RUBRIC")}}) + "\n")
 print(json.dumps({{"is_error": False, "result": "A" if prompt.startswith("Two curators") else "done", "total_cost_usd": 0.01,
                    "num_turns": 3, "usage": {{"input_tokens": 5}}}}))
 '''
@@ -92,10 +92,28 @@ def main() -> None:
             if i % 3 == 0:
                 (s / "IMPURE").write_text("")
             sessions.append(s)
-        go("add", *sessions)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            go("add", *sessions)
         m = json.loads((bench / ".sealed" / "map.json").read_text())["sessions"]
+        hold = [sid for sid, v in m.items() if v["split"] == "holdout"]
         assert len(m) == 30 and not any("real-session" in p.name for p in (bench / "sessions").iterdir())
-        assert {v["split"] for v in m.values()} == {"dev", "holdout"}
+        assert {v["split"] for v in m.values()} == {"dev", "holdout"} and hold
+        # nothing of a holdout session is visible outside .sealed: not its id in a path, not on stdout
+        assert out.getvalue().startswith(f"added 30 session(s), {30 - len(hold)} to dev"), out.getvalue()
+        assert not any(sid in out.getvalue() for sid in hold)
+        assert not any(sid in str(p.relative_to(bench)) for sid in hold for p in bench.rglob("*") if p.relative_to(bench).parts[0] != ".sealed")
+        assert all((bench / ".sealed" / "sessions" / sid / "input").is_dir() for sid in hold)
+        # an uncurated phy sort is refused, and leaves nothing behind
+        bad = t / "uncurated"
+        bad.mkdir()
+        (bad / "UNCURATED").write_text("")
+        try:
+            go("add", bad)
+            raise AssertionError("uncurated session must be refused")
+        except SystemExit as e:
+            assert "uncurated" in str(e)
+        assert len(json.loads((bench / ".sealed" / "map.json").read_text())["sessions"]) == 30
         assert all(v["split"] == "dev" for v in m.values() if not v["pure_manual"]) and sum(not v["pure_manual"] for v in m.values()) == 10
         before = len(m)
         go("add", sessions[0])  # idempotent
@@ -105,11 +123,18 @@ def main() -> None:
         for v in ("base", "cand"):
             (t / v).mkdir()
             (t / v / "review.md").write_text(v)
+        os.environ["SORREL_RUBRIC"] = "inherited"  # the variants have no rubric.md: it must not reach an arm
         for split, rep in (("dev", 2), ("holdout", 1)):
             for arm in bc.ARMS:
                 for v in ("base", "cand"):
-                    go("run", "--arm", arm, "--variant", t / v, "--split", split, "--repeats", rep, "--jobs", 4, "--model", "m1")
-        n_hold = sum(v["split"] == "holdout" for v in m.values())
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out):
+                        go("run", "--arm", arm, "--variant", t / v, "--split", split, "--repeats", rep, "--jobs", 4, "--model", "m1")
+                    if split == "holdout":
+                        assert out.getvalue().strip() == f"{len(hold)} holdout run(s): {len(hold)} ok", out.getvalue()
+        del os.environ["SORREL_RUBRIC"]
+        assert all(c["env"]["SORREL_RUBRIC"] is None for c in calls(log, "sorrel", "auto")) and all(c["rubric"] is None for c in calls(log, "claude"))
+        n_hold = len(hold)
         assert len(list((bench / ".sealed" / "runs").iterdir())) == 4 * n_hold
         assert all(m[json.loads(p.read_text())["session"]]["split"] == "dev" for p in (bench / "runs").glob("*/run.json"))
         mcp = calls(log, "claude")[0]
@@ -121,6 +146,8 @@ def main() -> None:
         assert list(mcp["cfg"]["mcpServers"]) == ["sorrel"] and mcp["cfg"]["mcpServers"]["sorrel"]["args"][0] == "mcp"
         assert mcp["stdin"].startswith("REVIEW GUIDE") and mcp["cwd_files"] == [] and "REVIEW GUIDE" not in " ".join(a)
         assert mcp["env"] and mcp["env"].endswith("review.md")
+        # a fresh cwd outside BENCH (no ancestor CLAUDE.md), gone afterwards
+        assert not Path(mcp["cwd"]).resolve().is_relative_to(bench) and not Path(mcp["cwd"]).exists(), mcp["cwd"]
         assert any(c["env"]["SORREL_REVIEW"] for c in calls(log, "sorrel", "auto"))
         assert all(c["argv"][-2:] == ["--llm-model", "m1"] or "--save" in c["argv"] for c in calls(log, "sorrel", "auto"))
         rec = json.loads(next((bench / "runs").glob("mcp-review-base-*/run.json")).read_text())
@@ -134,7 +161,7 @@ def main() -> None:
         go("report", "dev")
         rep = next((bench / "reports").glob("dev-*.md")).read_text()
         assert "### missed_merge" in rep and "9 mua +A" in rep and "cols: `id lab flags`" in rep
-        assert not list((bench / "sessions").glob("*/input/sorrel.journal"))
+        assert not list(bench.glob("**/sessions/*/input/sorrel.journal"))
 
         # holdout report: aggregates only, ledgered
         out = io.StringIO()
@@ -144,6 +171,7 @@ def main() -> None:
         assert not any(sid in text for sid in m) and "root" not in text and "session " not in text.replace("paired holdout sessions", ""), text
         assert "unit.f1" in text and "+0.100" in text and "misses.label" in text, text
         assert text.strip().endswith("holdout queries so far: 1")
+        assert "n<3" not in text  # many holdout sessions: a CI is reported
         with contextlib.redirect_stdout(out):
             go("report", "holdout", "--baseline", "base", "--candidate", "cand")
         assert len((bench / ".sealed" / "holdout-ledger.jsonl").read_text().splitlines()) == 2
@@ -182,7 +210,44 @@ def main() -> None:
         # --judge fills the sheet on dev
         go("adjudicate", "--split", "dev", "--judge", "claude", "--force")
         assert all(l.split("\t")[6] == "A" for l in cases.read_text().splitlines()[1:])
-        print("ok: add/splits, mcp-review argv, holdout blind + ledger, adjudication")
+
+        # a strict judge: only a final line that is exactly A, B or both-wrong counts
+        bc.claude = lambda *x, **k: (None, {"result": "I pick A\nB is wrong"})
+        assert bc.judge(next(iter(m)), [3], "x", "y", None) == ""
+        bc.claude = lambda *x, **k: (None, {"result": "reasoning\nboth-wrong\n"})
+        assert bc.judge(next(iter(m)), [3], "x", "y", None) == "both-wrong"
+
+        # holdout adjudication: sheet and disputed units live under .sealed, nothing prints an id
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            go("adjudicate", "--split", "holdout")
+        hcases = bench / ".sealed" / "adjudication" / "holdout" / "cases.tsv"
+        assert hcases.exists() and not (bench / "adjudication" / "holdout").exists()
+        hkey = json.loads((bench / ".sealed" / "adjudication-holdout.json").read_text())
+        hrows = [l.split("\t") for l in hcases.read_text().splitlines()]
+        pick = next(l for l, w in hkey[hrows[1][0]].items() if w == "arm" and l in "AB")
+        hcases.write_text("\n".join("\t".join(r[:6] + [c]) for r, c in zip(hrows, ["choice"] + [pick] + [""] * (len(hrows) - 2))) + "\n")
+        with contextlib.redirect_stdout(out):
+            go("adjudicate", "--split", "holdout", "--unmask")
+        hsid = hkey[hrows[1][0]]["session"]
+        assert (bench / ".sealed" / "disputed" / f"{hsid}.tsv").exists() and not (bench / "disputed" / f"{hsid}.tsv").exists()
+        log.write_text("")
+        go("score", "--split", "holdout")
+        assert any("--disputed" in c["argv"] for c in calls(log, "sorrel", "diff"))
+        assert not any(sid in out.getvalue() for sid in hold)
+
+        # fewer than 3 paired sessions: no CI
+        bench2 = t / "bench2"
+        go2 = lambda *a: bc.main(["--bench", str(bench2), *map(str, a)])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            go2("add", *[m[sid]["path"] for sid in hold[:2]])
+            for v in ("base", "cand"):
+                go2("run", "--arm", "auto-llm", "--variant", t / v, "--split", "holdout", "--repeats", 1)
+            go2("score")
+            go2("report", "holdout", "--baseline", "base", "--candidate", "cand")
+        assert "n<3 sessions: no CI" in out.getvalue() and "95% CI" not in out.getvalue(), out.getvalue()
+        print("ok: add/splits, mcp-review argv, holdout sealing + ledger, adjudication")
 
 
 if __name__ == "__main__":

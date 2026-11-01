@@ -15,7 +15,8 @@ docs/src/usage/auto-curation.md).
 
 BENCH is private data outside the repo. `$SORREL_BIN` names the sorrel binary
 (default: `sorrel` on PATH); a variant DIR may hold `rubric.md` / `review.md`.
-Holdout runs and scores live under BENCH/.sealed, never in a dev report.
+Everything about a holdout session (its copy, runs, scores, adjudication sheet,
+disputed units) lives under BENCH/.sealed, and no command prints its ids.
 """
 
 import argparse
@@ -24,7 +25,6 @@ import hashlib
 import json
 import os
 import random
-import re
 import secrets
 import shutil
 import statistics
@@ -39,6 +39,7 @@ from pathlib import Path
 B = Path()  # the bench root, set by main()
 SORREL = os.environ.get("SORREL_BIN", "sorrel")
 HOLDOUT_PCT = 30
+LINK_MIN = 64 << 20  # files at least this big are hard-linked into a copy, smaller ones copied
 ARMS = ("auto-llm", "mcp-review")
 TASK = "Task: review the dataset behind the sorrel MCP server, apply your curation decisions with its tools, then stop."
 JUDGE = (
@@ -48,7 +49,8 @@ JUDGE = (
 
 
 def run(argv, env=None, cwd=None, timeout=600, stdin=None):
-    return subprocess.run([str(a) for a in argv], env={**os.environ, **(env or {})}, cwd=cwd, input=stdin, capture_output=True, text=True, errors="replace", timeout=timeout)
+    env = {k: v for k, v in {**os.environ, **(env or {})}.items() if v is not None}  # a None value unsets an inherited variable
+    return subprocess.run([str(a) for a in argv], env=env, cwd=cwd, input=stdin, capture_output=True, text=True, errors="replace", timeout=timeout)
 
 
 def sorrel(*args, env=None, timeout=600) -> str:
@@ -71,12 +73,32 @@ def load_map() -> dict:
     return json.loads(p.read_text()) if p.exists() else {"salt": os.environ.get("BENCH_SALT") or secrets.token_hex(16), "sessions": {}}
 
 
+def home(split: str) -> Path:
+    """Where a split's material lives: holdout under .sealed, never beside dev."""
+    return B / ".sealed" if split == "holdout" else B
+
+
+def sess(sid: str) -> Path:
+    return home(load_map()["sessions"][sid]["split"]) / "sessions" / sid
+
+
+def link_or_copy(src, dst) -> None:
+    # ponytail: sorrel's own saves are atomic renames, so a link to a big array is safe
+    # from it; a small file is copied because an in-place write would reach the sealed input.
+    if os.stat(src).st_size >= LINK_MIN:
+        try:
+            return os.link(src, dst)
+        except OSError:
+            pass
+    shutil.copy2(src, dst)
+
+
 def copy_input(sid: str, dst: Path) -> None:
-    """Hard-linked copy of the sealed input. Only the files `add` saw are copied,
+    """Copy of the sealed input (big files hard-linked). Only the files `add` saw are copied,
     so a journal a reviewer's GUI or a stray `sorrel call` left in `input` never
     reaches an arm (curator blind)."""
-    src, keep = B / "sessions" / sid / "input", set(load_map()["sessions"][sid]["keep"])
-    shutil.copytree(src, dst, symlinks=True, copy_function=os.link, ignore=lambda d, ns: [n for n in ns if Path(d) == src and n not in keep])
+    src, keep = sess(sid) / "input", set(load_map()["sessions"][sid]["keep"])
+    shutil.copytree(src, dst, symlinks=True, copy_function=link_or_copy, ignore=lambda d, ns: [n for n in ns if Path(d) == src and n not in keep])
 
 
 @contextmanager
@@ -92,25 +114,32 @@ def scratch_input(sid: str):
 def cmd_add(a) -> None:
     m = load_map()
     known = {s["path"] for s in m["sessions"].values()}
+    n_added = n_dev = n_forced = 0
     for s in a.session:
         path = str(Path(s).resolve())
         if path in known:
             print(f"skip (already added): {s}")
             continue
         sid = secrets.token_hex(4)
-        d = B / "sessions" / sid
+        d = B / ".sealed" / "incoming" / sid  # moved out once the split is known: a holdout id never leaves .sealed
         try:
             sorrel("blind", path, "--input", d / "input", "--truth", d / "truth", *(["--phy-curated"] if a.phy_curated else []))
             prov = json.loads((d / "truth" / "provenance.json").read_text())
+            if prov.get("curated") is False:
+                raise SystemExit(f"refusing {s}: it looks uncurated (spike_clusters equals spike_templates, labels are the sorter's); a bench truth needs a saved human curation")
         except (SystemExit, OSError, ValueError):
             shutil.rmtree(d, ignore_errors=True)
             raise
         pure = prov.get("pure_manual") is True and not prov.get("anchored")
         h = int(hashlib.sha256((m["salt"] + path).encode()).hexdigest()[:8], 16) % 100
         split = "holdout" if pure and h < HOLDOUT_PCT else "dev"
-        m["sessions"][sid] = {"path": path, "split": split, "pure_manual": pure, "keep": sorted(p.name for p in (d / "input").iterdir())}
+        final = home(split) / "sessions" / sid
+        final.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(d, final)
+        m["sessions"][sid] = {"path": path, "split": split, "pure_manual": pure, "keep": sorted(p.name for p in (final / "input").iterdir())}
         write_json(B / ".sealed" / "map.json", m)  # per session: a later failure keeps the earlier ones
-        print(f"{sid}  {split}{'' if pure else '  (not purely manual: dev only)'}")
+        n_added, n_dev, n_forced = n_added + 1, n_dev + (split == "dev"), n_forced + (not pure)
+    print(f"added {n_added} session(s), {n_dev} to dev ({n_forced} of them not purely manual); the rest are sealed")
 
 
 def sorrel_rev() -> str | None:
@@ -122,15 +151,19 @@ def sorrel_rev() -> str | None:
 
 
 def claude(prompt: str, root: Path, servers: dict, allow: str | None, model: str | None, env: dict, timeout: int):
-    """One hardened `claude -p` (the sidecar's cli_argv flags): empty cwd, only
+    """One hardened `claude -p` (the sidecar's cli_argv flags): fresh empty cwd, only
     the given MCP servers, no built-in tools, prompt on stdin. -> (proc, json)."""
-    (root / "cwd").mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
     write_json(root / "mcp.json", {"mcpServers": servers})
     argv = [shutil.which("claude") or "claude", "-p", "--output-format", "json", "--strict-mcp-config", "--mcp-config", root / "mcp.json",
             "--setting-sources", "project", "--disable-slash-commands", "--no-session-persistence", "--tools", ""]
     argv += ["--allowedTools", allow] if allow else []
     argv += ["--model", model] if model else []
-    r = run(argv, env, cwd=root / "cwd", timeout=timeout, stdin=prompt)
+    cwd = tempfile.mkdtemp(prefix="bench-claude-")  # outside BENCH, so no ancestor CLAUDE.md loads
+    try:
+        r = run(argv, env, cwd=cwd, timeout=timeout, stdin=prompt)
+    finally:
+        shutil.rmtree(cwd, ignore_errors=True)
     try:
         return r, json.loads(r.stdout)
     except ValueError:
@@ -138,7 +171,8 @@ def claude(prompt: str, root: Path, servers: dict, allow: str | None, model: str
 
 
 def variant_env(v: Path) -> dict:
-    return {k: str((v / f).resolve()) for k, f in (("SORREL_RUBRIC", "rubric.md"), ("SORREL_REVIEW", "review.md")) if (v / f).exists()}
+    """A variant file sets its variable; a missing one unsets it, so a stray inherited override can't leak in."""
+    return {k: str((v / f).resolve()) if (v / f).exists() else None for k, f in (("SORREL_RUBRIC", "rubric.md"), ("SORREL_REVIEW", "review.md"))}
 
 
 def snap(d: Path) -> dict:
@@ -149,7 +183,7 @@ def run_roots(split: str) -> Path:
     return B / "runs" if split == "dev" else B / ".sealed" / "runs"
 
 
-def one_run(a, sid: str, k: int) -> str:
+def one_run(a, sid: str, k: int) -> dict:
     rid = f"{a.arm}-{a.variant.name}-{sid}-r{k}-{secrets.token_hex(2)}"
     root = run_roots(a.split) / rid
     data, env = root / "data", variant_env(a.variant)
@@ -163,7 +197,7 @@ def one_run(a, sid: str, k: int) -> str:
             rec["prompt_rev"] = json.loads(ev.read_text()).get("prompt_rev") if ev.exists() else None
         else:
             prompt = sorrel("agent-guide", "--prompt", "review", env=env) + "\n\n" + TASK + "\n"
-            sv = {"command": shutil.which(SORREL) or SORREL, "args": ["mcp", str(data)], **({"env": env} if env else {})}
+            sv = {"command": shutil.which(SORREL) or SORREL, "args": ["mcp", str(data)], **({"env": {k: v for k, v in env.items() if v}} if any(env.values()) else {})}
             r, out = claude(prompt, root, {"sorrel": sv}, "mcp__sorrel__*", a.model, env, a.timeout)
             rec["prompt_rev"] = hashlib.sha256(prompt.encode()).hexdigest()[:12]
             rec |= {"usage": out.get("usage"), "cost_usd": out.get("total_cost_usd"), "num_turns": out.get("num_turns")}
@@ -174,16 +208,16 @@ def one_run(a, sid: str, k: int) -> str:
         rec["status"] = "ok"
     except subprocess.TimeoutExpired:
         rec["status"] = "timeout"
-    except (SystemExit, RuntimeError, OSError) as e:
+    except (SystemExit, RuntimeError, OSError, ValueError) as e:  # ValueError: a bad evidence.json
         rec["status"], rec["error"] = "failed", str(e)
     # Hard links share inodes with the sealed input: an in-place write (same inode, new mtime) corrupts it.
     after = snap(data)
     if any(f in after and after[f][0] == v[0] and after[f] != v for f, v in before.items()):
         rec["status"] = "input-mutated"
-        print(f"!! {rid}: sorrel wrote a sealed input file in place; check BENCH/sessions/{sid}/input", file=sys.stderr)
+        print(f"!! {rid if a.split == 'dev' else 'a holdout run'}: sorrel wrote a sealed input file in place; check the run's run.json", file=sys.stderr)
     rec["wall_s"] = round(time.monotonic() - t0, 1)
     write_json(root / "run.json", rec)
-    return f"{rid}  {rec['status']}  {rec['wall_s']}s"
+    return rec
 
 
 def cmd_run(a) -> None:
@@ -192,8 +226,12 @@ def cmd_run(a) -> None:
         raise SystemExit(f"no {a.split} sessions")
     jobs = [(s, k) for s in sids for k in range(a.repeats)]
     with ThreadPoolExecutor(a.jobs) as ex:
-        for line in ex.map(lambda j: one_run(a, *j), jobs):
-            print(line)
+        recs = list(ex.map(lambda j: one_run(a, *j), jobs))
+    if a.split == "holdout":  # no run or session ids: they would tell which sessions are sealed
+        print(f"{len(recs)} holdout run(s): " + ", ".join(f"{n} {st}" for st in sorted({r["status"] for r in recs}) for n in [sum(r["status"] == st for r in recs)]))
+    else:
+        for r in recs:
+            print(f"{r['id']}  {r['status']}  {r['wall_s']}s")
 
 
 def runs(split: str):
@@ -207,13 +245,14 @@ def cmd_score(a) -> None:
         for rec, root in runs(split):
             if rec["status"] != "ok":
                 continue
-            s, disp = B / "sessions" / rec["session"], B / "disputed" / f"{rec['session']}.tsv"
+            s = sess(rec["session"])
+            disp = home(split) / "disputed" / f"{rec['session']}.tsv"
             argv = ["diff", s / "truth", root / "data", "--root", s / "input", "--json", "--match", a.match] + (["--disputed", disp] if disp.exists() else [])
             r = run([SORREL, *argv])
             try:
                 write_json(root / "score.json", json.loads(r.stdout))
             except ValueError:
-                print(f"{rec['id']}: diff failed: {r.stderr.strip()[-200:]}", file=sys.stderr)
+                print(f"{rec['id'] if split == 'dev' else 'a holdout run'}: diff failed: {r.stderr.strip()[-200:]}", file=sys.stderr)
 
 
 def misses(score: dict) -> list:
@@ -350,7 +389,8 @@ def report_holdout(a) -> None:
         for k in sorted({k for s in common for k in base[s] if k in cand[s]}):
             d = [cand[s][k] - base[s][k] for s in common if k in base[s] and k in cand[s]]
             boot = sorted(statistics.fmean(rng.choices(d, k=len(d))) for _ in range(2000))
-            lines.append(f"  {k:36s} base {statistics.fmean([base[s][k] for s in common if k in base[s]]):9.3f}  cand {statistics.fmean([cand[s][k] for s in common if k in cand[s]]):9.3f}  delta {statistics.fmean(d):+8.3f}  95% CI [{boot[50]:+.3f}, {boot[1949]:+.3f}]")
+            ci = f"95% CI [{boot[50]:+.3f}, {boot[1949]:+.3f}]" if len(d) >= 3 else "n<3 sessions: no CI"
+            lines.append(f"  {k:36s} base {statistics.fmean([base[s][k] for s in common if k in base[s]]):9.3f}  cand {statistics.fmean([cand[s][k] for s in common if k in cand[s]]):9.3f}  delta {statistics.fmean(d):+8.3f}  {ci}")
     if not lines:
         raise SystemExit(f"no paired scored holdout runs for {a.baseline} vs {a.candidate}")
     led = B / ".sealed" / "holdout-ledger.jsonl"
@@ -375,12 +415,12 @@ def judge(sid: str, ids, va: str, vb: str, model: str | None) -> str:
     prompt = JUDGE + f"\nCluster(s) {list(ids)}\nVerdict A: {va}\nVerdict B: {vb}\n\n{head}\n" + "\n".join(rows.values()) + "\n"
     with tempfile.TemporaryDirectory(dir=B / ".sealed") as d:
         _, out = claude(prompt, Path(d), {}, None, model, {}, 600)
-    m = re.findall(r"\b(both-wrong|A|B)\b", str(out.get("result", "")))
-    return m[-1] if m else ""  # ponytail: an unparseable reply stays blank for a human
+    last = str(out.get("result", "")).strip().splitlines()[-1:]  # strict: the final line is the whole verdict
+    return last[0].strip() if last and last[0].strip() in ("A", "B", "both-wrong") else ""  # anything else stays blank for a human
 
 
 def cmd_adjudicate(a) -> None:
-    sealed, d = B / ".sealed" / f"adjudication-{a.split}.json", B / "adjudication" / a.split
+    sealed, d = B / ".sealed" / f"adjudication-{a.split}.json", home(a.split) / "adjudication" / a.split
     if a.unmask:
         key, disputed = json.loads(sealed.read_text()), {}
         with (d / "cases.tsv").open(newline="") as f:
@@ -390,7 +430,7 @@ def cmd_adjudicate(a) -> None:
             if k in ("A", "B") and key[r["case"]][k] == "arm":
                 disputed.setdefault(key[r["case"]]["session"], set()).update(key[r["case"]]["ids"])
         for sid, ids in disputed.items():
-            p = B / "disputed" / f"{sid}.tsv"
+            p = home(a.split) / "disputed" / f"{sid}.tsv"
             old = {int(l) for l in p.read_text().splitlines()[1:]} if p.exists() else set()
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text("cluster_id\n" + "".join(f"{i}\n" for i in sorted(old | set(ids))))  # sorrel diff --disputed format
@@ -411,7 +451,7 @@ def cmd_adjudicate(a) -> None:
         va, vb = (arm, human) if flip else (human, arm)
         key[cid] = {"session": sid, "ids": list(ids), "A": "arm" if flip else "human", "B": "human" if flip else "arm"}
         choice = judge(sid, ids, va, vb, a.model) if a.judge else ""
-        out.append([cid, sid, ",".join(map(str, ids)), B / "sessions" / sid / "input", va, vb, choice])
+        out.append([cid, sid, ",".join(map(str, ids)), sess(sid) / "input", va, vb, choice])
     d.mkdir(parents=True, exist_ok=True)
     write_json(sealed, key)
     with (d / "cases.tsv").open("w", newline="") as f:
