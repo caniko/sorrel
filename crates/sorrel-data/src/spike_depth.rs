@@ -41,6 +41,20 @@ pub struct SpikeDepths {
     pub max: f32,
 }
 
+impl SpikeDepths {
+    /// Mean depth of `cluster` over the spikes that have one (a spike with
+    /// no position and no fallback is NaN); `None` when none has.
+    pub fn cluster_mean(&self, cluster: ClusterId) -> Option<f32> {
+        let (sum, n) = self
+            .per_cluster
+            .get(cluster.idx())?
+            .iter()
+            .filter(|v| v.is_finite())
+            .fold((0.0f64, 0usize), |(s, n), &v| (s + v as f64, n + 1));
+        (n > 0).then(|| (sum / n as f64) as f32)
+    }
+}
+
 /// Centre of mass of `channel_y` weighted by `max(pc0, 0)²`; `None` when no
 /// channel has positive loading (the spike is anti-phase on every channel,
 /// which happens for noise) or `chans` is empty.

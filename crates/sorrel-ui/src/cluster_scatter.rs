@@ -118,9 +118,7 @@ fn rows<P: DataProvider>(
                     v.iter().sum::<f32>() / v.len() as f32
                 }
             };
-            let depth = depths
-                .and_then(|d| d.per_cluster.get(c.idx()))
-                .map_or(f32::NAN, |d| mean(d));
+            let depth = depths.and_then(|d| d.cluster_mean(c)).unwrap_or(f32::NAN);
             let ch = s
                 .primary_template(c)
                 .and_then(|t| s.template_waveform(t))

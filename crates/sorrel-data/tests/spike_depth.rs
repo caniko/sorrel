@@ -143,4 +143,8 @@ fn a_spike_without_a_position_is_nan_not_depth_zero() {
         (1000.0, 1005.0),
         "the NaN spike sets no bound"
     );
+    // Cluster means skip it: cluster 2 has no depth at all, the others keep
+    // theirs (cluster 1 is rows 1 and 5).
+    assert_eq!(d.cluster_mean(ClusterId(2)), None);
+    assert_eq!(d.cluster_mean(ClusterId(1)), Some(1003.0));
 }
