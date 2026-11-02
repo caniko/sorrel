@@ -358,38 +358,6 @@ def bombcell_failures(row, thresholds: dict, section: str) -> list[str]:
 # --------------------------------------------------------------------------
 # Claude
 
-RUBRIC = """You review automatically sorted extracellular units (Kilosort 4, \
-SpikeInterface metrics) and decide what a careful human curator would decide. \
-Two classifiers disagreed or were unsure about the case you get; their outputs \
-are included. Judge the evidence, not the classifiers' authority.
-
-Units: label each as
-- "good": a well-isolated single neuron. Clean biphasic somatic waveform \
-(trough then peak, 0.2-1.0 ms trough-to-peak), spatially compact footprint \
-decaying over ~50-100 um, empty refractory period (ACG near zero in the first \
-1-2 ms, isi_violations_ratio and rp_contamination low), stable firing and \
-amplitude across the recording (presence_ratio high), amplitude_cutoff low.
-- "mua": neural but not isolated. Neural waveform, but refractory violations, \
-an amplitude distribution cut off by the detection threshold, or a mixture of \
-neurons (unstable amplitude, broad or multi-peaked footprint).
-- "noise": not neural. Non-physiological shape (too many peaks, very short or \
-very long, flat baseline violations), footprint spread uniformly across many \
-distant channels or confined to one channel with no decay, line-noise or \
-artefact-driven firing, or near-zero amplitude.
-
-Merges: decide whether the listed units are one neuron split by the sorter. \
-Merge when templates on the shared channel are nearly identical in shape (an \
-amplitude difference alone is fine: drift), units are close (< ~50 um), and the \
-cross-correlogram shows a refractory dip at 0 ms like an ACG. Do not merge when \
-the CCG has a central peak (synchrony between two neurons) or no dip, or the \
-shapes differ.
-
-The input is a sorrel brief: the header above defines the columns, flags \
-and SAX strings (compare shape, not level); a unit message is its card row(s) \
-and the classifier outputs, a merge message the counterfactual of the merge. \
-Amplitudes are in uV when the input says so, otherwise in ADC units. Give a \
-confidence in [0, 1] (0.5 = coin flip) and at most three short reasons."""
-
 UNIT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -738,7 +706,13 @@ def main() -> None:
         merges = resolve_groups(by_preset)
 
     llm_merge = [(g, p) for g, p in merges if len(p) < len(PRESETS)] if args.llm else []
-    system, evals = RUBRIC, {}
+    # The rubric is sorrel's single prompt source (`sorrel_data::effective_prompts`),
+    # passed by `sorrel auto`; `prompt_rev` names it in evidence.json.
+    rubric = os.environ.get("SORREL_RUBRIC")
+    if args.llm and not rubric:
+        raise SystemExit("--llm needs the rubric: run through `sorrel auto` (SORREL_RUBRIC unset)")
+    evidence["prompt_rev"] = os.environ.get("SORREL_PROMPT_REV")
+    system, evals = rubric, {}
     # Set a previous run's evidence.json aside (renamed, never deleted: its paid
     # verdicts survive a rerun) before anything writes it; the brief's `ev`
     # column would also read it stale.
@@ -750,7 +724,7 @@ def main() -> None:
         # before the classifiers pick the unsure units); one `sorrel call`
         # process per merge group, a batched call if runs show hundreds.
         header, _, _ = split_brief(sorrel_call(args.data_dir, "brief", {"level": 0}))
-        system = RUBRIC + "\n\n" + header
+        system = rubric + "\n\n" + header
         evidence["llm_header"] = header
         for g, _ in llm_merge:
             evals[g[0]] = eval_line(sorrel_call(args.data_dir, "eval", {"merge": list(g)}))

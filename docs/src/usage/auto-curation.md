@@ -248,3 +248,75 @@ Repeat with `--no-unitrefine`, without `--llm` and with `--llm` to see
 which stage helps on your recordings. A synthetic self-check lives in
 `scripts/test_sorrel_auto.py`
 (`uv run --script scripts/test_sorrel_auto.py [--unitrefine]`).
+
+## Double-blind bench
+
+To find out what `sorrel auto --llm` and the MCP `review` agent miss compared
+with a person, replay human curations through them and score the difference.
+`scripts/bench_curation.py` (a stdlib uv script) runs the bench; its data lives
+in a private `BENCH` directory outside the repo.
+
+**Data.** Sessions curated in sorrel and saved, ideally from scratch: a session
+whose history holds a `sorrel auto` or agent batch anchors the human on the
+machine's answer, so it is kept in dev and never enters the holdout. About 30%
+of the purely manual sessions go to the holdout, chosen by a salted hash. Many
+sessions beat many repeats; Neuropixels geometry helps the probe-based checks.
+Kilosort sorts curated in phy work too (`add --phy-curated`): the sorter's
+clustering comes from `spike_templates.npy`.
+Data owners package a phy-curated Kilosort sort with the `export-curated-sort` skill (`.claude/skills/export-curated-sort/`), which keeps only what the bench needs and verifies the compressed raw recording before delivery.
+
+**Three blinds.**
+
+1. **Curator blind.** `sorrel blind` writes the sorter's own root output (no
+   journal, labels, tags, notes, `curation.json` or `.phy/`), checks it against
+   the journal's baseline hash, and keeps the human's final state apart as the
+   truth. Sessions get opaque ids; the path map and the salt are sealed in
+   `BENCH/.sealed/`. Every run works on a fresh hard-linked copy of the input.
+2. **Improver blind.** Per-unit misses are only reported on dev. The holdout
+   reports aggregates, with a paired bootstrap over sessions, and every holdout
+   query is logged.
+3. **Blinded A/B adjudication.** Each disagreement goes to a reviewer as two
+   verdicts in random order, without saying which is the human's. Units where
+   the human loses are `disputed` and drop out of scoring.
+
+```bash
+b=~/sorrel-bench; v=variants/base       # a variant dir may hold rubric.md / review.md
+bench_curation.py --bench $b add ~/sessions/*                    # blind, seal, split
+bench_curation.py --bench $b run --arm mcp-review --variant $v --split dev --repeats 3
+bench_curation.py --bench $b run --arm auto-llm   --variant $v --split dev --repeats 3
+bench_curation.py --bench $b score                               # sorrel diff per run
+bench_curation.py --bench $b report dev                          # misses + the card the arm saw
+bench_curation.py --bench $b adjudicate --split dev [--judge claude]
+# fill the `choice` column (A, B or both-wrong) of adjudication/dev/cases.tsv, then:
+bench_curation.py --bench $b adjudicate --split dev --unmask     # writes disputed/<session>.tsv
+bench_curation.py --bench $b report holdout --baseline base --candidate new
+```
+
+`SORREL_BIN` picks the sorrel binary. The variant's `rubric.md` and `review.md`
+reach both arms as `SORREL_RUBRIC` / `SORREL_REVIEW`, and the prompt revision
+is recorded with every run, so a variant needs no rebuild. The `mcp-review` arm
+runs `claude -p` with the sidecar's isolation (empty working directory, strict
+MCP config holding only `sorrel mcp RUN`, no built-in tools, no session
+persistence) and the prompt from `sorrel agent-guide --prompt review`; each
+`run.json` records the model, usage, cost and wall time. Reviewers open the
+cases' `input_dir` (a copy is safer; stray files there never reach a run). The
+LLM judge is dev-only; holdout cases are for humans.
+
+**The improvement loop.**
+
+1. Baseline both arms on every session, 3 repeats each, and score.
+2. Adjudicate the disagreements (a human for the holdout, an LLM judge is fine
+   on dev), unmask, and score again.
+3. `report dev`; pick the largest miss category.
+4. The improver changes **one** thing: the rubric, the review instructions, a
+   brief feature, a rule default, a sidecar threshold or a missing probe/eval
+   capability. It sees dev reports and the repo only.
+5. Rerun dev. The target category must improve and no other may regress beyond
+   the spread across repeats.
+6. One holdout query decides: a paired improvement with no category regression.
+   The change then lands as a PR.
+7. When new sessions arrive, re-split, refresh the holdout and retire the
+   ledger.
+
+A smoke test with stub CLIs (`scripts/test_bench_curation.py`) needs neither
+data nor a model.

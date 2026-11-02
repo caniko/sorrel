@@ -9,8 +9,10 @@ result*
 .DS_Store
 docs/book/
 website/public/
-# Local agent state, canix build-result links and Python bytecode
-/.claude/
+# Local agent state (settings stay local, shared skills are tracked),
+# canix build-result links and Python bytecode
+/.claude/*
+!/.claude/skills/
 /.nix-results/
 __pycache__/
 # egui_kittest failure artefacts next to committed snapshots

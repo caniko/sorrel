@@ -33,7 +33,8 @@ or a single file (`*.nwb`, `rez.mat`).
 | `mcp [<DATA_DIR>] [OPTIONS]`                                                                                                  | MCP over stdio for agents and notebooks: metrics, suggestions, SVG plots, journaled relabel / merge / split / undo / save, proposals. Without `<DATA_DIR>` it attaches to the GUI's active tab or the only running host; see [Agents](../usage/agents.md). |
 | `mcp tools [--json]`                                                                                                          | List the MCP tools, offline.                                                                                                                                                                                                                               |
 | `mcp config [--client claude \| codex \| json] [<DATA_DIR>]`                                                                  | Print how to register sorrel with an agent. See [MCP tools and config](#mcp-tools-and-config).                                                                                                                                                             |
-| `diff <A.tsv> <B.tsv> [--json]`                                                                                               | Compare two `cluster_group.tsv` files: confusion table, Cohen's kappa, per-cluster disagreements.                                                                                                                                                          |
+| `diff <A.tsv> <B.tsv> [--json]`                                                                                               | Compare two `cluster_group.tsv` files: confusion table, Cohen's kappa, per-cluster disagreements. With two directories and `--root`, a spike-level score ([Blind bench](#blind-bench)).                                                                    |
+| `blind <DATA_DIR> --input <IN> --truth <TRUTH>`                                                                               | Write a double-blind bench pair from a curated session ([Blind bench](#blind-bench)).                                                                                                                                                                      |
 | `journal dump <JOURNAL> [--json]`                                                                                             | Print every committed journal record, oldest first.                                                                                                                                                                                                        |
 | `journal replay <DATA_DIR> --out DIR`                                                                                         | Replay the journal and write `spike_clusters.npy`, `cluster_group.tsv`, `curation.json` into `DIR`.                                                                                                                                                        |
 | `export-phy <DATA_DIR> --out DIR [--copy-raw]`                                                                                | Write the curated data as a complete phy directory into `DIR`, from any backend; see [Exporting a phy directory](../usage/saving.md#exporting-a-phy-directory).                                                                                            |
@@ -94,6 +95,45 @@ a Codex `[mcp_servers.sorrel]` TOML block, or an `mcpServers` JSON block.
 
 `sorrel agent-guide` prints a primer for LLM agents, including the live
 command list, the MCP tools and the running hosts.
+`sorrel agent-guide --prompt review` prints only the review prompt exactly as
+the MCP `review` prompt serves it. Setting `SORREL_RUBRIC` or `SORREL_REVIEW`
+(a file path, or the text itself) overrides the rubric or the review
+instructions for `sorrel mcp`, `sorrel auto --llm` and this command.
+
+## Blind bench
+
+`sorrel blind <DATA_DIR> --input <IN> --truth <TRUTH>` splits a curated session
+into a double-blind pair. `IN` is the sorter's own output, an allowlist of the
+root files (`spike_*`, `templates`, `channel_*`, `pc_features` and the like, and
+`params.py`) with the raw recording and its `.ch`/`.meta` inside it as regular
+files under their own names (`params.py` is pointed at them), so nothing in `IN`
+leads back to `DATA_DIR`. Files under 64 MiB are copied, larger ones hard-linked
+(a copy where that fails). The sorter's `cluster_KSLabel/ContamPct/Amplitude.tsv`
+are rewritten to the root cluster ids. There is no journal, other `cluster_*`
+file, `curation.json`, `phy.log`, `sorrel_auto/`, `.phy/`, `mcp/`, `.sorrel/` or
+`sorrel_original/`, and `spike_clusters.npy` is checked against the journal's
+baseline hash. `TRUTH`
+holds the journal head (`spike_clusters.npy`, `cluster_group.tsv`,
+`curation.json`) and `provenance.json` (edits by actor and method, `pure_manual`,
+`anchored`, journal hash, seal state). Both directories must be empty or absent.
+
+With `--phy-curated` the session is a Kilosort sort curated in phy instead:
+`spike_templates.npy` (which phy never rewrites) becomes `IN`'s
+`spike_clusters.npy`, and `TRUTH` takes the top-level `spike_clusters.npy` and
+`cluster_group.tsv`. `phy.log`, which lists the human's merges, is never copied.
+phy keeps no actor history, so `provenance.json` assumes the curation is manual
+unless `DATA_DIR` holds a sorrel journal, `sorrel_original/` or `sorrel_auto/`
+(then `pure_manual` is false and `anchored` true). `curated` is false, with a
+warning, when `spike_clusters.npy` equals `spike_templates.npy` and the labels are
+the sorter's.
+`DATA_DIR` is only read. If params.py names a `dat_path` that doesn't exist,
+the copy points at the recording of the same name next to it.
+
+`sorrel diff <TRUTH> <TEST> --root <IN> [--json] [--match 0.8] [--min-spikes 10]
+[--disputed FILE]` scores a curation of `IN` against the truth spike by spike:
+unit recovery (Jaccard at least `--match` and the same label), root-cluster label
+agreement, merge pairs, splits, noise exclusion and ARI. Misses are keyed by
+root cluster id; `--disputed` lists root ids (one per line) to leave out.
 
 ## Completions
 

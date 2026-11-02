@@ -1,6 +1,7 @@
 //! sorrel-data: the monomorphised core. `Session<P>` is generic over a
 //! `DataProvider`, so the entire state machine specialises per backend.
 
+pub mod blind;
 pub mod brief;
 pub mod cache;
 pub mod cluster_index;
@@ -29,6 +30,7 @@ pub mod session;
 pub mod spike_depth;
 pub mod suggest;
 
+pub use blind::{provenance, write_blind_input, write_phy_curated_pair, Provenance};
 pub use brief::{quantise, render_brief, BriefOpts, Flag, FLAGS};
 pub use cache::correlograms::{acg_or_compute, ccg_or_compute};
 pub use cluster_index::{ClusterIndex, MergeRecord, SplitRecord};
@@ -61,9 +63,9 @@ pub use report::{render_cluster_svgs, render_report, write_report, ClusterSvgs, 
 pub use rules::{apply_rules, Rule, RuleSet};
 pub use save::{save_and_seal, save_session, save_to_phy};
 pub use serve::{
-    actor_name, attach, call_once, handle_line, list_hosts, read_mcp_json, serve, spawn_listener,
-    tool_list, user_dir, Env, HostRecord, ListenerHandle, SharedSelection, Ui, PROTOCOL_VERSION,
-    RUBRIC,
+    actor_name, attach, call_once, effective_prompts, handle_line, list_hosts, prompt_rev,
+    read_mcp_json, review_prompt, serve, spawn_listener, tool_list, user_dir, Env, HostRecord,
+    ListenerHandle, SharedSelection, Ui, PROTOCOL_VERSION, RUBRIC,
 };
 pub use session::Session;
 pub use spike_depth::{pc_weighted_depth, spike_depths, DepthSource, SpikeDepths};

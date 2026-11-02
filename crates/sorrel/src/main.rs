@@ -99,7 +99,12 @@ enum Cmd {
     },
     /// Print a primer for LLM agents, with the live command list, MCP tools
     /// and running hosts
-    AgentGuide,
+    AgentGuide {
+        /// Print only the effective text of this MCP prompt (`review`, alias
+        /// `triage`), as `prompts/get` serves it, instead of the primer
+        #[arg(long, value_name = "NAME", value_parser = ["review", "triage"])]
+        prompt: Option<String>,
+    },
     /// Print a shell completion script
     Completions { shell: clap_complete::Shell },
     /// Windows: add a Start-menu shortcut to `sorrelw.exe` (`--remove` deletes it)
@@ -228,12 +233,48 @@ enum Cmd {
         #[command(subcommand)]
         sub: Option<McpCmd>,
     },
-    /// Compare two cluster_group.tsv files: confusion table, kappa, disagreements
+    /// Compare two cluster_group.tsv files (confusion table, kappa,
+    /// disagreements), or with `--root`, two curated directories spike by
+    /// spike (the bench score)
     Diff {
+        /// cluster_group.tsv, or the truth directory
         a: PathBuf,
+        /// cluster_group.tsv, or the directory under test
         b: PathBuf,
         #[arg(long)]
         json: bool,
+        /// Directory mode: the sort both started from (a `sorrel blind` input)
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Directory mode: minimum Jaccard overlap to count a unit as recovered
+        #[arg(long = "match", value_name = "JACCARD", default_value_t = 0.8)]
+        match_jaccard: f64,
+        /// Directory mode: root clusters with fewer spikes are left out of the
+        /// merge and split scores
+        #[arg(long, value_name = "N", default_value_t = 10)]
+        min_spikes: usize,
+        /// Directory mode: root cluster ids (one per line) to leave out of scoring
+        #[arg(long, value_name = "FILE")]
+        disputed: Option<PathBuf>,
+    },
+    /// Write a double-blind bench pair from a curated session: --input is the
+    /// sorter's output with no curation, --truth the curated head plus
+    /// provenance.json
+    Blind {
+        #[command(flatten)]
+        open: OpenArgs,
+        /// Blind input directory (must be empty or absent)
+        #[arg(long, value_name = "DIR")]
+        input: PathBuf,
+        /// Truth directory: spike_clusters.npy, cluster_group.tsv, curation.json
+        /// and provenance.json of the head
+        #[arg(long, value_name = "DIR")]
+        truth: PathBuf,
+        /// The sort was curated in phy, not sorrel: spike_templates.npy is the
+        /// sorter's clustering, spike_clusters.npy and cluster_group.tsv the
+        /// human's. DATA_DIR is only read.
+        #[arg(long)]
+        phy_curated: bool,
     },
     /// Inspect or replay a curation journal
     Journal {
@@ -978,6 +1019,51 @@ impl SessionVisitor for Replay {
     }
 }
 
+/// `sorrel blind`: the double-blind bench pair of a curated session.
+struct Blind {
+    dat: Option<PathBuf>,
+    input: PathBuf,
+    truth: PathBuf,
+}
+impl SessionVisitor for Blind {
+    fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
+    where
+        P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
+    {
+        if !ctx.reseal_on_save {
+            bail!("sorrel blind supports phy/Kilosort directories");
+        }
+        let session = seeded(session, seed)?;
+        if self.truth.exists() && std::fs::read_dir(&self.truth)?.next().is_some() {
+            bail!("{} is not empty", self.truth.display());
+        }
+        let files = sorrel_data::write_blind_input(
+            &ctx.save_dir,
+            self.dat.as_deref(),
+            &self.input,
+            "spike_clusters.npy",
+            session.journal().baseline(),
+        )?;
+        std::fs::create_dir_all(&self.truth)
+            .with_context(|| format!("create {}", self.truth.display()))?;
+        save_to_phy(&session, &self.truth, phy_label_str)?;
+        let prov = sorrel_data::provenance(&session)?;
+        std::fs::write(
+            self.truth.join("provenance.json"),
+            serde_json::to_vec_pretty(&prov)?,
+        )?;
+        println!(
+            "blind input {} ({} files), truth {} (pure_manual {}, anchored {})",
+            self.input.display(),
+            files.len(),
+            self.truth.display(),
+            prov.pure_manual,
+            prov.anchored
+        );
+        Ok(())
+    }
+}
+
 #[cfg(feature = "phy-export")]
 struct ExportPhy {
     out: PathBuf,
@@ -1211,6 +1297,8 @@ fn run_auto_sidecar(open: &OpenArgs, out: &Path, flags: &[String]) -> Result<()>
     args.extend(shared.iter().map(Into::into));
     args.extend(flags.iter().map(Into::into));
 
+    // One prompt source with the MCP `review` prompt; a path override is resolved to text.
+    let (rubric, _) = serve::effective_prompts()?;
     let uv = std::env::var_os("PATH").is_some_and(|path| uv_on_path(&path));
     let mut cmd = if uv && std::env::var_os("SORREL_PYTHON").is_none() {
         let mut c = std::process::Command::new("uv");
@@ -1227,6 +1315,8 @@ fn run_auto_sidecar(open: &OpenArgs, out: &Path, flags: &[String]) -> Result<()>
         .args(&args)
         .env("SORREL_BIN", std::env::current_exe()?)
         .env("SORREL_OPEN_ARGS", serde_json::to_string(&brief_args)?)
+        .env("SORREL_RUBRIC", rubric)
+        .env("SORREL_PROMPT_REV", serve::prompt_rev()?)
         .status()
         .context("spawn the sorrel_auto.py sidecar (install uv, or set SORREL_PYTHON)")?;
     if !status.success() {
@@ -1442,6 +1532,23 @@ fn diff_tsvs(a: &Path, b: &Path, json: bool) -> Result<()> {
     let read =
         |p: &Path| read_cluster_group_tsv(p).with_context(|| format!("read {}", p.display()));
     let d = diff_labels(&read(a)?, &read(b)?);
+    if json {
+        serde_json::to_writer_pretty(std::io::stdout().lock(), &d)?;
+        println!();
+    } else {
+        print!("{}", d.render());
+    }
+    Ok(())
+}
+
+fn diff_dirs(
+    truth: &Path,
+    test: &Path,
+    root: &Path,
+    opts: &sorrel_data::diff::SpikeDiffOpts,
+    json: bool,
+) -> Result<()> {
+    let d = sorrel_data::diff::diff_dirs(truth, test, root, opts)?;
     if json {
         serde_json::to_writer_pretty(std::io::stdout().lock(), &d)?;
         println!();
@@ -2118,8 +2225,11 @@ fn main() -> Result<()> {
             args,
             raw,
         }) => run_call(&open, &tool, args.as_deref(), raw),
-        Some(Cmd::AgentGuide) => {
-            print!("{}", agent_guide());
+        Some(Cmd::AgentGuide { prompt }) => {
+            match prompt {
+                Some(_) => print!("{}", serve::review_prompt()?),
+                None => print!("{}", agent_guide()),
+            }
             Ok(())
         }
         Some(Cmd::Completions { shell }) => {
@@ -2206,7 +2316,60 @@ fn main() -> Result<()> {
                 },
             )
         }
-        Some(Cmd::Diff { a, b, json }) => diff_tsvs(&a, &b, json),
+        Some(Cmd::Diff {
+            a,
+            b,
+            json,
+            root,
+            match_jaccard,
+            min_spikes,
+            disputed,
+        }) => match (root, a.is_dir() && b.is_dir()) {
+            (Some(root), true) => {
+                let opts = sorrel_data::diff::SpikeDiffOpts {
+                    match_jaccard,
+                    min_spikes,
+                    disputed: disputed
+                        .map(|p| sorrel_data::diff::read_disputed(&p))
+                        .transpose()?
+                        .unwrap_or_default(),
+                    ..Default::default()
+                };
+                diff_dirs(&a, &b, &root, &opts, json)
+            }
+            (None, false) if disputed.is_none() => diff_tsvs(&a, &b, json),
+            _ => bail!("sorrel diff: two directories need --root DIR; two files take no --root or --disputed"),
+        },
+        Some(Cmd::Blind {
+            open,
+            input,
+            truth,
+            phy_curated: true,
+        }) => {
+            let dir = open
+                .root
+                .as_deref()
+                .context("sorrel blind --phy-curated needs DATA_DIR")?;
+            let files =
+                sorrel_data::write_phy_curated_pair(dir, open.dat.as_deref(), &input, &truth)?;
+            println!(
+                "blind input {} ({} files), truth {} (phy-curated)",
+                input.display(),
+                files.len(),
+                truth.display()
+            );
+            Ok(())
+        }
+        Some(Cmd::Blind {
+            open, input, truth, ..
+        }) => with_session(
+            &open,
+            Blind {
+                dat: open.dat.clone(),
+                input,
+                truth,
+            },
+        ),
         Some(Cmd::Mcp { open, sub }) => match (sub, open.root.is_some()) {
             (Some(McpCmd::Tools { json }), _) => mcp_tools(json),
             (Some(McpCmd::Config { client, dir }), _) => mcp_config(client, dir),
@@ -2461,7 +2624,7 @@ mod tests {
         ));
         assert!(matches!(
             parse(&["agent-guide"]).unwrap().cmd,
-            Some(Cmd::AgentGuide)
+            Some(Cmd::AgentGuide { prompt: None })
         ));
     }
 
