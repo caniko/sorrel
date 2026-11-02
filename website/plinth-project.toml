@@ -4,6 +4,19 @@ description = "Native spike-sorting curation: a high-performance GUI for manual 
 base_url = "/"
 canonical_domain = "sorrel.tartanoglu.com"
 footer_note = "Sorrel is open-source software licensed under MIT OR Apache-2.0."
+stylesheets = ["/site.css"]
+favicon = "/sorrel.svg"
+og_image = "/showcase/social.png"
+
+[theme]
+paper = "#0d1117"
+surface = "#161b22"
+accent = "#59a14f"
+accent_soft = "rgba(89, 161, 79, 0.16)"
+secondary = "#4e79a7"
+warning = "#f28e2b"
+font_family = "Inter"
+font_url = "/fonts/InterVariable-latin.woff2"
 
 [[nav]]
 label = "Gallery"
@@ -16,6 +29,11 @@ href = "/docs/"
 [[nav]]
 label = "Source"
 href = "https://github.com/caniko/sorrel"
+
+[[nav]]
+label = "Download"
+href = "https://github.com/caniko/sorrel/releases/latest"
+primary = true
 
 [[footer_links]]
 label = "Docs"
@@ -38,40 +56,56 @@ source = "../assets/icon/sorrel.svg"
 target = "sorrel.svg"
 
 [[assets]]
-source = "../assets/showcase/hero.webp"
-target = "showcase/hero.webp"
+source = "site.css"
+target = "site.css"
 
 [[assets]]
-source = "../assets/showcase/wide_shell.webp"
-target = "showcase/wide_shell.webp"
+source = "fonts/InterVariable-latin.woff2"
+target = "fonts/InterVariable-latin.woff2"
 
 [[assets]]
-source = "../assets/showcase/features_3d_maximized.webp"
-target = "showcase/features_3d_maximized.webp"
+source = "fonts/Inter-OFL.txt"
+target = "fonts/Inter-OFL.txt"
 
 [[assets]]
-source = "../assets/showcase/waveforms_feature_link.webp"
-target = "showcase/waveforms_feature_link.webp"
+source = "../assets/showcase/hero-loop.webp"
+target = "showcase/hero-loop.webp"
 
 [[assets]]
-source = "../assets/showcase/features_kmeans_collision.webp"
-target = "showcase/features_kmeans_collision.webp"
+source = "../assets/showcase/hero-still.webp"
+target = "showcase/hero-still.webp"
 
 [[assets]]
-source = "../assets/showcase/xtalk_isi_whatif_split.webp"
-target = "showcase/xtalk_isi_whatif_split.webp"
+source = "../assets/showcase/hero-mobile.webp"
+target = "showcase/hero-mobile.webp"
 
 [[assets]]
-source = "../assets/showcase/dense_features.webp"
-target = "showcase/dense_features.webp"
+source = "../assets/showcase/social.png"
+target = "showcase/social.png"
 
 [[assets]]
-source = "../assets/showcase/proposals_pane.webp"
-target = "showcase/proposals_pane.webp"
+source = "../assets/showcase/gallery-3d.webp"
+target = "showcase/gallery-3d.webp"
 
 [[assets]]
-source = "../assets/showcase/history_branch.webp"
-target = "showcase/history_branch.webp"
+source = "../assets/showcase/gallery-kmeans.webp"
+target = "showcase/gallery-kmeans.webp"
+
+[[assets]]
+source = "../assets/showcase/gallery-isi-whatif.webp"
+target = "showcase/gallery-isi-whatif.webp"
+
+[[assets]]
+source = "../assets/showcase/gallery-probe.webp"
+target = "showcase/gallery-probe.webp"
+
+[[assets]]
+source = "../assets/showcase/gallery-proposals.webp"
+target = "showcase/gallery-proposals.webp"
+
+[[assets]]
+source = "../assets/showcase/gallery-history.webp"
+target = "showcase/gallery-history.webp"
 
 [[pages]]
 slug = "index"
@@ -80,69 +114,59 @@ description = "Native spike-sorting curation: a high-performance GUI for manual 
 
 [[pages.sections]]
 type = "hero"
-logo_src = "/sorrel.svg"
-eyebrow = "Spike-sorting curation"
-title = "Sorrel"
-tagline = "Native spike-sorting curation"
-subtitle = "A high-performance GUI for manual curation of spike-sorted electrophysiology data. phy / Kilosort, SpikeInterface, NWB, and KS4 rez out of the box, with a monomorphised Rust core, wgpu compute, and a durable append-only journal."
-preview_src = "/showcase/hero.webp"
-preview_alt = "The Sorrel workspace: a 40-cluster table beside waveform, CCG, quality, trace, and raster views, with a 3D feature cloud and a probe map floating alongside."
-note = "Downloads: GitHub releases, winget install Caniko.Sorrel, choco install sorrel. The code signing policy is linked in the footer."
+title = "Curate spike sorts at native speed."
+tagline = "Open phy, Kilosort, SpikeInterface or NWB output. Merge, split and label clusters against waveforms, features, correlograms and rasters. Every edit is journaled, and nothing is lost."
+subtitle = ""
+preview_src = "/showcase/hero-loop.webp"
+preview_still = "/showcase/hero-still.webp"
+preview_mobile_src = "/showcase/hero-mobile.webp"
+preview_alt = "Sorrel's waveform and feature views: a lasso drawn around a cloud of spikes lights the same spikes up in the waveforms, then the selection moves through the 3D feature space and the time brush."
+note = "winget install Caniko.Sorrel  ·  choco install sorrel"
 
 [[pages.sections.ctas]]
-label = "Get started"
-href = "/docs/"
+label = "Download"
+href = "https://github.com/caniko/sorrel/releases/latest"
 primary = true
 
 [[pages.sections.ctas]]
-label = "View source"
-href = "https://github.com/caniko/sorrel"
+label = "Documentation"
+href = "/docs/"
 
 [[pages.sections]]
 type = "screenshot_grid"
 id = "gallery"
 heading = "See it work"
-intro = "Every screenshot is rendered headlessly from the app's own UI tests, so what you see is what Sorrel draws."
+intro = "Every image is rendered headlessly from Sorrel's own UI tests, so what you see is what Sorrel draws."
 
 [[pages.sections.screenshots]]
-src = "/showcase/wide_shell.webp"
-alt = "The full Sorrel workspace with a 40-cluster table, waveforms, CCG, quality metrics, trace, and raster panes"
-caption = "The workspace: cluster table, waveforms, CCG, quality, trace, and raster in one window"
+src = "/showcase/gallery-3d.webp"
+alt = "A 3D feature space: two clusters as point clouds inside a wireframe cube, a lasso prism around a brushed group, and the list of candidate third axes"
+caption = "3D feature space: orbit the clusters, pick a third axis, and lasso a prism through them"
 
 [[pages.sections.screenshots]]
-src = "/showcase/features_3d_maximized.webp"
-alt = "The feature view maximised, showing a grid of principal-component plots and a 3D point cloud"
-caption = "Feature view, maximised: a PC grid and a 3D cloud over a chosen third axis"
+src = "/showcase/gallery-kmeans.webp"
+alt = "A k-means split of one cluster into numbered parts, with a collision matrix showing how much the parts overlap"
+caption = "K-means split with a collision matrix, so you see overlap before you commit"
 
 [[pages.sections.screenshots]]
-src = "/showcase/waveforms_feature_link.webp"
-alt = "A lasso drawn in the feature view, with the brushed spikes highlighted in the waveform view"
-caption = "Lasso spikes in the feature view and watch them light up in the waveforms"
+src = "/showcase/gallery-isi-whatif.webp"
+alt = "Waveforms of a proposed split beside an ISI histogram that shows the inside and outside groups separately"
+caption = "ISI what-if: see how a split changes refractory violations before you make it"
 
 [[pages.sections.screenshots]]
-src = "/showcase/features_kmeans_collision.webp"
-alt = "The feature view with a k-means split into numbered parts and a collision matrix over a grid of PC scatter plots"
-caption = "K-means split with a collision matrix to check for overlapping spikes"
+src = "/showcase/gallery-probe.webp"
+alt = "A probe map of 16 channels with two selected channels marked A and B, beside the feature navigator"
+caption = "Probe map and feature navigator: click channels, see their features"
 
 [[pages.sections.screenshots]]
-src = "/showcase/xtalk_isi_whatif_split.webp"
-alt = "The ISI view overlaying a proposed split, with refractory-violation rates for the inside and outside groups shown in the Quality table"
-caption = "ISI what-if: see how a split changes refractory violations before you commit it"
+src = "/showcase/gallery-proposals.webp"
+alt = "The proposals pane with an agent's merge and relabel suggestions, each with its evidence and Accept and Reject buttons"
+caption = "Agent proposals arrive with their evidence, and nothing changes until you accept"
 
 [[pages.sections.screenshots]]
-src = "/showcase/dense_features.webp"
-alt = "A probe map next to the feature navigator for a dense recording"
-caption = "Probe map and feature navigator for dense probes"
-
-[[pages.sections.screenshots]]
-src = "/showcase/proposals_pane.webp"
-alt = "The proposals pane listing agent merge and relabel suggestions with Accept and Reject buttons"
-caption = "Agent merge and relabel proposals, each with Accept and Reject"
-
-[[pages.sections.screenshots]]
-src = "/showcase/history_branch.webp"
+src = "/showcase/gallery-history.webp"
 alt = "The History pane showing a branching curation journal with entries from you and an agent"
-caption = "Branching curation history: go back to any row, nothing is ever discarded"
+caption = "Branching history: go back to any point, and nothing is ever discarded"
 
 [[pages.sections]]
 type = "feature_grid"
@@ -158,8 +182,8 @@ title = "Multiple backends"
 description = "phy / Kilosort, SpikeInterface SortingAnalyzer (binary folder), Kilosort 4 rez.mat, and NWB. SpikeGLX, Open Ephys, and MDA work as raw trace sources."
 
 [[pages.sections.features]]
-title = "Static-dispatch core"
-description = "Session, UI, render, and compute paths are generic over the DataProvider trait. Every hot path is monomorphised per backend, no Box<dyn Trait>."
+title = "Fast on every format"
+description = "Each data format gets its own compiled fast path: drawing, downsampling and journaling never go through a runtime lookup."
 
 [[pages.sections.features]]
 title = "GPU trace pipeline"
@@ -205,15 +229,14 @@ description = "SpikeGLX .bin+.meta, Open Ephys continuous.dat+structure.oebin, a
 [[pages.sections]]
 type = "install"
 id = "install"
-heading = "Build & run"
-intro = "Compile the release binary, then point it at a sorting directory (for example, sorrel my_run/phy). Sorrel auto-detects the backend."
+heading = "Install"
+intro = "Prebuilt binaries for Linux, macOS and Windows on every release. Point Sorrel at a sorting directory (sorrel open my_run/phy) and it detects the backend."
 guide_href = "/docs/getting-started/installation.html"
 
 [[pages.sections.primary_routes]]
-label = "Build from source"
-audience = "Cargo, all platforms"
-href = "/docs/getting-started/installation.html#with-cargo"
-command = "cargo build --release -p sorrel"
+label = "Download a release"
+audience = "Linux (AppImage, tar.gz), macOS (Apple silicon), Windows (.exe, .zip)"
+href = "https://github.com/caniko/sorrel/releases/latest"
 recommended = true
 
 [[pages.sections.secondary_routes]]
@@ -229,6 +252,7 @@ href = "/docs/getting-started/installation.html#windows"
 command = "choco install sorrel"
 
 [[pages.sections.secondary_routes]]
-label = "GitHub releases"
-audience = "Prebuilt binaries"
-href = "https://github.com/caniko/sorrel/releases"
+label = "Build from source"
+audience = "Cargo, all platforms"
+href = "/docs/getting-started/installation.html#with-cargo"
+command = "cargo build --release -p sorrel"

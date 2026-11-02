@@ -522,17 +522,17 @@
     "plinth": {
       "flake": false,
       "locked": {
-        "lastModified": 1792264902,
-        "narHash": "sha256-jVORzmyKgCmbwqR/XTAHjKGNJJOqN7V77VGkNcqPjeI=",
+        "lastModified": 1793577746,
+        "narHash": "sha256-mwihfhgrdKYwwnBEhCGdVCq3qnKmZQNXYM7ez0qrEE0=",
         "ref": "trunk",
-        "rev": "e02e06eace3fc87d1d951cc49d460c35ef8ca8ad",
-        "revCount": 399,
+        "rev": "29874c37500a813763bc2d49bcb9c3faaa77fb49",
+        "revCount": 404,
         "type": "git",
         "url": "https://github.com/caniko/plinth.git"
       },
       "original": {
         "ref": "trunk",
-        "rev": "e02e06eace3fc87d1d951cc49d460c35ef8ca8ad",
+        "rev": "29874c37500a813763bc2d49bcb9c3faaa77fb49",
         "type": "git",
         "url": "https://github.com/caniko/plinth.git"
       }
