@@ -15,8 +15,15 @@
     nixpkgs.follows = "harbor-rs/nixpkgs";
     rust-overlay.follows = "harbor-rs/rust-overlay";
     flake-utils.url = "github:numtide/flake-utils";
-    treefmt-nix.follows = "harbor-rs/treefmt-nix";
-    git-hooks.follows = "harbor-rs/git-hooks";
+    # harbor-rs keeps these in its dev partition, out of its public inputs.
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    git-hooks = {
+      url = "github:cachix/git-hooks.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
     # Static project-site generator for the landing page (built via crane below).
     plinth = {
@@ -150,7 +157,7 @@
             push_branches = ["trunk"];
             timeout_minutes = 120;
             # The simit that generated the workflows; vars.SIMIT_CI_ENGINE_REVISION overrides.
-            engine_revision = "0e0a1b3153649aa22148540bf87eff3d7dbf6bb4";
+            engine_revision = "bb75df673d9397e31e1fe8eb9108934364458ae1";
           };
         };
         # Linux closures only: the darwin build depends on the private macOS

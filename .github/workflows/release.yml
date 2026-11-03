@@ -299,6 +299,8 @@ jobs:
           }
           promote "sorrel-${VERSION}-x86_64-windows.zip" "sorrel.exe" "sorrel-${VERSION}-x86_64-windows.exe"
           promote "sorrel-${VERSION}-x86_64-windows.zip" "sorrelw.exe" "sorrel-${VERSION}-x86_64-windows-gui.exe"
+          promote "sorrel-${VERSION}-aarch64-windows.zip" "sorrel.exe" "sorrel-${VERSION}-aarch64-windows.exe"
+          promote "sorrel-${VERSION}-aarch64-windows.zip" "sorrelw.exe" "sorrel-${VERSION}-aarch64-windows-gui.exe"
           SCRIPT
       - name: Generate release checksums
         run: |
@@ -314,6 +316,8 @@ jobs:
           add_matches '*.whl'
           files+=("sorrel-${VERSION}-x86_64-windows.exe")
           files+=("sorrel-${VERSION}-x86_64-windows-gui.exe")
+          files+=("sorrel-${VERSION}-aarch64-windows.exe")
+          files+=("sorrel-${VERSION}-aarch64-windows-gui.exe")
           : > SHA256SUMS.txt
           count=0
           while IFS= read -r file; do
@@ -360,6 +364,8 @@ jobs:
           files=(release/*.tar.gz release/*.zip release/*.AppImage release/*.deb release/*.src.rpm release/*.exe)
           files+=("release/sorrel-${VERSION}-x86_64-windows.exe")
           files+=("release/sorrel-${VERSION}-x86_64-windows-gui.exe")
+          files+=("release/sorrel-${VERSION}-aarch64-windows.exe")
+          files+=("release/sorrel-${VERSION}-aarch64-windows-gui.exe")
           while IFS= read -r file; do
             [ -f "$file" ] || continue
             artifact_sha="$(sha256sum "$file" | awk '{print $1}')"; predicate="$(mktemp)"
@@ -408,6 +414,8 @@ jobs:
           add_matches 'release/*.whl'
           files+=("release/sorrel-${VERSION}-x86_64-windows.exe")
           files+=("release/sorrel-${VERSION}-x86_64-windows-gui.exe")
+          files+=("release/sorrel-${VERSION}-aarch64-windows.exe")
+          files+=("release/sorrel-${VERSION}-aarch64-windows-gui.exe")
           while IFS= read -r file; do
             [ -f "$file" ] || continue
             name=$(basename "$file")
@@ -495,8 +503,10 @@ jobs:
           }
           if [ -z "${WINGET_PAT:-}" ]; then publisher_missing winget 'WINGET_PAT unset'; fi
           ZIP_NAME="sorrel-${VERSION}-x86_64-windows.zip"; ZIP_URL="https://github.com/caniko/sorrel/releases/download/${TAG}/${ZIP_NAME}"
+          ARM64_ZIP_NAME="sorrel-${VERSION}-aarch64-windows.zip"; ARM64_ZIP_URL="https://github.com/caniko/sorrel/releases/download/${TAG}/${ARM64_ZIP_NAME}"
           test -s "release/${ZIP_NAME}" || publisher_missing winget "missing release/${ZIP_NAME}"
-          export ZIP_NAME ZIP_URL VERSION WINGET_PAT PUBLISH_WINGET_STATE
+          test -s "release/${ARM64_ZIP_NAME}" || publisher_missing winget "missing release/${ARM64_ZIP_NAME}"
+          export ZIP_NAME ZIP_URL ARM64_ZIP_NAME ARM64_ZIP_URL VERSION WINGET_PAT PUBLISH_WINGET_STATE
           case "${PUBLISH_WINGET_STATE:-}" in active-required|inactive-soft) ;; *) echo "::error::winget: winget-pkgs probe was inconclusive (${PUBLISH_WINGET_STATE:-unset}); not guessing between a new version and a first submission." >&2; exit 1 ;; esac
           nix shell nixpkgs#curl nixpkgs#jq -c bash <<'SCRIPT' || publisher_missing winget 'GitHub API submission failed'
           set -euo pipefail
@@ -509,8 +519,9 @@ jobs:
           hdr() { printf '# yaml-language-server: $schema=https://aka.ms/winget-manifest.%s.1.12.0.schema.json\n# Created with simit\n\n' "$1"; }
           dir="$tmpdir/"'manifests/c/Caniko/Sorrel'"/$VERSION"; mkdir -p "$dir"
           sha="$(sha256sum "release/${ZIP_NAME}" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')"
+          sha_arm64="$(sha256sum "release/${ARM64_ZIP_NAME}" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')"
           { hdr version; f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'DefaultLocale: en-US'; echo 'ManifestType: version'; echo 'ManifestVersion: 1.12.0'; } > "$dir"/'Caniko.Sorrel'.yaml
-          { hdr installer; f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'InstallerType: zip'; echo 'NestedInstallerType: portable'; echo 'Dependencies:'; echo '  PackageDependencies:'; printf '%s\n' "  - PackageIdentifier: $(yaml 'astral-sh.uv')" ; echo 'Installers:'; echo '- Architecture: x64'; echo '  NestedInstallerFiles:'; printf '%s\n' "  - RelativeFilePath: $(yaml 'sorrel.exe')" "    PortableCommandAlias: $(yaml 'sorrel')" "  - RelativeFilePath: $(yaml 'sorrelw.exe')"; printf '%s\n' "  InstallerUrl: $(yaml "$ZIP_URL")" "  InstallerSha256: $sha"; echo 'ManifestType: installer'; echo 'ManifestVersion: 1.12.0'; } > "$dir"/'Caniko.Sorrel'.installer.yaml
+          { hdr installer; f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'InstallerType: zip'; echo 'NestedInstallerType: portable'; echo 'Dependencies:'; echo '  PackageDependencies:'; printf '%s\n' "  - PackageIdentifier: $(yaml 'astral-sh.uv')" ; echo 'Installers:'; echo '- Architecture: x64'; echo '  NestedInstallerFiles:'; printf '%s\n' "  - RelativeFilePath: $(yaml 'sorrel.exe')" "    PortableCommandAlias: $(yaml 'sorrel')" "  - RelativeFilePath: $(yaml 'sorrelw.exe')"; printf '%s\n' "  InstallerUrl: $(yaml "$ZIP_URL")" "  InstallerSha256: $sha"; echo '- Architecture: arm64'; echo '  NestedInstallerFiles:'; printf '%s\n' "  - RelativeFilePath: $(yaml 'sorrel.exe')" "    PortableCommandAlias: $(yaml 'sorrel')" "  - RelativeFilePath: $(yaml 'sorrelw.exe')"; printf '%s\n' "  InstallerUrl: $(yaml "$ARM64_ZIP_URL")" "  InstallerSha256: $sha_arm64"; echo 'ManifestType: installer'; echo 'ManifestVersion: 1.12.0'; } > "$dir"/'Caniko.Sorrel'.installer.yaml
           { hdr defaultLocale; f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'PackageLocale: en-US'; f Publisher 'Caniko'; f PublisherUrl 'https://github.com/caniko'; f PackageName 'Sorrel'; f PackageUrl 'https://github.com/caniko/sorrel'; f License 'MIT OR Apache-2.0'; f LicenseUrl 'https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT'; f ShortDescription 'Native GUI for curating spike-sorted electrophysiology data'; echo 'ManifestType: defaultLocale'; echo 'ManifestVersion: 1.12.0'; } > "$dir"/'Caniko.Sorrel'.locale.en-US.yaml
           # Submit the manifests in "$dir" to microsoft/winget-pkgs through the GitHub
           # REST API as the WINGET_PAT user. Needs curl and jq.
@@ -881,7 +892,7 @@ jobs:
           test -s keys/minisign.pub
           minisign -V -m release/SHA256SUMS.txt -x release/SHA256SUMS.txt.minisig -p keys/minisign.pub
           need=()
-          case ",$REPUBLISH_CHANNELS," in *,winget,*) need+=("sorrel-${VERSION}-x86_64-windows.zip"); ;; esac
+          case ",$REPUBLISH_CHANNELS," in *,winget,*) need+=("sorrel-${VERSION}-x86_64-windows.zip"); need+=("sorrel-${VERSION}-aarch64-windows.zip"); ;; esac
           case ",$REPUBLISH_CHANNELS," in *,pypi,*) need+=("*.whl"); ;; esac
           case ",$REPUBLISH_CHANNELS," in *,chocolatey,*) need+=("sorrel-${VERSION}-x86_64-windows.zip"); ;; esac
           mapfile -t listed < <(awk '{print $2}' release/SHA256SUMS.txt)
@@ -977,8 +988,10 @@ jobs:
           }
           if [ -z "${WINGET_PAT:-}" ]; then publisher_missing winget 'WINGET_PAT unset'; fi
           ZIP_NAME="sorrel-${VERSION}-x86_64-windows.zip"; ZIP_URL="https://github.com/caniko/sorrel/releases/download/${TAG}/${ZIP_NAME}"
+          ARM64_ZIP_NAME="sorrel-${VERSION}-aarch64-windows.zip"; ARM64_ZIP_URL="https://github.com/caniko/sorrel/releases/download/${TAG}/${ARM64_ZIP_NAME}"
           test -s "release/${ZIP_NAME}" || publisher_missing winget "missing release/${ZIP_NAME}"
-          export ZIP_NAME ZIP_URL VERSION WINGET_PAT PUBLISH_WINGET_STATE
+          test -s "release/${ARM64_ZIP_NAME}" || publisher_missing winget "missing release/${ARM64_ZIP_NAME}"
+          export ZIP_NAME ZIP_URL ARM64_ZIP_NAME ARM64_ZIP_URL VERSION WINGET_PAT PUBLISH_WINGET_STATE
           case "${PUBLISH_WINGET_STATE:-}" in active-required|inactive-soft) ;; *) echo "::error::winget: winget-pkgs probe was inconclusive (${PUBLISH_WINGET_STATE:-unset}); not guessing between a new version and a first submission." >&2; exit 1 ;; esac
           nix shell nixpkgs#curl nixpkgs#jq -c bash <<'SCRIPT' || publisher_missing winget 'GitHub API submission failed'
           set -euo pipefail
@@ -991,8 +1004,9 @@ jobs:
           hdr() { printf '# yaml-language-server: $schema=https://aka.ms/winget-manifest.%s.1.12.0.schema.json\n# Created with simit\n\n' "$1"; }
           dir="$tmpdir/"'manifests/c/Caniko/Sorrel'"/$VERSION"; mkdir -p "$dir"
           sha="$(sha256sum "release/${ZIP_NAME}" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')"
+          sha_arm64="$(sha256sum "release/${ARM64_ZIP_NAME}" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')"
           { hdr version; f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'DefaultLocale: en-US'; echo 'ManifestType: version'; echo 'ManifestVersion: 1.12.0'; } > "$dir"/'Caniko.Sorrel'.yaml
-          { hdr installer; f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'InstallerType: zip'; echo 'NestedInstallerType: portable'; echo 'Dependencies:'; echo '  PackageDependencies:'; printf '%s\n' "  - PackageIdentifier: $(yaml 'astral-sh.uv')" ; echo 'Installers:'; echo '- Architecture: x64'; echo '  NestedInstallerFiles:'; printf '%s\n' "  - RelativeFilePath: $(yaml 'sorrel.exe')" "    PortableCommandAlias: $(yaml 'sorrel')" "  - RelativeFilePath: $(yaml 'sorrelw.exe')"; printf '%s\n' "  InstallerUrl: $(yaml "$ZIP_URL")" "  InstallerSha256: $sha"; echo 'ManifestType: installer'; echo 'ManifestVersion: 1.12.0'; } > "$dir"/'Caniko.Sorrel'.installer.yaml
+          { hdr installer; f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'InstallerType: zip'; echo 'NestedInstallerType: portable'; echo 'Dependencies:'; echo '  PackageDependencies:'; printf '%s\n' "  - PackageIdentifier: $(yaml 'astral-sh.uv')" ; echo 'Installers:'; echo '- Architecture: x64'; echo '  NestedInstallerFiles:'; printf '%s\n' "  - RelativeFilePath: $(yaml 'sorrel.exe')" "    PortableCommandAlias: $(yaml 'sorrel')" "  - RelativeFilePath: $(yaml 'sorrelw.exe')"; printf '%s\n' "  InstallerUrl: $(yaml "$ZIP_URL")" "  InstallerSha256: $sha"; echo '- Architecture: arm64'; echo '  NestedInstallerFiles:'; printf '%s\n' "  - RelativeFilePath: $(yaml 'sorrel.exe')" "    PortableCommandAlias: $(yaml 'sorrel')" "  - RelativeFilePath: $(yaml 'sorrelw.exe')"; printf '%s\n' "  InstallerUrl: $(yaml "$ARM64_ZIP_URL")" "  InstallerSha256: $sha_arm64"; echo 'ManifestType: installer'; echo 'ManifestVersion: 1.12.0'; } > "$dir"/'Caniko.Sorrel'.installer.yaml
           { hdr defaultLocale; f PackageIdentifier 'Caniko.Sorrel'; f PackageVersion "$VERSION"; echo 'PackageLocale: en-US'; f Publisher 'Caniko'; f PublisherUrl 'https://github.com/caniko'; f PackageName 'Sorrel'; f PackageUrl 'https://github.com/caniko/sorrel'; f License 'MIT OR Apache-2.0'; f LicenseUrl 'https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT'; f ShortDescription 'Native GUI for curating spike-sorted electrophysiology data'; echo 'ManifestType: defaultLocale'; echo 'ManifestVersion: 1.12.0'; } > "$dir"/'Caniko.Sorrel'.locale.en-US.yaml
           # Submit the manifests in "$dir" to microsoft/winget-pkgs through the GitHub
           # REST API as the WINGET_PAT user. Needs curl and jq.
