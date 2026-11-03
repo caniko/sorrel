@@ -162,6 +162,19 @@ fn a_session_a_run_and_its_score_land_in_the_results_db() {
     assert!(!tsv.status.success(), "--record on TSV mode must fail");
     ok(&record("r1"));
     ok(&record("r1")); // idempotent
+                       // Another TEST than the run's own output is not that run's score.
+    let other = sorrel(
+        t,
+        &[
+            "diff", &input, &truth, "--root", &input, "--json", "--record", "r1", "--db", &db,
+        ],
+    );
+    assert!(!other.status.success(), "a foreign TEST must be refused");
+    assert!(
+        String::from_utf8_lossy(&other.stderr).contains("not the run's recorded output"),
+        "{}",
+        String::from_utf8_lossy(&other.stderr)
+    );
 
     let q = |sql: &str| ok(&dev(&["db", "query", sql]));
     assert_eq!(q("SELECT COUNT(*) FROM runs"), "COUNT(*)\n1\n");

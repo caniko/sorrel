@@ -16,6 +16,7 @@ use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::{baseline_hash, Journal, Session};
 use sorrel_io::kilosort::PhyLabel;
 use sorrel_io::{DataProvider, HasGeometry};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Args, Debug)]
@@ -118,9 +119,16 @@ fn open_db(db: &Option<PathBuf>, deny: &Option<PathBuf>) -> Result<DevDb> {
     Ok(DevDb::open(&db_path(db.as_deref())?)?.with_deny(deny.lines().map(str::to_owned)))
 }
 
-/// `sorrel diff --record RID`: write the score of a recorded run.
-pub fn record_diff(db: Option<&Path>, rid: &str, d: &SpikeDiff) -> Result<()> {
-    open_db(&db.map(Path::to_owned), &None)?.record_diff(rid, d)
+/// `sorrel diff --record RID`: write the score of a recorded run, made against
+/// the curation in `test` with `disputed` dropped.
+pub fn record_diff(
+    db: Option<&Path>,
+    rid: &str,
+    d: &SpikeDiff,
+    test: &Path,
+    disputed: &HashSet<u32>,
+) -> Result<()> {
+    open_db(&db.map(Path::to_owned), &None)?.record_diff(rid, d, &truth_hash(test)?, disputed)
 }
 
 pub fn run(a: DevArgs) -> Result<()> {
@@ -343,6 +351,8 @@ fn record_run(db: &mut DevDb, dir: &Path, variant_dir: Option<&Path>) -> Result<
             prompt_rev: text("prompt_rev"),
             sorrel_rev: text("sorrel_rev"),
             learned_rev,
+            // The curated output `score` diffs as TEST; none (no data dir) is unknown.
+            output_hash: truth_hash(&dir.join("data")).ok(),
         },
         &arm_actions(&records, evidence.as_ref()),
     )?;

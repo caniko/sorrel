@@ -2395,7 +2395,7 @@ fn main() -> Result<()> {
                 let _score = diff_dirs(&a, &b, &root, &opts, json)?;
                 #[cfg(feature = "dev")]
                 if let Some(rid) = record {
-                    dev::record_diff(db.as_deref(), &rid, &_score)?;
+                    dev::record_diff(db.as_deref(), &rid, &_score, &b, &opts.disputed)?;
                 }
                 Ok(())
             }

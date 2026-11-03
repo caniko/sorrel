@@ -24,7 +24,7 @@ use anyhow::{bail, ensure, Context, Result};
 use rusqlite::{params, types::ValueRef, Connection, OpenFlags, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -91,8 +91,17 @@ ALTER TABLE runs ADD COLUMN state_hash TEXT;
 ALTER TABLE runs ADD COLUMN basis TEXT;
 ";
 
+/// v4: a score names the run's curated output and the options it was made with.
+/// `runs.output_hash` is the [`truth_hash`] of the run's own curation (NULL is
+/// unknown: no score until `record-run` supplies it), `runs.score_opts` the
+/// comparison settings of the stored score.
+const SCHEMA_V4: &str = "
+ALTER TABLE runs ADD COLUMN output_hash TEXT;
+ALTER TABLE runs ADD COLUMN score_opts TEXT;
+";
+
 /// `MIGRATIONS[i]` takes the schema from version `i` to `i + 1`.
-const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4];
 
 /// Brief card columns that are not numeric metrics, in exemplar-file order.
 const CARD_HEAD: [&str; 3] = ["lab", "flags", "tags"];
@@ -156,6 +165,9 @@ pub struct RunRow {
     pub prompt_rev: Option<String>,
     pub sorrel_rev: Option<String>,
     pub learned_rev: Option<String>,
+    /// [`truth_hash`] of the run's curated output (what `diff` scores as TEST);
+    /// `None` is unknown.
+    pub output_hash: Option<String>,
 }
 
 /// One edit of the arm's applied path, in order.
@@ -233,9 +245,9 @@ fn digest(v: Value) -> String {
     blake3::hash(v.to_string().as_bytes()).to_hex().to_string()
 }
 
-/// Hash of the truth a session is scored against: the bytes of `dir`'s
-/// `spike_clusters.npy` and `cluster_group.tsv`, the only files the scorer
-/// reads (a mua to unsorted edit changes it, though not the per-root summary).
+/// Hash of a curation the scorer reads (a session's truth, a run's output):
+/// the bytes of `dir`'s `spike_clusters.npy` and `cluster_group.tsv`, the only
+/// files it reads (a mua to unsorted edit changes it, though not the per-root summary).
 pub fn truth_hash(dir: &Path) -> Result<String> {
     let read = |f: &str| std::fs::read(dir.join(f)).with_context(|| format!("read {f}"));
     let hex = |b: &[u8]| blake3::hash(b).to_hex().to_string();
@@ -249,12 +261,13 @@ pub fn truth_hash(dir: &Path) -> Result<String> {
 }
 
 /// What the score of run `rid` depends on, hashed: its session's input and
-/// truth, and the run's own recorded state (row and actions).
+/// truth, the run's own recorded state (row, actions and output) and the
+/// options of its stored score.
 fn basis(conn: &Connection, rid: &str) -> Result<String> {
-    let parts: [Option<String>; 3] = conn.query_row(
-        "SELECT s.fingerprint, s.truth_hash, r.state_hash FROM runs r JOIN sessions s USING (sid) WHERE r.rid = ?1",
+    let parts: [Option<String>; 4] = conn.query_row(
+        "SELECT s.fingerprint, s.truth_hash, r.state_hash, r.score_opts FROM runs r JOIN sessions s USING (sid) WHERE r.rid = ?1",
         [rid],
-        |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?]),
+        |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?]),
     )?;
     Ok(digest(json!(parts)))
 }
@@ -272,7 +285,7 @@ fn drop_stale_scores(conn: &Connection, sid: &str) -> Result<()> {
             for q in [
                 "DELETE FROM metrics WHERE rid = ?1",
                 "DELETE FROM misses WHERE rid = ?1",
-                "UPDATE runs SET basis = NULL WHERE rid = ?1",
+                "UPDATE runs SET basis = NULL, score_opts = NULL WHERE rid = ?1",
             ] {
                 conn.execute(q, [&rid])?;
             }
@@ -567,13 +580,14 @@ impl DevDb {
             prompt_rev,
             sorrel_rev,
             learned_rev,
+            r.output_hash,
             rows
         ]));
         let tx = self.conn.transaction()?;
-        // The score's basis survives the replace; a changed state makes it stale.
+        // The score's basis and options survive the replace; a changed state makes them stale.
         tx.execute(
-            "INSERT OR REPLACE INTO runs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, (SELECT basis FROM runs WHERE rid = ?1))",
-            params![rid, sid, variant, arm, model, r.repeat, status, r.cost_usd, r.turns, r.wall_s, usage, prompt_rev, sorrel_rev, learned_rev, state],
+            "INSERT OR REPLACE INTO runs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, (SELECT basis FROM runs WHERE rid = ?1), ?16, (SELECT score_opts FROM runs WHERE rid = ?1))",
+            params![rid, sid, variant, arm, model, r.repeat, status, r.cost_usd, r.turns, r.wall_s, usage, prompt_rev, sorrel_rev, learned_rev, state, r.output_hash],
         )?;
         tx.execute("DELETE FROM arm_actions WHERE rid = ?1", [rid])?;
         for (seq, target, action, confidence, reasons) in rows {
@@ -589,14 +603,43 @@ impl DevDb {
 
     /// The score of a recorded run: every numeric leaf of the diff by dotted
     /// name (`good_units.recall`), `misses.<category>` counts, and the misses.
-    pub fn record_diff(&mut self, rid: &str, d: &SpikeDiff) -> Result<()> {
+    /// `test_hash` is the [`truth_hash`] of the TEST curation that was scored:
+    /// it must be the run's own output. `d` echoes the scoring options but the
+    /// disputed set, so that comes in too; together they are stored with the score.
+    pub fn record_diff(
+        &mut self,
+        rid: &str,
+        d: &SpikeDiff,
+        test_hash: &str,
+        disputed: &HashSet<u32>,
+    ) -> Result<()> {
         self.guard("rid", rid)?;
-        let known: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM runs WHERE rid = ?1", [rid], |r| {
-                    r.get(0)
-                })?;
-        ensure!(known == 1, "unknown run; record-run first");
+        let output: Option<Option<String>> = self
+            .conn
+            .query_row("SELECT output_hash FROM runs WHERE rid = ?1", [rid], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let output = output.context("unknown run; record-run first")?;
+        ensure!(
+            output.is_some(),
+            "run has no recorded output hash; re-run record-run"
+        );
+        ensure!(
+            output.as_deref() == Some(test_hash),
+            "TEST is not the run's recorded output (its curation hashes to {test_hash}, the run's to {}); score the run's own data dir",
+            output.unwrap_or_default()
+        );
+        let mut disputed: Vec<_> = disputed.iter().collect();
+        disputed.sort();
+        let opts = json!({
+            "match_jaccard": d.match_jaccard,
+            "min_spikes": d.min_spikes,
+            "split_share": d.split_share,
+            "binary": d.binary,
+            "disputed": disputed,
+        })
+        .to_string();
         let mut metrics = BTreeMap::new();
         // Settings and sizes of the comparison, not scores.
         let skip = [
@@ -634,6 +677,10 @@ impl DevDb {
                 params![rid, m.category, roots, m.truth, m.test],
             )?;
         }
+        tx.execute(
+            "UPDATE runs SET score_opts = ?2 WHERE rid = ?1",
+            params![rid, opts],
+        )?;
         let basis = basis(&tx, rid)?;
         tx.execute(
             "UPDATE runs SET basis = ?2 WHERE rid = ?1",
@@ -1148,6 +1195,8 @@ fn fit_logistic(x: &[Vec<f64>], y: &[bool], l2: f64) -> (f64, Vec<f64>) {
 mod tests {
     use super::*;
     use crate::command::{Actor, Method};
+    use crate::diff::{diff_spikes, Curation, SpikeDiffOpts};
+    use sorrel_io::kilosort::PhyLabel;
     use sorrel_io::ClusterId;
 
     fn db(dir: &Path) -> DevDb {
@@ -1711,7 +1760,7 @@ mod tests {
         let mut d = DevDb::open(&path).unwrap();
         assert_eq!(
             d.query("SELECT MAX(version) FROM schema_version").unwrap(),
-            "MAX(version)\n3\n"
+            "MAX(version)\n4\n"
         );
         assert_eq!(
             d.query("SELECT query, baseline, delta FROM holdout_ledger")
@@ -1741,7 +1790,7 @@ mod tests {
         let mut d = DevDb::open(&path).unwrap();
         assert_eq!(
             d.query("SELECT MAX(version) FROM schema_version").unwrap(),
-            "MAX(version)\n3\n"
+            "MAX(version)\n4\n"
         );
         assert_eq!(rows_in(&d, &["sessions", "runs", "metrics"]), 3);
         assert_eq!(
@@ -1752,6 +1801,124 @@ mod tests {
         // a NULL hash is not a known input: the first record of the run re-derives it
         record_plain_run(&mut d, "s1", "r1", None);
         assert_eq!(rows_in(&d, &["runs", "metrics"]), 1);
+    }
+
+    #[test]
+    fn a_v3_db_migrates_keeping_its_rows_with_an_unknown_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            for s in [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3] {
+                c.execute_batch(s).unwrap();
+            }
+            c.execute_batch(
+                "CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES (1), (2), (3);
+                 INSERT INTO sessions VALUES ('s1', 'dev', 'fp1', NULL, NULL, NULL, NULL, NULL, '2026-01-01', 't1');
+                 INSERT INTO runs VALUES ('r1', 's1', 'v0', 'a', NULL, 0, 'ok', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'h', 'b');
+                 INSERT INTO metrics VALUES ('r1', 'good_units.recall', 0.5);",
+            )
+            .unwrap();
+        }
+        let mut d = DevDb::open(&path).unwrap();
+        assert_eq!(
+            d.query("SELECT MAX(version) FROM schema_version").unwrap(),
+            "MAX(version)\n4\n"
+        );
+        assert_eq!(rows_in(&d, &["sessions", "runs", "metrics"]), 3);
+        assert_eq!(
+            d.query("SELECT output_hash IS NULL AS o, score_opts IS NULL AS s, basis FROM runs")
+                .unwrap(),
+            "o\ts\tbasis\n1\t1\tb\n"
+        );
+        // unknown output: no score until record-run supplies it
+        assert!(d
+            .record_diff(
+                "r1",
+                &score(&SpikeDiffOpts::default()),
+                "o1",
+                &HashSet::new()
+            )
+            .is_err());
+    }
+
+    /// The diff of a two-cluster sort against itself under `opts`.
+    fn score(opts: &SpikeDiffOpts) -> SpikeDiff {
+        let root = [0, 0, 1, 1];
+        let labels = [(0, PhyLabel::Good), (1, PhyLabel::Good)];
+        let c = Curation {
+            clusters: &root,
+            labels: &labels,
+        };
+        diff_spikes(&root, &c, &c, opts).unwrap()
+    }
+
+    /// A scored-able run of `s1` whose curated output hashes to `output`.
+    fn run_with_output(d: &mut DevDb, output: Option<&str>) {
+        let run = RunRow {
+            rid: "r1".into(),
+            sid: "s1".into(),
+            variant: "v0".into(),
+            arm: "a".into(),
+            status: "ok".into(),
+            output_hash: output.map(Into::into),
+            ..Default::default()
+        };
+        d.record_run(&run, &[]).unwrap();
+    }
+
+    #[test]
+    fn a_score_is_only_recorded_for_the_runs_own_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        let (diff, none) = (score(&SpikeDiffOpts::default()), HashSet::new());
+        run_with_output(&mut d, None);
+        let err = d.record_diff("r1", &diff, "o1", &none).unwrap_err();
+        assert!(err.to_string().contains("re-run record-run"), "{err}");
+        run_with_output(&mut d, Some("o1"));
+        let err = d.record_diff("r1", &diff, "o2", &none).unwrap_err();
+        assert!(
+            err.to_string().contains("not the run's recorded output"),
+            "{err}"
+        );
+        assert_eq!(rows_in(&d, &["metrics"]), 0);
+        d.record_diff("r1", &diff, "o1", &none).unwrap();
+        assert!(rows_in(&d, &["metrics"]) > 0);
+        // the run's output changed: the score goes with it
+        run_with_output(&mut d, Some("o2"));
+        assert_eq!(rows_in(&d, &["metrics"]), 0);
+    }
+
+    #[test]
+    fn the_scoring_options_are_part_of_the_basis() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        run_with_output(&mut d, Some("o1"));
+        let mut basis_of = |opts: &SpikeDiffOpts, disputed: &[u32]| {
+            let disputed = disputed.iter().copied().collect();
+            d.record_diff("r1", &score(opts), "o1", &disputed).unwrap();
+            d.query("SELECT basis FROM runs").unwrap()
+        };
+        let base = basis_of(&SpikeDiffOpts::default(), &[]);
+        assert_eq!(base, basis_of(&SpikeDiffOpts::default(), &[]));
+        let other = |f: fn(&mut SpikeDiffOpts)| {
+            let mut o = SpikeDiffOpts::default();
+            f(&mut o);
+            o
+        };
+        let changed = [
+            basis_of(&other(|o| o.match_jaccard = 0.5), &[]),
+            basis_of(&other(|o| o.min_spikes = 1), &[]),
+            basis_of(&other(|o| o.split_share = 0.3), &[]),
+            basis_of(&other(|o| o.binary = Some(false)), &[]),
+            basis_of(&SpikeDiffOpts::default(), &[7]),
+        ];
+        for b in &changed {
+            assert_ne!(b, &base);
+        }
+        assert_eq!(changed.iter().collect::<BTreeSet<_>>().len(), changed.len());
     }
 
     #[test]
