@@ -151,6 +151,15 @@ fn a_session_a_run_and_its_score_land_in_the_results_db() {
         )
     };
     assert!(!record("unknown").status.success(), "a score needs its run");
+    // Two label TSVs have no spikes to score: --record must refuse, not succeed silently.
+    let (ta, tb) = (t.join("a.tsv"), t.join("b.tsv"));
+    std::fs::write(&ta, "cluster_id\tgroup\n0\tgood\n").unwrap();
+    std::fs::write(&tb, "cluster_id\tgroup\n0\tnoise\n").unwrap();
+    let tsv = sorrel(
+        t,
+        &["diff", &s(&ta), &s(&tb), "--record", "r1", "--db", &db],
+    );
+    assert!(!tsv.status.success(), "--record on TSV mode must fail");
     ok(&record("r1"));
     ok(&record("r1")); // idempotent
 

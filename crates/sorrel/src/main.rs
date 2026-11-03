@@ -2399,6 +2399,10 @@ fn main() -> Result<()> {
                 }
                 Ok(())
             }
+            #[cfg(feature = "dev")]
+            (None, false) if record.is_some() => {
+                bail!("sorrel diff: --record scores a curation; it needs two directories and --root DIR")
+            }
             (None, false) if disputed.is_none() => diff_tsvs(&a, &b, json),
             _ => bail!("sorrel diff: two directories need --root DIR; two files take no --root or --disputed"),
         },
