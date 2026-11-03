@@ -107,7 +107,7 @@ collecting data; a failed check stops the round.
    against `spike_templates.npy`.
 4. **Upload only through `export-curated-sort`.** A raw Drive zip of one
    session was 3.8 GB (Neuralynx `.ncs`, PDFs, plots, `.phy` caches, MATLAB
-   exports); what the bench needs is about 0.5 GB. Keep `recording.dat` in the
+   exports); what the bench needs packed to 0.8 GB (1.73×; the raw int16 recording compresses 1.81×). Keep `recording.dat` in the
    Kilosort folder (`delete_recording_dat: false`): without it the arms cannot
    check waveforms. Check: one `.sorrel-upload.tar` per recording, and `pack`'s
    summary shows `recording.bin`.
