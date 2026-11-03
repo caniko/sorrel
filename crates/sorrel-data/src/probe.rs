@@ -24,7 +24,7 @@ pub const GRAMMAR: &str = "probe grammar (ms for acg/ccg, seconds for window/spl
   ccg A B [win=50] [bin=1]
   compare A B
   window C T0 T1
-  split C by=amp|time|pc|kmeans|core [at=X]   (new handle; minor part = spikes above/after X; core = clean refractory core)
+  split C by=amp|time|pc|kmeans|core [at=X]   (new handle; minor part = spikes above/after X; core = clean refractory core, or cleanup = the contaminated minority dropped to leave a clean majority; the handle says which)
   eval merge A B ..   |   eval s<C>.<k>   |   eval m<k>";
 
 /// Most queries in one `probe` call.
@@ -601,9 +601,9 @@ fn split_minor<P: DataProvider>(
             let globals = cluster_globals(session, c);
             if by == By::Core {
                 let core = core_split(session, c, &globals).ok_or(
-                    "no core (needs PC features, rpc > .1, and a separated component with rpc <= .1)",
+                    "no core or cleanup (needs PC features, rpc > .1, and a separated component with rpc <= .1, or a minority whose removal leaves rpc <= .1)",
                 )?;
-                return Ok((core.minor_idx, "core", f32::NAN, None));
+                return Ok((core.minor_idx, core.method, f32::NAN, None));
             }
             if by == By::Kmeans {
                 let km = kmeans_split(session, c, &globals)

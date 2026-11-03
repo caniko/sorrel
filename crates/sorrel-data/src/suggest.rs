@@ -80,7 +80,7 @@ pub struct SplitCandidate {
     pub drift_corr: f32,
     pub n_spikes: usize,
     /// Which proposer produced `bipartition_minor_idx`: `"kmeans"` (PC-feature
-    /// k-means), `"core"` (clean core of a contaminated cluster) or `"gmm"`
+    /// k-means), `"core"` (clean core of a contaminated cluster), `"cleanup"` (its dropped contaminated minority) or `"gmm"`
     /// (amplitude GMM; also the label when there is no proposal). k-means is
     /// preferred, then the core.
     pub method: &'static str,
@@ -658,11 +658,12 @@ fn score_split<P: DataProvider>(
     } else if let Some(core) =
         globals.and_then(|g| crate::proposers::core_split(session, c, &g[c.idx()]))
     {
-        // A clean core inside a contaminated cluster (only tried when the
-        // cluster fails RPV, so this stays off the hot path).
-        raw = raw.max(0.5 + ((core.d_prime - 2.0) / 10.0).clamp(0.0, 0.5));
+        // A clean core, or a majority left after a cleanup, inside a
+        // contaminated cluster (only tried when the cluster fails RPV, so this
+        // stays off the hot path).
+        raw = raw.max(core.score);
         bipartition = core.minor_idx;
-        method = "core";
+        method = core.method;
     }
     SplitCandidate {
         cluster: c,

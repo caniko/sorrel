@@ -13,6 +13,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **`bench_curation.py`:** `add --dev` forces sessions whose truth was seen into dev, and `run --max-budget-usd` caps each `mcp-review` run.
 - **`sorrel diff --split-share`:** a root counts as split when two or more kept (non-noise) units each hold that share of its kept spikes, so good cores cut out of a large noise remainder register as a split.
 - **Core split (`probe split C by=core`).** The split suggestions now find a small clean refractory core inside a contaminated unit: a diagonal GMM on PC features, BIC-chosen k ≤ 8, with the core as the minor part. It is tried only on units failing RPV and cached with the other split suggestions.
+- **Cleanup split.** The core proposer also tries the opposite reading of its mixture. When dropping the components that hold ISI violations leaves a clean majority (at least two thirds of the spikes, rpc ≤ 0.1), it proposes the dropped minority as the minor part, with method `cleanup`. `probe split C by=core` returns the better of the two readings, and the handle names which one it is.
 - **`sorrel diff --binary`:** when the truth only uses good and noise, the diff scores good against not-good (mua and unsorted count as noise) and reports `binary` in the JSON. `--no-binary` keeps the four labels.
 
 ### Fixed

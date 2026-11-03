@@ -230,33 +230,55 @@ pub fn kmeans_split_proposal(
     })
 }
 
-/// A clean, refractory-respecting core inside a contaminated cluster.
+/// A clean part of a contaminated cluster: a small `core` carved out of it, or
+/// the majority left once a `cleanup` of contaminated components is dropped.
 #[derive(Clone, Debug)]
 pub struct CoreSplit {
+    /// `"core"` (minor part = the clean core) or `"cleanup"` (minor part = the
+    /// dropped contaminated/odd components; the kept majority is the clean one).
+    pub method: &'static str,
     /// Components of the BIC-chosen mixture.
     pub k: usize,
-    /// LDA d′ of the core against the rest.
+    /// LDA d′ of the minor part against the rest.
     pub d_prime: f32,
-    /// Sliding-refractory contamination of the core and of the whole cluster.
+    /// Sliding-refractory contamination of the clean (kept) part and of the
+    /// whole cluster.
     pub core_contamination: f32,
     pub whole_contamination: f32,
-    /// Local spike indices (ascending) of the core: the minor part.
+    /// Suggestion score in [0.5, 1]: separation `min(d′/4, 1)` and cleanliness gain, a quarter each.
+    pub score: f32,
+    /// Local spike indices (ascending) of the minor part.
     pub minor_idx: Vec<u32>,
 }
 
-/// Propose a small clean core of a contaminated cluster.
+/// Propose a clean part of a contaminated cluster, as a core or a cleanup.
 ///
 /// Only runs when the whole cluster fails the RPV flag (`contamination(all) >
 /// 0.1`). Fits diagonal GMMs with k = 1..=8 on (a ≤ 20k-row subsample of)
-/// `feats`, keeps the BIC winner (k = 1 means no structure), and offers each
-/// component holding at least max(100, 1%) and at most half of the spikes as
-/// the core when its contamination is at most 0.1, its LDA d′ against the
-/// rest is at least 2, and it holds significantly fewer ISI violations than a
-/// random subset of that size would (`violations(local indices)` below the
-/// chance count minus 2.33 Poisson sd, none at all when that is
-/// below zero). The lowest-contamination
-/// core wins, ties to the larger. A second core comes from re-running on the
-/// remainder after the first split.
+/// `feats` and keeps the BIC winner (k = 1 means no structure). Two readings
+/// of that mixture are tried; both need the minor part to hold at least
+/// max(100, 1%) of the spikes and, for a core, an LDA d′ against the rest of at least 2.
+/// - `core`: one component of at most half the spikes with contamination at
+///   most 0.1 and significantly fewer ISI violations than a random subset of
+///   that size would have (`violations(local indices)` below the chance count
+///   minus 2.33 Poisson sd, none at all when that is below zero). The kept
+///   part is the core, the minor part too.
+/// - `cleanup`: the human kept the majority and dropped a contaminated or odd
+///   minority (10-30% in practice). Components holding ISI violations are
+///   dropped, most violations per spike first, until the remainder (at least
+///   two thirds of the spikes) has
+///   contamination at most 0.1 and, as for a core, significantly fewer ISI
+///   violations than chance. The minor part is the dropped components, at
+///   least max(100, 1%) of the spikes. It has no d′ floor: its dropped tail
+///   overlaps the kept unit (that is why it contaminates it), so the ISI gain
+///   is the evidence and d′ only weighs the rank and score.
+///
+/// Ranking: the reading that keeps more clean spikes wins, weighted by
+/// separation and cleanliness gain: `kept/n × min(d′/4, 1) × gain`, with
+/// `gain = (whole − kept contamination) / whole`. A cleanup keeps far more
+/// spikes than a core, so it wins whenever both exist unless its cut is very
+/// leaky (d′ near 0). Ties go to the core. A second core comes from
+/// re-running on the remainder after the first split.
 pub fn core_split_proposal(
     feats: &[f32],
     d: usize,
@@ -293,41 +315,91 @@ pub fn core_split_proposal(
     }
     let min_size = CORE_MIN_SPIKES.max((CORE_MIN_FRAC * n as f32).ceil() as usize);
     let viol_all = violations(&all) as f64;
-    let mut best: Option<(f32, usize, f32, usize)> = None; // (contamination, size, d′, part)
+    // LDA d′ of the rows labelled by `minor` (component set) against the rest.
+    let d_prime = |minor: &[usize]| {
+        let (mut rows, mut mask) = (Vec::new(), Vec::new());
+        for (row, &l) in sub.chunks_exact(d).zip(labels.iter().step_by(stride)) {
+            rows.extend_from_slice(row);
+            mask.push(minor.contains(&(l as usize)));
+        }
+        lda_d_prime(&rows, &mask, d)
+    };
+    // (rank, candidate)
+    let mut best: Option<(f32, CoreSplit)> = None;
+    let mut offer = |method: &'static str, minor: Vec<u32>, kept_n: usize, c: f32, dp: f32| {
+        let gain = ((whole - c) / whole).clamp(0.0, 1.0);
+        let sep = (dp / 4.0).clamp(0.0, 1.0);
+        let rank = kept_n as f32 / n as f32 * (dp / 4.0).clamp(0.0, 1.0) * gain;
+        if best.as_ref().is_none_or(|(r, _)| rank > *r) {
+            best = Some((
+                rank,
+                CoreSplit {
+                    method,
+                    k: gmm.k,
+                    d_prime: dp,
+                    core_contamination: c,
+                    whole_contamination: whole,
+                    score: 0.5 + 0.25 * sep + 0.25 * gain,
+                    minor_idx: minor,
+                },
+            ));
+        }
+    };
+    // Significantly fewer violations than a random subset would hold: below
+    // the chance count minus 2.33 Poisson sd (none at all when that is < 0).
+    let fewer_than_chance =
+        |v: usize, expected: f64| v as f64 <= (expected - 2.33 * expected.sqrt()).max(0.0);
+    let chance = |len: usize| viol_all * (len as f64 / n as f64).powi(2);
     for (j, p) in parts.iter().enumerate() {
         if p.len() < min_size || p.len() * 2 > n {
             continue;
         }
         let c = contamination(p);
-        let expected = viol_all * (p.len() as f64 / n as f64).powi(2);
-        if c.is_nan()
-            || c > CORE_RPV
-            || violations(p) as f64 > (expected - 2.33 * expected.sqrt()).max(0.0)
-        {
+        let expected = chance(p.len());
+        if c.is_nan() || c > CORE_RPV || !fewer_than_chance(violations(p), expected) {
             continue;
         }
-        let (mut rows, mut mask) = (Vec::new(), Vec::new());
-        for (row, &l) in sub.chunks_exact(d).zip(labels.iter().step_by(stride)) {
-            rows.extend_from_slice(row);
-            mask.push(l as usize == j);
-        }
-        let dp = lda_d_prime(&rows, &mask, d);
-        if dp.is_nan() || dp < MIN_D_PRIME {
-            continue;
-        }
-        let better = best.is_none_or(|(bc, bs, ..)| c < bc || (c == bc && p.len() > bs));
-        if better {
-            best = Some((c, p.len(), dp, j));
+        let dp = d_prime(&[j]);
+        if !dp.is_nan() && dp >= MIN_D_PRIME {
+            offer("core", p.clone(), p.len(), c, dp);
         }
     }
-    let (c, _, dp, j) = best?;
-    Some(CoreSplit {
-        k: gmm.k,
-        d_prime: dp,
-        core_contamination: c,
-        whole_contamination: whole,
-        minor_idx: std::mem::take(&mut parts[j]),
-    })
+    // Cleanup: drop components with ISI violations, most violations per spike
+    // first, until the remainder passes. The BIC mixture often fragments a
+    // contaminated tail over many components, so this is a prefix, not ≤ 2.
+    let mut order: Vec<(usize, f64)> = (0..gmm.k)
+        .filter(|&j| !parts[j].is_empty())
+        .map(|j| (j, violations(&parts[j]) as f64 / parts[j].len() as f64))
+        .filter(|&(_, v)| v > 0.0)
+        .collect();
+    order.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut set = Vec::new();
+    for (j, _) in order {
+        set.push(j);
+        let dropped: usize = set.iter().map(|&j| parts[j].len()).sum();
+        let kept = n - dropped;
+        if kept * 3 < n * 2 {
+            break;
+        }
+        if dropped < min_size {
+            continue;
+        }
+        let rest: Vec<u32> = (0..n as u32)
+            .filter(|&i| !set.contains(&(labels[i as usize] as usize)))
+            .collect();
+        let c = contamination(&rest);
+        if !c.is_nan() && c <= CORE_RPV && fewer_than_chance(violations(&rest), chance(kept)) {
+            let dp = d_prime(&set);
+            if dp > 0.0 {
+                let minor = (0..n as u32)
+                    .filter(|&i| set.contains(&(labels[i as usize] as usize)))
+                    .collect();
+                offer("cleanup", minor, kept, c, dp);
+            }
+            break;
+        }
+    }
+    best.map(|b| b.1)
 }
 
 /// Local indices of rows whose Mahalanobis² distance from the cluster mean
