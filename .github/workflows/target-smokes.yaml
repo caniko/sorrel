@@ -92,3 +92,80 @@ jobs:
           path: "smoke-out/**\n"
           retention-days: 7
           if-no-files-found: warn
+
+  build-target-smoke-windows-arm64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            substituters = https://attic.candee.baby/canix https://cache.nixos.org
+            trusted-public-keys = canix:lPzPzKrmYqW5Rxa5r0uQWvCqD3S5nx0h2eCy7XD5JM8= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+
+      - name: Configure GitHub input transport
+        run: |
+          git config --global --add url.https://github.com/.insteadOf ssh://git@github.com/
+          git config --global --add url.https://github.com/.insteadOf git@github.com:
+
+      - name: Build windows-arm64
+        run: |
+          set -euo pipefail
+          nix build .#packages.x86_64-linux.sorrel-windows-aarch64-smoke --out-link result
+          mkdir target-smoke-windows-arm64
+          cp -rL result/. target-smoke-windows-arm64/
+          chmod -R u+w target-smoke-windows-arm64
+
+      - name: Upload build output
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: target-smoke-windows-arm64
+          path: target-smoke-windows-arm64/
+          include-hidden-files: true
+          retention-days: 1
+          if-no-files-found: error
+
+  target-smoke-windows-arm64:
+    needs: [build-target-smoke-windows-arm64]
+    runs-on: windows-11-arm
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    env:
+      SIMIT_TARGET_SMOKE_DIR: ${{ github.workspace }}/target-smoke-windows-arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Download build output
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: target-smoke-windows-arm64
+          path: target-smoke-windows-arm64
+
+      - name: Target smoke windows-arm64
+        id: simit-required-gate-windows-arm64
+        shell: pwsh
+        timeout-minutes: 60
+        env:
+          RUST_LOG: "info"
+        run: |
+          ./release/smoke-windows.ps1 -SkipWheel
+
+      - name: Retain required gate evidence
+        if: always() && steps.simit-required-gate-windows-arm64.outcome != '' && steps.simit-required-gate-windows-arm64.outcome != 'skipped'
+        timeout-minutes: 5
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: "windows-arm64-smoke"
+          include-hidden-files: true
+          path: "smoke-out/**\n"
+          retention-days: 7
+          if-no-files-found: warn

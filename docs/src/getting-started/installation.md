@@ -62,6 +62,11 @@ winget install Caniko.Sorrel
 choco install sorrel
 ```
 
+On Windows on ARM the release also ships a native
+`sorrel-<VERSION>-aarch64-windows.zip`, and winget picks it for ARM64 machines.
+Chocolatey installs the x64 zip, which runs under emulation. There is no ARM64
+Python wheel yet.
+
 `sorrel.exe` is a console program. `sorrelw.exe` is the same program without a
 console window: it starts `sorrel.exe` with the same arguments (bare, it opens
 the launcher) and exits. Use it from shortcuts, Win+R and Explorer.

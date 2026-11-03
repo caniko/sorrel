@@ -20,7 +20,8 @@ upload.
 param(
     [string]$BuildDir = $env:SIMIT_TARGET_SMOKE_DIR,
     [string]$OutDir = 'smoke-out',
-    [int]$GuiSeconds = 20
+    [int]$GuiSeconds = 20,
+    [switch]$SkipWheel # no wheel is built for this target (windows-arm64)
 )
 $ErrorActionPreference = 'Stop'
 
@@ -527,6 +528,7 @@ finally {
 if (Select-String -Path (Join-Path $OutDir 'launcher.err.txt') -Pattern 'panicked at' -Quiet) { throw 'launcher GUI log contains a panic' }
 
 # 8. Python wheel in a fresh venv
+if (-not $SkipWheel) {
 $wheel = Get-ChildItem $BuildDir -Filter 'sorrel_ephys-*-win_amd64.whl' | Select-Object -First 1
 if (-not $wheel) { throw "no sorrel_ephys wheel in $BuildDir" }
 $venv = Join-Path ([IO.Path]::GetTempPath()) "sorrel-venv-$PID"
@@ -538,6 +540,8 @@ Assert-Ok 'import' (Invoke-Native 'import' $vpy @('-c',
 Assert-Ok 'wheel-exe' (Invoke-Native 'wheel-exe' (Join-Path $venv 'Scripts\sorrel.exe') @('--version'))
 $got = (Get-Content (Join-Path $OutDir 'wheel-exe.out.txt') -Raw).Trim()
 if ($got -ne "sorrel $version") { throw "wheel sorrel.exe --version is '$got', expected 'sorrel $version'" }
+
+}
 
 # 8a. Windows integration: embedded resources, the console-free launcher and
 #     the Start-menu shortcut. (Own block: kept apart from the steps above.)
@@ -616,6 +620,9 @@ Write-Host 'shortcut removed'
 #     build of the dev shell's, with the Khronos loader) and require the compute kernels to pass on it.
 #     The runner is elevated, and the loader then ignores VK_DRIVER_FILES, so the ICD
 #     is registered under HKLM and removed again afterwards.
+$arm64 = $env:PROCESSOR_ARCHITECTURE -eq 'ARM64'
+if ($arm64) { Write-Host 'arm64: the pinned lavapipe is x64-only, Vulkan check skipped' }
+else {
 $lvpIcd = (& (Join-Path $repo 'release\fetch-lavapipe-windows.ps1') -Dir (Join-Path ([IO.Path]::GetTempPath()) 'sorrel-lavapipe') -Register | Select-Object -Last 1)
 Write-Host "lavapipe ICD: $lvpIcd"
 $oldPath = $env:PATH
@@ -636,6 +643,7 @@ $vkOut = Get-Content (Join-Path $OutDir 'gpu-check-vulkan.out.txt') -Raw
 if ($vkOut -notmatch '(?m)^preferred adapter: llvmpipe .*\(Vulkan\)') { throw "gpu-check did not prefer lavapipe on Vulkan:`n$vkOut" }
 if ($vkOut -notmatch 'kernels: PASS') { throw "gpu-check kernels did not pass on Vulkan:`n$vkOut" }
 Write-Host "vulkan: $(($vkOut -split "`r?`n" | Where-Object { $_ -match '^preferred adapter' }) -join '')"
+}
 
 # 9. Microsoft Defender: winget-pkgs validation scans the installed package
 #    (Validation-Defender-Error), so reproduce that here on fresh signatures.

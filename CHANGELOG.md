@@ -7,6 +7,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- **Native Windows on ARM release.** Each release now includes `sorrel-<VERSION>-aarch64-windows.zip` (plus standalone `.exe` and `-gui.exe` assets), built for `aarch64-pc-windows-gnullvm`, and winget serves it to ARM64 machines. Smoke-tested on a `windows-11-arm` runner without the Vulkan and wheel steps; Chocolatey and the Python wheel stay x64.
+
 ## [0.4.0] - 2026-11-03
 
 ### Added

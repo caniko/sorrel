@@ -90,6 +90,13 @@ in
         format = "zip";
         binaries = ["sorrel.exe" "sorrelw.exe"];
       };
+      windows-aarch64 = archive {
+        package = packages.sorrel-windows-aarch64;
+        system = "aarch64-windows";
+        rustTarget = "aarch64-pc-windows-gnullvm";
+        format = "zip";
+        binaries = ["sorrel.exe" "sorrelw.exe"];
+      };
       darwin-aarch64 = archive {
         package = packages.sorrel-darwin-aarch64;
         system = "aarch64-darwin";
