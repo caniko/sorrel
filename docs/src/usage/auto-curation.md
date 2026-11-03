@@ -253,6 +253,14 @@ which stage helps on your recordings. A synthetic self-check lives in
 
 To find out what `sorrel auto --llm` and the MCP `review` agent miss compared
 with a person, replay human curations through them and score the difference.
+
+The target is the quality of the human's manual post-sort curation in phy:
+those curations are the training data. Sorrel will need new features and ideas
+to reach that quality, not only better prompts. On the first dev session both
+arms recovered 1 of 17 good units, because nothing in sorrel could propose the
+cores the human carved out of under-split templates. Each round of the loop
+therefore looks first for the missing capability (a proposer, probe, brief
+feature, metric, rule or tool) and only then at the prompt around it.
 `scripts/bench_curation.py` (a stdlib uv script) runs the bench; its data lives
 in a private `BENCH` directory outside the repo.
 
@@ -310,13 +318,18 @@ LLM judge is dev-only; holdout cases are for humans.
 2. Adjudicate the disagreements (a human for the holdout, an LLM judge is fine
    on dev), unmask, and score again.
 3. `report dev`; pick the largest miss category.
-4. The improver changes **one** thing: the rubric, the review instructions, a
-   brief feature, a rule default, a sidecar threshold or a missing probe/eval
-   capability. It sees dev reports and the repo only.
+4. The improver changes **one** thing. First it asks what sorrel lacks to make
+   the human's decision, and builds that: a new proposer, probe, brief feature,
+   metric, rule default or tool. A prompt change (rubric or review
+   instructions) on its own is only for gaps the existing capabilities already
+   cover. It sees dev reports, the dev truth verdicts and the repo only.
 5. Rerun dev. The target category must improve and no other may regress beyond
    the spread across repeats.
 6. One holdout query decides: a paired improvement with no category regression.
-   The change then lands as a PR.
+   The change then lands as a PR: a sorrel feature with its tests, or a prompt
+   edit in `serve.rs`. Each round reports the distance to the human curation
+   (good-unit recall and precision, where 1.0 means matching the human), not
+   just the delta to the previous round.
 7. When new sessions arrive, re-split, refresh the holdout and retire the
    ledger.
 

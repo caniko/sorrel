@@ -5,8 +5,24 @@ description: Use on the analysis host to run the double-blind improvement loop f
 
 # Curation bench improvement loop
 
-One round: baseline both arms on human-curated sessions, find the largest miss
-category, change one thing, rerun, and let a single holdout query decide.
+**The goal is the quality of the human's manual post-sort curation in phy.**
+That curation is the training data, and the target is reaching it, not doing
+slightly better than the last variant. Most of the distance is capability
+sorrel doesn't have yet. On the first dev session the arms recovered 1 of 17
+good units because no proposer could isolate the cores the human carved out;
+the prompt-only variant made things worse. So each round asks first _what
+would sorrel need in order to make the human's decision_: a new proposer,
+probe, brief feature, metric, rule or tool. Only after that does it ask how to
+word the prompt around it. Expect most accepted rounds to ship a sorrel
+feature, with the prompt as the smaller part.
+
+One round:
+
+- baseline both arms on human-curated sessions;
+- find the largest gap to the human curation;
+- change one thing: a new capability, or a prompt variant that uses one;
+- rerun, and let a single holdout query decide.
+
 Metrics, the three blinds and the command reference are in the "Double-blind
 bench" section of `docs/src/usage/auto-curation.md`; this page only orders the
 steps and says who does each.
@@ -44,17 +60,17 @@ Delegated agents get only what their task row lists.
 
 ## The loop
 
-| #   | Step                                                                                                                    | Tier   | Brief contains                                                                                                   | Returns                                                                               |
-| --- | ----------------------------------------------------------------------------------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| 1   | `add` sessions (`--dev` if the lead has seen the truth)                                                                 | flash  | the bench path and the session dirs                                                                              | the counts line                                                                       |
-| 2   | `run` the arms, then `score` (with `--db`, each dev session, run and score is recorded in the results DB)               | flash  | the command lines, the budget and the DB path                                                                    | run ids, status, cost, and the path of `report dev`                                   |
-| 3   | Query the DB (`sorrel dev db query`) and, after new dev data, `sorrel dev distill --out DIR`                            | flash  | the DB path, the SQL or the `distill` line and the head of `lineage.md` to report                                | the query output, the distilled `learned_rev` and the head of `lineage.md`            |
-| 4   | Condense the dev report into a miss taxonomy                                                                            | flash  | the dev report path only                                                                                         | a table of at most 40 lines: category x count, worst roots, and the card each arm saw |
-| 5   | Write ONE variant (`rubric.md` or `review.md`) for the largest miss category, or a code change for a missing capability | worker | the condensed taxonomy, the current prompt (`sorrel agent-guide --prompt review`) and `docs/src/usage/agents.md` | the variant dir and its rationale                                                     |
-| 6   | Review a code change, or a fit (the distilled `priors.toml` / `thresholds.toml` against the dev exemplars)              | worker | the diff, or the distilled files and `lineage.md`                                                                | findings                                                                              |
-| 7   | Accept or reject on dev, add holdout sessions, run the holdout `report` (it writes the ledger) and adjudication         | lead   |                                                                                                                  |                                                                                       |
+| #   | Step                                                                                                                                                                                                                                                    | Tier   | Brief contains                                                                                                                                                | Returns                                                                                        |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| 1   | `add` sessions (`--dev` if the lead has seen the truth)                                                                                                                                                                                                 | flash  | the bench path and the session dirs                                                                                                                           | the counts line                                                                                |
+| 2   | `run` the arms, then `score` (with `--db`, each dev session, run and score is recorded in the results DB)                                                                                                                                               | flash  | the command lines, the budget and the DB path                                                                                                                 | run ids, status, cost, and the path of `report dev`                                            |
+| 3   | Query the DB (`sorrel dev db query`) and, after new dev data, `sorrel dev distill --out DIR`                                                                                                                                                            | flash  | the DB path, the SQL or the `distill` line and the head of `lineage.md` to report                                                                             | the query output, the distilled `learned_rev` and the head of `lineage.md`                     |
+| 4   | Condense the dev report into a miss taxonomy                                                                                                                                                                                                            | flash  | the dev report path only                                                                                                                                      | a table of at most 40 lines: category x count, worst roots, and the card each arm saw          |
+| 5   | Close the largest gap with ONE change. First ask what sorrel lacks to make the human's call: a proposer, probe, brief feature, metric, rule or tool; build it. A prompt variant (`review.md`/`rubric.md`) alone only when the capability already exists | worker | the condensed taxonomy, the human split patterns from `truth_roots`, the current prompt (`sorrel agent-guide --prompt review`) and `docs/src/usage/agents.md` | the code change (with tests) and/or the variant dir, and a rationale naming the capability gap |
+| 6   | Review a code change, or a fit (the distilled `priors.toml` / `thresholds.toml` against the dev exemplars)                                                                                                                                              | worker | the diff, or the distilled files and `lineage.md`                                                                                                             | findings                                                                                       |
+| 7   | Accept or reject on dev, add holdout sessions, run the holdout `report` (it writes the ledger) and adjudication                                                                                                                                         | lead   |                                                                                                                                                               |                                                                                                |
 
-Steps 2 to 4 repeat for the new variant after step 5.
+Steps 2 to 4 repeat after step 5, on a binary pinned at the new commit when step 5 changed code.
 
 ## Sealing
 
@@ -72,18 +88,24 @@ for a round budget (for example $60) and sum `cost_usd` over the round's
 `run.json` files; stop and report when the total passes it, or when any single
 run hits its cap.
 
-## Accepting a variant
+## Accepting a change
 
-Rerun dev with the same repeats as the baseline. Accept only if the target
-category improves and no other category regresses beyond the spread across
-repeats. Then make a single holdout query (`report holdout --baseline ...
---candidate ...`); every holdout query is logged. A paired improvement with no
-category regression decides it.
+Rerun dev with the same repeats as the baseline, on a binary pinned at the
+change's commit. Accept only if the target gap closes and no other category
+regresses beyond the spread across repeats. Then make a single holdout query
+(`report holdout --baseline ... --candidate ...`); every holdout query is
+logged. A paired improvement with no category regression decides it.
 
-Only an accepted variant becomes a PR, editing `RUBRIC` or `REVIEW_INSTRUCTIONS`
-in `crates/sorrel-data/src/serve.rs`. Rejected variants stay in
-`bench/variants/` with their `RATIONALE.md`, so a later round doesn't retry
-them blind.
+An accepted capability lands as a sorrel PR with its tests. An accepted prompt
+variant becomes a PR editing `RUBRIC` or `REVIEW_INSTRUCTIONS` in
+`crates/sorrel-data/src/serve.rs`. Rejected variants stay in `bench/variants/`
+with their `RATIONALE.md`, and rejected ideas are named in the round's
+rationale, so a later round doesn't retry them blind.
+
+Track the distance to the human, not just the delta to the last round: report
+good-unit recall and precision against the human curation (1.0 is the target)
+in every round summary. When a category stops moving under prompt changes,
+that is the signal for a new capability rather than another variant.
 
 ## Pitfalls (learned the hard way)
 

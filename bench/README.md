@@ -1,7 +1,11 @@
 # Curation bench: portable state
 
-The `bench/` directory holds everything from the double-blind improvement loop
-that is safe to publish:
+The double-blind improvement loop measures sorrel's automated curation against
+manual post-sort curation in phy, and steers sorrel towards that quality. The
+gap is mostly missing capability, so most rounds ship sorrel features (new
+proposers, probes, brief features) as well as prompt variants.
+
+The `bench/` directory holds everything from the loop that is safe to publish:
 
 - `results.sqlite`: every round's derived results (git-lfs). It holds opaque
   session ids, metrics, misses, the root cards the arms saw, dev truth verdicts,
