@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-03
+
 ### Added
 
 - **Features view v2.**
@@ -51,6 +53,26 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   - **`scripts/bench_curation.py`:** runs `sorrel auto --llm` and the MCP review agent against the human curation, with a sealed holdout and blinded adjudication.
   - **Prompts:** `SORREL_RUBRIC` and `SORREL_REVIEW` override the rubric and review instructions (the MCP `review` prompt and `sorrel auto --llm` share one source), and `sorrel agent-guide --prompt review` prints the effective text.
   - **Skill:** `export-curated-sort` packages phy-curated sorts for the bench, one package per recording; recordings where the sorter found no units are excluded.
+
+### Changed
+
+- The landing page moves from Zola to Plinth's `plinth-project`: a
+  full-width animated hero (a still for reduced motion, a Waveforms crop on
+  phones), six focused gallery crops with a lightbox, a self-hosted Inter
+  subset, social metadata, and leaf-green download buttons that point at the
+  latest release. `.#site` still merges the mdBook docs under `/docs/`, and
+  the README opens with the hero.
+
+### Notes
+
+- Window pop-outs are exercised on Linux (X11 and Wayland). Native Windows
+  window-manager behavior is not covered by CI; the Windows smoke covers the
+  rest of the UI.
+- On Wayland a driver that offers only vsync (FIFO) can still stall when the
+  main window is fully covered, for example by a full-screen pop-out. Mesa's
+  RADV, ANV, radeonsi and lavapipe drivers offer mailbox and immediate, so
+  they are not affected. Sorrel's next step, should such a driver appear, is
+  to skip painting a covered main window.
 
 ### Fixed
 
@@ -659,7 +681,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Downstream dry-runs can fail until their local path dependencies have been
   published in order. See `RELEASE.md` for the publish sequence.
 
-[Unreleased]: https://github.com/caniko/sorrel/compare/0.3.0...HEAD
+[Unreleased]: https://github.com/caniko/sorrel/compare/0.4.0...HEAD
+[0.4.0]: https://github.com/caniko/sorrel/compare/0.3.0...0.4.0
 [0.3.0]: https://github.com/caniko/sorrel/compare/0.2.4...0.3.0
 [0.2.4]: https://github.com/caniko/sorrel/compare/0.2.3...0.2.4
 [0.2.3]: https://github.com/caniko/sorrel/compare/0.2.2...0.2.3
