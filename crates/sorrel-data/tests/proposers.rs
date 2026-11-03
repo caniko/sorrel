@@ -496,3 +496,23 @@ fn core_split_declines_a_clean_or_unstructured_cluster() {
     // Clean whole: never tried.
     assert!(core_split_proposal(&feats, d, |_| 0.0, |_| 0).is_none());
 }
+
+#[test]
+fn core_split_extracts_no_features_for_a_small_or_clean_cluster() {
+    use sorrel_data::proposers::core_split_lazy;
+    let boom = || -> Option<(Vec<f32>, usize)> { panic!("features extracted") };
+    // Too few spikes: not even the contamination is evaluated.
+    assert!(core_split_lazy(199, boom, |_| panic!("contamination"), |_| 0).is_none());
+    // Clean whole, or no sliding-refractory estimate (NaN): features stay untouched.
+    for whole in [0.0, f32::NAN] {
+        assert!(core_split_lazy(4000, boom, |_| whole, |_| 0).is_none());
+    }
+    // Contaminated enough: the features are asked for.
+    let asked = std::cell::Cell::new(false);
+    let ask = || {
+        asked.set(true);
+        None
+    };
+    assert!(core_split_lazy(4000, ask, |_| 0.5, |_| 0).is_none());
+    assert!(asked.get());
+}

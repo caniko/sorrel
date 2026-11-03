@@ -251,6 +251,17 @@ pub struct CoreSplit {
     pub minor_idx: Vec<u32>,
 }
 
+/// The cheap gates of [`core_split_proposal`]: at least `2 * CORE_MIN_SPIKES`
+/// spikes and a whole-cluster contamination (`whole`, evaluated only after the
+/// size gate) above `CORE_RPV`. Returns that contamination.
+fn core_gate(n: usize, whole: impl FnOnce() -> f32) -> Option<f32> {
+    if n < 2 * CORE_MIN_SPIKES {
+        return None;
+    }
+    let whole = whole();
+    (!whole.is_nan() && whole > CORE_RPV).then_some(whole)
+}
+
 /// Propose a clean part of a contaminated cluster, as a core or a cleanup.
 ///
 /// Only runs when the whole cluster fails the RPV flag (`contamination(all) >
@@ -289,14 +300,8 @@ pub fn core_split_proposal(
         return None;
     }
     let n = feats.len() / d;
-    if n < 2 * CORE_MIN_SPIKES {
-        return None;
-    }
     let all: Vec<u32> = (0..n as u32).collect();
-    let whole = contamination(&all);
-    if whole.is_nan() || whole <= CORE_RPV {
-        return None;
-    }
+    let whole = core_gate(n, || contamination(&all))?;
     let stride = n.div_ceil(CORE_MAX_FIT);
     let sub: Vec<f32> = (0..n)
         .step_by(stride)
@@ -474,14 +479,13 @@ pub fn core_split<P: DataProvider>(
     cluster: ClusterId,
     globals: &[u32],
 ) -> Option<CoreSplit> {
-    let (feats, d) = feature_space(session, cluster, globals, CORE_CHANNELS)?;
     let times = session.spike_times(cluster);
     let sr = session.provider.sample_rate().max(1.0);
     let duration = session.provider.n_samples().0;
     let pick = |idx: &[u32]| -> Vec<_> { idx.iter().map(|&i| times[i as usize]).collect() };
-    core_split_proposal(
-        &feats,
-        d,
+    core_split_lazy(
+        globals.len(),
+        || feature_space(session, cluster, globals, CORE_CHANNELS),
         |idx| {
             let (c, rp) = sliding_refractory_argmin(
                 &pick(idx),
@@ -499,6 +503,20 @@ pub fn core_split<P: DataProvider>(
         },
         |idx| isi_violations(&pick(idx), (sr * 0.0015).round() as u64),
     )
+}
+
+/// [`core_split_proposal`] on the `n` spikes of a cluster, with the PC
+/// features (`features`, the costly part) extracted only once the cheap gates
+/// (size, whole-cluster contamination) pass.
+pub fn core_split_lazy(
+    n: usize,
+    features: impl FnOnce() -> Option<(Vec<f32>, usize)>,
+    contamination: impl Fn(&[u32]) -> f32,
+    violations: impl Fn(&[u32]) -> usize,
+) -> Option<CoreSplit> {
+    core_gate(n, || contamination(&(0..n as u32).collect::<Vec<_>>()))?;
+    let (feats, d) = features()?;
+    core_split_proposal(&feats, d, contamination, violations)
 }
 
 /// Session wiring: [`outlier_proposal`] on `cluster`'s PC feature space.
