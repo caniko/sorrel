@@ -8,7 +8,9 @@ use super::{phy_label_str, seeded, OpenArgs, OpenCtx, Seed, SessionVisitor};
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
-use sorrel_data::devdb::{arm_actions, DevDb, LedgerRow, RunRow, SessionRow, VariantRow};
+use sorrel_data::devdb::{
+    arm_actions, truth_hash, DevDb, LedgerRow, RunRow, SessionRow, VariantRow,
+};
 use sorrel_data::diff::{root_truths_dirs, SpikeDiff, SpikeDiffOpts};
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::{baseline_hash, Journal, Session};
@@ -246,6 +248,7 @@ fn record_session(
         .as_str()
         .context("brief returned no text")?;
 
+    let truth_hash = truth.map(truth_hash).transpose()?;
     let truth = truth
         .map(|t| root_truths_dirs(t, &input, &SpikeDiffOpts::default()))
         .transpose()?;
@@ -258,6 +261,7 @@ fn record_session(
         n_roots: Some(roots.len() as i64),
         n_channels: Some(i64::from(info.1)),
         binary: truth.as_ref().map(|t| t.0),
+        truth_hash,
     })?;
     let n = db.record_cards(sid, brief)?;
     if let Some((_, rows)) = &truth {

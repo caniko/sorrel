@@ -596,7 +596,8 @@ pub struct RootTruth {
     pub cores: Vec<(f64, u32)>,
 }
 
-/// [`RootTruth`] of every root cluster with spikes, ascending. Labels are
+/// [`RootTruth`] of every root cluster with at least `min_spikes` spikes
+/// (smaller roots are outside the merge and split metrics too), ascending. Labels are
 /// folded exactly as [`diff_spikes`] folds the truth's; a unit that is
 /// neither good nor noise (mua, unsorted, in a truth that uses them) is
 /// neither in the shares, so such a root is `other`.
@@ -616,13 +617,15 @@ pub fn root_truths(root: &[u32], truth: &Curation, opts: &SpikeDiffOpts) -> Resu
     Ok(cells
         .by_root
         .iter()
-        .map(|(&r, units)| {
+        .filter_map(|(&r, units)| {
             let n: u32 = units.iter().map(|&(_, n)| n).sum();
-            let big = opts.min_spikes.min(n as usize) as u32;
+            if (n as usize) < opts.min_spikes {
+                return None;
+            }
             let (mut good, mut noise) = (Vec::new(), 0u32);
             for &(u, c) in units {
                 match lab.get(&u).copied().unwrap_or_default() {
-                    PhyLabel::Good if c >= big => good.push(c),
+                    PhyLabel::Good if c as usize >= opts.min_spikes => good.push(c),
                     PhyLabel::Good | PhyLabel::Noise => noise += c,
                     _ => {}
                 }
@@ -640,14 +643,14 @@ pub fn root_truths(root: &[u32], truth: &Curation, opts: &SpikeDiffOpts) -> Resu
             } else {
                 "other"
             };
-            RootTruth {
+            Some(RootTruth {
                 root: r,
                 n_spikes: n,
                 verdict,
                 n_good: good.len() as u32,
                 good_share: share(good_n),
                 cores: good.iter().map(|&c| (share(c), c)).collect(),
-            }
+            })
         })
         .collect())
 }
@@ -1084,6 +1087,27 @@ mod tests {
         );
         assert_eq!(got[2].cores, [(0.2, 20)]);
         assert_eq!((got[4].good_share, got[0].good_share), (0.7, 0.0));
+    }
+
+    #[test]
+    fn a_root_under_min_spikes_has_no_truth() {
+        // root 0 has 9 spikes (one under the cutoff), root 1 exactly 10, all good.
+        let root: Vec<u32> = [(0, 9), (1, 10)]
+            .into_iter()
+            .flat_map(|(r, n)| std::iter::repeat_n(r, n))
+            .collect();
+        let truth: Vec<u32> = [(5, 9), (6, 10)]
+            .into_iter()
+            .flat_map(|(u, n)| std::iter::repeat_n(u, n))
+            .collect();
+        let labels = [(5, PhyLabel::Good), (6, PhyLabel::Good)];
+        let c = Curation {
+            clusters: &truth,
+            labels: &labels,
+        };
+        let got = root_truths(&root, &c, &SpikeDiffOpts::default()).unwrap();
+        let v: Vec<_> = got.iter().map(|r| (r.root, r.verdict)).collect();
+        assert_eq!(v, [(1, "kept")]);
     }
 
     #[test]

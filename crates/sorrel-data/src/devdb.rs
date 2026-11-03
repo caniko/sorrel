@@ -23,7 +23,7 @@ use crate::journal::Record;
 use anyhow::{bail, ensure, Context, Result};
 use rusqlite::{params, types::ValueRef, Connection, OpenFlags, OptionalExtension};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -82,8 +82,17 @@ INSERT INTO holdout_ledger SELECT 'v1', * FROM holdout_ledger_v1;
 DROP TABLE holdout_ledger_v1;
 ";
 
+/// v3: score provenance. `sessions.truth_hash` and `runs.state_hash` hash the
+/// inputs a score depends on, `runs.basis` those the stored score was made from
+/// (see [`drop_stale_scores`]). Old rows get NULL, which counts as changed.
+const SCHEMA_V3: &str = "
+ALTER TABLE sessions ADD COLUMN truth_hash TEXT;
+ALTER TABLE runs ADD COLUMN state_hash TEXT;
+ALTER TABLE runs ADD COLUMN basis TEXT;
+";
+
 /// `MIGRATIONS[i]` takes the schema from version `i` to `i + 1`.
-const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2];
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
 
 /// Brief card columns that are not numeric metrics, in exemplar-file order.
 const CARD_HEAD: [&str; 3] = ["lab", "flags", "tags"];
@@ -115,6 +124,8 @@ pub struct SessionRow {
     pub n_roots: Option<i64>,
     pub n_channels: Option<i64>,
     pub binary: Option<bool>,
+    /// [`truth_hash`] of the truth the scores are made against.
+    pub truth_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -215,6 +226,59 @@ impl Exemplar {
     pub fn num(&self, field: &str) -> Option<f64> {
         self.card.get(field)?.parse().ok()
     }
+}
+
+/// Blake3 hex of a JSON value: the provenance hashes.
+fn digest(v: Value) -> String {
+    blake3::hash(v.to_string().as_bytes()).to_hex().to_string()
+}
+
+/// Hash of the truth a session is scored against: the bytes of `dir`'s
+/// `spike_clusters.npy` and `cluster_group.tsv`, the only files the scorer
+/// reads (a mua to unsorted edit changes it, though not the per-root summary).
+pub fn truth_hash(dir: &Path) -> Result<String> {
+    let read = |f: &str| std::fs::read(dir.join(f)).with_context(|| format!("read {f}"));
+    let hex = |b: &[u8]| blake3::hash(b).to_hex().to_string();
+    let tsv = dir.join("cluster_group.tsv").exists();
+    Ok(digest(json!([
+        hex(&read("spike_clusters.npy")?),
+        tsv.then(|| read("cluster_group.tsv"))
+            .transpose()?
+            .map(|b| hex(&b)),
+    ])))
+}
+
+/// What the score of run `rid` depends on, hashed: its session's input and
+/// truth, and the run's own recorded state (row and actions).
+fn basis(conn: &Connection, rid: &str) -> Result<String> {
+    let parts: [Option<String>; 3] = conn.query_row(
+        "SELECT s.fingerprint, s.truth_hash, r.state_hash FROM runs r JOIN sessions s USING (sid) WHERE r.rid = ?1",
+        [rid],
+        |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?]),
+    )?;
+    Ok(digest(json!(parts)))
+}
+
+/// A score holds only for the exact inputs it was computed from: drop the
+/// scores of `sid`'s runs whose stored `basis` is not what their inputs hash to
+/// now. Every record that changes an input ends here, so none compares fields.
+fn drop_stale_scores(conn: &Connection, sid: &str) -> Result<()> {
+    let runs: Vec<(String, Option<String>)> = conn
+        .prepare("SELECT rid, basis FROM runs WHERE sid = ?1")?
+        .query_map([sid], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (rid, stored) in runs {
+        if stored.as_deref() != Some(basis(conn, &rid)?.as_str()) {
+            for q in [
+                "DELETE FROM metrics WHERE rid = ?1",
+                "DELETE FROM misses WHERE rid = ?1",
+                "UPDATE runs SET basis = NULL WHERE rid = ?1",
+            ] {
+                conn.execute(q, [&rid])?;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl DevDb {
@@ -344,16 +408,23 @@ impl DevDb {
             )
             .optional()?;
         tx.execute(
-            "INSERT INTO sessions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CASE WHEN ?9 IS NULL THEN NULL ELSE date('now') END)
+            "INSERT INTO sessions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CASE WHEN ?9 IS NULL THEN NULL ELSE date('now') END, ?10)
              ON CONFLICT(sid) DO UPDATE SET split = excluded.split, fingerprint = excluded.fingerprint,
                  sorter = excluded.sorter, n_spikes = excluded.n_spikes, n_roots = excluded.n_roots,
-                 n_channels = excluded.n_channels, binary = excluded.binary, added = CASE WHEN excluded.added IS NULL THEN NULL ELSE COALESCE(added, excluded.added) END",
-            params![sid, s.split, fp, sorter, s.n_spikes, s.n_roots, s.n_channels, s.binary, added],
+                 n_channels = excluded.n_channels, added = CASE WHEN excluded.added IS NULL THEN NULL ELSE COALESCE(added, excluded.added) END,
+                 binary = COALESCE(excluded.binary, binary), truth_hash = COALESCE(excluded.truth_hash, truth_hash)",
+            params![sid, s.split, fp, sorter, s.n_spikes, s.n_roots, s.n_channels, s.binary, added, s.truth_hash],
         )?;
         // A session re-recorded as holdout, or on a changed input, loses everything
         // it had: truth, cards and the runs scored against the old input describe
         // another clustering. Re-record the truth after a changed fingerprint.
+        // On the same input a changed truth only stales the scores (below);
+        // a re-record that supplies no truth keeps the stored one.
         if s.split == "holdout" || old.is_some_and(|o| o.as_deref() != fp) {
+            tx.execute(
+                "UPDATE sessions SET truth_hash = ?2, binary = ?3 WHERE sid = ?1",
+                params![sid, s.truth_hash, s.binary],
+            )?;
             for q in [
                 "DELETE FROM metrics WHERE rid IN (SELECT rid FROM runs WHERE sid = ?1)",
                 "DELETE FROM misses WHERE rid IN (SELECT rid FROM runs WHERE sid = ?1)",
@@ -365,6 +436,7 @@ impl DevDb {
                 tx.execute(q, [sid])?;
             }
         }
+        drop_stale_scores(&tx, sid)?;
         tx.commit()?;
         Ok(())
     }
@@ -413,29 +485,16 @@ impl DevDb {
                 )
             })
             .collect();
-        let old: Vec<_> = tx
-            .prepare("SELECT root, n_spikes, verdict, n_good, good_share, core_shares, core_sizes FROM truth_roots WHERE sid = ?1 ORDER BY root")?
-            .query_map([sid], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        // Scores made against another truth no longer hold; the runs and their
-        // actions do not depend on it.
-        if old != rows {
-            for q in [
-                "DELETE FROM metrics WHERE rid IN (SELECT rid FROM runs WHERE sid = ?1)",
-                "DELETE FROM misses WHERE rid IN (SELECT rid FROM runs WHERE sid = ?1)",
-            ] {
-                tx.execute(q, [sid])?;
-            }
-            tx.execute("DELETE FROM truth_roots WHERE sid = ?1", [sid])?;
-            for (root, n_spikes, verdict, n_good, share, shares, sizes) in &rows {
-                tx.execute(
-                    "INSERT INTO truth_roots VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![sid, root, n_spikes, verdict, n_good, share, shares, sizes],
-                )?;
-            }
+        // The summary is derived data; whether the scores still hold is the
+        // truth hash `record_session` stored.
+        tx.execute("DELETE FROM truth_roots WHERE sid = ?1", [sid])?;
+        for (root, n_spikes, verdict, n_good, share, shares, sizes) in &rows {
+            tx.execute(
+                "INSERT INTO truth_roots VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![sid, root, n_spikes, verdict, n_good, share, shares, sizes],
+            )?;
         }
+        drop_stale_scores(&tx, sid)?;
         tx.commit()?;
         Ok(())
     }
@@ -493,22 +552,28 @@ impl DevDb {
                 reasons,
             ));
         }
+        let state = digest(json!([
+            rid,
+            sid,
+            variant,
+            arm,
+            model,
+            r.repeat,
+            status,
+            r.cost_usd,
+            r.turns,
+            r.wall_s,
+            usage,
+            prompt_rev,
+            sorrel_rev,
+            learned_rev,
+            rows
+        ]));
         let tx = self.conn.transaction()?;
-        // A changed run drops the scores of the old one so it is scored again;
-        // an identical re-record (runner, backfill) keeps them.
-        let same: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM runs WHERE rid = ?1 AND (sid, variant, arm, model, repeat, status, cost_usd, turns, wall_s, usage, prompt_rev, sorrel_rev, learned_rev)
-                 IS (?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14))",
-            params![rid, sid, variant, arm, model, r.repeat, status, r.cost_usd, r.turns, r.wall_s, usage, prompt_rev, sorrel_rev, learned_rev],
-            |r| r.get(0),
-        )?;
-        if !same {
-            tx.execute("DELETE FROM metrics WHERE rid = ?1", [rid])?;
-            tx.execute("DELETE FROM misses WHERE rid = ?1", [rid])?;
-        }
+        // The score's basis survives the replace; a changed state makes it stale.
         tx.execute(
-            "INSERT OR REPLACE INTO runs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![rid, sid, variant, arm, model, r.repeat, status, r.cost_usd, r.turns, r.wall_s, usage, prompt_rev, sorrel_rev, learned_rev],
+            "INSERT OR REPLACE INTO runs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, (SELECT basis FROM runs WHERE rid = ?1))",
+            params![rid, sid, variant, arm, model, r.repeat, status, r.cost_usd, r.turns, r.wall_s, usage, prompt_rev, sorrel_rev, learned_rev, state],
         )?;
         tx.execute("DELETE FROM arm_actions WHERE rid = ?1", [rid])?;
         for (seq, target, action, confidence, reasons) in rows {
@@ -517,6 +582,7 @@ impl DevDb {
                 params![rid, seq, target, action, confidence, reasons],
             )?;
         }
+        drop_stale_scores(&tx, sid)?;
         tx.commit()?;
         Ok(())
     }
@@ -568,6 +634,11 @@ impl DevDb {
                 params![rid, m.category, roots, m.truth, m.test],
             )?;
         }
+        let basis = basis(&tx, rid)?;
+        tx.execute(
+            "UPDATE runs SET basis = ?2 WHERE rid = ?1",
+            params![rid, basis],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1091,6 +1162,7 @@ mod tests {
             split: "dev".into(),
             fingerprint: Some(fp.into()),
             n_roots: Some(3),
+            truth_hash: Some("t1".into()),
             ..Default::default()
         }
     }
@@ -1345,10 +1417,27 @@ mod tests {
                 [rid],
             )
             .unwrap();
+        d.conn
+            .execute(
+                "UPDATE runs SET basis = ?2 WHERE rid = ?1",
+                params![rid, basis(&d.conn, rid).unwrap()],
+            )
+            .unwrap();
     }
 
     /// A run of a dev session with an action, not scored.
     fn record_plain_run(d: &mut DevDb, sid: &str, rid: &str, sorrel_rev: Option<&str>) {
+        record_run_doing(d, sid, rid, sorrel_rev, "relabel:good");
+    }
+
+    /// As [`record_plain_run`], the one action being `action`.
+    fn record_run_doing(
+        d: &mut DevDb,
+        sid: &str,
+        rid: &str,
+        sorrel_rev: Option<&str>,
+        action: &str,
+    ) {
         let run = RunRow {
             rid: rid.into(),
             sid: sid.into(),
@@ -1360,7 +1449,7 @@ mod tests {
         };
         let act = ArmAction {
             target: "1".into(),
-            action: "relabel:good".into(),
+            action: action.into(),
             confidence: None,
             reasons: None,
         };
@@ -1464,29 +1553,86 @@ mod tests {
     }
 
     #[test]
-    fn a_revised_truth_drops_the_scores_but_keeps_the_runs_and_an_identical_one_keeps_all() {
+    fn a_truth_edit_with_the_same_summary_drops_the_scores_and_an_identical_one_keeps_all() {
         let dir = tempfile::tempdir().unwrap();
         let mut d = db(dir.path());
         fill(&mut d, "s1", "fp1");
         scored_run(&mut d, "s1", "r1", None, 0.5);
         fill(&mut d, "s1", "fp1"); // the same truth again
         assert_eq!(rows_in(&d, &RUN_DATA), 4);
-        d.record_truth(
-            "s1",
-            &[
-                truth(0, "noise", 0),
-                truth(1, "cores", 2),
-                truth(2, "cleanup", 1),
-            ],
-        )
+        // mua turned unsorted: other truth bytes, the same per-root summary
+        d.record_session(&SessionRow {
+            truth_hash: Some("t2".into()),
+            ..dev("s1", "fp1")
+        })
         .unwrap();
+        let again = [
+            truth(0, "noise", 0),
+            truth(1, "cores", 1),
+            truth(2, "cleanup", 1),
+        ];
+        d.record_truth("s1", &again).unwrap();
         assert_eq!(rows_in(&d, &["metrics", "misses"]), 0);
         assert_eq!(rows_in(&d, &["runs", "arm_actions", "truth_roots"]), 5);
+        // scored again against t2, an identical re-record keeps it
+        scored_run(&mut d, "s1", "r1", None, 0.5);
+        d.record_session(&SessionRow {
+            truth_hash: Some("t2".into()),
+            ..dev("s1", "fp1")
+        })
+        .unwrap();
+        d.record_truth("s1", &again).unwrap();
+        assert_eq!(rows_in(&d, &["metrics", "misses"]), 2);
+    }
+
+    #[test]
+    fn a_re_record_without_truth_keeps_the_stored_truth_and_its_scores() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        scored_run(&mut d, "s1", "r1", None, 0.5);
+        // same input, no truth supplied: the stored truth still stands
+        d.record_session(&SessionRow {
+            truth_hash: None,
+            ..dev("s1", "fp1")
+        })
+        .unwrap();
         assert_eq!(
-            d.query("SELECT n_good FROM truth_roots WHERE root = 1")
-                .unwrap(),
-            "n_good\n2\n"
+            d.query("SELECT truth_hash FROM sessions").unwrap(),
+            "truth_hash\nt1\n"
         );
+        assert_eq!(rows_in(&d, &["metrics", "misses"]), 2);
+        // a changed input with no truth: truth, hash and scores all go
+        d.record_session(&SessionRow {
+            truth_hash: None,
+            ..dev("s1", "fp2")
+        })
+        .unwrap();
+        assert_eq!(
+            d.query("SELECT truth_hash IS NULL AS t FROM sessions")
+                .unwrap(),
+            "t\n1\n"
+        );
+        assert_eq!(rows_in(&d, &["metrics", "misses", "truth_roots"]), 0);
+    }
+
+    #[test]
+    fn a_changed_action_with_the_same_run_row_drops_the_scores() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        scored_run(&mut d, "s1", "r1", None, 0.5);
+        scored_run(&mut d, "s1", "r2", None, 0.5);
+        record_run_doing(&mut d, "s1", "r1", None, "relabel:good");
+        assert_eq!(rows_in(&d, &["metrics", "misses"]), 4);
+        record_run_doing(&mut d, "s1", "r1", None, "relabel:noise");
+        assert_eq!(rows_in(&d, &["metrics", "misses"]), 2);
+        assert_eq!(
+            d.query("SELECT COUNT(*) AS n FROM metrics WHERE rid = 'r1'")
+                .unwrap(),
+            "n\n0\n"
+        );
+        assert_eq!(rows_in(&d, &["runs", "arm_actions"]), 4);
     }
 
     #[test]
@@ -1565,7 +1711,7 @@ mod tests {
         let mut d = DevDb::open(&path).unwrap();
         assert_eq!(
             d.query("SELECT MAX(version) FROM schema_version").unwrap(),
-            "MAX(version)\n2\n"
+            "MAX(version)\n3\n"
         );
         assert_eq!(
             d.query("SELECT query, baseline, delta FROM holdout_ledger")
@@ -1574,6 +1720,38 @@ mod tests {
         );
         d.record_ledger(&[ledger("q1", 0.2)]).unwrap();
         assert_eq!(rows_in(&d, &["holdout_ledger"]), 2);
+    }
+
+    #[test]
+    fn a_v2_db_migrates_keeping_its_rows_and_scores_until_a_record_changes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(SCHEMA_V1).unwrap();
+            c.execute_batch(SCHEMA_V2).unwrap();
+            c.execute_batch(
+                "CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES (1), (2);
+                 INSERT INTO sessions VALUES ('s1', 'dev', 'fp1', NULL, NULL, NULL, NULL, NULL, '2026-01-01');
+                 INSERT INTO runs VALUES ('r1', 's1', 'v0', 'a', NULL, 0, 'ok', NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+                 INSERT INTO metrics VALUES ('r1', 'good_units.recall', 0.5);",
+            )
+            .unwrap();
+        }
+        let mut d = DevDb::open(&path).unwrap();
+        assert_eq!(
+            d.query("SELECT MAX(version) FROM schema_version").unwrap(),
+            "MAX(version)\n3\n"
+        );
+        assert_eq!(rows_in(&d, &["sessions", "runs", "metrics"]), 3);
+        assert_eq!(
+            d.query("SELECT s.truth_hash IS NULL AS t, r.state_hash IS NULL AS h, r.basis IS NULL AS b FROM sessions s, runs r")
+                .unwrap(),
+            "t\th\tb\n1\t1\t1\n"
+        );
+        // a NULL hash is not a known input: the first record of the run re-derives it
+        record_plain_run(&mut d, "s1", "r1", None);
+        assert_eq!(rows_in(&d, &["runs", "metrics"]), 1);
     }
 
     #[test]
