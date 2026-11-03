@@ -160,7 +160,8 @@ to the separator rule. `scripts/bench_curation.py --db FILE` calls these for you
   the claude usage and the actions of the run's journal. Dev runs only.
 - `sorrel diff TRUTH TEST --root INPUT --record RID [--db FILE]`: also writes the
   score's numeric fields (dotted names such as `good_units.recall`) and misses.
-- `sorrel dev ledger --json FILE`: holdout aggregates (no sid, no run id).
+- `sorrel dev ledger --json FILE`: holdout aggregates (no sid, no run id), each row
+  with a `query` id; the same id re-records in place, a new one appends.
 - `sorrel dev distill --out DIR`: `exemplars.tsv`, `priors.toml`, `thresholds.toml`
   and `lineage.md` from the dev sessions, each headed with the DB sha, the dev sids
   and a `learned_rev` hash of the content.

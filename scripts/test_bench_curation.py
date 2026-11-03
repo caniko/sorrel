@@ -294,7 +294,7 @@ def main() -> None:
         assert {a[a.index("--record") + 1] for a in rec} == runs4 and all(a[0] == "diff" for a in rec)
         ledger = [c for c in db_calls if c["argv"][1] == "ledger"]
         rows = json.loads(ledger[0]["ledger"])
-        assert len(ledger) == 1 and rows and {"baseline", "candidate", "arm", "metric", "delta"} <= set(rows[0]) and not any(sid in ledger[0]["ledger"] for sid in hold4)
+        assert len(ledger) == 1 and rows and {"query", "baseline", "candidate", "arm", "metric", "delta"} <= set(rows[0]) and len({r["query"] for r in rows}) == 1 and not any(sid in ledger[0]["ledger"] for sid in hold4)
         print("ok: add/splits, mcp-review argv, holdout sealing + ledger, results-DB calls, adjudication")
 
 

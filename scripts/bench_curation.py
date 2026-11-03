@@ -443,11 +443,12 @@ def report_holdout(a) -> None:
         raise SystemExit(f"no paired scored holdout runs for {a.baseline} vs {a.candidate}")
     led = B / ".sealed" / "holdout-ledger.jsonl"
     led.parent.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
     with led.open("a") as f:
-        f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "baseline": a.baseline, "candidate": a.candidate, "arms": arms}) + "\n")
+        f.write(json.dumps({"ts": ts, "baseline": a.baseline, "candidate": a.candidate, "arms": arms}) + "\n")
     if DB:  # aggregates only: no sid, no run id
         f = B / ".sealed" / f"ledger-{time.strftime('%Y%m%d-%H%M%S')}.json"
-        write_json(f, rows)
+        write_json(f, [{"query": f"{ts}-{len(led.read_text().splitlines())}", **r} for r in rows])  # the query id: a repeat of the same comparison appends
         dev("ledger", "--json", f)
     print("\n".join(lines))
     print(f"holdout queries so far: {len(led.read_text().splitlines())}")

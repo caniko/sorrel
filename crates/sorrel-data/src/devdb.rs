@@ -21,7 +21,7 @@ use crate::command::{CurationCommand, PhyLabelOp};
 use crate::diff::{RootTruth, SpikeDiff};
 use crate::journal::Record;
 use anyhow::{bail, ensure, Context, Result};
-use rusqlite::{params, types::ValueRef, Connection, OpenFlags};
+use rusqlite::{params, types::ValueRef, Connection, OpenFlags, OptionalExtension};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -69,8 +69,21 @@ CREATE TABLE holdout_ledger(
     PRIMARY KEY (baseline, candidate, arm, metric)) WITHOUT ROWID;
 ";
 
+/// v2: a repeated comparison appends instead of replacing; `query` names the
+/// holdout query (the runner's ledger timestamp), old rows get `v1`.
+const SCHEMA_V2: &str = "
+ALTER TABLE holdout_ledger RENAME TO holdout_ledger_v1;
+CREATE TABLE holdout_ledger(
+    query TEXT NOT NULL, baseline TEXT NOT NULL, candidate TEXT NOT NULL,
+    arm TEXT NOT NULL, metric TEXT NOT NULL, n_sessions INTEGER, base REAL,
+    cand REAL, delta REAL, ci_lo REAL, ci_hi REAL,
+    PRIMARY KEY (query, baseline, candidate, arm, metric)) WITHOUT ROWID;
+INSERT INTO holdout_ledger SELECT 'v1', * FROM holdout_ledger_v1;
+DROP TABLE holdout_ledger_v1;
+";
+
 /// `MIGRATIONS[i]` takes the schema from version `i` to `i + 1`.
-const MIGRATIONS: &[&str] = &[SCHEMA_V1];
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2];
 
 /// Brief card columns that are not numeric metrics, in exemplar-file order.
 const CARD_HEAD: [&str; 3] = ["lab", "flags", "tags"];
@@ -146,6 +159,9 @@ pub struct ArmAction {
 /// One aggregate of a holdout comparison; no sid, no run id.
 #[derive(Clone, Debug, Deserialize)]
 pub struct LedgerRow {
+    /// Which holdout query this comparison came from (the runner's ledger
+    /// timestamp): the same id re-records in place, a new one appends.
+    pub query: String,
     pub baseline: String,
     pub candidate: String,
     pub arm: String,
@@ -319,20 +335,37 @@ impl DevDb {
             self.guard_opt("sorter", s.sorter.as_deref())?,
         );
         let added = (s.split == "dev").then_some("now");
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        let old: Option<Option<String>> = tx
+            .query_row(
+                "SELECT fingerprint FROM sessions WHERE sid = ?1",
+                [sid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        tx.execute(
             "INSERT INTO sessions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CASE WHEN ?9 IS NULL THEN NULL ELSE date('now') END)
              ON CONFLICT(sid) DO UPDATE SET split = excluded.split, fingerprint = excluded.fingerprint,
                  sorter = excluded.sorter, n_spikes = excluded.n_spikes, n_roots = excluded.n_roots,
                  n_channels = excluded.n_channels, binary = excluded.binary, added = COALESCE(added, excluded.added)",
             params![sid, s.split, fp, sorter, s.n_spikes, s.n_roots, s.n_channels, s.binary, added],
         )?;
-        if s.split == "holdout" {
-            // A session re-recorded as holdout loses everything it had.
-            for t in ["root_cards", "truth_roots"] {
-                self.conn
-                    .execute(&format!("DELETE FROM {t} WHERE sid = ?1"), [sid])?;
+        // A session re-recorded as holdout, or on a changed input, loses everything
+        // it had: truth, cards and the runs scored against the old input describe
+        // another clustering. Re-record the truth after a changed fingerprint.
+        if s.split == "holdout" || old.is_some_and(|o| o.as_deref() != fp) {
+            for q in [
+                "DELETE FROM metrics WHERE rid IN (SELECT rid FROM runs WHERE sid = ?1)",
+                "DELETE FROM misses WHERE rid IN (SELECT rid FROM runs WHERE sid = ?1)",
+                "DELETE FROM arm_actions WHERE rid IN (SELECT rid FROM runs WHERE sid = ?1)",
+                "DELETE FROM runs WHERE sid = ?1",
+                "DELETE FROM root_cards WHERE sid = ?1",
+                "DELETE FROM truth_roots WHERE sid = ?1",
+            ] {
+                tx.execute(q, [sid])?;
             }
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -509,6 +542,7 @@ impl DevDb {
     pub fn record_ledger(&mut self, rows: &[LedgerRow]) -> Result<()> {
         for r in rows {
             for (w, v) in [
+                ("query", &r.query),
                 ("baseline", &r.baseline),
                 ("candidate", &r.candidate),
                 ("arm", &r.arm),
@@ -520,8 +554,8 @@ impl DevDb {
         let tx = self.conn.transaction()?;
         for r in rows {
             tx.execute(
-                "INSERT OR REPLACE INTO holdout_ledger VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![r.baseline, r.candidate, r.arm, r.metric, r.n_sessions, r.base, r.cand, r.delta, r.ci_lo, r.ci_hi],
+                "INSERT OR REPLACE INTO holdout_ledger VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![r.query, r.baseline, r.candidate, r.arm, r.metric, r.n_sessions, r.base, r.cand, r.delta, r.ci_lo, r.ci_hi],
             )?;
         }
         tx.commit()?;
@@ -663,7 +697,7 @@ impl DevDb {
         Ok(rev)
     }
 
-    /// One row per (variant, arm): mean dev metrics over its scored runs and
+    /// One row per (variant, arm, revisions): mean dev metrics over its scored runs and
     /// the holdout ledger rows that name it as the candidate.
     fn lineage(&self) -> Result<String> {
         let mut md = String::from("# Prompt lineage\n\nDev metrics are means over scored runs; holdout is the ledger delta of good_units.recall against its baseline.\n\n");
@@ -673,8 +707,9 @@ impl DevDb {
             "---|".repeat(LINEAGE_METRICS.len())
         );
         let mut st = self.conn.prepare(
-            "SELECT variant, arm, COUNT(*), MAX(prompt_rev), MAX(sorrel_rev), MAX(learned_rev), AVG(cost_usd)
-             FROM runs GROUP BY variant, arm ORDER BY MIN(rowid), variant, arm",
+            "SELECT variant, arm, COUNT(*), prompt_rev, sorrel_rev, learned_rev, AVG(cost_usd)
+             FROM runs GROUP BY variant, arm, prompt_rev, sorrel_rev, learned_rev
+             ORDER BY MIN(rowid), variant, arm",
         )?;
         let cell = |v: Option<f64>| v.map_or("-".into(), |v| format!("{v:.3}"));
         let txt = |v: Option<String>| v.unwrap_or_else(|| "-".into());
@@ -690,8 +725,9 @@ impl DevDb {
             let (variant, arm, n, revs, cost) = row?;
             let mean = |name: &str| -> Result<Option<f64>> {
                 Ok(self.conn.query_row(
-                    "SELECT AVG(m.value) FROM metrics m JOIN runs r USING (rid) WHERE r.variant = ?1 AND r.arm = ?2 AND m.name = ?3",
-                    params![variant, arm, name],
+                    "SELECT AVG(m.value) FROM metrics m JOIN runs r USING (rid) WHERE r.variant = ?1 AND r.arm = ?2 AND m.name = ?3
+                     AND r.prompt_rev IS ?4 AND r.sorrel_rev IS ?5 AND r.learned_rev IS ?6",
+                    params![variant, arm, name, revs[0], revs[1], revs[2]],
                     |r| r.get(0),
                 )?)
             };
@@ -1105,6 +1141,7 @@ mod tests {
             };
             d.record_run(&run, &[act]).unwrap();
             d.record_ledger(&[LedgerRow {
+                query: "q1".into(),
                 baseline: "v0".into(),
                 candidate: "v1".into(),
                 arm: "mcp-review".into(),
@@ -1258,6 +1295,178 @@ mod tests {
         })
         .unwrap();
         assert_eq!(d.query("SELECT (SELECT COUNT(*) FROM root_cards) + (SELECT COUNT(*) FROM truth_roots) AS n").unwrap(), "n\n0\n");
+    }
+
+    /// A run of a dev session with an action, a metric and a miss.
+    fn scored_run(d: &mut DevDb, sid: &str, rid: &str, sorrel_rev: Option<&str>, recall: f64) {
+        let run = RunRow {
+            rid: rid.into(),
+            sid: sid.into(),
+            variant: "v0".into(),
+            arm: "a".into(),
+            status: "ok".into(),
+            sorrel_rev: sorrel_rev.map(Into::into),
+            ..Default::default()
+        };
+        let act = ArmAction {
+            target: "1".into(),
+            action: "relabel:good".into(),
+            confidence: None,
+            reasons: None,
+        };
+        d.record_run(&run, &[act]).unwrap();
+        d.conn
+            .execute(
+                "INSERT INTO metrics VALUES (?1, 'good_units.recall', ?2)",
+                params![rid, recall],
+            )
+            .unwrap();
+        d.conn
+            .execute(
+                "INSERT INTO misses VALUES (?1, 'missed_merge', '1,2', NULL, NULL)",
+                [rid],
+            )
+            .unwrap();
+    }
+
+    /// Rows of `tables` (all session-derived ones by default).
+    fn rows_in(d: &DevDb, tables: &[&str]) -> i64 {
+        tables
+            .iter()
+            .map(|t| {
+                d.conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .unwrap()
+            })
+            .sum()
+    }
+
+    const RUN_DATA: [&str; 4] = ["runs", "metrics", "misses", "arm_actions"];
+
+    #[test]
+    fn re_recording_as_holdout_purges_the_runs_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        scored_run(&mut d, "s1", "r1", None, 0.5);
+        assert_eq!(rows_in(&d, &RUN_DATA), 4);
+        d.record_session(&SessionRow {
+            sid: "s1".into(),
+            split: "holdout".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let all = [&RUN_DATA[..], &["root_cards", "truth_roots"]].concat();
+        assert_eq!(rows_in(&d, &all), 0);
+        assert_eq!(rows_in(&d, &["sessions"]), 1);
+    }
+
+    #[test]
+    fn a_changed_input_drops_the_stale_truth_and_runs_but_the_same_one_keeps_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        scored_run(&mut d, "s1", "r1", None, 0.5);
+        // The same input again, without truth: nothing changes.
+        d.record_session(&dev("s1", "fp1")).unwrap();
+        d.record_cards("s1", BRIEF).unwrap();
+        assert_eq!(rows_in(&d, &["truth_roots"]), 3);
+        assert_eq!(rows_in(&d, &RUN_DATA), 4);
+        // A new input without truth: nothing scored against the old one remains.
+        d.record_session(&dev("s1", "fp2")).unwrap();
+        d.record_cards("s1", BRIEF).unwrap();
+        assert_eq!(rows_in(&d, &["truth_roots"]), 0);
+        assert_eq!(rows_in(&d, &RUN_DATA), 0);
+        assert!(d.exemplars(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn lineage_keeps_revisions_apart_with_their_own_means() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        scored_run(&mut d, "s1", "r1", Some("rev-a"), 0.2);
+        scored_run(&mut d, "s1", "r2", Some("rev-b"), 0.8);
+        scored_run(&mut d, "s1", "r3", None, 0.4);
+        scored_run(&mut d, "s1", "r4", None, 0.6);
+        let md = d.lineage().unwrap();
+        let rows: Vec<Vec<&str>> = md
+            .lines()
+            .filter(|l| l.starts_with("| v0 "))
+            .map(|l| l.split(" | ").collect())
+            .collect();
+        // (runs, sorrel_rev, good_units.recall mean); NULL revisions are one group.
+        let mut got: Vec<_> = rows.iter().map(|c| (c[2], c[4], c[6])).collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ("1", "rev-a", "0.200"),
+                ("1", "rev-b", "0.800"),
+                ("2", "-", "0.500")
+            ],
+            "{md}"
+        );
+    }
+
+    fn ledger(query: &str, delta: f64) -> LedgerRow {
+        LedgerRow {
+            query: query.into(),
+            baseline: "v0".into(),
+            candidate: "v1".into(),
+            arm: "a".into(),
+            metric: "m".into(),
+            n_sessions: 3,
+            base: 0.1,
+            cand: 0.1 + delta,
+            delta,
+            ci_lo: None,
+            ci_hi: None,
+        }
+    }
+
+    #[test]
+    fn the_ledger_appends_per_query_and_is_idempotent_within_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        d.record_ledger(&[ledger("q1", 0.1)]).unwrap();
+        d.record_ledger(&[ledger("q1", 0.1)]).unwrap();
+        assert_eq!(rows_in(&d, &["holdout_ledger"]), 1);
+        d.record_ledger(&[ledger("q2", 0.3)]).unwrap();
+        assert_eq!(
+            d.query("SELECT query, delta FROM holdout_ledger ORDER BY query")
+                .unwrap(),
+            "query\tdelta\nq1\t0.1\nq2\t0.3\n"
+        );
+    }
+
+    #[test]
+    fn a_v1_db_migrates_with_its_ledger_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(SCHEMA_V1).unwrap();
+            c.execute_batch(
+                "CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES (1);
+                 INSERT INTO holdout_ledger VALUES ('v0', 'v1', 'a', 'm', 3, 0.1, 0.2, 0.1, NULL, NULL);",
+            )
+            .unwrap();
+        }
+        let mut d = DevDb::open(&path).unwrap();
+        assert_eq!(
+            d.query("SELECT MAX(version) FROM schema_version").unwrap(),
+            "MAX(version)\n2\n"
+        );
+        assert_eq!(
+            d.query("SELECT query, baseline, delta FROM holdout_ledger")
+                .unwrap(),
+            "query\tbaseline\tdelta\nv1\tv0\t0.1\n"
+        );
+        d.record_ledger(&[ledger("q1", 0.2)]).unwrap();
+        assert_eq!(rows_in(&d, &["holdout_ledger"]), 2);
     }
 
     #[test]
