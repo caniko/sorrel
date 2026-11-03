@@ -347,7 +347,7 @@ impl DevDb {
             "INSERT INTO sessions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CASE WHEN ?9 IS NULL THEN NULL ELSE date('now') END)
              ON CONFLICT(sid) DO UPDATE SET split = excluded.split, fingerprint = excluded.fingerprint,
                  sorter = excluded.sorter, n_spikes = excluded.n_spikes, n_roots = excluded.n_roots,
-                 n_channels = excluded.n_channels, binary = excluded.binary, added = COALESCE(added, excluded.added)",
+                 n_channels = excluded.n_channels, binary = excluded.binary, added = CASE WHEN excluded.added IS NULL THEN NULL ELSE COALESCE(added, excluded.added) END",
             params![sid, s.split, fp, sorter, s.n_spikes, s.n_roots, s.n_channels, s.binary, added],
         )?;
         // A session re-recorded as holdout, or on a changed input, loses everything
@@ -396,24 +396,45 @@ impl DevDb {
     pub fn record_truth(&mut self, sid: &str, roots: &[RootTruth]) -> Result<()> {
         self.require_dev("truth", sid)?;
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM truth_roots WHERE sid = ?1", [sid])?;
-        for r in roots {
-            let join = |f: &dyn Fn(&(f64, u32)) -> String| {
-                r.cores.iter().map(f).collect::<Vec<_>>().join(",")
-            };
-            tx.execute(
-                "INSERT INTO truth_roots VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    sid,
+        let rows: Vec<_> = roots
+            .iter()
+            .map(|r| {
+                let join = |f: &dyn Fn(&(f64, u32)) -> String| {
+                    r.cores.iter().map(f).collect::<Vec<_>>().join(",")
+                };
+                (
                     r.root,
                     r.n_spikes,
-                    r.verdict,
+                    r.verdict.to_owned(),
                     r.n_good,
                     r.good_share,
                     join(&|c| format!("{:.4}", c.0)),
-                    join(&|c| c.1.to_string())
-                ],
-            )?;
+                    join(&|c| c.1.to_string()),
+                )
+            })
+            .collect();
+        let old: Vec<_> = tx
+            .prepare("SELECT root, n_spikes, verdict, n_good, good_share, core_shares, core_sizes FROM truth_roots WHERE sid = ?1 ORDER BY root")?
+            .query_map([sid], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        // Scores made against another truth no longer hold; the runs and their
+        // actions do not depend on it.
+        if old != rows {
+            for q in [
+                "DELETE FROM metrics WHERE rid IN (SELECT rid FROM runs WHERE sid = ?1)",
+                "DELETE FROM misses WHERE rid IN (SELECT rid FROM runs WHERE sid = ?1)",
+            ] {
+                tx.execute(q, [sid])?;
+            }
+            tx.execute("DELETE FROM truth_roots WHERE sid = ?1", [sid])?;
+            for (root, n_spikes, verdict, n_good, share, shares, sizes) in &rows {
+                tx.execute(
+                    "INSERT INTO truth_roots VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![sid, root, n_spikes, verdict, n_good, share, shares, sizes],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -473,6 +494,18 @@ impl DevDb {
             ));
         }
         let tx = self.conn.transaction()?;
+        // A changed run drops the scores of the old one so it is scored again;
+        // an identical re-record (runner, backfill) keeps them.
+        let same: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE rid = ?1 AND (sid, variant, arm, model, repeat, status, cost_usd, turns, wall_s, usage, prompt_rev, sorrel_rev, learned_rev)
+                 IS (?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14))",
+            params![rid, sid, variant, arm, model, r.repeat, status, r.cost_usd, r.turns, r.wall_s, usage, prompt_rev, sorrel_rev, learned_rev],
+            |r| r.get(0),
+        )?;
+        if !same {
+            tx.execute("DELETE FROM metrics WHERE rid = ?1", [rid])?;
+            tx.execute("DELETE FROM misses WHERE rid = ?1", [rid])?;
+        }
         tx.execute(
             "INSERT OR REPLACE INTO runs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![rid, sid, variant, arm, model, r.repeat, status, r.cost_usd, r.turns, r.wall_s, usage, prompt_rev, sorrel_rev, learned_rev],
@@ -1299,6 +1332,23 @@ mod tests {
 
     /// A run of a dev session with an action, a metric and a miss.
     fn scored_run(d: &mut DevDb, sid: &str, rid: &str, sorrel_rev: Option<&str>, recall: f64) {
+        record_plain_run(d, sid, rid, sorrel_rev);
+        d.conn
+            .execute(
+                "INSERT INTO metrics VALUES (?1, 'good_units.recall', ?2)",
+                params![rid, recall],
+            )
+            .unwrap();
+        d.conn
+            .execute(
+                "INSERT INTO misses VALUES (?1, 'missed_merge', '1,2', NULL, NULL)",
+                [rid],
+            )
+            .unwrap();
+    }
+
+    /// A run of a dev session with an action, not scored.
+    fn record_plain_run(d: &mut DevDb, sid: &str, rid: &str, sorrel_rev: Option<&str>) {
         let run = RunRow {
             rid: rid.into(),
             sid: sid.into(),
@@ -1315,18 +1365,6 @@ mod tests {
             reasons: None,
         };
         d.record_run(&run, &[act]).unwrap();
-        d.conn
-            .execute(
-                "INSERT INTO metrics VALUES (?1, 'good_units.recall', ?2)",
-                params![rid, recall],
-            )
-            .unwrap();
-        d.conn
-            .execute(
-                "INSERT INTO misses VALUES (?1, 'missed_merge', '1,2', NULL, NULL)",
-                [rid],
-            )
-            .unwrap();
     }
 
     /// Rows of `tables` (all session-derived ones by default).
@@ -1380,6 +1418,75 @@ mod tests {
         assert_eq!(rows_in(&d, &["truth_roots"]), 0);
         assert_eq!(rows_in(&d, &RUN_DATA), 0);
         assert!(d.exemplars(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_dev_session_re_recorded_as_holdout_keeps_no_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        assert_eq!(
+            d.query("SELECT added IS NULL AS a FROM sessions").unwrap(),
+            "a\n0\n"
+        );
+        d.record_session(&SessionRow {
+            sid: "s1".into(),
+            split: "holdout".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            d.query("SELECT split, fingerprint IS NULL AS f, added IS NULL AS a FROM sessions")
+                .unwrap(),
+            "split\tf\ta\nholdout\t1\t1\n"
+        );
+    }
+
+    #[test]
+    fn a_changed_run_drops_its_scores_but_an_identical_re_record_keeps_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        scored_run(&mut d, "s1", "r1", Some("rev1"), 0.5);
+        scored_run(&mut d, "s1", "r2", Some("rev1"), 0.5);
+        // the same run again (runner, backfill): scores stay
+        record_plain_run(&mut d, "s1", "r1", Some("rev1"));
+        assert_eq!(rows_in(&d, &["metrics", "misses"]), 4);
+        // r1 changed: its scores go, r2's stay, the run is refreshed
+        record_plain_run(&mut d, "s1", "r1", Some("rev2"));
+        assert_eq!(rows_in(&d, &["metrics", "misses"]), 2);
+        assert_eq!(
+            d.query("SELECT COUNT(*) AS n FROM metrics WHERE rid = 'r1'")
+                .unwrap(),
+            "n\n0\n"
+        );
+        assert_eq!(rows_in(&d, &["runs", "arm_actions"]), 4);
+    }
+
+    #[test]
+    fn a_revised_truth_drops_the_scores_but_keeps_the_runs_and_an_identical_one_keeps_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        scored_run(&mut d, "s1", "r1", None, 0.5);
+        fill(&mut d, "s1", "fp1"); // the same truth again
+        assert_eq!(rows_in(&d, &RUN_DATA), 4);
+        d.record_truth(
+            "s1",
+            &[
+                truth(0, "noise", 0),
+                truth(1, "cores", 2),
+                truth(2, "cleanup", 1),
+            ],
+        )
+        .unwrap();
+        assert_eq!(rows_in(&d, &["metrics", "misses"]), 0);
+        assert_eq!(rows_in(&d, &["runs", "arm_actions", "truth_roots"]), 5);
+        assert_eq!(
+            d.query("SELECT n_good FROM truth_roots WHERE root = 1")
+                .unwrap(),
+            "n_good\n2\n"
+        );
     }
 
     #[test]
