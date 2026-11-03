@@ -1,5 +1,6 @@
 {
   pkgs,
+  plinthProject,
   harbor-rs,
   craneLib,
   cross,
@@ -37,8 +38,8 @@ in
         python3
         xdotool
         xorg.xorgserver
-        zola
       ]
+      ++ [plinthProject]
       ++ hdf5Packages
       ++ preCommitEnabledPackages
       ++ buildInputs;
@@ -47,7 +48,7 @@ in
 
     extraShellHook = ''
       ${shellHook}
-      echo "Website: cd website && zola serve"
+      echo "Website: plinth-project dev --config website/plinth-project.toml"
       echo "Documentation: cd docs && mdbook serve"
     '';
   })

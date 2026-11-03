@@ -1,0 +1,143 @@
+/* Sorrel's layer over plinth-project's style.css. Unlayered, so it wins over plinth's @layer rules. */
+:root {
+  --sorrel-green: #59a14f;
+  --sorrel-blue: #4e79a7;
+  --sorrel-orange: #f28e2b;
+  --sorrel-wrap: 1296px;
+  --sorrel-gutter: clamp(1.25rem, 5vw, 4.5rem);
+  --sorrel-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+
+body { font-size: 1.125rem; -webkit-font-smoothing: antialiased; }
+
+/* One container for every row: nav, hero, sections, footer. */
+body :is(.nav-inner, .footer-inner),
+main > section,
+.hero.hero--split ~ :is(.features, .landing-content, .install-section) {
+  max-width: var(--sorrel-wrap);
+  margin-inline: auto;
+  padding-inline: var(--sorrel-gutter);
+}
+
+/* Nav: icon + wordmark lockup. */
+body .nav-brand { display: inline-flex; align-items: center; gap: .625rem; font-size: 1.125rem; font-weight: 700; text-transform: none; letter-spacing: -.01em; }
+body:has(.hero--split) .nav-brand::before { width: 1.75rem; height: 1.75rem; border-radius: .45rem; background: url("/sorrel.svg") center / contain no-repeat; }
+body .nav-links a { font-size: 1rem; }
+body .nav-links .nav-primary { background: var(--sorrel-green); color: #0d1117; padding: .45rem 1rem; border-radius: .5rem; min-height: 0; font-weight: 650; }
+body .nav-links .nav-primary:hover { color: #0d1117; filter: brightness(1.08); }
+
+/* Hero: centred copy over the product at nearly full width (plinth's split layout, restacked). */
+.hero.hero--split {
+  position: relative;
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: clamp(2rem, 3.5vw, 3.25rem) var(--sorrel-gutter) clamp(2rem, 4vw, 3rem);
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: center;
+  gap: clamp(1.75rem, 3vw, 2.75rem);
+  text-align: center;
+  isolation: isolate;
+}
+.hero.hero--split::before {
+  content: "";
+  position: absolute;
+  inset: 0 -20%;
+  z-index: -1;
+  pointer-events: none;
+  /* Light from behind the product; every gradient fades out inside the box. */
+  background:
+    radial-gradient(34% 22% at 50% 14%, color-mix(in srgb, var(--sorrel-green) 18%, transparent), transparent),
+    radial-gradient(38% 30% at 50% 66%, color-mix(in srgb, var(--sorrel-green) 40%, transparent), transparent),
+    radial-gradient(24% 22% at 72% 52%, color-mix(in srgb, var(--sorrel-blue) 30%, transparent), transparent),
+    radial-gradient(22% 20% at 30% 80%, color-mix(in srgb, var(--sorrel-orange) 16%, transparent), transparent);
+}
+.hero-logo { display: none; }
+.hero--split .hero-copy { justify-items: center; max-width: 56rem; }
+.hero.hero--split h1 {
+  font-size: clamp(2.75rem, 6.4vw, 6rem);
+  line-height: .98;
+  text-wrap: balance;
+  font-weight: 750;
+  letter-spacing: -.04em;
+  max-width: 14ch;
+  background: linear-gradient(180deg, #fff 38%, #9ad98a 62%, var(--sorrel-green) 92%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.hero--split .tagline { font-size: clamp(1.125rem, 1.5vw, 1.35rem); line-height: 1.55; color: var(--pp-ink-soft); max-width: 42rem; text-wrap: pretty; }
+.hero--split .subtitle { display: none; }
+.hero--split .hero-actions { justify-content: center; gap: .75rem; margin-top: .75rem; }
+.hero .btn { min-width: 11.5rem; text-align: center; padding: .9rem 1.6rem; border-radius: .6rem; font-size: 1.05rem; font-weight: 650; transition: transform .15s ease, box-shadow .15s ease; }
+.hero .btn-primary { background: var(--sorrel-green); color: #0d1117; box-shadow: 0 .75rem 2rem -0.75rem color-mix(in srgb, var(--sorrel-green) 70%, transparent); }
+.hero .btn-primary:hover { color: #0d1117; transform: translateY(-1px); box-shadow: 0 1rem 2.5rem -0.75rem var(--sorrel-green); }
+.hero .btn-secondary:hover { color: var(--pp-ink); border-color: var(--pp-ink-soft); }
+.hero--split .hero-note {
+  font-family: var(--sorrel-mono);
+  font-size: .8125rem;
+  color: var(--pp-ink-soft);
+  word-spacing: .15em;
+}
+.hero-media { position: relative; width: 100%; max-width: 1360px; }
+.hero-preview {
+  width: 100%;
+  border-radius: 1rem;
+  border: 1px solid rgb(255 255 255 / .12);
+  box-shadow:
+    0 0 0 8px rgb(255 255 255 / .03),
+    0 3rem 9rem -2rem color-mix(in srgb, var(--sorrel-green) 50%, transparent),
+    0 2rem 4rem -1rem rgb(0 0 0 / .75);
+}
+
+/* Section rhythm and headings. */
+main > section:not(.hero) { padding-block: clamp(3rem, 7vw, 6rem) 0; }
+.hero--split ~ section .section-heading h2,
+.landing-content h2 { font-size: clamp(2rem, 3.4vw, 2.75rem); font-weight: 750; letter-spacing: -.025em; }
+.hero--split ~ section .section-heading p,
+.landing-content > p { font-size: 1.125rem; max-width: 44rem; }
+
+main h2 { text-wrap: balance; }
+.install-section button { background: transparent; color: var(--sorrel-green); border: 1px solid color-mix(in srgb, var(--sorrel-green) 60%, transparent); }
+
+/* Gallery: two large tiles a row. */
+.screenshots-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.5rem; margin-top: 2rem; }
+.screenshot-slot { padding: 0; gap: 0; border-radius: .9rem; background: var(--pp-surface); transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease; }
+.screenshot-slot:hover { transform: translateY(-3px); border-color: color-mix(in srgb, var(--sorrel-green) 55%, transparent); box-shadow: 0 1.5rem 3rem -1.5rem rgb(0 0 0 / .8); }
+.screenshot-slot figcaption { padding: 1rem 1.25rem 1.25rem; font-size: 1rem; color: var(--pp-ink-soft); }
+
+/* Cards: four a row, so 8 features and 4 backends fill whole rows. */
+.hero--split ~ .features .features-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.install-routes { grid-template-columns: minmax(0, 1fr); }
+.hero--split ~ .features .feature-card { padding: 1.25rem 0 0; border: 0; border-top: 1px solid var(--pp-line); border-radius: 0; background: none; }
+.hero--split ~ .features .features-grid { column-gap: 2rem; row-gap: 2.25rem; }
+.hero--split ~ .features .feature-card p { font-size: 1rem; line-height: 1.55; }
+.hero--split ~ .features .feature-card h3 { font-size: 1.2rem; }
+.install-route.recommended { --pp-secondary: var(--sorrel-green); }
+.install-route p, .secondary-routes p { font-size: 1rem; }
+
+footer { margin-top: clamp(4rem, 8vw, 7rem); }
+
+@media (max-width: 1100px) {
+  .hero--split ~ .features .features-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 700px) {
+  .hero.hero--split h1 { font-size: 2.75rem; }
+  .hero--split .tagline { font-size: 1.0625rem; line-height: 1.5; }
+  .hero--split .hero-actions .btn-secondary { display: inline-block; }
+  .hero--split .hero-note { display: block; font-size: .65rem; word-spacing: 0; white-space: nowrap; }
+  .hero--split .hero-actions .btn { width: 100%; }
+  .hero.hero--split { text-align: left; justify-items: stretch; }
+  .hero--split .hero-copy { justify-items: start; }
+  .hero--split .hero-actions { justify-self: stretch; }
+  .screenshots-grid { grid-template-columns: minmax(0, 1fr); }
+  .hero--split ~ .features .features-grid { column-gap: 1.25rem; }
+  .hero--split ~ .features .feature-card { display: block; min-height: 0; padding: 1rem 0 0; }
+  .hero--split ~ .features .feature-index { display: none; }
+  .hero--split ~ .features .feature-card p { font-size: .9375rem; }
+  .hero .btn { min-width: 0; }
+  body { font-size: 1rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .hero .btn, .screenshot-slot { transition: none; }
+  .hero .btn-primary:hover, .screenshot-slot:hover { transform: none; }
+}

@@ -6,7 +6,9 @@
 
 <!-- simit:badges:end -->
 
-Native, high-performance GUI for manual curation of spike-sorted electrophysiology data.
+<p align="center"><img src="assets/showcase/hero.webp" alt="Sorrel's curation workspace: cluster table, waveforms, CCGs, quality metrics, trace and raster, with the 3D feature space and probe map floating alongside" width="100%"></p>
+
+Native, high-performance GUI for manual curation of spike-sorted electrophysiology data. More views in the [gallery](https://sorrel.tartanoglu.com/#gallery).
 
 Sorrel is built around **zero-cost abstractions**: the entire core is generic over a `DataProvider` trait, monomorphised at compile time, so hot paths (downsampling, vertex generation, journaling) cross no dynamic-dispatch boundary.
 

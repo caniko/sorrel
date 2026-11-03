@@ -1,0 +1,258 @@
+[site]
+title = "Sorrel"
+description = "Native spike-sorting curation: a high-performance GUI for manual curation of spike-sorted electrophysiology data."
+base_url = "/"
+canonical_domain = "sorrel.tartanoglu.com"
+footer_note = "Sorrel is open-source software licensed under MIT OR Apache-2.0."
+stylesheets = ["/site.css"]
+favicon = "/sorrel.svg"
+og_image = "/showcase/social.png"
+
+[theme]
+paper = "#0d1117"
+surface = "#161b22"
+accent = "#59a14f"
+accent_soft = "rgba(89, 161, 79, 0.16)"
+secondary = "#4e79a7"
+warning = "#f28e2b"
+font_family = "Inter"
+font_url = "/fonts/InterVariable-latin.woff2"
+
+[[nav]]
+label = "Gallery"
+href = "/#gallery"
+
+[[nav]]
+label = "Documentation"
+href = "/docs/"
+
+[[nav]]
+label = "Source"
+href = "https://github.com/caniko/sorrel"
+
+[[nav]]
+label = "Download"
+href = "https://github.com/caniko/sorrel/releases/latest"
+primary = true
+
+[[footer_links]]
+label = "Docs"
+href = "/docs/"
+
+[[footer_links]]
+label = "Source"
+href = "https://github.com/caniko/sorrel"
+
+[[footer_links]]
+label = "Releases"
+href = "https://github.com/caniko/sorrel/releases"
+
+[[footer_links]]
+label = "Code signing policy"
+href = "/docs/project/code-signing.html"
+
+[[assets]]
+source = "../assets/icon/sorrel.svg"
+target = "sorrel.svg"
+
+[[assets]]
+source = "site.css"
+target = "site.css"
+
+[[assets]]
+source = "fonts/InterVariable-latin.woff2"
+target = "fonts/InterVariable-latin.woff2"
+
+[[assets]]
+source = "fonts/Inter-OFL.txt"
+target = "fonts/Inter-OFL.txt"
+
+[[assets]]
+source = "../assets/showcase/hero-loop.webp"
+target = "showcase/hero-loop.webp"
+
+[[assets]]
+source = "../assets/showcase/hero-still.webp"
+target = "showcase/hero-still.webp"
+
+[[assets]]
+source = "../assets/showcase/hero-mobile.webp"
+target = "showcase/hero-mobile.webp"
+
+[[assets]]
+source = "../assets/showcase/social.png"
+target = "showcase/social.png"
+
+[[assets]]
+source = "../assets/showcase/gallery-3d.webp"
+target = "showcase/gallery-3d.webp"
+
+[[assets]]
+source = "../assets/showcase/gallery-kmeans.webp"
+target = "showcase/gallery-kmeans.webp"
+
+[[assets]]
+source = "../assets/showcase/gallery-isi-whatif.webp"
+target = "showcase/gallery-isi-whatif.webp"
+
+[[assets]]
+source = "../assets/showcase/gallery-probe.webp"
+target = "showcase/gallery-probe.webp"
+
+[[assets]]
+source = "../assets/showcase/gallery-proposals.webp"
+target = "showcase/gallery-proposals.webp"
+
+[[assets]]
+source = "../assets/showcase/gallery-history.webp"
+target = "showcase/gallery-history.webp"
+
+[[pages]]
+slug = "index"
+title = "Sorrel"
+description = "Native spike-sorting curation: a high-performance GUI for manual curation of spike-sorted electrophysiology data."
+
+[[pages.sections]]
+type = "hero"
+title = "Curate spike sorts at native speed."
+tagline = "Open phy, Kilosort, SpikeInterface or NWB output. Merge, split and label clusters against waveforms, features, correlograms and rasters. Every edit is journaled, and nothing is lost."
+subtitle = ""
+preview_src = "/showcase/hero-loop.webp"
+preview_still = "/showcase/hero-still.webp"
+preview_mobile_src = "/showcase/hero-mobile.webp"
+preview_alt = "Sorrel's waveform and feature views: a lasso drawn around a cloud of spikes lights the same spikes up in the waveforms, then the selection moves through the 3D feature space and the time brush."
+note = "winget install Caniko.Sorrel  ·  choco install sorrel"
+
+[[pages.sections.ctas]]
+label = "Download"
+href = "https://github.com/caniko/sorrel/releases/latest"
+primary = true
+
+[[pages.sections.ctas]]
+label = "Documentation"
+href = "/docs/"
+
+[[pages.sections]]
+type = "screenshot_grid"
+id = "gallery"
+heading = "See it work"
+intro = "Every image is rendered headlessly from Sorrel's own UI tests, so what you see is what Sorrel draws."
+
+[[pages.sections.screenshots]]
+src = "/showcase/gallery-3d.webp"
+alt = "A 3D feature space: two clusters as point clouds inside a wireframe cube, a lasso prism around a brushed group, and the list of candidate third axes"
+caption = "3D feature space: orbit the clusters, pick a third axis, and lasso a prism through them"
+
+[[pages.sections.screenshots]]
+src = "/showcase/gallery-kmeans.webp"
+alt = "A k-means split of one cluster into numbered parts, with a collision matrix showing how much the parts overlap"
+caption = "K-means split with a collision matrix, so you see overlap before you commit"
+
+[[pages.sections.screenshots]]
+src = "/showcase/gallery-isi-whatif.webp"
+alt = "Waveforms of a proposed split beside an ISI histogram that shows the inside and outside groups separately"
+caption = "ISI what-if: see how a split changes refractory violations before you make it"
+
+[[pages.sections.screenshots]]
+src = "/showcase/gallery-probe.webp"
+alt = "A probe map of 16 channels with two selected channels marked A and B, beside the feature navigator"
+caption = "Probe map and feature navigator: click channels, see their features"
+
+[[pages.sections.screenshots]]
+src = "/showcase/gallery-proposals.webp"
+alt = "The proposals pane with an agent's merge and relabel suggestions, each with its evidence and Accept and Reject buttons"
+caption = "Agent proposals arrive with their evidence, and nothing changes until you accept"
+
+[[pages.sections.screenshots]]
+src = "/showcase/gallery-history.webp"
+alt = "The History pane showing a branching curation journal with entries from you and an agent"
+caption = "Branching history: go back to any point, and nothing is ever discarded"
+
+[[pages.sections]]
+type = "feature_grid"
+id = "features"
+heading = "Built for curation work"
+
+[[pages.sections.features]]
+title = "Phy & Kilosort, natively"
+description = "Reads spike_times, spike_clusters, params.py, templates, PC features, amplitudes, similar_templates, channel_positions, and quality-metric sidecars exactly as phy does."
+
+[[pages.sections.features]]
+title = "Multiple backends"
+description = "phy / Kilosort, SpikeInterface SortingAnalyzer (binary folder), Kilosort 4 rez.mat, and NWB. SpikeGLX, Open Ephys, and MDA work as raw trace sources."
+
+[[pages.sections.features]]
+title = "Fast on every format"
+description = "Each data format gets its own compiled fast path: drawing, downsampling and journaling never go through a runtime lookup."
+
+[[pages.sections.features]]
+title = "GPU trace pipeline"
+description = "Optional wgpu kernels for common-median referencing, high-pass filtering, and mean-snippet extraction, sharing the renderer's device and queue, with a transparent CPU fallback."
+
+[[pages.sections.features]]
+title = "Durable curation journal"
+description = "Every relabel, merge, split, and undo/redo lands in the journal before the in-memory session moves. Replay on open is idempotent; resealed at save."
+
+[[pages.sections.features]]
+title = "Built-in views"
+description = "Trace, raster, ISI, CCG, waveform, template, feature, drift, probe, similarity, quality, and merge/split suggestions, all in one window."
+
+[[pages.sections.features]]
+title = "Headless QC export"
+description = "sorrel qc DIR --out DIR runs every metric on the loaded session and writes cluster_qc.tsv + cluster_qc.json without spawning a window."
+
+[[pages.sections.features]]
+title = "Python bridge"
+description = "sorrel.open(recording, sorting) opens a SpikeInterface analyzer in the native GUI via the sorrel-py bridge."
+
+[[pages.sections]]
+type = "feature_grid"
+id = "backends"
+heading = "Reads what you already have"
+
+[[pages.sections.features]]
+title = "phy / Kilosort"
+description = "Directory of spike_times.npy, spike_clusters.npy, params.py, plus optional templates, PC features, amplitudes, channel positions, similarity, and quality-metric sidecars."
+
+[[pages.sections.features]]
+title = "SpikeInterface"
+description = "SortingAnalyzer saved as binary_folder: recording.json, the flat sorting under sorting/, optional probe.json, and quality_metrics extension."
+
+[[pages.sections.features]]
+title = "NWB & KS4 rez"
+description = "*.nwb via /units/spike_times and the electrodes table; rez.mat via rez/st3 and rez/ops. Both gated behind --features hdf5."
+
+[[pages.sections.features]]
+title = "Recording sources"
+description = "SpikeGLX .bin+.meta, Open Ephys continuous.dat+structure.oebin, and Mountainsort MDA plug in via --dat, --spikeglx-meta, --oebin."
+
+[[pages.sections]]
+type = "install"
+id = "install"
+heading = "Install"
+intro = "Prebuilt binaries for Linux, macOS and Windows on every release. Point Sorrel at a sorting directory (sorrel open my_run/phy) and it detects the backend."
+guide_href = "/docs/getting-started/installation.html"
+
+[[pages.sections.primary_routes]]
+label = "Download a release"
+audience = "Linux (AppImage, tar.gz), macOS (Apple silicon), Windows (.exe, .zip)"
+href = "https://github.com/caniko/sorrel/releases/latest"
+recommended = true
+
+[[pages.sections.secondary_routes]]
+label = "Windows (winget)"
+audience = "Stable releases"
+href = "/docs/getting-started/installation.html#windows"
+command = "winget install Caniko.Sorrel"
+
+[[pages.sections.secondary_routes]]
+label = "Windows (Chocolatey)"
+audience = "Stable releases"
+href = "/docs/getting-started/installation.html#windows"
+command = "choco install sorrel"
+
+[[pages.sections.secondary_routes]]
+label = "Build from source"
+audience = "Cargo, all platforms"
+href = "/docs/getting-started/installation.html#with-cargo"
+command = "cargo build --release -p sorrel"
