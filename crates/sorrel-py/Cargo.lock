@@ -585,7 +585,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sorrel-cache"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "sorrel-compute"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rayon",
  "sorrel-io",
@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "sorrel-data"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "sorrel-io"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "sorrel-py"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "pyo3",
