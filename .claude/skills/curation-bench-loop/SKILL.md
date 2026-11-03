@@ -15,6 +15,9 @@ steps and says who does each.
 
 - A `sorrel` binary (`SORREL_BIN` if it is not on `PATH`) and the `claude` CLI.
 - uv, for the `auto-llm` arm.
+- For the results DB, a `sorrel` built with `--features dev`; `--db FILE` (or
+  `SORREL_DEV_DB`) on the runner turns recording on. Holdout runs are never
+  recorded; only the holdout report's aggregates are.
 - A private `BENCH` directory outside the repo and a variants directory beside
   it (`$BENCH/../variants`); variants never live in the repo.
 - Uploads from `export-curated-sort` unpacked first with
@@ -39,17 +42,19 @@ Delegated agents get only what their task row lists.
 | #   | Step                                                                                                                    | Tier   | Brief contains                                                                                                   | Returns                                                                               |
 | --- | ----------------------------------------------------------------------------------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | 1   | `add` sessions (`--dev` if the lead has seen the truth)                                                                 | flash  | the bench path and the session dirs                                                                              | the counts line                                                                       |
-| 2   | `run` the arms, then `score`                                                                                            | flash  | the command lines and the budget                                                                                 | run ids, status, cost, and the path of `report dev`                                   |
-| 3   | Condense the dev report into a miss taxonomy                                                                            | flash  | the dev report path only                                                                                         | a table of at most 40 lines: category x count, worst roots, and the card each arm saw |
-| 4   | Write ONE variant (`rubric.md` or `review.md`) for the largest miss category, or a code change for a missing capability | worker | the condensed taxonomy, the current prompt (`sorrel agent-guide --prompt review`) and `docs/src/usage/agents.md` | the variant dir and its rationale                                                     |
-| 5   | Review a code change                                                                                                    | worker | the diff                                                                                                         | findings                                                                              |
-| 6   | Accept or reject on dev, add holdout sessions, run the holdout `report` and adjudication                                | lead   |                                                                                                                  |                                                                                       |
+| 2   | `run` the arms, then `score` (with `--db`, each dev session, run and score is recorded in the results DB)               | flash  | the command lines, the budget and the DB path                                                                    | run ids, status, cost, and the path of `report dev`                                   |
+| 3   | Query the DB (`sorrel dev db query`) and, after new dev data, `sorrel dev distill --out DIR`                            | flash  | the DB path, the SQL or the `distill` line and the head of `lineage.md` to report                                | the query output, the distilled `learned_rev` and the head of `lineage.md`            |
+| 4   | Condense the dev report into a miss taxonomy                                                                            | flash  | the dev report path only                                                                                         | a table of at most 40 lines: category x count, worst roots, and the card each arm saw |
+| 5   | Write ONE variant (`rubric.md` or `review.md`) for the largest miss category, or a code change for a missing capability | worker | the condensed taxonomy, the current prompt (`sorrel agent-guide --prompt review`) and `docs/src/usage/agents.md` | the variant dir and its rationale                                                     |
+| 6   | Review a code change, or a fit (the distilled `priors.toml` / `thresholds.toml` against the dev exemplars)              | worker | the diff, or the distilled files and `lineage.md`                                                                | findings                                                                              |
+| 7   | Accept or reject on dev, add holdout sessions, run the holdout `report` (it writes the ledger) and adjudication         | lead   |                                                                                                                  |                                                                                       |
 
-Steps 2 and 3 repeat for the new variant after step 4.
+Steps 2 to 4 repeat for the new variant after step 5.
 
 ## Sealing
 
-- Flash and worker agents never get `BENCH/.sealed/`, truth directories, the
+- The results DB holds derived dev data and holdout aggregates only; flash and
+  worker agents may read it. They never get `BENCH/.sealed/`, truth directories, the
   source `src/` folder of a session or `phy.log`.
 - The holdout is lead-only. Add holdout sessions without inspecting them.
 - Any session whose truth the lead has looked at goes in with `add --dev`, so it

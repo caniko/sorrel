@@ -3,6 +3,8 @@ result*
 # sorrel-py is outside the workspace and builds into its own target dir
 /crates/sorrel-py/target/
 *.sqlite
+# ... except the bench results DB, versioned with git-lfs (.gitattributes)
+!/bench/results.sqlite
 # rs-harbor materialises this on dev-shell entry
 /.cargo/config.toml
 *.sqlite-journal

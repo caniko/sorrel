@@ -7,6 +7,8 @@ pub mod cache;
 pub mod cluster_index;
 pub mod command;
 pub mod curation_json;
+#[cfg(feature = "dev")]
+pub mod devdb;
 pub mod diff;
 pub mod evaluate;
 pub mod feature_subspace;
@@ -36,6 +38,8 @@ pub use cache::correlograms::{acg_or_compute, ccg_or_compute};
 pub use cluster_index::{ClusterIndex, MergeRecord, SplitRecord};
 pub use command::{describe_command, Actor, CurationCommand, Method, PhyLabelOp, UnitOrigin};
 pub use curation_json::write_curation_json;
+#[cfg(feature = "dev")]
+pub use devdb::DevDb;
 pub use diff::{diff_labels, LabelDiff};
 pub use evaluate::{eval_merge, eval_split, Handles, MergeEval, Relation, SplitEval};
 pub use feature_subspace::{

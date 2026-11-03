@@ -25,7 +25,9 @@ import json, os, sys
 from pathlib import Path
 a = sys.argv[1:]
 with open(os.environ["STUB_LOG"], "a") as f:
-    f.write(json.dumps({{"tool": "sorrel", "argv": a, "env": {{k: os.environ.get(k) for k in ("SORREL_RUBRIC", "SORREL_REVIEW")}}}}) + "\n")
+    deny = os.environ.get("SORREL_DEV_DENY")
+    f.write(json.dumps({{"tool": "sorrel", "argv": a, "env": {{k: os.environ.get(k) for k in ("SORREL_RUBRIC", "SORREL_REVIEW", "SORREL_DEV_DB", "SORREL_DEV_DENY")}},
+                         "deny": Path(deny).read_text() if deny else None, "ledger": Path(a[a.index("--json") + 1]).read_text() if a[:2] == ["dev", "ledger"] else None}}) + "\n")
 if a[0] == "blind":
     s, i, t = Path(a[1]), Path(a[a.index("--input") + 1]), Path(a[a.index("--truth") + 1])
     i.mkdir(parents=True); t.mkdir(parents=True)
@@ -78,8 +80,11 @@ def main() -> None:
             (stubs / name).chmod(0o755)
         log = t / "log.jsonl"
         os.environ |= {"PATH": f"{stubs}:{os.environ['PATH']}", "SORREL_BIN": "sorrel", "STUB_LOG": str(log), "BENCH_SALT": "salt"}
+        os.environ.pop("SORREL_DEV_DB", None)
         sys.path.insert(0, str(HERE))
         import bench_curation as bc
+
+        real_claude = bc.claude
 
         bench = t / "bench"
         go = lambda *a: bc.main(["--bench", str(bench), *map(str, a)])
@@ -255,7 +260,42 @@ def main() -> None:
             go2("score")
             go2("report", "holdout", "--baseline", "base", "--candidate", "cand")
         assert "n<3 sessions: no CI" in out.getvalue() and "95% CI" not in out.getvalue(), out.getvalue()
-        print("ok: add/splits, mcp-review argv, holdout sealing + ledger, adjudication")
+        bc.claude = real_claude
+        # results DB: the phases above ran without one and made no `dev` call
+        assert not [c for c in calls(log, "sorrel") if c["argv"][0] == "dev" or "--record" in c["argv"]]
+        benchdb, db = t / "benchdb", t / "r.sqlite"
+        godb = lambda *a: bc.main(["--bench", str(benchdb), "--db", str(db), *map(str, a)])
+        log.write_text("")
+        with contextlib.redirect_stdout(io.StringIO()):
+            godb("add", *sessions)
+            for v in ("base", "cand"):
+                for split in ("dev", "holdout"):
+                    godb("run", "--arm", "mcp-review", "--variant", t / v, "--split", split, "--repeats", 1)
+            godb("score")
+            godb("report", "holdout", "--baseline", "base", "--candidate", "cand")
+        m4 = json.loads((benchdb / ".sealed" / "map.json").read_text())["sessions"]
+        hold4 = [sid for sid, v in m4.items() if v["split"] == "holdout"]
+        dev4 = [sid for sid, v in m4.items() if v["split"] == "dev"]
+        assert hold4 and dev4
+        db_calls = [c for c in calls(log, "sorrel") if c["argv"][0] == "dev" or "--record" in c["argv"]]
+        blob = json.dumps([{k: v for k, v in c.items() if k != "deny"} for c in db_calls])  # the deny file lists the sealed ids by design
+        assert not any(sid in blob for sid in hold4) and ".sealed/sessions" not in blob and ".sealed/runs" not in blob, "a holdout id reached a DB call"
+        assert all(c["env"]["SORREL_DEV_DB"] == str(db.resolve()) for c in db_calls)
+        deny = db_calls[-1]["deny"].splitlines()
+        assert set(hold4) <= set(deny) and "real-session-0" in deny and not set(dev4) & set(deny), deny
+        sess_calls = [c["argv"] for c in db_calls if c["argv"][1] == "record-session"]
+        dev_s, hold_s = [a for a in sess_calls if "dev" == a[a.index("--split") + 1]], [a for a in sess_calls if "holdout" == a[a.index("--split") + 1]]
+        assert {a[a.index("--sid") + 1] for a in dev_s} == set(dev4) and all("--truth" in a and "--input" in a for a in dev_s)
+        assert len(hold_s) == len(hold4) and all("--input" not in a and "--truth" not in a and a[a.index("--sid") + 1].startswith("h") for a in hold_s)
+        runs4 = {json.loads(p.read_text())["id"] for p in (benchdb / "runs").glob("*/run.json")}
+        rr = [c["argv"] for c in db_calls if c["argv"][1] == "record-run"]
+        assert len(rr) == len(runs4) == 2 * len(dev4) and {Path(a[a.index("--run-dir") + 1]).name for a in rr} == runs4 and all("--variant-dir" in a for a in rr)
+        rec = [c["argv"] for c in db_calls if "--record" in c["argv"]]
+        assert {a[a.index("--record") + 1] for a in rec} == runs4 and all(a[0] == "diff" for a in rec)
+        ledger = [c for c in db_calls if c["argv"][1] == "ledger"]
+        rows = json.loads(ledger[0]["ledger"])
+        assert len(ledger) == 1 and rows and {"baseline", "candidate", "arm", "metric", "delta"} <= set(rows[0]) and not any(sid in ledger[0]["ledger"] for sid in hold4)
+        print("ok: add/splits, mcp-review argv, holdout sealing + ledger, results-DB calls, adjudication")
 
 
 if __name__ == "__main__":

@@ -1,2 +1,5 @@
 # Generated fixtures are compared byte for byte; keep LF on Windows checkouts.
 /release/fixtures/** -text
+
+# Bench results DB (derived data only; see "Dev mode" in the CLI docs)
+bench/*.sqlite filter=lfs diff=lfs merge=lfs -text

@@ -45,6 +45,8 @@ default = ["phy-export"]
 # `sorrel export-phy`, the serve tool and the GUI button.
 phy-export = ["sorrel-data/phy-export"]
 hdf5 = ["sorrel-io/hdf5", "sorrel-data/hdf5"]
+# `sorrel dev ...` and `sorrel diff --record`: the bench results DB.
+dev = ["sorrel-data/dev"]
 
 # Windows icon, version info and manifest (build.rs; a no-op off Windows).
 [build-dependencies]

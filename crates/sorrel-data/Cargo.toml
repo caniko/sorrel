@@ -21,6 +21,7 @@ serde_json.workspace = true
 toml.workspace = true
 xxhash-rust.workspace = true
 log.workspace = true
+rusqlite = { workspace = true, optional = true }
 
 [features]
 default = ["phy-export"]
@@ -28,6 +29,8 @@ default = ["phy-export"]
 phy-export = []
 # Forwarded to sorrel-io: enables HDF5-backed NWB and KS4 rez.mat readers.
 hdf5 = ["sorrel-io/hdf5"]
+# Results DB for the double-blind bench (`devdb`); off by default so release builds carry no SQLite.
+dev = ["dep:rusqlite"]
 
 [[bench]]
 name = "seed_amplitudes_cache"
