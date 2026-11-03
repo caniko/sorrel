@@ -213,7 +213,7 @@ pub struct SpikeDiff {
     /// Pairs of root clusters (kept in both curations) that share a unit.
     pub merges: Pr,
     /// Root clusters divided into at least two substantial kept units (see
-    /// `split_share`), among those with kept spikes in both curations.
+    /// `split_share`).
     pub splits: Pr,
     /// Spikes in noise units.
     pub exclusion: Pr,
@@ -468,10 +468,10 @@ pub fn diff_spikes(
 
     // A split is judged on a root's kept (non-noise) spikes in each curation:
     // curators carve a few clean cores out of a big template and call the rest
-    // noise, so the cores are tiny against the whole root. The gate is "kept
-    // spikes in both", not `scored`: a truth that keeps only cores must still
-    // be judged. A root one side labels wholly noise is skipped, so that
-    // disagreement is an exclusion miss only, never also a missed split.
+    // noise, so the cores are tiny against the whole root. Not gated on
+    // `scored`: a truth that keeps only cores must still be judged, and a test
+    // that throws the whole root away has missed the split (its lost core
+    // spikes also count against exclusion precision).
     let (mut st, mut ss) = (Vec::new(), Vec::new());
     let is_split = |kept: &[u32]| {
         let total = kept.iter().sum::<u32>() as f64;
@@ -484,9 +484,6 @@ pub fn diff_spikes(
         .filter(|r| size_r[r] as usize >= opts.min_spikes)
     {
         let (kt, ks) = (cells_t.kept(r, &lab_t), cells_s.kept(r, &lab_s));
-        if kt.is_empty() || ks.is_empty() {
-            continue;
-        }
         if is_split(&kt) {
             st.push(r);
         }
@@ -823,14 +820,15 @@ mod tests {
         assert_eq!((d.splits.n_truth, d.splits.f1), (1, 1.0));
         assert!(d.misses.is_empty(), "{:?}", d.misses);
 
-        // A test that calls the whole root noise is an exclusion miss only.
+        // A test that calls the whole root noise has missed the split too:
+        // throwing the root away must not score a vacuous split recall of 1.
         let all_noise = Curation {
             clusters: &whole,
             labels: &[(0, PhyLabel::Noise)],
         };
         let d = diff_spikes(&root, &t, &all_noise, &opts).unwrap();
-        assert_eq!(d.splits.n_truth, 0);
-        assert!(!d.misses.iter().any(|m| m.category == "missed_split"));
+        assert_eq!((d.splits.n_truth, d.splits.recall), (1, 0.0));
+        assert!(d.misses.iter().any(|m| m.category == "missed_split"));
 
         // Each core is about a third of the kept spikes, so 0.4 leaves no split.
         let strict = SpikeDiffOpts {
