@@ -635,7 +635,7 @@ pub fn root_truths(root: &[u32], truth: &Curation, opts: &SpikeDiffOpts) -> Resu
                 "kept"
             } else if good_n > 0 && share(good_n) < 0.5 && good_n + noise == n {
                 "cores"
-            } else if share(good_n) >= 0.5 && share(noise) >= 0.1 {
+            } else if share(good_n) >= 0.5 && share(noise) >= 0.1 && good_n + noise == n {
                 "cleanup"
             } else {
                 "other"
@@ -1084,5 +1084,26 @@ mod tests {
         );
         assert_eq!(got[2].cores, [(0.2, 20)]);
         assert_eq!((got[4].good_share, got[0].good_share), (0.7, 0.0));
+    }
+
+    #[test]
+    fn a_root_with_mua_left_over_is_not_cleanup() {
+        // 70 good, 20 noise, 10 mua: the mua is neither share, so not cleanup.
+        let root = vec![0u32; 100];
+        let truth: Vec<u32> = [(1, 70), (2, 20), (3, 10)]
+            .into_iter()
+            .flat_map(|(u, n)| std::iter::repeat_n(u, n))
+            .collect();
+        let labels = [
+            (1, PhyLabel::Good),
+            (2, PhyLabel::Noise),
+            (3, PhyLabel::Mua),
+        ];
+        let c = Curation {
+            clusters: &truth,
+            labels: &labels,
+        };
+        let got = root_truths(&root, &c, &SpikeDiffOpts::default()).unwrap();
+        assert_eq!(got[0].verdict, "other");
     }
 }
