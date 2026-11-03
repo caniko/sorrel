@@ -132,11 +132,11 @@ def cmd_add(a) -> None:
             raise
         pure = prov.get("pure_manual") is True and not prov.get("anchored")
         h = int(hashlib.sha256((m["salt"] + path).encode()).hexdigest()[:8], 16) % 100
-        split = "holdout" if pure and h < HOLDOUT_PCT else "dev"
+        split = "holdout" if pure and not a.dev and h < HOLDOUT_PCT else "dev"
         final = home(split) / "sessions" / sid
         final.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(d, final)
-        m["sessions"][sid] = {"path": path, "split": split, "pure_manual": pure, "keep": sorted(p.name for p in (final / "input").iterdir())}
+        m["sessions"][sid] = {"path": path, "split": split, "pure_manual": pure, "forced_dev": a.dev, "keep": sorted(p.name for p in (final / "input").iterdir())}
         write_json(B / ".sealed" / "map.json", m)  # per session: a later failure keeps the earlier ones
         n_added, n_dev, n_forced = n_added + 1, n_dev + (split == "dev"), n_forced + (not pure)
     print(f"added {n_added} session(s), {n_dev} to dev ({n_forced} of them not purely manual); the rest are sealed")
@@ -150,7 +150,7 @@ def sorrel_rev() -> str | None:
     return r.stdout.strip() or None if r.returncode == 0 else None
 
 
-def claude(prompt: str, root: Path, servers: dict, allow: str | None, model: str | None, env: dict, timeout: int):
+def claude(prompt: str, root: Path, servers: dict, allow: str | None, model: str | None, env: dict, timeout: int, budget: float | None = None):
     """One hardened `claude -p` (the sidecar's cli_argv flags): fresh empty cwd, only
     the given MCP servers, no built-in tools, prompt on stdin. -> (proc, json)."""
     root.mkdir(parents=True, exist_ok=True)
@@ -159,6 +159,7 @@ def claude(prompt: str, root: Path, servers: dict, allow: str | None, model: str
             "--setting-sources", "project", "--disable-slash-commands", "--no-session-persistence", "--tools", ""]
     argv += ["--allowedTools", allow] if allow else []
     argv += ["--model", model] if model else []
+    argv += ["--max-budget-usd", str(budget)] if budget else []
     cwd = tempfile.mkdtemp(prefix="bench-claude-")  # outside BENCH, so no ancestor CLAUDE.md loads
     try:
         r = run(argv, env, cwd=cwd, timeout=timeout, stdin=prompt)
@@ -198,7 +199,7 @@ def one_run(a, sid: str, k: int) -> dict:
         else:
             prompt = sorrel("agent-guide", "--prompt", "review", env=env) + "\n\n" + TASK + "\n"
             sv = {"command": shutil.which(SORREL) or SORREL, "args": ["mcp", str(data)], **({"env": {k: v for k, v in env.items() if v}} if any(env.values()) else {})}
-            r, out = claude(prompt, root, {"sorrel": sv}, "mcp__sorrel__*", a.model, env, a.timeout)
+            r, out = claude(prompt, root, {"sorrel": sv}, "mcp__sorrel__*", a.model, env, a.timeout, a.max_budget_usd)
             rec["prompt_rev"] = hashlib.sha256(prompt.encode()).hexdigest()[:12]
             rec |= {"usage": out.get("usage"), "cost_usd": out.get("total_cost_usd"), "num_turns": out.get("num_turns")}
             (root / "claude.json").write_text(r.stdout)
@@ -469,6 +470,7 @@ def main(argv=None) -> None:
     s = sub.add_parser("add")
     s.add_argument("session", nargs="+")
     s.add_argument("--phy-curated", action="store_true", help="sessions were curated in phy, not sorrel")
+    s.add_argument("--dev", action="store_true", help="force into dev: the improver has already seen these truths")
     s = sub.add_parser("run")
     s.add_argument("--arm", choices=ARMS, required=True)
     s.add_argument("--variant", type=Path, required=True)
@@ -477,6 +479,7 @@ def main(argv=None) -> None:
     s.add_argument("--model")
     s.add_argument("--jobs", type=int, default=2)
     s.add_argument("--timeout", type=int, default=3600)
+    s.add_argument("--max-budget-usd", type=float, default=10.0, help="per mcp-review run (claude --max-budget-usd)")
     s = sub.add_parser("score")
     s.add_argument("--split", choices=("dev", "holdout", "all"), default="all")
     s.add_argument("--match", default="0.8")

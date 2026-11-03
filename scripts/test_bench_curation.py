@@ -129,7 +129,7 @@ def main() -> None:
                 for v in ("base", "cand"):
                     out = io.StringIO()
                     with contextlib.redirect_stdout(out):
-                        go("run", "--arm", arm, "--variant", t / v, "--split", split, "--repeats", rep, "--jobs", 4, "--model", "m1")
+                        go("run", "--arm", arm, "--variant", t / v, "--split", split, "--repeats", rep, "--jobs", 4, "--model", "m1", "--max-budget-usd", 2.5)
                     if split == "holdout":
                         assert out.getvalue().strip() == f"{len(hold)} holdout run(s): {len(hold)} ok", out.getvalue()
         del os.environ["SORREL_RUBRIC"]
@@ -143,6 +143,7 @@ def main() -> None:
         for flag in ("--setting-sources", "--disable-slash-commands", "--no-session-persistence"):
             assert flag in a, flag
         assert a[a.index("--tools") + 1] == "" and a[a.index("--allowedTools") + 1] == "mcp__sorrel__*" and a[a.index("--model") + 1] == "m1"
+        assert a[a.index("--max-budget-usd") + 1] == "2.5", a
         assert list(mcp["cfg"]["mcpServers"]) == ["sorrel"] and mcp["cfg"]["mcpServers"]["sorrel"]["args"][0] == "mcp"
         assert mcp["stdin"].startswith("REVIEW GUIDE") and mcp["cwd_files"] == [] and "REVIEW GUIDE" not in " ".join(a)
         assert mcp["env"] and mcp["env"].endswith("review.md")
@@ -235,6 +236,13 @@ def main() -> None:
         go("score", "--split", "holdout")
         assert any("--disputed" in c["argv"] for c in calls(log, "sorrel", "diff"))
         assert not any(sid in out.getvalue() for sid in hold)
+
+        # add --dev: the same sessions that split into a holdout above all stay in dev
+        bench3 = t / "bench3"
+        with contextlib.redirect_stdout(io.StringIO()):
+            bc.main(["--bench", str(bench3), "add", "--dev", *map(str, sessions)])
+        m3 = json.loads((bench3 / ".sealed" / "map.json").read_text())["sessions"]
+        assert len(m3) == 30 and {v["split"] for v in m3.values()} == {"dev"} and not (bench3 / ".sealed" / "sessions").exists()
 
         # fewer than 3 paired sessions: no CI
         bench2 = t / "bench2"
