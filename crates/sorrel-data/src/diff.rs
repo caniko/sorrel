@@ -124,6 +124,10 @@ pub struct SpikeDiffOpts {
     /// A split piece must hold at least this fraction of its root cluster's
     /// kept (non-noise) spikes.
     pub split_share: f64,
+    /// Score good against not-good: every non-good label becomes noise. `None`
+    /// is automatic: on when the truth's labels, over units with spikes, are
+    /// all good or noise (a curator who never uses mua).
+    pub binary: Option<bool>,
     /// Root cluster ids dropped from scoring (every one of their spikes).
     pub disputed: HashSet<u32>,
 }
@@ -134,6 +138,7 @@ impl Default for SpikeDiffOpts {
             match_jaccard: 0.8,
             min_spikes: 10,
             split_share: 0.1,
+            binary: None,
             disputed: HashSet::new(),
         }
     }
@@ -195,6 +200,9 @@ pub struct SpikeDiff {
     pub match_jaccard: f64,
     pub min_spikes: u64,
     pub split_share: f64,
+    /// Whether labels were scored good against not-good (see
+    /// `SpikeDiffOpts::binary`).
+    pub binary: bool,
     /// Truth units recovered by a test unit (recall) and test units confirmed
     /// by a truth unit (precision), over the kept (non-noise) units.
     pub units: Pr,
@@ -301,7 +309,34 @@ pub fn diff_spikes(
         truth.clusters.len(),
         test.clusters.len()
     );
-    let (lab_t, lab_s) = (label_map(truth.labels), label_map(test.labels));
+    let (mut lab_t, mut lab_s) = (label_map(truth.labels), label_map(test.labels));
+    let unit_label = |m: &HashMap<u32, PhyLabel>, u: &u32| m.get(u).copied().unwrap_or_default();
+    let truth_units: BTreeSet<u32> = truth.clusters.iter().copied().collect();
+    let binary = opts.binary.unwrap_or_else(|| {
+        truth_units
+            .iter()
+            .all(|u| matches!(unit_label(&lab_t, u), PhyLabel::Good | PhyLabel::Noise))
+    });
+    if binary {
+        // Applied once here, so every metric (units, labels, exclusion,
+        // kept) sees the same two-label vocabulary; an unlabelled unit is
+        // unsorted, hence noise.
+        let fold = |m: &mut HashMap<u32, PhyLabel>, clusters: &[u32]| {
+            for u in clusters.iter().collect::<BTreeSet<_>>() {
+                let l = unit_label(m, u);
+                m.insert(
+                    *u,
+                    if l == PhyLabel::Good {
+                        l
+                    } else {
+                        PhyLabel::Noise
+                    },
+                );
+            }
+        };
+        fold(&mut lab_t, truth.clusters);
+        fold(&mut lab_s, test.clusters);
+    }
     let label = |m: &HashMap<u32, PhyLabel>, u: u32| m.get(&u).copied().unwrap_or_default();
 
     // One pass: the sparse (root, truth, test) table everything derives from.
@@ -519,6 +554,7 @@ pub fn diff_spikes(
         match_jaccard: opts.match_jaccard,
         min_spikes: opts.min_spikes as u64,
         split_share: opts.split_share,
+        binary,
         units,
         good_units,
         labels,
@@ -601,6 +637,9 @@ impl SpikeDiff {
             "{} spikes, {} root clusters ({} disputed), match {}\n",
             self.n_spikes, self.n_root_clusters, self.n_disputed, self.match_jaccard
         );
+        if self.binary {
+            s += "binary: good against not-good (mua and unsorted count as noise)\n";
+        }
         s += &pr("units", &self.units);
         s += &pr("good units", &self.good_units);
         s += &pr("merge pairs", &self.merges);
@@ -802,6 +841,74 @@ mod tests {
             diff_spikes(&root, &t, &t, &strict).unwrap().splits.n_truth,
             0
         );
+    }
+
+    /// Roots 0 (good), 1 and 2 (noise) in the truth; the test calls 1 mua and
+    /// leaves 2 unlabelled.
+    fn binary_pair() -> (Loaded, Loaded) {
+        let root: Vec<u32> = (0..3u32).flat_map(|r| std::iter::repeat_n(r, 20)).collect();
+        let truth = vec![
+            (0, PhyLabel::Good),
+            (1, PhyLabel::Noise),
+            (2, PhyLabel::Noise),
+        ];
+        let test = vec![(0, PhyLabel::Good), (1, PhyLabel::Mua)];
+        ((root.clone(), truth), (root, test))
+    }
+
+    #[test]
+    fn a_truth_without_mua_is_scored_good_against_not_good() {
+        let ((root, tl), (_, sl)) = binary_pair();
+        let score = |binary| {
+            let (t, s) = (
+                Curation {
+                    clusters: &root,
+                    labels: &tl,
+                },
+                Curation {
+                    clusters: &root,
+                    labels: &sl,
+                },
+            );
+            let opts = SpikeDiffOpts {
+                binary,
+                ..Default::default()
+            };
+            diff_spikes(&root, &t, &s, &opts).unwrap()
+        };
+        let d = score(None);
+        assert!(d.binary && d.misses.is_empty(), "{:?}", d.misses);
+        assert_eq!((d.exclusion.f1, d.labels.n_agree), (1.0, 3));
+        assert!(d.render().contains("binary"));
+
+        let d = score(Some(false));
+        let got: Vec<_> = d
+            .misses
+            .iter()
+            .map(|m| (m.category, m.roots.clone()))
+            .collect();
+        assert!(!d.binary);
+        assert_eq!(got, vec![("exclusion", vec![1]), ("exclusion", vec![2])]);
+    }
+
+    #[test]
+    fn a_truth_with_mua_is_not_binary() {
+        let (root, truth, labels) = scenario();
+        let c = Curation {
+            clusters: &truth,
+            labels: &labels,
+        };
+        let d = diff_spikes(&root, &c, &c, &SpikeDiffOpts::default()).unwrap();
+        assert!(!d.binary);
+        assert!(!d.render().contains("binary"));
+        // Forced on, the mua root folds into noise in both curations.
+        let forced = SpikeDiffOpts {
+            binary: Some(true),
+            ..Default::default()
+        };
+        let d = diff_spikes(&root, &c, &c, &forced).unwrap();
+        assert!(d.binary && d.misses.is_empty());
+        assert_eq!(d.exclusion.n_truth, 40);
     }
 
     #[test]

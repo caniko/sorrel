@@ -257,6 +257,13 @@ enum Cmd {
         /// kept (non-noise) spikes
         #[arg(long, value_name = "F", default_value_t = 0.1)]
         split_share: f64,
+        /// Directory mode: score good against not-good (mua and unsorted count as
+        /// noise); the default is on when the truth never uses mua
+        #[arg(long, conflicts_with = "no_binary")]
+        binary: bool,
+        /// Directory mode: keep mua and unsorted distinct even if the truth never uses mua
+        #[arg(long)]
+        no_binary: bool,
         /// Directory mode: root cluster ids (one per line) to leave out of scoring
         #[arg(long, value_name = "FILE")]
         disputed: Option<PathBuf>,
@@ -2348,6 +2355,8 @@ fn main() -> Result<()> {
             match_jaccard,
             min_spikes,
             split_share,
+            binary,
+            no_binary,
             disputed,
         }) => match (root, a.is_dir() && b.is_dir()) {
             (Some(root), true) => {
@@ -2355,6 +2364,11 @@ fn main() -> Result<()> {
                     match_jaccard,
                     min_spikes,
                     split_share,
+                    binary: match (binary, no_binary) {
+                        (true, _) => Some(true),
+                        (_, true) => Some(false),
+                        _ => None,
+                    },
                     disputed: disputed
                         .map(|p| sorrel_data::diff::read_disputed(&p))
                         .transpose()?

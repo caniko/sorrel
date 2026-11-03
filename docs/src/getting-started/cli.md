@@ -130,10 +130,12 @@ the sorter's.
 the copy points at the recording of the same name next to it.
 
 `sorrel diff <TRUTH> <TEST> --root <IN> [--json] [--match 0.8] [--min-spikes 10] [--split-share 0.1]
-[--disputed FILE]` scores a curation of `IN` against the truth spike by spike:
+[--binary | --no-binary] [--disputed FILE]` scores a curation of `IN` against the truth spike by spike:
 unit recovery (Jaccard at least `--match` and the same label), root-cluster label
 agreement, merge pairs, splits, noise exclusion and ARI. Misses are keyed by
-root cluster id; `--disputed` lists root ids (one per line) to leave out.
+root cluster id; `--disputed` lists root ids (one per line) to leave out. When the
+truth only uses good and noise, mua and unsorted count as noise (`--binary`; `--no-binary`
+keeps them apart) so a vocabulary gap is not scored as a miss.
 
 ## Completions
 
