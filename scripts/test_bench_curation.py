@@ -305,6 +305,15 @@ def main() -> None:
             bc.report_holdout(argparse.Namespace(baseline="b", candidate="c"))
         row = next(r for r in got[0] if r["metric"] == "misses.label")
         assert (row["n_sessions"], row["base"], row["cand"], row["delta"]) == (3, 0.5, 1.0, 0.5), row
+        # runs of one variant scored under another revision are not averaged into its holdout row
+        mixed = [({**r, "sorrel_rev": "x" if i == 0 else "y"}, sc) for i, (r, sc) in enumerate(fake)]
+        bc.scored = lambda split: iter(mixed)
+        try:
+            bc.report_holdout(argparse.Namespace(baseline="b", candidate="c"))
+        except SystemExit as e:
+            assert "revisions or scoring options" in str(e), e
+        else:
+            raise AssertionError("mixed revisions were averaged")
         print("ok: add/splits, mcp-review argv, holdout sealing + ledger, results-DB calls, adjudication")
 
 

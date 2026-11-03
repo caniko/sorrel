@@ -341,6 +341,11 @@ def metrics(score: dict) -> dict:
     return out
 
 
+def cfg(rec: dict, sc: dict) -> tuple:
+    """What a score depends on besides its variant: the revisions and the diff's options. Scores of different cfgs are never averaged."""
+    return tuple(str(x) for x in (rec.get("prompt_rev"), rec.get("sorrel_rev"), *(sc.get(k) for k in ("match_jaccard", "min_spikes", "split_share", "binary"))))
+
+
 def scored(split: str):
     for rec, root in runs(split):
         if (root / "score.json").exists():
@@ -369,9 +374,9 @@ def brief_rows(sid: str, ids) -> tuple[str, dict]:
 
 
 def report_dev(a) -> None:
-    groups: dict = {}  # (arm, variant) -> [(rec, score)]
+    groups: dict = {}  # (arm, variant, cfg) -> [(rec, score)]
     for rec, sc in scored("dev"):
-        groups.setdefault((rec["arm"], rec["variant"]), []).append((rec, sc))
+        groups.setdefault((rec["arm"], rec["variant"], cfg(rec, sc)), []).append((rec, sc))
     if not groups:
         raise SystemExit("no scored dev runs (run, then score)")
     failed = {}
@@ -379,10 +384,12 @@ def report_dev(a) -> None:
         if rec["status"] != "ok":
             failed[(rec["arm"], rec["variant"])] = failed.get((rec["arm"], rec["variant"]), 0) + 1
     names = sorted(groups)
+    cfgs = {n[:2]: sum(m[:2] == n[:2] for m in names) for n in names}  # a column names its cfg only when its arm/variant has several
+    label = {n: "/".join(n[:2]) + (f" [{' '.join(n[2])}]" if cfgs[n[:2]] > 1 else "") for n in names}
     ms = [dict(metrics(sc)) for k in names for _, sc in groups[k]]
     keys = sorted({k for m in ms for k in m})
-    md = ["# Dev report", "", f"| metric | {' | '.join('/'.join(n) for n in names)} |", f"|---|{'---|' * len(names)}"]
-    md.append("| runs (failed) | " + " | ".join(f"{len(groups[n])} ({failed.get(n, 0)})" for n in names) + " |")
+    md = ["# Dev report", "", f"| metric | {' | '.join(label[n] for n in names)} |", f"|---|{'---|' * len(names)}"]
+    md.append("| runs (failed) | " + " | ".join(f"{len(groups[n])} ({failed.get(n[:2], 0)})" for n in names) + " |")
     for k in keys:
         md.append(f"| {k} | " + " | ".join(fmt([metrics(sc)[k] for _, sc in groups[n] if k in metrics(sc)] or [float('nan')]) for n in names) + " |")
     for n in names:
@@ -397,7 +404,7 @@ def report_dev(a) -> None:
         for _, sid, ids in tally:
             want.setdefault(sid, set()).update(ids)
         cards = {sid: brief_rows(sid, ids) for sid, ids in want.items()}
-        md += ["", f"## Misses: {'/'.join(n)}"]
+        md += ["", f"## Misses: {label[n]}"]
         for cat in sorted({c for c, _, _ in tally}):
             md += ["", f"### {cat}"]
             for (c, sid, ids), cnt in sorted(tally.items()):
@@ -415,10 +422,14 @@ def report_dev(a) -> None:
 def per_session(split: str, variant: str, arm: str, cats=()) -> dict:
     """{session: {metric: mean over repeats}}; a miss category of `cats` a run lacks counts 0."""
     acc: dict = {}
+    seen = set()
     for rec, sc in scored(split):
         if rec["variant"] == variant and rec["arm"] == arm:
+            seen.add(cfg(rec, sc))
             for k, v in (dict.fromkeys(cats, 0) | metrics(sc)).items():
                 acc.setdefault(rec["session"], {}).setdefault(k, []).append(v)
+    if len(seen) > 1:  # the ledger row has no cfg to say which one it holds
+        raise SystemExit(f"{variant}/{arm}: {split} scores of {len(seen)} revisions or scoring options; re-run or re-score them under one")
     return {s: {k: statistics.fmean(v) for k, v in d.items()} for s, d in acc.items()}
 
 
