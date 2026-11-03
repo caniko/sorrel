@@ -554,6 +554,19 @@ fn decode_u32(h: &NpyHeader, bytes: &[u8], n: usize) -> Result<Vec<u32>> {
         NpyDtype::I64 | NpyDtype::U64 => decode_chunks(bytes, n, dtype, |c| {
             u64::from_le_bytes(c.try_into().unwrap()) as u32
         }),
+        // Kilosort 4 writes `channel_shanks.npy` as float32: accept floats
+        // that hold whole non-negative numbers, refuse anything else.
+        NpyDtype::F32 | NpyDtype::F64 => decode_chunks(bytes, n, dtype, |c| match c.len() {
+            4 => f32::from_le_bytes(c.try_into().unwrap()) as f64,
+            _ => f64::from_le_bytes(c.try_into().unwrap()),
+        })?
+        .into_iter()
+        .map(|x| {
+            ((0.0..=u32::MAX as f64).contains(&x) && x.fract() == 0.0)
+                .then_some(x as u32)
+                .with_context(|| format!("{x} in a {dtype:?} id array is not a whole number"))
+        })
+        .collect(),
         d => bail!("unsupported integer dtype {d:?}"),
     }
 }
@@ -602,6 +615,25 @@ mod tests {
         assert!(!h.fortran_order);
         assert_eq!(h.shape, vec![5]);
         assert_eq!(h.elem_count(), 5);
+    }
+
+    #[test]
+    fn whole_float_ids_read_as_u32_fractions_refused() {
+        // Kilosort 4's channel_shanks.npy is float32.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("shanks.npy");
+        let data: Vec<u8> = [0f32, 0.0, 1.0, 3.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        write_npy_v1(&p, "<f4", &[4], &data);
+        assert_eq!(read_1d_u32(&p).unwrap(), vec![0, 0, 1, 3]);
+        let data: Vec<u8> = [0f64, 1.5].iter().flat_map(|v| v.to_le_bytes()).collect();
+        write_npy_v1(&p, "<f8", &[2], &data);
+        assert!(read_1d_u32(&p).is_err());
+        let data: Vec<u8> = [-1f32].iter().flat_map(|v| v.to_le_bytes()).collect();
+        write_npy_v1(&p, "<f4", &[1], &data);
+        assert!(read_1d_u32(&p).is_err());
     }
 
     #[test]
