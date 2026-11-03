@@ -119,10 +119,11 @@ pub struct SpikeDiffOpts {
     /// recover a truth unit.
     pub match_jaccard: f64,
     /// Root clusters with fewer spikes are left out of the merge and split
-    /// metrics.
+    /// metrics; a split piece needs at least this many spikes too.
     pub min_spikes: usize,
-    /// A split piece must hold at least this fraction of its root cluster.
-    pub split_fraction: f64,
+    /// A split piece must hold at least this fraction of its root cluster's
+    /// kept (non-noise) spikes.
+    pub split_share: f64,
     /// Root cluster ids dropped from scoring (every one of their spikes).
     pub disputed: HashSet<u32>,
 }
@@ -132,7 +133,7 @@ impl Default for SpikeDiffOpts {
         Self {
             match_jaccard: 0.8,
             min_spikes: 10,
-            split_fraction: 0.1,
+            split_share: 0.1,
             disputed: HashSet::new(),
         }
     }
@@ -193,6 +194,7 @@ pub struct SpikeDiff {
     pub n_disputed: u32,
     pub match_jaccard: f64,
     pub min_spikes: u64,
+    pub split_share: f64,
     /// Truth units recovered by a test unit (recall) and test units confirmed
     /// by a truth unit (precision), over the kept (non-noise) units.
     pub units: Pr,
@@ -202,7 +204,8 @@ pub struct SpikeDiff {
     pub labels: LabelDiff,
     /// Pairs of root clusters (kept in both curations) that share a unit.
     pub merges: Pr,
-    /// Root clusters (kept in both) divided into at least two substantial units.
+    /// Root clusters divided into at least two substantial kept units (see
+    /// `split_share`), among those with kept spikes in both curations.
     pub splits: Pr,
     /// Spikes in noise units.
     pub exclusion: Pr,
@@ -235,12 +238,13 @@ impl Cells {
     fn home(&self, root: u32) -> u32 {
         self.by_root[&root][0].0
     }
-    /// Units holding at least `frac` of the root's `total` spikes.
-    fn substantial(&self, root: u32, total: u32, frac: f64) -> usize {
+    /// Spike counts of the root's units that are not noise.
+    fn kept(&self, root: u32, lab: &HashMap<u32, PhyLabel>) -> Vec<u32> {
         self.by_root[&root]
             .iter()
-            .filter(|&&(_, n)| n as f64 >= frac * total as f64)
-            .count()
+            .filter(|&&(u, _)| lab.get(&u).copied().unwrap_or_default() != PhyLabel::Noise)
+            .map(|&(_, n)| n)
+            .collect()
     }
 }
 
@@ -386,10 +390,8 @@ pub fn diff_spikes(
         });
     }
 
-    // Merge and split claims are scored over roots kept in both curations and
-    // big enough, so an exclusion is reported once and not as a lost merge.
-    // ponytail: a truth split of a root the test calls noise is an exclusion
-    // miss only; split noise out of a kept root is scored.
+    // Merge claims are scored over roots kept in both curations and big
+    // enough, so an exclusion is reported once and not as a lost merge.
     let scored: Vec<u32> = roots
         .iter()
         .copied()
@@ -429,19 +431,34 @@ pub fn diff_spikes(
     pair_misses(&mt, &ms, "missed_merge");
     pair_misses(&ms, &mt, "false_merge");
 
-    let is_split = |cells: &Cells, r| cells.substantial(r, size_r[&r], opts.split_fraction) >= 2;
-    let (st, ss): (Vec<u32>, Vec<u32>) = (
-        scored
-            .iter()
-            .copied()
-            .filter(|&r| is_split(&cells_t, r))
-            .collect(),
-        scored
-            .iter()
-            .copied()
-            .filter(|&r| is_split(&cells_s, r))
-            .collect(),
-    );
+    // A split is judged on a root's kept (non-noise) spikes in each curation:
+    // curators carve a few clean cores out of a big template and call the rest
+    // noise, so the cores are tiny against the whole root. The gate is "kept
+    // spikes in both", not `scored`: a truth that keeps only cores must still
+    // be judged. A root one side labels wholly noise is skipped, so that
+    // disagreement is an exclusion miss only, never also a missed split.
+    let (mut st, mut ss) = (Vec::new(), Vec::new());
+    let is_split = |kept: &[u32]| {
+        let total = kept.iter().sum::<u32>() as f64;
+        let big =
+            |&&n: &&u32| n as f64 >= opts.split_share * total && n as usize >= opts.min_spikes;
+        kept.iter().filter(big).count() >= 2
+    };
+    for &r in roots
+        .iter()
+        .filter(|r| size_r[r] as usize >= opts.min_spikes)
+    {
+        let (kt, ks) = (cells_t.kept(r, &lab_t), cells_s.kept(r, &lab_s));
+        if kt.is_empty() || ks.is_empty() {
+            continue;
+        }
+        if is_split(&kt) {
+            st.push(r);
+        }
+        if is_split(&ks) {
+            ss.push(r);
+        }
+    }
     let both = st.iter().filter(|r| ss.contains(r)).count() as u64;
     let splits = Pr::new(st.len() as u64, ss.len() as u64, both, both);
     for (from, other, category) in [(&st, &ss, "missed_split"), (&ss, &st, "false_split")] {
@@ -501,6 +518,7 @@ pub fn diff_spikes(
         n_disputed: disputed_seen.len() as u32,
         match_jaccard: opts.match_jaccard,
         min_spikes: opts.min_spikes as u64,
+        split_share: opts.split_share,
         units,
         good_units,
         labels,
@@ -720,6 +738,70 @@ mod tests {
         assert_eq!((d.merges.recall, d.merges.precision), (0.0, 1.0));
         assert_eq!(d.exclusion.recall, 0.0);
         assert!(d.ari < 1.0);
+    }
+
+    /// One root of 1000 spikes; the truth carves cores of 50, 52 and 48 spikes
+    /// (units 1..=3, good) out of it and leaves 850 as noise (unit 0).
+    fn cores_and_noise() -> (Vec<u32>, Vec<u32>, Vec<(u32, PhyLabel)>) {
+        let truth: Vec<u32> = (0..1000u32)
+            .map(|i| match i {
+                0..50 => 1,
+                50..102 => 2,
+                102..150 => 3,
+                _ => 0,
+            })
+            .collect();
+        let labels = vec![
+            (0, PhyLabel::Noise),
+            (1, PhyLabel::Good),
+            (2, PhyLabel::Good),
+            (3, PhyLabel::Good),
+        ];
+        (vec![0; 1000], truth, labels)
+    }
+
+    #[test]
+    fn split_share_is_over_kept_spikes() {
+        let (root, truth, labels) = cores_and_noise();
+        let t = Curation {
+            clusters: &truth,
+            labels: &labels,
+        };
+        let opts = SpikeDiffOpts::default();
+        // Untouched root: one unit, labelled good (any label but noise).
+        let whole = vec![0; 1000];
+        let untouched = Curation {
+            clusters: &whole,
+            labels: &[(0, PhyLabel::Good)],
+        };
+        let d = diff_spikes(&root, &t, &untouched, &opts).unwrap();
+        let got: Vec<_> = d.misses.iter().map(|m| m.category).collect();
+        assert!(got.contains(&"missed_split"), "{got:?}");
+        assert_eq!((d.splits.n_truth, d.splits.recall), (1, 0.0));
+
+        // The same truth reproduced: perfect split score, nothing missed.
+        let d = diff_spikes(&root, &t, &t, &opts).unwrap();
+        assert_eq!((d.splits.n_truth, d.splits.f1), (1, 1.0));
+        assert!(d.misses.is_empty(), "{:?}", d.misses);
+
+        // A test that calls the whole root noise is an exclusion miss only.
+        let all_noise = Curation {
+            clusters: &whole,
+            labels: &[(0, PhyLabel::Noise)],
+        };
+        let d = diff_spikes(&root, &t, &all_noise, &opts).unwrap();
+        assert_eq!(d.splits.n_truth, 0);
+        assert!(!d.misses.iter().any(|m| m.category == "missed_split"));
+
+        // Each core is about a third of the kept spikes, so 0.4 leaves no split.
+        let strict = SpikeDiffOpts {
+            split_share: 0.4,
+            ..opts
+        };
+        assert_eq!(
+            diff_spikes(&root, &t, &t, &strict).unwrap().splits.n_truth,
+            0
+        );
     }
 
     #[test]
