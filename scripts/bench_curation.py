@@ -412,12 +412,12 @@ def report_dev(a) -> None:
     print(out)
 
 
-def per_session(split: str, variant: str, arm: str) -> dict:
-    """{session: {metric: mean over repeats}}"""
+def per_session(split: str, variant: str, arm: str, cats=()) -> dict:
+    """{session: {metric: mean over repeats}}; a miss category of `cats` a run lacks counts 0."""
     acc: dict = {}
     for rec, sc in scored(split):
         if rec["variant"] == variant and rec["arm"] == arm:
-            for k, v in metrics(sc).items():
+            for k, v in (dict.fromkeys(cats, 0) | metrics(sc)).items():
                 acc.setdefault(rec["session"], {}).setdefault(k, []).append(v)
     return {s: {k: statistics.fmean(v) for k, v in d.items()} for s, d in acc.items()}
 
@@ -426,16 +426,18 @@ def report_holdout(a) -> None:
     arms = sorted({r["arm"] for r, _ in scored("holdout")})
     rng, lines, rows = random.Random(0), [], []
     for arm in arms:
-        base, cand = per_session("holdout", a.baseline, arm), per_session("holdout", a.candidate, arm)
+        cats = {f"misses.{miss_cat(m)}" for r, sc in scored("holdout") if r["arm"] == arm and r["variant"] in (a.baseline, a.candidate) for m in misses(sc)}
+        base, cand = per_session("holdout", a.baseline, arm, cats), per_session("holdout", a.candidate, arm, cats)
         common = sorted(set(base) & set(cand))
         if not common:
             continue
         lines.append(f"{arm}: {len(common)} paired holdout sessions")
         for k in sorted({k for s in common for k in base[s] if k in cand[s]}):
-            d = [cand[s][k] - base[s][k] for s in common if k in base[s] and k in cand[s]]
+            ss = [s for s in common if k in base[s] and k in cand[s]]  # the one session set of the means and the deltas
+            d = [cand[s][k] - base[s][k] for s in ss]
             boot = sorted(statistics.fmean(rng.choices(d, k=len(d))) for _ in range(2000))
             ci = f"95% CI [{boot[50]:+.3f}, {boot[1949]:+.3f}]" if len(d) >= 3 else "n<3 sessions: no CI"
-            mb, mc = statistics.fmean([base[s][k] for s in common if k in base[s]]), statistics.fmean([cand[s][k] for s in common if k in cand[s]])
+            mb, mc = statistics.fmean([base[s][k] for s in ss]), statistics.fmean([cand[s][k] for s in ss])
             lines.append(f"  {k:36s} base {mb:9.3f}  cand {mc:9.3f}  delta {statistics.fmean(d):+8.3f}  {ci}")
             rows.append({"baseline": a.baseline, "candidate": a.candidate, "arm": arm, "metric": k, "n_sessions": len(d), "base": mb, "cand": mc,
                          "delta": statistics.fmean(d), "ci_lo": boot[50] if len(d) >= 3 else None, "ci_hi": boot[1949] if len(d) >= 3 else None})

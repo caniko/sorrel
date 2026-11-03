@@ -10,6 +10,7 @@ is ledgered, and A/B adjudication that disputes only arm-picked units.
     uv run --script scripts/test_bench_curation.py
 """
 
+import argparse
 import contextlib
 import io
 import json
@@ -295,6 +296,15 @@ def main() -> None:
         ledger = [c for c in db_calls if c["argv"][1] == "ledger"]
         rows = json.loads(ledger[0]["ledger"])
         assert len(ledger) == 1 and rows and {"query", "baseline", "candidate", "arm", "metric", "delta"} <= set(rows[0]) and len({r["query"] for r in rows}) == 1 and not any(sid in ledger[0]["ledger"] for sid in hold4)
+        # a run without a miss category counts 0 of it: one session set for the means and the delta
+        fake = [({"arm": "a", "variant": v, "session": sid}, {"unit": {"f1": 0.5}, "misses": [{"category": "label", "roots": [i]} for i in range(n)]})
+                for v, sid, n in (("b", "s1", 1), ("b", "s1", 0), ("b", "s2", 0), ("b", "s3", 1), ("c", "s1", 0), ("c", "s2", 2), ("c", "s3", 1))]
+        got: list = []
+        bc.scored, bc.DB, bc.B, bc.dev = lambda split: iter(fake), Path("db"), t / "bench4", lambda *x: got.append(json.loads(Path(x[2]).read_text()))
+        with contextlib.redirect_stdout(io.StringIO()):
+            bc.report_holdout(argparse.Namespace(baseline="b", candidate="c"))
+        row = next(r for r in got[0] if r["metric"] == "misses.label")
+        assert (row["n_sessions"], row["base"], row["cand"], row["delta"]) == (3, 0.5, 1.0, 0.5), row
         print("ok: add/splits, mcp-review argv, holdout sealing + ledger, results-DB calls, adjudication")
 
 
