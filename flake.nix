@@ -88,6 +88,20 @@
                 paths = ["smoke-out/**"];
               };
             }
+            # No arm64 wheel is built, so the wheel step is skipped there.
+            {
+              id = "windows-arm64";
+              nix_build = ".#packages.x86_64-linux.sorrel-windows-aarch64-smoke";
+              runner = "windows-11-arm";
+              shell = "pwsh";
+              run = "./release/smoke-windows.ps1 -SkipWheel";
+              timeout_minutes = 60;
+              env.RUST_LOG = "info";
+              artifacts = {
+                name = "windows-arm64-smoke";
+                paths = ["smoke-out/**"];
+              };
+            }
           ];
           # sorrel's #[cfg(windows)] paths and the save tests need a real
           # Windows run; the Nix tests above only cover Linux.
@@ -198,6 +212,16 @@
                 member = "sorrelw.exe";
                 asset = "sorrel-{version}-x86_64-windows-gui.exe";
               }
+              {
+                archive = "sorrel-{version}-aarch64-windows.zip";
+                member = "sorrel.exe";
+                asset = "sorrel-{version}-aarch64-windows.exe";
+              }
+              {
+                archive = "sorrel-{version}-aarch64-windows.zip";
+                member = "sorrelw.exe";
+                asset = "sorrel-{version}-aarch64-windows-gui.exe";
+              }
             ];
             build_commands = [
               "git archive --format=tar --prefix=\"sorrel-$VERSION/\" HEAD | gzip -n > \"release/sorrel-$VERSION.tar.gz\""
@@ -208,6 +232,7 @@
           package_id = "Caniko.Sorrel";
           download_repo = "caniko/sorrel";
           zip_archive = "sorrel-{version}-x86_64-windows.zip";
+          arm64_zip_archive = "sorrel-{version}-aarch64-windows.zip";
           publisher = "Caniko";
           license = "MIT OR Apache-2.0";
           license_url = "https://github.com/caniko/sorrel/blob/trunk/LICENSE-MIT";
@@ -313,7 +338,7 @@
       crossSorrelPackages = harbor-rs.lib.mkCrossPackages {
         inherit pkgs craneLib cross;
         pname = "sorrel";
-        targets = ["aarch64-linux" "windows" "darwin-aarch64"];
+        targets = ["aarch64-linux" "windows" "windows-aarch64" "darwin-aarch64"];
         commonArgs = {
           inherit src;
           version = sorrelVersion;
@@ -337,6 +362,18 @@
             # This replaces harbor-rs's value, so keep its -L. The GNU ld
             # --no-gc-sections fix for linkme lives in crates/sorrel/build.rs.
             CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-L ${cross.winpthreads}/lib";
+            doCheck = false;
+          };
+          # aarch64-pc-windows-gnullvm: harbor-rs supplies llvm-mingw (cc, ar,
+          # windres) through depsBuildBuild and the CC_/RC_/linker env.
+          windows-aarch64 = {
+            buildInputs = [];
+            inherit (deps) nativeBuildInputs;
+            # aws-lc-sys (via libp2p-quic) compiles jitterentropy, which needs
+            # winpthreads' <sched.h>; llvm-mingw's sysroot does not carry it, and nixpkgs'
+            # aarch64 winpthreads does not build with clang (winver.h). The
+            # headers are arch-neutral, so borrow the x64 package's.
+            CFLAGS_aarch64_pc_windows_gnullvm = "-I${cross.winpthreads}/include";
             doCheck = false;
           };
           darwin-aarch64 = {
@@ -455,6 +492,11 @@
               cp ${self.packages.${system}.sorrel-windows}/bin/sorrelw.exe $out/
               cp ${wheel}/${wheel.file} $out/
             '';
+          sorrel-windows-aarch64-smoke = pkgs.runCommand "sorrel-windows-aarch64-smoke-${sorrelVersion}" {} ''
+            mkdir -p $out
+            cp ${self.packages.${system}.sorrel-windows-aarch64}/bin/sorrel.exe $out/
+            cp ${self.packages.${system}.sorrel-windows-aarch64}/bin/sorrelw.exe $out/
+          '';
         };
 
       checks =
