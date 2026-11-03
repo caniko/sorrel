@@ -175,6 +175,28 @@ fn a_session_a_run_and_its_score_land_in_the_results_db() {
         "{}",
         String::from_utf8_lossy(&other.stderr)
     );
+    // Nor is a score made against another TRUTH than the session's.
+    let foreign = sorrel(
+        t,
+        &[
+            "diff",
+            &input,
+            &s(&data),
+            "--root",
+            &input,
+            "--json",
+            "--record",
+            "r1",
+            "--db",
+            &db,
+        ],
+    );
+    assert!(!foreign.status.success(), "a foreign TRUTH must be refused");
+    assert!(
+        String::from_utf8_lossy(&foreign.stderr).contains("TRUTH is not the session's"),
+        "{}",
+        String::from_utf8_lossy(&foreign.stderr)
+    );
 
     let q = |sql: &str| ok(&dev(&["db", "query", sql]));
     assert_eq!(q("SELECT COUNT(*) FROM runs"), "COUNT(*)\n1\n");

@@ -119,16 +119,31 @@ fn open_db(db: &Option<PathBuf>, deny: &Option<PathBuf>) -> Result<DevDb> {
     Ok(DevDb::open(&db_path(db.as_deref())?)?.with_deny(deny.lines().map(str::to_owned)))
 }
 
+/// The session fingerprint of an input dir: `baseline_hash` of its `spike_clusters.npy`, in hex.
+fn input_fingerprint(input: &Path) -> Result<String> {
+    let path = sorrel_io::RootView::open(input)?.path("spike_clusters.npy");
+    let hash =
+        baseline_hash(&std::fs::read(&path).with_context(|| format!("read {}", path.display()))?);
+    Ok(format!("{hash:016x}"))
+}
+
 /// `sorrel diff --record RID`: write the score of a recorded run, made against
-/// the curation in `test` with `disputed` dropped.
+/// the curations in `test` and `truth` and the input `root`, with `disputed` dropped.
 pub fn record_diff(
     db: Option<&Path>,
     rid: &str,
     d: &SpikeDiff,
-    test: &Path,
+    (test, truth, root): (&Path, &Path, &Path),
     disputed: &HashSet<u32>,
 ) -> Result<()> {
-    open_db(&db.map(Path::to_owned), &None)?.record_diff(rid, d, &truth_hash(test)?, disputed)
+    open_db(&db.map(Path::to_owned), &None)?.record_diff(
+        rid,
+        d,
+        &truth_hash(test)?,
+        &truth_hash(truth)?,
+        &input_fingerprint(root)?,
+        disputed,
+    )
 }
 
 pub fn run(a: DevArgs) -> Result<()> {
@@ -214,10 +229,7 @@ fn record_session(
         .context("a dev session needs --input")?
         .canonicalize()?;
     let clusters_path = sorrel_io::RootView::open(&input)?.path("spike_clusters.npy");
-    let fingerprint = baseline_hash(
-        &std::fs::read(&clusters_path)
-            .with_context(|| format!("read {}", clusters_path.display()))?,
-    );
+    let fingerprint = input_fingerprint(&input)?;
     let clusters = sorrel_io::npy::read_1d_u32(&clusters_path)?;
     let roots: Vec<u32> = clusters
         .iter()
@@ -263,7 +275,7 @@ fn record_session(
     db.record_session(&SessionRow {
         sid: sid.into(),
         split: split.into(),
-        fingerprint: Some(format!("{fingerprint:016x}")),
+        fingerprint: Some(fingerprint),
         sorter: Some(info.0),
         n_spikes: Some(clusters.len() as i64),
         n_roots: Some(roots.len() as i64),

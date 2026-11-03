@@ -603,24 +603,30 @@ impl DevDb {
 
     /// The score of a recorded run: every numeric leaf of the diff by dotted
     /// name (`good_units.recall`), `misses.<category>` counts, and the misses.
-    /// `test_hash` is the [`truth_hash`] of the TEST curation that was scored:
-    /// it must be the run's own output. `d` echoes the scoring options but the
-    /// disputed set, so that comes in too; together they are stored with the score.
+    /// `test_hash` and `truth` are the [`truth_hash`] of the TEST and TRUTH
+    /// curations that were scored, `fingerprint` that of the `--root` input:
+    /// TEST must be the run's own output, the others the session's. `d` echoes
+    /// the scoring options but the disputed set, so that comes in too; together
+    /// they are stored with the score.
     pub fn record_diff(
         &mut self,
         rid: &str,
         d: &SpikeDiff,
         test_hash: &str,
+        truth: &str,
+        fingerprint: &str,
         disputed: &HashSet<u32>,
     ) -> Result<()> {
         self.guard("rid", rid)?;
-        let output: Option<Option<String>> = self
+        let stored: Option<[Option<String>; 3]> = self
             .conn
-            .query_row("SELECT output_hash FROM runs WHERE rid = ?1", [rid], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT r.output_hash, s.truth_hash, s.fingerprint FROM runs r JOIN sessions s USING (sid) WHERE r.rid = ?1",
+                [rid],
+                |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?]),
+            )
             .optional()?;
-        let output = output.context("unknown run; record-run first")?;
+        let [output, s_truth, s_fp] = stored.context("unknown run; record-run first")?;
         ensure!(
             output.is_some(),
             "run has no recorded output hash; re-run record-run"
@@ -629,6 +635,20 @@ impl DevDb {
             output.as_deref() == Some(test_hash),
             "TEST is not the run's recorded output (its curation hashes to {test_hash}, the run's to {}); score the run's own data dir",
             output.unwrap_or_default()
+        );
+        ensure!(
+            s_truth.is_some(),
+            "session has no recorded truth; re-run record-session --truth"
+        );
+        ensure!(
+            s_truth.as_deref() == Some(truth),
+            "TRUTH is not the session's recorded truth (it hashes to {truth}, the session's to {}); score against the session's own truth",
+            s_truth.unwrap_or_default()
+        );
+        ensure!(
+            s_fp.as_deref() == Some(fingerprint),
+            "--root is not the session's recorded input (its spike_clusters.npy hashes to {fingerprint}, the session's to {}); pass the session's own input",
+            s_fp.unwrap_or_default()
         );
         let mut disputed: Vec<_> = disputed.iter().collect();
         disputed.sort();
@@ -848,18 +868,18 @@ impl DevDb {
         Ok(rev)
     }
 
-    /// One row per (variant, arm, revisions): mean dev metrics over its scored runs and
+    /// One row per (variant, arm, revisions, score options): mean dev metrics over its scored runs and
     /// the holdout ledger rows that name it as the candidate.
     fn lineage(&self) -> Result<String> {
         let mut md = String::from("# Prompt lineage\n\nDev metrics are means over scored runs; holdout is the ledger delta of good_units.recall against its baseline.\n\n");
-        md += &format!("| variant | arm | runs | prompt_rev | sorrel_rev | learned_rev | {} | cost_usd | holdout |\n", LINEAGE_METRICS.join(" | "));
+        md += &format!("| variant | arm | runs | prompt_rev | sorrel_rev | learned_rev | score_opts | {} | cost_usd | holdout |\n", LINEAGE_METRICS.join(" | "));
         md += &format!(
-            "|---|---|---|---|---|---|{}---|---|\n",
+            "|---|---|---|---|---|---|---|{}---|---|\n",
             "---|".repeat(LINEAGE_METRICS.len())
         );
         let mut st = self.conn.prepare(
-            "SELECT variant, arm, COUNT(*), prompt_rev, sorrel_rev, learned_rev, AVG(cost_usd)
-             FROM runs GROUP BY variant, arm, prompt_rev, sorrel_rev, learned_rev
+            "SELECT variant, arm, COUNT(*), prompt_rev, sorrel_rev, learned_rev, AVG(cost_usd), score_opts
+             FROM runs GROUP BY variant, arm, prompt_rev, sorrel_rev, learned_rev, score_opts
              ORDER BY MIN(rowid), variant, arm",
         )?;
         let cell = |v: Option<f64>| v.map_or("-".into(), |v| format!("{v:.3}"));
@@ -871,14 +891,15 @@ impl DevDb {
                 r.get::<_, i64>(2)?,
                 [3, 4, 5].map(|i| r.get::<_, Option<String>>(i).unwrap_or(None)),
                 r.get::<_, Option<f64>>(6)?,
+                r.get::<_, Option<String>>(7)?,
             ))
         })? {
-            let (variant, arm, n, revs, cost) = row?;
+            let (variant, arm, n, revs, cost, opts) = row?;
             let mean = |name: &str| -> Result<Option<f64>> {
                 Ok(self.conn.query_row(
                     "SELECT AVG(m.value) FROM metrics m JOIN runs r USING (rid) WHERE r.variant = ?1 AND r.arm = ?2 AND m.name = ?3
-                     AND r.prompt_rev IS ?4 AND r.sorrel_rev IS ?5 AND r.learned_rev IS ?6",
-                    params![variant, arm, name, revs[0], revs[1], revs[2]],
+                     AND r.prompt_rev IS ?4 AND r.sorrel_rev IS ?5 AND r.learned_rev IS ?6 AND r.score_opts IS ?7",
+                    params![variant, arm, name, revs[0], revs[1], revs[2], opts],
                     |r| r.get(0),
                 )?)
             };
@@ -897,8 +918,9 @@ impl DevDb {
                 holdout.join("; ")
             };
             let [p, s, l] = revs.map(txt);
+            let opts = txt(opts);
             md += &format!(
-                "| {variant} | {arm} | {n} | {p} | {s} | {l} | {} | {} | {holdout} |\n",
+                "| {variant} | {arm} | {n} | {p} | {s} | {l} | {opts} | {} | {} | {holdout} |\n",
                 means.join(" | "),
                 cell(cost)
             );
@@ -1700,7 +1722,7 @@ mod tests {
             .map(|l| l.split(" | ").collect())
             .collect();
         // (runs, sorrel_rev, good_units.recall mean); NULL revisions are one group.
-        let mut got: Vec<_> = rows.iter().map(|c| (c[2], c[4], c[6])).collect();
+        let mut got: Vec<_> = rows.iter().map(|c| (c[2], c[4], c[7])).collect();
         got.sort();
         assert_eq!(
             got,
@@ -1709,6 +1731,37 @@ mod tests {
                 ("1", "rev-b", "0.800"),
                 ("2", "-", "0.500")
             ],
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn lineage_keeps_scoring_options_apart_with_their_own_means() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        scored_run(&mut d, "s1", "r1", None, 0.2);
+        scored_run(&mut d, "s1", "r2", None, 0.8);
+        // after both records: a later record-run drops scores whose basis moved
+        for (rid, opts) in [("r1", "{\"a\":1}"), ("r2", "{\"a\":2}")] {
+            d.conn
+                .execute(
+                    "UPDATE runs SET score_opts = ?2 WHERE rid = ?1",
+                    params![rid, opts],
+                )
+                .unwrap();
+        }
+        let md = d.lineage().unwrap();
+        let mut got: Vec<(&str, &str)> = md
+            .lines()
+            .filter(|l| l.starts_with("| v0 "))
+            .map(|l| l.split(" | ").collect::<Vec<_>>())
+            .map(|c| (c[6], c[7]))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [("{\"a\":1}", "0.200"), ("{\"a\":2}", "0.800")],
             "{md}"
         );
     }
@@ -1837,6 +1890,8 @@ mod tests {
                 "r1",
                 &score(&SpikeDiffOpts::default()),
                 "o1",
+                "t1",
+                "fp1",
                 &HashSet::new()
             )
             .is_err());
@@ -1874,20 +1929,60 @@ mod tests {
         fill(&mut d, "s1", "fp1");
         let (diff, none) = (score(&SpikeDiffOpts::default()), HashSet::new());
         run_with_output(&mut d, None);
-        let err = d.record_diff("r1", &diff, "o1", &none).unwrap_err();
+        let err = d
+            .record_diff("r1", &diff, "o1", "t1", "fp1", &none)
+            .unwrap_err();
         assert!(err.to_string().contains("re-run record-run"), "{err}");
         run_with_output(&mut d, Some("o1"));
-        let err = d.record_diff("r1", &diff, "o2", &none).unwrap_err();
+        let err = d
+            .record_diff("r1", &diff, "o2", "t1", "fp1", &none)
+            .unwrap_err();
         assert!(
             err.to_string().contains("not the run's recorded output"),
             "{err}"
         );
         assert_eq!(rows_in(&d, &["metrics"]), 0);
-        d.record_diff("r1", &diff, "o1", &none).unwrap();
+        d.record_diff("r1", &diff, "o1", "t1", "fp1", &none)
+            .unwrap();
         assert!(rows_in(&d, &["metrics"]) > 0);
         // the run's output changed: the score goes with it
         run_with_output(&mut d, Some("o2"));
         assert_eq!(rows_in(&d, &["metrics"]), 0);
+    }
+
+    #[test]
+    fn a_score_is_only_recorded_against_the_sessions_truth_and_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        run_with_output(&mut d, Some("o1"));
+        let (diff, none) = (score(&SpikeDiffOpts::default()), HashSet::new());
+        let err = d
+            .record_diff("r1", &diff, "o1", "t2", "fp1", &none)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("TRUTH is not the session's"),
+            "{err}"
+        );
+        let err = d
+            .record_diff("r1", &diff, "o1", "t1", "fp2", &none)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("--root is not the session's"),
+            "{err}"
+        );
+        assert_eq!(rows_in(&d, &["metrics"]), 0);
+        d.record_diff("r1", &diff, "o1", "t1", "fp1", &none)
+            .unwrap();
+        assert!(rows_in(&d, &["metrics"]) > 0);
+        // a session whose truth was never recorded cannot vouch for any
+        d.conn
+            .execute("UPDATE sessions SET truth_hash = NULL", [])
+            .unwrap();
+        let err = d
+            .record_diff("r1", &diff, "o1", "t1", "fp1", &none)
+            .unwrap_err();
+        assert!(err.to_string().contains("no recorded truth"), "{err}");
     }
 
     #[test]
@@ -1898,7 +1993,8 @@ mod tests {
         run_with_output(&mut d, Some("o1"));
         let mut basis_of = |opts: &SpikeDiffOpts, disputed: &[u32]| {
             let disputed = disputed.iter().copied().collect();
-            d.record_diff("r1", &score(opts), "o1", &disputed).unwrap();
+            d.record_diff("r1", &score(opts), "o1", "t1", "fp1", &disputed)
+                .unwrap();
             d.query("SELECT basis FROM runs").unwrap()
         };
         let base = basis_of(&SpikeDiffOpts::default(), &[]);
