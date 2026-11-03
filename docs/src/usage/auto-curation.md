@@ -265,7 +265,7 @@ Kilosort sorts curated in phy work too (`add --phy-curated`): the sorter's
 clustering comes from `spike_templates.npy`.
 Data owners package a phy-curated Kilosort sort with the `export-curated-sort` skill (`.claude/skills/export-curated-sort/`), which keeps only what the bench needs and verifies the compressed raw recording before delivery.
 
-The `curation-bench-loop` skill (`.claude/skills/curation-bench-loop/`) runs the improvement loop below and says which steps a cheap `flash` agent can do, which need a `worker` and which stay with the `lead`.
+The `curation-bench-loop` skill (`.claude/skills/curation-bench-loop/`) runs the improvement loop below and says which steps a cheap `flash` agent can do, which need a `worker` and which stay with the `lead`. Before collecting data, run the checks in its "Pitfalls (learned the hard way)" section. Each one cost a round or leaked an answer once. To set the bench up on a new machine, including how the sealed holdout survives the move, see `bench/README.md`. Results, prompt variants and lineage live in `bench/` (the results DB through git-lfs).
 
 **Three blinds.**
 

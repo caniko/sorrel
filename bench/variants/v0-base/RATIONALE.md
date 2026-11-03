@@ -1,0 +1,1 @@
+No override files: this variant runs sorrel's built-in RUBRIC and REVIEW_INSTRUCTIONS (`sorrel agent-guide --prompt review`) of the sorrel binary it was run with; the DB's `runs.sorrel_rev` names that binary.
