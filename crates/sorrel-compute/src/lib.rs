@@ -10,6 +10,7 @@ pub mod distribution;
 pub mod drift;
 pub mod filter;
 pub mod gmm;
+pub mod gmm_diag;
 pub mod hull3d;
 pub mod kmeans;
 pub mod linalg;
@@ -34,6 +35,7 @@ pub use drift::{
 };
 pub use filter::{Biquad, BiquadState};
 pub use gmm::{gmm_split_proposal, GmmSplitProposal};
+pub use gmm_diag::{fit_diag_gmm, DiagGmm};
 pub use hull3d::convex_hull_3d;
 pub use kmeans::{assign as kmeans_assign, kmeans, KMeans};
 pub use lttb::lttb_downsample;

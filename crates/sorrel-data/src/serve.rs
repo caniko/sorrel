@@ -102,7 +102,7 @@ until margin units and disagreements with the auto classifiers are few.
 brief {clusters:[..]} for cards, brief level 3 for relations (merge components \
 m<k>, split candidates s<cluster>.<k>), eval for a counterfactual of a merge or a \
 split. When the precomputed evidence does not settle a hypothesis, test it with \
-probe (acg, ccg, compare, window, split by=amp|time|pc|kmeans, eval): one short \
+probe (acg, ccg, compare, window, split by=amp|time|pc|kmeans|core, eval): one short \
 answer per query, and probe split gives a new s handle you can decide on. \
 select moves the human's selection so they see what you discuss.
 4. Call rules_apply, then decide for the exceptions, the merges (by m handle, or \
@@ -268,7 +268,7 @@ fn read_tools() -> Vec<Value> {
          "inputSchema": cluster}),
         json!({"name": "merge_candidates", "description": "Merge candidates involving a cluster with their evidence (CCG dip, amplitude KS); brief level 3 shows all of them as components (m<k>)",
          "inputSchema": cluster}),
-        json!({"name": "probe", "description": "Closed-grammar computations for hypotheses the brief did not anticipate, one compact answer per query. q = one string or a list. acg C [win=50] [bin=1] (refractory estimate, contamination, burst, SAX of log lags, first bin rates); ccg A B [win=50] [bin=1] (dip_z, sync_z, +/- lag asymmetry, SAX); compare A B (template cosine on shared channels, peak-channel distance um, trough-to-peak/half-width deltas, amplitude ratio); window C T0 T1 (seconds: n, rate, rpc, amplitude, presence of the slice vs the whole unit); split C by=amp|time|pc|kmeans [at=X] (creates a NEW split handle s<C>.<k> with its counterfactual line: minor part = spikes above/after X, default the GMM boundary / the biggest amplitude jump / PC1 sign; act on it with split {candidate}, decide or eval); eval merge A B .. | eval s12.1 | eval m3. Read-only except that split registers a handle",
+        json!({"name": "probe", "description": "Closed-grammar computations for hypotheses the brief did not anticipate, one compact answer per query. q = one string or a list. acg C [win=50] [bin=1] (refractory estimate, contamination, burst, SAX of log lags, first bin rates); ccg A B [win=50] [bin=1] (dip_z, sync_z, +/- lag asymmetry, SAX); compare A B (template cosine on shared channels, peak-channel distance um, trough-to-peak/half-width deltas, amplitude ratio); window C T0 T1 (seconds: n, rate, rpc, amplitude, presence of the slice vs the whole unit); split C by=amp|time|pc|kmeans|core [at=X] (core = small clean refractory core of a contaminated unit, minor part; creates a NEW split handle s<C>.<k> with its counterfactual line: minor part = spikes above/after X, default the GMM boundary / the biggest amplitude jump / PC1 sign; act on it with split {candidate}, decide or eval); eval merge A B .. | eval s12.1 | eval m3. Read-only except that split registers a handle",
          "inputSchema": {"type": "object", "properties": {"q": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]}}, "required": ["q"]}}),
         json!({"name": "eval", "description": "Counterfactual of a merge or split without applying it: per-part and merged contamination, presence and cutoff, plus per-pair CCG dip/synchrony z and amplitude KS. {merge:[ids]} tests any merge; {candidate:\"s12.1\"|\"m3\"} a handle from brief level 3 or suggest",
          "inputSchema": {"type": "object", "properties": {"merge": {"type": "array", "items": {"type": "integer"}}, "candidate": {"type": "string"}}}}),

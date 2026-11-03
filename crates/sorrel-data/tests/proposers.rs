@@ -324,3 +324,111 @@ fn mcp_attention_queue_includes_pc_outliers() {
         "{row}"
     );
 }
+
+/// Cluster 0 = a broad contaminated cloud (triples 8 samples apart, 97%)
+/// around a tight refractory core (3%, offset in PC space); cluster 1 = one
+/// clean unimodal unit. Returns the provider and cluster 0's core truth.
+fn core_prov() -> (Prov, Vec<bool>) {
+    let mut s = 0xC0DE_u32;
+    let mut p = Prov {
+        times: vec![],
+        amps: vec![],
+        templates: vec![],
+        pc_rows: vec![],
+        pc: vec![],
+        waves: vec![1.0; N_TEMPLATES * 4 * 3],
+        sim: vec![0.1; N_TEMPLATES * N_TEMPLATES],
+        tags: vec![],
+    };
+    let mut host: Vec<(u64, bool)> = (0..1293_u64)
+        .flat_map(|j| [0, 8, 16].map(|o| (190 * j + 5 + o, false)))
+        .collect();
+    host.extend((0..120_u64).map(|i| (2000 * i + 1000, true)));
+    host.sort_unstable();
+    let clean: Vec<(u64, bool)> = (0..500_u64).map(|i| (i * 400 + 100, false)).collect();
+    let mut truth = Vec::new();
+    for (c, spikes) in [host, clean].into_iter().enumerate() {
+        let first_row = (p.pc.len() / 9) as u32;
+        p.pc_rows
+            .push((first_row..first_row + spikes.len() as u32).collect());
+        for &(_, core) in &spikes {
+            for k in 0..9 {
+                let (mu, sd) = if core { (4.0, 0.3) } else { (0.0, 1.0) };
+                p.pc.push(mu * (k < 3) as u8 as f32 + sd * gaussian(&mut s));
+            }
+        }
+        p.amps.push(vec![5.0; spikes.len()]);
+        p.templates.push(vec![c as u32; spikes.len()]);
+        p.times
+            .push(spikes.iter().map(|&(t, _)| SampleIndex(t)).collect());
+        if c == 0 {
+            truth = spikes.iter().map(|&(_, core)| core).collect();
+        }
+    }
+    (p, truth)
+}
+
+#[test]
+fn core_split_isolates_the_refractory_core_in_a_contaminated_cluster() {
+    let (p, truth) = core_prov();
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::new(p, Journal::open(&dir.path().join("j.sqlite")).unwrap());
+    s.seed_amplitudes();
+    s.seed_templates();
+    s.seed_pc_features();
+    s.seed_template_waveforms();
+
+    let splits = rank_split_candidates(&s, &SuggestConfig::default());
+    let c0 = splits
+        .iter()
+        .find(|c| c.cluster == ClusterId(0))
+        .expect("host flagged");
+    assert_eq!(c0.method, "core", "{c0:?}");
+    let got: std::collections::HashSet<u32> = c0.bipartition_minor_idx.iter().copied().collect();
+    let want: std::collections::HashSet<u32> = (0..truth.len() as u32)
+        .filter(|&i| truth[i as usize])
+        .collect();
+    let jaccard = got.intersection(&want).count() as f64 / got.union(&want).count() as f64;
+    assert!(jaccard >= 0.9, "Jaccard {jaccard}, {} spikes", got.len());
+    assert!(
+        splits.iter().all(|c| c.cluster != ClusterId(1)),
+        "a clean unimodal unit gets no proposal"
+    );
+
+    let probe = |q: &str, s: Session<Prov>| {
+        let req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"probe","arguments":{"q":q}}});
+        let mut out = Vec::new();
+        sorrel_data::serve(
+            &sorrel_data::SessionHost::new(s),
+            dir.path(),
+            false,
+            |_: &u8| "unsorted",
+            std::io::Cursor::new(format!("{req}\n")),
+            &mut out,
+        )
+        .unwrap();
+        let reply: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let line = probe("split 0 by=core", s);
+    assert!(
+        line.contains("s0.1 core") && line.contains("parts 3879/120"),
+        "{line}"
+    );
+}
+
+#[test]
+fn core_split_declines_a_clean_or_unstructured_cluster() {
+    use sorrel_data::proposers::{core_split_proposal, whiten};
+    let mut s = 7_u32;
+    let raw: Vec<f32> = (0..4000 * 9).map(|_| gaussian(&mut s)).collect();
+    let (feats, d) = whiten(&raw, 9).unwrap();
+    // Contaminated but featureless: BIC keeps one component.
+    assert!(core_split_proposal(&feats, d, |_| 0.5, |_| 100).is_none());
+    // Clean whole: never tried.
+    assert!(core_split_proposal(&feats, d, |_| 0.0, |_| 0).is_none());
+}

@@ -115,12 +115,14 @@ the batch.
   amplitude ratio.
 - `window C T0 T1`: n, rate, contamination, amplitude and presence of that
   slice against the whole unit.
-- `split C by=amp|time|pc|kmeans [at=X]`: registers a new split handle
+- `split C by=amp|time|pc|kmeans|core [at=X]`: registers a new split handle
   `s<C>.<k>` and prints its `eval` line. The minor part is the spikes above
   (`amp`, `pc`) or after (`time`) `at`. Defaults: the GMM boundary, the
   largest amplitude jump on a coarse 20-point scan, PC1 at 0 with the smaller
-  side as minor; `kmeans` uses the same proposer as `brief` level 3. Act on the
-  handle with `split`, `decide` or `eval`.
+  side as minor; `kmeans` uses the same proposer as `brief` level 3; `core`
+  isolates a small clean refractory core of a contaminated unit (diagonal GMM,
+  BIC-chosen k <= 8; run it again on the remainder for a second core). Act on
+  the handle with `split`, `decide` or `eval`.
 - `eval merge A B ..`, `eval s12.1`, `eval m3`: as the `eval` tool.
 
 A parse error in one query lists the grammar and does not stop the others.

@@ -10,7 +10,7 @@ use crate::cache::correlograms::{acg_or_compute, ccg_or_compute};
 use crate::evaluate::{
     ccg_z, eval_merge, merge_edges, qm, qn, render_merge, unit_stats, Handles, UnitStats,
 };
-use crate::proposers::{cluster_feature_space, cluster_globals, kmeans_split};
+use crate::proposers::{cluster_feature_space, cluster_globals, core_split, kmeans_split};
 use crate::session::Session;
 use crate::suggest::MergeCandidate;
 use sorrel_compute::{
@@ -24,7 +24,7 @@ pub const GRAMMAR: &str = "probe grammar (ms for acg/ccg, seconds for window/spl
   ccg A B [win=50] [bin=1]
   compare A B
   window C T0 T1
-  split C by=amp|time|pc|kmeans [at=X]   (new handle; minor part = spikes above/after X)
+  split C by=amp|time|pc|kmeans|core [at=X]   (new handle; minor part = spikes above/after X; core = clean refractory core)
   eval merge A B ..   |   eval s<C>.<k>   |   eval m<k>";
 
 /// Most queries in one `probe` call.
@@ -36,6 +36,7 @@ pub enum By {
     Time,
     Pc,
     Kmeans,
+    Core,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -134,8 +135,9 @@ pub fn parse(q: &str) -> Result<Query, String> {
                 Some("time") => By::Time,
                 Some("pc") => By::Pc,
                 Some("kmeans") => By::Kmeans,
+                Some("core") => By::Core,
                 Some(o) => return Err(format!("unknown by={o}")),
-                None => return Err("split needs by=amp|time|pc|kmeans".into()),
+                None => return Err("split needs by=amp|time|pc|kmeans|core".into()),
             };
             Ok(Query::Split {
                 c: id(pos[0])?,
@@ -595,8 +597,14 @@ fn split_minor<P: DataProvider>(
             };
             Ok((above(&secs, x), "time", f32::NAN, Some(x)))
         }
-        By::Pc | By::Kmeans => {
+        By::Pc | By::Kmeans | By::Core => {
             let globals = cluster_globals(session, c);
+            if by == By::Core {
+                let core = core_split(session, c, &globals).ok_or(
+                    "no core (needs PC features, rpc > .1, and a separated component with rpc <= .1)",
+                )?;
+                return Ok((core.minor_idx, "core", f32::NAN, None));
+            }
             if by == By::Kmeans {
                 let km = kmeans_split(session, c, &globals)
                     .ok_or("no k-means split (needs PC features, silhouette >= .25, d' >= 2)")?;
