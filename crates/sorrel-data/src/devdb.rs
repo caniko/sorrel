@@ -1173,8 +1173,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            d.record_run(&run("v/x"), &[]).is_err()
-                && d.record_run(&run("sess_ks4"), &[]).is_err()
+            d.record_run(&run("v/x"), &[]).is_err() && d.record_run(&run("sess_ks4"), &[]).is_err()
         );
         let act = ArmAction {
             target: "1".into(),
