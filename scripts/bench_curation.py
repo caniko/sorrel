@@ -13,6 +13,11 @@ docs/src/usage/auto-curation.md).
     bench_curation.py --bench BENCH report holdout --baseline NAME --candidate NAME
     bench_curation.py --bench BENCH adjudicate --split S [--judge claude] | --unmask --split S
 
+With `--db FILE` (or $SORREL_DEV_DB) and a `sorrel` built with `--features dev`, every dev result
+is also recorded in the results DB (`sorrel dev ...`): `add` records sessions, `run` runs, `score`
+the metrics and misses, `report holdout` the aggregate rows. A holdout session reaches the DB only
+as an opaque alias row; no holdout run or id ever does. The JSON files stay as a cache.
+
 BENCH is private data outside the repo. `$SORREL_BIN` names the sorrel binary
 (default: `sorrel` on PATH); a variant DIR may hold `rubric.md` / `review.md`.
 Everything about a holdout session (its copy, runs, scores, adjudication sheet,
@@ -37,6 +42,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 B = Path()  # the bench root, set by main()
+DB = None  # the results DB (--db or $SORREL_DEV_DB), set by main(); None = JSON files only
 SORREL = os.environ.get("SORREL_BIN", "sorrel")
 HOLDOUT_PCT = 30
 LINK_MIN = 64 << 20  # files at least this big are hard-linked into a copy, smaller ones copied
@@ -58,6 +64,33 @@ def sorrel(*args, env=None, timeout=600) -> str:
     if r.returncode:
         raise SystemExit(f"sorrel {args[0]} failed (exit {r.returncode}): {r.stderr.strip()[-400:]}")
     return r.stdout
+
+
+def dev_env() -> dict:
+    """Environment of every results-DB call: the DB, and a deny file of what it must never hold
+    (the sealed ids and every source basename), rewritten from the map each time."""
+    sessions = load_map()["sessions"]
+    deny = B / ".sealed" / "dev-deny.txt"
+    deny.parent.mkdir(parents=True, exist_ok=True)
+    deny.write_text("".join(f"{x}\n" for x in sorted({sid for sid, v in sessions.items() if v["split"] == "holdout"} | {Path(v["path"]).name for v in sessions.values()})))
+    return {"SORREL_DEV_DB": str(DB), "SORREL_DEV_DENY": str(deny)}
+
+
+def dev(*args) -> str:
+    """`sorrel dev ...` on the results DB; a refusal (privacy guard) stops the bench."""
+    return sorrel("dev", *args, env=dev_env(), timeout=1800)
+
+
+def db_session(sid: str) -> None:
+    """Record a session. A holdout session is an alias row (salted hash, unlinkable to its sealed id), nothing else."""
+    if not DB:
+        return
+    m = load_map()
+    if m["sessions"][sid]["split"] == "dev":
+        d = home("dev") / "sessions" / sid
+        dev("record-session", "--sid", sid, "--split", "dev", "--input", d / "input", "--truth", d / "truth")
+    else:
+        dev("record-session", "--sid", "h" + hashlib.sha256((m["salt"] + sid).encode()).hexdigest()[:8], "--split", "holdout")
 
 
 def write_json(p: Path, obj) -> None:
@@ -133,6 +166,7 @@ def cmd_add(a) -> None:
                     shutil.rmtree(r)
                 m["sessions"][sid] |= {"split": "dev", "forced_dev": True}
                 write_json(B / ".sealed" / "map.json", m)
+                db_session(sid)  # now a dev session: its input and truth go into the results DB
                 n_unsealed += 1
             else:
                 print(f"skip (already added): {s}")
@@ -155,6 +189,7 @@ def cmd_add(a) -> None:
         shutil.move(d, final)
         m["sessions"][sid] = {"path": path, "split": split, "pure_manual": pure, "forced_dev": a.dev, "keep": sorted(p.name for p in (final / "input").iterdir())}
         write_json(B / ".sealed" / "map.json", m)  # per session: a later failure keeps the earlier ones
+        db_session(sid)
         n_added, n_dev, n_forced = n_added + 1, n_dev + (split == "dev"), n_forced + (not pure)
     print(f"added {n_added} session(s), {n_dev} to dev ({n_forced} of them not purely manual); the rest are sealed")
     if n_unsealed:
@@ -214,7 +249,8 @@ def one_run(a, sid: str, k: int) -> dict:
         if a.arm == "auto-llm":
             sorrel("auto", data, "--llm", *(["--llm-model", a.model] if a.model else []), "--save", env=env, timeout=a.timeout)
             ev = data / "sorrel_auto" / "evidence.json"
-            rec["prompt_rev"] = json.loads(ev.read_text()).get("prompt_rev") if ev.exists() else None
+            evidence = json.loads(ev.read_text()) if ev.exists() else {}
+            rec["prompt_rev"], rec["learned_rev"] = evidence.get("prompt_rev"), evidence.get("learned_rev")
         else:
             prompt = sorrel("agent-guide", "--prompt", "review", env=env) + "\n\n" + TASK + "\n"
             sv = {"command": shutil.which(SORREL) or SORREL, "args": ["mcp", str(data)], **({"env": {k: v for k, v in env.items() if v}} if any(env.values()) else {})}
@@ -245,8 +281,14 @@ def cmd_run(a) -> None:
     if not sids:
         raise SystemExit(f"no {a.split} sessions")
     jobs = [(s, k) for s in sids for k in range(a.repeats)]
+    if DB and a.split == "dev":
+        for s in sids:
+            db_session(s)  # idempotent; a run needs its session row
     with ThreadPoolExecutor(a.jobs) as ex:
         recs = list(ex.map(lambda j: one_run(a, *j), jobs))
+    if DB and a.split == "dev":  # never a holdout run: its id holds the sealed session id
+        for r in recs:
+            dev("record-run", "--run-dir", run_roots("dev") / r["id"], "--variant-dir", a.variant)
     if a.split == "holdout":  # no run or session ids: they would tell which sessions are sealed
         print(f"{len(recs)} holdout run(s): " + ", ".join(f"{n} {st}" for st in sorted({r["status"] for r in recs}) for n in [sum(r["status"] == st for r in recs)]))
     else:
@@ -267,12 +309,21 @@ def cmd_score(a) -> None:
                 continue
             s = sess(rec["session"])
             disp = home(split) / "disputed" / f"{rec['session']}.tsv"
+            record = bool(DB) and split == "dev"
             argv = ["diff", s / "truth", root / "data", "--root", s / "input", "--json", "--match", a.match] + (["--disputed", disp] if disp.exists() else [])
-            r = run([SORREL, *argv])
+            # Only a score the DB accepted (when recording) is cached: a rejected or timed-out one must not
+            # reach a report, so the old cache goes before the diff runs.
+            (root / "score.json").unlink(missing_ok=True)
+            r = run([SORREL, *argv, *(["--record", rec["id"], "--db", DB] if record else [])], env=dev_env() if record else None)
             try:
-                write_json(root / "score.json", json.loads(r.stdout))
+                score = json.loads(r.stdout) if r.returncode == 0 else None
             except ValueError:
-                print(f"{rec['id'] if split == 'dev' else 'a holdout run'}: diff failed: {r.stderr.strip()[-200:]}", file=sys.stderr)
+                score = None
+            if score is None:
+                what = "not recorded in the results DB" if record and r.stdout.strip() else "diff failed"
+                print(f"{rec['id'] if split == 'dev' else 'a holdout run'}: {what}: {r.stderr.strip()[-200:]}", file=sys.stderr)
+            else:
+                write_json(root / "score.json", score)
 
 
 def misses(score: dict) -> list:
@@ -310,10 +361,19 @@ def metrics(score: dict) -> dict:
             elif isinstance(v, (int, float)) and not isinstance(v, bool):
                 out[p + k] = v
 
-    walk({k: v for k, v in score.items() if k not in ("misses", "n_spikes", "n_root_clusters", "match_jaccard", "min_spikes")}, "")
+    # the scoring options and dataset sizes are configuration, not outcomes
+    skip = ("misses", "n_spikes", "n_root_clusters", "n_disputed", "match_jaccard", "min_spikes", "split_share", "binary")
+    walk({k: v for k, v in score.items() if k not in skip}, "")
     for m in misses(score):
         out[f"misses.{miss_cat(m)}"] = out.get(f"misses.{miss_cat(m)}", 0) + 1
     return out
+
+
+def cfg(rec: dict, sc: dict) -> tuple:
+    """What a score depends on besides its variant: model, revisions, then the diff's options. Scores of different cfgs are never averaged.
+    The options are the last four entries (report_holdout compares them alone)."""
+    run_side = (rec.get("model"), rec.get("prompt_rev"), rec.get("sorrel_rev"), rec.get("learned_rev"))
+    return tuple(str(x) for x in (*run_side, *(sc.get(k) for k in ("match_jaccard", "min_spikes", "split_share", "binary"))))
 
 
 def scored(split: str):
@@ -344,9 +404,9 @@ def brief_rows(sid: str, ids) -> tuple[str, dict]:
 
 
 def report_dev(a) -> None:
-    groups: dict = {}  # (arm, variant) -> [(rec, score)]
+    groups: dict = {}  # (arm, variant, cfg) -> [(rec, score)]
     for rec, sc in scored("dev"):
-        groups.setdefault((rec["arm"], rec["variant"]), []).append((rec, sc))
+        groups.setdefault((rec["arm"], rec["variant"], cfg(rec, sc)), []).append((rec, sc))
     if not groups:
         raise SystemExit("no scored dev runs (run, then score)")
     failed = {}
@@ -354,12 +414,19 @@ def report_dev(a) -> None:
         if rec["status"] != "ok":
             failed[(rec["arm"], rec["variant"])] = failed.get((rec["arm"], rec["variant"]), 0) + 1
     names = sorted(groups)
+    cfgs = {n[:2]: sum(m[:2] == n[:2] for m in names) for n in names}  # a column names its cfg only when its arm/variant has several
+    label = {n: "/".join(n[:2]) + (f" [{' '.join(n[2])}]" if cfgs[n[:2]] > 1 else "") for n in names}
     ms = [dict(metrics(sc)) for k in names for _, sc in groups[k]]
     keys = sorted({k for m in ms for k in m})
-    md = ["# Dev report", "", f"| metric | {' | '.join('/'.join(n) for n in names)} |", f"|---|{'---|' * len(names)}"]
-    md.append("| runs (failed) | " + " | ".join(f"{len(groups[n])} ({failed.get(n, 0)})" for n in names) + " |")
+    md = ["# Dev report", "", f"| metric | {' | '.join(label[n] for n in names)} |", f"|---|{'---|' * len(names)}"]
+    # A failed run has no score, so no cfg: its count belongs to the arm/variant, shown once, not under each column.
+    md.append("| runs (failed) | " + " | ".join(f"{len(groups[n])} ({failed.get(n[:2], 0)})" if cfgs[n[:2]] == 1 else f"{len(groups[n])}" for n in names) + " |")
+    if any(cfgs[n[:2]] > 1 and failed.get(n[:2]) for n in names):
+        md.append("| failed runs (all configurations) | " + " | ".join(str(failed.get(n[:2], 0)) if cfgs[n[:2]] > 1 else "" for n in names) + " |")
     for k in keys:
-        md.append(f"| {k} | " + " | ".join(fmt([metrics(sc)[k] for _, sc in groups[n] if k in metrics(sc)] or [float('nan')]) for n in names) + " |")
+        # a scored run without a miss category has none of it: counts 0, never left out of the mean
+        val = lambda sc: metrics(sc).get(k, 0 if k.startswith("misses.") else None)
+        md.append(f"| {k} | " + " | ".join(fmt([v for _, sc in groups[n] if (v := val(sc)) is not None] or [float('nan')]) for n in names) + " |")
     for n in names:
         tally: dict = {}  # (cat, sid, ids) -> runs with that miss
         per_sid: dict = {}
@@ -372,7 +439,7 @@ def report_dev(a) -> None:
         for _, sid, ids in tally:
             want.setdefault(sid, set()).update(ids)
         cards = {sid: brief_rows(sid, ids) for sid, ids in want.items()}
-        md += ["", f"## Misses: {'/'.join(n)}"]
+        md += ["", f"## Misses: {label[n]}"]
         for cat in sorted({c for c, _, _ in tally}):
             md += ["", f"### {cat}"]
             for (c, sid, ids), cnt in sorted(tally.items()):
@@ -387,36 +454,52 @@ def report_dev(a) -> None:
     print(out)
 
 
-def per_session(split: str, variant: str, arm: str) -> dict:
-    """{session: {metric: mean over repeats}}"""
+def per_session(split: str, variant: str, arm: str, cats=()) -> dict:
+    """{session: {metric: mean over repeats}}; a miss category of `cats` a run lacks counts 0."""
     acc: dict = {}
+    seen = set()
     for rec, sc in scored(split):
         if rec["variant"] == variant and rec["arm"] == arm:
-            for k, v in metrics(sc).items():
+            seen.add(cfg(rec, sc))
+            for k, v in (dict.fromkeys(cats, 0) | metrics(sc)).items():
                 acc.setdefault(rec["session"], {}).setdefault(k, []).append(v)
-    return {s: {k: statistics.fmean(v) for k, v in d.items()} for s, d in acc.items()}
+    if len(seen) > 1:  # the ledger row has no cfg to say which one it holds
+        raise SystemExit(f"{variant}/{arm}: {split} scores of {len(seen)} revisions or scoring options; re-run or re-score them under one")
+    return {s: {k: statistics.fmean(v) for k, v in d.items()} for s, d in acc.items()}, next(iter(seen), None)
 
 
 def report_holdout(a) -> None:
     arms = sorted({r["arm"] for r, _ in scored("holdout")})
-    rng, lines = random.Random(0), []
+    rng, lines, rows = random.Random(0), [], []
     for arm in arms:
-        base, cand = per_session("holdout", a.baseline, arm), per_session("holdout", a.candidate, arm)
+        cats = {f"misses.{miss_cat(m)}" for r, sc in scored("holdout") if r["arm"] == arm and r["variant"] in (a.baseline, a.candidate) for m in misses(sc)}
+        (base, bcfg), (cand, ccfg) = per_session("holdout", a.baseline, arm, cats), per_session("holdout", a.candidate, arm, cats)
+        if bcfg and ccfg and bcfg[-4:] != ccfg[-4:]:  # model and revisions may differ (that is the comparison); scoring options may not
+            raise SystemExit(f"{arm}: {a.baseline} and {a.candidate} were scored with different options; re-score both the same way")
         common = sorted(set(base) & set(cand))
         if not common:
             continue
         lines.append(f"{arm}: {len(common)} paired holdout sessions")
         for k in sorted({k for s in common for k in base[s] if k in cand[s]}):
-            d = [cand[s][k] - base[s][k] for s in common if k in base[s] and k in cand[s]]
+            ss = [s for s in common if k in base[s] and k in cand[s]]  # the one session set of the means and the deltas
+            d = [cand[s][k] - base[s][k] for s in ss]
             boot = sorted(statistics.fmean(rng.choices(d, k=len(d))) for _ in range(2000))
             ci = f"95% CI [{boot[50]:+.3f}, {boot[1949]:+.3f}]" if len(d) >= 3 else "n<3 sessions: no CI"
-            lines.append(f"  {k:36s} base {statistics.fmean([base[s][k] for s in common if k in base[s]]):9.3f}  cand {statistics.fmean([cand[s][k] for s in common if k in cand[s]]):9.3f}  delta {statistics.fmean(d):+8.3f}  {ci}")
+            mb, mc = statistics.fmean([base[s][k] for s in ss]), statistics.fmean([cand[s][k] for s in ss])
+            lines.append(f"  {k:36s} base {mb:9.3f}  cand {mc:9.3f}  delta {statistics.fmean(d):+8.3f}  {ci}")
+            rows.append({"baseline": a.baseline, "candidate": a.candidate, "arm": arm, "metric": k, "n_sessions": len(d), "base": mb, "cand": mc,
+                         "delta": statistics.fmean(d), "ci_lo": boot[50] if len(d) >= 3 else None, "ci_hi": boot[1949] if len(d) >= 3 else None})
     if not lines:
         raise SystemExit(f"no paired scored holdout runs for {a.baseline} vs {a.candidate}")
     led = B / ".sealed" / "holdout-ledger.jsonl"
     led.parent.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
     with led.open("a") as f:
-        f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "baseline": a.baseline, "candidate": a.candidate, "arms": arms}) + "\n")
+        f.write(json.dumps({"ts": ts, "baseline": a.baseline, "candidate": a.candidate, "arms": arms}) + "\n")
+    if DB:  # aggregates only: no sid, no run id
+        f = B / ".sealed" / f"ledger-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        write_json(f, [{"query": f"{ts}-{len(led.read_text().splitlines())}", **r} for r in rows])  # the query id: a repeat of the same comparison appends
+        dev("ledger", "--json", f)
     print("\n".join(lines))
     print(f"holdout queries so far: {len(led.read_text().splitlines())}")
 
@@ -482,9 +565,10 @@ def cmd_adjudicate(a) -> None:
 
 
 def main(argv=None) -> None:
-    global B
+    global B, DB
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--bench", type=Path, required=True)
+    p.add_argument("--db", type=Path, help="results DB (default $SORREL_DEV_DB): record dev results with `sorrel dev`")
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("add")
     s.add_argument("session", nargs="+")
@@ -514,6 +598,8 @@ def main(argv=None) -> None:
     s.add_argument("--force", action="store_true")
     a = p.parse_args(argv)
     B = a.bench.resolve()
+    db = a.db or os.environ.get("SORREL_DEV_DB")
+    DB = Path(db).resolve() if db else None
     (B / ".sealed").mkdir(parents=True, exist_ok=True)
     {"add": cmd_add, "run": cmd_run, "score": cmd_score, "report": cmd_report, "adjudicate": cmd_adjudicate}[a.cmd](a)
 

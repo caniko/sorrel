@@ -71,6 +71,8 @@ egui-wgpu = "0.34.2"
 egui_tiles = "0.15"
 egui_kittest = { version = "0.34.2", features = ["eframe", "wgpu", "snapshot"] }
 tempfile = "3"
+# Dev-mode results DB (`--features dev` only); bundled so no system libsqlite is needed.
+rusqlite = { version = "0.41", features = ["bundled"] }
 rayon = "1"
 pollster = "0.3"
 # Native folder picker for the launcher (xdg-portal on Linux, no GTK).

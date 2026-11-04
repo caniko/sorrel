@@ -1,0 +1,14 @@
+# v1-cores: look for isolated cores in big contaminated units
+
+- Change: review.md only (rubric.md keeps the built-in). Adds step 3b (core search) and a step 4 note (rules_eval/rules_apply after splits; split and relabel in separate decide calls). Rest of the protocol is verbatim.
+- Targets: missed_split (roots 0, 7, 8, 15, no SPLIT? flag) and, through the remainder rule, part of the exclusion misses (remainder with +RPV/+ISI -> noise, not mua).
+- Cost bound: top 4 units by ledger n with +ISI or +RPV, at most 4 probe queries each, one probe call per unit (<=16 probes, <=4 split decides).
+- Accept rule from the split line: part n >= 300, part rpc below the RPV threshold (.1) while the unit's is above, dip_z not <= about -2 (refractory dip across parts = one neuron).
+- Probes used: `split C by=pc at=2`, `split C by=pc at=-2`, then `split C by=amp at=X`; apply with `decide [["s7.2","split",0.7,["ISI"]]]`, then `brief {clusters:[old,new]}` and the rubric decides good.
+- Expected effect: recall of good units rises only if a core is a PC1 or amplitude tail. A modest gain (1 of 17 -> a few) at best; kmeans is excluded on purpose.
+- Caveat on the brief: `-CUT` is a mode delta, not a contamination sign. CUT fires on most units, so -CUT means THIS unit is not cut off (healthy amplitude). The prompt uses it only as a credibility boost; triggers are +ISI/+RPV and n.
+- Gap 1 (cannot be fixed by prompt): kmeans takes no k and no threshold. proposers.rs `kmeans_split_proposal` tries k in {2,3}, requires every part >= max(30, 5% n), silhouette >= .25, pairwise d' >= 2 and the largest part's contamination <= the whole's (consts at lines 24-28, 149, 169-196). It is the same proposer as SPLIT?, so it cannot find a 2-5% core. probe.rs `split_minor` (By::Kmeans, ~line 601) just calls it.
+- Gap 2: `by=pc` uses only PC1 of 3 channels x 3 PCs whitened (probe.rs `pc1`, `split_minor` By::Pc, ~lines 506 and 605-616). One axis, one threshold, sign arbitrary when at= is given (the flip is only for at=none), and the scale of at is not shown anywhere, so the prompt guesses +/-2.
+- Gap 3: one split per probe query is a two-way cut (minor = spikes above `at`). A 3+-way split or a density-based core (isolating the tight cluster in PC space) is not expressible. Cheapest fix: `by=pc at=` auto-pick from a GMM on PC1, or a `by=gmm k=N` returning the tightest component.
+- Gap 4: the split line gives per-part rpc, amp and n, but not isi_violation_ratio or amplitude_cutoff for the parts. The card of the part only exists after the split is applied (undoable), so the prompt applies accepted cores first, then reads cards.
+- Not verified: Bash was unavailable (disk full) so the `agent-guide` load check and any live probe run were not done. The text was written from reading serve.rs, probe.rs, evaluate.rs and proposers.rs.

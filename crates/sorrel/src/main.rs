@@ -27,6 +27,8 @@ use sorrel_io::{
 use sorrel_ui::{OpenRequest, Opened, Opener, Shell, SorrelApp, Tab};
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "dev")]
+mod dev;
 mod rescue;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -257,9 +259,24 @@ enum Cmd {
         /// kept (non-noise) spikes
         #[arg(long, value_name = "F", default_value_t = 0.1)]
         split_share: f64,
+        /// Directory mode: score good against not-good (mua and unsorted count as
+        /// noise); the default is on when the truth never uses mua
+        #[arg(long, conflicts_with = "no_binary")]
+        binary: bool,
+        /// Directory mode: keep mua and unsorted distinct even if the truth never uses mua
+        #[arg(long)]
+        no_binary: bool,
         /// Directory mode: root cluster ids (one per line) to leave out of scoring
         #[arg(long, value_name = "FILE")]
         disputed: Option<PathBuf>,
+        /// Dev builds: write the score and misses of the recorded run RID into the results DB
+        #[cfg(feature = "dev")]
+        #[arg(long, value_name = "RID")]
+        record: Option<String>,
+        /// Dev builds: the results DB for --record (default as for `sorrel dev`)
+        #[cfg(feature = "dev")]
+        #[arg(long, value_name = "FILE", requires = "record")]
+        db: Option<PathBuf>,
     },
     /// Write a double-blind bench pair from a curated session: --input is the
     /// sorter's output with no curation, --truth the curated head plus
@@ -357,6 +374,10 @@ enum Cmd {
         #[command(flatten)]
         args: rescue::RescueArgs,
     },
+    /// The bench results DB (record sessions, runs and scores; distill what
+    /// they teach). Built with `--features dev` only
+    #[cfg(feature = "dev")]
+    Dev(dev::DevArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -1551,7 +1572,7 @@ fn diff_dirs(
     root: &Path,
     opts: &sorrel_data::diff::SpikeDiffOpts,
     json: bool,
-) -> Result<()> {
+) -> Result<sorrel_data::diff::SpikeDiff> {
     let d = sorrel_data::diff::diff_dirs(truth, test, root, opts)?;
     if json {
         serde_json::to_writer_pretty(std::io::stdout().lock(), &d)?;
@@ -1559,7 +1580,7 @@ fn diff_dirs(
     } else {
         print!("{}", d.render());
     }
-    Ok(())
+    Ok(d)
 }
 
 fn journal_dump(path: &Path, json: bool) -> Result<()> {
@@ -2348,19 +2369,39 @@ fn main() -> Result<()> {
             match_jaccard,
             min_spikes,
             split_share,
+            binary,
+            no_binary,
             disputed,
+            #[cfg(feature = "dev")]
+            record,
+            #[cfg(feature = "dev")]
+            db,
         }) => match (root, a.is_dir() && b.is_dir()) {
             (Some(root), true) => {
                 let opts = sorrel_data::diff::SpikeDiffOpts {
                     match_jaccard,
                     min_spikes,
                     split_share,
+                    binary: match (binary, no_binary) {
+                        (true, _) => Some(true),
+                        (_, true) => Some(false),
+                        _ => None,
+                    },
                     disputed: disputed
                         .map(|p| sorrel_data::diff::read_disputed(&p))
                         .transpose()?
                         .unwrap_or_default(),
                 };
-                diff_dirs(&a, &b, &root, &opts, json)
+                let _score = diff_dirs(&a, &b, &root, &opts, json)?;
+                #[cfg(feature = "dev")]
+                if let Some(rid) = record {
+                    dev::record_diff(db.as_deref(), &rid, &_score, (&b, &a, &root), &opts.disputed)?;
+                }
+                Ok(())
+            }
+            #[cfg(feature = "dev")]
+            (None, false) if record.is_some() => {
+                bail!("sorrel diff: --record scores a curation; it needs two directories and --root DIR")
             }
             (None, false) if disputed.is_none() => diff_tsvs(&a, &b, json),
             _ => bail!("sorrel diff: two directories need --root DIR; two files take no --root or --disputed"),
@@ -2441,6 +2482,8 @@ fn main() -> Result<()> {
         Some(Cmd::ClearCache { root }) => clear_cache(&root),
         Some(Cmd::GpuCheck) => gpu_check(),
         Some(Cmd::Rescue { open, args }) => with_session(&open, rescue::Rescue(args)),
+        #[cfg(feature = "dev")]
+        Some(Cmd::Dev(args)) => dev::run(args),
     }
 }
 #[cfg(test)]

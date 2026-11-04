@@ -324,3 +324,227 @@ fn mcp_attention_queue_includes_pc_outliers() {
         "{row}"
     );
 }
+
+/// Provider of `clusters` of `(time, flagged)` spikes. PC dims 0..3 of a
+/// flagged spike are `N(mu, sd)`, everything else `N(0, 1)`.
+fn flagged_prov(clusters: Vec<Vec<(u64, bool)>>, mu: f32, sd: f32) -> (Prov, Vec<bool>) {
+    let mut s = 0xC0DE_u32;
+    let mut p = Prov {
+        times: vec![],
+        amps: vec![],
+        templates: vec![],
+        pc_rows: vec![],
+        pc: vec![],
+        waves: vec![1.0; N_TEMPLATES * 4 * 3],
+        sim: vec![0.1; N_TEMPLATES * N_TEMPLATES],
+        tags: vec![],
+    };
+    let mut truth = Vec::new();
+    for (c, spikes) in clusters.into_iter().enumerate() {
+        let first_row = (p.pc.len() / 9) as u32;
+        p.pc_rows
+            .push((first_row..first_row + spikes.len() as u32).collect());
+        for &(_, flagged) in &spikes {
+            for k in 0..9 {
+                let (mu, sd) = if flagged { (mu, sd) } else { (0.0, 1.0) };
+                p.pc.push(mu * (k < 3) as u8 as f32 + sd * gaussian(&mut s));
+            }
+        }
+        p.amps.push(vec![5.0; spikes.len()]);
+        p.templates.push(vec![c as u32; spikes.len()]);
+        p.times
+            .push(spikes.iter().map(|&(t, _)| SampleIndex(t)).collect());
+        if c == 0 {
+            truth = spikes.iter().map(|&(_, f)| f).collect();
+        }
+    }
+    (p, truth)
+}
+
+/// Cluster 0 = a broad contaminated cloud (triples 8 samples apart, 97%)
+/// around a tight refractory core (3%, offset in PC space); cluster 1 = one
+/// clean unimodal unit. Returns the provider and cluster 0's core truth.
+fn core_prov() -> (Prov, Vec<bool>) {
+    let mut host: Vec<(u64, bool)> = (0..1293_u64)
+        .flat_map(|j| [0, 8, 16].map(|o| (190 * j + 5 + o, false)))
+        .collect();
+    host.extend((0..120_u64).map(|i| (2000 * i + 1000, true)));
+    host.sort_unstable();
+    let clean: Vec<(u64, bool)> = (0..500_u64).map(|i| (i * 400 + 100, false)).collect();
+    flagged_prov(vec![host, clean], 4.0, 0.3)
+}
+
+/// Cluster 0 = 75% a clean refractory unit (spikes 100 samples apart) plus 25%
+/// a broad contaminated cloud (triples 8 samples apart, offset in PC space);
+/// cluster 1 = one clean unit. Truth is true for the cloud.
+fn cleanup_prov() -> (Prov, Vec<bool>) {
+    let mut host: Vec<(u64, bool)> = (0..2400_u64).map(|i| (100 * i + 17, false)).collect();
+    host.extend((0..267_u64).flat_map(|j| [0, 8, 16].map(|o| (900 * j + 50 + o, true))));
+    host.sort_unstable();
+    let clean: Vec<(u64, bool)> = (0..500_u64).map(|i| (i * 400 + 100, false)).collect();
+    flagged_prov(vec![host, clean], 5.0, 1.5)
+}
+
+fn seeded(p: Prov) -> (Session<Prov>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::new(p, Journal::open(&dir.path().join("j.sqlite")).unwrap());
+    s.seed_amplitudes();
+    s.seed_templates();
+    s.seed_pc_features();
+    s.seed_template_waveforms();
+    (s, dir)
+}
+
+fn jaccard(got: &[u32], want: impl Iterator<Item = u32>) -> f64 {
+    let got: std::collections::HashSet<u32> = got.iter().copied().collect();
+    let want: std::collections::HashSet<u32> = want.collect();
+    got.intersection(&want).count() as f64 / got.union(&want).count() as f64
+}
+
+#[test]
+fn core_split_isolates_the_refractory_core_in_a_contaminated_cluster() {
+    let (p, truth) = core_prov();
+    let (s, dir) = seeded(p);
+
+    let splits = rank_split_candidates(&s, &SuggestConfig::default());
+    let c0 = splits
+        .iter()
+        .find(|c| c.cluster == ClusterId(0))
+        .expect("host flagged");
+    assert_eq!(c0.method, "core", "{c0:?}");
+    let want = (0..truth.len() as u32).filter(|&i| truth[i as usize]);
+    let j = jaccard(&c0.bipartition_minor_idx, want);
+    assert!(
+        j >= 0.9,
+        "Jaccard {j}, {} spikes",
+        c0.bipartition_minor_idx.len()
+    );
+    assert!(
+        splits.iter().all(|c| c.cluster != ClusterId(1)),
+        "a clean unimodal unit gets no proposal"
+    );
+
+    let line = probe_line(dir.path(), "split 0 by=core", s);
+    assert!(
+        line.contains("s0.1 core") && line.contains("parts 3879/120"),
+        "{line}"
+    );
+}
+
+fn probe_line(dir: &std::path::Path, q: &str, s: Session<Prov>) -> String {
+    let req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{"name":"probe","arguments":{"q":q}}});
+    let mut out = Vec::new();
+    sorrel_data::serve(
+        &sorrel_data::SessionHost::new(s),
+        dir,
+        false,
+        |_: &u8| "unsorted",
+        std::io::Cursor::new(format!("{req}\n")),
+        &mut out,
+    )
+    .unwrap();
+    let reply: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn cleanup_split_drops_the_contaminated_minority_and_keeps_the_clean_majority() {
+    let (p, truth) = cleanup_prov();
+    let (s, dir) = seeded(p);
+
+    // k-means outranks the core proposer in the queue and also finds this
+    // well-separated cloud, so call the core/cleanup proposer directly.
+    let globals = sorrel_data::proposers::cluster_globals(&s, ClusterId(0));
+    let c0 = sorrel_data::proposers::core_split(&s, ClusterId(0), &globals).expect("cleanup");
+    assert_eq!(c0.method, "cleanup", "{c0:?}");
+    let n = truth.len() as u32;
+    // The kept part is the clean unit; the minor part is the dropped cloud.
+    let minor: std::collections::HashSet<u32> = c0.minor_idx.iter().copied().collect();
+    let kept: Vec<u32> = (0..n).filter(|i| !minor.contains(i)).collect();
+    let j = jaccard(&kept, (0..n).filter(|&i| !truth[i as usize]));
+    assert!(j >= 0.9, "kept Jaccard {j}, {} dropped", minor.len());
+    assert!(
+        minor.len() * 2 < n as usize,
+        "the dropped part is the minority"
+    );
+    assert!(
+        sorrel_data::proposers::core_split(
+            &s,
+            ClusterId(1),
+            &sorrel_data::proposers::cluster_globals(&s, ClusterId(1))
+        )
+        .is_none(),
+        "a clean unimodal unit gets no proposal"
+    );
+
+    let line = probe_line(dir.path(), "split 0 by=core", s);
+    assert!(line.contains("s0.1 cleanup"), "{line}");
+}
+
+#[test]
+fn core_split_declines_a_clean_or_unstructured_cluster() {
+    use sorrel_data::proposers::{core_split_proposal, whiten};
+    let mut s = 7_u32;
+    let raw: Vec<f32> = (0..4000 * 9).map(|_| gaussian(&mut s)).collect();
+    let (feats, d) = whiten(&raw, 9).unwrap();
+    // Contaminated but featureless: BIC keeps one component.
+    assert!(core_split_proposal(&feats, d, |_| 0.5, |_| 100).is_none());
+    // Clean whole: never tried.
+    assert!(core_split_proposal(&feats, d, |_| 0.0, |_| 0).is_none());
+}
+
+#[test]
+fn core_split_extracts_no_features_for_a_small_or_clean_cluster() {
+    use sorrel_data::proposers::core_split_lazy;
+    let boom = || -> Option<(Vec<f32>, usize)> { panic!("features extracted") };
+    // Too few spikes: not even the contamination is evaluated.
+    assert!(core_split_lazy(199, boom, |_| panic!("contamination"), |_| 0).is_none());
+    // Clean whole, or no sliding-refractory estimate (NaN): features stay untouched.
+    for whole in [0.0, f32::NAN] {
+        assert!(core_split_lazy(4000, boom, |_| whole, |_| 0).is_none());
+    }
+    // Contaminated enough: the features are asked for.
+    let asked = std::cell::Cell::new(false);
+    let ask = || {
+        asked.set(true);
+        None
+    };
+    assert!(core_split_lazy(4000, ask, |_| 0.5, |_| 0).is_none());
+    assert!(asked.get());
+}
+
+#[test]
+fn core_split_sweeps_the_whole_cluster_once() {
+    use sorrel_data::proposers::core_split_lazy;
+    // A contaminated host with structure: the whole-cluster contamination (a
+    // full refractory sweep) is evaluated by the gate and reused, not redone.
+    let mut rng = 7u64;
+    let mut next = || {
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (rng >> 33) as f32 / (1u64 << 31) as f32 - 0.5
+    };
+    let n = 2000;
+    let feats: Vec<f32> = (0..n)
+        .flat_map(|i| {
+            let c = if i < 100 { 6.0 } else { 0.0 };
+            [c + next(), c + next(), next()]
+        })
+        .collect();
+    let whole_sweeps = std::cell::Cell::new(0);
+    let contamination = |idx: &[u32]| {
+        if idx.len() == n {
+            whole_sweeps.set(whole_sweeps.get() + 1);
+            0.5
+        } else {
+            0.0
+        }
+    };
+    core_split_lazy(n, || Some((feats.clone(), 3)), contamination, |_| 0);
+    assert_eq!(whole_sweeps.get(), 1);
+}

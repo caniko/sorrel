@@ -11,7 +11,8 @@ use crate::session::Session;
 use crate::suggest::{MergeCandidate, SplitCandidate, SuggestConfig};
 use sorrel_compute::linalg::{chi2_sf, covariance, invert, mahalanobis_sq, row_mean};
 use sorrel_compute::{
-    kmeans, kmeans_assign, lda_d_prime, quality_breakdown, refractory_contamination,
+    fit_diag_gmm, isi_violations, kmeans, kmeans_assign, lda_d_prime, quality_breakdown,
+    refractory_contamination, sliding_refractory_argmin,
 };
 use sorrel_io::{ClusterId, DataProvider};
 
@@ -31,6 +32,17 @@ const MIN_D_PRIME: f32 = 2.0;
 const OUTLIER_P: f64 = 1e-3;
 const OUTLIER_MIN_FRAC: f32 = 0.001;
 const OUTLIER_MAX_FRAC: f32 = 0.10;
+/// Core proposer: BIC picks among k = 1..=CORE_MAX_K diagonal GMM components
+/// fitted on at most CORE_MAX_FIT rows; a core holds at least
+/// max(CORE_MIN_SPIKES, CORE_MIN_FRAC) of the spikes. CORE_RPV is the brief's
+/// RPV flag threshold: the whole must exceed it, the core must not.
+const CORE_MAX_K: usize = 8;
+const CORE_MAX_FIT: usize = 20_000;
+const CORE_MIN_SPIKES: usize = 100;
+const CORE_MIN_FRAC: f32 = 0.01;
+const CORE_RPV: f32 = 0.1;
+/// The core's feature space spans this many best channels (a tetrode fully).
+const CORE_CHANNELS: usize = 4;
 
 /// Whiten a raw `(n, d0)` matrix where `NaN` marks a missing value (the
 /// spike's template has no feature on that channel). Dimensions present for
@@ -90,11 +102,20 @@ pub fn cluster_feature_space<P: DataProvider>(
     cluster: ClusterId,
     globals: &[u32],
 ) -> Option<(Vec<f32>, usize)> {
+    feature_space(session, cluster, globals, FEATURE_CHANNELS)
+}
+
+fn feature_space<P: DataProvider>(
+    session: &Session<P>,
+    cluster: ClusterId,
+    globals: &[u32],
+    n_chans: usize,
+) -> Option<(Vec<f32>, usize)> {
     let n_pcs = session.pc_shape().0.min(FEATURE_PCS);
     let chans: Vec<u32> = session
         .best_channels(&[cluster])
         .into_iter()
-        .take(FEATURE_CHANNELS)
+        .take(n_chans)
         .collect();
     if n_pcs == 0 || chans.is_empty() {
         return None;
@@ -209,6 +230,196 @@ pub fn kmeans_split_proposal(
     })
 }
 
+/// A clean part of a contaminated cluster: a small `core` carved out of it, or
+/// the majority left once a `cleanup` of contaminated components is dropped.
+#[derive(Clone, Debug)]
+pub struct CoreSplit {
+    /// `"core"` (minor part = the clean core) or `"cleanup"` (minor part = the
+    /// dropped contaminated/odd components; the kept majority is the clean one).
+    pub method: &'static str,
+    /// Components of the BIC-chosen mixture.
+    pub k: usize,
+    /// LDA d′ of the minor part against the rest.
+    pub d_prime: f32,
+    /// Sliding-refractory contamination of the clean (kept) part and of the
+    /// whole cluster.
+    pub core_contamination: f32,
+    pub whole_contamination: f32,
+    /// Suggestion score in [0.5, 1]: separation `min(d′/4, 1)` and cleanliness gain, a quarter each.
+    pub score: f32,
+    /// Local spike indices (ascending) of the minor part.
+    pub minor_idx: Vec<u32>,
+}
+
+/// The cheap gates of [`core_split_proposal`]: at least `2 * CORE_MIN_SPIKES`
+/// spikes and a whole-cluster contamination (`whole`, evaluated only after the
+/// size gate) above `CORE_RPV`. Returns that contamination.
+fn core_gate(n: usize, whole: impl FnOnce() -> f32) -> Option<f32> {
+    if n < 2 * CORE_MIN_SPIKES {
+        return None;
+    }
+    let whole = whole();
+    (!whole.is_nan() && whole > CORE_RPV).then_some(whole)
+}
+
+/// Propose a clean part of a contaminated cluster, as a core or a cleanup.
+///
+/// Only runs when the whole cluster fails the RPV flag (`contamination(all) >
+/// 0.1`). Fits diagonal GMMs with k = 1..=8 on (a ≤ 20k-row subsample of)
+/// `feats` and keeps the BIC winner (k = 1 means no structure). Two readings
+/// of that mixture are tried; both need the minor part to hold at least
+/// max(100, 1%) of the spikes and, for a core, an LDA d′ against the rest of at least 2.
+/// - `core`: one component of at most half the spikes with contamination at
+///   most 0.1 and significantly fewer ISI violations than a random subset of
+///   that size would have (`violations(local indices)` below the chance count
+///   minus 2.33 Poisson sd, none at all when that is below zero). The kept
+///   part is the core, the minor part too.
+/// - `cleanup`: the human kept the majority and dropped a contaminated or odd
+///   minority (10-30% in practice). Components holding ISI violations are
+///   dropped, most violations per spike first, until the remainder (at least
+///   two thirds of the spikes) has
+///   contamination at most 0.1 and, as for a core, significantly fewer ISI
+///   violations than chance. The minor part is the dropped components, at
+///   least max(100, 1%) of the spikes. It has no d′ floor: its dropped tail
+///   overlaps the kept unit (that is why it contaminates it), so the ISI gain
+///   is the evidence and d′ only weighs the rank and score.
+///
+/// Ranking: the reading that keeps more clean spikes wins, weighted by
+/// separation and cleanliness gain: `kept/n × min(d′/4, 1) × gain`, with
+/// `gain = (whole − kept contamination) / whole`. A cleanup keeps far more
+/// spikes than a core, so it wins whenever both exist unless its cut is very
+/// leaky (d′ near 0). Ties go to the core. A second core comes from
+/// re-running on the remainder after the first split.
+pub fn core_split_proposal(
+    feats: &[f32],
+    d: usize,
+    contamination: impl Fn(&[u32]) -> f32,
+    violations: impl Fn(&[u32]) -> usize,
+) -> Option<CoreSplit> {
+    if d == 0 {
+        return None;
+    }
+    let n = feats.len() / d;
+    let whole = core_gate(n, || contamination(&(0..n as u32).collect::<Vec<_>>()))?;
+    core_from_mixture(feats, d, whole, contamination, violations)
+}
+
+/// [`core_split_proposal`] past its gates, with the whole-cluster
+/// contamination `whole` already computed (it is a full refractory sweep).
+fn core_from_mixture(
+    feats: &[f32],
+    d: usize,
+    whole: f32,
+    contamination: impl Fn(&[u32]) -> f32,
+    violations: impl Fn(&[u32]) -> usize,
+) -> Option<CoreSplit> {
+    let n = feats.len() / d;
+    let all: Vec<u32> = (0..n as u32).collect();
+    let stride = n.div_ceil(CORE_MAX_FIT);
+    let sub: Vec<f32> = (0..n)
+        .step_by(stride)
+        .flat_map(|i| feats[i * d..(i + 1) * d].iter().copied())
+        .collect();
+    let gmm = (1..=CORE_MAX_K)
+        .filter_map(|k| fit_diag_gmm(&sub, d, k, 60))
+        .min_by(|a, b| a.bic().total_cmp(&b.bic()))?;
+    if gmm.k < 2 {
+        return None;
+    }
+    let labels = gmm.assign(feats);
+    let mut parts: Vec<Vec<u32>> = vec![Vec::new(); gmm.k];
+    for (i, &l) in labels.iter().enumerate() {
+        parts[l as usize].push(i as u32);
+    }
+    let min_size = CORE_MIN_SPIKES.max((CORE_MIN_FRAC * n as f32).ceil() as usize);
+    let viol_all = violations(&all) as f64;
+    // LDA d′ of the rows labelled by `minor` (component set) against the rest.
+    let d_prime = |minor: &[usize]| {
+        let (mut rows, mut mask) = (Vec::new(), Vec::new());
+        for (row, &l) in sub.chunks_exact(d).zip(labels.iter().step_by(stride)) {
+            rows.extend_from_slice(row);
+            mask.push(minor.contains(&(l as usize)));
+        }
+        lda_d_prime(&rows, &mask, d)
+    };
+    // (rank, candidate)
+    let mut best: Option<(f32, CoreSplit)> = None;
+    let mut offer = |method: &'static str, minor: Vec<u32>, kept_n: usize, c: f32, dp: f32| {
+        let gain = ((whole - c) / whole).clamp(0.0, 1.0);
+        let sep = (dp / 4.0).clamp(0.0, 1.0);
+        let rank = kept_n as f32 / n as f32 * (dp / 4.0).clamp(0.0, 1.0) * gain;
+        if best.as_ref().is_none_or(|(r, _)| rank > *r) {
+            best = Some((
+                rank,
+                CoreSplit {
+                    method,
+                    k: gmm.k,
+                    d_prime: dp,
+                    core_contamination: c,
+                    whole_contamination: whole,
+                    score: 0.5 + 0.25 * sep + 0.25 * gain,
+                    minor_idx: minor,
+                },
+            ));
+        }
+    };
+    // Significantly fewer violations than a random subset would hold: below
+    // the chance count minus 2.33 Poisson sd (none at all when that is < 0).
+    let fewer_than_chance =
+        |v: usize, expected: f64| v as f64 <= (expected - 2.33 * expected.sqrt()).max(0.0);
+    let chance = |len: usize| viol_all * (len as f64 / n as f64).powi(2);
+    for (j, p) in parts.iter().enumerate() {
+        if p.len() < min_size || p.len() * 2 > n {
+            continue;
+        }
+        let c = contamination(p);
+        let expected = chance(p.len());
+        if c.is_nan() || c > CORE_RPV || !fewer_than_chance(violations(p), expected) {
+            continue;
+        }
+        let dp = d_prime(&[j]);
+        if !dp.is_nan() && dp >= MIN_D_PRIME {
+            offer("core", p.clone(), p.len(), c, dp);
+        }
+    }
+    // Cleanup: drop components with ISI violations, most violations per spike
+    // first, until the remainder passes. The BIC mixture often fragments a
+    // contaminated tail over many components, so this is a prefix, not ≤ 2.
+    let mut order: Vec<(usize, f64)> = (0..gmm.k)
+        .filter(|&j| !parts[j].is_empty())
+        .map(|j| (j, violations(&parts[j]) as f64 / parts[j].len() as f64))
+        .filter(|&(_, v)| v > 0.0)
+        .collect();
+    order.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut set = Vec::new();
+    for (j, _) in order {
+        set.push(j);
+        let dropped: usize = set.iter().map(|&j| parts[j].len()).sum();
+        let kept = n - dropped;
+        if kept * 3 < n * 2 {
+            break;
+        }
+        if dropped < min_size {
+            continue;
+        }
+        let rest: Vec<u32> = (0..n as u32)
+            .filter(|&i| !set.contains(&(labels[i as usize] as usize)))
+            .collect();
+        let c = contamination(&rest);
+        if !c.is_nan() && c <= CORE_RPV && fewer_than_chance(violations(&rest), chance(kept)) {
+            let dp = d_prime(&set);
+            if dp > 0.0 {
+                let minor = (0..n as u32)
+                    .filter(|&i| set.contains(&(labels[i as usize] as usize)))
+                    .collect();
+                offer("cleanup", minor, kept, c, dp);
+            }
+            break;
+        }
+    }
+    best.map(|b| b.1)
+}
+
 /// Local indices of rows whose Mahalanobis² distance from the cluster mean
 /// has `chi2_sf(d², d) < 1e-3`; `None` unless they are 0.1%–10% of the rows.
 ///
@@ -271,6 +482,55 @@ pub fn kmeans_split<P: DataProvider>(
         let t: Vec<_> = idx.iter().map(|&i| times[i as usize]).collect();
         refractory_contamination(&t, refractory, duration, sr)
     })
+}
+
+/// Session wiring: [`core_split_proposal`] on `cluster`'s PC feature space
+/// (best 4 channels × 3 PCs). Contamination is the sliding-refractory value
+/// the probe's `rpc` shows. `None` without PC features.
+pub fn core_split<P: DataProvider>(
+    session: &Session<P>,
+    cluster: ClusterId,
+    globals: &[u32],
+) -> Option<CoreSplit> {
+    let times = session.spike_times(cluster);
+    let sr = session.provider.sample_rate().max(1.0);
+    let duration = session.provider.n_samples().0;
+    let pick = |idx: &[u32]| -> Vec<_> { idx.iter().map(|&i| times[i as usize]).collect() };
+    core_split_lazy(
+        globals.len(),
+        || feature_space(session, cluster, globals, CORE_CHANNELS),
+        |idx| {
+            let (c, rp) = sliding_refractory_argmin(
+                &pick(idx),
+                (sr * 0.0005) as u64,
+                (sr * 0.010) as u64,
+                20,
+                duration,
+                sr,
+            );
+            if rp > 0 {
+                c
+            } else {
+                f32::NAN
+            }
+        },
+        |idx| isi_violations(&pick(idx), (sr * 0.0015).round() as u64),
+    )
+}
+
+/// [`core_split_proposal`] on the `n` spikes of a cluster, with the PC
+/// features (`features`, the costly part) extracted only once the cheap gates
+/// (size, whole-cluster contamination) pass.
+pub fn core_split_lazy(
+    n: usize,
+    features: impl FnOnce() -> Option<(Vec<f32>, usize)>,
+    contamination: impl Fn(&[u32]) -> f32,
+    violations: impl Fn(&[u32]) -> usize,
+) -> Option<CoreSplit> {
+    let whole = core_gate(n, || contamination(&(0..n as u32).collect::<Vec<_>>()))?;
+    let (feats, d) = features()?;
+    (d > 0 && feats.len() / d == n).then_some(())?;
+    core_from_mixture(&feats, d, whole, contamination, violations)
 }
 
 /// Session wiring: [`outlier_proposal`] on `cluster`'s PC feature space.

@@ -80,8 +80,9 @@ pub struct SplitCandidate {
     pub drift_corr: f32,
     pub n_spikes: usize,
     /// Which proposer produced `bipartition_minor_idx`: `"kmeans"` (PC-feature
-    /// k-means) or `"gmm"` (amplitude GMM; also the label when there is no
-    /// proposal). k-means is preferred when both pass.
+    /// k-means), `"core"` (clean core of a contaminated cluster), `"cleanup"` (its dropped contaminated minority) or `"gmm"`
+    /// (amplitude GMM; also the label when there is no proposal). k-means is
+    /// preferred, then the core.
     pub method: &'static str,
     /// `BIC(k=1) - BIC(k=2)` for the GMM fit on this cluster's
     /// amplitudes. Positive = mixture model wins. NaN if the GMM was
@@ -654,6 +655,15 @@ fn score_split<P: DataProvider>(
         raw = raw.max(0.5 + (km.silhouette - 0.25).clamp(0.0, 0.5));
         bipartition = km.minor_idx;
         method = "kmeans";
+    } else if let Some(core) =
+        globals.and_then(|g| crate::proposers::core_split(session, c, &g[c.idx()]))
+    {
+        // A clean core, or a majority left after a cleanup, inside a
+        // contaminated cluster (only tried when the cluster fails RPV, so this
+        // stays off the hot path).
+        raw = raw.max(core.score);
+        bipartition = core.minor_idx;
+        method = core.method;
     }
     SplitCandidate {
         cluster: c,

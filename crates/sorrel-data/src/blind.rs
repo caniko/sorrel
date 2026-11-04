@@ -272,7 +272,7 @@ fn create_empty(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))
 }
 
-fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
+pub fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
     // A link to a symlink would be one (and leads back into the source): link
     // what it names.
     let src = src.canonicalize()?;

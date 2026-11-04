@@ -10,10 +10,12 @@ is ledgered, and A/B adjudication that disputes only arm-picked units.
     uv run --script scripts/test_bench_curation.py
 """
 
+import argparse
 import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -25,7 +27,9 @@ import json, os, sys
 from pathlib import Path
 a = sys.argv[1:]
 with open(os.environ["STUB_LOG"], "a") as f:
-    f.write(json.dumps({{"tool": "sorrel", "argv": a, "env": {{k: os.environ.get(k) for k in ("SORREL_RUBRIC", "SORREL_REVIEW")}}}}) + "\n")
+    deny = os.environ.get("SORREL_DEV_DENY")
+    f.write(json.dumps({{"tool": "sorrel", "argv": a, "env": {{k: os.environ.get(k) for k in ("SORREL_RUBRIC", "SORREL_REVIEW", "SORREL_DEV_DB", "SORREL_DEV_DENY")}},
+                         "deny": Path(deny).read_text() if deny else None, "ledger": Path(a[a.index("--json") + 1]).read_text() if a[:2] == ["dev", "ledger"] else None}}) + "\n")
 if a[0] == "blind":
     s, i, t = Path(a[1]), Path(a[a.index("--input") + 1]), Path(a[a.index("--truth") + 1])
     i.mkdir(parents=True); t.mkdir(parents=True)
@@ -78,8 +82,11 @@ def main() -> None:
             (stubs / name).chmod(0o755)
         log = t / "log.jsonl"
         os.environ |= {"PATH": f"{stubs}:{os.environ['PATH']}", "SORREL_BIN": "sorrel", "STUB_LOG": str(log), "BENCH_SALT": "salt"}
+        os.environ.pop("SORREL_DEV_DB", None)
         sys.path.insert(0, str(HERE))
         import bench_curation as bc
+
+        real_claude = bc.claude
 
         bench = t / "bench"
         go = lambda *a: bc.main(["--bench", str(bench), *map(str, a)])
@@ -272,7 +279,113 @@ def main() -> None:
             go2("score")
             go2("report", "holdout", "--baseline", "base", "--candidate", "cand")
         assert "n<3 sessions: no CI" in out.getvalue() and "95% CI" not in out.getvalue(), out.getvalue()
-        print("ok: add/splits, mcp-review argv, holdout sealing + ledger, adjudication")
+        bc.claude = real_claude
+        # results DB: the phases above ran without one and made no `dev` call
+        assert not [c for c in calls(log, "sorrel") if c["argv"][0] == "dev" or "--record" in c["argv"]]
+        benchdb, db = t / "benchdb", t / "r.sqlite"
+        godb = lambda *a: bc.main(["--bench", str(benchdb), "--db", str(db), *map(str, a)])
+        log.write_text("")
+        with contextlib.redirect_stdout(io.StringIO()):
+            godb("add", *sessions)
+            for v in ("base", "cand"):
+                for split in ("dev", "holdout"):
+                    godb("run", "--arm", "mcp-review", "--variant", t / v, "--split", split, "--repeats", 1)
+            godb("score")
+            godb("report", "holdout", "--baseline", "base", "--candidate", "cand")
+        m4 = json.loads((benchdb / ".sealed" / "map.json").read_text())["sessions"]
+        hold4 = [sid for sid, v in m4.items() if v["split"] == "holdout"]
+        dev4 = [sid for sid, v in m4.items() if v["split"] == "dev"]
+        assert hold4 and dev4
+        db_calls = [c for c in calls(log, "sorrel") if c["argv"][0] == "dev" or "--record" in c["argv"]]
+        blob = json.dumps([{k: v for k, v in c.items() if k != "deny"} for c in db_calls])  # the deny file lists the sealed ids by design
+        assert not any(sid in blob for sid in hold4) and ".sealed/sessions" not in blob and ".sealed/runs" not in blob, "a holdout id reached a DB call"
+        assert all(c["env"]["SORREL_DEV_DB"] == str(db.resolve()) for c in db_calls)
+        deny = db_calls[-1]["deny"].splitlines()
+        assert set(hold4) <= set(deny) and "real-session-0" in deny and not set(dev4) & set(deny), deny
+        sess_calls = [c["argv"] for c in db_calls if c["argv"][1] == "record-session"]
+        dev_s, hold_s = [a for a in sess_calls if "dev" == a[a.index("--split") + 1]], [a for a in sess_calls if "holdout" == a[a.index("--split") + 1]]
+        assert {a[a.index("--sid") + 1] for a in dev_s} == set(dev4) and all("--truth" in a and "--input" in a for a in dev_s)
+        assert len(hold_s) == len(hold4) and all("--input" not in a and "--truth" not in a and a[a.index("--sid") + 1].startswith("h") for a in hold_s)
+        runs4 = {json.loads(p.read_text())["id"] for p in (benchdb / "runs").glob("*/run.json")}
+        rr = [c["argv"] for c in db_calls if c["argv"][1] == "record-run"]
+        assert len(rr) == len(runs4) == 2 * len(dev4) and {Path(a[a.index("--run-dir") + 1]).name for a in rr} == runs4 and all("--variant-dir" in a for a in rr)
+        rec = [c["argv"] for c in db_calls if "--record" in c["argv"]]
+        assert {a[a.index("--record") + 1] for a in rec} == runs4 and all(a[0] == "diff" for a in rec)
+        ledger = [c for c in db_calls if c["argv"][1] == "ledger"]
+        rows = json.loads(ledger[0]["ledger"])
+        assert len(ledger) == 1 and rows and {"query", "baseline", "candidate", "arm", "metric", "delta"} <= set(rows[0]) and len({r["query"] for r in rows}) == 1 and not any(sid in ledger[0]["ledger"] for sid in hold4)
+        # unsealing a seen holdout session records it in the DB as dev, with its truth
+        seen4 = hold4[0]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            godb("add", "--dev", m4[seen4]["path"])
+        last = [c["argv"] for c in calls(log, "sorrel") if c["argv"][:2] == ["dev", "record-session"]][-1]
+        assert last[last.index("--sid") + 1] == seen4 and last[last.index("--split") + 1] == "dev" and "--truth" in last, last
+        # a run without a miss category counts 0 of it: one session set for the means and the delta
+        fake = [({"arm": "a", "variant": v, "session": sid}, {"unit": {"f1": 0.5}, "split_share": 0.1, "misses": [{"category": "label", "roots": [i]} for i in range(n)]})
+                for v, sid, n in (("b", "s1", 1), ("b", "s1", 0), ("b", "s2", 0), ("b", "s3", 1), ("c", "s1", 0), ("c", "s2", 2), ("c", "s3", 1))]
+        got: list = []
+        bc.scored, bc.DB, bc.B, bc.dev = lambda split: iter(fake), Path("db"), t / "bench4", lambda *x: got.append(json.loads(Path(x[2]).read_text()))
+        with contextlib.redirect_stdout(io.StringIO()):
+            bc.report_holdout(argparse.Namespace(baseline="b", candidate="c"))
+        row = next(r for r in got[0] if r["metric"] == "misses.label")
+        assert not {"split_share", "match_jaccard", "min_spikes", "binary", "n_disputed"} & {r["metric"] for r in got[0]}, "an option became a metric"
+        assert (row["n_sessions"], row["base"], row["cand"], row["delta"]) == (3, 0.5, 1.0, 0.5), row
+        # runs of one variant scored under another revision are not averaged into its holdout row
+        mixed = [({**r, "sorrel_rev": "x" if i == 0 else "y"}, sc) for i, (r, sc) in enumerate(fake)]
+        bc.scored = lambda split: iter(mixed)
+        try:
+            bc.report_holdout(argparse.Namespace(baseline="b", candidate="c"))
+        except SystemExit as e:
+            assert "revisions or scoring options" in str(e), e
+        else:
+            raise AssertionError("mixed revisions were averaged")
+        # baseline and candidate each under one config, but different scoring options: not paired
+        opts = [(r, {**sc, "match_jaccard": 0.8 if r["variant"] == "b" else 0.5}) for r, sc in fake]
+        bc.scored = lambda split: iter(opts)
+        try:
+            bc.report_holdout(argparse.Namespace(baseline="b", candidate="c"))
+        except SystemExit as e:
+            assert "different options" in str(e), e
+        else:
+            raise AssertionError("scores under different options were paired")
+        # runs of one variant under another model or learned bundle are other configurations
+        base_rec, base_sc = {"arm": "a", "variant": "v"}, {"match_jaccard": 0.8}
+        assert bc.cfg({**base_rec, "model": "m1"}, base_sc) != bc.cfg({**base_rec, "model": "m2"}, base_sc)
+        assert bc.cfg({**base_rec, "learned_rev": "l1"}, base_sc) != bc.cfg({**base_rec, "learned_rev": "l2"}, base_sc)
+        # a score the results DB rejected is not cached, so no report can read it
+        rdir = t / "rejected"
+        (rdir / "r1").mkdir(parents=True)
+        (rdir / "r1" / "score.json").write_text("{}")  # a stale cache from an earlier score
+        rej = [({"id": "r1", "status": "ok", "session": "s1"}, rdir / "r1")]
+        bc.runs, bc.sess, bc.home = lambda split: iter(rej), lambda sid: t, lambda split: t
+        bc.run = lambda argv, env=None, **k: subprocess.CompletedProcess(argv, 1, stdout='{"unit": {"f1": 1}}', stderr="TEST is not the run's")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            bc.cmd_score(argparse.Namespace(split="dev", match="0.8"))
+        assert not (rdir / "r1" / "score.json").exists() and "not recorded" in err.getvalue(), err.getvalue()
+        # a rescore that times out leaves no stale cache either: the old one goes before the diff runs
+        (rdir / "r1" / "score.json").write_text("{}")
+        def timeout(argv, env=None, **k):
+            raise subprocess.TimeoutExpired(argv, 1)
+        bc.run = timeout
+        try:
+            bc.cmd_score(argparse.Namespace(split="dev", match="0.8"))
+        except subprocess.TimeoutExpired:
+            pass
+        assert not (rdir / "r1" / "score.json").exists()
+        # report dev: a run without a miss category counts 0 of it, and a failed run's count isn't repeated per config
+        two = [({"arm": "a", "variant": "v", "session": "s1", "sorrel_rev": rv, "status": "ok"}, {"unit": {"f1": 0.5}, "misses": ms})
+               for rv, ms in (("x", [{"category": "label", "roots": [1]}]), ("x", []), ("y", []))]
+        failed_run = {"arm": "a", "variant": "v", "session": "s1", "status": "failed"}
+        bc.scored, bc.runs = lambda split: iter(two), lambda split: iter([(r, None) for r, _ in two] + [(failed_run, None)])
+        bc.brief_rows, bc.B = lambda sid, ids: ("id", {}), t / "bench5"
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            bc.report_dev(argparse.Namespace())
+        rep = Path(out.getvalue().strip()).read_text()
+        label_row = next(l for l in rep.splitlines() if l.startswith("| misses.label |"))
+        assert label_row.split(" | ")[1].startswith("0.500"), label_row  # 1 miss over 2 runs, not 1
+        runs_row = next(l for l in rep.splitlines() if l.startswith("| runs (failed) |"))
+        assert "(1)" not in runs_row and "| failed runs (all configurations) |" in rep, rep
+        print("ok: add/splits, mcp-review argv, holdout sealing + ledger, results-DB calls, adjudication")
 
 
 if __name__ == "__main__":

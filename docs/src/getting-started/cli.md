@@ -130,10 +130,43 @@ the sorter's.
 the copy points at the recording of the same name next to it.
 
 `sorrel diff <TRUTH> <TEST> --root <IN> [--json] [--match 0.8] [--min-spikes 10] [--split-share 0.1]
-[--disputed FILE]` scores a curation of `IN` against the truth spike by spike:
+[--binary | --no-binary] [--disputed FILE]` scores a curation of `IN` against the truth spike by spike:
 unit recovery (Jaccard at least `--match` and the same label), root-cluster label
 agreement, merge pairs, splits, noise exclusion and ARI. Misses are keyed by
-root cluster id; `--disputed` lists root ids (one per line) to leave out.
+root cluster id; `--disputed` lists root ids (one per line) to leave out. When the
+truth only uses good and noise, mua and unsorted count as noise (`--binary`; `--no-binary`
+keeps them apart) so a vocabulary gap is not scored as a miss.
+
+## Dev mode (`--features dev`)
+
+The double-blind bench keeps its results in one SQLite file, `bench/results.sqlite`
+(git-lfs, derived data only: opaque ids and numbers, no paths or dataset names).
+It is a cargo feature that is off by default, so release, nix and CI builds carry
+no SQLite: `cargo build --release -p sorrel --features dev`.
+
+The DB is `--db FILE`, else `$SORREL_DEV_DB`, else `bench/results.sqlite` found by
+walking up from the cwd. Every text value is refused if it holds `/` or `\`, or a
+string of the `--deny FILE` (else `$SORREL_DEV_DENY`) list of sealed ids and source
+basenames. Prompt text in `variants.rubric` / `variants.review` is the one exception
+to the separator rule. `scripts/bench_curation.py --db FILE` calls these for you.
+
+- `sorrel dev db init|status|query SQL`: `query` is read-only and prints TSV.
+- `sorrel dev record-session --sid S --split dev --input DIR --truth DIR`: the
+  input's fingerprint (journal `baseline_hash` of `spike_clusters.npy`), its root
+  cards (level-2 brief) and the human verdict per root (`truth_roots`: `noise`,
+  `kept`, `cores`, `cleanup` or `other`, with the good share). `--split holdout`
+  records an id and nothing else.
+- `sorrel dev record-run --run-dir DIR [--variant-dir DIR]`: run.json, evidence.json,
+  the claude usage and the actions of the run's journal. Dev runs only.
+- `sorrel diff TRUTH TEST --root INPUT --record RID [--db FILE]`: also writes the
+  score's numeric fields (dotted names such as `good_units.recall`) and misses.
+  TEST must be the run's own output (`record-run` hashes it), TRUTH the session's recorded
+  truth and `--root` its recorded input; the scoring options are stored with the score.
+- `sorrel dev ledger --json FILE`: holdout aggregates (no sid, no run id), each row
+  with a `query` id; the same id re-records in place, a new one appends.
+- `sorrel dev distill --out DIR`: `exemplars.tsv`, `priors.toml`, `thresholds.toml`
+  and `lineage.md` (one row per variant, arm, revisions and scoring options) from the dev sessions, each headed with the DB sha, the dev sids
+  and a `learned_rev` hash of the content.
 
 ## Completions
 
