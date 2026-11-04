@@ -291,13 +291,17 @@ def cmd_score(a) -> None:
             record = bool(DB) and split == "dev"
             argv = ["diff", s / "truth", root / "data", "--root", s / "input", "--json", "--match", a.match] + (["--disputed", disp] if disp.exists() else [])
             r = run([SORREL, *argv, *(["--record", rec["id"], "--db", DB] if record else [])], env=dev_env() if record else None)
+            # Only a score the DB accepted (when recording) is cached: a rejected one must not reach a report.
+            (root / "score.json").unlink(missing_ok=True)
             try:
-                write_json(root / "score.json", json.loads(r.stdout))
+                score = json.loads(r.stdout) if r.returncode == 0 else None
             except ValueError:
-                print(f"{rec['id'] if split == 'dev' else 'a holdout run'}: diff failed: {r.stderr.strip()[-200:]}", file=sys.stderr)
+                score = None
+            if score is None:
+                what = "not recorded in the results DB" if record and r.stdout.strip() else "diff failed"
+                print(f"{rec['id'] if split == 'dev' else 'a holdout run'}: {what}: {r.stderr.strip()[-200:]}", file=sys.stderr)
             else:
-                if record and r.returncode:
-                    print(f"{rec['id']}: not recorded in the results DB: {r.stderr.strip()[-200:]}", file=sys.stderr)
+                write_json(root / "score.json", score)
 
 
 def misses(score: dict) -> list:
@@ -430,7 +434,7 @@ def per_session(split: str, variant: str, arm: str, cats=()) -> dict:
                 acc.setdefault(rec["session"], {}).setdefault(k, []).append(v)
     if len(seen) > 1:  # the ledger row has no cfg to say which one it holds
         raise SystemExit(f"{variant}/{arm}: {split} scores of {len(seen)} revisions or scoring options; re-run or re-score them under one")
-    return {s: {k: statistics.fmean(v) for k, v in d.items()} for s, d in acc.items()}
+    return {s: {k: statistics.fmean(v) for k, v in d.items()} for s, d in acc.items()}, next(iter(seen), None)
 
 
 def report_holdout(a) -> None:
@@ -438,7 +442,9 @@ def report_holdout(a) -> None:
     rng, lines, rows = random.Random(0), [], []
     for arm in arms:
         cats = {f"misses.{miss_cat(m)}" for r, sc in scored("holdout") if r["arm"] == arm and r["variant"] in (a.baseline, a.candidate) for m in misses(sc)}
-        base, cand = per_session("holdout", a.baseline, arm, cats), per_session("holdout", a.candidate, arm, cats)
+        (base, bcfg), (cand, ccfg) = per_session("holdout", a.baseline, arm, cats), per_session("holdout", a.candidate, arm, cats)
+        if bcfg and ccfg and bcfg[2:] != ccfg[2:]:  # revisions may differ (that is the comparison); scoring options may not
+            raise SystemExit(f"{arm}: {a.baseline} and {a.candidate} were scored with different options; re-score both the same way")
         common = sorted(set(base) & set(cand))
         if not common:
             continue

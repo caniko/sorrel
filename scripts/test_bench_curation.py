@@ -15,6 +15,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -314,6 +315,25 @@ def main() -> None:
             assert "revisions or scoring options" in str(e), e
         else:
             raise AssertionError("mixed revisions were averaged")
+        # baseline and candidate each under one config, but different scoring options: not paired
+        opts = [(r, {**sc, "match_jaccard": 0.8 if r["variant"] == "b" else 0.5}) for r, sc in fake]
+        bc.scored = lambda split: iter(opts)
+        try:
+            bc.report_holdout(argparse.Namespace(baseline="b", candidate="c"))
+        except SystemExit as e:
+            assert "different options" in str(e), e
+        else:
+            raise AssertionError("scores under different options were paired")
+        # a score the results DB rejected is not cached, so no report can read it
+        rdir = t / "rejected"
+        (rdir / "r1").mkdir(parents=True)
+        (rdir / "r1" / "score.json").write_text("{}")  # a stale cache from an earlier score
+        rej = [({"id": "r1", "status": "ok", "session": "s1"}, rdir / "r1")]
+        bc.runs, bc.sess, bc.home = lambda split: iter(rej), lambda sid: t, lambda split: t
+        bc.run = lambda argv, env=None, **k: subprocess.CompletedProcess(argv, 1, stdout='{"unit": {"f1": 1}}', stderr="TEST is not the run's")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            bc.cmd_score(argparse.Namespace(split="dev", match="0.8"))
+        assert not (rdir / "r1" / "score.json").exists() and "not recorded" in err.getvalue(), err.getvalue()
         print("ok: add/splits, mcp-review argv, holdout sealing + ledger, results-DB calls, adjudication")
 
 
