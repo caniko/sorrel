@@ -324,6 +324,10 @@ def main() -> None:
             assert "different options" in str(e), e
         else:
             raise AssertionError("scores under different options were paired")
+        # runs of one variant under another model or learned bundle are other configurations
+        base_rec, base_sc = {"arm": "a", "variant": "v"}, {"match_jaccard": 0.8}
+        assert bc.cfg({**base_rec, "model": "m1"}, base_sc) != bc.cfg({**base_rec, "model": "m2"}, base_sc)
+        assert bc.cfg({**base_rec, "learned_rev": "l1"}, base_sc) != bc.cfg({**base_rec, "learned_rev": "l2"}, base_sc)
         # a score the results DB rejected is not cached, so no report can read it
         rdir = t / "rejected"
         (rdir / "r1").mkdir(parents=True)

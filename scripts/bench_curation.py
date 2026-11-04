@@ -229,7 +229,8 @@ def one_run(a, sid: str, k: int) -> dict:
         if a.arm == "auto-llm":
             sorrel("auto", data, "--llm", *(["--llm-model", a.model] if a.model else []), "--save", env=env, timeout=a.timeout)
             ev = data / "sorrel_auto" / "evidence.json"
-            rec["prompt_rev"] = json.loads(ev.read_text()).get("prompt_rev") if ev.exists() else None
+            evidence = json.loads(ev.read_text()) if ev.exists() else {}
+            rec["prompt_rev"], rec["learned_rev"] = evidence.get("prompt_rev"), evidence.get("learned_rev")
         else:
             prompt = sorrel("agent-guide", "--prompt", "review", env=env) + "\n\n" + TASK + "\n"
             sv = {"command": shutil.which(SORREL) or SORREL, "args": ["mcp", str(data)], **({"env": {k: v for k, v in env.items() if v}} if any(env.values()) else {})}
@@ -346,8 +347,10 @@ def metrics(score: dict) -> dict:
 
 
 def cfg(rec: dict, sc: dict) -> tuple:
-    """What a score depends on besides its variant: the revisions and the diff's options. Scores of different cfgs are never averaged."""
-    return tuple(str(x) for x in (rec.get("prompt_rev"), rec.get("sorrel_rev"), *(sc.get(k) for k in ("match_jaccard", "min_spikes", "split_share", "binary"))))
+    """What a score depends on besides its variant: model, revisions, then the diff's options. Scores of different cfgs are never averaged.
+    The options are the last four entries (report_holdout compares them alone)."""
+    run_side = (rec.get("model"), rec.get("prompt_rev"), rec.get("sorrel_rev"), rec.get("learned_rev"))
+    return tuple(str(x) for x in (*run_side, *(sc.get(k) for k in ("match_jaccard", "min_spikes", "split_share", "binary"))))
 
 
 def scored(split: str):
@@ -448,7 +451,7 @@ def report_holdout(a) -> None:
     for arm in arms:
         cats = {f"misses.{miss_cat(m)}" for r, sc in scored("holdout") if r["arm"] == arm and r["variant"] in (a.baseline, a.candidate) for m in misses(sc)}
         (base, bcfg), (cand, ccfg) = per_session("holdout", a.baseline, arm, cats), per_session("holdout", a.candidate, arm, cats)
-        if bcfg and ccfg and bcfg[2:] != ccfg[2:]:  # revisions may differ (that is the comparison); scoring options may not
+        if bcfg and ccfg and bcfg[-4:] != ccfg[-4:]:  # model and revisions may differ (that is the comparison); scoring options may not
             raise SystemExit(f"{arm}: {a.baseline} and {a.candidate} were scored with different options; re-score both the same way")
         common = sorted(set(base) & set(cand))
         if not common:
