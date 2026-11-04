@@ -20,6 +20,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **Dev DB scores name their TEST and options (schema v4).** `record-run` hashes the run's curated output (`data/spike_clusters.npy`, `cluster_group.tsv`), and `sorrel diff --record RID` refuses a TEST that is not that output (or a run recorded before v4: re-run `record-run`). The match, `min_spikes`, `split_share`, resolved binary mode and disputed set are stored with the score and part of its basis.
 - **Dev DB scores also name their TRUTH and root.** `sorrel diff --record RID` refuses a TRUTH or `--root` other than the session's recorded truth and input (or a session recorded without a truth), and `lineage.md` keeps runs scored under different options in separate rows.
 - **`sorrel diff --binary`:** when the truth only uses good and noise, the diff scores good against not-good (mua and unsorted count as noise) and reports `binary` in the JSON. `--no-binary` keeps the four labels.
+- **Native Windows on ARM release.** Each release now includes `sorrel-<VERSION>-aarch64-windows.zip` (plus standalone `.exe` and `-gui.exe` assets), built for `aarch64-pc-windows-gnullvm`, and winget serves it to ARM64 machines. Smoke-tested on a `windows-11-arm` runner without the Vulkan and wheel steps; Chocolatey and the Python wheel stay x64.
 
 ### Fixed
 
