@@ -16,7 +16,9 @@ pip install sorrel-ephys
 The distribution is `sorrel-ephys` (PyPI's `sorrel` is an unrelated
 project); the import is still `import sorrel`. The wheel holds the Rust
 extension, the Python wrapper and the `sorrel` GUI binary, which pip puts on
-the environment's PATH. Each GitHub release also attaches the wheels.
+the environment's PATH. Each GitHub release also attaches the wheels. There
+is no Windows ARM64 wheel yet; on ARM64 Windows use the native release zip or
+winget.
 
 ## Build from source
 

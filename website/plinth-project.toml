@@ -230,24 +230,24 @@ description = "SpikeGLX .bin+.meta, Open Ephys continuous.dat+structure.oebin, a
 type = "install"
 id = "install"
 heading = "Install"
-intro = "Prebuilt binaries for Linux, macOS and Windows on every release. Point Sorrel at a sorting directory (sorrel open my_run/phy) and it detects the backend."
+intro = "Prebuilt binaries for Linux, macOS and Windows (x64 and ARM64) on every release. Point Sorrel at a sorting directory (sorrel open my_run/phy) and it detects the backend."
 guide_href = "/docs/getting-started/installation.html"
 
 [[pages.sections.primary_routes]]
 label = "Download a release"
-audience = "Linux (AppImage, tar.gz), macOS (Apple silicon), Windows (.exe, .zip)"
+audience = "Linux (AppImage, tar.gz), macOS (Apple silicon), Windows (x64, ARM64)"
 href = "https://github.com/caniko/sorrel/releases/latest"
 recommended = true
 
 [[pages.sections.secondary_routes]]
 label = "Windows (winget)"
-audience = "Stable releases"
+audience = "Stable releases, x64 and ARM64"
 href = "/docs/getting-started/installation.html#windows"
 command = "winget install Caniko.Sorrel"
 
 [[pages.sections.secondary_routes]]
 label = "Windows (Chocolatey)"
-audience = "Stable releases"
+audience = "Stable releases, x64"
 href = "/docs/getting-started/installation.html#windows"
 command = "choco install sorrel"
 
