@@ -890,8 +890,10 @@ impl DevDb {
         Ok(rev)
     }
 
-    /// One row per (variant, arm, revisions, score options): mean dev metrics over its scored runs and
-    /// the holdout ledger rows that name it as the candidate.
+    /// One row per (variant, arm, model, revisions, score options): mean dev metrics over its scored
+    /// runs and the holdout ledger rows that name it as the candidate. The options key leaves out the
+    /// disputed roots: those ids are local to each session, so they'd split one configuration by
+    /// session (the full set stays in `score_opts` and in the score's basis).
     fn lineage(&self) -> Result<String> {
         let mut md = String::from("# Prompt lineage\n\nDev metrics are means over scored runs; holdout is the ledger delta of good_units.recall against its baseline.\n\n");
         md += &format!("| variant | arm | model | runs | prompt_rev | sorrel_rev | learned_rev | score_opts | {} | cost_usd | holdout |\n", LINEAGE_METRICS.join(" | "));
@@ -900,8 +902,8 @@ impl DevDb {
             "---|".repeat(LINEAGE_METRICS.len())
         );
         let mut st = self.conn.prepare(
-            "SELECT variant, arm, COUNT(*), prompt_rev, sorrel_rev, learned_rev, AVG(cost_usd), score_opts, model
-             FROM runs GROUP BY variant, arm, model, prompt_rev, sorrel_rev, learned_rev, score_opts
+            "SELECT variant, arm, COUNT(*), prompt_rev, sorrel_rev, learned_rev, AVG(cost_usd), json_remove(score_opts, '$.disputed'), model
+             FROM runs GROUP BY variant, arm, model, prompt_rev, sorrel_rev, learned_rev, json_remove(score_opts, '$.disputed')
              ORDER BY MIN(rowid), variant, arm",
         )?;
         let cell = |v: Option<f64>| v.map_or("-".into(), |v| format!("{v:.3}"));
@@ -921,7 +923,7 @@ impl DevDb {
             let mean = |name: &str| -> Result<Option<f64>> {
                 Ok(self.conn.query_row(
                     "SELECT AVG(m.value) FROM metrics m JOIN runs r USING (rid) WHERE r.variant = ?1 AND r.arm = ?2 AND m.name = ?3
-                     AND r.prompt_rev IS ?4 AND r.sorrel_rev IS ?5 AND r.learned_rev IS ?6 AND r.score_opts IS ?7 AND r.model IS ?8",
+                     AND r.prompt_rev IS ?4 AND r.sorrel_rev IS ?5 AND r.learned_rev IS ?6 AND json_remove(r.score_opts, '$.disputed') IS ?7 AND r.model IS ?8",
                     params![variant, arm, name, revs[0], revs[1], revs[2], opts, model],
                     |r| r.get(0),
                 )?)
@@ -938,7 +940,7 @@ impl DevDb {
             // The ledger records no configuration: a holdout result belongs to a
             // row only when the variant/arm was run under exactly one.
             let n_cfg: i64 = self.conn.query_row(
-                "SELECT COUNT(*) FROM (SELECT DISTINCT model, prompt_rev, sorrel_rev, learned_rev, score_opts FROM runs WHERE variant = ?1 AND arm = ?2)",
+                "SELECT COUNT(*) FROM (SELECT DISTINCT model, prompt_rev, sorrel_rev, learned_rev, json_remove(score_opts, '$.disputed') FROM runs WHERE variant = ?1 AND arm = ?2)",
                 params![variant, arm],
                 |r| r.get(0),
             )?;
@@ -1829,6 +1831,32 @@ mod tests {
         assert_eq!(
             got,
             [("{\"a\":1}", "0.200"), ("{\"a\":2}", "0.800")],
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn lineage_averages_one_configuration_across_sessions_disputed_roots_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        scored_run(&mut d, "s1", "r1", None, 0.2);
+        scored_run(&mut d, "s1", "r2", None, 0.8);
+        // same options, each session disputing its own (session-local) roots
+        for (rid, disputed) in [("r1", "[3]"), ("r2", "[7,9]")] {
+            let opts = format!("{{\"binary\":true,\"disputed\":{disputed},\"match_jaccard\":0.8}}");
+            d.conn
+                .execute(
+                    "UPDATE runs SET score_opts = ?2 WHERE rid = ?1",
+                    params![rid, opts],
+                )
+                .unwrap();
+        }
+        let md = d.lineage().unwrap();
+        let rows: Vec<&str> = md.lines().filter(|l| l.starts_with("| v0 ")).collect();
+        assert_eq!(rows.len(), 1, "{md}");
+        assert!(
+            rows[0].contains("| 0.500 |") && !rows[0].contains("disputed"),
             "{md}"
         );
     }
