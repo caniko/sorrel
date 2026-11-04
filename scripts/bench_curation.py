@@ -158,6 +158,10 @@ def cmd_add(a) -> None:
                 shutil.rmtree(B / "sessions" / sid, ignore_errors=True)
                 (B / "sessions").mkdir(parents=True, exist_ok=True)
                 shutil.move(B / ".sealed" / "sessions" / sid, B / "sessions" / sid)
+                disp = B / ".sealed" / "disputed" / f"{sid}.tsv"  # its adjudicated roots stay excluded in dev
+                if disp.exists():
+                    (B / "disputed").mkdir(parents=True, exist_ok=True)
+                    shutil.move(disp, B / "disputed" / disp.name)
                 for r in (B / ".sealed" / "runs").glob(f"*-{sid}-r*"):
                     shutil.rmtree(r)
                 m["sessions"][sid] |= {"split": "dev", "forced_dev": True}

@@ -258,8 +258,11 @@ def main() -> None:
         # a holdout session whose truth the lead later saw: add --dev moves it to dev and drops its holdout runs
         mm = json.loads((bench / ".sealed" / "map.json").read_text())["sessions"]
         seen = hold[0]
+        (bench / ".sealed" / "disputed").mkdir(parents=True, exist_ok=True)
+        (bench / ".sealed" / "disputed" / f"{seen}.tsv").write_text("cluster_id\n9\n")  # an adjudicated holdout root
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
             go("add", "--dev", mm[seen]["path"])
+        assert (bench / "disputed" / f"{seen}.tsv").read_text() == "cluster_id\n9\n" and not (bench / ".sealed" / "disputed" / f"{seen}.tsv").exists()
         mm = json.loads((bench / ".sealed" / "map.json").read_text())["sessions"]
         assert mm[seen]["split"] == "dev" and mm[seen]["forced_dev"] and "moved 1 seen holdout" in err.getvalue(), err.getvalue()
         assert (bench / "sessions" / seen / "truth").exists() and not (bench / ".sealed" / "sessions" / seen).exists()
