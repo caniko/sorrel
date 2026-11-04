@@ -940,7 +940,7 @@ impl DevDb {
             // The ledger records no configuration: a holdout result belongs to a
             // row only when the variant/arm was run under exactly one.
             let n_cfg: i64 = self.conn.query_row(
-                "SELECT COUNT(*) FROM (SELECT DISTINCT model, prompt_rev, sorrel_rev, learned_rev, json_remove(score_opts, '$.disputed') FROM runs WHERE variant = ?1 AND arm = ?2)",
+                "SELECT COUNT(*) FROM (SELECT DISTINCT model, prompt_rev, sorrel_rev, learned_rev, json_remove(score_opts, '$.disputed') FROM runs WHERE variant = ?1 AND arm = ?2 AND rid IN (SELECT rid FROM metrics))",
                 params![variant, arm],
                 |r| r.get(0),
             )?;
@@ -1913,6 +1913,19 @@ mod tests {
                 .collect()
         };
         assert_eq!(hold(&d), ["+0.100 vs v0 (n=3)"]);
+        // an unscored run (failed, or not scored yet) is not another configuration
+        record_plain_run(&mut d, "s1", "r9", None);
+        d.conn
+            .execute(
+                "UPDATE runs SET score_opts = '{\"x\":1}' WHERE rid = 'r9'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            hold(&d).contains(&"+0.100 vs v0 (n=3)".to_owned()),
+            "{:?}",
+            hold(&d)
+        );
         // a second configuration of the same variant/arm: the ledger can't say which it ran
         scored_run(&mut d, "s1", "r2", Some("rev2"), 0.8);
         assert_eq!(hold(&d), ["see ledger (2 configurations)"; 2]);
