@@ -321,13 +321,14 @@ def main() -> None:
         last = [c["argv"] for c in calls(log, "sorrel") if c["argv"][:2] == ["dev", "record-session"]][-1]
         assert last[last.index("--sid") + 1] == seen4 and last[last.index("--split") + 1] == "dev" and "--truth" in last, last
         # a run without a miss category counts 0 of it: one session set for the means and the delta
-        fake = [({"arm": "a", "variant": v, "session": sid}, {"unit": {"f1": 0.5}, "misses": [{"category": "label", "roots": [i]} for i in range(n)]})
+        fake = [({"arm": "a", "variant": v, "session": sid}, {"unit": {"f1": 0.5}, "split_share": 0.1, "misses": [{"category": "label", "roots": [i]} for i in range(n)]})
                 for v, sid, n in (("b", "s1", 1), ("b", "s1", 0), ("b", "s2", 0), ("b", "s3", 1), ("c", "s1", 0), ("c", "s2", 2), ("c", "s3", 1))]
         got: list = []
         bc.scored, bc.DB, bc.B, bc.dev = lambda split: iter(fake), Path("db"), t / "bench4", lambda *x: got.append(json.loads(Path(x[2]).read_text()))
         with contextlib.redirect_stdout(io.StringIO()):
             bc.report_holdout(argparse.Namespace(baseline="b", candidate="c"))
         row = next(r for r in got[0] if r["metric"] == "misses.label")
+        assert not {"split_share", "match_jaccard", "min_spikes", "binary", "n_disputed"} & {r["metric"] for r in got[0]}, "an option became a metric"
         assert (row["n_sessions"], row["base"], row["cand"], row["delta"]) == (3, 0.5, 1.0, 0.5), row
         # runs of one variant scored under another revision are not averaged into its holdout row
         mixed = [({**r, "sorrel_rev": "x" if i == 0 else "y"}, sc) for i, (r, sc) in enumerate(fake)]
@@ -361,6 +362,16 @@ def main() -> None:
         with contextlib.redirect_stderr(io.StringIO()) as err:
             bc.cmd_score(argparse.Namespace(split="dev", match="0.8"))
         assert not (rdir / "r1" / "score.json").exists() and "not recorded" in err.getvalue(), err.getvalue()
+        # a rescore that times out leaves no stale cache either: the old one goes before the diff runs
+        (rdir / "r1" / "score.json").write_text("{}")
+        def timeout(argv, env=None, **k):
+            raise subprocess.TimeoutExpired(argv, 1)
+        bc.run = timeout
+        try:
+            bc.cmd_score(argparse.Namespace(split="dev", match="0.8"))
+        except subprocess.TimeoutExpired:
+            pass
+        assert not (rdir / "r1" / "score.json").exists()
         # report dev: a run without a miss category counts 0 of it, and a failed run's count isn't repeated per config
         two = [({"arm": "a", "variant": "v", "session": "s1", "sorrel_rev": rv, "status": "ok"}, {"unit": {"f1": 0.5}, "misses": ms})
                for rv, ms in (("x", [{"category": "label", "roots": [1]}]), ("x", []), ("y", []))]

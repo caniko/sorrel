@@ -311,9 +311,10 @@ def cmd_score(a) -> None:
             disp = home(split) / "disputed" / f"{rec['session']}.tsv"
             record = bool(DB) and split == "dev"
             argv = ["diff", s / "truth", root / "data", "--root", s / "input", "--json", "--match", a.match] + (["--disputed", disp] if disp.exists() else [])
-            r = run([SORREL, *argv, *(["--record", rec["id"], "--db", DB] if record else [])], env=dev_env() if record else None)
-            # Only a score the DB accepted (when recording) is cached: a rejected one must not reach a report.
+            # Only a score the DB accepted (when recording) is cached: a rejected or timed-out one must not
+            # reach a report, so the old cache goes before the diff runs.
             (root / "score.json").unlink(missing_ok=True)
+            r = run([SORREL, *argv, *(["--record", rec["id"], "--db", DB] if record else [])], env=dev_env() if record else None)
             try:
                 score = json.loads(r.stdout) if r.returncode == 0 else None
             except ValueError:
@@ -360,7 +361,9 @@ def metrics(score: dict) -> dict:
             elif isinstance(v, (int, float)) and not isinstance(v, bool):
                 out[p + k] = v
 
-    walk({k: v for k, v in score.items() if k not in ("misses", "n_spikes", "n_root_clusters", "match_jaccard", "min_spikes")}, "")
+    # the scoring options and dataset sizes are configuration, not outcomes
+    skip = ("misses", "n_spikes", "n_root_clusters", "n_disputed", "match_jaccard", "min_spikes", "split_share", "binary")
+    walk({k: v for k, v in score.items() if k not in skip}, "")
     for m in misses(score):
         out[f"misses.{miss_cat(m)}"] = out.get(f"misses.{miss_cat(m)}", 0) + 1
     return out
