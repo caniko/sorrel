@@ -100,6 +100,9 @@ ALTER TABLE runs ADD COLUMN output_hash TEXT;
 ALTER TABLE runs ADD COLUMN score_opts TEXT;
 ";
 
+/// The verdicts [`crate::diff::root_truths`] assigns, the only ones `truth_roots` holds.
+const VERDICTS: [&str; 5] = ["noise", "kept", "cores", "cleanup", "other"];
+
 /// `MIGRATIONS[i]` takes the schema from version `i` to `i + 1`.
 const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4];
 
@@ -481,6 +484,10 @@ impl DevDb {
 
     pub fn record_truth(&mut self, sid: &str, roots: &[RootTruth]) -> Result<()> {
         self.require_dev("truth", sid)?;
+        // Verdicts come from `root_truths`; anything else is refused, never stored.
+        if let Some(r) = roots.iter().find(|r| !VERDICTS.contains(&r.verdict)) {
+            bail!("root {}: unknown truth verdict", r.root);
+        }
         let tx = self.conn.transaction()?;
         let rows: Vec<_> = roots
             .iter()
@@ -914,10 +921,17 @@ impl DevDb {
                 .prepare("SELECT baseline, delta, n_sessions FROM holdout_ledger WHERE candidate = ?1 AND arm = ?2 AND metric = 'good_units.recall'")?
                 .query_map(params![variant, arm], |r| Ok(format!("{:+.3} vs {} (n={})", r.get::<_, f64>(1)?, r.get::<_, String>(0)?, r.get::<_, i64>(2)?)))?
                 .collect::<rusqlite::Result<_>>()?;
-            let holdout = if holdout.is_empty() {
-                "-".into()
-            } else {
-                holdout.join("; ")
+            // The ledger records no configuration: a holdout result belongs to a
+            // row only when the variant/arm was run under exactly one.
+            let n_cfg: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM (SELECT DISTINCT prompt_rev, sorrel_rev, learned_rev, score_opts FROM runs WHERE variant = ?1 AND arm = ?2)",
+                params![variant, arm],
+                |r| r.get(0),
+            )?;
+            let holdout = match (holdout.is_empty(), n_cfg) {
+                (true, _) => "-".into(),
+                (false, 1) => holdout.join("; "),
+                (false, n) => format!("see ledger ({n} configurations)"),
             };
             let [p, s, l] = revs.map(txt);
             let opts = txt(opts);
@@ -1784,6 +1798,47 @@ mod tests {
             [("{\"a\":1}", "0.200"), ("{\"a\":2}", "0.800")],
             "{md}"
         );
+    }
+
+    #[test]
+    fn a_holdout_result_is_shown_only_on_a_single_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        scored_run(&mut d, "s1", "r1", None, 0.2);
+        let row = LedgerRow {
+            candidate: "v0".into(),
+            metric: "good_units.recall".into(),
+            ..ledger("q1", 0.1)
+        };
+        d.record_ledger(&[row]).unwrap();
+        let hold = |d: &DevDb| -> Vec<String> {
+            d.lineage()
+                .unwrap()
+                .lines()
+                .filter(|l| l.starts_with("| v0 "))
+                .map(|l| {
+                    l.trim_end_matches(" |")
+                        .rsplit(" | ")
+                        .next()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect()
+        };
+        assert_eq!(hold(&d), ["+0.100 vs v0 (n=3)"]);
+        // a second configuration of the same variant/arm: the ledger can't say which it ran
+        scored_run(&mut d, "s1", "r2", Some("rev2"), 0.8);
+        assert_eq!(hold(&d), ["see ledger (2 configurations)"; 2]);
+    }
+
+    #[test]
+    fn an_unknown_truth_verdict_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        assert!(d.record_truth("s1", &[truth(0, "/data/leak", 1)]).is_err());
+        assert!(d.record_truth("s1", &[truth(0, "cleanup", 1)]).is_ok());
     }
 
     fn ledger(query: &str, delta: f64) -> LedgerRow {
