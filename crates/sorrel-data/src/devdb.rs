@@ -686,6 +686,13 @@ impl DevDb {
             "split_share",
         ];
         flatten(&serde_json::to_value(d)?, "", &skip, &mut metrics);
+        // Miss text reaches the DB twice (misses rows, misses.<category> metric
+        // names): guard it before either write.
+        for m in &d.misses {
+            self.guard("miss category", m.category)?;
+            self.guard_opt("miss label", m.truth)?;
+            self.guard_opt("miss label", m.test)?;
+        }
         for m in &d.misses {
             *metrics
                 .entry(format!("misses.{}", m.category))
@@ -887,14 +894,14 @@ impl DevDb {
     /// the holdout ledger rows that name it as the candidate.
     fn lineage(&self) -> Result<String> {
         let mut md = String::from("# Prompt lineage\n\nDev metrics are means over scored runs; holdout is the ledger delta of good_units.recall against its baseline.\n\n");
-        md += &format!("| variant | arm | runs | prompt_rev | sorrel_rev | learned_rev | score_opts | {} | cost_usd | holdout |\n", LINEAGE_METRICS.join(" | "));
+        md += &format!("| variant | arm | model | runs | prompt_rev | sorrel_rev | learned_rev | score_opts | {} | cost_usd | holdout |\n", LINEAGE_METRICS.join(" | "));
         md += &format!(
-            "|---|---|---|---|---|---|---|{}---|---|\n",
+            "|---|---|---|---|---|---|---|---|{}---|---|\n",
             "---|".repeat(LINEAGE_METRICS.len())
         );
         let mut st = self.conn.prepare(
-            "SELECT variant, arm, COUNT(*), prompt_rev, sorrel_rev, learned_rev, AVG(cost_usd), score_opts
-             FROM runs GROUP BY variant, arm, prompt_rev, sorrel_rev, learned_rev, score_opts
+            "SELECT variant, arm, COUNT(*), prompt_rev, sorrel_rev, learned_rev, AVG(cost_usd), score_opts, model
+             FROM runs GROUP BY variant, arm, model, prompt_rev, sorrel_rev, learned_rev, score_opts
              ORDER BY MIN(rowid), variant, arm",
         )?;
         let cell = |v: Option<f64>| v.map_or("-".into(), |v| format!("{v:.3}"));
@@ -907,14 +914,15 @@ impl DevDb {
                 [3, 4, 5].map(|i| r.get::<_, Option<String>>(i).unwrap_or(None)),
                 r.get::<_, Option<f64>>(6)?,
                 r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<String>>(8)?,
             ))
         })? {
-            let (variant, arm, n, revs, cost, opts) = row?;
+            let (variant, arm, n, revs, cost, opts, model) = row?;
             let mean = |name: &str| -> Result<Option<f64>> {
                 Ok(self.conn.query_row(
                     "SELECT AVG(m.value) FROM metrics m JOIN runs r USING (rid) WHERE r.variant = ?1 AND r.arm = ?2 AND m.name = ?3
-                     AND r.prompt_rev IS ?4 AND r.sorrel_rev IS ?5 AND r.learned_rev IS ?6 AND r.score_opts IS ?7",
-                    params![variant, arm, name, revs[0], revs[1], revs[2], opts],
+                     AND r.prompt_rev IS ?4 AND r.sorrel_rev IS ?5 AND r.learned_rev IS ?6 AND r.score_opts IS ?7 AND r.model IS ?8",
+                    params![variant, arm, name, revs[0], revs[1], revs[2], opts, model],
                     |r| r.get(0),
                 )?)
             };
@@ -930,7 +938,7 @@ impl DevDb {
             // The ledger records no configuration: a holdout result belongs to a
             // row only when the variant/arm was run under exactly one.
             let n_cfg: i64 = self.conn.query_row(
-                "SELECT COUNT(*) FROM (SELECT DISTINCT prompt_rev, sorrel_rev, learned_rev, score_opts FROM runs WHERE variant = ?1 AND arm = ?2)",
+                "SELECT COUNT(*) FROM (SELECT DISTINCT model, prompt_rev, sorrel_rev, learned_rev, score_opts FROM runs WHERE variant = ?1 AND arm = ?2)",
                 params![variant, arm],
                 |r| r.get(0),
             )?;
@@ -942,7 +950,8 @@ impl DevDb {
             let [p, s, l] = revs.map(txt);
             let opts = txt(opts);
             md += &format!(
-                "| {variant} | {arm} | {n} | {p} | {s} | {l} | {opts} | {} | {} | {holdout} |\n",
+                "| {variant} | {arm} | {} | {n} | {p} | {s} | {l} | {opts} | {} | {} | {holdout} |\n",
+                txt(model),
                 means.join(" | "),
                 cell(cost)
             );
@@ -1780,7 +1789,7 @@ mod tests {
             .map(|l| l.split(" | ").collect())
             .collect();
         // (runs, sorrel_rev, good_units.recall mean); NULL revisions are one group.
-        let mut got: Vec<_> = rows.iter().map(|c| (c[2], c[4], c[7])).collect();
+        let mut got: Vec<_> = rows.iter().map(|c| (c[3], c[5], c[8])).collect();
         got.sort();
         assert_eq!(
             got,
@@ -1814,12 +1823,37 @@ mod tests {
             .lines()
             .filter(|l| l.starts_with("| v0 "))
             .map(|l| l.split(" | ").collect::<Vec<_>>())
-            .map(|c| (c[6], c[7]))
+            .map(|c| (c[7], c[8]))
             .collect();
         got.sort();
         assert_eq!(
             got,
             [("{\"a\":1}", "0.200"), ("{\"a\":2}", "0.800")],
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn lineage_keeps_models_apart_with_their_own_means() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        scored_run(&mut d, "s1", "r1", None, 0.2);
+        scored_run(&mut d, "s1", "r2", None, 0.8);
+        d.conn
+            .execute("UPDATE runs SET model = 'big' WHERE rid = 'r2'", [])
+            .unwrap();
+        let md = d.lineage().unwrap();
+        let mut got: Vec<(String, String)> = md
+            .lines()
+            .filter(|l| l.starts_with("| v0 "))
+            .map(|l| l.split(" | ").map(str::to_owned).collect::<Vec<_>>())
+            .map(|c| (c[2].clone(), c[8].clone()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [("-".into(), "0.200".into()), ("big".into(), "0.800".into())],
             "{md}"
         );
     }
@@ -2019,6 +2053,31 @@ mod tests {
             ..Default::default()
         };
         d.record_run(&run, &[]).unwrap();
+    }
+
+    #[test]
+    fn miss_text_is_guarded_before_it_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        let none = HashSet::new();
+        run_with_output(&mut d, Some("o1"));
+        let mut diff = score(&SpikeDiffOpts::default());
+        diff.misses.push(crate::diff::Miss {
+            category: "/data/leak",
+            roots: vec![0],
+            truth: None,
+            test: None,
+        });
+        assert!(d
+            .record_diff("r1", &diff, "o1", "t1", "fp1", &none)
+            .is_err());
+        diff.misses.last_mut().unwrap().category = "label";
+        diff.misses.last_mut().unwrap().test = Some("sess_ks4");
+        assert!(d
+            .record_diff("r1", &diff, "o1", "t1", "fp1", &none)
+            .is_err());
+        assert_eq!(rows_in(&d, &["metrics", "misses"]), 0);
     }
 
     #[test]
