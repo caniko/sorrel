@@ -83,3 +83,23 @@ everything and prints the counts. It works in a temp subfolder and moves the fil
 into `OUT_DIR` only after every check passed, so a failure leaves `OUT_DIR` empty.
 `pack` refuses an `OUT_DIR` inside `PHY_DIR`. Self-check of the tool:
 `uv run .claude/skills/export-curated-sort/test_export_curated_sort.py`.
+
+## Agent tiers
+
+<!-- Keep this section's prose in sync with .claude/skills/curation-bench-loop/SKILL.md. -->
+
+Roles, not models. `flash` does cheap, mechanical or scouting work; `worker`
+does long code or prompt edits and reviews; `lead` is the invoking session, which
+decides and runs anything sealed. Name the agents in the skill args, e.g.
+`flash=<agent> worker=<agent>`. An agent can be a subagent type, a model alias or
+a CLI profile, and is passed through as-is; nothing here assumes a vendor
+(`flash=haiku worker=sonnet` in Claude Code is only an example). A role with no
+agent named is done by the lead inline.
+
+Delegated agents get only what their task row lists.
+
+| Task                                                                                                                              | Tier  | Gets                | Returns                                                           |
+| --------------------------------------------------------------------------------------------------------------------------------- | ----- | ------------------- | ----------------------------------------------------------------- |
+| Find candidate phy folders under a root the user names (`params.py` + `spike_templates.npy`); list which lack `cluster_group.tsv` | flash | the root            | the folder list, with the ones missing `cluster_group.tsv` marked |
+| After `pack`, read its summary                                                                                                    | flash | the printed summary | included/excluded/failed counts and the warnings                  |
+| Confirm the folder list with the user, run `pack`, relay the `.meta` and custom-label questions                                   | lead  |                     |                                                                   |

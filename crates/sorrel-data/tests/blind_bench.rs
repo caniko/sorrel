@@ -41,7 +41,7 @@ fn write_sort(root: &Path) {
     .unwrap();
     std::fs::write(
         root.join("cluster_KSLabel.tsv"),
-        "cluster_id\tKSLabel\n0\tunsorted\n9\tgood\n",
+        "cluster_id\tKSLabel\n0\tunsorted\n1\tunsorted\n2\tunsorted\n3\tunsorted\n4\tunsorted\n9\tgood\n",
     )
     .unwrap();
 }
@@ -161,7 +161,7 @@ fn blind_pair_scores_exactly_the_injected_edits() {
     // The sorter's rows only: id 9 is not a root cluster.
     assert_eq!(
         std::fs::read_to_string(input.join("cluster_KSLabel.tsv")).unwrap(),
-        "cluster_id\tKSLabel\n0\tunsorted\n"
+        "cluster_id\tKSLabel\n0\tunsorted\n1\tunsorted\n2\tunsorted\n3\tunsorted\n4\tunsorted\n"
     );
     assert_eq!(
         baseline_hash(&std::fs::read(input.join("spike_clusters.npy")).unwrap()),
@@ -285,7 +285,7 @@ fn phy_curated_pair_takes_the_sort_from_spike_templates() {
     assert_self_contained(&input);
     assert_eq!(
         std::fs::read_to_string(input.join("cluster_KSLabel.tsv")).unwrap(),
-        "cluster_id\tKSLabel\n0\tunsorted\n"
+        "cluster_id\tKSLabel\n0\tunsorted\n1\tunsorted\n2\tunsorted\n3\tunsorted\n4\tunsorted\n"
     );
     let prov: serde_json::Value =
         serde_json::from_slice(&std::fs::read(truth.join("provenance.json")).unwrap()).unwrap();
@@ -293,6 +293,16 @@ fn phy_curated_pair_takes_the_sort_from_spike_templates() {
         (prov["pure_manual"].as_bool(), prov["curated"].as_bool()),
         (Some(true), Some(true))
     );
+    // phy rewrote KSLabel on save: the edited roots lost their rows. A partial
+    // file would tell the arm which roots the human left alone, so it is dropped.
+    let (input2, truth2) = (tmp.path().join("in2"), tmp.path().join("truth2"));
+    std::fs::write(
+        root.join("cluster_KSLabel.tsv"),
+        "cluster_id\tKSLabel\n1\tmua\n3\tgood\n4\tmua\n5\tgood\n6\tmua\n",
+    )
+    .unwrap();
+    write_phy_curated_pair(&root, None, &input2, &truth2).unwrap();
+    assert!(!input2.join("cluster_KSLabel.tsv").exists());
     // The relocated recording opens, and nothing is written beside the source.
     let s = open(&input);
     assert_eq!(s.n_clusters(), 5);

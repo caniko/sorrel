@@ -129,7 +129,7 @@ the sorter's.
 `DATA_DIR` is only read. If params.py names a `dat_path` that doesn't exist,
 the copy points at the recording of the same name next to it.
 
-`sorrel diff <TRUTH> <TEST> --root <IN> [--json] [--match 0.8] [--min-spikes 10]
+`sorrel diff <TRUTH> <TEST> --root <IN> [--json] [--match 0.8] [--min-spikes 10] [--split-share 0.1]
 [--disputed FILE]` scores a curation of `IN` against the truth spike by spike:
 unit recovery (Jaccard at least `--match` and the same label), root-cluster label
 agreement, merge pairs, splits, noise exclusion and ARI. Misses are keyed by

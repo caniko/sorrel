@@ -253,6 +253,10 @@ enum Cmd {
         /// merge and split scores
         #[arg(long, value_name = "N", default_value_t = 10)]
         min_spikes: usize,
+        /// Directory mode: a split piece must hold this share of its root cluster's
+        /// kept (non-noise) spikes
+        #[arg(long, value_name = "F", default_value_t = 0.1)]
+        split_share: f64,
         /// Directory mode: root cluster ids (one per line) to leave out of scoring
         #[arg(long, value_name = "FILE")]
         disputed: Option<PathBuf>,
@@ -2343,17 +2347,18 @@ fn main() -> Result<()> {
             root,
             match_jaccard,
             min_spikes,
+            split_share,
             disputed,
         }) => match (root, a.is_dir() && b.is_dir()) {
             (Some(root), true) => {
                 let opts = sorrel_data::diff::SpikeDiffOpts {
                     match_jaccard,
                     min_spikes,
+                    split_share,
                     disputed: disputed
                         .map(|p| sorrel_data::diff::read_disputed(&p))
                         .transpose()?
                         .unwrap_or_default(),
-                    ..Default::default()
                 };
                 diff_dirs(&a, &b, &root, &opts, json)
             }

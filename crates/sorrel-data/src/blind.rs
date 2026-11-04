@@ -118,15 +118,23 @@ pub fn write_blind_input(
             let text = std::fs::read_to_string(&src)?;
             let mut lines = text.lines();
             let mut kept = lines.next().map(|h| format!("{h}\n")).unwrap_or_default();
+            let mut covered = HashSet::new();
             for l in lines {
                 let id = l.split('\t').next().and_then(|c| c.trim().parse().ok());
-                if id.is_some_and(|id| root_ids.contains(&id)) {
+                if let Some(id) = id.filter(|id| root_ids.contains(id)) {
+                    covered.insert(id);
                     kept.push_str(l);
                     kept.push('\n');
                 }
             }
-            std::fs::write(out.join(name), kept)?;
-            written.push(name.to_owned());
+            // phy rewrites these on save with rows for the clusters that exist
+            // then, so the edited roots lose their rows: a partial file tells the
+            // arm which roots the human left alone. Only a file covering every
+            // root is the sorter's own.
+            if covered == root_ids {
+                std::fs::write(out.join(name), kept)?;
+                written.push(name.to_owned());
+            }
         }
     }
 
