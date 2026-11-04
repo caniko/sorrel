@@ -417,13 +417,14 @@ impl DevDb {
         );
         let added = (s.split == "dev").then_some("now");
         let tx = self.conn.transaction()?;
-        let old: Option<Option<String>> = tx
+        let (old, old_truth): (Option<Option<String>>, Option<String>) = tx
             .query_row(
-                "SELECT fingerprint FROM sessions WHERE sid = ?1",
+                "SELECT fingerprint, truth_hash FROM sessions WHERE sid = ?1",
                 [sid],
-                |r| r.get(0),
+                |r| Ok((Some(r.get(0)?), r.get(1)?)),
             )
-            .optional()?;
+            .optional()?
+            .unwrap_or((None, None));
         tx.execute(
             "INSERT INTO sessions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CASE WHEN ?9 IS NULL THEN NULL ELSE date('now') END, ?10)
              ON CONFLICT(sid) DO UPDATE SET split = excluded.split, fingerprint = excluded.fingerprint,
@@ -436,7 +437,12 @@ impl DevDb {
         // it had: truth, cards and the runs scored against the old input describe
         // another clustering. Re-record the truth after a changed fingerprint.
         // On the same input a changed truth only stales the scores (below);
-        // a re-record that supplies no truth keeps the stored one.
+        // a re-record that supplies no truth keeps the stored one. A new truth
+        // drops the old summary in this transaction, so an interrupted re-record
+        // leaves no truth (skipped by the exemplar join), never stale truth.
+        if truth_hash.is_some() && old_truth.as_deref() != truth_hash {
+            tx.execute("DELETE FROM truth_roots WHERE sid = ?1", [sid])?;
+        }
         if s.split == "holdout" || old.is_some_and(|o| o.as_deref() != fp) {
             tx.execute(
                 "UPDATE sessions SET truth_hash = ?2, binary = ?3 WHERE sid = ?1",
@@ -1688,6 +1694,24 @@ mod tests {
         .unwrap();
         d.record_truth("s1", &again).unwrap();
         assert_eq!(rows_in(&d, &["metrics", "misses"]), 2);
+    }
+
+    #[test]
+    fn an_interrupted_truth_re_record_leaves_no_stale_verdicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        fill(&mut d, "s1", "fp1");
+        assert_eq!(rows_in(&d, &["truth_roots"]), 3);
+        // the same truth again keeps its summary
+        d.record_session(&dev("s1", "fp1")).unwrap();
+        assert_eq!(rows_in(&d, &["truth_roots"]), 3);
+        // a new truth whose record_truth never ran: no summary rather than the old one
+        d.record_session(&SessionRow {
+            truth_hash: Some("t2".into()),
+            ..dev("s1", "fp1")
+        })
+        .unwrap();
+        assert_eq!(rows_in(&d, &["truth_roots"]), 0);
     }
 
     #[test]
