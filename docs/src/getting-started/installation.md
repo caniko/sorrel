@@ -45,7 +45,9 @@ pip install sorrel-ephys
 ```
 
 Each GitHub release attaches the same wheels
-(`sorrel_ephys-<VERSION>-cp38-abi3-<PLATFORM>.whl`).
+(`sorrel_ephys-<VERSION>-cp38-abi3-<PLATFORM>.whl`). There is no Windows ARM64
+wheel yet; on ARM64 Windows use winget or the release zip (see
+[Windows](#windows)).
 
 `nix build .#release-bundle.wheels.x86_64-linux` builds one locally
 (`aarch64-linux`, `windows`, `darwin-aarch64` likewise). See
@@ -53,19 +55,22 @@ Each GitHub release attaches the same wheels
 
 ## Windows
 
-Stable releases go to winget and Chocolatey. Both install `sorrel.exe` and
-`sorrelw.exe` from the release's `sorrel-<VERSION>-x86_64-windows.zip` and put
-`sorrel` (and `sorrelw`) on your `PATH`:
+Stable releases go to winget and Chocolatey, which put `sorrel` (and
+`sorrelw`) on your `PATH`:
 
 ```powershell
 winget install Caniko.Sorrel
 choco install sorrel
 ```
 
-On Windows on ARM the release also ships a native
-`sorrel-<VERSION>-aarch64-windows.zip`, and winget picks it for ARM64 machines.
-Chocolatey installs the x64 zip, which runs under emulation. There is no ARM64
-Python wheel yet.
+winget picks the native build for the machine: x64 gets
+`sorrel-<VERSION>-x86_64-windows.zip`, and Windows on ARM64 gets
+`sorrel-<VERSION>-aarch64-windows.zip`. Chocolatey only ships the x64 zip,
+which runs under emulation on ARM64. There is no ARM64 Python wheel yet.
+
+Microsoft reviews winget submissions by hand, so a package can take a few
+days to appear. If `winget` reports that no package matches, use Chocolatey
+or the release zip until it is listed.
 
 `sorrel.exe` is a console program. `sorrelw.exe` is the same program without a
 console window: it starts `sorrel.exe` with the same arguments (bare, it opens
@@ -98,11 +103,13 @@ PowerShell completion in every session:
 sorrel completions powershell | Out-String | Invoke-Expression
 ```
 
-**Standalone files.** Each release page also lists `sorrel-<VERSION>-x86_64-windows.exe`
-(`sorrel.exe`) and `sorrel-<VERSION>-x86_64-windows-gui.exe` (`sorrelw.exe`)
-for use without a package manager. `sorrelw.exe` looks for `sorrel.exe` next
-to itself, so rename the downloads back to `sorrel.exe` and `sorrelw.exe` and
-keep them in one folder.
+**Standalone files.** Each release page also lists the same executables for
+x64 (`sorrel-<VERSION>-x86_64-windows.exe` and
+`sorrel-<VERSION>-x86_64-windows-gui.exe`) and ARM64
+(`sorrel-<VERSION>-aarch64-windows.exe` and
+`sorrel-<VERSION>-aarch64-windows-gui.exe`) for use without a package manager.
+`sorrelw.exe` looks for `sorrel.exe` next to itself, so rename the downloads
+back to `sorrel.exe` and `sorrelw.exe` and keep them in one folder.
 
 **SmartScreen.** The executables are not code-signed yet, so Windows
 SmartScreen may warn about an _unknown publisher_ when you run a download
@@ -115,13 +122,15 @@ and each file has Sigstore bundles (`<file>.cosign.bundle`, plus an SLSA
 provenance `<file>.intoto.bundle`):
 
 ```powershell
-(Get-FileHash .\sorrel-<VERSION>-x86_64-windows.zip).Hash   # compare with SHA256SUMS.txt
+(Get-FileHash .\sorrel-<VERSION>-<ARCH>-windows.zip).Hash   # compare with SHA256SUMS.txt
 minisign -V -p minisign.pub -m SHA256SUMS.txt
-cosign verify-blob --bundle sorrel-<VERSION>-x86_64-windows.zip.cosign.bundle `
+cosign verify-blob --bundle sorrel-<VERSION>-<ARCH>-windows.zip.cosign.bundle `
   --certificate-identity-regexp 'https://github.com/caniko/sorrel/' `
   --certificate-oidc-issuer https://token.actions.githubusercontent.com `
-  sorrel-<VERSION>-x86_64-windows.zip
+  sorrel-<VERSION>-<ARCH>-windows.zip
 ```
+
+`<ARCH>` is `x86_64` or `aarch64`.
 
 **Uninstall.** `winget uninstall Caniko.Sorrel` or `choco uninstall sorrel`
 removes the programs. Sorrel's per-user state (the GUI instance file, the
@@ -142,7 +151,9 @@ sorrel open <DATA_DIR>
 ```
 
 `sorrel gpu-check` shows what each backend can do. Trace filtering falls back
-to the CPU on its own when a backend rejects the compute kernels.
+to the CPU on its own when a backend rejects the compute kernels. The Windows
+on ARM smoke test covers DX12 only, because the CI Vulkan driver is x64-only;
+Vulkan on ARM64 is untested.
 
 ## With Nix
 

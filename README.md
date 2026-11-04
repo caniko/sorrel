@@ -10,6 +10,9 @@
 
 Native, high-performance GUI for manual curation of spike-sorted electrophysiology data. More views in the [gallery](https://sorrel.tartanoglu.com/#gallery).
 
+Prebuilt releases cover Linux (x86_64 and aarch64), macOS (Apple silicon) and
+Windows (x64 and ARM64).
+
 Sorrel is built around **zero-cost abstractions**: the entire core is generic over a `DataProvider` trait, monomorphised at compile time, so hot paths (downsampling, vertex generation, journaling) cross no dynamic-dispatch boundary.
 
 ## Workspace
