@@ -82,7 +82,7 @@ fn a_session_a_run_and_its_score_land_in_the_results_db() {
     ok(&dev(&[
         "record-session",
         "--sid",
-        "holdout-1",
+        "h0a1b2c3d",
         "--split",
         "holdout",
     ]));

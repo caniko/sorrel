@@ -396,6 +396,17 @@ impl DevDb {
             matches!(s.split.as_str(), "dev" | "holdout"),
             "split must be dev or holdout"
         );
+        // A holdout row is the runner's alias (`h` + 8 hex of a salted hash), never the sealed
+        // id or a source name: refused here, so no deny list is needed to keep it out.
+        if s.split == "holdout" {
+            let alias = sid.len() == 9
+                && sid.starts_with('h')
+                && sid[1..].bytes().all(|b| b.is_ascii_hexdigit());
+            ensure!(
+                alias,
+                "a holdout session is recorded under its h<8 hex> alias only"
+            );
+        }
         // Whatever the caller knows about a holdout session stays out.
         let s = if s.split == "holdout" {
             SessionRow {
@@ -1254,6 +1265,9 @@ mod tests {
     use sorrel_io::kilosort::PhyLabel;
     use sorrel_io::ClusterId;
 
+    /// A holdout session id: the runner's alias form, `h` + 8 hex.
+    const HOLDOUT_SID: &str = "h1a2b3c4d";
+
     fn db(dir: &Path) -> DevDb {
         DevDb::open(&dir.join("r.sqlite"))
             .unwrap()
@@ -1461,6 +1475,34 @@ mod tests {
     }
 
     #[test]
+    fn a_holdout_row_takes_only_the_alias_form() {
+        let dir = tempfile::tempdir().unwrap();
+        // no deny list at all: a sealed id or a source name must still never land
+        let mut d = DevDb::open(&dir.path().join("r.sqlite")).unwrap();
+        for bad in [
+            "9f3a1c2e",
+            "day12_tt4",
+            "hzzzzzzzz",
+            "h1a2b3c4",
+            "h1a2b3c4d5",
+        ] {
+            let r = d.record_session(&SessionRow {
+                sid: bad.into(),
+                split: "holdout".into(),
+                ..Default::default()
+            });
+            assert!(r.is_err(), "{bad} was accepted");
+        }
+        d.record_session(&SessionRow {
+            sid: HOLDOUT_SID.into(),
+            split: "holdout".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rows_in(&d, &["sessions"]), 1);
+    }
+
+    #[test]
     fn query_is_read_only() {
         let dir = tempfile::tempdir().unwrap();
         let mut d = db(dir.path());
@@ -1487,7 +1529,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut d = db(dir.path());
         d.record_session(&SessionRow {
-            sid: "holdout-1".into(),
+            sid: HOLDOUT_SID.into(),
             split: "holdout".into(),
             fingerprint: Some("fp9".into()),
             n_spikes: Some(5),
@@ -1499,13 +1541,13 @@ mod tests {
                 .unwrap(),
             "fingerprint\tn_spikes\tadded\n\t\t\n"
         );
-        assert!(d.record_cards("holdout-1", BRIEF).is_err());
+        assert!(d.record_cards(HOLDOUT_SID, BRIEF).is_err());
         assert!(d
-            .record_truth("holdout-1", &[truth(0, "noise", 0)])
+            .record_truth(HOLDOUT_SID, &[truth(0, "noise", 0)])
             .is_err());
         let run = RunRow {
             rid: "r".into(),
-            sid: "holdout-1".into(),
+            sid: HOLDOUT_SID.into(),
             variant: "v".into(),
             arm: "a".into(),
             status: "ok".into(),
@@ -1514,9 +1556,9 @@ mod tests {
         assert!(d.record_run(&run, &[]).is_err());
         assert!(d.record_cards("nope", BRIEF).is_err());
         // a dev session re-recorded as holdout loses what it had
-        fill(&mut d, "s1", "fp1");
+        fill(&mut d, HOLDOUT_SID, "fp1");
         d.record_session(&SessionRow {
-            sid: "s1".into(),
+            sid: HOLDOUT_SID.into(),
             split: "holdout".into(),
             ..Default::default()
         })
@@ -1598,11 +1640,11 @@ mod tests {
     fn re_recording_as_holdout_purges_the_runs_too() {
         let dir = tempfile::tempdir().unwrap();
         let mut d = db(dir.path());
-        fill(&mut d, "s1", "fp1");
-        scored_run(&mut d, "s1", "r1", None, 0.5);
+        fill(&mut d, HOLDOUT_SID, "fp1");
+        scored_run(&mut d, HOLDOUT_SID, "r1", None, 0.5);
         assert_eq!(rows_in(&d, &RUN_DATA), 4);
         d.record_session(&SessionRow {
-            sid: "s1".into(),
+            sid: HOLDOUT_SID.into(),
             split: "holdout".into(),
             ..Default::default()
         })
@@ -1635,13 +1677,13 @@ mod tests {
     fn a_dev_session_re_recorded_as_holdout_keeps_no_date() {
         let dir = tempfile::tempdir().unwrap();
         let mut d = db(dir.path());
-        fill(&mut d, "s1", "fp1");
+        fill(&mut d, HOLDOUT_SID, "fp1");
         assert_eq!(
             d.query("SELECT added IS NULL AS a FROM sessions").unwrap(),
             "a\n0\n"
         );
         d.record_session(&SessionRow {
-            sid: "s1".into(),
+            sid: HOLDOUT_SID.into(),
             split: "holdout".into(),
             ..Default::default()
         })
@@ -2223,7 +2265,7 @@ mod tests {
         fill(&mut d, "s1", "fp1");
         fill(&mut d, "s2", "fp2");
         d.record_session(&SessionRow {
-            sid: "holdout-1".into(),
+            sid: HOLDOUT_SID.into(),
             split: "holdout".into(),
             ..Default::default()
         })
@@ -2248,7 +2290,7 @@ mod tests {
         fill(&mut d, "s1", "fp1");
         fill(&mut d, "s2", "fp2");
         d.record_session(&SessionRow {
-            sid: "holdout-1".into(),
+            sid: HOLDOUT_SID.into(),
             split: "holdout".into(),
             ..Default::default()
         })
