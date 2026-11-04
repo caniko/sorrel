@@ -393,9 +393,14 @@ def report_dev(a) -> None:
     ms = [dict(metrics(sc)) for k in names for _, sc in groups[k]]
     keys = sorted({k for m in ms for k in m})
     md = ["# Dev report", "", f"| metric | {' | '.join(label[n] for n in names)} |", f"|---|{'---|' * len(names)}"]
-    md.append("| runs (failed) | " + " | ".join(f"{len(groups[n])} ({failed.get(n[:2], 0)})" for n in names) + " |")
+    # A failed run has no score, so no cfg: its count belongs to the arm/variant, shown once, not under each column.
+    md.append("| runs (failed) | " + " | ".join(f"{len(groups[n])} ({failed.get(n[:2], 0)})" if cfgs[n[:2]] == 1 else f"{len(groups[n])}" for n in names) + " |")
+    if any(cfgs[n[:2]] > 1 and failed.get(n[:2]) for n in names):
+        md.append("| failed runs (all configurations) | " + " | ".join(str(failed.get(n[:2], 0)) if cfgs[n[:2]] > 1 else "" for n in names) + " |")
     for k in keys:
-        md.append(f"| {k} | " + " | ".join(fmt([metrics(sc)[k] for _, sc in groups[n] if k in metrics(sc)] or [float('nan')]) for n in names) + " |")
+        # a scored run without a miss category has none of it: counts 0, never left out of the mean
+        val = lambda sc: metrics(sc).get(k, 0 if k.startswith("misses.") else None)
+        md.append(f"| {k} | " + " | ".join(fmt([v for _, sc in groups[n] if (v := val(sc)) is not None] or [float('nan')]) for n in names) + " |")
     for n in names:
         tally: dict = {}  # (cat, sid, ids) -> runs with that miss
         per_sid: dict = {}

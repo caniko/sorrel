@@ -334,6 +334,19 @@ def main() -> None:
         with contextlib.redirect_stderr(io.StringIO()) as err:
             bc.cmd_score(argparse.Namespace(split="dev", match="0.8"))
         assert not (rdir / "r1" / "score.json").exists() and "not recorded" in err.getvalue(), err.getvalue()
+        # report dev: a run without a miss category counts 0 of it, and a failed run's count isn't repeated per config
+        two = [({"arm": "a", "variant": "v", "session": "s1", "sorrel_rev": rv, "status": "ok"}, {"unit": {"f1": 0.5}, "misses": ms})
+               for rv, ms in (("x", [{"category": "label", "roots": [1]}]), ("x", []), ("y", []))]
+        failed_run = {"arm": "a", "variant": "v", "session": "s1", "status": "failed"}
+        bc.scored, bc.runs = lambda split: iter(two), lambda split: iter([(r, None) for r, _ in two] + [(failed_run, None)])
+        bc.brief_rows, bc.B = lambda sid, ids: ("id", {}), t / "bench5"
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            bc.report_dev(argparse.Namespace())
+        rep = Path(out.getvalue().strip()).read_text()
+        label_row = next(l for l in rep.splitlines() if l.startswith("| misses.label |"))
+        assert label_row.split(" | ")[1].startswith("0.500"), label_row  # 1 miss over 2 runs, not 1
+        runs_row = next(l for l in rep.splitlines() if l.startswith("| runs (failed) |"))
+        assert "(1)" not in runs_row and "| failed runs (all configurations) |" in rep, rep
         print("ok: add/splits, mcp-review argv, holdout sealing + ledger, results-DB calls, adjudication")
 
 
