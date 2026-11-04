@@ -151,6 +151,10 @@ def main() -> None:
             assert flag in a, flag
         assert a[a.index("--tools") + 1] == "" and a[a.index("--allowedTools") + 1] == "mcp__sorrel__*" and a[a.index("--model") + 1] == "m1"
         assert a[a.index("--max-budget-usd") + 1] == "2.5", a
+        n_before = len(calls(log, "claude"))
+        bc.claude("p", t / "zero-budget", {}, None, None, {}, 60, 0.0)  # a zero cap is a cap, not "no cap"
+        z = calls(log, "claude")[n_before]["argv"]
+        assert z[z.index("--max-budget-usd") + 1] == "0.0", z
         assert list(mcp["cfg"]["mcpServers"]) == ["sorrel"] and mcp["cfg"]["mcpServers"]["sorrel"]["args"][0] == "mcp"
         assert mcp["stdin"].startswith("REVIEW GUIDE") and mcp["cwd_files"] == [] and "REVIEW GUIDE" not in " ".join(a)
         assert mcp["env"] and mcp["env"].endswith("review.md")
@@ -251,6 +255,16 @@ def main() -> None:
         m3 = json.loads((bench3 / ".sealed" / "map.json").read_text())["sessions"]
         assert len(m3) == 30 and {v["split"] for v in m3.values()} == {"dev"} and not (bench3 / ".sealed" / "sessions").exists()
 
+        # a holdout session whose truth the lead later saw: add --dev moves it to dev and drops its holdout runs
+        mm = json.loads((bench / ".sealed" / "map.json").read_text())["sessions"]
+        seen = hold[0]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            go("add", "--dev", mm[seen]["path"])
+        mm = json.loads((bench / ".sealed" / "map.json").read_text())["sessions"]
+        assert mm[seen]["split"] == "dev" and mm[seen]["forced_dev"] and "moved 1 seen holdout" in err.getvalue(), err.getvalue()
+        assert (bench / "sessions" / seen / "truth").exists() and not (bench / ".sealed" / "sessions" / seen).exists()
+        assert not list((bench / ".sealed" / "runs").glob(f"*-{seen}-r*"))
+
         # fewer than 3 paired sessions: no CI
         bench2 = t / "bench2"
         go2 = lambda *a: bc.main(["--bench", str(bench2), *map(str, a)])
@@ -297,6 +311,12 @@ def main() -> None:
         ledger = [c for c in db_calls if c["argv"][1] == "ledger"]
         rows = json.loads(ledger[0]["ledger"])
         assert len(ledger) == 1 and rows and {"query", "baseline", "candidate", "arm", "metric", "delta"} <= set(rows[0]) and len({r["query"] for r in rows}) == 1 and not any(sid in ledger[0]["ledger"] for sid in hold4)
+        # unsealing a seen holdout session records it in the DB as dev, with its truth
+        seen4 = hold4[0]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            godb("add", "--dev", m4[seen4]["path"])
+        last = [c["argv"] for c in calls(log, "sorrel") if c["argv"][:2] == ["dev", "record-session"]][-1]
+        assert last[last.index("--sid") + 1] == seen4 and last[last.index("--split") + 1] == "dev" and "--truth" in last, last
         # a run without a miss category counts 0 of it: one session set for the means and the delta
         fake = [({"arm": "a", "variant": v, "session": sid}, {"unit": {"f1": 0.5}, "misses": [{"category": "label", "roots": [i]} for i in range(n)]})
                 for v, sid, n in (("b", "s1", 1), ("b", "s1", 0), ("b", "s2", 0), ("b", "s3", 1), ("c", "s1", 0), ("c", "s2", 2), ("c", "s3", 1))]

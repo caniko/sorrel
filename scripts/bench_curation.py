@@ -146,12 +146,26 @@ def scratch_input(sid: str):
 
 def cmd_add(a) -> None:
     m = load_map()
-    known = {s["path"] for s in m["sessions"].values()}
-    n_added = n_dev = n_forced = 0
+    known = {v["path"]: sid for sid, v in m["sessions"].items()}
+    n_added = n_dev = n_forced = n_unsealed = 0
     for s in a.session:
         path = str(Path(s).resolve())
         if path in known:
-            print(f"skip (already added): {s}")
+            sid = known[path]
+            if a.dev and m["sessions"][sid]["split"] == "holdout":
+                # The lead has seen this truth: it can no longer be sealed. Move it to dev and
+                # drop its holdout runs; reports already made with it are not undone.
+                shutil.rmtree(B / "sessions" / sid, ignore_errors=True)
+                (B / "sessions").mkdir(parents=True, exist_ok=True)
+                shutil.move(B / ".sealed" / "sessions" / sid, B / "sessions" / sid)
+                for r in (B / ".sealed" / "runs").glob(f"*-{sid}-r*"):
+                    shutil.rmtree(r)
+                m["sessions"][sid] |= {"split": "dev", "forced_dev": True}
+                write_json(B / ".sealed" / "map.json", m)
+                db_session(sid)  # now a dev session: its input and truth go into the results DB
+                n_unsealed += 1
+            else:
+                print(f"skip (already added): {s}")
             continue
         sid = secrets.token_hex(4)
         d = B / ".sealed" / "incoming" / sid  # moved out once the split is known: a holdout id never leaves .sealed
@@ -174,6 +188,8 @@ def cmd_add(a) -> None:
         db_session(sid)
         n_added, n_dev, n_forced = n_added + 1, n_dev + (split == "dev"), n_forced + (not pure)
     print(f"added {n_added} session(s), {n_dev} to dev ({n_forced} of them not purely manual); the rest are sealed")
+    if n_unsealed:
+        print(f"moved {n_unsealed} seen holdout session(s) to dev and dropped their holdout runs; holdout reports made before still included them", file=sys.stderr)
 
 
 def sorrel_rev() -> str | None:
@@ -193,7 +209,7 @@ def claude(prompt: str, root: Path, servers: dict, allow: str | None, model: str
             "--setting-sources", "project", "--disable-slash-commands", "--no-session-persistence", "--tools", ""]
     argv += ["--allowedTools", allow] if allow else []
     argv += ["--model", model] if model else []
-    argv += ["--max-budget-usd", str(budget)] if budget else []
+    argv += ["--max-budget-usd", str(budget)] if budget is not None else []  # 0 is a cap too, not "no cap"
     cwd = tempfile.mkdtemp(prefix="bench-claude-")  # outside BENCH, so no ancestor CLAUDE.md loads
     try:
         r = run(argv, env, cwd=cwd, timeout=timeout, stdin=prompt)
