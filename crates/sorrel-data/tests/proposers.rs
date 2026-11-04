@@ -516,3 +516,35 @@ fn core_split_extracts_no_features_for_a_small_or_clean_cluster() {
     assert!(core_split_lazy(4000, ask, |_| 0.5, |_| 0).is_none());
     assert!(asked.get());
 }
+
+#[test]
+fn core_split_sweeps_the_whole_cluster_once() {
+    use sorrel_data::proposers::core_split_lazy;
+    // A contaminated host with structure: the whole-cluster contamination (a
+    // full refractory sweep) is evaluated by the gate and reused, not redone.
+    let mut rng = 7u64;
+    let mut next = || {
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (rng >> 33) as f32 / (1u64 << 31) as f32 - 0.5
+    };
+    let n = 2000;
+    let feats: Vec<f32> = (0..n)
+        .flat_map(|i| {
+            let c = if i < 100 { 6.0 } else { 0.0 };
+            [c + next(), c + next(), next()]
+        })
+        .collect();
+    let whole_sweeps = std::cell::Cell::new(0);
+    let contamination = |idx: &[u32]| {
+        if idx.len() == n {
+            whole_sweeps.set(whole_sweeps.get() + 1);
+            0.5
+        } else {
+            0.0
+        }
+    };
+    core_split_lazy(n, || Some((feats.clone(), 3)), contamination, |_| 0);
+    assert_eq!(whole_sweeps.get(), 1);
+}

@@ -300,8 +300,21 @@ pub fn core_split_proposal(
         return None;
     }
     let n = feats.len() / d;
+    let whole = core_gate(n, || contamination(&(0..n as u32).collect::<Vec<_>>()))?;
+    core_from_mixture(feats, d, whole, contamination, violations)
+}
+
+/// [`core_split_proposal`] past its gates, with the whole-cluster
+/// contamination `whole` already computed (it is a full refractory sweep).
+fn core_from_mixture(
+    feats: &[f32],
+    d: usize,
+    whole: f32,
+    contamination: impl Fn(&[u32]) -> f32,
+    violations: impl Fn(&[u32]) -> usize,
+) -> Option<CoreSplit> {
+    let n = feats.len() / d;
     let all: Vec<u32> = (0..n as u32).collect();
-    let whole = core_gate(n, || contamination(&all))?;
     let stride = n.div_ceil(CORE_MAX_FIT);
     let sub: Vec<f32> = (0..n)
         .step_by(stride)
@@ -514,9 +527,10 @@ pub fn core_split_lazy(
     contamination: impl Fn(&[u32]) -> f32,
     violations: impl Fn(&[u32]) -> usize,
 ) -> Option<CoreSplit> {
-    core_gate(n, || contamination(&(0..n as u32).collect::<Vec<_>>()))?;
+    let whole = core_gate(n, || contamination(&(0..n as u32).collect::<Vec<_>>()))?;
     let (feats, d) = features()?;
-    core_split_proposal(&feats, d, contamination, violations)
+    (d > 0 && feats.len() / d == n).then_some(())?;
+    core_from_mixture(&feats, d, whole, contamination, violations)
 }
 
 /// Session wiring: [`outlier_proposal`] on `cluster`'s PC feature space.
