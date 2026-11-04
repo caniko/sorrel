@@ -407,9 +407,10 @@ impl DevDb {
             );
             s.clone()
         };
-        let (fp, sorter) = (
+        let (fp, sorter, truth_hash) = (
             self.guard_opt("fingerprint", s.fingerprint.as_deref())?,
             self.guard_opt("sorter", s.sorter.as_deref())?,
+            self.guard_opt("truth hash", s.truth_hash.as_deref())?,
         );
         let added = (s.split == "dev").then_some("now");
         let tx = self.conn.transaction()?;
@@ -426,7 +427,7 @@ impl DevDb {
                  sorter = excluded.sorter, n_spikes = excluded.n_spikes, n_roots = excluded.n_roots,
                  n_channels = excluded.n_channels, added = CASE WHEN excluded.added IS NULL THEN NULL ELSE COALESCE(added, excluded.added) END,
                  binary = COALESCE(excluded.binary, binary), truth_hash = COALESCE(excluded.truth_hash, truth_hash)",
-            params![sid, s.split, fp, sorter, s.n_spikes, s.n_roots, s.n_channels, s.binary, added, s.truth_hash],
+            params![sid, s.split, fp, sorter, s.n_spikes, s.n_roots, s.n_channels, s.binary, added, truth_hash],
         )?;
         // A session re-recorded as holdout, or on a changed input, loses everything
         // it had: truth, cards and the runs scored against the old input describe
@@ -436,7 +437,7 @@ impl DevDb {
         if s.split == "holdout" || old.is_some_and(|o| o.as_deref() != fp) {
             tx.execute(
                 "UPDATE sessions SET truth_hash = ?2, binary = ?3 WHERE sid = ?1",
-                params![sid, s.truth_hash, s.binary],
+                params![sid, truth_hash, s.binary],
             )?;
             for q in [
                 "DELETE FROM metrics WHERE rid IN (SELECT rid FROM runs WHERE sid = ?1)",
@@ -552,6 +553,7 @@ impl DevDb {
             self.guard_opt("sorrel_rev", r.sorrel_rev.as_deref())?,
             self.guard_opt("learned_rev", r.learned_rev.as_deref())?,
         );
+        let output_hash = self.guard_opt("output hash", r.output_hash.as_deref())?;
         let mut rows = Vec::new();
         for (i, a) in actions.iter().enumerate() {
             // A model's reasons are free text: slashes become spaces, the deny set still refuses.
@@ -580,14 +582,14 @@ impl DevDb {
             prompt_rev,
             sorrel_rev,
             learned_rev,
-            r.output_hash,
+            output_hash,
             rows
         ]));
         let tx = self.conn.transaction()?;
         // The score's basis and options survive the replace; a changed state makes them stale.
         tx.execute(
             "INSERT OR REPLACE INTO runs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, (SELECT basis FROM runs WHERE rid = ?1), ?16, (SELECT score_opts FROM runs WHERE rid = ?1))",
-            params![rid, sid, variant, arm, model, r.repeat, status, r.cost_usd, r.turns, r.wall_s, usage, prompt_rev, sorrel_rev, learned_rev, state, r.output_hash],
+            params![rid, sid, variant, arm, model, r.repeat, status, r.cost_usd, r.turns, r.wall_s, usage, prompt_rev, sorrel_rev, learned_rev, state, output_hash],
         )?;
         tx.execute("DELETE FROM arm_actions WHERE rid = ?1", [rid])?;
         for (seq, target, action, confidence, reasons) in rows {
@@ -1403,6 +1405,24 @@ mod tests {
         };
         d.record_variant(&prompt("good/mua")).unwrap();
         assert!(d.record_variant(&prompt("see sess_ks4")).is_err());
+        // provenance hashes are guarded too: a path or a denied name never lands
+        for bad in ["/data/x", "sess_ks4"] {
+            assert!(d
+                .record_session(&SessionRow {
+                    truth_hash: Some(bad.into()),
+                    ..dev("s1", "fp1")
+                })
+                .is_err());
+            assert!(d
+                .record_run(
+                    &RunRow {
+                        output_hash: Some(bad.into()),
+                        ..run("v0")
+                    },
+                    &[]
+                )
+                .is_err());
+        }
         assert_eq!(
             d.query("SELECT COUNT(*) FROM runs").unwrap(),
             "COUNT(*)\n0\n"
