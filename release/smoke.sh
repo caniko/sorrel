@@ -13,6 +13,9 @@ expected=(
   "sorrel-${VERSION}-x86_64-windows.zip"
   "sorrel-${VERSION}-x86_64-windows.exe"
   "sorrel-${VERSION}-x86_64-windows-gui.exe"
+  "sorrel-${VERSION}-aarch64-windows.zip"
+  "sorrel-${VERSION}-aarch64-windows.exe"
+  "sorrel-${VERSION}-aarch64-windows-gui.exe"
   "sorrel-${VERSION}-aarch64-darwin.tar.gz"
   "sorrel-${VERSION}-x86_64.AppImage"
   "sorrel-${VERSION}.tar.gz"
@@ -37,6 +40,10 @@ unzip -Z1 "sorrel-${VERSION}-x86_64-windows.zip" | grep -Fx 'sorrel.exe' >/dev/n
 unzip -Z1 "sorrel-${VERSION}-x86_64-windows.zip" | grep -Fx 'sorrelw.exe' >/dev/null
 unzip -p "sorrel-${VERSION}-x86_64-windows.zip" sorrel.exe | cmp - "sorrel-${VERSION}-x86_64-windows.exe"
 unzip -p "sorrel-${VERSION}-x86_64-windows.zip" sorrelw.exe | cmp - "sorrel-${VERSION}-x86_64-windows-gui.exe"
+unzip -Z1 "sorrel-${VERSION}-aarch64-windows.zip" | grep -Fx 'sorrel.exe' >/dev/null
+unzip -Z1 "sorrel-${VERSION}-aarch64-windows.zip" | grep -Fx 'sorrelw.exe' >/dev/null
+unzip -p "sorrel-${VERSION}-aarch64-windows.zip" sorrel.exe | cmp - "sorrel-${VERSION}-aarch64-windows.exe"
+unzip -p "sorrel-${VERSION}-aarch64-windows.zip" sorrelw.exe | cmp - "sorrel-${VERSION}-aarch64-windows-gui.exe"
 tar -tzf "sorrel-${VERSION}.tar.gz" | grep -Fx "sorrel-${VERSION}/Cargo.toml" >/dev/null
 
 for wheel in sorrel_ephys-"${VERSION}"-cp38-abi3-*.whl; do
