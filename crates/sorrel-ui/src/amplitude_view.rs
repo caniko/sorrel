@@ -234,15 +234,18 @@ pub fn amplitude_view<P: DataProvider>(
                 state.cancel_split();
             }
         }
-        ui.weak("(a)");
+        ui.weak(format!(
+            "({})",
+            crate::settings::hint(ui.ctx(), "amplitudes.next")
+        ));
         if current.is_none() {
             ui.spinner();
         }
     });
     let hint = match (state.lasso.is_active(), state.can_split()) {
-        (_, true) => "k splits · Esc clears",
-        (true, false) => "Ctrl+click to add points",
-        _ => "Ctrl+click: lasso · Shift+drag: time range · Alt+right-drag: threshold",
+        (_, true) => crate::settings::split_hint(ui.ctx()),
+        (true, false) => "Ctrl+click to add points".into(),
+        _ => "Ctrl+click: lasso · Shift+drag: time range · Alt+right-drag: threshold".into(),
     };
     // A truncated hint keeps its full gesture list on hover.
     ui.add(egui::Label::new(egui::RichText::new(hint).weak()).truncate())

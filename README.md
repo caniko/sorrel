@@ -39,17 +39,9 @@ sorrel open <KILOSORT_DIR> --dat recording.dat --sample-rate 30000 --channels 32
 - Loads `cluster_group.tsv` into a `Vec<PhyLabel>` (1 byte per cluster).
 - Curation operations are journaled synchronously to the journal **before** the in-memory state changes.
 
-### Keyboard
-
-| Key                               | Action                                                                   |
-| --------------------------------- | ------------------------------------------------------------------------ |
-| `G` / `M` / `N` / `U`             | Label the selection Good / MUA / Noise / Unsorted                        |
-| `J` / `K` / arrows                | Next / previous cluster in table order                                   |
-| `H` / `L`                         | Pan trace window (drag / wheel in the trace also pans; Ctrl-wheel zooms) |
-| `Cmd/Ctrl-G`                      | Merge the selection into the first-selected cluster                      |
-| `Cmd/Ctrl-Z` / `Cmd/Ctrl-Shift-Z` | Undo / redo                                                              |
-| `Cmd/Ctrl-S`                      | Save `spike_clusters.npy` + `cluster_group.tsv`                          |
-| `?` / `F1`                        | Keyboard & mouse help overlay                                            |
+Configure shortcuts in **Settings → Keyboard shortcuts**. **Help** shows the
+active bindings. Shortcuts and global preferences are saved in
+`~/.sorrel/settings.toml`; see [Keyboard & Mouse](docs/src/usage/keyboard-controls.md).
 
 Views are dockable tiles: drag tabs to rearrange, `×` to close, the
 **View** menu to reopen. See `docs/src/usage/views.md` and

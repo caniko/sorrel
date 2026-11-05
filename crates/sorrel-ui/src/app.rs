@@ -936,7 +936,9 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 resp
             })
             .inner;
-        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        if (resp.has_focus() || resp.lost_focus())
+            && crate::settings::pressed(ui.ctx(), "app.submit")
+        {
             let text = self.snippet.take().unwrap_or_default();
             match crate::snippets::parse(&text) {
                 Ok(snippet) => self.run_snippet(snippet),
@@ -1175,9 +1177,28 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         let before = read(&self.session).version();
         match self.host.apply(Actor::Human, cmd) {
             Err(e) => self.error = Some(format!("journal write failed: {e}")),
-            Ok(ev) if ev.version != before => self.status = toast(ev.desc),
+            Ok(ev) if ev.version != before => {
+                self.cancel_feature_interaction();
+                self.status = toast(ev.desc);
+            }
             Ok(_) => {}
         }
+    }
+
+    /// Abandon only Features' spike-selection operation. Clearing its brush
+    /// here also updates linked panes when Features is hidden. This is not
+    /// a journal Undo: an unrelated edit must never be reverted by Cancel.
+    fn cancel_feature_interaction(&mut self) -> bool {
+        let was_cutting = self.feature_state.cancel_operation();
+        if self.brushes.spikes.as_ref().is_some_and(|b| {
+            matches!(
+                b.source,
+                crate::brush::BrushSource::FeatureLasso | crate::brush::BrushSource::KMeansPart
+            )
+        }) {
+            self.brushes.spikes = None;
+        }
+        was_cutting
     }
 
     /// Turn lasso hits into one journal entry (a batch when several
@@ -1250,6 +1271,21 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         let title = pending.title.clone();
         let body = pending.body.clone();
         let is_quit = matches!(pending.action, ConfirmAction::Quit);
+        let submit = crate::settings::pressed(ctx, "app.submit");
+        // egui's modal and focused buttons otherwise retain hidden Escape /
+        // Enter / Space bindings after the user remaps our dialog commands.
+        // Native text editing elsewhere is deliberately unaffected.
+        ctx.input_mut(|i| {
+            i.events.retain(|e| {
+                !matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::Enter | egui::Key::Space,
+                        ..
+                    }
+                )
+            })
+        });
         let accent = egui::Color32::from_rgb(80, 130, 60);
         let danger = ctx.global_style().visuals.error_fg_color;
         let btn = egui::vec2(110.0, 30.0);
@@ -1274,7 +1310,9 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     )
                     .fill(accent)
                     .min_size(btn);
-                    let resp = ui.add(primary).on_hover_text("Enter");
+                    let resp = ui
+                        .add(primary)
+                        .on_hover_text(crate::settings::hint(ui.ctx(), "app.submit"));
                     if ui.memory(|m| m.focused().is_none()) {
                         resp.request_focus();
                     }
@@ -1300,13 +1338,13 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     }
                     if ui
                         .add(egui::Button::new("Cancel").min_size(btn))
-                        .on_hover_text("Esc")
+                        .on_hover_text(crate::settings::hint(ui.ctx(), "app.cancel"))
                         .clicked()
                     {
                         decision = Some(Decision::Cancel);
                     }
                 });
-                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if submit {
                     decision = Some(if is_quit {
                         Decision::SaveThenConfirm
                     } else {
@@ -1314,7 +1352,8 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     });
                 }
             });
-        if decision.is_none() && resp.should_close() {
+        if decision.is_none() && (resp.backdrop_response.clicked() || resp.response.should_close())
+        {
             decision = Some(Decision::Cancel);
         }
         let Some(decision) = decision else {
@@ -1343,12 +1382,13 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             return;
         }
         // Keyboard rows come from the keymap itself, so they cannot drift.
-        use crate::intent::{help_rows, Section};
-        let keys = help_rows();
-        let section = |s: Section| -> Vec<(String, &'static str)> {
-            keys.iter()
-                .filter(|r| r.0 == s)
-                .map(|r| (r.1.clone(), r.2))
+        use crate::shortcuts::{Scope, COMMANDS};
+        let map = crate::settings::shared(ctx).lock().unwrap().keymap.clone();
+        let section = |scope: Scope| -> Vec<(String, &'static str)> {
+            COMMANDS
+                .iter()
+                .filter(|c| c.scope == scope)
+                .map(|c| (map.hint(c.id), c.description))
                 .collect()
         };
         let mouse: Vec<(String, &'static str)> = [
@@ -1380,14 +1420,16 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 "tab-bar maximize · pop-out buttons",
                 "fill the window with one view · move it to its own window",
             ),
-            ("F11", "full screen for the window it is pressed in"),
         ]
         .map(|(k, v)| (k.to_string(), v))
         .to_vec();
         let groups = [
-            ("Curation", section(Section::Curation)),
-            ("Navigation", section(Section::Navigation)),
-            ("Views", section(Section::Views)),
+            ("Recording", section(Scope::Recording)),
+            ("Application", section(Scope::Application)),
+            ("Window", section(Scope::Window)),
+            ("Waveforms (hovered)", section(Scope::Waveforms)),
+            ("CCG (hovered)", section(Scope::Ccg)),
+            ("Dialogs and text commands", section(Scope::Submit)),
             ("Mouse", mouse),
         ];
         egui::Window::new("Keyboard & mouse")
@@ -1435,7 +1477,8 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     return;
                 }
                 Intent::Move(..) | Intent::Snippet(":l ") => {
-                    self.status = toast("labels are unavailable in merge mode (V leaves it)");
+                    self.status =
+                        toast("labels are unavailable in merge mode; leave merge mode first");
                     return;
                 }
                 _ => {}
@@ -1637,19 +1680,12 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 } else if self.amplitude_state.cancel_split() {
                     self.status = toast("amplitude split cancelled");
                 } else if self.feature_state.lasso_active() {
-                    self.feature_state.cancel_lasso();
-                    // The lasso's brush goes with it; sync_brush only runs
-                    // when Features draws.
-                    if self.brushes.spikes.as_ref().is_some_and(|b| {
-                        matches!(
-                            b.source,
-                            crate::brush::BrushSource::FeatureLasso
-                                | crate::brush::BrushSource::KMeansPart
-                        )
-                    }) {
-                        self.brushes.spikes = None;
-                    }
-                    self.status = toast("lasso cancelled");
+                    let was_cutting = self.cancel_feature_interaction();
+                    self.status = toast(if was_cutting {
+                        "cut cancelled — cluster unchanged"
+                    } else {
+                        "lasso cancelled"
+                    });
                 } else if self.brushes.cancel() {
                     self.status = toast("brush cleared");
                 } else if self.detached.maximized.take().is_some() {
@@ -1741,7 +1777,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     Icon::Dot,
                     "unsaved",
                     theme.warn,
-                    "Unsaved curation — Cmd/Ctrl-S writes phy artefacts.".to_string(),
+                    format!(
+                        "Unsaved curation — {} writes phy artefacts.",
+                        crate::settings::hint(ui.ctx(), "curation.save")
+                    ),
                 )
             } else if let Some(tip) = &self.last_save {
                 (Icon::Check, "saved", theme.good, tip.clone())
@@ -1805,7 +1844,12 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
 
             let undo_tip = undo
                 .as_ref()
-                .map(|d| format!("Undo {d} (Cmd/Ctrl-Z)"))
+                .map(|d| {
+                    format!(
+                        "Undo {d} ({})",
+                        crate::settings::hint(ui.ctx(), "curation.undo")
+                    )
+                })
                 .unwrap_or_else(|| "Nothing to undo".into());
             if ui
                 .add_enabled(undo.is_some(), egui::Button::new("Undo"))
@@ -1817,7 +1861,12 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             }
             let redo_tip = redo
                 .as_ref()
-                .map(|d| format!("Redo {d} (Cmd/Ctrl-Shift-Z)"))
+                .map(|d| {
+                    format!(
+                        "Redo {d} ({})",
+                        crate::settings::hint(ui.ctx(), "curation.redo")
+                    )
+                })
                 .unwrap_or_else(|| "Nothing to redo".into());
             if ui
                 .add_enabled(redo.is_some(), egui::Button::new("Redo"))
@@ -1846,9 +1895,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             if ui
                 .add_enabled(n_sel >= 2, egui::Button::new(merge_label))
                 .on_hover_text(format!(
-                    "Merge the selection into cluster {target} (Cmd/Ctrl-G)"
+                    "Merge the selection into cluster {target} ({})",
+                    crate::settings::hint(ui.ctx(), "curation.merge")
                 ))
-                .on_disabled_hover_text("Select two or more clusters to merge (Cmd/Ctrl-G)")
+                .on_disabled_hover_text("Select two or more clusters to merge")
                 .clicked()
             {
                 self.dispatch_intent(Intent::MergeSelection);
@@ -1866,8 +1916,9 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             }
             let save_tip = match self.save_dir.as_deref() {
                 Some(dir) => format!(
-                    "Write spike_clusters.npy + cluster_group.tsv to {} (Cmd/Ctrl-S)",
-                    dir.display()
+                    "Write spike_clusters.npy + cluster_group.tsv to {} ({})",
+                    dir.display(),
+                    crate::settings::hint(ui.ctx(), "curation.save")
                 ),
                 None => "Open sorrel with a kilosort directory to enable saving.".to_string(),
             };
@@ -1892,10 +1943,21 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 ui.push_id("topbar-right", |ui| {
                     if ui
                         .button("Help")
-                        .on_hover_text("Keyboard & mouse help (? / F1)")
+                        .on_hover_text(format!(
+                            "Keyboard & mouse help ({})",
+                            crate::settings::hint(ui.ctx(), "app.help")
+                        ))
                         .clicked()
                     {
                         self.show_help = !self.show_help;
+                    }
+                    if !crate::settings::shared(ui.ctx())
+                        .lock()
+                        .unwrap()
+                        .shell_owned
+                        && ui.button("Settings").clicked()
+                    {
+                        crate::settings::open(ui.ctx());
                     }
                     ui.menu_button("View", |ui| {
                         let closed = layout::missing_panes(&self.tree);
@@ -2365,6 +2427,11 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
 impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root_ui.ctx().clone();
+        crate::settings::capture_input(&ctx);
+        crate::settings::shared(&ctx).lock().unwrap().modal = self.pending_confirm.is_some();
+        if !crate::settings::shared(&ctx).lock().unwrap().shell_owned {
+            layout::window_shortcuts(&ctx);
+        }
         if !self.visuals_installed {
             crate::theme::install_visuals(&ctx);
             crate::theme::install_style(&ctx);
@@ -2392,8 +2459,7 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
             self.finish_screenshot(pane, &image);
         }
 
-        let text_input_active = ctx.egui_wants_keyboard_input();
-        let input_intents = ctx.input(|i| layout::key_intents(&i.events, text_input_active));
+        let input_intents = layout::configured_key_intents(&ctx);
         let dialog_open = self.pending_confirm.is_some();
         for it in input_intents {
             if dialog_open && !matches!(it, Intent::Cancel) {
@@ -2436,8 +2502,10 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                     ui.horizontal(|ui| {
                         ui.strong("Merge mode");
                         ui.label(format!(
-                            "{staged} staged + {similar} similar · G merges {} · V cancels",
-                            staged + similar
+                            "{staged} staged + {similar} similar · {} merges {} · {} cancels",
+                            crate::settings::hint(ui.ctx(), "curation.merge"),
+                            staged + similar,
+                            crate::settings::hint(ui.ctx(), "curation.merge_mode")
                         ));
                         if ui.button("Cancel merge mode").clicked() {
                             self.dispatch_intent(Intent::ToggleMergeMode);
@@ -2508,6 +2576,15 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
 
         egui::CentralPanel::default()
             .show_inside(root_ui, |ui| self.tiles_and_popouts(&ctx, Some(ui)));
+        let shell_owned = {
+            let shared = crate::settings::shared(&ctx);
+            let mut rt = shared.lock().unwrap();
+            rt.modal = self.pending_confirm.is_some();
+            rt.shell_owned
+        };
+        if !shell_owned {
+            crate::settings::show(&ctx);
+        }
     }
 
     fn on_exit(&mut self) {
@@ -2564,6 +2641,47 @@ mod tests {
     use sorrel_data::session::ApplyPhyLabel;
     use sorrel_data::{Journal, PhyLabelOp, Session};
     use sorrel_io::{ClusterId, DataProvider, SampleIndex, TraceSamples, TraceSlice};
+
+    #[test]
+    fn remapping_dialog_submit_does_not_leave_native_enter_bound() {
+        let (mut app, _dir) = make_app();
+        app.pending_confirm = Some(PendingConfirm {
+            title: "Confirm test".into(),
+            body: "Test".into(),
+            action: ConfirmAction::Dispatch(CurationCommand::Relabel {
+                cluster: ClusterId(0),
+                op: PhyLabelOp::SetGood,
+            }),
+            on_success: "done".into(),
+        });
+        let ctx = egui::Context::default();
+        {
+            let shared = crate::settings::shared(&ctx);
+            let mut rt = shared.lock().unwrap();
+            rt.settings
+                .keybindings
+                .insert("app.submit".into(), vec!["F8".into()]);
+            rt.keymap = rt.settings.validate().unwrap();
+        }
+        for (key, remains) in [
+            (egui::Key::Enter, true),
+            (egui::Key::Escape, true),
+            (egui::Key::F8, false),
+        ] {
+            let input = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| app.show_confirm_dialog(ui.ctx()));
+            assert_eq!(app.pending_confirm.is_some(), remains);
+        }
+    }
 
     /// Minimal in-memory `DataProvider` — just enough metadata for the app's
     /// state machine. Trace, waveform, and template paths are exercised by
@@ -3211,6 +3329,78 @@ mod tests {
         };
         assert!(app.commit(cmd));
         assert!(history_len(&app) > baseline);
+    }
+
+    #[test]
+    fn cancelling_a_pending_feature_cut_discards_selection_without_undoing_an_edit() {
+        use crate::brush::{BrushSource, SpikeBrush, TimeBrush};
+        let (mut app, _dir) = make_app();
+        assert!(app.commit(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetGood,
+        }));
+        app.selection.replace(ClusterId(0));
+        let before = {
+            let session = read(&app.session);
+            (
+                session.version(),
+                session.history_len(),
+                session.n_clusters(),
+                session.spike_clusters_global().to_vec(),
+                session.labels().to_vec(),
+            )
+        };
+        let time = TimeBrush::new(0.1, 0.5);
+        app.brushes.time = time;
+        app.brushes.spikes = SpikeBrush::new(
+            BrushSource::FeatureLasso,
+            before.0,
+            [(ClusterId(0), vec![0])],
+        );
+        app.feature_state.set_test_lasso();
+        app.feature_state.request_split();
+        app.feature_state.km.auto_run = true;
+
+        app.dispatch_intent(Intent::Cancel);
+        assert!(!app.feature_state.lasso_active());
+        assert!(!app.feature_state.can_split());
+        assert!(app.brushes.spikes.is_none());
+        assert_eq!(app.brushes.time, time);
+        assert_eq!(app.selection.as_slice(), &[ClusterId(0)]);
+        assert!(
+            !app.feature_state.km.auto_run,
+            "Cancel must not re-arm the lasso"
+        );
+        // Pressing Split again cannot reuse the abandoned spike subset.
+        app.dispatch_intent(Intent::Split);
+        let session = read(&app.session);
+        assert_eq!(session.version(), before.0);
+        assert_eq!(session.history_len(), before.1);
+        assert_eq!(session.n_clusters(), before.2);
+        assert_eq!(session.spike_clusters_global(), before.3);
+        assert_eq!(session.labels(), before.4);
+    }
+
+    #[test]
+    fn undoing_a_completed_lasso_batch_restores_membership_and_clears_its_selection() {
+        use crate::brush::{BrushSource, SpikeBrush};
+        let (mut app, _dir) = make_app();
+        let before = read(&app.session).spike_clusters_global().to_vec();
+        app.apply_lasso_splits(vec![(ClusterId(0), vec![0]), (ClusterId(1), vec![0])]);
+        assert_eq!(history_len(&app), 1, "a multi-cluster cut is one Undo step");
+        assert_eq!(read(&app.session).n_clusters(), 5);
+        app.feature_state.set_test_lasso();
+        app.brushes.spikes = SpikeBrush::new(
+            BrushSource::FeatureLasso,
+            read(&app.session).version(),
+            [(ClusterId(0), vec![0])],
+        );
+        app.dispatch_intent(Intent::Undo);
+        let session = read(&app.session);
+        assert_eq!(session.n_clusters(), 3);
+        assert_eq!(session.spike_clusters_global(), before);
+        assert!(!app.feature_state.lasso_active());
+        assert!(app.brushes.spikes.is_none());
     }
 
     #[test]

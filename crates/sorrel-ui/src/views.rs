@@ -732,10 +732,11 @@ pub fn raster_view<P: DataProvider>(
     let (v_span, r_top, r_span) = ((v1 - v0).max(1e-6), n_rows - y1, (y1 - y0).max(1e-3));
     let (rect, resp) = alloc_plot(ui, egui::vec2(120.0, 160.0), Sense::click_and_drag());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "raster plot"));
-    let resp = resp.on_hover_text(
+    let resp = resp.on_hover_text(format!(
         "Click to seek the trace to that time. Drag pans, wheel zooms, double-click resets. \
-         Shift+drag sets a time range (Esc clears).",
-    );
+         Shift+drag sets a time range ({} clears).",
+        crate::settings::hint(ui.ctx(), "app.cancel")
+    ));
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme.plot_bg);
     // Row ids are drawn below; an empty y tick list only reserves the gutter.

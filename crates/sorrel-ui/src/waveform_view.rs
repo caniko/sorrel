@@ -1,7 +1,7 @@
 //! phy WaveformView: spikes, means or templates per channel at probe positions.
 //!
-//! Channels follow phylib `_find_best_channels` (the primary template's peak
-//! channel and its nearest neighbours, 12 in all, on the same shank); modes, overlap and the
+//! One shared channel set follows the primary cluster's peak, four channels
+//! in all by default, on the same shank. Modes, overlap and the
 //! scaling keys follow phy v2.1's `WaveformView`. Parameters live in
 //! [`WaveformParams`] so they persist with the other prefs.
 
@@ -14,13 +14,8 @@ use crate::feature_view::{ChannelEdit, FeatureLink};
 use crate::layout::ViewAction;
 use crate::prefs::{WaveformMode, WaveformParams};
 use crate::theme::{selection_colour, Theme};
-use crate::views::{
-    alloc_plot, axes_data_rect, draw_axes_grid, grid_colour, nice_ticks, pad_range, tick_label,
-    TICK_PX,
-};
+use crate::views::{alloc_plot, grid_colour, nice_ticks, pad_range, tick_label, TICK_PX};
 
-/// phylib's `n_closest_channels`: channels shown besides the peak.
-const N_NEAREST: usize = 12;
 /// Templates drawn per cluster in `Templates` mode (a heavily merged cluster
 /// can span hundreds); the rest are dropped, smallest share first.
 // ponytail: fixed cap, make it a param if someone needs the long tail.
@@ -580,12 +575,34 @@ pub(crate) fn nearest_channels(
     others
 }
 
-/// Sorted union of per-cluster channel sets.
-pub(crate) fn union_channels(sets: &[Vec<usize>]) -> Vec<usize> {
-    let mut all: Vec<usize> = sets.iter().flatten().copied().collect();
-    all.sort_unstable();
-    all.dedup();
-    all
+/// One channel set for the whole selection. Adding a comparison cluster must
+/// not add another cluster's neighbours and silently expand a tetrode view.
+fn display_channels(
+    n_channels: usize,
+    peak: usize,
+    geometry: &[[f32; 2]],
+    shanks: &[u32],
+    limit: usize,
+) -> Vec<usize> {
+    if n_channels == 0 {
+        return Vec::new();
+    }
+    let peak = peak.min(n_channels - 1);
+    let limit = limit.clamp(1, n_channels);
+    if geometry.len() == n_channels {
+        return nearest_channels(peak, geometry, shanks, limit);
+    }
+    // Without positions there is no physical-neighbour inference to make.
+    // Keep the primary peak, then channels in acquisition order, respecting
+    // an explicit channel group if one was supplied.
+    let mut channels = vec![peak];
+    channels
+        .extend((0..n_channels).filter(|&ch| {
+            ch != peak && (shanks.len() != n_channels || shanks[ch] == shanks[peak])
+        }));
+    channels.truncate(limit);
+    channels.sort_unstable();
+    channels
 }
 
 /// Peak channel of a template (`n_samples × n_channels`, flat): argmax |v|.
@@ -624,68 +641,59 @@ pub(crate) fn next_mode(mode: WaveformMode, dir: i32, has_templates: bool) -> Wa
 
 /// Consume one exact `key` press (ctrl = command), so nothing downstream
 /// (the global keymap) sees it.
-fn take_key(i: &mut egui::InputState, key: egui::Key, command: bool, shift: bool) -> bool {
-    let mut hit = false;
-    i.events.retain(|e| match e {
-        egui::Event::Key {
-            key: k,
-            pressed: true,
-            modifiers: m,
-            ..
-        } if *k == key && m.command == command && m.shift == shift && !m.alt => {
-            hit = true;
-            false
-        }
-        _ => true,
-    });
-    hit
-}
-
 /// Pane-local keys (only called while the pane is hovered). Returns true
 /// when `R` asked for a reset of the scaling.
-fn handle_keys(i: &mut egui::InputState, p: &mut WaveformParams, has_templates: bool) -> bool {
-    use egui::Key as K;
+fn handle_keys(ctx: &egui::Context, p: &mut WaveformParams, has_templates: bool) -> bool {
+    use crate::shortcuts::{Action, Scope, WaveformAction as W};
     const STEP: f32 = 1.1;
     let mut reset = false;
-    if take_key(i, K::W, false, true) {
+    let actions = crate::settings::consume(ctx, Scope::Waveforms);
+    let has = |a| actions.contains(&Action::Waveform(a));
+    if has(W::Previous) {
         p.mode = next_mode(p.mode, -1, has_templates);
     }
-    if take_key(i, K::W, false, false) {
+    if has(W::Next) {
         p.mode = next_mode(p.mode, 1, has_templates);
     }
     // phy `toggle_mean_waveforms`: mean-only <-> spikes with the mean on top.
-    if take_key(i, K::M, false, false) {
+    if has(W::Mean) {
         p.mode = if p.mode == WaveformMode::Mean {
             WaveformMode::Waveforms
         } else {
             WaveformMode::Mean
         };
     }
-    if take_key(i, K::O, false, false) {
+    if has(W::Overlap) {
         p.overlap = !p.overlap;
     }
-    if take_key(i, K::L, true, false) {
+    if has(W::Labels) {
         p.show_labels = !p.show_labels;
     }
     let scale =
         |v: &mut f32, up: bool| *v = (*v * if up { STEP } else { 1.0 / STEP }).clamp(0.05, 50.0);
-    for (key, up) in [(K::ArrowUp, true), (K::ArrowDown, false)] {
-        if take_key(i, key, true, false) {
+    for (amplitude, spread, up) in [
+        (W::AmplitudeUp, W::SpreadUp, true),
+        (W::AmplitudeDown, W::SpreadDown, false),
+    ] {
+        if has(amplitude) {
             scale(&mut p.amp_scale, up);
         }
-        if take_key(i, key, false, true) {
+        if has(spread) {
             scale(&mut p.probe_scale[1], up);
         }
     }
-    for (key, up) in [(K::ArrowRight, true), (K::ArrowLeft, false)] {
-        if take_key(i, key, true, false) {
+    for (box_width, spread, up) in [
+        (W::BoxWider, W::SpreadWider, true),
+        (W::BoxNarrower, W::SpreadNarrower, false),
+    ] {
+        if has(box_width) {
             scale(&mut p.box_scale[0], up);
         }
-        if take_key(i, key, false, true) {
+        if has(spread) {
             scale(&mut p.probe_scale[0], up);
         }
     }
-    if take_key(i, K::R, false, false) || take_key(i, K::R, false, true) {
+    if has(W::Reset) {
         p.box_scale = [1.0; 2];
         p.probe_scale = [1.0; 2];
         p.amp_scale = 1.0;
@@ -768,9 +776,9 @@ fn mean_of<'a>(
 
 // ---- Drawing -----------------------------------------------------------
 
-/// Multi-cluster waveform view. Shows each selected cluster's best channels
-/// (see [`nearest_channels`]) at their probe positions, or a single peak
-/// channel when no probe geometry is available. Caches the extracted
+/// Multi-cluster waveform view. Shows all selected clusters on one shared
+/// channel set (four channels by default), at their probe positions or in a
+/// simple grid when no geometry is available. Caches the extracted
 /// snippets so cluster-switching stalls happen at most once per change.
 /// Clicks on a channel box queue a [`ViewAction::Channel`]: Shift+click
 /// toggles it in the Features channel set, Ctrl+click / Ctrl+right-click set
@@ -815,7 +823,7 @@ pub fn waveform_view<P: DataProvider>(
             // egui reports Ctrl+wheel as a zoom gesture.
             params.box_scale[1] = (params.box_scale[1] * pinch).clamp(0.05, 50.0);
         }
-        if ui.input_mut(|i| handle_keys(i, params, has_templates)) {
+        if handle_keys(ui.ctx(), params, has_templates) {
             cache.frozen = None;
         }
     }
@@ -871,32 +879,18 @@ pub fn waveform_view<P: DataProvider>(
         _ => None,
     };
     cache.ensure_ghost(session, ghost, pre, post);
-    let peaks = channel_peak_abs(&cache.means, nc);
     let geometry_available = geometry.len() == nc;
-
-    // Channels per cluster, and their sorted union.
-    let per_cluster: Vec<Vec<usize>> = if geometry_available {
-        selection
-            .iter()
-            .enumerate()
-            .map(|(ci, _)| {
-                let tpl_peak = cache
-                    .templates
-                    .get(ci)
-                    .and_then(|t| t.first())
-                    .and_then(|&(tid, _)| session.template_waveform(tid))
-                    .and_then(|w| template_peak(w, session.template_shape().2))
-                    .filter(|&ch| ch < nc);
-                tpl_peak
-                    .or_else(|| cache.peak_channel(ci))
-                    .map(|p| nearest_channels(p, geometry, shanks, N_NEAREST))
-                    .unwrap_or_default()
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let chans = union_channels(&per_cluster);
+    params.max_channels = params.max_channels.clamp(1, nc);
+    let peak = cache
+        .templates
+        .first()
+        .and_then(|t| t.first())
+        .and_then(|&(tid, _)| session.template_waveform(tid))
+        .and_then(|w| template_peak(w, session.template_shape().2))
+        .filter(|&ch| ch < nc)
+        .or_else(|| cache.peak_channel(0))
+        .unwrap_or(0);
+    let chans = display_channels(nc, peak, geometry, shanks, params.max_channels);
 
     let theme = Theme::from_ui(ui);
     let hp = if cache.cfg.hp().is_some() {
@@ -905,17 +899,19 @@ pub fn waveform_view<P: DataProvider>(
         "raw"
     };
     let ms = pre as f32 / sr * 1000.0;
-    let head = if geometry_available {
-        format!("{} ch · ±{ms:.1} ms", chans.len())
-    } else {
-        let peak = peaks
-            .iter()
-            .enumerate()
-            .fold((0, 0.0f32), |b, (i, &v)| if v > b.1 { (i, v) } else { b });
-        format!("ch {} · ±{ms:.1} ms · no probe geometry", peak.0)
-    };
+    let head = format!(
+        "{} ch · ±{ms:.1} ms{}",
+        chans.len(),
+        if geometry_available {
+            ""
+        } else {
+            " · no probe geometry"
+        }
+    );
     // V1: one-row bar. `overlap` (phy `o`) checked (default) superimposes
     // every cluster in the cell; unchecked is phy's side-by-side slots.
+    let compact = ui.available_width() < 300.0;
+    let (mut overlap, mut pc_shapes) = (params.overlap, params.pc_shapes);
     crate::views::param_bar(
         ui,
         &head,
@@ -927,24 +923,48 @@ pub fn waveform_view<P: DataProvider>(
                     .suffix(" spikes"),
             )
             .on_hover_text("spikes sampled per cluster (phy n_spikes_waveforms)");
-            ui.checkbox(&mut params.overlap, "overlap")
-                .on_hover_text("o: superimpose the selected clusters (off = side-by-side slots)");
-            ui.checkbox(&mut params.pc_shapes, "PC shapes")
-                .on_hover_text(
-                "dashed PC1 / dotted PC2 temporal shape of the focused Features plot's channels",
-            );
+            if !compact {
+                ui.checkbox(&mut params.overlap, "overlap")
+                    .on_hover_text(format!(
+                        "{}: superimpose the selected clusters (off = side-by-side slots)",
+                        crate::settings::hint(ui.ctx(), "waveforms.overlap")
+                    ));
+                ui.checkbox(&mut params.pc_shapes, "PC shapes")
+                    .on_hover_text(
+                        "dashed PC1 / dotted PC2 temporal shape of the focused Features plot's channels",
+                    );
+            }
         },
         |ui| {
             ui.weak(format!("source: {hp} (follows the trace pane)"));
+            if compact {
+                ui.checkbox(&mut overlap, "overlap");
+                ui.checkbox(&mut pc_shapes, "PC shapes");
+            }
+            if ui
+                .add(
+                    egui::DragValue::new(&mut params.max_channels)
+                        .range(1..=nc)
+                        .suffix(" channels"),
+                )
+                .on_hover_text("Total channels for all selected clusters; default 4 for a tetrode")
+                .changed()
+            {
+                cache.frozen = None;
+            }
             ui.selectable_value(&mut params.mode, WaveformMode::Waveforms, "spikes + mean");
             ui.selectable_value(&mut params.mode, WaveformMode::Mean, "mean");
             if has_templates {
                 ui.selectable_value(&mut params.mode, WaveformMode::Templates, "templates");
             }
             ui.checkbox(&mut params.show_labels, "channel labels")
-                .on_hover_text("ctrl+l");
+                .on_hover_text(crate::settings::hint(ui.ctx(), "waveforms.labels"));
         },
     );
+    if compact {
+        params.overlap = overlap;
+        params.pc_shapes = pc_shapes;
+    }
     ui.add(egui::Label::new(egui::RichText::new(link_hint(&link.set)).small().weak()).truncate())
         .on_hover_text(link_legend(link, params.pc_shapes));
     // V6.2 legend: swatch + cluster id per selection slot.
@@ -969,12 +989,19 @@ pub fn waveform_view<P: DataProvider>(
         snippet_len,
         sr,
     };
-    if geometry_available && !chans.is_empty() {
-        if let Some(edit) = ctx.probe_layout(ui, geometry, &chans, &per_cluster) {
-            actions.push(ViewAction::Channel(edit));
-        }
+    let fallback;
+    let positions = if geometry_available {
+        geometry
     } else {
-        ctx.single_channel(ui, &peaks);
+        let mut positions = vec![[0.0, 0.0]; nc];
+        for (slot, &ch) in chans.iter().enumerate() {
+            positions[ch] = [(slot % 2) as f32 * 32.0, (slot / 2) as f32 * 20.0];
+        }
+        fallback = positions;
+        &fallback
+    };
+    if let Some(edit) = ctx.probe_layout(ui, positions, &chans) {
+        actions.push(ViewAction::Channel(edit));
     }
 }
 
@@ -1019,46 +1046,12 @@ impl<P: DataProvider> Ctx<'_, P> {
         })
     }
 
-    fn single_channel(mut self, ui: &mut Ui, peaks: &[f32]) {
-        let theme = self.theme;
-        let (peak_ch, peak_val) =
-            peaks.iter().enumerate().fold(
-                (0usize, 0.0f32),
-                |b, (i, &v)| if v > b.1 { (i, v) } else { b },
-            );
-        if peak_val <= 0.0 {
-            ui.label("no waveforms in range — try expanding the selection");
-            return;
-        }
-        let (lo, hi) = self.range(&[peak_ch]);
-        let ms = (self.snippet_len as f32 / 2.0) / self.sr * 1000.0;
-        let (rect, _resp) = alloc_plot(ui, egui::vec2(120.0, 160.0), Sense::hover());
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, theme.plot_bg);
-        let data = axes_data_rect(rect, true);
-        let amp = self.params.amp_scale;
-        draw_axes_grid(
-            &painter,
-            rect,
-            (-ms, ms),
-            (lo / amp, hi / amp),
-            "ms",
-            "amplitude",
-            theme,
-        );
-        let all: Vec<usize> = (0..self.selection.len()).collect();
-        // No geometry: superimpose every cluster on the one channel.
-        let mark = BoxMark::default();
-        self.draw_box(&painter, data, peak_ch, &all, true, (lo, hi), 2.0, mark);
-    }
-
     /// Returns the channel edit a click on a box asks for.
     fn probe_layout(
         &mut self,
         ui: &mut Ui,
         geometry: &[[f32; 2]],
         chans: &[usize],
-        per_cluster: &[Vec<usize>],
     ) -> Option<ChannelEdit> {
         let theme = self.theme;
         let peaks = channel_peak_abs(&self.cache.means, self.nc);
@@ -1118,7 +1111,7 @@ impl<P: DataProvider> Ctx<'_, P> {
         let (x_mid, y_mid) = ((x_min + x_max) * 0.5, (y_min + y_max) * 0.5);
 
         let mut boxes: Vec<(usize, egui::Rect)> = Vec::with_capacity(chans.len());
-        let mut max_slots = 1;
+        let present: Vec<usize> = (0..self.selection.len()).collect();
         for &ch in chans {
             let g = geometry[ch];
             // y is flipped (probes have y increasing upward; egui downward).
@@ -1128,11 +1121,18 @@ impl<P: DataProvider> Ctx<'_, P> {
             );
             let sub = egui::Rect::from_center_size(c, egui::vec2(sub_w, sub_h));
             boxes.push((ch, sub));
-            // Clusters whose best channels include this one.
-            let present: Vec<usize> = (0..self.selection.len())
-                .filter(|&ci| per_cluster[ci].contains(&ch))
-                .collect();
-            max_slots = max_slots.max(present.len());
+            ui.interact(
+                sub.intersect(rect),
+                ui.id().with(("waveform-channel", ch)),
+                Sense::hover(),
+            )
+            .widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Other,
+                    true,
+                    format!("waveform channel {ch}"),
+                )
+            });
             painter.rect_filled(sub, 0.0, theme.panel);
             painter.rect_stroke(
                 sub,
@@ -1173,7 +1173,7 @@ impl<P: DataProvider> Ctx<'_, P> {
         let slot_w = if p.overlap {
             1.0
         } else {
-            overlap_slot(0, max_slots).1
+            overlap_slot(0, present.len()).1
         };
         let ms_px = sub_w * slot_w / (self.snippet_len as f32 - 1.0).max(1.0) * self.sr * 0.001;
         scale_bar(
@@ -1636,9 +1636,43 @@ mod tests {
     }
 
     #[test]
-    fn union_is_sorted_and_deduped() {
-        let u = union_channels(&[vec![1, 5, 9], vec![5, 2], vec![]]);
-        assert_eq!(u, vec![1, 2, 5, 9]);
+    fn a_tetrode_shows_all_four_channels_with_or_without_geometry() {
+        let geometry = [[0.0, 0.0], [32.0, 0.0], [0.0, 20.0], [32.0, 20.0]];
+        let limit = WaveformParams::default().max_channels;
+        assert_eq!(limit, 4);
+        for peak in 0..4 {
+            assert_eq!(
+                display_channels(4, peak, &geometry, &[], limit),
+                [0, 1, 2, 3]
+            );
+            assert_eq!(display_channels(4, peak, &[], &[], limit), [0, 1, 2, 3]);
+        }
+        assert_eq!(display_channels(2, 1, &[], &[], limit), [0, 1]);
+        assert!(display_channels(0, 0, &[], &[], limit).is_empty());
+    }
+
+    #[test]
+    fn the_shared_channel_set_keeps_real_ids_and_the_primary_channel_group() {
+        let geometry: Vec<[f32; 2]> = (0..16).map(|ch| [0.0, ch as f32 * 20.0]).collect();
+        let groups: Vec<u32> = (0..16).map(|ch| ch / 4).collect();
+        let limit = WaveformParams::default().max_channels;
+        let channels = display_channels(16, 10, &geometry, &groups, limit);
+        assert_eq!(
+            channels,
+            [8, 9, 10, 11],
+            "never replace tetrode IDs with 0..3"
+        );
+        assert_eq!(display_channels(16, 10, &[], &groups, limit), channels);
+    }
+
+    #[test]
+    fn larger_channel_views_are_explicit_and_still_respect_group_membership() {
+        let geometry: Vec<[f32; 2]> = (0..16).map(|ch| [0.0, ch as f32 * 20.0]).collect();
+        assert_eq!(display_channels(16, 8, &geometry, &[], 4).len(), 4);
+        assert_eq!(display_channels(16, 8, &geometry, &[], 12).len(), 12);
+        assert_eq!(display_channels(16, 8, &geometry, &[], 100).len(), 16);
+        assert_eq!(display_channels(16, 8, &geometry, &[], 0), [8]);
+        assert_eq!(display_channels(4, 100, &[], &[], 4), [0, 1, 2, 3]);
     }
 
     #[test]

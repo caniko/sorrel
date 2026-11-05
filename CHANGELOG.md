@@ -9,6 +9,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
+- **Configurable keyboard shortcuts.** Settings provides searchable, scoped shortcut editing, key capture, alternatives, conflict checks and reset controls. One command registry drives dispatch, help and hints in tabs and pop-out windows. Global preferences, theme and recent datasets are stored in `~/.sorrel/settings.toml` (`SORREL_CONFIG_DIR` overrides the directory); per-recording workspace state stays local. The obsolete README shortcut table is removed.
+- **Live lasso tracking.** The Features toolbar has a `live tracking` toggle, off by default. While it is off, spike counts, highlights and linked views settle when a node drag ends instead of recomputing every frame, which keeps cutting a cluster smooth.
 - **Curation bench loop.** The `curation-bench-loop` skill turns the double-blind improvement loop into steps with sealing rules, a cost guard and an acceptance rule. Both it and `export-curated-sort` gain an Agent tiers section (`flash`, `worker`, `lead`) that names the jobs a cheap agent can do; the invoker names its own agents.
 - **`bench_curation.py`:** `add --dev` forces sessions whose truth was seen into dev, and `run --max-budget-usd` caps each `mcp-review` run.
 - **`sorrel diff --split-share`:** a root counts as split when two or more kept (non-noise) units each hold that share of its kept spikes, so good cores cut out of a large noise remainder register as a split.

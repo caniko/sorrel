@@ -5995,6 +5995,7 @@ dependencies = [
  "sorrel-io",
  "sorrel-render",
  "tempfile",
+ "toml 0.8.23",
  "wgpu",
 ]
 

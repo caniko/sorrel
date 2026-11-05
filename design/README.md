@@ -3,6 +3,7 @@
 - `sorrel.fig`: the OpenPencil design file.
   - **Design pages.** `Design · Lasso tool` and `Design · Feature view v2` were made before the code. `feature-view-v2.js` rebuilds the second page.
   - **Implemented pages.** `Implemented · <state>` holds the dark-theme render of each Features, cross-talk and pane UI state. These are the states with a design counterpart, so a parity check can compare the two side by side.
+  - **Keyboard settings.** `Implemented · keyboard_settings`, `keyboard_settings_capture`, `keyboard_settings_conflict` and `help` are generated from the real settings editor and the effective command registry. Keyboard capture and conflicting bindings are separate states, not hand-maintained shortcut lists.
 - `icon.fig`: the app icon.
 
 Every other UI state is left out to keep the file small, and so is the light theme. Regenerate any of them from the UI tests. Each kittest `snap` writes a Figma-plugin script per state and theme:

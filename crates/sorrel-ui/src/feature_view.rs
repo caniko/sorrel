@@ -23,7 +23,7 @@ use sorrel_render::{extract_snippet, TracePreproc};
 use crate::brush::{BrushSource, Brushes, Ghost, HoverSpike, SpikeBrush, TimeBrush};
 use crate::feature_view3d::{feature_3d, Overlay, PointColour};
 use crate::jobs::{JobCtx, Memo};
-use crate::lasso::{Lasso, LassoEvent};
+use crate::lasso::Lasso;
 use crate::theme::{selection_colour, viridis, Theme};
 use crate::views::waveform_window_samples;
 use crate::wgpu_raster::pack_rgba;
@@ -114,20 +114,51 @@ const N_COMPUTED: usize = 500;
 /// Snippets the temporal PCs are fitted on.
 const N_FIT: usize = 1000;
 pub(crate) const BACKGROUND: u16 = u16::MAX;
-/// Grid layout: gap between cells, the label strip above each cell, the
-/// pane width one column wants, and the background marker radius (1 px).
+/// Grid layout: gap between cells, the label strip above each cell, and the
+/// background marker radius (1 px).
 const CELL_GAP: f32 = 6.0;
 const LABEL_H: f32 = 14.0;
-const COL_W: f32 = 140.0;
 const BACKGROUND_RADIUS: f32 = 0.5;
 
-/// Columns (2 to 4) and square cell side for a pane `width` wide.
-fn grid_geometry(width: f32) -> (usize, f32) {
-    let cols = ((width / COL_W) as usize).clamp(2, 4);
-    (
-        cols,
-        ((width - (cols - 1) as f32 * CELL_GAP) / cols as f32).max(40.0),
+/// The 4×4 grid's square cell side and overall extent for a pane area.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct GridGeometry {
+    side: f32,
+    width: f32,
+    height: f32,
+}
+
+/// The 4×4 projection matrix fitted by both `size`'s width and height. The
+/// side is floored so all sixteen cells, their label strips and the gaps stay
+/// inside the pane at every width instead of asking for a scroll area.
+fn grid_geometry(size: Vec2) -> GridGeometry {
+    let cols = GRID[0].len() as f32;
+    let rows = GRID.len() as f32;
+    let by_width = (size.x - (cols - 1.0) * CELL_GAP) / cols;
+    let by_height = (size.y - rows * LABEL_H - (rows - 1.0) * CELL_GAP) / rows;
+    let side = by_width.min(by_height).floor().max(1.0);
+    GridGeometry {
+        side,
+        width: cols * side + (cols - 1.0) * CELL_GAP,
+        height: rows * (side + LABEL_H) + (rows - 1.0) * CELL_GAP,
+    }
+}
+
+/// Top-left of `cell`'s label strip in the grid at `min`.
+fn cell_origin(min: Pos2, geo: GridGeometry, cell: usize) -> Pos2 {
+    min + egui::vec2(
+        (cell % GRID[0].len()) as f32 * (geo.side + CELL_GAP),
+        (cell / GRID[0].len()) as f32 * (geo.side + LABEL_H + CELL_GAP),
     )
+}
+
+/// Phy's short axis names keep both dimensions legible in narrow cells;
+/// the A/B chips and caption tooltip retain the physical channel IDs.
+fn grid_axis_label(dim: Dim) -> String {
+    match dim {
+        Dim::Time => "t".into(),
+        Dim::Pc { ch, pc } => format!("{pc}{}", char::from(b'A' + ch)),
+    }
 }
 
 /// Channels in the set at most.
@@ -465,7 +496,8 @@ pub enum ViewMode {
 pub struct FeatureViewState {
     pub mode: ViewMode,
     pub(crate) view3d: crate::feature_view3d::View3dState,
-    /// Grid cell the large cell shows (Compact and Expansive layouts).
+    /// The grid cell whose channels drive the link and the 3-D overlay; a
+    /// click on any of the sixteen cells moves it.
     focus: usize,
     /// A and B kept as they are (phy's `c`, or a channel click) instead of
     /// following the best-separating pair of the set.
@@ -479,9 +511,21 @@ pub struct FeatureViewState {
     pub scaling: f32,
     /// Marker radius in points (Alt+wheel).
     pub marker: f32,
+    /// Content zoom (plain wheel): the data range shrinks about its middle,
+    /// so every projection zooms in place and its box keeps its size.
     zoom: f32,
-    pan: [f32; 2],
+    /// Shared pixel offset of the projection rectangles and their labels
+    /// (primary drag). The layout, its gaps and the controls stay put; zero
+    /// keeps the original geometry exactly.
+    pan_px: Vec2,
     lasso: Lasso,
+    /// Update the lasso's hits, brush and linked views while a node is
+    /// dragged. Off (the default) settles them on release, which keeps
+    /// cutting a cluster smooth.
+    pub live_tracking: bool,
+    /// The lasso the computed outputs saw last; with live tracking off it
+    /// holds still while a gesture is in progress.
+    settled_lasso: Lasso,
     /// The data the lasso was drawn against ([`lasso_key`]); a different
     /// key drops the lasso and any pending split.
     lasso_key: Option<FeatureKey>,
@@ -503,6 +547,8 @@ pub struct FeatureViewState {
     pub colour: ColourBy,
     /// What `brushes.spikes` was last set from; it is written only on change.
     brush_written: BrushWant,
+    /// The secondary alternatives strip below the 4×4 grid is expanded.
+    alts_open: bool,
     /// This frame's hovered spike, the Alt+clicked one to seek to and the
     /// Shift+drag time brush (`Some(None)` clears it), for `feature_view` to
     /// hand on.
@@ -949,9 +995,10 @@ fn label_source(
     } else if fit.is_some() {
         km_key.hash(&mut h);
         (1, "silhouette of the k-means parts".to_owned())
-    } else if state.lasso.is_closed() {
-        state.lasso.cell.hash(&mut h);
-        for v in state.lasso.points.iter().flatten() {
+    } else if state.computed_lasso().is_closed() {
+        let lasso = state.computed_lasso();
+        lasso.cell.hash(&mut h);
+        for v in lasso.points.iter().flatten() {
             v.to_bits().hash(&mut h);
         }
         (2, "silhouette inside vs outside the lasso".to_owned())
@@ -1058,8 +1105,10 @@ impl Default for FeatureViewState {
             scaling: 1.0,
             marker: 2.5,
             zoom: 1.0,
-            pan: [0.0; 2],
+            pan_px: Vec2::ZERO,
             lasso: Lasso::default(),
+            live_tracking: false,
+            settled_lasso: Lasso::default(),
             lasso_key: None,
             split_requested: false,
             want_full: false,
@@ -1072,6 +1121,7 @@ impl Default for FeatureViewState {
             ghost: GhostCells::default(),
             colour: ColourBy::default(),
             brush_written: None,
+            alts_open: false,
             hover_out: None,
             seek: None,
             time_out: None,
@@ -1094,16 +1144,70 @@ impl FeatureViewState {
     /// Abandon an in-progress lasso (Esc).
     pub fn cancel_lasso(&mut self) {
         self.lasso.clear();
+        self.settled_lasso.clear();
         self.lasso_key = None;
         self.split_requested = false;
         self.want_full = false;
         self.clear_km_preview();
     }
 
+    /// User cancellation, distinct from clearing a polygon after a successful
+    /// cut. Discard all work owned by this lasso so late results cannot
+    /// re-arm it. This never mutates the session or resets navigation.
+    /// Returns whether an uncommitted cut was pending.
+    pub fn cancel_operation(&mut self) -> bool {
+        let active = self.lasso_active();
+        let cutting = self.split_requested;
+        self.cancel_lasso();
+        self.memo.cancel();
+        self.km.memo.cancel();
+        self.km.requested = false;
+        self.km.lasso_auto = false;
+        self.km.scroll_to_lasso = false;
+        if active {
+            self.km.auto_run = false;
+        }
+        self.alts.memo.cancel();
+        self.alts.armed = None;
+        self.hits = None;
+        self.cells = None;
+        self.link.spikes.clear();
+        self.link_key = 0;
+        cutting
+    }
+
+    /// Snapshot the lasso for the computed outputs (hits, brush, link,
+    /// alternatives). With live tracking off the snapshot holds still for
+    /// the length of a drag, so cutting a cluster only settles once on
+    /// release instead of recomputing every frame.
+    fn settle_lasso(&mut self) {
+        if !self.live_tracking && self.lasso.is_editing() {
+            return;
+        }
+        if self.settled_lasso.cell != self.lasso.cell
+            || self.settled_lasso.points != self.lasso.points
+        {
+            self.settled_lasso = Lasso::new(self.lasso.cell, self.lasso.points.clone());
+        }
+    }
+
+    /// The lasso the computed outputs use: the live one except while a node
+    /// is dragged with live tracking off.
+    fn computed_lasso(&self) -> &Lasso {
+        if self.live_tracking || !self.lasso.is_editing() {
+            &self.lasso
+        } else {
+            &self.settled_lasso
+        }
+    }
+
     /// A hand edit makes the lasso the user's: auto-run leaves it, and it no
     /// longer wraps the previewed k-means part, so that preview ends and the
     /// brush follows the polygon.
     fn lasso_edited(&mut self) {
+        // Editing the polygon abandons a previously requested cut. A fresh
+        // K press is required for the new shape; no old request may cut it.
+        self.split_requested = false;
         self.km.lasso_auto = false;
         self.clear_km_preview();
     }
@@ -1144,7 +1248,7 @@ impl FeatureViewState {
 
     /// A lasso or a k-means part preview Esc would cancel.
     pub fn lasso_active(&self) -> bool {
-        self.lasso.is_active() || self.km_armed()
+        self.lasso.is_active() || self.km_armed() || self.split_requested || self.km.requested
     }
 
     pub fn lasso_closed(&self) -> bool {
@@ -1186,7 +1290,7 @@ impl FeatureViewState {
 
     /// `k` has something to split: a closed lasso or an armed k-means part.
     pub fn can_split(&self) -> bool {
-        self.lasso.is_closed() || self.km_armed()
+        !self.lasso.is_editing() && (self.lasso.is_closed() || self.km_armed())
     }
 
     /// phy `toggle_automatic_channel_selection` (`c`): fix A and B, with the
@@ -1306,39 +1410,161 @@ impl FeatureViewState {
     }
 }
 
-/// Pane widths (px): below `COMPACT_W` one large cell and a navigator, from
-/// `EXPANSIVE_W` the grid at pane height beside a large cell.
-const COMPACT_W: f32 = 480.0;
-const EXPANSIVE_W: f32 = 1100.0;
-/// Room under the Expansive large cell for the K-MEANS and LASSO panels, and
-/// the navigator tile side of the Compact layout.
-const PANELS_H: f32 = 240.0;
-const NAV_TILE: f32 = 20.0;
+/// Pane width (px) from which the toolbar can show its controls inline; below
+/// it they fold into the ⚙ popover and a wrapped channel row.
+const WIDE_TOOLBAR: f32 = 700.0;
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-enum Layout {
-    Compact,
-    Regular,
-    Expansive,
+/// What one wheel/scroll event asks the view to do. Ctrl+wheel (and a native
+/// pinch, which egui reports as the same zoom delta) scales the PC features;
+/// Alt+wheel the marker; a plain wheel zooms the projected data.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum WheelAction {
+    None,
+    Scale(f32),
+    Marker(f32),
+    Zoom(f32),
 }
 
-/// The layout a pane of `size` gets.
-fn layout_for(size: egui::Vec2) -> Layout {
-    if size.x < COMPACT_W {
-        Layout::Compact
-    } else if size.x < EXPANSIVE_W {
-        Layout::Regular
+fn wheel_action(scroll: f32, pinch: f32, alt: bool) -> WheelAction {
+    if pinch != 1.0 {
+        WheelAction::Scale(pinch)
+    } else if scroll != 0.0 {
+        let factor = (scroll * 0.002).exp();
+        if alt {
+            WheelAction::Marker(factor)
+        } else {
+            WheelAction::Zoom(factor)
+        }
     } else {
-        Layout::Expansive
+        WheelAction::None
     }
 }
 
-/// Cell side of the Expansive grid: four rows fill `size`'s height, and the
-/// grid takes at most half its width.
-fn expansive_side(size: egui::Vec2) -> f32 {
-    let by_height = (size.y - 3.0 * CELL_GAP) / 4.0 - LABEL_H;
-    let by_width = (size.x / 2.0 - 3.0 * CELL_GAP) / 4.0;
-    by_height.min(by_width).max(40.0)
+/// One frame's navigation input. Every projection and the gaps between them
+/// report the gesture they own; the transform is applied once after the frame
+/// was drawn, so all cells of a frame use the same values and a change can
+/// never leak into a cell drawn earlier in that frame.
+#[derive(Copy, Clone, Debug)]
+struct NavInput {
+    pan: Vec2,
+    zoom: f32,
+    scaling: f32,
+    marker: f32,
+    reset: bool,
+    wheel_seen: bool,
+}
+
+impl Default for NavInput {
+    fn default() -> Self {
+        Self {
+            pan: Vec2::ZERO,
+            zoom: 1.0,
+            scaling: 1.0,
+            marker: 1.0,
+            reset: false,
+            wheel_seen: false,
+        }
+    }
+}
+
+impl NavInput {
+    /// A primary drag pans every projection together unless the gesture
+    /// belongs to the lasso (node/freehand) or is modified (Ctrl lasso,
+    /// Shift time brush). A double-click resets the shared view, but only
+    /// when the lasso did not claim that click (edge/node editing).
+    fn drag(&mut self, resp: &egui::Response, modifiers: egui::Modifiers, allowed: bool) {
+        if !allowed || modifiers.any() {
+            return;
+        }
+        if resp.double_clicked() {
+            self.reset = true;
+        }
+        if resp.dragged_by(egui::PointerButton::Primary) {
+            self.pan += resp.drag_delta();
+        }
+    }
+
+    /// Read the wheel at most once per frame: an overlapped duplicate cell
+    /// must not apply the same event twice.
+    fn wheel(&mut self, scroll: f32, pinch: f32, alt: bool) {
+        if self.wheel_seen {
+            return;
+        }
+        match wheel_action(scroll, pinch, alt) {
+            WheelAction::None => {}
+            WheelAction::Scale(f) => {
+                self.wheel_seen = true;
+                self.scaling *= f;
+            }
+            WheelAction::Marker(f) => {
+                self.wheel_seen = true;
+                self.marker *= f;
+            }
+            WheelAction::Zoom(f) => {
+                self.wheel_seen = true;
+                self.zoom *= f;
+            }
+        }
+    }
+
+    fn wheel_from(&mut self, ui: &Ui) {
+        let (scroll, pinch, alt) =
+            ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta(), i.modifiers.alt));
+        self.wheel(scroll, pinch, alt);
+    }
+
+    /// Apply the frame's input once. Returns whether anything changed (the
+    /// caller then repaints; the next frame draws the settled transform).
+    fn finish(self, state: &mut FeatureViewState) -> bool {
+        let mut changed = false;
+        if self.reset {
+            state.zoom = 1.0;
+            state.pan_px = Vec2::ZERO;
+            state.scaling = 1.0;
+            changed = true;
+        }
+        if self.pan != Vec2::ZERO {
+            state.pan_px += self.pan;
+            changed = true;
+        }
+        if self.zoom != 1.0 {
+            state.zoom = (state.zoom * self.zoom).clamp(0.05, 100.0);
+            changed = true;
+        }
+        if self.scaling != 1.0 {
+            state.scaling = (state.scaling * self.scaling).clamp(0.05, 50.0);
+            changed = true;
+        }
+        if self.marker != 1.0 {
+            state.marker = (state.marker * self.marker).clamp(0.5, 8.0);
+            changed = true;
+        }
+        changed
+    }
+}
+
+/// A projection's label strip and plot rect at its unshifted layout origin.
+fn cell_rects(origin: Pos2, side: f32) -> (Rect, Rect) {
+    (
+        Rect::from_min_size(origin, egui::vec2(side, LABEL_H)),
+        Rect::from_min_size(origin + egui::vec2(0.0, LABEL_H), egui::vec2(side, side)),
+    )
+}
+
+/// Where a projection paints after the shared drag translation.
+fn projection_origin(origin: Pos2, state: &FeatureViewState) -> Pos2 {
+    origin + state.pan_px
+}
+
+/// The gaps between projections navigate too, so a drag or wheel anywhere in
+/// the matrix belongs to the shared view.
+fn nav_gap(ui: &Ui, nav: &mut NavInput, rect: Rect, id: egui::Id) {
+    let resp = ui.interact(rect, id, Sense::click_and_drag());
+    let modifiers = ui.input(|i| i.modifiers);
+    if resp.hovered() {
+        nav.wheel_from(ui);
+    }
+    nav.drag(&resp, modifiers, true);
 }
 
 /// The previewed k-means part with its hull in every grid cell.
@@ -1359,13 +1585,6 @@ impl Coll {
     /// The cell k-means lassoed.
     fn best(&self) -> usize {
         self.fit.lassos[self.part].cell
-    }
-
-    /// The cell with the most collisions.
-    fn worst(&self) -> usize {
-        (0..self.fit.hits[self.part].len())
-            .max_by_key(|&c| self.hit(c).map_or(0, CellHit::total))
-            .unwrap_or(0)
     }
 
     /// Names of what else is counted: the anchor's other part(s) and the
@@ -1395,22 +1614,6 @@ fn collision_colour(theme: &Theme, total: usize, part: usize) -> Color32 {
     }
 }
 
-/// Matrix tile fill and digit colour: white on red and on dark tiles, the
-/// theme's strong text on the light theme's tinted green and amber.
-fn tile_colours(theme: &Theme, ui: &Ui, total: usize, part: usize) -> (Color32, Color32) {
-    let base = collision_colour(theme, total, part);
-    if base == theme.danger {
-        (base, Color32::WHITE)
-    } else if theme.dark {
-        (base.gamma_multiply(0.55), Color32::WHITE)
-    } else {
-        (
-            Color32::WHITE.lerp_to_gamma(base, 0.45),
-            ui.visuals().strong_text_color(),
-        )
-    }
-}
-
 /// Hints sit between the caption grey and body text.
 fn hint_colour(theme: &Theme) -> Color32 {
     theme.caption.lerp_to_gamma(theme.text, 0.5)
@@ -1422,24 +1625,29 @@ fn hint(ui: &mut Ui, text: impl Into<String>) {
 }
 
 /// Lasso gestures `(keys, effect)`, the list in lasso.rs's module doc.
-const LASSO_HELP: [(&str, &str); 8] = [
+const LASSO_HELP: [(&str, &str); 6] = [
     ("Ctrl+drag", "draw freehand (simplified to nodes)"),
     ("Ctrl+click", "add a node"),
     ("Ctrl+right-click", "clear"),
     ("drag node", "move"),
     ("right-click node", "delete (never below three)"),
     ("double-click edge", "insert a node"),
-    ("K", "split the lassoed spikes"),
-    ("Esc", "clear"),
 ];
 
-fn help_text() -> String {
+fn help_text(ctx: &egui::Context) -> String {
     let mut s: String = LASSO_HELP
         .iter()
         .map(|(k, v)| format!("{k}: {v}\n"))
         .collect();
+    s.push_str(&format!(
+        "{}: split the lassoed spikes\n{}: clear\n",
+        crate::settings::hint(ctx, "curation.split"),
+        crate::settings::hint(ctx, "app.cancel")
+    ));
     s.push_str(
-        "wheel: zoom · drag: pan · double-click: reset\n\
+        "live tracking: update hits while dragging (off: on release)\n\
+         wheel: centred zoom in every projection · drag: move the windows together\n\
+         double-click: reset · Esc: cancel the lasso or pending cut\n\
          Ctrl+wheel: feature scale · Alt+wheel: marker size\n\
          Alt+click / Alt+right-click: amplitude feature (x / y)\n\
          Alt+click a spike: seek the Trace to it\n\
@@ -1453,15 +1661,28 @@ fn help_text() -> String {
 
 /// One short line whatever it says, so nothing moves under the cursor while
 /// a lasso is being drawn; the full gesture list is on `(?)`.
-fn hint_line(state: &FeatureViewState) -> &'static str {
+fn hint_line(state: &FeatureViewState, ctx: &egui::Context) -> String {
     match (state.lasso.is_active(), state.lasso.is_closed()) {
-        (_, true) => "K: split · Esc: clear",
-        (true, false) => "Ctrl+click: add point · Ctrl+right-click: clear",
-        _ => "Ctrl+click: lasso · K: split",
+        (_, true) => crate::settings::split_hint(ctx),
+        (true, false) => "Ctrl+click: add point · Ctrl+right-click: clear".into(),
+        _ => format!(
+            "Ctrl+click: lasso · {}: split",
+            crate::settings::hint(ctx, "curation.split")
+        ),
     }
 }
 
-/// What every layout draws with.
+const LIVE_TRACKING_HELP: &str =
+    "Update spike counts, highlights and linked views while a node is dragged.\n\
+     Off (the default) updates them when you release, which keeps lasso edits fast.";
+
+/// The lasso's live-tracking switch, shown while a lasso is in play.
+fn live_tracking_toggle(ui: &mut Ui, state: &mut FeatureViewState) {
+    ui.checkbox(&mut state.live_tracking, "live tracking")
+        .on_hover_text(LIVE_TRACKING_HELP);
+}
+
+/// What the view draws with.
 struct Ctx<'a, P: DataProvider> {
     session: &'a Session<P>,
     jobs: &'a JobCtx<Session<P>>,
@@ -1476,8 +1697,6 @@ struct Ctx<'a, P: DataProvider> {
     dark: bool,
     cells: CellVertices,
     cells_gen: u64,
-    /// The focused cell is drawn twice (grid and large cell).
-    dup: bool,
     alts: AltsView,
     /// Time brush, the hovered spike's point and the points inside the Trace
     /// window (few enough per cluster to ring), as `FeatureSet::points` ids.
@@ -1586,18 +1805,20 @@ pub fn feature_view<P: DataProvider>(
     // A lasso from before a selection/channel change must not hit the new
     // set's points.
     state.drop_stale_lasso(&cur);
+    state.settle_lasso();
 
     let km_key: KmKey = (set.generation, selection[0], state.km.k);
     kmeans_update(state, &set, km_key, selection[0], jobs);
-    let layout = layout_for(ui.available_size());
-    if state.km.scroll_to_lasso && (layout != Layout::Regular || state.mode == ViewMode::Three) {
-        // One large cell (or no grid): show the lasso's cell, don't scroll.
+    if state.km.scroll_to_lasso {
+        // All sixteen cells are on screen: focus the lasso's cell so the
+        // 3-D overlay and the link follow it.
         if state.lasso.is_active() {
             state.focus = state.lasso.cell;
         }
         state.km.scroll_to_lasso = false;
     }
-    toolbar(ui, state, &set, current.is_none(), layout, depths);
+    let wide = ui.available_width() >= WIDE_TOOLBAR;
+    toolbar(ui, state, &set, current.is_none(), wide, depths);
 
     let fit = km_fit(state, km_key);
     let coll = fit.clone().filter(|_| state.km.previewing).map(|fit| Coll {
@@ -1662,7 +1883,6 @@ pub fn feature_view<P: DataProvider>(
             .map(|(_, _, c)| c.clone())
             .unwrap_or_default(),
         cells_gen: state.cells_gen,
-        dup: layout == Layout::Expansive,
         alts,
         time,
         hover_pt,
@@ -1670,18 +1890,25 @@ pub fn feature_view<P: DataProvider>(
         shown,
         ghost,
     };
-    match (state.mode, layout) {
-        (_, Layout::Expansive) => expansive(ui, &c, state, brushes, depths),
-        (ViewMode::Three, _) => {
-            kmeans_row(ui, state, &c, layout == Layout::Regular, false);
-            show_3d(ui, &c, state, layout == Layout::Compact, brushes, depths);
+    let mut nav = NavInput::default();
+    match state.mode {
+        ViewMode::Three => {
+            kmeans_row(ui, state, &c, wide);
+            // The 3-D axes sidebar has its own width requirement; folding
+            // toolbar controls must not also hide the scene's legend/axes.
+            let compact = ui.available_width() < 480.0;
+            show_3d(ui, &c, state, compact, brushes, depths);
         }
-        (ViewMode::Two, Layout::Compact) => compact(ui, &c, state),
-        (ViewMode::Two, Layout::Regular) => regular(ui, &c, state),
+        ViewMode::Two => two_d(ui, &c, state, &mut nav, wide),
+    }
+    // Navigation settles after the whole frame was drawn: every projection
+    // above used one transform, and the next frame shows the new one.
+    if nav.finish(state) {
+        ui.ctx().request_repaint();
     }
 
-    // With the grid beside it (Expansive) the focused 2-D cell wins.
-    let from_triple = state.mode == ViewMode::Three && layout != Layout::Expansive;
+    // The 3-D scene's triple owns the Waveforms highlight; 2-D focuses a cell.
+    let from_triple = state.mode == ViewMode::Three;
     // Computed PCs: a closed lasso previews and splits every spike, not the
     // display sample. `want_full` follows the lasso (it drops with it, in
     // `cancel_lasso` or here) and the brush waits for the full set.
@@ -1839,10 +2066,10 @@ fn want_brush(state: &FeatureViewState, set: &FeatureSet) -> BrushWant {
     let source = if state.km.previewing && state.preview.is_some() {
         state.preview_gen.hash(&mut h);
         BrushSource::KMeansPart
-    } else if state.lasso.is_closed() {
-        state.lasso.cell.hash(&mut h);
-        state
-            .lasso
+    } else if state.computed_lasso().is_closed() {
+        let lasso = state.computed_lasso();
+        lasso.cell.hash(&mut h);
+        lasso
             .points
             .iter()
             .flatten()
@@ -1864,12 +2091,12 @@ fn sync_brush(
     version: u64,
     brushes: &mut Brushes,
 ) {
-    // A sampled set (computed PCs) holds only some of the spikes the split
-    // would move: keep the old brush until the full set is in.
-    if set.computed && !set.full {
+    let want = want_brush(state, set);
+    // Do not publish a partial selection, but always allow clearing one:
+    // cancellation must remove old highlights even while a sample loads.
+    if set.computed && !set.full && want.is_some() {
         return;
     }
-    let want = want_brush(state, set);
     match brush_action(&mut state.brush_written, want) {
         BrushAction::Keep => {}
         BrushAction::Clear => {
@@ -1936,191 +2163,50 @@ fn show_3d<P: DataProvider>(
     );
 }
 
-/// Regular: the grid in 2-4 columns, scrolling.
-fn regular<P: DataProvider>(ui: &mut Ui, c: &Ctx<P>, state: &mut FeatureViewState) {
-    kmeans_row(ui, state, c, true, true);
-    egui::ScrollArea::vertical()
-        .auto_shrink([false; 2])
-        .show(ui, |ui| {
-            let (cols, side) = grid_geometry(ui.available_width());
-            let rows = GRID.len() * GRID[0].len() / cols;
-            let width = cols as f32 * side + (cols - 1) as f32 * CELL_GAP;
-            // The alternatives strip sits under the focused cell's row.
-            let strip_h = strip_height(width, state.alts.armed.is_some()) + CELL_GAP;
-            let focus_row = state.focus / cols;
-            let (grid_rect, _) = ui.allocate_exact_size(
-                egui::vec2(
-                    width,
-                    rows as f32 * (side + LABEL_H) + (rows - 1) as f32 * CELL_GAP + strip_h,
-                ),
-                Sense::hover(),
-            );
-            let row_h = side + LABEL_H + CELL_GAP;
-            let strip = Rect::from_min_size(
-                grid_rect.min + egui::vec2(0.0, (focus_row + 1) as f32 * row_h),
-                egui::vec2(width, strip_h - CELL_GAP),
-            );
-            ui.scope_builder(egui::UiBuilder::new().max_rect(strip), |ui| {
-                alternatives(ui, c, state, width);
-            });
-            for cell in 0..GRID.len() * GRID[0].len() {
-                let (row, col) = (cell / cols, cell % cols);
-                let shift = if row > focus_row { strip_h } else { 0.0 };
-                let origin = grid_rect.min
-                    + egui::vec2(col as f32 * (side + CELL_GAP), row as f32 * row_h + shift);
-                if state.km.scroll_to_lasso && state.lasso.cell == cell {
-                    state.km.scroll_to_lasso = false;
-                    ui.scroll_to_rect(
-                        Rect::from_min_size(origin, egui::vec2(side, side + LABEL_H)),
-                        Some(egui::Align::Center),
-                    );
-                }
-                draw_cell(ui, c, state, cell, origin, side, false);
-            }
-        });
-}
-
-/// Compact: the k-means row, one large focused cell and the 4×4 collision
-/// matrix as navigator.
-fn compact<P: DataProvider>(ui: &mut Ui, c: &Ctx<P>, state: &mut FeatureViewState) {
-    kmeans_row(ui, state, c, false, false);
-    let height = ui.available_height();
-    egui::ScrollArea::vertical()
-        .auto_shrink([false; 2])
-        .show(ui, |ui| {
-            let nav_h = 4.0 * NAV_TILE + 3.0 * 2.0;
-            let w = ui.available_width();
-            let strip_h = strip_height(w, state.alts.armed.is_some());
-            let side = w.min((height - LABEL_H - nav_h - strip_h - 12.0).max(140.0));
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(side, side + LABEL_H), Sense::hover());
-            let focus = state.focus;
-            draw_cell(ui, c, state, focus, rect.min, side, true);
-            ui.add_space(4.0);
-            // The navigator first: it is how a narrow pane reaches the other
-            // 15 views, so it must not drop below the fold.
-            ui.horizontal_top(|ui| {
-                let lasso_cell = state.lasso.is_active().then_some(state.lasso.cell);
-                let clicked = collision_matrix(
-                    ui,
-                    &c.theme,
-                    c.set,
-                    c.coll.as_ref(),
-                    state.focus,
-                    lasso_cell,
-                    NAV_TILE,
-                );
-                if let Some(cell) = clicked {
-                    goto_cell(state, c.coll.as_ref(), cell);
-                }
-                ui.vertical(|ui| {
-                    ui.strong(if c.coll.is_some() {
-                        "Navigator + collision"
-                    } else {
-                        "Navigator"
-                    });
-                    hint(ui, nav_text(c));
-                    ui.horizontal(|ui| {
-                        hint(ui, "Ctrl+drag lasso · drag node · K split ·");
-                        ui.label("(?)").on_hover_text(help_text());
-                    });
-                    if c.coll.is_some() {
-                        colour_legend(ui, &c.theme);
-                    }
-                });
-            });
-            ui.add_space(4.0);
-            alternatives(ui, c, state, w);
-        });
-}
-
-/// "click a tile to focus it", and what the numbers count when a part is
-/// previewed.
-fn nav_text<P: DataProvider>(c: &Ctx<P>) -> String {
-    match &c.coll {
-        Some(k) => {
-            let (parts, clusters) = k.others(c.selection);
-            format!(
-                "click a tile to focus it · N = spikes of {parts}{} inside part {}'s hull (of {})",
-                clusters.map_or(String::new(), |n| format!(" + {n}")),
-                k.part + 1,
-                k.size()
-            )
-        }
-        None => "click a tile to focus it".into(),
-    }
-}
-
-/// Swatches for the tile colours.
-fn colour_legend(ui: &mut Ui, theme: &Theme) {
-    ui.horizontal(|ui| {
-        for (colour, text) in [
-            (theme.good, "0"),
-            (theme.warn, "≤15% of part"),
-            (theme.danger, ">15%"),
-        ] {
-            let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
-            ui.painter().rect_filled(r, 2.0, colour);
-            hint(ui, text);
-        }
-    });
-}
-
-/// Expansive: the 4×4 grid at pane height on the left (no scroll), the
-/// focused cell and its K-MEANS and LASSO panels (or the 3-D scene) on the
-/// right.
-fn expansive<P: DataProvider>(
+/// The 4×4 projection matrix, fitted to the pane's width and height at every
+/// width. The alternatives strip is a collapsible secondary row below it.
+fn two_d<P: DataProvider>(
     ui: &mut Ui,
     c: &Ctx<P>,
     state: &mut FeatureViewState,
-    brushes: &mut Brushes,
-    depths: Option<&SpikeDepths>,
+    nav: &mut NavInput,
+    wide: bool,
 ) {
+    kmeans_row(ui, state, c, wide);
+    let width = ui.available_width();
+    let header_h = ui.spacing().interact_size.y;
+    let body_h = if state.alts_open {
+        alternatives_height(width, state.alts.armed.is_some())
+    } else {
+        0.0
+    };
+    let reserve = header_h + body_h + 2.0 * ui.spacing().item_spacing.y;
     let size = ui.available_size();
-    let (area, _) = ui.allocate_exact_size(size, Sense::hover());
-    let side = expansive_side(area.size());
+    let grid_h = (size.y - reserve).max(1.0);
+    let (area, _) = ui.allocate_exact_size(egui::vec2(size.x, grid_h), Sense::hover());
+    let geo = grid_geometry(area.size());
+    let viewport = area.intersect(ui.clip_rect());
+    // The gaps between projections navigate too.
+    nav_gap(ui, nav, area, ui.id().with(("feature-nav", "grid")));
     for cell in 0..GRID.len() * GRID[0].len() {
-        let origin = area.min
-            + egui::vec2(
-                (cell % 4) as f32 * (side + CELL_GAP),
-                (cell / 4) as f32 * (side + LABEL_H + CELL_GAP),
-            );
-        draw_cell(ui, c, state, cell, origin, side, false);
+        let origin = cell_origin(area.min, geo, cell);
+        draw_cell(ui, c, state, nav, cell, origin, geo.side, viewport);
     }
-    let left = 4.0 * side + 3.0 * CELL_GAP + 2.0 * CELL_GAP;
-    let right = Rect::from_min_max(area.min + egui::vec2(left, 0.0), area.max);
-    ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
-        if state.mode == ViewMode::Three {
-            kmeans_row(ui, state, c, true, false);
-            show_3d(ui, c, state, false, brushes, depths);
-            return;
+    ui.horizontal(|ui| {
+        if ui
+            .selectable_label(state.alts_open, "ALTERNATIVES")
+            .on_hover_text("Show the best-separating alternative projections")
+            .clicked()
+        {
+            state.alts_open = !state.alts_open;
         }
-        let strip_h = strip_height(right.width(), state.alts.armed.is_some());
-        let big = right
-            .width()
-            .min(right.height() - LABEL_H - PANELS_H - strip_h - CELL_GAP)
-            .max(120.0);
-        let focus = state.focus;
-        draw_cell(ui, c, state, focus, right.min, big, true);
-        let strip = Rect::from_min_size(
-            right.min + egui::vec2(0.0, LABEL_H + big + CELL_GAP),
-            egui::vec2(right.width(), strip_h),
-        );
-        ui.scope_builder(egui::UiBuilder::new().max_rect(strip), |ui| {
-            alternatives(ui, c, state, right.width());
-        });
-        let panels = Rect::from_min_max(
-            right.min + egui::vec2(0.0, LABEL_H + big + strip_h + 2.0 * CELL_GAP),
-            right.max,
-        );
-        ui.scope_builder(egui::UiBuilder::new().max_rect(panels), |ui| {
-            ui.separator();
-            ui.columns(2, |cols| {
-                kmeans_panel(&mut cols[0], c, state);
-                lasso_panel(&mut cols[1], c, state);
-            });
-        });
+        if wide {
+            hint(ui, c.alts.text.clone());
+        }
     });
+    if state.alts_open {
+        alternatives(ui, c, state, width);
+    }
 }
 
 /// Scores the set's dim pairs for the current labels and builds the minis of
@@ -2137,7 +2223,10 @@ fn update_alts<P: DataProvider>(
     let (label_key, text) = label_source(state, km_key, fit.as_ref(), selection);
     let key: AltKey = (set.generation, label_key);
     let (job_set, job_fit) = (Arc::clone(set), fit.clone());
-    let (cell, polygon) = (state.lasso.cell, state.lasso.points.clone());
+    let (cell, polygon) = (
+        state.computed_lasso().cell,
+        state.computed_lasso().points.clone(),
+    );
     let scores = state
         .alts
         .memo
@@ -2217,35 +2306,30 @@ fn promote(state: &mut FeatureViewState, set: &FeatureSet, x: Dim, y: Dim) {
     state.alts.armed = None;
 }
 
-const ALT_CAPTION_H: f32 = 16.0;
 const ALT_LABEL_H: f32 = 26.0;
 const TOAST_H: f32 = 24.0;
 
-/// Minis per row and their side for a strip `width` wide.
+/// Minis per row and their side for a strip `width` wide. All six stay in one
+/// compact row so the secondary strip never grows into the projection grid.
 fn alt_geometry(width: f32) -> (usize, f32) {
-    let cols = if width >= 240.0 { N_ALTS } else { N_ALTS / 2 };
+    let cols = N_ALTS;
     (
         cols,
-        ((width - (cols - 1) as f32 * CELL_GAP) / cols as f32).clamp(36.0, 150.0),
+        ((width - (cols - 1) as f32 * CELL_GAP) / cols as f32).clamp(4.0, 64.0),
     )
 }
 
-/// Height of the strip, with the warning row when `armed`.
-fn strip_height(width: f32, armed: bool) -> f32 {
+/// Height of the alternatives body, with the warning row when `armed`.
+fn alternatives_height(width: f32, armed: bool) -> f32 {
     let (cols, side) = alt_geometry(width);
     let rows = N_ALTS.div_ceil(cols) as f32;
-    ALT_CAPTION_H
-        + rows * (ALT_LABEL_H + side)
-        + (rows - 1.0) * CELL_GAP
-        + if armed { TOAST_H + 4.0 } else { 0.0 }
+    rows * (ALT_LABEL_H + side) + (rows - 1.0) * CELL_GAP + if armed { TOAST_H + 4.0 } else { 0.0 }
 }
 
-/// The alternatives strip: the six best-separating views of the set that are
+/// The alternatives body: the six best-separating views of the set that are
 /// not the focused one, as mini scatters. A click promotes one; with a lasso
-/// the first click asks for a second.
-/// Below this strip width the alternatives caption drops its explanation.
-const WIDE_ALT_CAPTION: f32 = 480.0;
-
+/// the first click asks for a second. The collapsible header above carries
+/// the label source.
 fn alternatives<P: DataProvider>(
     ui: &mut Ui,
     c: &Ctx<P>,
@@ -2258,31 +2342,23 @@ fn alternatives<P: DataProvider>(
     }
     let (cols, side) = alt_geometry(width);
     let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(width, strip_height(width, state.alts.armed.is_some())),
+        egui::vec2(
+            width,
+            alternatives_height(width, state.alts.armed.is_some()),
+        ),
         Sense::hover(),
     );
     let painter = ui.painter_at(rect);
-    let caption = |text: String| {
+    let Some(alts) = &c.alts.alts else {
         painter.text(
-            rect.left_top() + egui::vec2(2.0, 0.0),
+            rect.left_top(),
             egui::Align2::LEFT_TOP,
-            text,
+            "scoring the set's views…",
             egui::FontId::proportional(10.0),
             theme.caption,
         );
-    };
-    let Some(alts) = &c.alts.alts else {
-        caption("ALTERNATIVES · scoring the set's views…".into());
         return;
     };
-    caption(if width < WIDE_ALT_CAPTION {
-        format!("ALTERNATIVES ({}) · click promotes", c.alts.text)
-    } else {
-        format!(
-            "ALTERNATIVES · best-separating pairs over the set ({}) · click promotes to A/B",
-            c.alts.text
-        )
-    });
     let name = |alt: &Alt| format!("{} × {}", dim_label(alt.x, set), dim_label(alt.y, set));
     if state
         .alts
@@ -2297,7 +2373,7 @@ fn alternatives<P: DataProvider>(
         let origin = rect.min
             + egui::vec2(
                 (slot % cols) as f32 * (side + CELL_GAP),
-                ALT_CAPTION_H + (slot / cols) as f32 * (ALT_LABEL_H + side + CELL_GAP),
+                (slot / cols) as f32 * (ALT_LABEL_H + side + CELL_GAP),
             );
         let label = Rect::from_min_size(origin, egui::vec2(side, ALT_LABEL_H));
         let plot = Rect::from_min_size(origin + egui::vec2(0.0, ALT_LABEL_H), Vec2::splat(side));
@@ -2480,14 +2556,15 @@ fn refresh_link<P: DataProvider>(
     }
     // The part of a proposal or k-means shows its exact members, a lasso the
     // spikes inside it.
-    let own_lasso = state.lasso.is_closed() && !state.km.lasso_auto;
+    let lasso = state.computed_lasso();
+    let lasso_closed = lasso.is_closed();
+    let own_lasso = lasso_closed && !state.km.lasso_auto;
     let mut h = DefaultHasher::new();
     (set.generation, state.preview_gen, own_lasso).hash(&mut h);
     hash_brush(brushes.spikes.as_ref(), &mut h);
-    if state.lasso.is_closed() {
-        state.lasso.cell.hash(&mut h);
-        state
-            .lasso
+    if lasso_closed {
+        lasso.cell.hash(&mut h);
+        lasso
             .points
             .iter()
             .flatten()
@@ -2506,7 +2583,7 @@ fn refresh_link<P: DataProvider>(
                 v.sort_unstable();
                 vec![(*cluster, thin(&v))]
             }
-            _ if state.lasso.is_closed() => lasso_hits_cached(state, set, selection).spikes.clone(),
+            _ if lasso_closed => lasso_hits_cached(state, set, selection).spikes.clone(),
             _ => Vec::new(),
         };
     }
@@ -2631,126 +2708,51 @@ fn lstsq_basis(f: &[[f32; 2]], x: &[Vec<f32>]) -> Option<[Vec<f32>; 2]> {
     Some([w0, w1])
 }
 
-fn caption(ui: &mut Ui, text: &str) {
-    ui.label(
-        egui::RichText::new(text)
-            .small()
-            .color(Theme::from_ui(ui).caption),
-    );
-}
-
-/// K-MEANS: the row, then the selected part's 22 px collision matrix with
-/// its best and worst view.
-fn kmeans_panel<P: DataProvider>(ui: &mut Ui, c: &Ctx<P>, state: &mut FeatureViewState) {
-    caption(ui, "K-MEANS");
-    kmeans_row(ui, state, c, true, false);
-    let Some(k) = &c.coll else { return };
-    let (parts, clusters) = k.others(c.selection);
-    let text = |cell: usize| {
-        let (dx, dy) = GRID[cell / 4][cell % 4];
-        let h = k.hit(cell).map_or(0, CellHit::total);
-        let n = k.hit(cell).map_or((0, 0), |h| (h.parts, h.clusters));
-        format!(
-            "{} × {} · {} {parts}{}  ({h})",
-            dim_label(dx, c.set),
-            dim_label(dy, c.set),
-            n.0,
-            clusters
-                .as_ref()
-                .map_or(String::new(), |name| format!(" + {} {name}", n.1)),
-        )
-    };
-    egui::Frame::new()
-        .fill(ui.visuals().selection.bg_fill.gamma_multiply(0.35))
-        .corner_radius(4.0)
-        .inner_margin(8.0)
-        .show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                let lasso_cell = state.lasso.is_active().then_some(state.lasso.cell);
-                if let Some(cell) =
-                    collision_matrix(ui, &c.theme, c.set, Some(k), state.focus, lasso_cell, 22.0)
-                {
-                    goto_cell(state, Some(k), cell);
-                }
-                ui.vertical(|ui| {
-                    ui.label(format!(
-                        "part {} · {} spikes{}",
-                        k.part + 1,
-                        k.size(),
-                        if state.lasso.is_closed() {
-                            " (lassoed)"
-                        } else {
-                            ""
-                        }
-                    ));
-                    hint(ui, format!("best  {}", text(k.best())));
-                    hint(ui, format!("worst {}", text(k.worst())));
-                    hint(ui, "click a tile to move the lasso to that view");
-                });
-            });
-        });
-}
-
-/// LASSO: nodes · spikes · cell, and the gesture list.
-fn lasso_panel<P: DataProvider>(ui: &mut Ui, c: &Ctx<P>, state: &mut FeatureViewState) {
-    caption(ui, "LASSO");
-    if state.lasso.is_closed() {
-        let n = lasso_hit_count(state, c.set, c.selection);
-        let (dx, dy) = GRID[state.lasso.cell / 4][state.lasso.cell % 4];
-        ui.strong(format!(
-            "{} nodes · {n} spikes · {} × {}",
-            state.lasso.points.len(),
-            dim_label(dx, c.set),
-            dim_label(dy, c.set)
-        ));
-    } else {
-        ui.strong("no lasso");
-    }
-    egui::Grid::new("lasso-help")
-        .min_row_height(14.0)
-        .spacing([12.0, 2.0])
-        .show(ui, |ui| {
-            for (keys, effect) in LASSO_HELP {
-                hint(ui, keys);
-                hint(ui, effect);
-                ui.end_row();
-            }
-        });
-}
-
-/// One grid cell, or the large focused one: `origin` is the top-left of its
-/// label strip, `big` tells the two apart. All the plot gestures live here.
+/// One grid cell: `origin` is the top-left of its label strip. All the plot
+/// gestures live here.
+#[allow(clippy::too_many_arguments)]
 fn draw_cell<P: DataProvider>(
     ui: &mut Ui,
     c: &Ctx<P>,
     state: &mut FeatureViewState,
+    nav: &mut NavInput,
     cell: usize,
     origin: Pos2,
     side: f32,
-    big: bool,
+    viewport: Rect,
 ) {
     let (theme, set) = (&c.theme, &**c.set);
     let (dx, dy) = GRID[cell / 4][cell % 4];
-    let strip = Rect::from_min_size(origin, egui::vec2(side, LABEL_H));
-    let rect = Rect::from_min_size(origin + egui::vec2(0.0, LABEL_H), egui::vec2(side, side));
-    if !ui.is_rect_visible(strip.union(rect)) {
+    let origin = projection_origin(origin, state);
+    let (strip, rect) = cell_rects(origin, side);
+    let viewport = viewport.intersect(ui.clip_rect());
+    if !viewport.intersects(strip.union(rect)) {
         return;
     }
-    let painter = ui.painter_at(strip.union(rect));
+    // The paint clip travels with the window inside the shared viewport,
+    // never staying behind in its former slot. Retain the original clip
+    // dimensions so border rasterization is unchanged at the default origin.
+    let window = Rect::from_min_size(origin, egui::vec2(side, side + LABEL_H));
+    let painter = ui.painter_at(window.intersect(viewport));
     painter.with_clip_rect(strip).text(
         strip.left_center() + egui::vec2(2.0, 0.0),
         egui::Align2::LEFT_CENTER,
-        format!("{} × {}", dim_label(dx, set), dim_label(dy, set)),
+        format!("{} × {}", grid_axis_label(dx), grid_axis_label(dy)),
         egui::FontId::proportional(11.0),
         theme.caption,
     );
-    if let Some((g, ..)) = &c.ghost {
+    let caption = strip.intersect(viewport);
+    if caption.is_positive() {
+        let mut description = format!("{} × {}", dim_label(dx, set), dim_label(dy, set));
+        if let Some((g, ..)) = &c.ghost {
+            description.push_str(&format!("\nc{} (ghost): the merge candidate, in grey", g.0));
+        }
         ui.interact(
-            strip,
-            ui.id().with(("feature-caption", cell, big)),
+            caption,
+            ui.id().with(("feature-caption", cell)),
             Sense::hover(),
         )
-        .on_hover_text(format!("c{} (ghost): the merge candidate, in grey", g.0));
+        .on_hover_text(description);
     }
     painter.rect_filled(rect, 0.0, theme.plot_bg);
     let (x, y) = (axis_range(set, state, dx, 0), axis_range(set, state, dy, 1));
@@ -2788,19 +2790,18 @@ fn draw_cell<P: DataProvider>(
             let Some((vertices, generation)) = vertices else {
                 continue;
             };
-            ui.painter()
-                .add(eframe::egui_wgpu::Callback::new_paint_callback(
-                    rect,
-                    ScatterCallback {
-                        id: ui.id().with((layer, cell, big)).value(),
-                        vertices: Arc::clone(vertices),
-                        generation,
-                        x,
-                        y,
-                        radius,
-                        size: rect.size(),
-                    },
-                ));
+            painter.add(eframe::egui_wgpu::Callback::new_paint_callback(
+                rect,
+                ScatterCallback {
+                    id: ui.id().with((layer, cell)).value(),
+                    vertices: Arc::clone(vertices),
+                    generation,
+                    x,
+                    y,
+                    radius,
+                    size: rect.size(),
+                },
+            ));
         }
     }
     painter.rect_stroke(
@@ -2848,7 +2849,7 @@ fn draw_cell<P: DataProvider>(
             theme.caption,
         );
     }
-    if c.dup && !big && cell == state.focus {
+    if cell == state.focus {
         painter.rect_stroke(
             rect,
             0.0,
@@ -2901,20 +2902,15 @@ fn draw_cell<P: DataProvider>(
     }
 
     let resp = ui.interact(
-        rect,
-        ui.id().with(("feature-hit", cell, big)),
+        rect.intersect(viewport),
+        ui.id().with(("feature-hit", cell)),
         Sense::click_and_drag(),
     );
-    let large = c.dup && big;
     resp.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::Other,
             true,
-            if large {
-                format!("focused feature cell {cell}")
-            } else {
-                format!("feature cell {cell}")
-            },
+            format!("feature cell {cell}"),
         )
     });
     // The nearest shown spike of a selected cluster under the pointer.
@@ -2946,7 +2942,8 @@ fn draw_cell<P: DataProvider>(
     if under.is_some() {
         state.hover_out = under;
     }
-    let (alt, shift) = ui.input(|i| (i.modifiers.alt, i.modifiers.shift));
+    let modifiers = ui.input(|i| i.modifiers);
+    let (alt, shift) = (modifiers.alt, modifiers.shift);
     // Shift+drag along a time axis sets the time brush, Shift+click clears it.
     let time_gesture = shift && !alt && dx == Dim::Time;
     if time_gesture {
@@ -2980,31 +2977,48 @@ fn draw_cell<P: DataProvider>(
         (true, _, true) => Some(dy),
         _ => None,
     };
+    let mut lasso_claimed = false;
     if let Some(Dim::Pc { ch, pc }) = picked {
         state.amplitude_dim = Some((set.channels[ch as usize], pc as usize));
     } else if !(seek || time_gesture) {
-        // The grid's copy of the focused cell leaves the lasso to the large
-        // one, unless it is the one being used: the hover feedback is
-        // written by whichever copy runs last.
-        let idle =
-            c.dup && !big && cell == state.focus && !resp.contains_pointer() && !resp.dragged();
-        let ev = if idle {
-            LassoEvent::default()
-        } else {
-            state.lasso.interact(cell, &resp, to_data, to_screen)
-        };
+        let ev = state.lasso.interact(cell, &resp, to_data, to_screen);
+        lasso_claimed = ev.consumed;
         if ev.changed {
-            state.lasso_edited();
+            if state.lasso.is_active() {
+                state.lasso_edited();
+            } else {
+                // Ctrl+right-click has the same lifecycle as Escape.
+                state.cancel_operation();
+            }
             if state.lasso.is_active() && state.lasso.cell == cell {
                 state.focus = cell;
             }
-        }
-        if !ev.consumed {
-            interact_view(ui, state, &resp);
-            if resp.clicked() && !ui.input(|i| i.modifiers.any()) {
-                state.focus = cell;
+            // A node click/insert/delete changed the polygon after this
+            // frame was painted: draw the settled hits next frame.
+            if !state.lasso.is_editing() {
+                ui.ctx().request_repaint();
             }
         }
+        // The lasso owns editing and drawing gestures; navigation only sees
+        // the drags it did not claim.
+        if !ev.consumed {
+            nav.drag(&resp, modifiers, true);
+            if resp.clicked() && !modifiers.any() {
+                state.focus = cell;
+                // While a k-means part is previewed, clicking one of the real
+                // cells moves the lasso to the part's hull there (the old
+                // mini navigator's job, now on the projection itself).
+                if let Some(h) = c.coll.as_ref().and_then(|k| k.hit(cell)) {
+                    state.lasso = Lasso::new(cell, h.hull.clone());
+                    state.km.lasso_auto = true;
+                }
+            }
+        }
+    }
+    // Wheel stays navigation while a lasso is merely hovered, but a claimed
+    // edit/draw gesture and the Shift time brush own the pointer.
+    if !(seek || time_gesture || lasso_claimed) && resp.hovered() {
+        nav.wheel_from(ui);
     }
 
     // Collision badge, top right.
@@ -3025,7 +3039,7 @@ fn draw_cell<P: DataProvider>(
         let (parts, clusters) = k.others(c.selection);
         ui.interact(
             pill,
-            ui.id().with(("collision-badge", cell, big)),
+            ui.id().with(("collision-badge", cell)),
             Sense::hover(),
         )
         .on_hover_text(format!(
@@ -3037,100 +3051,14 @@ fn draw_cell<P: DataProvider>(
     }
 }
 
-/// Focus `cell`; with a previewed part, move the lasso to the part's hull there.
-fn goto_cell(state: &mut FeatureViewState, coll: Option<&Coll>, cell: usize) {
-    state.focus = cell;
-    if let Some(h) = coll.and_then(|k| k.hit(cell)) {
-        state.lasso = Lasso::new(cell, h.hull.clone());
-        state.km.lasso_auto = true;
-        state.km.scroll_to_lasso = true;
-    }
-}
-
-/// The 4×4 collision matrix: one `tile`-px square per grid cell, coloured by
-/// the previewed part's collisions there (neutral without one), the number
-/// shown from 18 px. The focused cell is outlined, the lasso's in the
-/// selection colour. Returns the clicked cell.
-fn collision_matrix(
-    ui: &mut Ui,
-    theme: &Theme,
-    set: &FeatureSet,
-    coll: Option<&Coll>,
-    focus: usize,
-    lasso_cell: Option<usize>,
-    tile: f32,
-) -> Option<usize> {
-    let gap = if tile >= 18.0 { 2.0 } else { 1.0 };
-    let (area, _) = ui.allocate_exact_size(Vec2::splat(4.0 * tile + 3.0 * gap), Sense::hover());
-    let mut clicked = None;
-    for (cell, &(dx, dy)) in GRID.iter().flatten().enumerate() {
-        let r = Rect::from_min_size(
-            area.min
-                + egui::vec2(
-                    (cell % 4) as f32 * (tile + gap),
-                    (cell / 4) as f32 * (tile + gap),
-                ),
-            Vec2::splat(tile),
-        );
-        let resp = ui.interact(
-            r,
-            ui.make_persistent_id(("collision", cell, tile as u32)),
-            Sense::click(),
-        );
-        let label = format!("collision {} × {}", dim_label(dx, set), dim_label(dy, set));
-        resp.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.clone())
-        });
-        let hit = coll.and_then(|k| k.hit(cell).map(|h| (k, h)));
-        let (fill, text) = hit.map_or((theme.grid.gamma_multiply(0.6), theme.text), |(k, h)| {
-            tile_colours(theme, ui, h.total(), k.size())
-        });
-        let painter = ui.painter();
-        painter.rect_filled(r, 1.0, fill);
-        if let (Some((_, h)), true) = (hit, tile >= 18.0) {
-            painter.text(
-                r.center(),
-                egui::Align2::CENTER_CENTER,
-                h.total().to_string(),
-                egui::FontId::proportional((tile * 0.45).min(11.0)),
-                text,
-            );
-        }
-        if cell == focus {
-            painter.rect_stroke(
-                r,
-                1.0,
-                Stroke::new(1.5_f32, ui.visuals().strong_text_color()),
-                egui::StrokeKind::Inside,
-            );
-        } else if lasso_cell == Some(cell) {
-            painter.rect_stroke(
-                r,
-                1.0,
-                Stroke::new(1.0_f32, ui.visuals().selection.bg_fill),
-                egui::StrokeKind::Inside,
-            );
-        }
-        if resp.clicked() {
-            clicked = Some(cell);
-        }
-        resp.on_hover_text(match hit {
-            Some((_, h)) => format!("{label}: {} collisions", h.total()),
-            None => label,
-        });
-    }
-    clicked
-}
-
-/// Toolbar: `[2D|3D]`, the channels, and the rest inline (Regular and up)
-/// or in the ⚙ popover (always for marker size and the source; Compact also
-/// holds `fixed (c)`, auto-run and the hint there).
+/// Toolbar: `[2D|3D]`, the channels, and the rest inline when the pane is
+/// wide enough or folded into the ⚙ popover and a wrapped channel row.
 fn toolbar(
     ui: &mut Ui,
     state: &mut FeatureViewState,
     set: &FeatureSet,
     busy: bool,
-    layout: Layout,
+    wide: bool,
     depths: Option<&SpikeDepths>,
 ) {
     ui.horizontal(|ui| {
@@ -3145,17 +3073,17 @@ fn toolbar(
                 }
             }
         });
-        if state.mode == ViewMode::Three && layout != Layout::Compact {
+        if state.mode == ViewMode::Three && wide {
             pin_chip(ui, state, set);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.menu_button("⚙", |ui| {
                 ui.set_min_width(180.0);
-                if layout == Layout::Compact {
+                if !wide {
                     fixed_controls(ui, state);
                     ui.checkbox(&mut state.km.auto_run, "auto-run")
                         .on_hover_text(AUTO_RUN_HELP);
-                    hint(ui, hint_line(state));
+                    hint(ui, hint_line(state, ui.ctx()));
                 }
                 if state.edited.is_some()
                     && ui
@@ -3185,28 +3113,33 @@ fn toolbar(
             })
             .response
             .on_hover_text("More settings");
+            if state.mode == ViewMode::Two && state.lasso.is_active() {
+                live_tracking_toggle(ui, state);
+            }
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                if layout != Layout::Compact {
+                if wide {
                     set_chips(ui, state, set);
                 }
                 if busy {
                     ui.spinner();
                 }
-                if layout != Layout::Compact {
+                if wide {
                     fixed_controls(ui, state);
                     // The old "ⓘ" glyph rendered as an empty checkbox-like box
                     // (missing glyph); plain ASCII always draws.
-                    ui.label("(?)").on_hover_text(help_text());
+                    ui.label("(?)").on_hover_text(help_text(ui.ctx()));
                     let colour = hint_colour(&Theme::from_ui(ui));
                     ui.add(
-                        egui::Label::new(egui::RichText::new(hint_line(state)).color(colour))
-                            .truncate(),
+                        egui::Label::new(
+                            egui::RichText::new(hint_line(state, ui.ctx())).color(colour),
+                        )
+                        .truncate(),
                     );
                 }
             });
         });
     });
-    if layout == Layout::Compact {
+    if !wide {
         ui.horizontal_wrapped(|ui| {
             set_chips(ui, state, set);
             if state.mode == ViewMode::Three {
@@ -3292,7 +3225,13 @@ fn pin_chip(ui: &mut Ui, state: &mut FeatureViewState, set: &FeatureSet) {
 fn fixed_controls(ui: &mut Ui, state: &mut FeatureViewState) {
     let mut fixed = state.fixed_channels.is_some();
     if ui
-        .checkbox(&mut fixed, "fixed A/B (c)")
+        .checkbox(
+            &mut fixed,
+            format!(
+                "fixed A/B ({})",
+                crate::settings::hint(ui.ctx(), "features.channels")
+            ),
+        )
         .on_hover_text("Keep A and B instead of following the best-separating channel pair")
         .changed()
     {
@@ -3370,23 +3309,21 @@ fn kmeans_update<P: DataProvider>(
     }
 }
 
-/// The k-means row: button, k, auto-run (`auto_run`) and one chip per part;
-/// with `mini` the 5 px collision matrix and the part's best cell.
+/// The k-means row: button, k, optional auto-run and one chip per part.
 fn kmeans_row<P: DataProvider>(
     ui: &mut Ui,
     state: &mut FeatureViewState,
     c: &Ctx<P>,
     auto_run: bool,
-    mini: bool,
 ) {
     let anchor = c.selection[0];
     let mut chosen = None;
-    let mut goto = None;
     ui.horizontal_wrapped(|ui| {
         if ui
             .button("k-means")
             .on_hover_text(format!(
-                "Cluster c{anchor}'s spikes in PC space and lasso the smallest part; K splits it"
+                "Cluster c{anchor}'s spikes in PC space and lasso the smallest part; {} splits it",
+                crate::settings::hint(ui.ctx(), "curation.split")
             ))
             .clicked()
         {
@@ -3434,15 +3371,18 @@ fn kmeans_row<P: DataProvider>(
             }
             _ => {}
         }
-        if let (true, Some(k)) = (mini, &c.coll) {
-            let lasso_cell = state.lasso.is_active().then_some(state.lasso.cell);
-            goto = collision_matrix(ui, &c.theme, c.set, Some(k), state.focus, lasso_cell, 5.0);
+        if let Some(k) = &c.coll {
             let best = k.best();
             let (dx, dy) = GRID[best / 4][best % 4];
+            let click = if state.mode == ViewMode::Two {
+                " · click a cell to move the lasso"
+            } else {
+                ""
+            };
             hint(
                 ui,
                 format!(
-                    "collisions · best {} × {}: {} of {}",
+                    "best {} × {} · {} of {}{click}",
                     dim_label(dx, c.set),
                     dim_label(dy, c.set),
                     k.hit(best).map_or(0, CellHit::total),
@@ -3455,9 +3395,6 @@ fn kmeans_row<P: DataProvider>(
         state.km.part = i;
         apply_part(state, c.set, &fit, anchor);
         ui.ctx().request_repaint();
-    }
-    if let Some(cell) = goto {
-        goto_cell(state, c.coll.as_ref(), cell);
     }
 }
 
@@ -3503,18 +3440,27 @@ fn lasso_hits_cached<'a>(
     set: &FeatureSet,
     selection: &[ClusterId],
 ) -> &'a Hits {
-    let fresh = |h: &Hits| h.generation == set.generation && h.polygon == state.lasso.points;
-    if !state.hits.as_ref().is_some_and(fresh) {
-        let (dx, dy) = GRID[state.lasso.cell / 4][state.lasso.cell % 4];
+    let fresh = {
+        let lasso = state.computed_lasso();
+        state
+            .hits
+            .as_ref()
+            .is_some_and(|h| h.generation == set.generation && h.polygon == lasso.points)
+    };
+    if !fresh {
+        let lasso = state.computed_lasso();
+        let (cell, polygon) = (lasso.cell, lasso.points.clone());
+        let lasso = Lasso::new(cell, polygon.clone());
+        let (dx, dy) = GRID[cell / 4][cell % 4];
         let mut per: Vec<Vec<u32>> = vec![Vec::new(); selection.len()];
         for (i, p) in set.points.iter().enumerate() {
-            if p.slot != BACKGROUND && state.lasso.contains([set.value(i, dx), set.value(i, dy)]) {
+            if p.slot != BACKGROUND && lasso.contains([set.value(i, dx), set.value(i, dy)]) {
                 per[p.slot as usize].push(p.local);
             }
         }
         state.hits = Some(Hits {
             generation: set.generation,
-            polygon: state.lasso.points.clone(),
+            polygon,
             n: per.iter().map(Vec::len).sum(),
             spikes: selection
                 .iter()
@@ -3552,7 +3498,11 @@ fn hit_badge(
             .collect::<Vec<_>>(),
     );
     let galley = painter.layout_no_wrap(
-        format!("{n} spikes · {} nodes · K splits", lasso.points.len()),
+        format!(
+            "{n} spikes · {} nodes · {} splits",
+            lasso.points.len(),
+            crate::settings::hint(painter.ctx(), "curation.split")
+        ),
         egui::FontId::proportional(11.0),
         text,
     );
@@ -3570,41 +3520,10 @@ fn hit_badge(
     painter.galley(r.min + egui::vec2(4.0, 2.0), galley, text);
 }
 
-/// Pan (drag), zoom (wheel), feature scaling (Ctrl+wheel), marker size
-/// (Alt+wheel) and reset (double-click). Pan and zoom are shared by every
-/// cell, as in phy.
-fn interact_view(ui: &Ui, state: &mut FeatureViewState, resp: &egui::Response) {
-    if resp.dragged_by(egui::PointerButton::Primary) {
-        let d = resp.drag_delta();
-        state.pan[0] -= d.x / resp.rect.width() / state.zoom;
-        state.pan[1] += d.y / resp.rect.height() / state.zoom;
-    }
-    if resp.double_clicked() {
-        state.zoom = 1.0;
-        state.pan = [0.0; 2];
-        state.scaling = 1.0;
-    }
-    if !resp.hovered() {
-        return;
-    }
-    let (scroll, pinch, alt) =
-        ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta(), i.modifiers.alt));
-    if pinch != 1.0 {
-        // egui reports Ctrl+wheel as a zoom gesture.
-        state.scaling = (state.scaling * pinch).clamp(0.05, 50.0);
-    } else if scroll != 0.0 {
-        let f = (scroll * 0.002).exp();
-        if alt {
-            state.marker = (state.marker * f).clamp(0.5, 8.0);
-        } else {
-            state.zoom = (state.zoom * f).clamp(1.0, 100.0);
-        }
-    }
-}
-
-/// Visible data range of `dim` along `axis` (0 = x, 1 = y) after scaling,
-/// pan and zoom.
-fn axis_range(set: &FeatureSet, state: &FeatureViewState, dim: Dim, axis: usize) -> (f32, f32) {
+/// Visible data range of `dim` along `axis` (0 = x, 1 = y) after scaling and
+/// zoom. Zoom is always about the middle: the shared drag only translates
+/// the projection boxes, never the data range.
+fn axis_range(set: &FeatureSet, state: &FeatureViewState, dim: Dim, _axis: usize) -> (f32, f32) {
     let (lo, hi) = match dim {
         Dim::Time => set.bound(dim),
         Dim::Pc { .. } => {
@@ -3614,9 +3533,8 @@ fn axis_range(set: &FeatureSet, state: &FeatureViewState, dim: Dim, axis: usize)
         }
     };
     let span = hi - lo;
-    let centre = 0.5 + state.pan[axis];
     let half = 0.5 / state.zoom;
-    (lo + (centre - half) * span, lo + (centre + half) * span)
+    (lo + (0.5 - half) * span, lo + (0.5 + half) * span)
 }
 
 pub(crate) fn dim_label(dim: Dim, set: &FeatureSet) -> String {
@@ -4110,11 +4028,48 @@ mod tests {
     }
 
     #[test]
-    fn grid_geometry_clamps_columns_and_stays_square() {
-        for (w, cols) in [(100.0, 2), (300.0, 2), (420.0, 3), (700.0, 4), (2000.0, 4)] {
-            let (c, side) = grid_geometry(w);
-            assert_eq!(c, cols, "width {w}");
-            assert!(c as f32 * side + (c - 1) as f32 * CELL_GAP <= w.max(86.0) + 1e-3);
+    fn grid_axis_labels_use_phys_compact_pc_and_channel_names() {
+        assert_eq!(grid_axis_label(Dim::Time), "t");
+        assert_eq!(grid_axis_label(pc(0, 0)), "0A");
+        assert_eq!(grid_axis_label(pc(1, 0)), "0B");
+        assert_eq!(grid_axis_label(pc(0, 1)), "1A");
+        assert_eq!(grid_axis_label(pc(1, 1)), "1B");
+    }
+
+    #[test]
+    fn full_grid_fits_narrow_normal_wide_and_maximized_panes() {
+        for size in [
+            egui::vec2(240.0, 300.0),
+            egui::vec2(480.0, 520.0),
+            egui::vec2(1000.0, 700.0),
+            egui::vec2(2200.0, 1100.0),
+        ] {
+            let geo = grid_geometry(size);
+            assert!(geo.side > 10.0, "readable cell side at {size:?}");
+            assert!(geo.width <= size.x + 1e-3, "{size:?}");
+            assert!(geo.height <= size.y + 1e-3, "{size:?}");
+            let area = Rect::from_min_size(Pos2::ZERO, size);
+            let (mut xs, mut ys) = (Vec::new(), Vec::new());
+            for cell in 0..GRID.len() * GRID[0].len() {
+                let origin = cell_origin(area.min, geo, cell);
+                let (strip, plot) = cell_rects(origin, geo.side);
+                let window = strip.union(plot);
+                assert!(
+                    window.min.x >= area.min.x - 1e-3
+                        && window.min.y >= area.min.y - 1e-3
+                        && window.max.x <= area.max.x + 1e-3
+                        && window.max.y <= area.max.y + 1e-3,
+                    "cell {cell} of {size:?} outside the pane: {window:?}"
+                );
+                assert!(plot.width() > 10.0 && plot.height() > 10.0);
+                xs.push(origin.x as i32);
+                ys.push(origin.y as i32);
+            }
+            xs.sort_unstable();
+            xs.dedup();
+            ys.sort_unstable();
+            ys.dedup();
+            assert_eq!((xs.len(), ys.len()), (4, 4), "four fixed rows and columns");
         }
     }
 
@@ -4259,41 +4214,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn collision_colours_follow_the_15_percent_rule() {
-        let theme = Theme::from_visuals(&egui::Visuals::dark());
-        assert_eq!(collision_colour(&theme, 0, 100), theme.good);
-        assert_eq!(collision_colour(&theme, 15, 100), theme.warn);
-        assert_eq!(collision_colour(&theme, 16, 100), theme.danger);
-    }
-
-    #[test]
-    fn layout_follows_the_pane_width() {
-        for (w, layout) in [
-            (200.0, Layout::Compact),
-            (479.9, Layout::Compact),
-            (480.0, Layout::Regular),
-            (720.0, Layout::Regular),
-            (1099.9, Layout::Regular),
-            (1100.0, Layout::Expansive),
-            (1920.0, Layout::Expansive),
-        ] {
-            assert_eq!(layout_for(egui::vec2(w, 700.0)), layout, "width {w}");
-        }
-    }
-
-    #[test]
-    fn expansive_grid_fits_the_height_and_half_the_width() {
-        for size in [egui::vec2(1920.0, 1000.0), egui::vec2(1100.0, 900.0)] {
-            let side = expansive_side(size);
-            let (w, h) = (
-                4.0 * side + 3.0 * CELL_GAP,
-                4.0 * (side + LABEL_H) + 3.0 * CELL_GAP,
-            );
-            assert!(w <= size.x / 2.0 + 1e-3 && h <= size.y + 1e-3, "{size:?}");
-        }
-    }
-
     /// `cargo test -p sorrel-ui --release kmeans_timing -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -4359,6 +4279,51 @@ mod tests {
         );
         set.bounds = vec![(-1.0, 1.0); 4];
         set
+    }
+
+    #[test]
+    fn live_tracking_off_holds_the_hits_until_the_drag_ends() {
+        // One spike at (0.5, 0.5) in cell 0's time × PC1 view.
+        let points = vec![FeaturePoint {
+            local: 0,
+            slot: 0,
+            t: 0.5,
+        }];
+        let mut set = FeatureSet::new(
+            vec![0, 1],
+            false,
+            true,
+            points,
+            vec![0.5, 0.5, 0.0, 0.0],
+            1.0,
+        );
+        set.bounds = vec![(-1.0, 1.0); 4];
+        let selection = [ClusterId(7)];
+
+        let mut st = FeatureViewState::default();
+        assert!(!st.live_tracking, "live tracking starts off");
+        st.lasso = Lasso::new(0, vec![[0.2, 0.2], [0.8, 0.2], [0.8, 0.8], [0.2, 0.8]]);
+        st.settle_lasso();
+        assert_eq!(lasso_hits_cached(&mut st, &set, &selection).n, 1);
+
+        // A drag moves the polygon off the spike, but the count holds.
+        st.lasso.set_test_editing(true);
+        st.lasso.points = vec![[0.6, 0.6], [0.9, 0.6], [0.9, 0.9], [0.6, 0.9]];
+        assert_eq!(
+            lasso_hits_cached(&mut st, &set, &selection).n,
+            1,
+            "the count waits for the release"
+        );
+
+        // Release settles it once.
+        st.lasso.set_test_editing(false);
+        assert_eq!(lasso_hits_cached(&mut st, &set, &selection).n, 0);
+
+        // Live tracking follows the polygon during the drag.
+        st.live_tracking = true;
+        st.lasso.set_test_editing(true);
+        st.lasso.points = vec![[0.2, 0.2], [0.8, 0.2], [0.8, 0.8], [0.2, 0.8]];
+        assert_eq!(lasso_hits_cached(&mut st, &set, &selection).n, 1);
     }
 
     #[test]
@@ -4726,5 +4691,420 @@ mod tests {
         assert_eq!(window_locals(&times, 20, 20), 1..3, "start in, end out");
         assert_eq!(window_locals(&times, 0, 5), 0..0);
         assert_eq!(window_locals(&times, 0, 1000), 0..5);
+    }
+
+    #[test]
+    fn cancellation_discards_a_pending_cut_and_its_cached_selection_not_navigation() {
+        let mut st = FeatureViewState {
+            zoom: 2.0,
+            pan_px: egui::vec2(20.0, -12.0),
+            scaling: 1.5,
+            lasso: Lasso::new(0, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]),
+            preview: Some((ClusterId(4), [1, 2].into_iter().collect())),
+            split_requested: true,
+            want_full: true,
+            ..Default::default()
+        };
+        st.settled_lasso = st.lasso.clone();
+        st.km.previewing = true;
+        st.km.requested = true;
+        st.km.lasso_auto = true;
+        st.km.auto_run = true;
+        st.km.scroll_to_lasso = true;
+        st.link.spikes = vec![(ClusterId(4), Arc::from([1, 2]))];
+        let sample = one_point_set(true, false);
+        st.brush_written = Some((BrushSource::FeatureLasso, 7));
+        let mut brushes = Brushes {
+            spikes: SpikeBrush::new(BrushSource::FeatureLasso, 0, [(ClusterId(4), vec![1, 2])]),
+            ..Default::default()
+        };
+        assert!(st.cancel_operation());
+        assert!(!st.lasso_active() && !st.can_split());
+        assert!(!st.split_requested && !st.want_full);
+        assert!(!st.settled_lasso.is_active());
+        assert!(st.preview.is_none() && st.hits.is_none());
+        assert!(st.link.spikes.is_empty());
+        assert!(!st.km.requested && !st.km.auto_run && !st.km.lasso_auto);
+        assert!(!st.km.scroll_to_lasso);
+        assert_eq!(
+            (st.zoom, st.pan_px, st.scaling),
+            (2.0, egui::vec2(20.0, -12.0), 1.5)
+        );
+
+        // Even a partial feature load must allow clearing an old brush.
+        sync_brush(&mut st, &sample, &[ClusterId(4)], 0, &mut brushes);
+        assert!(brushes.spikes.is_none());
+        // A later full set cannot resurrect an abandoned selection either.
+        sync_brush(
+            &mut st,
+            &one_point_set(true, true),
+            &[ClusterId(4)],
+            0,
+            &mut brushes,
+        );
+        assert!(brushes.spikes.is_none());
+    }
+
+    #[test]
+    fn cancellation_also_stops_a_requested_kmeans_lasso_before_it_exists() {
+        let mut st = FeatureViewState::default();
+        st.request_kmeans(None);
+        assert!(
+            st.lasso_active(),
+            "Escape can cancel the pending tool operation"
+        );
+        assert!(!st.cancel_operation(), "no cut had been requested");
+        assert!(!st.lasso_active());
+        assert!(!st.km.requested);
+    }
+
+    #[test]
+    fn editing_a_lasso_drops_its_previous_cut_request() {
+        let mut st = FeatureViewState {
+            lasso: Lasso::new(0, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]),
+            ..Default::default()
+        };
+        st.request_split();
+        assert!(st.split_requested);
+        st.lasso_edited();
+        assert!(!st.split_requested, "the new polygon needs a fresh K press");
+        st.lasso.set_test_editing(true);
+        assert!(!st.can_split(), "an unfinished drag cannot be committed");
+    }
+
+    #[test]
+    fn wheel_zoom_is_centred_and_the_projection_box_keeps_its_size() {
+        let set = two_blobs();
+        let mut st = FeatureViewState::default();
+        for dim in [
+            Dim::Time,
+            Dim::Pc { ch: 0, pc: 0 },
+            Dim::Pc { ch: 1, pc: 1 },
+        ] {
+            let (lo, hi) = axis_range(&set, &st, dim, 0);
+            let centre = (lo + hi) / 2.0;
+            st.zoom = 2.0;
+            let (zlo, zhi) = axis_range(&set, &st, dim, 0);
+            assert!(((zlo + zhi) / 2.0 - centre).abs() < 1e-5, "{dim:?}");
+            assert!(
+                ((zhi - zlo) - (hi - lo) / 2.0).abs() < 1e-5,
+                "zoom shrinks the data range, not the box"
+            );
+            st.zoom = 1.0;
+        }
+        // The rects depend only on the layout origin and side, never on zoom.
+        let origin = egui::pos2(17.0, 23.0);
+        let before = cell_rects(origin, 72.0);
+        st.zoom = 7.0;
+        assert_eq!(before, cell_rects(origin, 72.0));
+        let mut zoomed_out = FeatureViewState::default();
+        let nav = NavInput {
+            zoom: 0.5,
+            ..Default::default()
+        };
+        nav.finish(&mut zoomed_out);
+        assert_eq!(
+            zoomed_out.zoom, 0.5,
+            "wheel-down can zoom out from the default view"
+        );
+    }
+
+    #[test]
+    fn shared_drag_translates_every_projection_and_keeps_data_and_lasso() {
+        let set = two_blobs();
+        let mut st = FeatureViewState::default();
+        let base = egui::pos2(40.0, 60.0);
+        let before: Vec<_> = [
+            Dim::Time,
+            Dim::Pc { ch: 0, pc: 0 },
+            Dim::Pc { ch: 1, pc: 1 },
+        ]
+        .map(|d| axis_range(&set, &st, d, 0))
+        .to_vec();
+        st.lasso = Lasso::new(0, vec![[0.1, 0.2], [0.8, 0.2], [0.8, 0.9]]);
+        let polygon = st.lasso.points.clone();
+
+        let delta = egui::vec2(-37.0, 21.5);
+        let nav = NavInput {
+            pan: delta,
+            ..Default::default()
+        };
+        assert!(nav.finish(&mut st));
+        assert_eq!(st.pan_px, delta);
+        for cell in 0..GRID.len() * GRID[0].len() {
+            let origin = base + egui::vec2((cell % 4) as f32 * 80.0, (cell / 4) as f32 * 95.0);
+            assert_eq!(projection_origin(origin, &st), origin + delta);
+        }
+        let after: Vec<_> = [
+            Dim::Time,
+            Dim::Pc { ch: 0, pc: 0 },
+            Dim::Pc { ch: 1, pc: 1 },
+        ]
+        .map(|d| axis_range(&set, &st, d, 0))
+        .to_vec();
+        assert_eq!(before, after, "a drag never pans the data ranges");
+        assert_eq!(st.lasso.points, polygon, "the lasso stays in data space");
+    }
+
+    #[test]
+    fn wheel_routes_ctrl_to_features_alt_to_markers_and_plain_to_zoom() {
+        assert_eq!(
+            wheel_action(0.0, 1.25, false),
+            WheelAction::Scale(1.25),
+            "Ctrl+wheel and native pinch are egui's zoom delta"
+        );
+        assert!(matches!(
+            wheel_action(24.0, 1.0, true),
+            WheelAction::Marker(f) if f > 1.0
+        ));
+        assert!(matches!(
+            wheel_action(24.0, 1.0, false),
+            WheelAction::Zoom(f) if f > 1.0
+        ));
+        assert_eq!(wheel_action(0.0, 1.0, false), WheelAction::None);
+
+        let mut st = FeatureViewState::default();
+        let mut nav = NavInput::default();
+        nav.wheel(0.0, 1.4, false);
+        assert!(nav.finish(&mut st));
+        assert!((st.scaling - 1.4).abs() < 1e-6);
+        assert_eq!(st.zoom, 1.0, "Ctrl+wheel must not zoom the matrix");
+        assert_eq!(st.pan_px, Vec2::ZERO);
+
+        // A duplicated cell/overlap reports the same wheel once per frame.
+        let mut nav = NavInput::default();
+        nav.wheel(0.0, 1.4, false);
+        nav.wheel(0.0, 1.4, false);
+        nav.finish(&mut st);
+        assert!(
+            (st.scaling - 1.96).abs() < 1e-6,
+            "applied once: {}",
+            st.scaling
+        );
+
+        let marker = st.marker;
+        let mut nav = NavInput::default();
+        nav.wheel(20.0, 1.0, true);
+        nav.finish(&mut st);
+        assert!(st.marker > marker, "Alt+wheel changes the marker");
+        assert_eq!(st.zoom, 1.0);
+
+        let mut nav = NavInput::default();
+        nav.wheel(20.0, 1.0, false);
+        nav.finish(&mut st);
+        assert!(st.zoom > 1.0, "plain wheel zooms the content");
+        assert!((st.marker - marker * (20.0f32 * 0.002).exp()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_double_click_resets_the_shared_view() {
+        let mut st = FeatureViewState {
+            zoom: 4.0,
+            pan_px: egui::vec2(30.0, -20.0),
+            scaling: 3.0,
+            ..Default::default()
+        };
+        let nav = NavInput {
+            reset: true,
+            ..Default::default()
+        };
+        assert!(nav.finish(&mut st));
+        assert_eq!(st.zoom, 1.0);
+        assert_eq!(st.pan_px, Vec2::ZERO);
+        assert_eq!(st.scaling, 1.0);
+        assert_eq!(st.marker, 2.5);
+    }
+
+    #[test]
+    fn navigation_starts_at_the_original_geometry() {
+        let st = FeatureViewState::default();
+        assert_eq!(st.zoom, 1.0);
+        assert_eq!(st.pan_px, Vec2::ZERO);
+        assert_eq!(st.scaling, 1.0);
+        assert_eq!(st.marker, 2.5);
+        let origin = egui::pos2(11.0, 29.0);
+        let (strip, plot) = cell_rects(origin, 80.0);
+        assert_eq!(
+            strip,
+            Rect::from_min_size(origin, egui::vec2(80.0, LABEL_H))
+        );
+        assert_eq!(
+            plot,
+            Rect::from_min_size(origin + egui::vec2(0.0, LABEL_H), Vec2::splat(80.0))
+        );
+        assert_eq!(projection_origin(origin, &st), origin);
+    }
+
+    fn nav_pointer(pos: Pos2, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers,
+        }
+    }
+
+    /// Run one test frame with a cell response and feed both the lasso and the
+    /// navigation layer, as `draw_cell` does. Returns whether the lasso claimed
+    /// the gesture.
+    fn nav_frame(
+        ctx: &egui::Context,
+        nav: &mut NavInput,
+        lasso: &mut Lasso,
+        rect: Rect,
+        modifiers: egui::Modifiers,
+        events: Vec<egui::Event>,
+    ) -> bool {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(260.0, 180.0))),
+            modifiers,
+            events,
+            ..Default::default()
+        };
+        let mut claimed = false;
+        let _ = ctx.run_ui(input, |ui| {
+            let resp = ui.interact(rect, ui.id().with("nav-test-cell"), Sense::click_and_drag());
+            let ev = lasso.interact(0, &resp, |p| [p.x, p.y], |p| p.into());
+            claimed = ev.consumed;
+            nav.drag(&resp, modifiers, !ev.consumed);
+        });
+        claimed
+    }
+
+    #[test]
+    fn lasso_node_drag_has_priority_over_the_shared_pan() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(200.0, 160.0));
+        let mut lasso = Lasso::new(
+            0,
+            vec![[20.0, 20.0], [100.0, 20.0], [100.0, 100.0], [20.0, 100.0]],
+        );
+        let mut nav = NavInput::default();
+        let start = egui::pos2(20.0, 20.0);
+        nav_frame(
+            &ctx,
+            &mut nav,
+            &mut lasso,
+            rect,
+            egui::Modifiers::NONE,
+            vec![],
+        );
+        nav_frame(
+            &ctx,
+            &mut nav,
+            &mut lasso,
+            rect,
+            egui::Modifiers::NONE,
+            vec![
+                egui::Event::PointerMoved(start),
+                nav_pointer(start, true, egui::Modifiers::NONE),
+            ],
+        );
+        let claimed = nav_frame(
+            &ctx,
+            &mut nav,
+            &mut lasso,
+            rect,
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(egui::pos2(60.0, 60.0))],
+        );
+        assert!(claimed, "the lasso owns a node drag");
+        assert_eq!(nav.pan, Vec2::ZERO, "the matrix must not pan under it");
+        assert!(
+            (lasso.points[0][0] - 60.0).abs() < 1.0 && (lasso.points[0][1] - 60.0).abs() < 1.0,
+            "the node followed the pointer: {:?}",
+            lasso.points[0]
+        );
+    }
+
+    #[test]
+    fn free_drag_pans_the_matrix_but_not_the_data_or_the_lasso() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(200.0, 160.0));
+        // A closed lasso far from where this drag starts.
+        let mut lasso = Lasso::new(
+            0,
+            vec![[20.0, 20.0], [60.0, 20.0], [60.0, 60.0], [20.0, 60.0]],
+        );
+        let polygon = lasso.points.clone();
+        let mut nav = NavInput::default();
+        let start = egui::pos2(150.0, 140.0);
+        nav_frame(
+            &ctx,
+            &mut nav,
+            &mut lasso,
+            rect,
+            egui::Modifiers::NONE,
+            vec![],
+        );
+        nav_frame(
+            &ctx,
+            &mut nav,
+            &mut lasso,
+            rect,
+            egui::Modifiers::NONE,
+            vec![
+                egui::Event::PointerMoved(start),
+                nav_pointer(start, true, egui::Modifiers::NONE),
+            ],
+        );
+        let claimed = nav_frame(
+            &ctx,
+            &mut nav,
+            &mut lasso,
+            rect,
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(egui::pos2(190.0, 150.0))],
+        );
+        assert!(!claimed, "a drag away from the lasso is navigation");
+        assert!(
+            nav.pan.x > 0.0 && nav.pan.y > 0.0,
+            "the projections move with the pointer: {:?}",
+            nav.pan
+        );
+
+        let set = two_blobs();
+        let mut st = FeatureViewState::default();
+        let before = axis_range(&set, &st, Dim::Pc { ch: 0, pc: 0 }, 0);
+        assert!(nav.finish(&mut st));
+        assert_eq!(st.pan_px, nav.pan);
+        assert_eq!(axis_range(&set, &st, Dim::Pc { ch: 0, pc: 0 }, 0), before);
+        assert_eq!(lasso.points, polygon, "the polygon stays in data space");
+    }
+
+    #[test]
+    fn ctrl_and_shift_drags_do_not_pan_the_matrix() {
+        for modifiers in [
+            egui::Modifiers::COMMAND,
+            egui::Modifiers::SHIFT,
+            egui::Modifiers::ALT,
+        ] {
+            let ctx = egui::Context::default();
+            let rect = Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(200.0, 160.0));
+            let mut lasso = Lasso::default();
+            let mut nav = NavInput::default();
+            let start = egui::pos2(150.0, 140.0);
+            nav_frame(&ctx, &mut nav, &mut lasso, rect, modifiers, vec![]);
+            nav_frame(
+                &ctx,
+                &mut nav,
+                &mut lasso,
+                rect,
+                modifiers,
+                vec![
+                    egui::Event::PointerMoved(start),
+                    nav_pointer(start, true, modifiers),
+                ],
+            );
+            nav_frame(
+                &ctx,
+                &mut nav,
+                &mut lasso,
+                rect,
+                modifiers,
+                vec![egui::Event::PointerMoved(egui::pos2(190.0, 150.0))],
+            );
+            assert_eq!(nav.pan, Vec2::ZERO, "{modifiers:?} is not a pan gesture");
+        }
     }
 }

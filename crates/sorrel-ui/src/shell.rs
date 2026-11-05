@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
 const RECENT_KEY: &str = "recent_datasets";
-const RECENT_MAX: usize = 10;
 
 /// Where a tab is in closing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +64,7 @@ pub type Opener = Box<
 >;
 
 pub struct Shell {
+    ctx: egui::Context,
     tabs: Vec<Box<dyn Tab>>,
     active: usize,
     opener: Opener,
@@ -87,6 +87,25 @@ impl Shell {
         opener: Opener,
         instance: Option<Receiver<Pending>>,
     ) -> Self {
+        let legacy = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, RECENT_KEY))
+            .unwrap_or_default();
+        crate::settings::install(&cc.egui_ctx, crate::settings::path(), legacy);
+        Self::new_in_memory(cc, opener, instance)
+    }
+
+    /// Embedders and tests can supply an isolated context without reading or
+    /// writing the user's home. Install explicit settings first if desired.
+    pub fn new_in_memory(
+        cc: &eframe::CreationContext<'_>,
+        opener: Opener,
+        instance: Option<Receiver<Pending>>,
+    ) -> Self {
+        crate::settings::shared(&cc.egui_ctx)
+            .lock()
+            .unwrap()
+            .shell_owned = true;
         crate::theme::install_visuals(&cc.egui_ctx);
         crate::theme::install_style(&cc.egui_ctx);
         if let Some(rs) = &cc.wgpu_render_state {
@@ -95,11 +114,9 @@ impl Shell {
             ScatterPipeline::install(rs);
             crate::wgpu_scene3d::Scene3dPipeline::install(rs);
         }
-        let recents = cc
-            .storage
-            .and_then(|s| eframe::get_value(s, RECENT_KEY))
-            .unwrap_or_default();
+        let recents = crate::settings::recent(&cc.egui_ctx);
         Self {
+            ctx: cc.egui_ctx.clone(),
             tabs: Vec::new(),
             active: 0,
             opener,
@@ -129,9 +146,8 @@ impl Shell {
             Opened::Existing(i) => anyhow::bail!("no tab {i}"),
             Opened::Tab(tab, root) => {
                 self.tabs.push(tab);
-                self.recents.retain(|p| *p != root);
-                self.recents.insert(0, root);
-                self.recents.truncate(RECENT_MAX);
+                crate::settings::remember(&self.ctx, root);
+                self.recents = crate::settings::recent(&self.ctx);
                 self.tabs.len() - 1
             }
         };
@@ -192,32 +208,24 @@ impl Shell {
         }
     }
 
-    /// Ctrl-O, Ctrl-W and Ctrl-(Shift-)Tab. None is in the app keymap, and
-    /// consuming them here keeps the active tab from seeing them.
+    /// Application commands consume their events before the active recording
+    /// or hovered pane sees them. All bindings come from the shared registry.
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        use egui::{Key, Modifiers};
-        crate::layout::toggle_fullscreen_on_f11(ctx);
-        let (open, close, next, prev) = ctx.input_mut(|i| {
-            (
-                i.consume_key(Modifiers::COMMAND, Key::O),
-                i.consume_key(Modifiers::COMMAND, Key::W),
-                i.consume_key(Modifiers::CTRL, Key::Tab),
-                i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Tab),
-            )
-        });
-        let n = self.tabs.len();
-        if open {
-            self.pick();
-        }
-        if close && n > 0 {
-            self.tabs[self.active].request_close();
-        }
-        if n > 1 && (next || prev) {
-            self.active = if next {
-                (self.active + 1) % n
-            } else {
-                (self.active + n - 1) % n
-            };
+        use crate::shortcuts::{Action, Scope, ShellAction as S};
+        crate::settings::capture_input(ctx);
+        crate::layout::window_shortcuts(ctx);
+        let mut actions = crate::settings::consume(ctx, Scope::Application);
+        actions.extend(crate::settings::take_window_requests(ctx));
+        for action in actions {
+            let n = self.tabs.len();
+            match action {
+                Action::Shell(S::Open) => self.pick(),
+                Action::Shell(S::Close) if n > 0 => self.tabs[self.active].request_close(),
+                Action::Shell(S::Next) if n > 1 => self.active = (self.active + 1) % n,
+                Action::Shell(S::Previous) if n > 1 => self.active = (self.active + n - 1) % n,
+                Action::Settings => crate::settings::open(ctx),
+                _ => {}
+            }
         }
     }
 
@@ -240,7 +248,10 @@ impl Shell {
                     }
                     if ui
                         .small_button("×")
-                        .on_hover_text("Close (Ctrl+W)")
+                        .on_hover_text(format!(
+                            "Close ({})",
+                            crate::settings::hint(ui.ctx(), "app.close_dataset")
+                        ))
                         .clicked()
                     {
                         close = Some(i);
@@ -249,8 +260,14 @@ impl Shell {
                 }
                 add = ui
                     .small_button("+")
-                    .on_hover_text("Open dataset (Ctrl+O)")
+                    .on_hover_text(format!(
+                        "Open dataset ({})",
+                        crate::settings::hint(ui.ctx(), "app.open_dataset")
+                    ))
                     .clicked();
+                if ui.button("Settings").clicked() {
+                    crate::settings::open(ui.ctx());
+                }
             });
         });
         if let Some(i) = switch {
@@ -274,7 +291,7 @@ impl Shell {
             ui.add_space(14.0);
             if ui
                 .add(egui::Button::new("Open dataset…").min_size(egui::vec2(180.0, 30.0)))
-                .on_hover_text("Ctrl+O")
+                .on_hover_text(crate::settings::hint(ui.ctx(), "app.open_dataset"))
                 .clicked()
             {
                 self.pick();
@@ -285,13 +302,18 @@ impl Shell {
                     .hint_text("or paste a dataset path and press Enter")
                     .desired_width(f32::INFINITY),
             );
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if (resp.has_focus() || resp.lost_focus())
+                && crate::settings::pressed(ui.ctx(), "app.submit")
+            {
                 let p = std::mem::take(&mut self.path_input);
                 if !p.trim().is_empty() {
                     open = Some(p.trim().into());
                 }
             }
             ui.weak("…or drop a dataset folder on this window");
+            if ui.button("Settings").clicked() {
+                crate::settings::open(ui.ctx());
+            }
             if !self.recents.is_empty() {
                 ui.add_space(16.0);
                 ui.label(egui::RichText::new("Recent").strong());
@@ -448,10 +470,17 @@ impl eframe::App for Shell {
                 tab.popouts(&ctx);
             }
         }
-    }
-
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, RECENT_KEY, &self.recents);
+        if let Some(warning) = crate::settings::shared(&ctx)
+            .lock()
+            .unwrap()
+            .warning
+            .clone()
+        {
+            egui::Window::new("Settings warning").show(&ctx, |ui| {
+                ui.label(warning);
+            });
+        }
+        crate::settings::show(&ctx);
     }
 
     fn on_exit(&mut self) {
