@@ -44,10 +44,23 @@ in
       ++ preCommitEnabledPackages
       ++ buildInputs;
 
-    extraEnv = {LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;} // hdf5Env // lavapipeEnv;
+    extraEnv =
+      {
+        LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
+        # Match the release cross build: aws-lc's jitterentropy includes sched.h,
+        # which lives in winpthreads rather than the MinGW compiler's headers.
+        CFLAGS_x86_64_pc_windows_gnu = "-I${cross.winpthreads}/include";
+      }
+      // hdf5Env // lavapipeEnv;
 
     extraShellHook = ''
       ${shellHook}
+      ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+        # windres invokes gcc by basename. Add only the bin directories: adding
+        # the cross compiler as a shell package runs its setup hook and wrongly
+        # sets CC_<linux host> to the Windows compiler during native tests.
+        export PATH="${cross.mingwCC}/bin:${cross.mingwBinutils}/bin:$PATH"
+      ''}
       echo "Website: plinth-project dev --config website/plinth-project.toml"
       echo "Documentation: cd docs && mdbook serve"
     '';

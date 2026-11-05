@@ -1,16 +1,20 @@
 //! sorrel-data: the monomorphised core. `Session<P>` is generic over a
 //! `DataProvider`, so the entire state machine specialises per backend.
 
+pub mod axis_split;
 pub mod blind;
 pub mod brief;
 pub mod cache;
 pub mod cluster_index;
 pub mod command;
 pub mod curation_json;
+pub mod density_tree;
 #[cfg(feature = "dev")]
 pub mod devdb;
 pub mod diff;
 pub mod evaluate;
+#[cfg(feature = "dev")]
+pub mod feature_oracle;
 pub mod feature_subspace;
 pub mod host;
 pub mod instance;
@@ -24,7 +28,9 @@ pub mod proposals;
 pub mod proposers;
 pub mod qc_export;
 pub mod quality_ext;
+pub mod raw_waveform;
 pub mod report;
+pub mod robust_cleanup;
 pub mod rules;
 pub mod save;
 pub mod serve;

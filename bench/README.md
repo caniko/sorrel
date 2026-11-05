@@ -22,6 +22,66 @@ Never in the repo: recordings, `BENCH/` (blinded inputs, truths and run copies),
 `BENCH/.sealed/` (the salt, the id↔path map and the holdout), and anything that
 names an animal, a date or a lab path.
 
+## Native CLI
+
+Build with `--features dev` to use `sorrel dev bench` without a Python runner.
+Discovery checks names and existence only; intake reads originals without
+opening a session host on them, requires a self-contained raw recording, blinds
+the input and seals the truth. Duplicate sorter fingerprints cannot straddle
+dev and holdout. Add any previously inspected session with `--dev` first.
+
+```sh
+sorrel dev bench discover /data/sorts --integer-ids
+sorrel dev --db bench/results.sqlite bench --bench /private/BENCH add --phy-curated --dev /data/seen-sort
+sorrel dev --db bench/results.sqlite bench --bench /private/BENCH add --phy-curated --discover /data/sorts --integer-ids
+sorrel dev --db bench/results.sqlite bench --bench /private/BENCH run --arm mcp-review --variant bench/variants/v2-core-base --split dev --repeats 1 --dev-limit 1 --plumbing-check --backend opencode --model PROVIDER/MODEL --sorrel-rev COMMIT --max-budget-usd 2
+sorrel dev --db bench/results.sqlite bench --bench /private/BENCH score --split dev
+sorrel dev bench --bench /private/BENCH report dev
+```
+
+Remove `--dev-limit` and `--plumbing-check` and use three repeats for an actual comparison; run the
+`auto-llm` arm too. `--sorrel` and `--scorer` select immutable binaries; the
+scorer must stay fixed across variants. Repeating the same command resumes it:
+successful runs with identical configuration and repeat number are skipped.
+`--jobs 2` runs two independent sessions concurrently (default 1, maximum 8);
+repeats of a session stay sequential. Use the same job count for comparative
+rounds and check memory before increasing it. Any failure stops new work;
+already active runs finish and are accounted for before the command returns
+an error. Per-run timeouts and cost caps still apply to each active model.
+
+`sorrel dev bench --bench /private/BENCH coverage --dev-limit 6` is a lead-only,
+dev-only boundary diagnostic. It fits the experimental robust majority-cleanup
+boundary on input alone, then measures oracle overlap with existing dev truth.
+It opens only disposable allowlisted input copies, never original sorts or
+holdout, and writes a separate coverage report (not a scored arm run). Oracle
+reachability is a capability ceiling, not automated curation performance or
+scientific acceptance. No threshold or boundary is optimized using truth.
+`--method density` instead measures the bounded hierarchical-tail proposer
+(at most four levels /15 fitted nodes per root), with the same row-alignment
+and dev-only safeguards. Neither diagnostic is an LLM curation-arm score.
+`--method feature-oracle` is different: it deliberately fits human training
+labels to transparent PC/amplitude/time cuts and evaluates the fixed cuts on
+alternate spikes. Feature/threshold selection uses training data only, with
+bounded class-weighted sampling. These correlated same-session validation
+spikes do NOT establish leave-session-out accuracy. This mode diagnoses the
+input representation; its fitted thresholds must never enter an arm directly.
+Each run records the binary hash and
+commit, and saves revision-pinned input cards. Failed, capped, disconnected or
+input-mutating runs stop collection and are not scored. Sidecar billing that
+is not exposed is reported as unknown, never as free.
+
+The usual Jaccard-0.8 recovery metrics measure progress, not identity. `sorrel
+diff` also reports `exact_match`: all spike memberships and original labels,
+including noise, must agree up to a bijective cluster-id rename, with no
+disputed roots excluded. Only that check certifies an exact reproduction.
+
+Holdout commands are lead-only. They keep runs and scores under `.sealed/`;
+`report holdout --baseline NAME --candidate NAME` logs each attempted query and
+exports paired aggregates only. Keep the adjudication requirement from the
+skill: a score without human holdout adjudication is not a final acceptance.
+The legacy Python runner below remains available for older benches; new
+reusable utilities belong in the sorrel CLI.
+
 ## Bootstrap on a new machine
 
 1. **Clone with LFS.** Run `git lfs install` once per user, then clone. Check

@@ -1,6 +1,6 @@
 ---
 name: curation-bench-loop
-description: Use on the analysis host to run the double-blind improvement loop for sorrel's automated curation (`sorrel auto --llm` and the MCP review agent) against human-curated sorts. Covers adding sessions, running arms, condensing misses, writing one prompt variant, and the dev/holdout acceptance rule.
+description: Use on the analysis host to run the double-blind improvement loop for sorrel's automated curation (`sorrel auto --llm` and the MCP review agent) against human-curated sorts. Original phy and Kilosort data is strictly read-only. Covers adding sessions, running arms on disposable copies, condensing misses, writing one prompt variant, and the dev/holdout acceptance rule.
 ---
 
 # Curation bench improvement loop
@@ -27,9 +27,48 @@ Metrics, the three blinds and the command reference are in the "Double-blind
 bench" section of `docs/src/usage/auto-curation.md`; this page only orders the
 steps and says who does each.
 
+## Source-data protection: originals are strictly read-only
+
+**Never modify the original phy curation, Kilosort output, or raw recordings.**
+They are the scientific source and ground truth, not a workspace. An unlimited
+budget, a failing command, a parser bug, or the goal of exact reproduction does
+not authorize changing them. On this host this includes `D:\KS4`, the matched
+data under `W:\Dejana\DataAPPPS1`, and the historical source ZIP.
+
+- Read, list and hash originals only. Do not write, overwrite, delete, rename,
+  move, relabel, merge, split, save, export over, or repair anything there.
+  Do not change permissions, attributes or timestamps as a workaround.
+- Do not launch phy, a sorrel session/host, `auto`, `call`, or another program
+  on an original if it can create journals, locks, caches, backups, analyzer
+  output, `.phy`, `.sorrel`, `sorrel_original`, or other side effects. Even an
+  apparently read-only probe can create session metadata. Run it on a separate
+  disposable diagnostic copy instead.
+- Intake must read originals through the native allowlisted blinding API and
+  write to a distinct private bench directory. Fix code, not source files:
+  never patch an original `params.py`, NPY array, TSV, `phy.log`, or recording
+  to make intake succeed. Validate source/destination separation, including
+  symlinks, junctions and other filesystem aliases, before any writable open.
+- Treat immutable bench input and truth dataset files as read-only after
+  intake. Run curation, saves, exports and diagnostics only in disposable
+  per-run or diagnostic directories. Reports, logs, databases and operational
+  bench metadata belong outside source dataset directories.
+- A hard link is not an independent copy. Never write in place through a link
+  to an original or immutable bench file. Materialize an independent copy
+  before a tool could modify it; share large raw/features only when every
+  consumer opens them read-only. Do not rely on a different pathname for safety.
+- Include a **Source-data integrity** statement in the round report: identify
+  permitted write locations, any original-source write observed or suspected,
+  checks performed, and remaining verification limits. Earlier D/W agreement
+  or bench-input hashes are not a fresh, complete audit of all source files.
+- If any command writes, or may have written, to original data, stop affected
+  work and report it immediately. Preserve evidence; state the exact command,
+  paths, known changes and uncertainty. Do not silently repair, restore or
+  overwrite the originals to hide or undo it; wait for the user's decision.
+
 ## Prerequisites
 
-- A `sorrel` binary (`SORREL_BIN` if it is not on `PATH`) and the `claude` CLI.
+- A `sorrel` binary (`SORREL_BIN` if it is not on `PATH`) and an authenticated
+  supported LLM CLI (`claude` or `opencode`, with an explicit model for OpenCode).
 - uv, for the `auto-llm` arm.
 - For the results DB, a `sorrel` built with `--features dev`; `--db FILE` (or
   `SORREL_DEV_DB`) on the runner turns recording on. Holdout runs are never
@@ -38,11 +77,32 @@ steps and says who does each.
   publishable (prompt text only) and live in `bench/variants/<name>/`
   (`review.md`, `rubric.md`, `RATIONALE.md`); a variant with no override
   files runs the binary's built-in prompt.
-- Uploads from `export-curated-sort` unpacked first with
-  `export_curated_sort.py unpack PKG OUT_DIR`.
+- Verified uploads from `export-curated-sort`, unpacked before intake. Use or
+  implement a native sorrel CLI unpacker rather than a Python utility. Local
+  sorts may be ingested directly by the native CLI's read-only, allowlisted
+  blinding intake; never open a session host on an original.
 - A new machine: follow `bench/README.md` (pinned binaries, re-sealing, env).
 - Run through the checks in [Pitfalls](#pitfalls-learned-the-hard-way) before
   collecting any data.
+
+## CLI-first utilities
+
+Do not write or extend Python scripts for this loop. Implement reusable intake,
+packaging, discovery, running, scoring, reporting and diagnostic utilities at the
+`sorrel` CLI level instead, with tests. When the CLI lacks a needed operation,
+add it before collecting results; do not create an ad-hoc Python runner to bridge
+the gap. Python command examples in older bench documentation describe the legacy workflow,
+not permission to create another script. The existing SpikeInterface sidecar is
+part of sorrel, not a new bench utility.
+
+Python scripts are allowed only for niche navigation or interoperability issues
+specific to the current host or session. Record why that exception is needed;
+move any generally useful operation into the sorrel CLI.
+
+When targeting Windows 11 from NixOS WSL, enter with `wsl -d NixOS`, run builds
+and tests in the pinned Nix development environment, and rebuild the Windows
+binary after each code improvement before benchmarking it. Keep each round's
+arm and scorer binaries immutable and record their commits.
 
 ## Agent tiers
 
@@ -83,10 +143,12 @@ Steps 2 to 4 repeat after step 5, on a binary pinned at the new commit when step
 
 ## Cost
 
-`run --max-budget-usd N` caps each `mcp-review` run (default 10). Ask the user
-for a round budget (for example $60) and sum `cost_usd` over the round's
-`run.json` files; stop and report when the total passes it, or when any single
-run hits its cap.
+`run --max-budget-usd N` caps each `mcp-review` run (default 10). Ask for a round
+budget (for example $60) only if the user has not already provided one. An
+explicit unlimited budget removes the round-total limit, not the per-run cap,
+timeouts, plumbing checks or cost accounting. Sum `cost_usd` over the round's
+`run.json` files; stop and report when a finite round budget is exceeded or a
+single run hits its cap. Do not score capped or disconnected runs as successes.
 
 ## Accepting a change
 
@@ -107,6 +169,12 @@ good-unit recall and precision against the human curation (1.0 is the target)
 in every round summary. When a category stops moving under prompt changes,
 that is the signal for a new capability rather than another variant.
 
+Do not call a tolerant unit match an exact reproduction of phy. To claim the
+same cluster results, verify `sorrel diff`'s `exact_match` on every recording:
+all spike memberships must agree up to a bijective cluster-id rename and all
+original labels must agree, including noise. Empty comparisons, disputed-root
+exclusions and good/not-good label folding cannot certify exact agreement.
+
 ## Pitfalls (learned the hard way)
 
 Each item cost a round or leaked an answer once. Run the check before
@@ -115,7 +183,8 @@ collecting data; a failed check stops the round.
 1. **Kilosort 4 writes `channel_shanks.npy` as float32.** Sorrel before
    2c1991d refuses it, so no KS4 folder opens and the MCP server never starts:
    the agent run "succeeds" with no tools. Check: `sorrel describe <input>`
-   prints the cluster count for every new session.
+   prints the cluster count for every new session. Run this on its blinded
+   intake copy, never on the original dataset.
 2. **phy rewrites `cluster_KSLabel.tsv`, `cluster_ContamPct.tsv` and
    `cluster_Amplitude.tsv` on save**, with rows only for the clusters that
    exist after curation, so a filtered copy marks which roots the human left
@@ -171,3 +240,39 @@ INPUT` matches the number of roots with two or more good pieces. A single
     copies its input (big files hard-linked, the rest copied), and Claude
     Code's own temp directory filling up silently loses command output. Check:
     `df -h $BENCH "$TMPDIR"` shows room for repeats × arms × the input size.
+13. **Set both cwd and `PWD` for isolated OpenCode calls.** An inherited repo
+    `PWD` can select the repo's Location even when the subprocess cwd is an
+    empty temporary directory. Check the generated review agent with
+    `opencode --standalone debug agents` in the same environment before a model
+    call; stop if it is missing. Qualified `provider/model#variant` names also
+    need typed results-DB validation, not a blanket path-separator rejection.
+14. **Use a Git-aware Nix flake path for build checkouts.** Explicit `path:`
+    inputs can copy the checkout's entire growing `target/` into the store and
+    make later builds appear hung. Use the clean pinned Git checkout (or its
+    commit-qualified Git URL), keep build outputs separate, and use already
+    fetched inputs offline when registry refresh is the blocker.
+15. **Some KS4 exports use a singleton-list `dat_path`.** Parse that literal
+    safely in sorrel; never execute params.py or patch an original by hand.
+    The blinded copy must always replace the source path with its local raw
+    filename, including when the provider used the default recording.dat.
+    Check the copied params resolve to an existing file before adding a session.
+16. **Bound concurrency, not just total spending.** Native `run --jobs N`
+    runs independent sessions concurrently; repeats stay sequential. Start
+    conservatively (two sessions), check memory, retain per-run caps/timeouts
+    and match job counts across comparisons. A failure stops new work while
+    already active runs finish and remain accounted for. The runner must not
+    rewrite a shared privacy deny file while DB subprocesses read it.
+17. **Session globals are not original NPY rows.** The session sorts spikes by
+    time with cluster-ID tie breaking; simultaneous spikes may have a different
+    order in phy's files. A diagnostic comparing memberships must map through
+    the original row permutation, validate bijection and input-root agreement,
+    and test ties/interleaving. Never index truth arrays with session-global
+    indices directly. Save/export already restores original file row order.
+18. **Do not share workspace build artifacts between scientific arms and
+    diagnostic reporters.** Different source clones can have matching crate
+    names/versions while exposing incompatible modules or rejected behavior.
+    A shared Cargo target cache once supplied an axis-only data library to a
+    reporter that required diagnostic modules. Use distinct target/build dirs
+    per isolated source snapshot; pin outputs from that exact directory and
+    record build failures. A commit-qualified flake URL alone does not isolate
+    Cargo artifacts. Never treat a failed build's old executable as its output.

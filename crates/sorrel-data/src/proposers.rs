@@ -43,6 +43,10 @@ const CORE_MIN_FRAC: f32 = 0.01;
 const CORE_RPV: f32 = 0.1;
 /// The core's feature space spans this many best channels (a tetrode fully).
 const CORE_CHANNELS: usize = 4;
+/// Interior candidates are bounded, model-defined ellipsoids, never a scan of
+/// arbitrary spike subsets. Keep the largest passing interior per component.
+const CORE_POSTERIOR: f64 = 0.95;
+const CORE_DENSITY_MASS: [f64; 7] = [1.0, 0.99, 0.95, 0.90, 0.75, 0.50, 0.25];
 
 /// Whiten a raw `(n, d0)` matrix where `NaN` marks a missing value (the
 /// spike's template has no feature on that channel). Dimensions present for
@@ -269,7 +273,8 @@ fn core_gate(n: usize, whole: impl FnOnce() -> f32) -> Option<f32> {
 /// `feats` and keeps the BIC winner (k = 1 means no structure). Two readings
 /// of that mixture are tried; both need the minor part to hold at least
 /// max(100, 1%) of the spikes and, for a core, an LDA d′ against the rest of at least 2.
-/// - `core`: one component of at most half the spikes with contamination at
+/// - `core`: one component (or a high-posterior dense interior when its full
+///   component fails) of at most half the spikes with contamination at
 ///   most 0.1 and significantly fewer ISI violations than a random subset of
 ///   that size would have (`violations(local indices)` below the chance count
 ///   minus 2.33 Poisson sd, none at all when that is below zero). The kept
@@ -314,7 +319,6 @@ fn core_from_mixture(
     violations: impl Fn(&[u32]) -> usize,
 ) -> Option<CoreSplit> {
     let n = feats.len() / d;
-    let all: Vec<u32> = (0..n as u32).collect();
     let stride = n.div_ceil(CORE_MAX_FIT);
     let sub: Vec<f32> = (0..n)
         .step_by(stride)
@@ -323,10 +327,29 @@ fn core_from_mixture(
     let gmm = (1..=CORE_MAX_K)
         .filter_map(|k| fit_diag_gmm(&sub, d, k, 60))
         .min_by(|a, b| a.bic().total_cmp(&b.bic()))?;
+    core_from_fitted(feats, d, whole, &gmm, contamination, violations)
+}
+
+fn core_from_fitted(
+    feats: &[f32],
+    d: usize,
+    whole: f32,
+    gmm: &sorrel_compute::DiagGmm,
+    contamination: impl Fn(&[u32]) -> f32,
+    violations: impl Fn(&[u32]) -> usize,
+) -> Option<CoreSplit> {
     if gmm.k < 2 {
         return None;
     }
-    let labels = gmm.assign(feats);
+    let n = feats.len() / d;
+    let all: Vec<u32> = (0..n as u32).collect();
+    let stride = n.div_ceil(CORE_MAX_FIT);
+    let sub: Vec<f32> = (0..n)
+        .step_by(stride)
+        .flat_map(|i| feats[i * d..(i + 1) * d].iter().copied())
+        .collect();
+    let details = gmm.assign_with_confidence(feats);
+    let labels: Vec<_> = details.iter().map(|x| x.0).collect();
     let mut parts: Vec<Vec<u32>> = vec![Vec::new(); gmm.k];
     for (i, &l) in labels.iter().enumerate() {
         parts[l as usize].push(i as u32);
@@ -369,17 +392,62 @@ fn core_from_mixture(
         |v: usize, expected: f64| v as f64 <= (expected - 2.33 * expected.sqrt()).max(0.0);
     let chance = |len: usize| viol_all * (len as f64 / n as f64).powi(2);
     for (j, p) in parts.iter().enumerate() {
-        if p.len() < min_size || p.len() * 2 > n {
+        if p.len() < min_size {
             continue;
         }
-        let c = contamination(p);
-        let expected = chance(p.len());
-        if c.is_nan() || c > CORE_RPV || !fewer_than_chance(violations(p), expected) {
-            continue;
+        if p.len() * 2 <= n {
+            let c = contamination(p);
+            let dp = d_prime(&[j]);
+            if c.is_finite()
+                && c <= CORE_RPV
+                && fewer_than_chance(violations(p), chance(p.len()))
+                && dp.is_finite()
+                && dp >= MIN_D_PRIME
+            {
+                offer("core", p.clone(), p.len(), c, dp);
+                // Preserve a supported full component; don't trim a clean unit
+                // merely to improve its apparent refractory score.
+                continue;
+            }
         }
-        let dp = d_prime(&[j]);
-        if !dp.is_nan() && dp >= MIN_D_PRIME {
-            offer("core", p.clone(), p.len(), c, dp);
+        let mut previous_size = p.len();
+        for mass in CORE_DENSITY_MASS {
+            let interior: Vec<u32> = p
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    let (_, posterior, radius_sq) = details[i as usize];
+                    posterior >= CORE_POSTERIOR
+                        && radius_sq.is_finite()
+                        && chi2_sf(radius_sq, d as f64) >= 1.0 - mass
+                })
+                .collect();
+            if interior.len() < min_size {
+                break;
+            }
+            if interior.len() == previous_size {
+                continue;
+            }
+            previous_size = interior.len();
+            if interior.len() * 2 > n {
+                continue;
+            }
+            let c = contamination(&interior);
+            if !c.is_finite()
+                || c > CORE_RPV
+                || !fewer_than_chance(violations(&interior), chance(interior.len()))
+            {
+                continue;
+            }
+            let mask: Vec<_> = (0..n as u32)
+                .step_by(stride)
+                .map(|i| interior.binary_search(&i).is_ok())
+                .collect();
+            let dp = lda_d_prime(&sub, &mask, d);
+            if dp.is_finite() && dp >= MIN_D_PRIME {
+                offer("core", interior.clone(), interior.len(), c, dp);
+                break;
+            }
         }
     }
     // Cleanup: drop components with ISI violations, most violations per spike
@@ -721,6 +789,110 @@ mod tests {
         // Parent clean, every part dirty.
         let c = |idx: &[u32]| if idx.len() == 600 { 0.0 } else { 0.5 };
         assert!(kmeans_split_proposal(&feats, d, c).is_none());
+    }
+
+    fn nested_core(n_core: usize) -> (Vec<f32>, sorrel_compute::DiagGmm, Vec<bool>) {
+        let mut seed = 43;
+        let rows: Vec<f32> = (0..(1000 + n_core) * 2)
+            .map(|i| {
+                gaussian(&mut seed)
+                    + if i % 2 == 0 {
+                        if i / 2 < 1000 {
+                            -5.0
+                        } else {
+                            5.0
+                        }
+                    } else {
+                        0.0
+                    }
+            })
+            .collect();
+        let clean: Vec<_> = rows
+            .chunks_exact(2)
+            .map(|r| (r[0] - 5.0).powi(2) + r[1].powi(2) <= 2.0)
+            .collect();
+        let gmm = sorrel_compute::DiagGmm {
+            k: 2,
+            d: 2,
+            weights: vec![
+                1000.0 / (1000 + n_core) as f64,
+                n_core as f64 / (1000 + n_core) as f64,
+            ],
+            means: vec![-5.0, 0.0, 5.0, 0.0],
+            vars: vec![1.0; 4],
+            log_lik: 0.0,
+            n: 1000 + n_core,
+        };
+        (rows, gmm, clean)
+    }
+
+    #[test]
+    fn dense_interior_is_available_when_the_full_component_is_contaminated() {
+        let (rows, gmm, clean) = nested_core(400);
+        let c = |idx: &[u32]| {
+            if idx.iter().all(|&i| clean[i as usize]) {
+                0.0
+            } else {
+                0.6
+            }
+        };
+        let v = |idx: &[u32]| {
+            if idx.iter().all(|&i| clean[i as usize]) {
+                0
+            } else {
+                idx.len() / 2
+            }
+        };
+        let p = core_from_fitted(&rows, 2, 0.6, &gmm, c, v).expect("dense clean interior");
+        assert_eq!(p.method, "core");
+        assert!(p.minor_idx.len() >= CORE_MIN_SPIKES && p.minor_idx.len() < 400);
+        assert!(p.minor_idx.iter().all(|&i| clean[i as usize]));
+        assert!(p.minor_idx.windows(2).all(|w| w[0] < w[1]));
+        assert!(p.d_prime >= MIN_D_PRIME && p.core_contamination <= CORE_RPV);
+        // The same capability is reached through actual BIC fitting, not only
+        // the controlled fitted-model test seam.
+        assert!(core_split_proposal(&rows, 2, c, v).is_some());
+    }
+
+    #[test]
+    fn density_trimming_keeps_the_original_size_and_refractory_vetoes() {
+        let (rows, gmm, _) = nested_core(400);
+        assert!(core_from_fitted(&rows, 2, 0.6, &gmm, |_| 0.6, |_| 0).is_none());
+        assert!(core_from_fitted(&rows, 2, 0.6, &gmm, |_| f32::NAN, |_| 0).is_none());
+        assert!(core_from_fitted(&rows, 2, 0.6, &gmm, |_| 0.0, |idx| idx.len()).is_none());
+        let (rows, gmm, clean) = nested_core(120);
+        let c = |idx: &[u32]| {
+            if idx.iter().all(|&i| clean[i as usize]) {
+                0.0
+            } else {
+                0.6
+            }
+        };
+        assert!(
+            core_from_fitted(&rows, 2, 0.6, &gmm, c, |_| 0).is_none(),
+            "a tiny interior must not bypass the 100-spike minimum"
+        );
+    }
+
+    #[test]
+    fn supported_whole_components_are_not_trimmed_for_a_better_score() {
+        let (rows, gmm, _) = nested_core(400);
+        let c = |idx: &[u32]| {
+            if idx.iter().all(|&i| i >= 1000) {
+                0.0
+            } else {
+                0.6
+            }
+        };
+        let v = |idx: &[u32]| {
+            if idx.iter().all(|&i| i >= 1000) {
+                0
+            } else {
+                idx.len() / 2
+            }
+        };
+        let p = core_from_fitted(&rows, 2, 0.6, &gmm, c, v).unwrap();
+        assert_eq!(p.minor_idx, (1000..1400).collect::<Vec<_>>());
     }
 
     #[test]

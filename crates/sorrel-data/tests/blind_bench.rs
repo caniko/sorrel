@@ -72,6 +72,40 @@ fn label_str(l: &PhyLabel) -> &'static str {
     l.as_str()
 }
 
+#[test]
+fn blind_input_always_writes_a_local_literal_recording_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (index, path_line) in [
+        "",
+        "dat_path = ['recording.dat']\n",
+        "dat_path = ['/private/export/recording.dat']\n",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let root = tmp.path().join(format!("source-{index}"));
+        let input = tmp.path().join(format!("input-{index}"));
+        std::fs::create_dir(&root).unwrap();
+        write_sort(&root);
+        let mut params = std::fs::read_to_string(root.join("params.py")).unwrap();
+        params.push_str(path_line);
+        std::fs::write(root.join("params.py"), &params).unwrap();
+        let baseline = baseline_hash(&std::fs::read(root.join("spike_clusters.npy")).unwrap());
+        write_blind_input(&root, None, &input, "spike_clusters.npy", baseline).unwrap();
+        let parsed = sorrel_io::PhyParams::read(&input.join("params.py")).unwrap();
+        assert_eq!(parsed.dat_path.as_deref(), Some(Path::new("recording.dat")));
+        let output = std::fs::read_to_string(input.join("params.py")).unwrap();
+        assert!(output.contains("dat_path = \"recording.dat\""));
+        assert!(!output.contains("/private/export"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("params.py")).unwrap(),
+            params
+        );
+        assert!(!root.join("sorrel.journal").exists());
+        assert_self_contained(&input);
+    }
+}
+
 fn open(root: &Path) -> Session<KilosortProvider> {
     let mut s = open_phy(root, KilosortOpenParams::default(), &JournalOpts::default()).unwrap();
     seed_phy(&mut s).unwrap();
