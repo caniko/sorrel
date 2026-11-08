@@ -499,6 +499,11 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         &self.brushes
     }
 
+    /// Progress and exact valid/total counts for the all-spike waveform view.
+    pub fn waveform_all_summary(&self) -> crate::waveform_view::WaveformAllSummary {
+        self.waveform_cache.all_spikes_summary()
+    }
+
     /// The host that owns the session; other frontends (MCP, remote) edit
     /// through it.
     pub fn host(&self) -> &Arc<SessionHost<P>> {
@@ -864,6 +869,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
 
     /// Stop background jobs so the write lock is free at once.
     fn cancel_jobs(&mut self) {
+        self.waveform_cache.cancel();
         self.suggest_cache.cancel();
         self.quality_cache.cancel();
         self.depth_memo.cancel();

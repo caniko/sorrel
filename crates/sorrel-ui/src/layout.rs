@@ -16,8 +16,8 @@ use crate::trace_image::{trace_image_view, TraceImageCache};
 use crate::views::{
     cluster_statistics_view_for, contamination_over_time_view, correlogram_grid_view,
     drift_map_view, firing_rate_view, isi_view, probe_view, psth_view, quality_view, raster_view,
-    selection_summary, suggest_view, waveform_view, waveform_window_samples, CcgCache, PsthCache,
-    PsthState, QualityCache, RasterCache, RasterClick, SuggestAction, SuggestCache, WaveformCache,
+    selection_summary, suggest_view, waveform_window_samples, CcgCache, PsthCache, PsthState,
+    QualityCache, RasterCache, RasterClick, SuggestAction, SuggestCache, WaveformCache,
 };
 use crate::widgets::{trace_view, TraceCache, TraceMarker};
 use egui::Ui;
@@ -972,7 +972,7 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                     crate::settings::hint(ui.ctx(), "app.help")
                 ));
             }
-            Pane::Waveforms => waveform_view(
+            Pane::Waveforms => crate::waveform_view::waveform_view_with_jobs(
                 ui,
                 session,
                 selected,
@@ -982,6 +982,7 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                 &mut self.view_params.waveform,
                 self.feature_link,
                 &*self.brushes,
+                self.jobs,
                 &mut self.actions,
             ),
             Pane::SpikeData => {

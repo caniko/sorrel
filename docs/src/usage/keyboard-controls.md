@@ -134,6 +134,14 @@ field has focus. They are configurable in Settings too.
 | Waveforms | `R` / `Shift+R`       | Reset scales.                           |
 | CCG       | `N`                   | Toggle uniform normalization.           |
 
+While hovering Waveforms, each `M` press switches between the mean alone
+and individual waveforms from **every valid spike**, with the same full-set
+mean overlaid. No click in the pane is needed. Loading counts distinguish
+available waveforms from the total cluster spike count; text fields and
+dialogs keep their keyboard input.
+An explicitly selected sample preview is separate; `M` always restores the
+all-spike source, even with older preferences that stored a 100-spike cap.
+
 Undo moves to the previous edit and redo to the branch you visited last.
 An edit after an undo starts a new branch, and the old one stays in the
 [History](./history.md) pane. The top bar's Undo/Redo buttons name the
