@@ -76,11 +76,19 @@ impl SelectionSet {
     /// half's id, so the selection must not keep naming it. The anchor falls
     /// back to the last surviving id.
     pub fn retain(&mut self, mut keep: impl FnMut(ClusterId) -> bool) {
-        self.items.retain(|&c| keep(c));
+        let mut i = 0;
+        let mut n_best = 0;
+        self.items.retain(|&c| {
+            let k = keep(c);
+            n_best += usize::from(k && i < self.n_best);
+            i += 1;
+            k
+        });
+        // Only best ids that survive stay best; a Similar id is never promoted.
+        self.n_best = n_best;
         if self.anchor.is_some_and(|a| !self.items.contains(&a)) {
             self.anchor = self.items.last().copied();
         }
-        self.n_best = self.n_best.min(self.items.len());
     }
 
     /// Add or remove one similar cluster (Ctrl+click in the Similar pane).
@@ -424,6 +432,18 @@ mod tests {
         s.retain(|c| c.0 < 3);
         assert_eq!(s.as_slice(), &[ClusterId(0)]);
         assert_eq!(s.anchor(), Some(ClusterId(0)));
+        // A freed best id must not promote a Similar-pane id into best.
+        s.toggle(ClusterId(3));
+        s.toggle_similar(ClusterId(1));
+        assert_eq!(
+            (s.best(), s.similar()),
+            (&[ClusterId(0), ClusterId(3)][..], &[ClusterId(1)][..])
+        );
+        s.retain(|c| c.0 < 3);
+        assert_eq!(
+            (s.best(), s.similar()),
+            (&[ClusterId(0)][..], &[ClusterId(1)][..])
+        );
         // No anchor left: clear it rather than name a missing cluster.
         s.retain(|_| false);
         assert!(s.is_empty());
