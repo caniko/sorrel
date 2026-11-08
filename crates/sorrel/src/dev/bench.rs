@@ -11,9 +11,10 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sorrel_data::learn::shard::{InputFile, InputManifest};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -637,6 +638,77 @@ fn input_hash(input: &Path) -> Result<String> {
     Ok(h.finalize().to_hex().to_string())
 }
 
+/// Files at or below this size are hashed in full for a feature-key manifest.
+const MANIFEST_FULL_MAX: u64 = 8 << 20;
+/// Large files contribute their size plus a digest of this many bytes at each
+/// end. See [`InputManifest`] for why.
+const MANIFEST_EDGE: u64 = 1 << 20;
+
+/// Content identity of the files a feature extraction will consume, for the
+/// feature key.
+///
+/// `input_hash` above stays exactly as it was: it is the legacy key that
+/// feature shards from earlier builds recorded, and a new build must still be
+/// able to recognise (and warn about) those shards. The manifest is the
+/// superset that also covers amplitudes, PC features, `params.py`, probe
+/// geometry, templates, similarity and the recording length. `names` is the
+/// bench's blind allowlist, exactly what `copy_input` places in the temporary
+/// input the extractor opens (the sealed session also holds sorrel journals,
+/// which are not consumed).
+fn input_manifest(input: &Path, names: &[String]) -> Result<InputManifest> {
+    let mut files = Vec::with_capacity(names.len());
+    for name in names {
+        ensure!(
+            Path::new(name).components().count() == 1,
+            "input allowlist entry {name:?} is not a plain file name"
+        );
+        let path = input.join(name);
+        let meta = fs::symlink_metadata(&path)
+            .with_context(|| format!("session input file {}", path.display()))?;
+        ensure!(
+            meta.file_type().is_file() && !is_link(&meta),
+            "session input {} is not a regular file; the manifest cannot identify it",
+            path.display()
+        );
+        files.push(input_file(path, name.clone(), meta.len())?);
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(InputManifest { files })
+}
+
+fn input_file(path: PathBuf, name: String, size: u64) -> Result<InputFile> {
+    let mut h = blake3::Hasher::new();
+    let sampled = size > MANIFEST_FULL_MAX;
+    if sampled {
+        // Size plus both edges, never mtime: a bench copy legitimately gets a
+        // fresh mtime while keeping the same bytes.
+        h.update(&size.to_le_bytes());
+        let mut f = fs::File::open(&path)?;
+        let mut buf = vec![0; MANIFEST_EDGE as usize];
+        f.read_exact(&mut buf)?;
+        h.update(&buf);
+        f.seek(SeekFrom::Start(size - MANIFEST_EDGE))?;
+        f.read_exact(&mut buf)?;
+        h.update(&buf);
+    } else {
+        let mut f = fs::File::open(&path)?;
+        let mut buf = vec![0; 1 << 20];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
+    }
+    Ok(InputFile {
+        name,
+        size,
+        sampled,
+        digest: h.finalize().to_hex().to_string(),
+    })
+}
+
 pub(super) fn run(a: &BenchArgs, db: Option<&Path>) -> Result<()> {
     if let BenchCmd::Discover {
         root,
@@ -792,6 +864,89 @@ mod tests {
         assert_eq!(before, input_hash(t.path()).unwrap());
         fs::write(t.path().join("spike_times.npy"), b"another recording").unwrap();
         assert_ne!(before, input_hash(t.path()).unwrap());
+    }
+
+    #[test]
+    fn input_manifest_covers_files_beyond_the_legacy_fingerprint() {
+        let t = tempfile::tempdir().unwrap();
+        let files = [
+            "spike_times.npy",
+            "spike_templates.npy",
+            "templates.npy",
+            "amplitudes.npy",
+            "pc_features.npy",
+            "params.py",
+            "channel_positions.npy",
+            "similar_templates.npy",
+        ];
+        for file in files {
+            fs::write(t.path().join(file), file.as_bytes()).unwrap();
+        }
+        let names: Vec<String> = files.iter().map(|name| (*name).to_owned()).collect();
+        let before = input_manifest(t.path(), &names).unwrap();
+        assert_eq!(before.files.len(), 8);
+        assert!(before.files.iter().all(|f| !f.sampled));
+        // Files the blind allowlist does not copy are not consumed and must
+        // not enter the key (sealed inputs also hold sorrel's own journals).
+        fs::write(t.path().join("sorrel.journal"), b"not an input").unwrap();
+        assert_eq!(before, input_manifest(t.path(), &names).unwrap());
+        let legacy_before = input_hash(t.path()).unwrap();
+        // An amplitude edit leaves the legacy three-NPY key untouched but
+        // must change the manifest that the new feature key records.
+        fs::write(t.path().join("amplitudes.npy"), b"new amplitudes").unwrap();
+        assert_eq!(legacy_before, input_hash(t.path()).unwrap());
+        assert_ne!(before, input_manifest(t.path(), &names).unwrap());
+        fs::write(t.path().join("amplitudes.npy"), b"amplitudes.npy").unwrap();
+        assert_eq!(before, input_manifest(t.path(), &names).unwrap());
+        fs::write(t.path().join("params.py"), b"sample_rate = 1").unwrap();
+        assert_ne!(before, input_manifest(t.path(), &names).unwrap());
+    }
+
+    #[test]
+    fn large_inputs_use_size_and_both_edge_digests() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("recording.dat");
+        let names = vec!["recording.dat".to_owned()];
+        let mut bytes = vec![0u8; (MANIFEST_FULL_MAX + 1024) as usize];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = (i % 251) as u8;
+        }
+        fs::write(&path, &bytes).unwrap();
+        let before = input_manifest(t.path(), &names).unwrap();
+        assert!(before.files[0].sampled);
+
+        bytes[0] ^= 0xFF;
+        fs::write(&path, &bytes).unwrap();
+        assert_ne!(
+            before,
+            input_manifest(t.path(), &names).unwrap(),
+            "first edge"
+        );
+        bytes[0] ^= 0xFF;
+
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        fs::write(&path, &bytes).unwrap();
+        assert_ne!(
+            before,
+            input_manifest(t.path(), &names).unwrap(),
+            "last edge"
+        );
+        bytes[last] ^= 0xFF;
+
+        // The documented heuristic: a middle-only edit and an unchanged
+        // length are not detected. This keeps resumes cheap.
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xFF;
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(before, input_manifest(t.path(), &names).unwrap());
+
+        fs::write(&path, &bytes[..bytes.len() - 8]).unwrap();
+        assert_ne!(
+            before,
+            input_manifest(t.path(), &names).unwrap(),
+            "truncation"
+        );
     }
 
     #[test]

@@ -589,31 +589,11 @@ pub fn extract<P: DataProvider + HasGeometry>(
 
     let mut roots = Table::new(EXTRACTOR_VERSION, root_columns());
     roots.sids = vec![sid.to_owned()];
-    roots.codes.insert(
-        "y_verdict".into(),
-        [
-            ("noise", 0),
-            ("kept", 1),
-            ("cleanup", 2),
-            ("cores", 3),
-            ("other", 4),
-        ]
-        .into_iter()
-        .map(|(name, code)| (name.to_owned(), code))
-        .collect(),
-    );
-    roots.notes.insert(
-        "y_verdict".into(),
-        "the dev DB's root_truths verdict with its default ten-spike floor (the same function and \
-         thresholds the bench records): noise, kept, cleanup, cores, other (4; e.g. a root wholly \
-         good but split between several good units). NaN for roots below the floor, whose verdict \
-         is undefined"
-            .into(),
-    );
     roots.notes.insert(
         "f_root_size_rank".into(),
         "fraction of the session's roots with at most this root's spike count".into(),
     );
+    apply_target_metadata(&mut roots, "roots");
     let mut candidates = Table::new(EXTRACTOR_VERSION, candidate_columns());
     candidates.sids = vec![sid.to_owned()];
     candidates.codes.insert(
@@ -639,18 +619,6 @@ pub fn extract<P: DataProvider + HasGeometry>(
             .collect(),
     );
     candidates.notes.insert(
-        "y_jaccard_any".into(),
-        "max Jaccard against any human unit whose label is not noise (good, mua and unsorted \
-         count); 0 when the candidate shares no spike with any such unit"
-            .into(),
-    );
-    candidates.notes.insert(
-        "y_best_unit".into(),
-        "truth cluster id of the good unit that achieves y_jaccard; NaN when no good unit is \
-         present in the candidate"
-            .into(),
-    );
-    candidates.notes.insert(
         "f_amp_ratio".into(),
         "mean amplitude of the candidate part divided by the complement's".into(),
     );
@@ -658,49 +626,16 @@ pub fn extract<P: DataProvider + HasGeometry>(
         "f_rpc_delta".into(),
         "candidate part's sliding-refractory contamination minus the whole root's".into(),
     );
+    apply_target_metadata(&mut candidates, "candidates");
     let mut pairs = Table::new(EXTRACTOR_VERSION, pair_columns());
     pairs.sids = vec![sid.to_owned()];
-    pairs.notes.insert(
-        "y_merge".into(),
-        "1 when some human good unit takes at least 20% of each root's spikes and at least 20% \
-         of its own spikes come from each root"
-            .into(),
-    );
-    pairs.notes.insert(
-        "y_shared".into(),
-        "max over human good units of Jaccard(root_a ∪ root_b, unit) with global unit totals; \
-         the union of both roots' truth units is searched, so a unit present only in root_b \
-         still counts, and 0 means no shared good spike"
-            .into(),
-    );
+    apply_target_metadata(&mut pairs, "pairs");
     let mut units = Table::new(EXTRACTOR_VERSION, unit_columns());
-    units.codes.insert(
-        "y_label".into(),
-        [("noise", 0), ("mua", 1), ("good", 2)]
-            .into_iter()
-            .map(|(name, code)| (name.to_owned(), code))
-            .collect(),
-    );
-    units.notes.insert(
-        "y_label".into(),
-        "phy label; unsorted is folded into noise (0)".into(),
-    );
+    apply_target_metadata(&mut units, "units");
     let mut cand_units = Table::new(EXTRACTOR_VERSION, cand_unit_columns());
-    cand_units.codes = units.codes.clone();
-    cand_units.notes.insert(
-        "y_label".into(),
-        "label of the human unit with the largest Jaccard overlap with this candidate; 0 (noise) \
-         when that best overlap is below 0.5. Unsorted folds into noise"
-            .into(),
-    );
+    apply_target_metadata(&mut cand_units, "cand_units");
     let mut spikes = Table::new(EXTRACTOR_VERSION, spike_columns());
     spikes.sids = vec![sid.to_owned()];
-    spikes.notes.insert(
-        "y_unit".into(),
-        "dense local index of the spike's truth cluster within this session (sorted truth ids); \
-         for core grouping, not a global unit id"
-            .into(),
-    );
     spikes.notes.insert(
         "f_refractory".into(),
         "1 when the previous or next spike of the same root is within 1.5 ms".into(),
@@ -711,6 +646,7 @@ pub fn extract<P: DataProvider + HasGeometry>(
          root's median of that distance"
             .into(),
     );
+    apply_target_metadata(&mut spikes, "spikes");
 
     // Within-session context: percentiles are over non-empty roots.
     let metrics: [(&str, MetricGet); 12] = [
@@ -1248,6 +1184,120 @@ pub fn extract<P: DataProvider + HasGeometry>(
     })
 }
 
+/// Header metadata owned by the target columns of `name`. It is applied by
+/// [`label`] every time targets are regenerated, so a target-version change
+/// is never advertised under an encoding frozen into an old feature shard.
+fn target_codes(name: &str) -> BTreeMap<String, BTreeMap<String, i64>> {
+    let mut out = BTreeMap::new();
+    match name {
+        "roots" => {
+            out.insert(
+                "y_verdict".into(),
+                [
+                    ("noise", 0),
+                    ("kept", 1),
+                    ("cleanup", 2),
+                    ("cores", 3),
+                    ("other", 4),
+                ]
+                .into_iter()
+                .map(|(name, code)| (name.to_owned(), code))
+                .collect(),
+            );
+        }
+        "units" | "cand_units" => {
+            out.insert(
+                "y_label".into(),
+                [("noise", 0), ("mua", 1), ("good", 2)]
+                    .into_iter()
+                    .map(|(name, code)| (name.to_owned(), code))
+                    .collect(),
+            );
+        }
+        _ => {}
+    }
+    out
+}
+
+fn target_notes(name: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    match name {
+        "roots" => {
+            out.insert(
+                "y_verdict".into(),
+                "the dev DB's root_truths verdict with its default ten-spike floor (the same \
+                 function and thresholds the bench records): noise, kept, cleanup, cores, other \
+                 (4; e.g. a root wholly good but split between several good units). NaN for roots \
+                 below the floor, whose verdict is undefined"
+                    .into(),
+            );
+        }
+        "candidates" => {
+            out.insert(
+                "y_jaccard_any".into(),
+                "max Jaccard against any human unit whose label is not noise (good, mua and \
+                 unsorted count); 0 when the candidate shares no spike with any such unit"
+                    .into(),
+            );
+            out.insert(
+                "y_best_unit".into(),
+                "truth cluster id of the good unit that achieves y_jaccard; NaN when no good \
+                 unit is present in the candidate"
+                    .into(),
+            );
+        }
+        "pairs" => {
+            out.insert(
+                "y_merge".into(),
+                "1 when some human good unit takes at least 20% of each root's spikes and at \
+                 least 20% of its own spikes come from each root"
+                    .into(),
+            );
+            out.insert(
+                "y_shared".into(),
+                "max over human good units of Jaccard(root_a ∪ root_b, unit) with global unit \
+                 totals; the union of both roots' truth units is searched, so a unit present \
+                 only in root_b still counts, and 0 means no shared good spike"
+                    .into(),
+            );
+        }
+        "units" => {
+            out.insert(
+                "y_label".into(),
+                "phy label; unsorted is folded into noise (0)".into(),
+            );
+        }
+        "cand_units" => {
+            out.insert(
+                "y_label".into(),
+                "label of the human unit with the largest Jaccard overlap with this candidate; \
+                 0 (noise) when that best overlap is below 0.5. Unsorted folds into noise"
+                    .into(),
+            );
+        }
+        "spikes" => {
+            out.insert(
+                "y_unit".into(),
+                "dense local index of the spike's truth cluster within this session (sorted \
+                 truth ids); for core grouping, not a global unit id"
+                    .into(),
+            );
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Write the target-owned codes and notes into a table header.
+fn apply_target_metadata(table: &mut Table, name: &str) {
+    for (key, value) in target_codes(name) {
+        table.codes.insert(key, value);
+    }
+    for (key, value) in target_notes(name) {
+        table.notes.insert(key, value);
+    }
+}
+
 /// Attach supervised targets from `truth`. Call only after [`extract`].
 pub fn label(data: &mut ExtractData, truth: &Truth) -> Result<()> {
     let n = data.root_of_spike.len();
@@ -1347,6 +1397,7 @@ pub fn label(data: &mut ExtractData, truth: &Truth) -> Result<()> {
             }
             set(&mut roots, row, "y_whole_jaccard", best as f32);
         }
+        apply_target_metadata(&mut roots, "roots");
         data.tables.roots = roots;
     }
 
@@ -1395,6 +1446,7 @@ pub fn label(data: &mut ExtractData, truth: &Truth) -> Result<()> {
             );
             set(&mut table, row, "y_best_unit", best_unit);
         }
+        apply_target_metadata(&mut table, "candidates");
         data.tables.candidates = table;
     }
 
@@ -1434,6 +1486,7 @@ pub fn label(data: &mut ExtractData, truth: &Truth) -> Result<()> {
             set(&mut table, row, "y_merge", merge);
             set(&mut table, row, "y_shared", shared as f32);
         }
+        apply_target_metadata(&mut table, "pairs");
         data.tables.pairs = table;
     }
 
@@ -1471,6 +1524,7 @@ pub fn label(data: &mut ExtractData, truth: &Truth) -> Result<()> {
             );
             set(&mut table, row, "y_unit", unit_index[&u] as f32);
         }
+        apply_target_metadata(&mut table, "spikes");
         data.tables.spikes = table;
     }
 
@@ -1489,6 +1543,7 @@ pub fn label(data: &mut ExtractData, truth: &Truth) -> Result<()> {
             row.set("y_label", phy_label_code(label(u)));
             table.push_row(&row.values)?;
         }
+        apply_target_metadata(&mut table, "units");
         data.tables.units = table;
     }
 
@@ -1531,6 +1586,7 @@ pub fn label(data: &mut ExtractData, truth: &Truth) -> Result<()> {
             values.set("y_label", target);
             table.push_row(&values.values)?;
         }
+        apply_target_metadata(&mut table, "cand_units");
         data.tables.cand_units = table;
     }
 
@@ -2345,6 +2401,7 @@ mod tests {
             max_spikes_per_root: 99,
             seed: 3,
             input_fingerprint: "fp".into(),
+            manifest: None,
         };
         let dir = tempfile::tempdir().unwrap();
         let fdir = dir.path().join(super::super::shard::FEATURES_DIR);
@@ -2380,5 +2437,69 @@ mod tests {
         let mut expected = data.tables.candidates.clone();
         expected.target_version = Some(crate::learn::TARGET_VERSION.to_owned());
         assert_eq!(joined, expected);
+    }
+
+    #[test]
+    fn retarget_regenerates_target_metadata_and_join_keeps_it_authoritative() {
+        let mut data = test_data(vec![0, 0, 0, 0], vec![4], vec![vec![0, 1]], vec![]);
+        // The extractor sets target metadata in memory; a feature shard must
+        // still keep only its feature-owned entries.
+        data.tables.roots.codes.insert(
+            "y_verdict".into(),
+            [("stale".to_owned(), 9)].into_iter().collect(),
+        );
+        data.tables
+            .roots
+            .notes
+            .insert("y_verdict".into(), "stale target note".into());
+        data.tables
+            .roots
+            .notes
+            .insert("f_root_size_rank".into(), "feature note".into());
+        let key = super::super::shard::FeatureKey {
+            extractor_version: EXTRACTOR_VERSION.into(),
+            max_spikes_per_root: 99,
+            seed: 0,
+            input_fingerprint: "fp".into(),
+            manifest: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let fdir = dir.path().join(super::super::shard::FEATURES_DIR);
+        let tdir = dir.path().join(super::super::shard::TARGETS_DIR);
+        super::super::shard::save_features(&fdir, &key, &data).unwrap();
+        let features = Table::load(&fdir, "roots").unwrap();
+        assert!(
+            !features.codes.contains_key("y_verdict"),
+            "target metadata must not be frozen into a feature shard"
+        );
+        assert!(features.notes.contains_key("f_root_size_rank"));
+
+        let mut loaded = super::super::shard::load_features(&fdir, &key).unwrap();
+        label(
+            &mut loaded,
+            &truth(&[10, 10, 10, 10], &[(10, PhyLabel::Good)]),
+        )
+        .unwrap();
+        // Simulate a TARGET_VERSION bump that changes the documented codes.
+        let mut new_codes = loaded.tables.roots.codes["y_verdict"].clone();
+        new_codes.insert("merged".into(), 5);
+        loaded
+            .tables
+            .roots
+            .codes
+            .insert("y_verdict".into(), new_codes.clone());
+        super::super::shard::save_targets(&tdir, &key.id(), "h", &loaded).unwrap();
+        let targets = super::super::shard::load_targets(&tdir, &key.id(), "h").unwrap();
+        assert_eq!(targets.roots.codes["y_verdict"], new_codes);
+        let joined = super::super::shard::join("roots", &features, &targets.roots).unwrap();
+        assert_eq!(
+            joined.codes["y_verdict"], new_codes,
+            "target metadata must win the join"
+        );
+        assert_eq!(joined.notes["f_root_size_rank"], "feature note");
+        assert_eq!(
+            joined.notes["y_verdict"],
+            loaded.tables.roots.notes["y_verdict"]
+        );
     }
 }

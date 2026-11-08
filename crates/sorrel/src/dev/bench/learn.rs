@@ -11,11 +11,13 @@
 //! order and row-sorted, so the output bytes do not depend on `--jobs`.
 //!
 //! A features shard is reused when it matches the current extractor version,
-//! extraction options and input fingerprint. A targets shard is reused when it
-//! additionally matches [`TARGET_VERSION`], the features key and the session's
-//! truth hash. `--retarget` skips extraction entirely: it loads the stored
-//! features, attaches the truth and rewrites only the targets, so changing a
-//! target costs seconds rather than the proposer suite.
+//! extraction options and input identity: a manifest of every input file the
+//! extraction read (with the legacy three-NPY fingerprint kept alongside for
+//! pre-manifest shards). A targets shard is reused when it additionally
+//! matches [`TARGET_VERSION`], the features key and the session's truth hash.
+//! `--retarget` skips extraction entirely: it loads the stored features,
+//! attaches the truth and rewrites only the targets, so changing a target
+//! costs seconds rather than the proposer suite.
 //!
 //! Bounds, so one session's cost stays predictable: roots with no spikes are
 //! omitted; only roots with at least 100 spikes get candidates, spike rows and
@@ -25,7 +27,7 @@
 
 use super::coverage::{aligned_truth, dev_sessions};
 use super::{Bench, LearnDatasetArgs};
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use sorrel_data::learn::features::{self, ExtractData, ExtractOpts, Truth};
 use sorrel_data::learn::shard::{self, FeatureKey, FEATURES_DIR, TARGETS_DIR};
 use sorrel_data::learn::table::{append_remapped, Table};
@@ -79,13 +81,15 @@ impl Bench {
         // Refuse a writable destination inside the bench's immutable session
         // originals or the sealed holdout home BEFORE the first write, also
         // through junctions/symlinks (the check compares canonical paths).
-        ensure_out_safe(self, out)?;
+        // Every destination directory is re-checked before a write, because a
+        // junction can appear below the --out root after this check.
+        let guard = ensure_out_safe(self, out)?;
         let limit = a.dev_limit.unwrap_or(usize::MAX);
         let sids: Vec<String> = dev_sessions(&self.map, limit)?
             .into_iter()
             .map(str::to_owned)
             .collect();
-        fs::create_dir_all(out.join("shards"))?;
+        guard.prepare_dir(&guard.root().join("shards"))?;
         let opts = ExtractOpts {
             max_spikes_per_root: a.max_spikes_per_root,
             seed: a.seed,
@@ -94,7 +98,7 @@ impl Bench {
         let mut jobs = Vec::with_capacity(sids.len());
         let mut reused = 0usize;
         for sid in &sids {
-            let fdir = shard_dir(out, sid).join(FEATURES_DIR);
+            let fdir = guard.shard_dir(sid).join(FEATURES_DIR);
             if a.retarget {
                 let key = shard::read_feature_key(&fdir).with_context(|| {
                     format!(
@@ -118,6 +122,7 @@ impl Bench {
                     shard::features_match(&fdir, &key),
                     "--retarget: {sid} features shard is incomplete; run without --retarget"
                 );
+                warn_legacy_key(sid, &key);
                 jobs.push(Job {
                     sid: sid.clone(),
                     action: Action::Retarget,
@@ -126,8 +131,18 @@ impl Bench {
             } else {
                 let key = feature_key(self, sid, &opts)?;
                 let action = if shard::features_match(&fdir, &key) {
+                    // Use the key actually stored on disk: a pre-manifest
+                    // shard is accepted on its legacy fields, and its targets
+                    // are keyed to that legacy features id.
+                    let stored = shard::read_feature_key(&fdir)?;
+                    warn_legacy_key(sid, &stored);
                     reused += 1;
-                    Action::Reuse
+                    jobs.push(Job {
+                        sid: sid.clone(),
+                        action: Action::Reuse,
+                        key: stored,
+                    });
+                    continue;
                 } else {
                     Action::Extract
                 };
@@ -158,9 +173,9 @@ impl Bench {
                         };
                         let started = Instant::now();
                         let result = match job.action {
-                            Action::Retarget => retarget_session(self, &job.sid, out, &job.key),
+                            Action::Retarget => retarget_session(self, &job.sid, &guard, &job.key),
                             Action::Extract | Action::Reuse => {
-                                process_session(self, &job.sid, out, &job.key, &opts)
+                                process_session(self, &job.sid, &guard, &job.key, &opts)
                             }
                         }
                         .map(|(action, counts)| SessionStat {
@@ -203,7 +218,7 @@ impl Bench {
         for name in TABLES {
             let mut all: Option<Table> = None;
             for (idx, sid) in sids.iter().enumerate() {
-                let shard = shard_dir(out, sid);
+                let shard = guard.shard_dir(sid);
                 let table = load_output_table(&shard, name)
                     .with_context(|| format!("load {sid} {name} shard"))?;
                 ensure!(
@@ -234,8 +249,9 @@ impl Bench {
                 continue;
             };
             sort_rows(&mut table, row_keys(name));
-            table.save(out, name)?;
-            let (_, data) = sorrel_data::learn::table::paths(out, name);
+            guard.prepare_dir(guard.root())?;
+            table.save(guard.root(), name)?;
+            let (_, data) = sorrel_data::learn::table::paths(guard.root(), name);
             println!(
                 "{name}: {} rows × {} columns, {} bytes",
                 table.n_rows(),
@@ -243,7 +259,7 @@ impl Bench {
                 fs::metadata(&data).map(|m| m.len()).unwrap_or(0)
             );
         }
-        println!("{}", out.display());
+        println!("{}", guard.root().display());
         Ok(())
     }
 }
@@ -298,17 +314,87 @@ fn sort_rows(table: &mut Table, keys: &[&str]) {
     table.data = sorted;
 }
 
-fn shard_dir(out: &Path, sid: &str) -> PathBuf {
-    out.join("shards").join(sid)
+/// A checked `--out` root and the paths it may never reach.
+///
+/// [`ensure_out_safe`] resolves the root once. Because a junction or symlink
+/// can appear below it later (or already be there), every destination
+/// directory is re-checked immediately before a write: its path must stay
+/// under the root, none of its components under the root may be a reparse
+/// point, and its canonical form must not land in a protected directory.
+#[derive(Debug)]
+struct OutGuard {
+    root: PathBuf,
+    protected: Vec<PathBuf>,
+}
+
+impl OutGuard {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn shard_dir(&self, sid: &str) -> PathBuf {
+        self.root.join("shards").join(sid)
+    }
+
+    /// Check `dir`, create it if needed, then check it again.
+    fn prepare_dir(&self, dir: &Path) -> Result<()> {
+        self.check_dir(dir)?;
+        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        self.check_dir(dir)
+    }
+
+    fn check_dir(&self, dir: &Path) -> Result<()> {
+        ensure!(
+            dir.starts_with(&self.root),
+            "{} is outside --out {}",
+            dir.display(),
+            self.root.display()
+        );
+        let mut current = self.root.clone();
+        for component in dir
+            .strip_prefix(&self.root)
+            .expect("checked above")
+            .components()
+        {
+            current.push(component.as_os_str());
+            match fs::symlink_metadata(&current) {
+                Ok(meta) if super::is_link(&meta) => bail!(
+                    "{} is a junction/symlink under --out; refusing to write through it",
+                    current.display()
+                ),
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+                Err(err) => {
+                    return Err(err).with_context(|| format!("inspect {}", current.display()))
+                }
+            }
+        }
+        let resolved = canonical_target(dir)?;
+        ensure!(
+            resolved.starts_with(&self.root),
+            "{} resolves outside --out {} (a junction/symlink?)",
+            dir.display(),
+            self.root.display()
+        );
+        for p in &self.protected {
+            ensure!(
+                !resolved.starts_with(p),
+                "{} resolves inside protected {}; refusing to write",
+                dir.display(),
+                p.display()
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Refuse a writable destination inside the bench's immutable session copies,
 /// its sealed home or any recorded session source. Canonical paths are
 /// compared, so a junction or symlink cannot smuggle `--out` back inside.
-fn ensure_out_safe(bench: &Bench, out: &Path) -> Result<()> {
+fn ensure_out_safe(bench: &Bench, out: &Path) -> Result<OutGuard> {
     // Resolve the nearest existing ancestor so a not-yet-created --out still
     // compares canonically (and through a junction/symlink) without writing.
-    let out = canonical_target(out)?;
+    let root = canonical_target(out)?;
     let mut protected = Vec::new();
     for p in [bench.root.join("sessions"), bench.root.join(".sealed")] {
         if let Ok(p) = canonical_target(&p) {
@@ -320,17 +406,17 @@ fn ensure_out_safe(bench: &Bench, out: &Path) -> Result<()> {
             protected.push(p);
         }
     }
-    for p in protected {
+    for p in &protected {
         ensure!(
-            !out.starts_with(&p),
+            !root.starts_with(p),
             "--out {} is inside protected {}; choose a directory outside BENCH/sessions, \
              BENCH/.sealed and every session source",
-            out.display(),
+            root.display(),
             p.display()
         );
     }
-    fs::create_dir_all(&out).with_context(|| format!("create --out {}", out.display()))?;
-    Ok(())
+    fs::create_dir_all(&root).with_context(|| format!("create --out {}", root.display()))?;
+    Ok(OutGuard { root, protected })
 }
 
 /// Canonical path of `path`, resolving existing ancestors even when the leaf
@@ -386,19 +472,35 @@ fn feature_key(bench: &Bench, sid: &str, opts: &ExtractOpts) -> Result<FeatureKe
         max_spikes_per_root: opts.max_spikes_per_root,
         seed: opts.seed,
         input_fingerprint: super::input_hash(&input)?,
+        manifest: Some(super::input_manifest(
+            &input,
+            &bench.map.sessions[sid].keep,
+        )?),
     })
+}
+
+/// A shard from before the manifest existed is still usable when its legacy
+/// fingerprint matches; say so, because it does not cover every consumed file.
+fn warn_legacy_key(sid: &str, key: &FeatureKey) {
+    if key.manifest.is_none() {
+        eprintln!(
+            "dev {sid}: features shard predates the input manifest; reusing it because the \
+             legacy fingerprint still matches (re-extract to cover amplitudes, PC features, \
+             params.py and the recording length)"
+        );
+    }
 }
 
 /// One session: input-only extraction first, truth afterwards.
 fn process_session(
     bench: &Bench,
     sid: &str,
-    out: &Path,
+    out: &OutGuard,
     key: &FeatureKey,
     opts: &ExtractOpts,
 ) -> Result<(&'static str, Option<[usize; 6]>)> {
     let started = Instant::now();
-    let shard = shard_dir(out, sid);
+    let shard = out.shard_dir(sid);
     let fdir = shard.join(FEATURES_DIR);
     let tdir = shard.join(TARGETS_DIR);
     let (mut data, action) = if shard::features_match(&fdir, key) {
@@ -418,6 +520,12 @@ fn process_session(
             super::input_hash(&input)? == key.input_fingerprint,
             "{sid}: copied input fingerprint differs from the sealed session input"
         );
+        if let Some(manifest) = &key.manifest {
+            ensure!(
+                super::input_manifest(&input, &bench.map.sessions[sid].keep)? == *manifest,
+                "{sid}: copied input manifest differs from the sealed session input"
+            );
+        }
         let provider = KilosortProvider::open(&input, Default::default())?;
         let mut session =
             Session::new(provider, Journal::open(&temp.path().join("learn.journal"))?);
@@ -436,6 +544,7 @@ fn process_session(
             seeded.duration_since(started).as_secs_f64(),
             extracted_at.duration_since(seeded).as_secs_f64()
         );
+        out.prepare_dir(&fdir)?;
         shard::save_features(&fdir, key, &data)?;
         (data, Action::Extract)
     };
@@ -448,6 +557,7 @@ fn process_session(
     }
     let label_started = Instant::now();
     features::label(&mut data, &truth)?;
+    out.prepare_dir(&tdir)?;
     shard::save_targets(&tdir, &key.id(), &truth_hash, &data)?;
     eprintln!(
         "dev {sid}: truth read {truth_secs:.1}s, label {:.1}s",
@@ -476,16 +586,17 @@ fn process_session(
 fn retarget_session(
     bench: &Bench,
     sid: &str,
-    out: &Path,
+    out: &OutGuard,
     key: &FeatureKey,
 ) -> Result<(&'static str, Option<[usize; 6]>)> {
     let started = Instant::now();
-    let shard = shard_dir(out, sid);
+    let shard = out.shard_dir(sid);
     let mut data = shard::load_features(&shard.join(FEATURES_DIR), key)?;
     let loaded = Instant::now();
     let (truth, truth_hash, truth_secs) = load_truth(bench, sid, &data)?;
     let label_started = Instant::now();
     features::label(&mut data, &truth)?;
+    out.prepare_dir(&shard.join(TARGETS_DIR))?;
     shard::save_targets(&shard.join(TARGETS_DIR), &key.id(), &truth_hash, &data)?;
     eprintln!(
         "dev {sid}: retarget features {:.1}s, truth read {truth_secs:.1}s, label {:.1}s",
@@ -580,6 +691,28 @@ mod tests {
         }
     }
 
+    /// Create a directory symlink/junction, or report that this machine
+    /// refuses to. A Windows junction needs no special privilege, so it is
+    /// the fallback when Developer Mode is off.
+    fn link_dir(target: &Path, link: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+                return true;
+            }
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .status()
+                .is_ok_and(|s| s.success())
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
     #[test]
     fn learn_dataset_session_selection_cannot_read_holdout() {
         let mut map = SessionMap::default();
@@ -630,23 +763,51 @@ mod tests {
         fs::create_dir_all(&sessions).unwrap();
         let bench = bench_at(&root, SessionMap::default());
         let link = root.join("outlink");
-        if std::os::windows::fs::symlink_dir(&sessions, &link).is_err() {
-            // Creating symlinks needs Developer Mode/admin; try a junction,
-            // which normal users may create.
-            let status = std::process::Command::new("cmd")
-                .args(["/C", "mklink", "/J"])
-                .arg(&link)
-                .arg(&sessions)
-                .status();
-            if !status.is_ok_and(|s| s.success()) {
-                eprintln!("skipping: cannot create a junction or symlink here");
-                return;
-            }
+        if !link_dir(&sessions, &link) {
+            eprintln!("skipping: cannot create a junction or symlink here");
+            return;
         }
         let err = ensure_out_safe(&bench, &link.join("out"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("protected"), "{err}");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_junction_or_symlink_below_out_is_refused_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bench");
+        fs::create_dir_all(&root).unwrap();
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let bench = bench_at(&root, SessionMap::default());
+        let out = root.join("learn");
+        let guard = ensure_out_safe(&bench, &out).unwrap();
+        let shards = guard.root().join("shards");
+        if !link_dir(&sessions, &shards) {
+            eprintln!("skipping: cannot create a junction or symlink here");
+            return;
+        }
+        for dest in [
+            guard.shard_dir("sid").join(FEATURES_DIR),
+            guard.shard_dir("sid").join(TARGETS_DIR),
+        ] {
+            let err = guard.prepare_dir(&dest).unwrap_err().to_string();
+            assert!(
+                err.contains("junction/symlink") || err.contains("protected"),
+                "{err}"
+            );
+        }
+        // Even a link that points somewhere benign is refused: no reparse
+        // point below --out is a writable destination.
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let nested = guard.root().join("nested");
+        if link_dir(&elsewhere, &nested) {
+            let err = guard.prepare_dir(&nested).unwrap_err().to_string();
+            assert!(err.contains("junction/symlink"), "{err}");
+        }
     }
 
     #[test]
@@ -657,6 +818,7 @@ mod tests {
             max_spikes_per_root: 1500,
             seed: 0,
             input_fingerprint: "abc".into(),
+            manifest: None,
         };
         assert!(!shard::features_match(dir.path(), &key));
         let mut t = Table::new(EXTRACTOR_VERSION, vec!["sid_idx".into(), "root".into()]);
@@ -697,6 +859,41 @@ mod tests {
         let mut other = key.clone();
         other.input_fingerprint = "different".into();
         assert!(!shard::features_match(dir.path(), &other));
+
+        // A pre-manifest shard is accepted on the legacy fields...
+        let mut with_manifest = key.clone();
+        with_manifest.manifest = Some(sorrel_data::learn::shard::InputManifest {
+            files: vec![sorrel_data::learn::shard::InputFile {
+                name: "amplitudes.npy".into(),
+                size: 4,
+                sampled: false,
+                digest: "d".into(),
+            }],
+        });
+        assert!(shard::features_match(dir.path(), &with_manifest));
+        assert_ne!(with_manifest.id(), key.id());
+        // ...but once the shard itself records a manifest it must match.
+        let meta = serde_json::json!({
+            "format": 1u32,
+            "key": &with_manifest,
+            "features_id": with_manifest.id(),
+            "n_spikes": 1,
+            "n_roots": 1,
+            "n_candidates": 0,
+            "n_pair_roots": 0,
+            "n_spike_rows": 0,
+            "sr_bits": 30000.0f32.to_bits(),
+            "total_samples": 1,
+        });
+        fs::write(
+            dir.path().join("meta.json"),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+        assert!(shard::features_match(dir.path(), &with_manifest));
+        let mut changed = with_manifest.clone();
+        changed.manifest.as_mut().unwrap().files[0].digest = "e".into();
+        assert!(!shard::features_match(dir.path(), &changed));
     }
 
     #[test]
@@ -797,17 +994,19 @@ mod tests {
         data.root_center = vec![None, None];
         data.candidate_members = vec![vec![0, 1], vec![2]];
         let out = tmp.path().join("learn");
-        let shard = shard_dir(&out, sid);
+        let guard = ensure_out_safe(&bench, &out).unwrap();
+        let shard = guard.shard_dir(sid);
         let key = FeatureKey {
             extractor_version: EXTRACTOR_VERSION.into(),
             max_spikes_per_root: 1500,
             seed: 0,
             input_fingerprint: "fp".into(),
+            manifest: None,
         };
         shard::save_features(&shard.join(FEATURES_DIR), &key, &data).unwrap();
         // No `sessions/<sid>/input` exists at all.
         assert!(!root.join("sessions").join(sid).join("input").exists());
-        let (action, _) = retarget_session(&bench, sid, &out, &key).unwrap();
+        let (action, _) = retarget_session(&bench, sid, &guard, &key).unwrap();
         assert_eq!(action, "retargeted");
         let targets = shard::load_targets(&shard.join(TARGETS_DIR), &key.id(), &{
             sorrel_data::devdb::truth_hash(&truth_dir).unwrap()

@@ -430,7 +430,7 @@ fn learn_dataset_cv_and_train_over_a_synthetic_bench() {
             "--target",
             "y_verdict",
             "--objective",
-            "softmax:4",
+            "softmax:5",
             "--folds",
             "2",
         ],
@@ -439,6 +439,35 @@ fn learn_dataset_cv_and_train_over_a_synthetic_bench() {
     assert_eq!(report["n_rows"], 4);
     assert_eq!(report["per_fold"].as_array().unwrap().len(), 2);
     assert_eq!(report["pooled"]["kind"], "classification");
+
+    // `other` is class 4: a four-class softmax must refuse the five-class
+    // target instead of silently dropping those roots.
+    let refused = sorrel(
+        tmp.path(),
+        &[
+            "dev",
+            "learn",
+            "cv",
+            "--data",
+            &s(&out),
+            "--table",
+            "roots",
+            "--target",
+            "y_verdict",
+            "--objective",
+            "softmax:4",
+            "--folds",
+            "2",
+        ],
+    );
+    assert!(!refused.status.success());
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        err.contains("y_verdict has 5 classes")
+            && err.contains("codes in the table header")
+            && err.contains("softmax:5"),
+        "{err}"
+    );
 
     // A regression target with a joined root context must also go through.
     let cv = ok(&sorrel(
@@ -480,7 +509,7 @@ fn learn_dataset_cv_and_train_over_a_synthetic_bench() {
             "--target",
             "y_verdict",
             "--objective",
-            "softmax:4",
+            "softmax:5",
             "--folds",
             "2",
             "--out",

@@ -360,7 +360,11 @@ pub fn paths(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
 
 /// Write `bytes` to `path` through a temporary file in the same directory, so
 /// an interrupted write never leaves a truncated file at the destination.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+///
+/// Renaming over the destination also unlinks an existing hard link instead
+/// of truncating the inode in place, so another name for the old file keeps
+/// its bytes.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
