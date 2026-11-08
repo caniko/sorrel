@@ -349,6 +349,11 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     }
 
     fn build(session: Session<P>, label_str: fn(&P::Label) -> &'static str) -> Self {
+        log::info!(
+            "Sorrel {} polygon-input-v3 · executable {}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::current_exe().map_or_else(|_| "unknown".into(), |p| p.display().to_string())
+        );
         let window_len = (session.provider.sample_rate() as u32).max(1) / 10; // 100 ms
         let host = Arc::new(SessionHost::new(session));
         let repaint = Arc::new(std::sync::OnceLock::<egui::Context>::new());
@@ -497,6 +502,16 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     #[doc(hidden)]
     pub fn brushes(&self) -> &crate::brush::Brushes {
         &self.brushes
+    }
+
+    #[doc(hidden)]
+    pub fn feature_interaction_summary(&self) -> crate::feature_view::FeatureInteractionSummary {
+        self.feature_state.interaction_summary()
+    }
+
+    /// Ordered selection, for embedders and keyboard regression tests.
+    pub fn selected_clusters(&self) -> &[ClusterId] {
+        self.selection.as_slice()
     }
 
     /// Progress and exact valid/total counts for the all-spike waveform view.
@@ -1153,6 +1168,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         follow: Follow,
     ) -> bool {
         self.cancel_jobs();
+        let started = std::time::Instant::now();
         // Every GUI edit is a human decision: the host clears the touched
         // clusters' `review:*` tags (from `sorrel auto`), so the review
         // queue drains.
@@ -1160,6 +1176,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             Ok(Some(ev)) => ev,
             Ok(None) => return true,
             Err(e) => {
+                log::warn!(
+                    "curation commit failed after {:?}: {what}: {e}",
+                    started.elapsed()
+                );
                 self.error = Some(format!("{what} failed: {e}"));
                 return false;
             }
@@ -1173,6 +1193,11 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             }
         }
         self.status = toast(ev.desc);
+        log::info!(
+            "curation commit complete in {:?} · version {}",
+            started.elapsed(),
+            ev.version
+        );
         true
     }
 
@@ -1222,7 +1247,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             });
         }
         let cmd = match cmds.len() {
-            0 => return,
+            0 => {
+                self.status = toast("no spikes inside the lasso; no split made");
+                return;
+            }
             1 => cmds.remove(0),
             _ => match CurationCommand::batch(cmds) {
                 Some(b) => b,
@@ -1720,6 +1748,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             Intent::Split => {
                 if self.feature_state.can_split() {
                     self.feature_state.request_split();
+                    self.status = toast("K accepted · selecting all enclosed spikes…");
                 } else if self.amplitude_state.can_split() {
                     self.amplitude_state.request_split();
                 } else if self.template_features.lasso_closed() {
@@ -1761,7 +1790,13 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             )
         };
         ui.horizontal(|ui| {
-            ui.heading(egui::RichText::new("Sorrel").strong());
+            ui.heading(egui::RichText::new("Sorrel").strong())
+                .on_hover_text(format!(
+                    "Sorrel {} · polygon-input-v3\n{}",
+                    env!("CARGO_PKG_VERSION"),
+                    std::env::current_exe()
+                        .map_or_else(|_| "unknown executable".into(), |p| p.display().to_string())
+                ));
             // Save-state chip: unsaved / saved / failed, with the detail on hover.
             let theme = crate::theme::Theme::from_ui(ui);
             let failed = self
@@ -2319,7 +2354,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             }
             let (_, colours_gen, colours) = self.scheme_colours.as_ref().expect("just built");
             self.brushes.sync(session.version());
-            let feature_link = self.feature_state.link();
+            let feature_link = self.feature_state.link_for(&selected, session.version());
             let mut behavior = ViewBehavior {
                 session: &session,
                 selection: &selected,
@@ -2392,6 +2427,12 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             self.scheme = self.scheme.step(scheme_delta);
             self.status = toast(format!("colour scheme: {}", self.scheme.name()));
         }
+        if !actions.is_empty() {
+            // View actions run after painting. In particular a pop-out's K
+            // arms a cut for its next frame, and a completed cut changes the
+            // selection/status after those panes have already been drawn.
+            ctx.request_repaint();
+        }
         for action in actions {
             self.apply_view_action(action);
         }
@@ -2433,6 +2474,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
 impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root_ui.ctx().clone();
+        crate::settings::recover_packet_keys(&ctx);
         crate::settings::capture_input(&ctx);
         crate::settings::shared(&ctx).lock().unwrap().modal = self.pending_confirm.is_some();
         if !crate::settings::shared(&ctx).lock().unwrap().shell_owned {
@@ -2466,9 +2508,38 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
         }
 
         let input_intents = layout::configured_key_intents(&ctx);
+        let cancelled = input_intents.iter().any(|it| matches!(it, Intent::Cancel));
         let dialog_open = self.pending_confirm.is_some();
+        // Preserve the key event until pointer/focus processing has finished;
+        // do not discard it based on the preceding frame's text focus.
+        let split_key_seen = crate::settings::pressed(&ctx, "curation.split");
+        let split_was_text = crate::settings::text_input_active(&ctx);
+        let pointer_focus_change = ctx.input(|i| i.pointer.any_released());
+        if split_key_seen {
+            log::info!(
+                "lasso K: received · text_focus={} dialog={} blocked={}",
+                crate::settings::text_input_active(&ctx),
+                dialog_open,
+                crate::settings::blocked(&ctx)
+            );
+            if !dialog_open
+                && !crate::settings::blocked(&ctx)
+                && (!split_was_text || pointer_focus_change)
+            {
+                self.feature_state.prepare_keyboard_split();
+            }
+        }
+        let mut split_after_panes = false;
         for it in input_intents {
             if dialog_open && !matches!(it, Intent::Cancel) {
+                continue;
+            }
+            // Pointer release closes a freehand lasso (and finishes node
+            // edits) inside the pane below. Native input may deliver that
+            // release and K in one frame: asking can_split now loses K, or
+            // lasso_edited clears the request afterwards. Escape still wins.
+            if matches!(it, Intent::Split) {
+                split_after_panes = !cancelled;
                 continue;
             }
             self.dispatch_intent(it);
@@ -2582,6 +2653,31 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
 
         egui::CentralPanel::default()
             .show_inside(root_ui, |ui| self.tiles_and_popouts(&ctx, Some(ui)));
+        if let Some(notice) = self.feature_state.take_notice() {
+            log::warn!("{notice}");
+            self.status = toast(notice);
+            ctx.request_repaint();
+        }
+        if (split_after_panes || split_key_seen)
+            && (!split_was_text || pointer_focus_change)
+            && !dialog_open
+            && !cancelled
+            && !crate::settings::blocked(&ctx)
+            && !crate::settings::text_input_active(&ctx)
+        {
+            self.dispatch_intent(Intent::Split);
+            // Panes consume their pending cut on the next frame, even when
+            // no further keyboard/pointer event wakes the native window.
+            ctx.request_repaint();
+        } else if split_key_seen {
+            log::info!(
+                "lasso K: not dispatched · text_focus={} dialog={} cancelled={} blocked={}",
+                crate::settings::text_input_active(&ctx),
+                dialog_open,
+                cancelled,
+                crate::settings::blocked(&ctx)
+            );
+        }
         let shell_owned = {
             let shared = crate::settings::shared(&ctx);
             let mut rt = shared.lock().unwrap();
@@ -3385,6 +3481,16 @@ mod tests {
         assert_eq!(session.n_clusters(), before.2);
         assert_eq!(session.spike_clusters_global(), before.3);
         assert_eq!(session.labels(), before.4);
+    }
+
+    #[test]
+    fn an_empty_lasso_reports_why_k_did_not_make_a_split() {
+        let (mut app, _dir) = make_app();
+        let before = read(&app.session).spike_clusters_global().to_vec();
+        app.apply_lasso_splits(vec![(ClusterId(0), Vec::new())]);
+        assert_eq!(history_len(&app), 0);
+        assert_eq!(read(&app.session).spike_clusters_global(), before);
+        assert!(app.status.as_ref().unwrap().0.contains("no spikes inside"));
     }
 
     #[test]

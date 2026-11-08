@@ -233,10 +233,33 @@ impl FeatureSet {
         feats: Vec<f32>,
         duration: f32,
     ) -> Self {
+        Self::new_cancellable(
+            channels,
+            computed,
+            full,
+            points,
+            feats,
+            duration,
+            &AtomicBool::new(false),
+        )
+    }
+
+    fn new_cancellable(
+        channels: Vec<u32>,
+        computed: bool,
+        full: bool,
+        points: Vec<FeaturePoint>,
+        feats: Vec<f32>,
+        duration: f32,
+        cancel: &AtomicBool,
+    ) -> Self {
         let width = 2 * channels.len();
         assert_eq!(feats.len(), points.len() * width);
         let bounds = (0..width)
             .map(|j| {
+                if cancel.load(Ordering::Relaxed) {
+                    return (-1.0, 1.0);
+                }
                 robust_range(
                     points
                         .iter()
@@ -336,6 +359,9 @@ impl FeatureSet {
 
 /// Per cell: `[background, selected, brushed]` vertex buffers.
 type CellVertices = Vec<[Arc<Vec<ScatterVertex>>; 3]>;
+type CellKey = (u64, u64, u64);
+type CellBuild = (CellVertices, Arc<Vec<usize>>);
+type CellMemo = Memo<CellKey, Arc<CellBuild>>;
 
 /// How the selected points are coloured (the ⚙ popover's "colour by").
 #[derive(Default, Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -511,17 +537,17 @@ pub struct FeatureViewState {
     pub scaling: f32,
     /// Marker radius in points (Alt+wheel).
     pub marker: f32,
-    /// Content zoom (plain wheel): the data range shrinks about its middle,
-    /// so every projection zooms in place and its box keeps its size.
+    /// Canvas zoom (plain wheel): scales the entire projection matrix,
+    /// including its boxes, captions and spacing, without changing data ranges.
     zoom: f32,
     /// Shared pixel offset of the projection rectangles and their labels
-    /// (primary drag). The layout, its gaps and the controls stay put; zero
-    /// keeps the original geometry exactly.
+    /// (primary drag). Combined with `zoom` around the grid's origin; controls
+    /// stay put. Zero offset and unit zoom preserve the fitted default grid.
     pan_px: Vec2,
     lasso: Lasso,
-    /// Update the lasso's hits, brush and linked views while a node is
-    /// dragged. Off (the default) settles them on release, which keeps
-    /// cutting a cluster smooth.
+    /// Update hits, brush and linked views while constructing/editing the
+    /// polygon. Off freezes them across Ctrl-clicks until Ctrl release or K,
+    /// and across node drags until mouse-up.
     pub live_tracking: bool,
     /// The lasso the computed outputs saw last; with live tracking off it
     /// holds still while a gesture is in progress.
@@ -530,15 +556,22 @@ pub struct FeatureViewState {
     /// key drops the lasso and any pending split.
     lasso_key: Option<FeatureKey>,
     split_requested: bool,
+    notice: Option<String>,
     want_full: bool,
     /// Channels of the last drawn set, so `c` can freeze what is on screen.
     shown_channels: Option<Vec<u32>>,
     /// Alt+clicked `(channel, pc)` for the AmplitudeView feature type.
     amplitude_dim: Option<(u32, usize)>,
+    /// Point slots and local spike indices are meaningful only for this
+    /// ordered selection and curation version.
+    membership: Option<(Vec<ClusterId>, u64)>,
     memo: Memo<FeatureKey, Arc<FeatureSet>>,
     basis: Basis,
     /// Per-cell vertex buffers for `(set generation, dark mode)`.
-    cells: Option<((u64, u64, u64), u64, CellVertices)>,
+    cells: Option<(CellKey, u64, CellVertices)>,
+    cell_jobs: CellMemo,
+    /// K's input frame must not spend time constructing obsolete previews.
+    skip_preview_once: bool,
     /// The non-background points those buffers draw (hover, trace rings).
     shown: Arc<Vec<usize>>,
     /// The merge preview's grey points.
@@ -565,6 +598,7 @@ pub struct FeatureViewState {
     pub km: KmState,
     /// Closed-lasso hits for `(set generation, lasso vertices)`.
     hits: Option<Hits>,
+    hit_jobs: Memo<HitKey, Arc<Hits>>,
     alts: Alts,
     /// What Waveforms draws from Features ([`FeatureViewState::link`]).
     link: FeatureLink,
@@ -576,15 +610,45 @@ pub struct FeatureViewState {
     pending_edits: Vec<ChannelEdit>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FeatureInteractionSummary {
+    pub nodes: usize,
+    pub drafting: bool,
+    pub live_tracking: bool,
+    pub preview_generation: u64,
+    pub hit_generation: Option<u64>,
+    pub split_pending: bool,
+}
+
 /// Selected spikes inside a closed lasso.
+#[derive(Clone)]
 struct Hits {
     generation: u64,
+    selection: Vec<ClusterId>,
+    cell: usize,
     polygon: Vec<[f32; 2]>,
     n: usize,
     /// Local indices per cluster, at most [`LINK_SPIKES`] each.
     spikes: Vec<(ClusterId, Arc<[u32]>)>,
     /// Every hit, for the spike brush.
     all: Vec<(ClusterId, Vec<u32>)>,
+}
+
+#[derive(Clone, PartialEq)]
+struct HitKey {
+    generation: u64,
+    selection: Vec<ClusterId>,
+    cell: usize,
+    polygon: Vec<[f32; 2]>,
+}
+
+impl Hits {
+    fn matches(&self, set: &FeatureSet, selection: &[ClusterId], lasso: &Lasso) -> bool {
+        self.generation == set.generation
+            && self.selection == selection
+            && self.cell == lasso.cell
+            && self.polygon == lasso.points
+    }
 }
 
 /// Spikes per cluster the link to Waveforms carries.
@@ -1111,12 +1175,16 @@ impl Default for FeatureViewState {
             settled_lasso: Lasso::default(),
             lasso_key: None,
             split_requested: false,
+            notice: None,
             want_full: false,
             shown_channels: None,
             amplitude_dim: None,
+            membership: None,
             memo: Memo::new(),
             basis: Basis::default(),
             cells: None,
+            cell_jobs: Memo::new(),
+            skip_preview_once: false,
             shown: Arc::default(),
             ghost: GhostCells::default(),
             colour: ColourBy::default(),
@@ -1131,6 +1199,7 @@ impl Default for FeatureViewState {
             cells_gen: 0,
             km: KmState::default(),
             hits: None,
+            hit_jobs: Memo::new(),
             alts: Alts::default(),
             link: FeatureLink::default(),
             link_key: 0,
@@ -1141,6 +1210,72 @@ impl Default for FeatureViewState {
 }
 
 impl FeatureViewState {
+    pub fn take_notice(&mut self) -> Option<String> {
+        self.notice.take()
+    }
+    pub fn interaction_summary(&self) -> FeatureInteractionSummary {
+        FeatureInteractionSummary {
+            nodes: self.lasso.points.len(),
+            drafting: self.lasso.is_drafting(),
+            live_tracking: self.live_tracking,
+            preview_generation: self.cells_gen,
+            hit_generation: self.hits.as_ref().map(|hits| hits.generation),
+            split_pending: self.split_requested,
+        }
+    }
+    /// Never carry bucket indices across a selection/reorder or a curation
+    /// edit, including while the replacement feature worker is still loading.
+    fn sync_membership(&mut self, selection: &[ClusterId], version: u64, brushes: &mut Brushes) {
+        let membership = (selection.to_vec(), version);
+        if self.membership.as_ref() == Some(&membership) {
+            return;
+        }
+        self.membership = Some(membership);
+        if self.split_requested {
+            self.notice = Some("Split cancelled: cluster membership changed after K.".into());
+        }
+        let auto_run = self.km.auto_run;
+        self.cancel_operation();
+        // Changing clusters is not Esc: keep the user's automatic fitting
+        // preference, but never keep a pending cut or the old part's indices.
+        self.km.auto_run = auto_run;
+        if self.preview.take().is_some() {
+            self.preview_gen += 1;
+        }
+        self.km.applied = None;
+        self.shown_channels = None;
+        self.ghost = GhostCells::default();
+        self.clear_loaded_outputs(brushes);
+    }
+
+    /// Hide selection-owned outputs while no current keyed feature set is
+    /// available. Keep a compatible sample-to-full lasso and pending cut.
+    fn clear_loaded_outputs(&mut self, brushes: &mut Brushes) {
+        self.link = FeatureLink::default();
+        self.link_key = 0;
+        self.brush_written = None;
+        self.hits = None;
+        self.hit_jobs.invalidate();
+        self.cell_jobs.invalidate();
+        self.cells = None;
+        self.shown = Arc::default();
+        self.hover_out = None;
+        self.seek = None;
+        self.time_out = None;
+        self.time_from = None;
+        self.km.memo.cancel();
+        self.alts.memo.cancel();
+        self.basis_jobs.clear();
+        if brushes.spikes.as_ref().is_some_and(|b| {
+            matches!(
+                b.source,
+                BrushSource::FeatureLasso | BrushSource::KMeansPart
+            )
+        }) {
+            brushes.spikes = None;
+        }
+    }
+
     /// Abandon an in-progress lasso (Esc).
     pub fn cancel_lasso(&mut self) {
         self.lasso.clear();
@@ -1170,18 +1305,19 @@ impl FeatureViewState {
         self.alts.memo.cancel();
         self.alts.armed = None;
         self.hits = None;
+        self.hit_jobs.invalidate();
+        self.cell_jobs.cancel();
         self.cells = None;
         self.link.spikes.clear();
         self.link_key = 0;
         cutting
     }
 
-    /// Snapshot the lasso for the computed outputs (hits, brush, link,
-    /// alternatives). With live tracking off the snapshot holds still for
-    /// the length of a drag, so cutting a cluster only settles once on
-    /// release instead of recomputing every frame.
+    /// Freeze all computed outputs across a complete polygon draft, not just
+    /// across each individual mouse-down. Geometry validity (three vertices)
+    /// is deliberately distinct from finishing polygon construction.
     fn settle_lasso(&mut self) {
-        if !self.live_tracking && self.lasso.is_editing() {
+        if !self.live_tracking && self.lasso.is_drafting() {
             return;
         }
         if self.settled_lasso.cell != self.lasso.cell
@@ -1194,7 +1330,7 @@ impl FeatureViewState {
     /// The lasso the computed outputs use: the live one except while a node
     /// is dragged with live tracking off.
     fn computed_lasso(&self) -> &Lasso {
-        if self.live_tracking || !self.lasso.is_editing() {
+        if self.live_tracking || !self.lasso.is_drafting() {
             &self.lasso
         } else {
             &self.settled_lasso
@@ -1207,6 +1343,11 @@ impl FeatureViewState {
     fn lasso_edited(&mut self) {
         // Editing the polygon abandons a previously requested cut. A fresh
         // K press is required for the new shape; no old request may cut it.
+        if self.split_requested {
+            self.notice = Some(
+                "Split cancelled: polygon changed after K; press K for the new polygon.".into(),
+            );
+        }
         self.split_requested = false;
         self.km.lasso_auto = false;
         self.clear_km_preview();
@@ -1258,6 +1399,10 @@ impl FeatureViewState {
     /// Drop the lasso and a pending split drawn against other data than `cur`.
     fn drop_stale_lasso(&mut self, cur: &FeatureKey) {
         if self.lasso_key.as_ref().is_some_and(|k| k != cur) {
+            if self.split_requested {
+                self.notice =
+                    Some("Split cancelled: the feature axes or selection changed after K.".into());
+            }
             self.cancel_lasso();
         }
     }
@@ -1279,7 +1424,23 @@ impl FeatureViewState {
 
     /// phy `split` (`k`): the next frame splits off the lassoed spikes.
     pub fn request_split(&mut self) {
+        self.lasso.finish_polygon();
+        self.settle_lasso();
         self.split_requested = self.can_split();
+        self.cell_jobs.cancel();
+        log::info!(
+            "lasso K: accepted={} nodes={} editing={} draft={}",
+            self.split_requested,
+            self.lasso.points.len(),
+            self.lasso.is_editing(),
+            self.lasso.is_drafting()
+        );
+    }
+
+    pub fn prepare_keyboard_split(&mut self) {
+        self.skip_preview_once = true;
+        self.cell_jobs.cancel();
+        self.alts.memo.cancel();
     }
 
     /// A previewed k-means part with its auto lasso splits by membership, so
@@ -1400,13 +1561,35 @@ impl FeatureViewState {
         self.link.clone()
     }
 
+    /// Other panes may paint before Features, or while Features is hidden.
+    /// Do not publish the previous selection's channels or bucket indices.
+    pub fn link_for(&self, selection: &[ClusterId], version: u64) -> FeatureLink {
+        if self
+            .membership
+            .as_ref()
+            .is_some_and(|(s, v)| s == selection && *v == version)
+        {
+            self.link()
+        } else {
+            FeatureLink::default()
+        }
+    }
+
     /// Stop the worker before a curation write takes the session lock.
     pub fn cancel(&mut self) {
+        self.hit_jobs.cancel();
+        self.cell_jobs.cancel();
         self.memo.cancel();
+        self.km.memo.cancel();
+        self.alts.memo.cancel();
+        self.ghost.memo.cancel();
+        for memo in self.basis_jobs.values_mut() {
+            memo.cancel();
+        }
     }
 
     pub fn pending(&self) -> bool {
-        self.memo.pending()
+        self.memo.pending() || self.hit_jobs.pending() || self.cell_jobs.pending()
     }
 }
 
@@ -1416,7 +1599,7 @@ const WIDE_TOOLBAR: f32 = 700.0;
 
 /// What one wheel/scroll event asks the view to do. Ctrl+wheel (and a native
 /// pinch, which egui reports as the same zoom delta) scales the PC features;
-/// Alt+wheel the marker; a plain wheel zooms the projected data.
+/// Alt+wheel the marker; a plain wheel magnifies the whole projection canvas.
 #[derive(Copy, Clone, Debug, PartialEq)]
 enum WheelAction {
     None,
@@ -1448,6 +1631,8 @@ fn wheel_action(scroll: f32, pinch: f32, alt: bool) -> WheelAction {
 struct NavInput {
     pan: Vec2,
     zoom: f32,
+    canvas_origin: Pos2,
+    zoom_anchor: Option<Pos2>,
     scaling: f32,
     marker: f32,
     reset: bool,
@@ -1459,6 +1644,8 @@ impl Default for NavInput {
         Self {
             pan: Vec2::ZERO,
             zoom: 1.0,
+            canvas_origin: Pos2::ZERO,
+            zoom_anchor: None,
             scaling: 1.0,
             marker: 1.0,
             reset: false,
@@ -1508,8 +1695,17 @@ impl NavInput {
     }
 
     fn wheel_from(&mut self, ui: &Ui) {
-        let (scroll, pinch, alt) =
-            ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta(), i.modifiers.alt));
+        let (scroll, pinch, alt, pointer) = ui.input(|i| {
+            (
+                i.smooth_scroll_delta.y,
+                i.zoom_delta(),
+                i.modifiers.alt,
+                i.pointer.hover_pos(),
+            )
+        });
+        if !self.wheel_seen {
+            self.zoom_anchor = pointer;
+        }
         self.wheel(scroll, pinch, alt);
     }
 
@@ -1528,8 +1724,16 @@ impl NavInput {
             changed = true;
         }
         if self.zoom != 1.0 {
-            state.zoom = (state.zoom * self.zoom).clamp(0.05, 100.0);
-            changed = true;
+            let zoom = (state.zoom * self.zoom).clamp(0.1, 20.0);
+            if zoom != state.zoom {
+                // Keep the image point under the cursor fixed. Translation
+                // remains in screen pixels, so dragging feels identical at
+                // every zoom level and works after zooming into one square.
+                let anchor = self.zoom_anchor.unwrap_or(self.canvas_origin) - self.canvas_origin;
+                state.pan_px = anchor - (anchor - state.pan_px) * (zoom / state.zoom);
+                state.zoom = zoom;
+                changed = true;
+            }
         }
         if self.scaling != 1.0 {
             state.scaling = (state.scaling * self.scaling).clamp(0.05, 50.0);
@@ -1551,9 +1755,44 @@ fn cell_rects(origin: Pos2, side: f32) -> (Rect, Rect) {
     )
 }
 
-/// Where a projection paints after the shared drag translation.
-fn projection_origin(origin: Pos2, state: &FeatureViewState) -> Pos2 {
-    origin + state.pan_px
+/// One image-like transform for the whole matrix, never one zoom per cell.
+fn projection_transform(origin: Pos2, state: &FeatureViewState) -> egui::emath::TSTransform {
+    egui::emath::TSTransform::new(
+        origin.to_vec2() * (1.0 - state.zoom) + state.pan_px,
+        state.zoom,
+    )
+}
+
+/// Keep the GPU viewport inside the canvas. egui clamps callback viewports to
+/// the screen; an oversized/off-screen plot must use the corresponding data
+/// subrange, otherwise its points would squash into the visible fragment.
+#[derive(Debug, PartialEq)]
+struct ScatterViewport {
+    rect: Rect,
+    x: (f32, f32),
+    y: (f32, f32),
+}
+
+fn scatter_viewport(
+    rect: Rect,
+    clip: Rect,
+    x: (f32, f32),
+    y: (f32, f32),
+) -> Option<ScatterViewport> {
+    let visible = rect.intersect(clip);
+    if !visible.is_positive() {
+        return None;
+    }
+    if visible == rect {
+        return Some(ScatterViewport { rect, x, y });
+    }
+    let x_at = |p: f32| x.0 + (p - rect.left()) / rect.width() * (x.1 - x.0);
+    let y_at = |p: f32| y.0 + (rect.bottom() - p) / rect.height() * (y.1 - y.0);
+    Some(ScatterViewport {
+        rect: visible,
+        x: (x_at(visible.left()), x_at(visible.right())),
+        y: (y_at(visible.bottom()), y_at(visible.top())),
+    })
 }
 
 /// The gaps between projections navigate too, so a drag or wheel anywhere in
@@ -1565,6 +1804,25 @@ fn nav_gap(ui: &Ui, nav: &mut NavInput, rect: Rect, id: egui::Id) {
         nav.wheel_from(ui);
     }
     nav.drag(&resp, modifiers, true);
+}
+
+/// The square that owns a canvas drag may leave the viewport entirely.
+/// Retain its capture until release without painting or adding a hit target.
+fn continue_offscreen_drag(
+    ui: &Ui,
+    nav: &mut NavInput,
+    id: egui::Id,
+    viewport: Rect,
+    lasso_editing: bool,
+) {
+    if ui.ctx().is_being_dragged(id) && !lasso_editing {
+        let response = ui.interact(
+            Rect::from_min_size(viewport.min, Vec2::ZERO),
+            id,
+            Sense::click_and_drag(),
+        );
+        nav.drag(&response, ui.input(|i| i.modifiers), true);
+    }
 }
 
 /// The previewed k-means part with its hull in every grid cell.
@@ -1646,7 +1904,7 @@ fn help_text(ctx: &egui::Context) -> String {
     ));
     s.push_str(
         "live tracking: update hits while dragging (off: on release)\n\
-         wheel: centred zoom in every projection · drag: move the windows together\n\
+         wheel: zoom the whole projection grid · drag: move the grid\n\
          double-click: reset · Esc: cancel the lasso or pending cut\n\
          Ctrl+wheel: feature scale · Alt+wheel: marker size\n\
          Alt+click / Alt+right-click: amplitude feature (x / y)\n\
@@ -1673,8 +1931,10 @@ fn hint_line(state: &FeatureViewState, ctx: &egui::Context) -> String {
 }
 
 const LIVE_TRACKING_HELP: &str =
-    "Update spike counts, highlights and linked views while a node is dragged.\n\
-     Off (the default) updates them when you release, which keeps lasso edits fast.";
+    "Update spike selection while constructing or editing the polygon.\n\
+     Off (default): only the outline changes between Ctrl-clicks.\n\
+     Release Ctrl to finish; K finishes and splits the current polygon.\n\
+     Dragged-node edits update after mouse-up. Large previews run in the background.";
 
 /// The lasso's live-tracking switch, shown while a lasso is in play.
 fn live_tracking_toggle(ui: &mut Ui, state: &mut FeatureViewState) {
@@ -1736,22 +1996,21 @@ pub fn feature_view<P: DataProvider>(
     window: (u64, u32),
 ) -> Option<Vec<(ClusterId, Vec<u32>)>> {
     let theme = Theme::from_ui(ui);
+    state.sync_membership(selection, session.version(), brushes);
+    let skip_preview = std::mem::take(&mut state.skip_preview_once);
+    let (command, pointer_down) = ui.input(|i| (i.modifiers.command, i.pointer.primary_down()));
+    if state.lasso.finish_polygon_on_release(command, pointer_down) {
+        ui.ctx().request_repaint();
+    }
     if selection.is_empty() {
         ui.label("no selection");
-        state.link = FeatureLink::default();
-        // sync_brush never runs here, so take back a brush this view owns.
-        state.brush_written = None;
-        if brushes.spikes.as_ref().is_some_and(|b| {
-            matches!(
-                b.source,
-                BrushSource::FeatureLasso | BrushSource::KMeansPart
-            )
-        }) {
-            brushes.spikes = None;
-        }
+        state.clear_loaded_outputs(brushes);
         return None;
     }
     let computed = !session.has_pc_features();
+    if computed && state.split_requested {
+        state.want_full = true;
+    }
     // Loading every lassoed spike keeps the channels (and order) on screen.
     let pinned = state
         .want_full
@@ -1785,9 +2044,19 @@ pub fn feature_view<P: DataProvider>(
             Arc::new(compute(s, &job_key, &basis, cancel))
         })
         .cloned();
-    let set = match current.clone().or_else(|| state.memo.last().cloned()) {
+    // A point's slot belongs to exactly this request's ordered selection.
+    // Memo::last() deliberately ignores the key and must not be used here:
+    // merging, relabel-and-advance, or deselecting can change both mappings.
+    let set = match current.clone() {
         Some(set) => set,
         None => {
+            let shown = bound_key
+                .channels
+                .as_deref()
+                .or(state.shown_channels.as_deref())
+                .unwrap_or_default();
+            state.drop_stale_lasso(&lasso_key(&bound_key, shown));
+            state.clear_loaded_outputs(brushes);
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(if computed {
@@ -1806,9 +2075,30 @@ pub fn feature_view<P: DataProvider>(
     // set's points.
     state.drop_stale_lasso(&cur);
     state.settle_lasso();
+    if state.split_requested {
+        ensure_lasso_hits(state, &set, selection, jobs);
+    }
 
     let km_key: KmKey = (set.generation, selection[0], state.km.k);
     kmeans_update(state, &set, km_key, selection[0], jobs);
+    // K was armed after the preceding frame's pointer edits. Do not build
+    // sixteen million-point brushed vertex buffers only to discard them
+    // after committing the cut. A new pointer edit must still run first.
+    let pointer_edit =
+        ui.input(|i| i.pointer.any_down() || i.pointer.any_pressed() || i.pointer.any_released());
+    if !pointer_edit {
+        if let Some(splits) = take_ready_split(state, &set, km_key, selection) {
+            ui.label("splitting lassoed spikes…");
+            return Some(splits);
+        }
+        if state.split_requested {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("K accepted · selecting all enclosed spikes…");
+            });
+            return None;
+        }
+    }
     if state.km.scroll_to_lasso {
         // All sixteen cells are on screen: focus the lasso's cell so the
         // 3-D overlay and the link follow it.
@@ -1836,17 +2126,61 @@ pub fn feature_view<P: DataProvider>(
         brush: brush.as_ref(),
         time,
     };
-    let alts = update_alts(state, &set, &fit, km_key, selection, &paint, jobs);
+    let freeze_preview = skip_preview || (!state.live_tracking && state.lasso.is_drafting());
+    let alts = if freeze_preview || !state.alts_open {
+        let (_, text) = label_source(state, km_key, fit.as_ref(), selection);
+        AltsView {
+            alts: state.alts.built.as_ref().map(|(_, alts)| Arc::clone(alts)),
+            generation: state.alts.generation,
+            text,
+        }
+    } else {
+        update_alts(state, &set, &fit, km_key, selection, &paint, jobs)
+    };
     let cells_key = (set.generation, paint.key(), state.preview_gen);
-    if !matches!(&state.cells, Some((k, ..)) if *k == cells_key) {
+    if !freeze_preview && !matches!(&state.cells, Some((k, ..)) if *k == cells_key) {
         let preview = state.preview.as_ref().and_then(|(c, idx)| {
             let slot = selection.iter().position(|s| s == c)?;
             Some((slot as u16, idx))
         });
-        state.cells_gen += 1;
-        let (cells, shown) = cell_vertices(&set, &paint, preview);
-        state.cells = Some((cells_key, state.cells_gen, cells));
-        state.shown = Arc::new(shown);
+        if set.points.len() < 4096 {
+            state.cells_gen += 1;
+            let (cells, shown) = cell_vertices(&set, &paint, preview);
+            state.cells = Some((cells_key, state.cells_gen, cells));
+            state.shown = Arc::new(shown);
+        } else {
+            let owned_set = Arc::clone(&set);
+            let owned_selection = selection.to_vec();
+            let owned_brush = brush.clone();
+            let owned_depths = depths.filter(|_| state.colour == ColourBy::Depth).cloned();
+            let owned_preview = state.preview.clone();
+            let colour = state.colour;
+            if let Some(built) =
+                state
+                    .cell_jobs
+                    .ensure_owned(cells_key, jobs.repaint(), move |cancel| {
+                        let paint = Paint {
+                            dark,
+                            colour,
+                            selection: &owned_selection,
+                            brush: owned_brush.as_ref(),
+                            depths: owned_depths.as_ref(),
+                            time,
+                        };
+                        let preview = owned_preview.as_ref().and_then(|(c, indices)| {
+                            let slot = owned_selection.iter().position(|s| s == c)?;
+                            Some((slot as u16, indices))
+                        });
+                        let (cells, shown) =
+                            cell_vertices_cancellable(&owned_set, &paint, preview, cancel);
+                        Arc::new((cells, Arc::new(shown)))
+                    })
+            {
+                state.cells_gen += 1;
+                state.cells = Some((cells_key, state.cells_gen, built.0.clone()));
+                state.shown = Arc::clone(&built.1);
+            }
+        }
     }
     let ghost = ghost_cells(
         state,
@@ -1911,8 +2245,18 @@ pub fn feature_view<P: DataProvider>(
     let from_triple = state.mode == ViewMode::Three;
     // Computed PCs: a closed lasso previews and splits every spike, not the
     // display sample. `want_full` follows the lasso (it drops with it, in
-    // `cancel_lasso` or here) and the brush waits for the full set.
-    state.want_full = computed && state.can_split();
+    // `cancel_lasso` or here) and the brush waits for the full set. A frozen
+    // draft (tracking off) keeps the request: dropping it would reload the
+    // sample mid-draft.
+    state.want_full = computed
+        && (state.split_requested
+            || if !state.live_tracking && state.lasso.is_drafting() {
+                state.want_full
+            } else {
+                state.can_split()
+            });
+    state.settle_lasso();
+    ensure_lasso_hits(state, &set, selection, jobs);
     sync_brush(state, &set, selection, session.version(), brushes);
     if let Some(h) = state.hover_out.take() {
         brushes.hover_next = Some(h);
@@ -1932,11 +2276,17 @@ pub fn feature_view<P: DataProvider>(
         session.version(),
     );
     state.stamp_lasso(&cur, current.is_some());
-    // Computed PCs wait for the full set (`want_full`, above) to split.
-    if let Some(set) = current
-        .filter(|s| s.full || !s.computed)
-        .filter(|_| state.split_requested && state.can_split())
-    {
+    take_ready_split(state, &set, km_key, selection)
+}
+
+fn take_ready_split(
+    state: &mut FeatureViewState,
+    set: &FeatureSet,
+    km_key: KmKey,
+    selection: &[ClusterId],
+) -> Option<Vec<(ClusterId, Vec<u32>)>> {
+    // Computed PCs wait for the full set (`want_full`) to split.
+    if (set.full || !set.computed) && state.split_requested && state.can_split() {
         // The previewed part's members while the lasso is its auto lasso,
         // else the polygon's hits. A part fitted on the sample is refitted on
         // the full set first (the fit is in flight unless it failed).
@@ -1947,10 +2297,15 @@ pub fn feature_view<P: DataProvider>(
         if fit_pending {
             return None;
         }
+        let splits = match state.km_members(set) {
+            Some(members) => members,
+            None => current_hits(state, set, selection)?.all.clone(),
+        };
         state.split_requested = false;
-        let splits = state
-            .km_members(&set)
-            .unwrap_or_else(|| lasso_hits(&set, &state.lasso, selection));
+        log::info!(
+            "lasso K: membership ready, moving {} spikes",
+            splits.iter().map(|(_, v)| v.len()).sum::<usize>()
+        );
         state.cancel_lasso();
         return Some(splits);
     }
@@ -2053,7 +2408,9 @@ fn windowed_points<P: DataProvider>(
         .copied()
         .filter(|&i| {
             let p = &set.points[i];
-            ranges[p.slot as usize].contains(&p.local)
+            ranges
+                .get(p.slot as usize)
+                .is_some_and(|r| r.contains(&p.local))
         })
         .collect()
 }
@@ -2091,6 +2448,13 @@ fn sync_brush(
     version: u64,
     brushes: &mut Brushes,
 ) {
+    if (!state.live_tracking && state.lasso.is_drafting())
+        || (state.computed_lasso().is_closed()
+            && current_hits(state, set, selection).is_none()
+            && !state.km.previewing)
+    {
+        return;
+    }
     let want = want_brush(state, set);
     // Do not publish a partial selection, but always allow clearing one:
     // cancellation must remove old highlights even while a sample loads.
@@ -2115,7 +2479,8 @@ fn sync_brush(
                 (BrushSource::KMeansPart, Some((c, members))) => {
                     vec![(*c, members.iter().copied().collect())]
                 }
-                _ => lasso_hits_cached(state, set, selection).all.clone(),
+                _ => current_hits(state, set, selection)
+                    .map_or_else(Vec::new, |hits| hits.all.clone()),
             };
             brushes.spikes = SpikeBrush::new(source, version, spikes);
         }
@@ -2131,9 +2496,10 @@ fn show_3d<P: DataProvider>(
     brushes: &mut Brushes,
     depths: Option<&SpikeDepths>,
 ) {
-    let lasso = if state.lasso.is_closed() {
-        let (dx, dy) = GRID[state.lasso.cell / 4][state.lasso.cell % 4];
-        Some((dx, dy, &state.lasso.points[..]))
+    let computed_lasso = state.computed_lasso().clone();
+    let lasso = if computed_lasso.is_closed() {
+        let (dx, dy) = GRID[computed_lasso.cell / 4][computed_lasso.cell % 4];
+        Some((dx, dy, &computed_lasso.points[..]))
     } else {
         None
     };
@@ -2184,6 +2550,7 @@ fn two_d<P: DataProvider>(
     let size = ui.available_size();
     let grid_h = (size.y - reserve).max(1.0);
     let (area, _) = ui.allocate_exact_size(egui::vec2(size.x, grid_h), Sense::hover());
+    nav.canvas_origin = area.min;
     let geo = grid_geometry(area.size());
     let viewport = area.intersect(ui.clip_rect());
     // The gaps between projections navigate too.
@@ -2230,7 +2597,7 @@ fn update_alts<P: DataProvider>(
     let scores = state
         .alts
         .memo
-        .ensure(key, &jobs.session, jobs.repaint(), move |_, cancel| {
+        .ensure_owned(key, jobs.repaint(), move |cancel| {
             let (dx, dy) = GRID[cell / 4][cell % 4];
             let src = match (label_key.0, &job_fit) {
                 (0, _) => Labels::Clusters,
@@ -2538,6 +2905,9 @@ fn refresh_link<P: DataProvider>(
     brushes: &Brushes,
     version: u64,
 ) {
+    if !state.live_tracking && state.lasso.is_drafting() {
+        return;
+    }
     let (dx, dy) = GRID[state.focus / 4][state.focus % 4];
     // The 3-D scene's triple, else the focused cell's channels.
     let mut highlight: Vec<u32> = if from_triple {
@@ -2583,7 +2953,8 @@ fn refresh_link<P: DataProvider>(
                 v.sort_unstable();
                 vec![(*cluster, thin(&v))]
             }
-            _ if lasso_closed => lasso_hits_cached(state, set, selection).spikes.clone(),
+            _ if lasso_closed => current_hits(state, set, selection)
+                .map_or_else(Vec::new, |hits| hits.spikes.clone()),
             _ => Vec::new(),
         };
     }
@@ -2723,22 +3094,26 @@ fn draw_cell<P: DataProvider>(
 ) {
     let (theme, set) = (&c.theme, &**c.set);
     let (dx, dy) = GRID[cell / 4][cell % 4];
-    let origin = projection_origin(origin, state);
     let (strip, rect) = cell_rects(origin, side);
+    let transform = projection_transform(nav.canvas_origin, state);
+    let window = transform * Rect::from_min_size(origin, egui::vec2(side, side + LABEL_H));
+    let (strip, rect) = (transform * strip, transform * rect);
+    let scale = state.zoom;
+    let hit_id = ui.id().with(("feature-hit", cell));
     let viewport = viewport.intersect(ui.clip_rect());
     if !viewport.intersects(strip.union(rect)) {
+        continue_offscreen_drag(ui, nav, hit_id, viewport, state.lasso.is_editing());
         return;
     }
     // The paint clip travels with the window inside the shared viewport,
     // never staying behind in its former slot. Retain the original clip
     // dimensions so border rasterization is unchanged at the default origin.
-    let window = Rect::from_min_size(origin, egui::vec2(side, side + LABEL_H));
     let painter = ui.painter_at(window.intersect(viewport));
     painter.with_clip_rect(strip).text(
-        strip.left_center() + egui::vec2(2.0, 0.0),
+        strip.left_center() + egui::vec2(2.0 * scale, 0.0),
         egui::Align2::LEFT_CENTER,
         format!("{} × {}", grid_axis_label(dx), grid_axis_label(dy)),
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(11.0 * scale),
         theme.caption,
     );
     let caption = strip.intersect(viewport);
@@ -2770,7 +3145,9 @@ fn draw_cell<P: DataProvider>(
     };
     // Background first (1 px, faint), the merge ghost (grey, a little
     // smaller), the selection and the brushed spikes (ink) on top.
-    if let Some([background, selected, brushed]) = c.cells.get(cell) {
+    if let (Some([background, selected, brushed]), Some(gpu)) =
+        (c.cells.get(cell), scatter_viewport(rect, viewport, x, y))
+    {
         let ghost = c.ghost.as_ref().map(|(_, gen, cells)| (&cells[cell], *gen));
         let layers = [
             (
@@ -2791,15 +3168,15 @@ fn draw_cell<P: DataProvider>(
                 continue;
             };
             painter.add(eframe::egui_wgpu::Callback::new_paint_callback(
-                rect,
+                gpu.rect,
                 ScatterCallback {
                     id: ui.id().with((layer, cell)).value(),
                     vertices: Arc::clone(vertices),
                     generation,
-                    x,
-                    y,
-                    radius,
-                    size: rect.size(),
+                    x: gpu.x,
+                    y: gpu.y,
+                    radius: radius * scale,
+                    size: gpu.rect.size(),
                 },
             ));
         }
@@ -2807,7 +3184,7 @@ fn draw_cell<P: DataProvider>(
     painter.rect_stroke(
         rect,
         0.0,
-        Stroke::new(0.5_f32, theme.grid),
+        Stroke::new(0.5 * scale, theme.grid),
         egui::StrokeKind::Inside,
     );
     let strong = ui.visuals().strong_text_color();
@@ -2829,7 +3206,11 @@ fn draw_cell<P: DataProvider>(
     };
     for &i in &c.windowed {
         if let (Some(p), Some(_)) = (screen_of(i), time_alpha(c.time, set.points[i].t)) {
-            inner.circle_stroke(p, state.marker + 1.5, Stroke::new(1.0_f32, theme.caption));
+            inner.circle_stroke(
+                p,
+                (state.marker + 1.5) * scale,
+                Stroke::new(scale, theme.caption),
+            );
         }
     }
     // The spike hovered in any view: the accent ring.
@@ -2842,10 +3223,10 @@ fn draw_cell<P: DataProvider>(
     }
     if let Some((g, ..)) = &c.ghost {
         painter.text(
-            rect.left_top() + egui::vec2(4.0, 4.0),
+            rect.left_top() + egui::vec2(4.0, 4.0) * scale,
             egui::Align2::LEFT_TOP,
             format!("c{} (ghost)", g.0),
-            egui::FontId::proportional(10.0),
+            egui::FontId::proportional(10.0 * scale),
             theme.caption,
         );
     }
@@ -2888,7 +3269,11 @@ fn draw_cell<P: DataProvider>(
         }
         state.lasso.paint(&painter, to_screen, strong);
         if state.lasso.is_closed() {
-            let n = lasso_hit_count(state, set, c.selection);
+            let n = if !state.live_tracking && state.lasso.is_drafting() {
+                None
+            } else {
+                current_hits(state, set, c.selection).map(|hits| hits.n)
+            };
             hit_badge(
                 &painter.with_clip_rect(rect),
                 &state.lasso,
@@ -2901,11 +3286,7 @@ fn draw_cell<P: DataProvider>(
         }
     }
 
-    let resp = ui.interact(
-        rect.intersect(viewport),
-        ui.id().with(("feature-hit", cell)),
-        Sense::click_and_drag(),
-    );
+    let resp = ui.interact(rect.intersect(viewport), hit_id, Sense::click_and_drag());
     resp.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::Other,
@@ -2917,7 +3298,7 @@ fn draw_cell<P: DataProvider>(
     // Hovering writes the shared hover; Alt+click on it seeks the Trace.
     let under = resp
         .hover_pos()
-        .filter(|_| !resp.dragged())
+        .filter(|_| !resp.dragged() && !state.lasso.is_drafting())
         .and_then(|at| {
             let pts = c.shown.iter().filter_map(|&i| {
                 time_alpha(c.time, set.points[i].t)?;
@@ -2931,7 +3312,7 @@ fn draw_cell<P: DataProvider>(
         })
         .and_then(|i| {
             let p = &set.points[i];
-            let cluster = c.selection[p.slot as usize];
+            let cluster = *c.selection.get(p.slot as usize)?;
             let sample = c.session.spike_times(cluster).get(p.local as usize)?.0;
             Some(HoverSpike {
                 cluster,
@@ -3427,55 +3808,106 @@ fn thin(v: &[u32]) -> Arc<[u32]> {
 }
 
 /// Selected spikes inside the closed lasso, cached per set and polygon.
-fn lasso_hit_count(
-    state: &mut FeatureViewState,
+fn current_hits<'a>(
+    state: &'a FeatureViewState,
     set: &FeatureSet,
     selection: &[ClusterId],
-) -> usize {
-    lasso_hits_cached(state, set, selection).n
+) -> Option<&'a Hits> {
+    state
+        .hits
+        .as_ref()
+        .filter(|hits| hits.matches(set, selection, state.computed_lasso()))
 }
 
+fn ensure_lasso_hits<P: DataProvider>(
+    state: &mut FeatureViewState,
+    set: &Arc<FeatureSet>,
+    selection: &[ClusterId],
+    jobs: &JobCtx<Session<P>>,
+) {
+    if (!state.live_tracking && state.lasso.is_drafting())
+        || !state.computed_lasso().is_closed()
+        || current_hits(state, set, selection).is_some()
+    {
+        return;
+    }
+    let lasso = state.computed_lasso();
+    let key = HitKey {
+        generation: set.generation,
+        selection: selection.to_vec(),
+        cell: lasso.cell,
+        polygon: lasso.points.clone(),
+    };
+    if set.points.len() < 4096 {
+        state.hits = Some(compute_lasso_hits(set, &key, &AtomicBool::new(false)));
+    } else {
+        let owned_set = Arc::clone(set);
+        let owned_key = key.clone();
+        if let Some(hits) = state
+            .hit_jobs
+            .ensure_owned(key, jobs.repaint(), move |cancel| {
+                Arc::new(compute_lasso_hits(&owned_set, &owned_key, cancel))
+            })
+        {
+            state.hits = Some((**hits).clone());
+        }
+    }
+}
+
+fn compute_lasso_hits(set: &FeatureSet, key: &HitKey, cancel: &AtomicBool) -> Hits {
+    let lasso = Lasso::new(key.cell, key.polygon.clone());
+    let (dx, dy) = GRID[key.cell / 4][key.cell % 4];
+    let mut per: Vec<Vec<u32>> = vec![Vec::new(); key.selection.len()];
+    for (i, p) in set.points.iter().enumerate() {
+        if i % 4096 == 0 && cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let xy = [set.value(i, dx), set.value(i, dy)];
+        if p.slot != BACKGROUND && xy.iter().all(|v| v.is_finite()) && lasso.contains(xy) {
+            if let Some(bucket) = per.get_mut(p.slot as usize) {
+                bucket.push(p.local);
+            }
+        }
+    }
+    Hits {
+        generation: key.generation,
+        selection: key.selection.clone(),
+        cell: key.cell,
+        polygon: key.polygon.clone(),
+        n: per.iter().map(Vec::len).sum(),
+        spikes: key
+            .selection
+            .iter()
+            .copied()
+            .zip(&per)
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(c, v)| (c, thin(v)))
+            .collect(),
+        all: key
+            .selection
+            .iter()
+            .copied()
+            .zip(per)
+            .filter(|(_, v)| !v.is_empty())
+            .collect(),
+    }
+}
+
+#[cfg(test)]
 fn lasso_hits_cached<'a>(
     state: &'a mut FeatureViewState,
     set: &FeatureSet,
     selection: &[ClusterId],
 ) -> &'a Hits {
-    let fresh = {
+    if current_hits(state, set, selection).is_none() {
         let lasso = state.computed_lasso();
-        state
-            .hits
-            .as_ref()
-            .is_some_and(|h| h.generation == set.generation && h.polygon == lasso.points)
-    };
-    if !fresh {
-        let lasso = state.computed_lasso();
-        let (cell, polygon) = (lasso.cell, lasso.points.clone());
-        let lasso = Lasso::new(cell, polygon.clone());
-        let (dx, dy) = GRID[cell / 4][cell % 4];
-        let mut per: Vec<Vec<u32>> = vec![Vec::new(); selection.len()];
-        for (i, p) in set.points.iter().enumerate() {
-            if p.slot != BACKGROUND && lasso.contains([set.value(i, dx), set.value(i, dy)]) {
-                per[p.slot as usize].push(p.local);
-            }
-        }
-        state.hits = Some(Hits {
+        let key = HitKey {
             generation: set.generation,
-            polygon,
-            n: per.iter().map(Vec::len).sum(),
-            spikes: selection
-                .iter()
-                .copied()
-                .zip(&per)
-                .filter(|(_, v)| !v.is_empty())
-                .map(|(c, v)| (c, thin(v)))
-                .collect(),
-            all: selection
-                .iter()
-                .copied()
-                .zip(per)
-                .filter(|(_, v)| !v.is_empty())
-                .collect(),
-        });
+            selection: selection.to_vec(),
+            cell: lasso.cell,
+            polygon: lasso.points.clone(),
+        };
+        state.hits = Some(compute_lasso_hits(set, &key, &AtomicBool::new(false)));
     }
     state.hits.as_ref().expect("just filled")
 }
@@ -3486,7 +3918,7 @@ fn hit_badge(
     lasso: &Lasso,
     to_screen: impl Fn([f32; 2]) -> Pos2,
     cell: Rect,
-    n: usize,
+    n: Option<usize>,
     theme: &Theme,
     text: egui::Color32,
 ) {
@@ -3499,7 +3931,16 @@ fn hit_badge(
     );
     let galley = painter.layout_no_wrap(
         format!(
-            "{n} spikes · {} nodes · {} splits",
+            "{} · {} nodes · {} splits",
+            n.map_or_else(
+                || if lasso.is_drafting() {
+                    "draft"
+                } else {
+                    "selecting…"
+                }
+                .to_owned(),
+                |n| format!("{n} spikes")
+            ),
             lasso.points.len(),
             crate::settings::hint(painter.ctx(), "curation.split")
         ),
@@ -3520,9 +3961,8 @@ fn hit_badge(
     painter.galley(r.min + egui::vec2(4.0, 2.0), galley, text);
 }
 
-/// Visible data range of `dim` along `axis` (0 = x, 1 = y) after scaling and
-/// zoom. Zoom is always about the middle: the shared drag only translates
-/// the projection boxes, never the data range.
+/// Data range of `dim` after Ctrl+wheel feature scaling. Canvas navigation
+/// changes only screen geometry; neither scrolling nor dragging changes it.
 fn axis_range(set: &FeatureSet, state: &FeatureViewState, dim: Dim, _axis: usize) -> (f32, f32) {
     let (lo, hi) = match dim {
         Dim::Time => set.bound(dim),
@@ -3532,9 +3972,8 @@ fn axis_range(set: &FeatureSet, state: &FeatureViewState, dim: Dim, _axis: usize
             (((a + b) / 2.0) - half, ((a + b) / 2.0) + half)
         }
     };
-    let span = hi - lo;
-    let half = 0.5 / state.zoom;
-    (lo + (0.5 - half) * span, lo + (0.5 + half) * span)
+    // Preserve the fitted view's original floating-point endpoints.
+    (lo, lo + (hi - lo))
 }
 
 pub(crate) fn dim_label(dim: Dim, set: &FeatureSet) -> String {
@@ -3553,25 +3992,42 @@ fn display_order(
     thin_background: bool,
     kept: &dyn Fn(usize) -> bool,
 ) -> Vec<usize> {
+    display_order_cancellable(set, cap, thin_background, kept, &AtomicBool::new(false))
+}
+
+fn display_order_cancellable(
+    set: &FeatureSet,
+    cap: usize,
+    thin_background: bool,
+    kept: &dyn Fn(usize) -> bool,
+    cancel: &AtomicBool,
+) -> Vec<usize> {
     let mut counts: HashMap<u16, usize> = HashMap::new();
-    for p in &set.points {
+    for (i, p) in set.points.iter().enumerate() {
+        if i % 4096 == 0 && cancel.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
         *counts.entry(p.slot).or_default() += 1;
     }
     let stride = |slot: u16| (counts[&slot] / cap).max(1);
-    let mut order: Vec<usize> = (0..set.points.len())
-        .filter(|&i| {
+    let mut order: Vec<(usize, bool, bool)> = (0..set.points.len())
+        .take_while(|i| i % 4096 != 0 || !cancel.load(Ordering::Relaxed))
+        .filter_map(|i| {
             let p = &set.points[i];
-            kept(i)
+            let keep = kept(i);
+            let shown = keep
                 || if p.slot == BACKGROUND {
                     !thin_background || i.is_multiple_of(stride(BACKGROUND))
                 } else {
                     (p.local as usize).is_multiple_of(stride(p.slot))
-                }
+                };
+            shown.then_some((i, p.slot != BACKGROUND, keep))
         })
         .collect();
     // Background under the clusters, a previewed split on top.
-    order.sort_by_key(|&i| (set.points[i].slot != BACKGROUND, kept(i)));
-    order
+    // Cache the brush lookup once per point, not on every sort comparison.
+    order.sort_by_key(|&(_, selected, keep)| (selected, keep));
+    order.into_iter().map(|(i, ..)| i).collect()
 }
 
 /// `[background, selected, brushed]` vertices of `order` in the `dx` × `dy`
@@ -3583,6 +4039,24 @@ fn layer_vertices(
     (dx, dy): (Dim, Dim),
     paint: &Paint,
     previewed: &dyn Fn(usize) -> bool,
+) -> [Arc<Vec<ScatterVertex>>; 3] {
+    layer_vertices_cancellable(
+        set,
+        order,
+        (dx, dy),
+        paint,
+        previewed,
+        &AtomicBool::new(false),
+    )
+}
+
+fn layer_vertices_cancellable(
+    set: &FeatureSet,
+    order: &[usize],
+    (dx, dy): (Dim, Dim),
+    paint: &Paint,
+    previewed: &dyn Fn(usize) -> bool,
+    cancel: &AtomicBool,
 ) -> [Arc<Vec<ScatterVertex>>; 3] {
     let dark = paint.dark;
     // Faint background: gray(170)@~0.47 in dark, gray(190)@0.5 in light.
@@ -3599,7 +4073,9 @@ fn layer_vertices(
         Arc::new(
             order
                 .iter()
-                .filter_map(|&i| {
+                .enumerate()
+                .take_while(|(j, _)| j % 4096 != 0 || !cancel.load(Ordering::Relaxed))
+                .filter_map(|(_, &i)| {
                     let p = &set.points[i];
                     let bg = p.slot == BACKGROUND;
                     let brushed = !bg && paint.brushed(p);
@@ -3647,6 +4123,15 @@ fn cell_vertices(
     paint: &Paint,
     preview: Option<(u16, &std::collections::HashSet<u32>)>,
 ) -> (CellVertices, Vec<usize>) {
+    cell_vertices_cancellable(set, paint, preview, &AtomicBool::new(false))
+}
+
+fn cell_vertices_cancellable(
+    set: &FeatureSet,
+    paint: &Paint,
+    preview: Option<(u16, &std::collections::HashSet<u32>)>,
+    cancel: &AtomicBool,
+) -> (CellVertices, Vec<usize>) {
     let previewed = |i: usize| {
         let p = &set.points[i];
         preview.is_some_and(|(slot, idx)| p.slot == slot && idx.contains(&p.local))
@@ -3654,11 +4139,12 @@ fn cell_vertices(
     // Brushed spikes survive the thinning, so a brush made elsewhere (ISI
     // violators, an Amplitudes lasso) shows every spike it holds.
     let kept = |i: usize| previewed(i) || paint.brushed(&set.points[i]);
-    let order = display_order(set, N_DISPLAY, false, &kept);
+    let order = display_order_cancellable(set, N_DISPLAY, false, &kept, cancel);
     let cells = GRID
         .iter()
         .flatten()
-        .map(|&dims| layer_vertices(set, &order, dims, paint, &previewed))
+        .take_while(|_| !cancel.load(Ordering::Relaxed))
+        .map(|&dims| layer_vertices_cancellable(set, &order, dims, paint, &previewed, cancel))
         .collect();
     let shown = order
         .into_iter()
@@ -3667,6 +4153,7 @@ fn cell_vertices(
     (cells, shown)
 }
 
+#[cfg(test)]
 fn lasso_hits(
     set: &FeatureSet,
     lasso: &Lasso,
@@ -3682,7 +4169,9 @@ fn lasso_hits(
     {
         let xy = [set.value(i, dx), set.value(i, dy)];
         if xy[0].is_finite() && xy[1].is_finite() && lasso.contains(xy) {
-            hits[p.slot as usize].push(p.local);
+            if let Some(bucket) = hits.get_mut(p.slot as usize) {
+                bucket.push(p.local);
+            }
         }
     }
     selection
@@ -3703,6 +4192,18 @@ pub(crate) fn compute<P: DataProvider>(
 ) -> FeatureSet {
     let computed = !s.has_pc_features();
     let sr = s.provider.sample_rate().max(1.0);
+    // Cancelled jobs never publish. Return a well-formed empty set instead
+    // of holding the session read lock through millions of obsolete rows.
+    let cancelled_set = || {
+        FeatureSet::new(
+            vec![0, 0],
+            computed,
+            key.full,
+            Vec::new(),
+            Vec::new(),
+            s.provider.n_samples().0 as f32 / sr,
+        )
+    };
     let clusters = s.spike_clusters_global();
     let slot_of: HashMap<ClusterId, u16> = key
         .selection
@@ -3724,6 +4225,9 @@ pub(crate) fn compute<P: DataProvider>(
     // (global index, local index, slot)
     let mut picked: Vec<(u32, u32, u16)> = Vec::new();
     for (g, c) in clusters.iter().enumerate() {
+        if g % 4096 == 0 && cancel.load(Ordering::Relaxed) {
+            return cancelled_set();
+        }
         match slot_of.get(c) {
             Some(&slot) => {
                 let local = counters[slot as usize];
@@ -3738,54 +4242,61 @@ pub(crate) fn compute<P: DataProvider>(
     }
     let t_of = |g: u32| s.cluster_index().display_time(g, key.reorder).0 as f32 / sr;
 
-    let (channels, points, feats) = if computed {
+    let (channels, mut points, mut feats) = if computed {
         computed_features(s, key, basis, &picked, cancel)
     } else {
         let channels = set_channels(key.channels.clone(), || s.best_channels(&key.selection));
         let n = channels.len();
-        let points = picked
-            .iter()
-            .map(|&(g, local, slot)| FeaturePoint {
+        let mut points = Vec::with_capacity(picked.len());
+        let mut feats = Vec::with_capacity(picked.len() * 2 * n);
+        for (i, &(g, local, slot)) in picked.iter().enumerate() {
+            if i % 4096 == 0 && cancel.load(Ordering::Relaxed) {
+                return cancelled_set();
+            }
+            let missing = if slot == BACKGROUND { f32::NAN } else { 0.0 };
+            points.push(FeaturePoint {
                 local,
                 slot,
                 t: t_of(g),
-            })
-            .collect();
-        let feats = picked
-            .iter()
-            .flat_map(|&(g, _, slot)| {
-                let missing = if slot == BACKGROUND { f32::NAN } else { 0.0 };
-                let channels = &channels;
-                (0..2 * n).map(move |i| s.pc_feature(g, channels[i % n], i / n).unwrap_or(missing))
-            })
-            .collect();
+            });
+            feats.extend(
+                (0..2 * n).map(|j| s.pc_feature(g, channels[j % n], j / n).unwrap_or(missing)),
+            );
+        }
         (channels, points, feats)
     };
+    if cancel.load(Ordering::Relaxed) {
+        return cancelled_set();
+    }
     // Background spikes without any feature are dropped.
     let width = 2 * channels.len();
-    let (points, feats): (Vec<FeaturePoint>, Vec<f32>) = {
-        let keep = |i: usize| {
-            points[i].slot != BACKGROUND
-                || feats[i * width..(i + 1) * width]
-                    .iter()
-                    .any(|v| v.is_finite())
-        };
-        let kept: Vec<usize> = (0..points.len()).filter(|&i| keep(i)).collect();
-        (
-            kept.iter().map(|&i| points[i]).collect(),
-            kept.iter()
-                .flat_map(|&i| &feats[i * width..(i + 1) * width])
-                .copied()
-                .collect(),
-        )
-    };
-    let set = FeatureSet::new(
+    let mut kept = 0;
+    for i in 0..points.len() {
+        if i % 4096 == 0 && cancel.load(Ordering::Relaxed) {
+            return cancelled_set();
+        }
+        if points[i].slot != BACKGROUND
+            || feats[i * width..(i + 1) * width]
+                .iter()
+                .any(|v| v.is_finite())
+        {
+            if kept != i {
+                points[kept] = points[i];
+                feats.copy_within(i * width..(i + 1) * width, kept * width);
+            }
+            kept += 1;
+        }
+    }
+    points.truncate(kept);
+    feats.truncate(kept * width);
+    let set = FeatureSet::new_cancellable(
         channels,
         computed,
         key.full || !computed,
         points,
         feats,
         s.provider.n_samples().0 as f32 / sr,
+        cancel,
     );
     if key.keep_order || set.n() < 3 || key.selection.len() < 2 || cancel.load(Ordering::Relaxed) {
         return set;
@@ -3849,9 +4360,18 @@ pub(crate) fn robust_range(vals: impl Iterator<Item = f32>) -> (f32, f32) {
     if v.is_empty() {
         return (-1.0, 1.0);
     }
-    v.sort_unstable_by(f32::total_cmp);
-    let at = |q: f32| v[((v.len() - 1) as f32 * q).round() as usize];
-    let (lo, hi) = (at(0.005), at(0.995));
+    // Only two order statistics are needed. Sorting every million-spike
+    // column costs O(n log n) on each selection; selection is O(n), with
+    // exactly the same percentile indices and total floating-point order.
+    let lo_idx = ((v.len() - 1) as f32 * 0.005).round() as usize;
+    let hi_idx = ((v.len() - 1) as f32 * 0.995).round() as usize;
+    let (below, hi, _) = v.select_nth_unstable_by(hi_idx, f32::total_cmp);
+    let hi = *hi;
+    let lo = if lo_idx == hi_idx {
+        hi
+    } else {
+        *below.select_nth_unstable_by(lo_idx, f32::total_cmp).1
+    };
     let pad = ((hi - lo) * 0.05).max(1e-6);
     (lo - pad, hi + pad)
 }
@@ -3990,6 +4510,230 @@ fn fitted_basis<P: DataProvider>(
 mod tests {
     use super::*;
 
+    struct EmptyTrace;
+
+    impl DataProvider for EmptyTrace {
+        type Label = u8;
+        fn sample_rate(&self) -> f32 {
+            30_000.0
+        }
+        fn n_channels(&self) -> u32 {
+            4
+        }
+        fn n_samples(&self) -> SampleIndex {
+            SampleIndex(1_000_000)
+        }
+        fn n_clusters(&self) -> u32 {
+            3
+        }
+        fn spike_times(&self, _: ClusterId) -> &[SampleIndex] {
+            &[SampleIndex(10), SampleIndex(30)]
+        }
+        fn trace(&self, _: SampleIndex, _: u32) -> sorrel_io::TraceSlice<'_> {
+            sorrel_io::TraceSlice {
+                start: SampleIndex(0),
+                n_channels: 0,
+                samples: sorrel_io::TraceSamples::I16(&[]),
+            }
+        }
+        fn initial_labels(&self) -> Vec<u8> {
+            vec![0; 3]
+        }
+    }
+
+    #[test]
+    fn delayed_replacement_never_draws_last_sets_slots_as_the_new_selection() {
+        use std::sync::{mpsc, RwLock};
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            sorrel_data::Journal::open_or_create(&dir.path().join("journal"), 0, 3).unwrap();
+        let session = Arc::new(RwLock::new(Session::new(EmptyTrace, journal)));
+        let ctx = egui::Context::default();
+        let jobs = JobCtx {
+            session: Arc::clone(&session),
+            egui: ctx.clone(),
+        };
+        for selection in [
+            vec![ClusterId(0)],
+            vec![ClusterId(1), ClusterId(0)],
+            vec![ClusterId(1), ClusterId(2)],
+        ] {
+            let old_key = FeatureKey {
+                selection: vec![ClusterId(0), ClusterId(1)],
+                channels: None,
+                keep_order: false,
+                version: 0,
+                cfg: TracePreproc::default(),
+                shanks: vec![],
+                full: false,
+                reorder: false,
+            };
+            let mut st = FeatureViewState::default();
+            let mut brushes = Brushes::default();
+            st.sync_membership(&selection, 0, &mut brushes);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while st
+                .memo
+                .ensure(old_key.clone(), &session, || {}, |_, _| Arc::new(blobs(30)))
+                .is_none()
+            {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            assert!(st.memo.last().is_some());
+            let key = FeatureKey {
+                selection: selection.clone(),
+                ..old_key
+            };
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let (finished_tx, finished_rx) = mpsc::channel();
+            st.memo.ensure(
+                key,
+                &session,
+                || {},
+                move |_, cancel| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    finished_tx.send(cancel.load(Ordering::Relaxed)).unwrap();
+                    Arc::new(one_point_set(true, false))
+                },
+            );
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            st.link.spikes = vec![(ClusterId(0), Arc::from([0, 1]))];
+            st.link.set = vec![0, 1];
+            st.shown = Arc::new(vec![0, 500]);
+            brushes.spikes =
+                SpikeBrush::new(BrushSource::FeatureLasso, 0, [(ClusterId(0), vec![0])]);
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let s = crate::jobs::read(&session);
+                assert!(feature_view(
+                    ui,
+                    &s,
+                    &selection,
+                    &mut st,
+                    &jobs,
+                    TracePreproc::default(),
+                    &[],
+                    false,
+                    &mut brushes,
+                    None,
+                    (0, 100)
+                )
+                .is_none());
+            });
+            assert!(st.shown.is_empty() && st.cells.is_none());
+            assert!(st.link.spikes.is_empty() && st.link.set.is_empty());
+            assert!(brushes.spikes.is_none());
+            // A cancelled worker is not allowed to publish after a later edit.
+            st.cancel();
+            release_tx.send(()).unwrap();
+            assert!(finished_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        let s = crate::jobs::read(&session);
+        let set = blobs(30);
+        assert!(windowed_points(&s, &[ClusterId(0)], &set, &[500], (0, 100)).is_empty());
+    }
+
+    #[test]
+    fn membership_changes_clear_slot_owned_state_before_loading() {
+        let old = vec![ClusterId(7), ClusterId(9)];
+        for (selection, version) in [
+            (vec![ClusterId(7)], 0),
+            (vec![ClusterId(9), ClusterId(7)], 0),
+            (vec![ClusterId(2), ClusterId(3)], 0),
+            (old.clone(), 1),
+            (vec![], 0),
+        ] {
+            let mut st = FeatureViewState {
+                membership: Some((old.clone(), 0)),
+                lasso: Lasso::new(1, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]),
+                split_requested: true,
+                want_full: true,
+                preview: Some((ClusterId(7), [0, 1].into_iter().collect())),
+                zoom: 2.0,
+                pan_px: egui::vec2(20.0, -12.0),
+                ..Default::default()
+            };
+            st.link.spikes = vec![(ClusterId(7), Arc::from([0, 1]))];
+            st.link.set = vec![0, 1];
+            st.km.auto_run = true;
+            assert_eq!(st.link_for(&old, 0).set.len(), 2);
+            assert!(st.link_for(&selection, version).set.is_empty());
+            st.hover_out = Some(HoverSpike {
+                cluster: ClusterId(9),
+                local: 0,
+                sample: 10,
+            });
+            st.seek = Some(10);
+            st.shown = Arc::new(vec![0, 1]);
+            let mut brushes = Brushes {
+                spikes: SpikeBrush::new(BrushSource::FeatureLasso, 0, [(ClusterId(7), vec![0, 1])]),
+                ..Default::default()
+            };
+            st.sync_membership(&selection, version, &mut brushes);
+            assert!(!st.lasso_active() && !st.want_full);
+            assert!(st.preview.is_none() && st.hits.is_none() && st.shown.is_empty());
+            assert!(st.link.spikes.is_empty() && st.link.set.is_empty());
+            assert!(st.hover_out.is_none() && st.seek.is_none());
+            assert!(brushes.spikes.is_none());
+            assert!(
+                st.km.auto_run,
+                "selection changes preserve automatic fitting"
+            );
+            assert_eq!((st.zoom, st.pan_px), (2.0, egui::vec2(20.0, -12.0)));
+        }
+    }
+
+    #[test]
+    fn loading_full_features_keeps_a_compatible_pending_lasso_and_external_brush() {
+        let mut st = FeatureViewState {
+            membership: Some((vec![ClusterId(7)], 0)),
+            lasso: Lasso::new(1, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]),
+            split_requested: true,
+            want_full: true,
+            ..Default::default()
+        };
+        let mut brushes = Brushes {
+            spikes: SpikeBrush::new(BrushSource::IsiViolators, 0, [(ClusterId(7), vec![1])]),
+            ..Default::default()
+        };
+        st.sync_membership(&[ClusterId(7)], 0, &mut brushes);
+        st.clear_loaded_outputs(&mut brushes);
+        assert!(st.lasso.is_closed() && st.split_requested && st.want_full);
+        assert_eq!(
+            brushes.spikes.as_ref().unwrap().source,
+            BrushSource::IsiViolators
+        );
+    }
+
+    #[test]
+    fn lasso_hit_cache_tracks_selection_order_and_ignores_invalid_slots() {
+        let set = blobs(30);
+        let mut st = FeatureViewState {
+            lasso: Lasso::new(1, vec![[4.0, 4.0], [6.0, 4.0], [6.0, 6.0], [4.0, 6.0]]),
+            ..Default::default()
+        };
+        let both = lasso_hits_cached(&mut st, &set, &[ClusterId(7), ClusterId(9)])
+            .all
+            .clone();
+        assert_eq!(
+            both.iter().map(|(c, v)| (*c, v.len())).collect::<Vec<_>>(),
+            [(ClusterId(7), 100), (ClusterId(9), 30)]
+        );
+        let reordered = lasso_hits_cached(&mut st, &set, &[ClusterId(9), ClusterId(7)])
+            .all
+            .clone();
+        assert_eq!(reordered[0].0, ClusterId(9));
+        assert_eq!(reordered[1].0, ClusterId(7));
+        let single = lasso_hits_cached(&mut st, &set, &[ClusterId(7)])
+            .all
+            .clone();
+        assert_eq!(single, vec![(ClusterId(7), (400..500).collect())]);
+        assert_eq!(lasso_hits(&set, &st.lasso, &[ClusterId(7)]), single);
+    }
+
     #[test]
     fn lasso_is_dropped_when_the_feature_key_changes() {
         let key = FeatureKey {
@@ -4080,6 +4824,65 @@ mod tests {
         let (lo, hi) = robust_range(v.into_iter());
         assert!(lo < 5.0 && hi > 990.0 && hi < 1100.0, "{lo} {hi}");
         assert_eq!(robust_range(std::iter::empty()), (-1.0, 1.0));
+    }
+
+    fn sorted_range(vals: impl Iterator<Item = f32>) -> (f32, f32) {
+        let mut v: Vec<_> = vals.filter(|v| v.is_finite()).collect();
+        if v.is_empty() {
+            return (-1.0, 1.0);
+        }
+        v.sort_unstable_by(f32::total_cmp);
+        let at = |q: f32| v[((v.len() - 1) as f32 * q).round() as usize];
+        let (lo, hi) = (at(0.005), at(0.995));
+        let pad = ((hi - lo) * 0.05).max(1e-6);
+        (lo - pad, hi + pad)
+    }
+
+    #[test]
+    fn selected_percentiles_are_exactly_the_same_as_full_sorting() {
+        let mut seed = 0x5eed_u32;
+        for n in [0, 1, 2, 3, 99, 100, 101, 1000, 10_000] {
+            let mut values: Vec<_> = (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    (seed as i32 % 1111) as f32
+                })
+                .collect();
+            values.extend([f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.0, 0.0]);
+            for _ in 0..2 {
+                assert_eq!(
+                    robust_range(values.iter().copied()),
+                    sorted_range(values.iter().copied())
+                );
+                values.reverse();
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "million-row exact-percentile benchmark"]
+    fn benchmark_million_row_percentiles() {
+        let mut seed = 0x5eed_u32;
+        let values: Vec<_> = (0..1_000_000)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as i32 as f32 / 1000.0
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let sorted = sorted_range(values.iter().copied());
+        let sorting = start.elapsed();
+        let start = std::time::Instant::now();
+        let selected = robust_range(values.iter().copied());
+        eprintln!(
+            "1m exact percentiles: sort {sorting:?}, selection {:?}",
+            start.elapsed()
+        );
+        assert_eq!(selected, sorted);
     }
 
     #[test]
@@ -4282,6 +5085,47 @@ mod tests {
     }
 
     #[test]
+    fn k_finishes_the_current_polygon_instead_of_cutting_the_frozen_preview() {
+        let set = two_blobs();
+        let selection = [ClusterId(7)];
+        let mut state = FeatureViewState {
+            lasso: Lasso::new(1, vec![[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]]),
+            ..Default::default()
+        };
+        state.settle_lasso();
+        assert_eq!(lasso_hits_cached(&mut state, &set, &selection).n, 400);
+        state.lasso.points = vec![[4.0, 4.0], [6.0, 4.0], [6.0, 6.0], [4.0, 6.0]];
+        state.lasso.set_test_drafting(true);
+        assert_eq!(
+            lasso_hits_cached(&mut state, &set, &selection).n,
+            400,
+            "preview stays frozen"
+        );
+        state.request_split();
+        assert!(!state.lasso.is_drafting());
+        assert!(state.split_requested);
+        assert!(
+            take_ready_split(
+                &mut state,
+                &set,
+                (set.generation, selection[0], None),
+                &selection
+            )
+            .is_none(),
+            "never cut the old preview while the new membership is pending"
+        );
+        lasso_hits_cached(&mut state, &set, &selection);
+        let split = take_ready_split(
+            &mut state,
+            &set,
+            (set.generation, selection[0], None),
+            &selection,
+        )
+        .unwrap();
+        assert_eq!(split, vec![(selection[0], (400..500).collect())]);
+    }
+
+    #[test]
     fn live_tracking_off_holds_the_hits_until_the_drag_ends() {
         // One spike at (0.5, 0.5) in cell 0's time × PC1 view.
         let points = vec![FeaturePoint {
@@ -4391,6 +5235,12 @@ mod tests {
         );
         assert!(b.spikes.is_none(), "the sample is not the lassoed set");
         let full = one_point_set(true, true);
+        sync_brush(&mut st, &full, &[ClusterId(7)], 2, &mut b);
+        assert!(
+            b.spikes.is_none(),
+            "wait for exact membership, not an empty partial brush"
+        );
+        lasso_hits_cached(&mut st, &full, &[ClusterId(7)]);
         sync_brush(&mut st, &full, &[ClusterId(7)], 2, &mut b);
         let brush = b.spikes.as_ref().expect("published from the full set");
         assert_eq!(brush.of(ClusterId(7)), &[3]);
@@ -4773,30 +5623,60 @@ mod tests {
     }
 
     #[test]
-    fn wheel_zoom_is_centred_and_the_projection_box_keeps_its_size() {
+    fn wheel_zoom_scales_the_whole_matrix_without_changing_data_or_lasso() {
         let set = two_blobs();
-        let mut st = FeatureViewState::default();
-        for dim in [
+        let mut st = FeatureViewState {
+            pan_px: egui::vec2(30.0, -15.0),
+            lasso: Lasso::new(0, vec![[0.1, 0.2], [0.8, 0.2], [0.8, 0.9]]),
+            ..Default::default()
+        };
+        let dims = [
             Dim::Time,
             Dim::Pc { ch: 0, pc: 0 },
             Dim::Pc { ch: 1, pc: 1 },
-        ] {
-            let (lo, hi) = axis_range(&set, &st, dim, 0);
-            let centre = (lo + hi) / 2.0;
-            st.zoom = 2.0;
-            let (zlo, zhi) = axis_range(&set, &st, dim, 0);
-            assert!(((zlo + zhi) / 2.0 - centre).abs() < 1e-5, "{dim:?}");
-            assert!(
-                ((zhi - zlo) - (hi - lo) / 2.0).abs() < 1e-5,
-                "zoom shrinks the data range, not the box"
-            );
-            st.zoom = 1.0;
+        ];
+        let ranges = dims.map(|dim| axis_range(&set, &st, dim, 0));
+        let polygon = st.lasso.points.clone();
+        let base = egui::pos2(40.0, 60.0);
+        let pointer = egui::pos2(200.0, 180.0);
+        let geo = grid_geometry(egui::vec2(500.0, 600.0));
+        let before = projection_transform(base, &st);
+        let nav = NavInput {
+            zoom: 2.0,
+            canvas_origin: base,
+            zoom_anchor: Some(pointer),
+            ..Default::default()
+        };
+        assert!(nav.finish(&mut st));
+        let after = projection_transform(base, &st);
+        for cell in 0..16 {
+            let (strip, plot) = cell_rects(cell_origin(base, geo, cell), geo.side);
+            for rect in [strip, plot] {
+                let (old, new) = (before * rect, after * rect);
+                assert!((new.size() - old.size() * 2.0).length() < 1e-3);
+                for (was, now) in [(old.min, new.min), (old.max, new.max)] {
+                    assert!(
+                        (now - (pointer + (was - pointer) * 2.0)).length() < 1e-3,
+                        "every square, label and gap follows one image transform"
+                    );
+                }
+            }
         }
-        // The rects depend only on the layout origin and side, never on zoom.
-        let origin = egui::pos2(17.0, 23.0);
-        let before = cell_rects(origin, 72.0);
-        st.zoom = 7.0;
-        assert_eq!(before, cell_rects(origin, 72.0));
+        assert_eq!(ranges, dims.map(|dim| axis_range(&set, &st, dim, 0)));
+        assert_eq!(st.lasso.points, polygon);
+        assert_eq!((st.scaling, st.marker), (1.0, 2.5));
+
+        // Zooming back out around the same image point restores the canvas.
+        let nav = NavInput {
+            zoom: 0.5,
+            canvas_origin: base,
+            zoom_anchor: Some(pointer),
+            ..Default::default()
+        };
+        nav.finish(&mut st);
+        assert_eq!(st.zoom, 1.0);
+        assert!((st.pan_px - egui::vec2(30.0, -15.0)).length() < 1e-3);
+
         let mut zoomed_out = FeatureViewState::default();
         let nav = NavInput {
             zoom: 0.5,
@@ -4807,6 +5687,53 @@ mod tests {
             zoomed_out.zoom, 0.5,
             "wheel-down can zoom out from the default view"
         );
+    }
+
+    #[test]
+    fn canvas_zoom_limits_do_not_drift_the_pan_at_the_pointer() {
+        for (zoom, factor) in [(20.0, 2.0), (0.1, 0.5)] {
+            let mut st = FeatureViewState {
+                zoom,
+                pan_px: egui::vec2(17.0, -9.0),
+                ..Default::default()
+            };
+            let nav = NavInput {
+                zoom: factor,
+                canvas_origin: egui::pos2(400.0, 100.0),
+                zoom_anchor: Some(egui::pos2(550.0, 250.0)),
+                ..Default::default()
+            };
+            assert!(!nav.finish(&mut st));
+            assert_eq!((st.zoom, st.pan_px), (zoom, egui::vec2(17.0, -9.0)));
+        }
+    }
+
+    #[test]
+    fn clipped_scatter_keeps_points_fixed_in_the_enlarged_projection() {
+        let rect = Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(100.0, 200.0));
+        let clip = Rect::from_min_max(egui::pos2(60.0, 70.0), egui::pos2(160.0, 170.0));
+        let (x, y) = ((0.0, 10.0), (-10.0, 10.0));
+        let ScatterViewport {
+            rect: visible,
+            x: gx,
+            y: gy,
+        } = scatter_viewport(rect, clip, x, y).unwrap();
+        assert_eq!(visible, rect.intersect(clip));
+        assert_eq!((gx, gy), ((5.0, 10.0), (-5.0, 5.0)));
+        let map = |r: Rect, x: (f32, f32), y: (f32, f32), p: [f32; 2]| {
+            egui::pos2(
+                r.left() + (p[0] - x.0) / (x.1 - x.0) * r.width(),
+                r.bottom() - (p[1] - y.0) / (y.1 - y.0) * r.height(),
+            )
+        };
+        for point in [[5.0, -5.0], [7.5, 0.0], [10.0, 5.0]] {
+            assert_eq!(map(rect, x, y, point), map(visible, gx, gy, point));
+        }
+        assert_eq!(
+            scatter_viewport(rect, Rect::EVERYTHING, x, y),
+            Some(ScatterViewport { rect, x, y })
+        );
+        assert!(scatter_viewport(rect, rect.translate(egui::vec2(500.0, 0.0)), x, y).is_none());
     }
 
     #[test]
@@ -4833,7 +5760,7 @@ mod tests {
         assert_eq!(st.pan_px, delta);
         for cell in 0..GRID.len() * GRID[0].len() {
             let origin = base + egui::vec2((cell % 4) as f32 * 80.0, (cell / 4) as f32 * 95.0);
-            assert_eq!(projection_origin(origin, &st), origin + delta);
+            assert_eq!(projection_transform(base, &st) * origin, origin + delta);
         }
         let after: Vec<_> = [
             Dim::Time,
@@ -4892,7 +5819,7 @@ mod tests {
         let mut nav = NavInput::default();
         nav.wheel(20.0, 1.0, false);
         nav.finish(&mut st);
-        assert!(st.zoom > 1.0, "plain wheel zooms the content");
+        assert!(st.zoom > 1.0, "plain wheel magnifies the whole matrix");
         assert!((st.marker - marker * (20.0f32 * 0.002).exp()).abs() < 1e-5);
     }
 
@@ -4932,7 +5859,7 @@ mod tests {
             plot,
             Rect::from_min_size(origin + egui::vec2(0.0, LABEL_H), Vec2::splat(80.0))
         );
-        assert_eq!(projection_origin(origin, &st), origin);
+        assert_eq!(projection_transform(origin, &st) * origin, origin);
     }
 
     fn nav_pointer(pos: Pos2, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
@@ -4963,7 +5890,12 @@ mod tests {
         };
         let mut claimed = false;
         let _ = ctx.run_ui(input, |ui| {
-            let resp = ui.interact(rect, ui.id().with("nav-test-cell"), Sense::click_and_drag());
+            let id = ui.id().with("nav-test-cell");
+            if !ui.clip_rect().intersects(rect) {
+                continue_offscreen_drag(ui, nav, id, ui.clip_rect(), lasso.is_editing());
+                return;
+            }
+            let resp = ui.interact(rect, id, Sense::click_and_drag());
             let ev = lasso.interact(0, &resp, |p| [p.x, p.y], |p| p.into());
             claimed = ev.consumed;
             nav.drag(&resp, modifiers, !ev.consumed);
@@ -5070,6 +6002,57 @@ mod tests {
         assert_eq!(st.pan_px, nav.pan);
         assert_eq!(axis_range(&set, &st, Dim::Pc { ch: 0, pc: 0 }, 0), before);
         assert_eq!(lasso.points, polygon, "the polygon stays in data space");
+    }
+
+    #[test]
+    fn canvas_drag_continues_when_its_owning_square_moves_out_of_view() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(200.0, 160.0));
+        let mut lasso = Lasso::default();
+        let mut nav = NavInput::default();
+        let start = egui::pos2(150.0, 140.0);
+        nav_frame(
+            &ctx,
+            &mut nav,
+            &mut lasso,
+            rect,
+            egui::Modifiers::NONE,
+            vec![],
+        );
+        nav_frame(
+            &ctx,
+            &mut nav,
+            &mut lasso,
+            rect,
+            egui::Modifiers::NONE,
+            vec![
+                egui::Event::PointerMoved(start),
+                nav_pointer(start, true, egui::Modifiers::NONE),
+            ],
+        );
+        nav_frame(
+            &ctx,
+            &mut nav,
+            &mut lasso,
+            rect,
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(start + egui::vec2(30.0, 10.0))],
+        );
+        assert_eq!(nav.pan, egui::vec2(30.0, 10.0));
+        let offscreen = rect.translate(egui::vec2(600.0, 0.0));
+        nav_frame(
+            &ctx,
+            &mut nav,
+            &mut lasso,
+            offscreen,
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(start + egui::vec2(10.0, 5.0))],
+        );
+        assert_eq!(
+            nav.pan,
+            egui::vec2(10.0, 5.0),
+            "the held drag can bring the grid back"
+        );
     }
 
     #[test]

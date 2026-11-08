@@ -60,13 +60,25 @@ or with missing raw data may not have a complete waveform.
 | **Scatter**       | phy v2.1's ClusterScatterView: one point per cluster, x / y / size from amp, depth, fr, n_spikes or ch; click selects, Shift-click adds, Ctrl-click lasso selects.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | **PSTH**          | Event-aligned firing rate per selected cluster plus a per-trial raster of the first one. Needs `events.csv` (`time,label`, seconds) or `events.npy` next to the dataset, an NWB file's `/intervals/trials` table, or `--events FILE`; pick the label, pre/post window and bins in the toolbar.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
-**Feature navigation.** Plain drag moves the projection windows together;
-the wheel zooms each projection's contents around its centre, without
-resizing the windows or panning the points inside one window. Ctrl-wheel
-retains PC-feature scaling and Alt-wheel changes marker size. These gestures
-do not change the default layout, channel set or lasso membership. Esc
-abandons the lasso and a pending cut, clearing its linked spike highlights
-without changing the clusters; Undo reverses a completed split.
+**Feature navigation.** Plain drag pans the whole 4×4 projection grid, and
+the wheel zooms it like a single image around the pointer: the projection
+squares, the gaps between them and their captions scale together. A modest
+zoom enlarges the visible projections so they can be inspected, and panning
+brings an enlarged square fully into view. Double-click resets the zoom and
+pan so all sixteen projections fit the pane again. Ctrl-wheel still scales
+PC features and Alt-wheel changes marker size. Plain-wheel zoom and drag do
+not change axis ranges, the lasso polygon, spike brush or cluster data, or
+relayout the pane, reset the channel set or change the default grid; the
+toolbar and alternatives strip stay fixed. Esc abandons the lasso and a
+pending cut, clearing its linked spike highlights without changing the
+clusters; Undo reverses a completed split.
+
+**Lasso tracking.** With **live tracking** unchecked (the default), a Ctrl-click
+polygon stays a draft between clicks: only its outline changes, not the spike
+selection or linked previews. Release Ctrl to finish it, then press `K` to cut;
+`K` also finishes the current valid polygon directly. Node drags settle on
+mouse-up. Large hit-tests and highlight-buffer builds run off the UI thread,
+and a cut does not wait for a preview to finish. `Esc` cancels without editing.
 
 **Cross-talk** (Sorrel extra). The views share four kinds of state, so a pick in one shows in all the others:
 

@@ -222,7 +222,7 @@ pub fn actions(ctx: &Context, scope: Scope) -> Vec<Action> {
     if rt.open || (rt.modal && scope != Scope::Submit && scope != Scope::Recording) {
         return vec![];
     }
-    let typing = ctx.egui_wants_keyboard_input();
+    let typing = text_input_active(ctx);
     let mut actions = ctx.input(|i| rt.keymap.actions(&i.events, scope, typing));
     if rt.modal && scope == Scope::Recording {
         actions.retain(|a| *a == Action::Intent(crate::intent::Intent::Cancel));
@@ -358,6 +358,51 @@ pub fn capture_input(ctx: &Context) {
         }
         consume_keyboard(ctx);
     }
+}
+
+/// Remote-desktop clients and on-screen keyboards can inject letters as
+/// Windows `VK_PACKET`: winit then reports no key, only the text, so `K`,
+/// `G` and every other single-key shortcut never fire. Recover the key press
+/// from a lone letter or digit that arrived without one. Text editors keep
+/// the text only.
+pub fn recover_packet_keys(ctx: &Context) {
+    if text_input_active(ctx) {
+        return;
+    }
+    ctx.input_mut(|i| {
+        let modifiers = i.modifiers;
+        let mut events = Vec::with_capacity(i.events.len());
+        for event in std::mem::take(&mut i.events) {
+            if let Event::Text(text) = &event {
+                if let Some(key) = packet_key(text).filter(|&key| {
+                    !events
+                        .iter()
+                        .any(|e| matches!(e, Event::Key { key: k, pressed: true, .. } if *k == key))
+                }) {
+                    for pressed in [true, false] {
+                        events.push(Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed,
+                            repeat: false,
+                            modifiers,
+                        });
+                    }
+                }
+            }
+            events.push(event);
+        }
+        i.events = events;
+    });
+}
+
+fn packet_key(text: &str) -> Option<egui::Key> {
+    let mut chars = text.chars();
+    let c = chars.next().filter(char::is_ascii_alphanumeric)?;
+    if chars.next().is_some() {
+        return None;
+    }
+    egui::Key::from_name(c.encode_utf8(&mut [0; 4]))
 }
 
 fn consume_keyboard(ctx: &Context) {
@@ -499,6 +544,52 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         }
+    }
+
+    #[test]
+    fn focused_buttons_do_not_suppress_keys_but_text_editing_does() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = egui_kittest::Harness::new_ui(|ui| {
+            let _ = ui.button("table row");
+            let mut text = String::new();
+            ui.add(egui::TextEdit::singleline(&mut text).hint_text("filter"));
+        });
+        h.get_by_label("table row").focus();
+        h.run_ok();
+        assert!(h.ctx.egui_wants_keyboard_input());
+        assert!(!text_input_active(&h.ctx));
+        let _ = h.ctx.run_ui(
+            egui::RawInput {
+                events: vec![key(egui::Key::G), key(egui::Key::M)],
+                ..Default::default()
+            },
+            |ui| {
+                assert_eq!(
+                    actions(ui.ctx(), Scope::Recording),
+                    [Action::Intent(crate::intent::Intent::MergeSelection)]
+                );
+                assert_eq!(
+                    actions(ui.ctx(), Scope::Waveforms),
+                    [Action::Waveform(crate::shortcuts::WaveformAction::Mean)]
+                );
+                let _ = ui.button("table row");
+            },
+        );
+
+        h.run_ok();
+        h.get_by_role(egui::accesskit::Role::TextInput).focus();
+        h.run_ok();
+        assert!(text_input_active(&h.ctx));
+        let _ = h.ctx.run_ui(
+            egui::RawInput {
+                events: vec![key(egui::Key::G), key(egui::Key::M)],
+                ..Default::default()
+            },
+            |ui| {
+                assert!(actions(ui.ctx(), Scope::Recording).is_empty());
+                assert!(actions(ui.ctx(), Scope::Waveforms).is_empty());
+            },
+        );
     }
 
     #[test]

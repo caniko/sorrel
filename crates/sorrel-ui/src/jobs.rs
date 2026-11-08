@@ -2,10 +2,12 @@
 //! thread, hand the result back to the UI thread, and drop it if the
 //! inputs it was computed for are no longer what the UI wants.
 //!
-//! The session lives behind an `Arc<RwLock<_>>`. Workers hold a read lock
+//! The session lives behind an `Arc<RwLock<_>>`. Session jobs hold a read lock
 //! for the duration of one job; a curation command takes the write lock
 //! and therefore waits for in-flight jobs — the UI cancels them first and
 //! jobs poll the cancel flag between steps, so that wait stays short.
+//! Geometry/hit-test/render previews use `spawn_owned` / `ensure_owned` over
+//! immutable snapshots instead, so they never hold this lock during curation.
 //!
 //! ponytail: a job that ignores the flag inside a long sorrel-data call
 //! (`rank_merge_candidates` on 1k+ clusters) can still hold the write
@@ -48,6 +50,31 @@ pub struct Job<K, T> {
 }
 
 impl<K, T> Job<K, T> {
+    /// Work on an owned immutable snapshot, without holding the session's
+    /// read lock. Preview work must never delay a curation write.
+    pub fn spawn_owned<F>(key: K, repaint: impl Fn() + Send + 'static, f: F) -> Self
+    where
+        T: Send + 'static,
+        F: FnOnce(&AtomicBool) -> T + Send + 'static,
+    {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = channel();
+        let flag = Arc::clone(&cancel);
+        std::thread::Builder::new()
+            .name("sorrel-preview".into())
+            .spawn(move || {
+                if flag.load(Ordering::Relaxed) {
+                    return;
+                }
+                let out = f(&flag);
+                if !flag.load(Ordering::Relaxed) && tx.send(out).is_ok() {
+                    repaint();
+                }
+            })
+            .expect("spawn sorrel preview thread");
+        Self { key, rx, cancel }
+    }
+
     /// Spawn `f` on a worker thread holding a read lock on `session`.
     /// `repaint` is called when the result is ready so an idle UI wakes up.
     pub fn spawn<S, F>(
@@ -117,6 +144,33 @@ impl<K, T> Default for Memo<K, T> {
 }
 
 impl<K: PartialEq + Clone, T> Memo<K, T> {
+    /// As `ensure`, but the closure owns its inputs and takes no session lock.
+    pub fn ensure_owned<F>(
+        &mut self,
+        key: K,
+        repaint: impl Fn() + Send + 'static,
+        f: F,
+    ) -> Option<&T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&AtomicBool) -> T + Send + 'static,
+    {
+        if let Some(job) = &self.job {
+            if let Some(value) = job.try_take() {
+                self.value = Some((job.key().clone(), value));
+                self.job = None;
+            }
+        }
+        if self.value.as_ref().is_some_and(|(k, _)| *k == key) {
+            self.job = None;
+            return self.value.as_ref().map(|(_, value)| value);
+        }
+        if !matches!(&self.job, Some(job) if *job.key() == key) {
+            self.job = Some(Job::spawn_owned(key, repaint, f));
+        }
+        None
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -231,6 +285,36 @@ mod tests {
             memo.last().is_none(),
             "the abandoned cut result stays discarded"
         );
+    }
+
+    #[test]
+    fn owned_preview_does_not_hold_the_session_and_cannot_publish_after_cancel() {
+        let session = Arc::new(RwLock::new(10u32));
+        let snapshot = *read(&session);
+        let mut memo: Memo<u32, u32> = Memo::new();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        memo.ensure_owned(
+            1,
+            || {},
+            move |cancel| {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                finished_tx.send(cancel.load(Ordering::Relaxed)).unwrap();
+                snapshot
+            },
+        );
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        *session
+            .try_write()
+            .expect("preview must not lock out curation") = 20;
+        memo.cancel();
+        release_tx.send(()).unwrap();
+        assert!(finished_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert!(memo.last().is_none());
+        wait_until(|| memo.ensure_owned(2, || {}, |_| 20).is_some());
+        assert_eq!(memo.last(), Some(&20));
     }
 
     #[test]
