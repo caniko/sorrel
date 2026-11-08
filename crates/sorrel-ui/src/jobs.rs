@@ -205,6 +205,35 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_finishing_after_cancel_cannot_publish_its_old_result() {
+        let session = Arc::new(RwLock::new(()));
+        let mut memo: Memo<u32, u32> = Memo::new();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        memo.ensure(
+            1,
+            &session,
+            || {},
+            move |_, cancel| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                finished_tx.send(cancel.load(Ordering::Relaxed)).unwrap();
+                42
+            },
+        );
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        memo.cancel();
+        release_tx.send(()).unwrap();
+        assert!(finished_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert!(!memo.pending());
+        assert!(
+            memo.last().is_none(),
+            "the abandoned cut result stays discarded"
+        );
+    }
+
+    #[test]
     fn cancel_unblocks_the_writer_and_drops_the_result() {
         let session = Arc::new(RwLock::new(0u32));
         let mut memo: Memo<u32, u32> = Memo::new();

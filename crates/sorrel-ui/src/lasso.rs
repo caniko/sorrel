@@ -63,11 +63,22 @@ impl Lasso {
     }
 
     pub fn is_active(&self) -> bool {
-        !self.points.is_empty()
+        !self.points.is_empty() || self.is_editing()
+    }
+
+    /// A freehand stroke or node drag is in progress: the polygon is still
+    /// moving, so callers may hold their computed outputs until it settles.
+    pub fn is_editing(&self) -> bool {
+        self.drag.is_some() || !self.stroke.is_empty()
     }
 
     pub fn clear(&mut self) {
         *self = Self::default();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_editing(&mut self, editing: bool) {
+        self.drag = editing.then_some(0);
     }
 
     /// Delete node `i`; a polygon never drops below three nodes.
@@ -96,7 +107,13 @@ impl Lasso {
 
         // Ctrl+drag: record, draw live, close on release.
         if m.command && resp.drag_started_by(Primary) {
+            self.cell = cell;
             self.stroke = press.into_iter().collect();
+        }
+        // A shared lasso is visited by every projection each frame. Only
+        // the projection where the gesture began may extend or finish it.
+        if self.is_editing() && self.cell != cell {
+            return ev;
         }
         if !self.stroke.is_empty() && resp.dragged_by(Primary) {
             self.stroke.extend(at);
@@ -126,6 +143,9 @@ impl Lasso {
                     ev.changed = true;
                     ev.drawn = true;
                 }
+                // The closed polygon (and the hits computed from it) is
+                // painted next frame, after the stroke's last frame was drawn.
+                resp.ctx.request_repaint();
             }
             return ev;
         }
@@ -166,6 +186,9 @@ impl Lasso {
                 }
                 if resp.drag_stopped() {
                     self.drag = None;
+                    // With live tracking off the hits settle after this
+                    // frame; ask for the one that draws them.
+                    resp.ctx.request_repaint();
                 }
             } else if let Some(p) = at {
                 let on_node = nearest_node(&pts, p, NODE_HIT);
@@ -329,6 +352,99 @@ pub fn point_in_polygon(p: [f32; 2], poly: &[[f32; 2]]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame(ctx: &egui::Context, lasso: &mut Lasso, events: Vec<egui::Event>) -> [LassoEvent; 2] {
+        let mut result = [LassoEvent::default(); 2];
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                Pos2::ZERO,
+                egui::vec2(260.0, 160.0),
+            )),
+            modifiers: egui::Modifiers::COMMAND,
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            for (cell, event) in result.iter_mut().enumerate() {
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(10.0 + cell as f32 * 120.0, 10.0),
+                    egui::Vec2::splat(100.0),
+                );
+                let response = ui.interact(rect, ui.id().with(cell), egui::Sense::click_and_drag());
+                *event = lasso.interact(cell, &response, |p| [p.x, p.y], |p| p.into());
+            }
+        });
+        result
+    }
+
+    fn pointer_button(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::COMMAND,
+        }
+    }
+
+    #[test]
+    fn an_unfinished_freehand_stroke_is_active_and_belongs_to_its_projection() {
+        let ctx = egui::Context::default();
+        let mut lasso = Lasso::default();
+        frame(&ctx, &mut lasso, vec![]);
+        let start = egui::pos2(150.0, 30.0);
+        frame(
+            &ctx,
+            &mut lasso,
+            vec![
+                egui::Event::PointerMoved(start),
+                pointer_button(start, true),
+            ],
+        );
+        let events = frame(
+            &ctx,
+            &mut lasso,
+            vec![egui::Event::PointerMoved(egui::pos2(200.0, 30.0))],
+        );
+        assert!(
+            lasso.is_active(),
+            "Esc must see a stroke before it has vertices"
+        );
+        assert!(lasso.is_editing());
+        assert_eq!(lasso.cell, 1);
+        assert!(
+            !events[0].consumed,
+            "the sibling projection does not own this stroke"
+        );
+        assert!(events[1].consumed);
+    }
+
+    #[test]
+    fn clearing_a_freehand_stroke_does_not_recreate_it_when_the_mouse_is_released() {
+        let ctx = egui::Context::default();
+        let mut lasso = Lasso::default();
+        frame(&ctx, &mut lasso, vec![]);
+        let start = egui::pos2(30.0, 30.0);
+        frame(
+            &ctx,
+            &mut lasso,
+            vec![
+                egui::Event::PointerMoved(start),
+                pointer_button(start, true),
+            ],
+        );
+        for p in [egui::pos2(90.0, 30.0), egui::pos2(90.0, 90.0)] {
+            frame(&ctx, &mut lasso, vec![egui::Event::PointerMoved(p)]);
+        }
+        assert!(lasso.is_active());
+        lasso.clear();
+        let end = egui::pos2(30.0, 90.0);
+        frame(&ctx, &mut lasso, vec![egui::Event::PointerMoved(end)]);
+        frame(&ctx, &mut lasso, vec![pointer_button(end, false)]);
+        assert!(!lasso.is_active());
+        assert!(!lasso.is_editing());
+        assert!(lasso.points.is_empty());
+        assert!(lasso.stroke.is_empty());
+    }
 
     #[test]
     fn concave_polygon_in_and_out() {

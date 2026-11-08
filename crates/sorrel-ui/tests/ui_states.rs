@@ -74,12 +74,12 @@ impl Rng {
 /// A two-column, 20 µm pitch probe with `n_clusters` units: biphasic
 /// templates centred on a peak channel, refractory spike trains, PCs that
 /// separate by unit, and a raw recording with the spikes added to noise.
-fn write_fixture(root: &Path, n_clusters: usize) {
+fn write_fixture(root: &Path, n_clusters: usize, n_channels: usize) {
     let mut rng = Rng(0x5eed_0f50_11e1);
-    let positions: Vec<f32> = (0..N_CHANNELS)
+    let positions: Vec<f32> = (0..n_channels)
         .flat_map(|c| [(c % 2) as f32 * 32.0, (c / 2) as f32 * 20.0])
         .collect();
-    let peak = |u: usize| (u * 5 + 3) % N_CHANNELS;
+    let peak = |u: usize| (u * 5 + 3) % n_channels;
     let falloff = |u: usize, ch: usize| {
         let (pu, pc) = (peak(u), ch);
         let dx = positions[2 * pu] - positions[2 * pc];
@@ -87,14 +87,14 @@ fn write_fixture(root: &Path, n_clusters: usize) {
         (-(dx * dx + dy * dy) / (2.0 * 30.0f32.powi(2))).exp()
     };
 
-    let mut templates = vec![0f32; n_clusters * N_T * N_CHANNELS];
+    let mut templates = vec![0f32; n_clusters * N_T * n_channels];
     for u in 0..n_clusters {
         let width = 3.0 + (u % 4) as f32;
         for t in 0..N_T {
             let x = (t as f32 - 20.0) / width;
             let shape = -(-x * x).exp() + 0.35 * (-(x - 2.5).powi(2) / 2.0).exp();
-            for ch in 0..N_CHANNELS {
-                templates[(u * N_T + t) * N_CHANNELS + ch] = shape * falloff(u, ch);
+            for ch in 0..n_channels {
+                templates[(u * N_T + t) * n_channels + ch] = shape * falloff(u, ch);
             }
         }
     }
@@ -118,7 +118,7 @@ fn write_fixture(root: &Path, n_clusters: usize) {
     spikes.sort_by_key(|s| s.0);
     let n = spikes.len();
 
-    let mut raw = vec![0f32; N_SAMPLES * N_CHANNELS];
+    let mut raw = vec![0f32; N_SAMPLES * n_channels];
     for v in raw.iter_mut() {
         *v = (rng.next() - 0.5) * 24.0;
     }
@@ -126,9 +126,9 @@ fn write_fixture(root: &Path, n_clusters: usize) {
     for (i, &(t, u, amp)) in spikes.iter().enumerate() {
         let u = u as usize;
         for dt in 0..N_T {
-            for ch in 0..N_CHANNELS {
-                raw[(t as usize + dt - 20) * N_CHANNELS + ch] +=
-                    amp * 3.0 * templates[(u * N_T + dt) * N_CHANNELS + ch];
+            for ch in 0..n_channels {
+                raw[(t as usize + dt - 20) * n_channels + ch] +=
+                    amp * 3.0 * templates[(u * N_T + dt) * n_channels + ch];
             }
         }
         let (cx, cy) = ((u as f32 * 2.4).cos(), (u as f32 * 2.4).sin());
@@ -153,22 +153,22 @@ fn write_fixture(root: &Path, n_clusters: usize) {
     npy::write_f32_atomic(&root.join("amplitudes.npy"), &[n], &amps).unwrap();
     npy::write_f32_atomic(&root.join("pc_features.npy"), &[n, 3, 4], &pcs).unwrap();
     let pc_ind: Vec<u32> = (0..n_clusters)
-        .flat_map(|u| (0..4).map(move |k| ((peak(u) + k) % N_CHANNELS) as u32))
+        .flat_map(|u| (0..4).map(move |k| ((peak(u) + k) % n_channels) as u32))
         .collect();
     npy::write_1d_u32_atomic(
         &root.join("channel_map.npy"),
-        &(0..N_CHANNELS as u32).collect::<Vec<_>>(),
+        &(0..n_channels as u32).collect::<Vec<_>>(),
     )
     .unwrap();
     npy::write_f32_atomic(
         &root.join("channel_positions.npy"),
-        &[N_CHANNELS, 2],
+        &[n_channels, 2],
         &positions,
     )
     .unwrap();
     npy::write_f32_atomic(
         &root.join("templates.npy"),
-        &[n_clusters, N_T, N_CHANNELS],
+        &[n_clusters, N_T, n_channels],
         &templates,
     )
     .unwrap();
@@ -206,7 +206,7 @@ fn write_fixture(root: &Path, n_clusters: usize) {
     std::fs::write(
         root.join("params.py"),
         format!(
-            "dat_path = 'recording.dat'\nn_channels_dat = {N_CHANNELS}\ndtype = 'int16'\n\
+            "dat_path = 'recording.dat'\nn_channels_dat = {n_channels}\ndtype = 'int16'\n\
              offset = 0\nsample_rate = {SAMPLE_RATE:.1}\nhp_filtered = False\n"
         ),
     )
@@ -321,13 +321,17 @@ fn harness_sized(
 /// A fresh dataset at a fixed path per `slot`: the top bar prints the
 /// save directory, so a random tempdir name would break every snapshot.
 fn dataset(slot: &str, n_clusters: usize) -> PathBuf {
+    dataset_channels(slot, n_clusters, N_CHANNELS)
+}
+
+fn dataset_channels(slot: &str, n_clusters: usize, n_channels: usize) -> PathBuf {
     let slot = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("ui_states")
         .join(slot);
     let _ = std::fs::remove_dir_all(&slot);
     let root = slot.join("fixture/synthetic-probe");
     std::fs::create_dir_all(&root).unwrap();
-    write_fixture(&root, n_clusters);
+    write_fixture(&root, n_clusters, n_channels);
     root
 }
 
@@ -1232,6 +1236,192 @@ fn select_two_and_open_features(h: &mut Harness<'static, App>) {
     click_tab(h, "Features");
 }
 
+fn shape_draws_rect(shape: &egui::Shape, rect: egui::Rect) -> bool {
+    match shape {
+        egui::Shape::Rect(r) => {
+            (r.rect.min - rect.min).length() < 0.5 && (r.rect.size() - rect.size()).length() < 0.5
+        }
+        egui::Shape::Vec(shapes) => shapes.iter().any(|s| shape_draws_rect(s, rect)),
+        _ => false,
+    }
+}
+
+fn assert_full_feature_grid(h: &Harness<'static, App>) {
+    let cells: Vec<_> = (0..16)
+        .map(|cell| {
+            h.get_by_label(format!("feature cell {cell}").as_str())
+                .rect()
+        })
+        .collect();
+    assert_eq!(h.query_all_by_label_contains("feature cell ").count(), 16);
+    assert!(h.query_by_label("Navigator").is_none());
+    assert!(h.query_by_label("Navigator + collision").is_none());
+    for (cell, rect) in cells.iter().enumerate() {
+        assert!(
+            rect.width() > 10.0 && rect.height() > 10.0,
+            "cell {cell} is visible"
+        );
+        assert!((rect.size() - cells[0].size()).length() < 0.5);
+        assert!(
+            (rect.left() - cells[cell % 4].left()).abs() < 0.5,
+            "four fixed columns"
+        );
+        assert!(
+            (rect.top() - cells[(cell / 4) * 4].top()).abs() < 0.5,
+            "four fixed rows"
+        );
+        assert!(
+            h.output().shapes.iter().any(|s| {
+                s.clip_rect.contains_rect(rect.shrink(0.5)) && shape_draws_rect(&s.shape, *rect)
+            }),
+            "cell {cell} must really paint in full, not just exist in accessibility or below a scroll clip"
+        );
+    }
+}
+
+/// Optional visual-review output without accepting or changing baselines.
+fn review_image(h: &mut Harness<'static, App>, name: &str) {
+    if let Some(dir) = std::env::var_os("SORREL_UI_REVIEW_DIR") {
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        h.render()
+            .expect("render for review")
+            .save(dir.join(format!("{name}.png")))
+            .unwrap();
+    }
+}
+
+#[test]
+fn tetrode_feature_grid_is_complete_at_narrow_default_wide_and_maximized_sizes() {
+    if no_gpu() {
+        return;
+    }
+    each_theme(|theme, name| {
+        let root = dataset_channels(&format!("tetrode-grid-{name}"), 3, 4);
+        let mut h = harness_with(theme, move || {
+            let (session, positions) = open(&root);
+            let mut app = SorrelApp::new(session, label_str);
+            configure(&mut app, &root, positions);
+            app
+        });
+        settle(&mut h);
+        select_two_and_open_features(&mut h);
+        for size in [[1000.0, 700.0], SIZE, [2200.0, 1100.0]] {
+            h.set_size(egui::vec2(size[0], size[1]));
+            settle(&mut h);
+            assert_full_feature_grid(&h);
+            review_image(&mut h, &format!("tetrode-grid-{}-{name}", size[0]));
+        }
+        group_button(&h, "maximize pane", 1).click();
+        settle(&mut h);
+        assert_full_feature_grid(&h);
+        review_image(&mut h, &format!("tetrode-grid-maximized-{name}"));
+        h
+    });
+}
+
+#[test]
+fn tetrode_waveforms_keep_one_four_channel_set_across_clusters_and_modes() {
+    if no_gpu() {
+        return;
+    }
+    let mut results = SnapshotResults::new();
+    for n_channels in [4, 16] {
+        for geometry in [true, false] {
+            for (theme, name) in [(egui::Theme::Dark, "dark"), (egui::Theme::Light, "light")] {
+                let root = dataset_channels(
+                    &format!("tetrode-waveforms-{n_channels}-{geometry}-{name}"),
+                    3,
+                    n_channels,
+                );
+                if !geometry {
+                    std::fs::remove_file(root.join("channel_positions.npy")).unwrap();
+                }
+                let mut h = harness_with(theme, move || {
+                    let (session, positions) = open(&root);
+                    let mut app = SorrelApp::new(session, label_str);
+                    configure(&mut app, &root, positions);
+                    app
+                });
+                settle(&mut h);
+                h.get_all_by_label("0")
+                    .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+                    .expect("primary cluster 0 row")
+                    .click();
+                settle(&mut h);
+                click_tab(&mut h, "Waveforms");
+                let channel_ids = |h: &Harness<'static, App>| -> Vec<usize> {
+                    (0..n_channels)
+                        .filter(|ch| {
+                            h.query_by_label(format!("waveform channel {ch}").as_str())
+                                .is_some()
+                        })
+                        .collect()
+                };
+                let initial = channel_ids(&h);
+                assert_eq!(
+                    initial.len(),
+                    4,
+                    "four channels total, not a peak-only fallback"
+                );
+                if n_channels == 4 {
+                    assert_eq!(initial, [0, 1, 2, 3]);
+                    h.set_size(egui::vec2(1000.0, 700.0));
+                    settle(&mut h);
+                    for ch in &initial {
+                        let rect = h
+                            .get_by_label(format!("waveform channel {ch}").as_str())
+                            .rect();
+                        assert!(
+                            h.output().shapes.iter().any(|s| {
+                                s.clip_rect.contains_rect(rect.shrink(0.5))
+                                    && shape_draws_rect(&s.shape, rect)
+                            }),
+                            "all four waveform boxes fit even in a narrow pane"
+                        );
+                    }
+                    if geometry {
+                        review_image(&mut h, &format!("tetrode-waveforms-narrow-{name}"));
+                    }
+                    h.set_size(egui::vec2(SIZE[0], SIZE[1]));
+                    settle(&mut h);
+                }
+                for cluster in [1, 2] {
+                    h.get_all_by_label(cluster.to_string().as_str())
+                        .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+                        .expect("cluster row")
+                        .click_modifiers(egui::Modifiers::COMMAND);
+                    settle(&mut h);
+                    assert_eq!(
+                        channel_ids(&h),
+                        initial,
+                        "comparison clusters cannot add channels"
+                    );
+                }
+                if n_channels == 4 && geometry {
+                    review_image(&mut h, &format!("tetrode-waveforms-{name}"));
+                }
+                let point = h
+                    .get_by_label(format!("waveform channel {}", initial[0]).as_str())
+                    .rect()
+                    .center();
+                for _ in 0..3 {
+                    h.hover_at(point);
+                    h.key_press(egui::Key::W);
+                    settle(&mut h);
+                    assert_eq!(
+                        channel_ids(&h),
+                        initial,
+                        "spikes, means and templates share the same channels"
+                    );
+                }
+                results.extend_harness(&mut h);
+            }
+        }
+    }
+    results.unwrap();
+}
+
 #[test]
 fn features_grid_lasso_split() {
     if no_gpu() {
@@ -1247,6 +1437,171 @@ fn features_grid_lasso_split() {
         settle(&mut h);
         let s = sorrel_ui::jobs::read(h.state().session()).history_len();
         assert_eq!(s, 1, "k splits the lassoed spikes as one journal entry");
+        h
+    });
+}
+
+#[test]
+fn features_cancel_clears_the_lasso_without_changing_cluster_membership() {
+    if no_gpu() {
+        return;
+    }
+    each_theme(|theme, name| {
+        let mut h = fixture(&format!("features-cancel-{name}"), 3, theme);
+        select_two_and_open_features(&mut h);
+        let before = {
+            let session = sorrel_ui::jobs::read(h.state().session());
+            (session.version(), session.spike_clusters_global().to_vec())
+        };
+        lasso_points(&mut h, 4);
+        assert!(
+            h.state().brushes().spikes.is_some(),
+            "the lasso selected spikes"
+        );
+        h.key_press(egui::Key::Escape);
+        settle(&mut h);
+        assert!(h.state().brushes().spikes.is_none());
+        // An abandoned lasso must not become a pending cut again later.
+        h.key_press(egui::Key::K);
+        settle(&mut h);
+        let session = sorrel_ui::jobs::read(h.state().session());
+        assert_eq!(session.version(), before.0);
+        assert_eq!(session.spike_clusters_global(), before.1);
+        assert_eq!(session.history_len(), 0);
+        drop(session);
+        h
+    });
+}
+
+#[test]
+fn features_cancel_during_freehand_drawing_does_not_restore_it_on_release() {
+    if no_gpu() {
+        return;
+    }
+    each_theme(|theme, name| {
+        let mut h = fixture(&format!("features-cancel-stroke-{name}"), 3, theme);
+        select_two_and_open_features(&mut h);
+        let cell = h.get_by_label("feature cell 1").rect();
+        let start = cell.lerp_inside(egui::vec2(0.2, 0.2));
+        h.hover_at(start);
+        h.input_mut().modifiers = egui::Modifiers::COMMAND;
+        h.event(egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        h.run_ok();
+        for point in [egui::vec2(0.8, 0.2), egui::vec2(0.8, 0.8)] {
+            h.hover_at(cell.lerp_inside(point));
+            h.run_ok();
+        }
+        h.input_mut().modifiers = egui::Modifiers::NONE;
+        h.key_press(egui::Key::Escape);
+        let end = cell.lerp_inside(egui::vec2(0.2, 0.8));
+        h.hover_at(end);
+        h.event(egui::Event::PointerButton {
+            pos: end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_ok();
+        settle(&mut h);
+        assert!(h.state().brushes().spikes.is_none());
+        h.key_press(egui::Key::K);
+        settle(&mut h);
+        assert_eq!(sorrel_ui::jobs::read(h.state().session()).history_len(), 0);
+        h
+    });
+}
+
+#[test]
+fn features_navigation_keeps_layout_and_moves_projection_windows_as_a_group() {
+    if no_gpu() {
+        return;
+    }
+    each_theme(|theme, name| {
+        let mut h = wide_fixture(&format!("features-navigation-{name}"), theme);
+        select_two_and_open_features(&mut h);
+        h.get_by_label("ALTERNATIVES").click();
+        settle(&mut h);
+        let before = [
+            h.get_by_label("feature cell 0").rect(),
+            h.get_by_label("feature cell 1").rect(),
+        ];
+        let controls = h.get_by_label("k-means").rect();
+        let alternative = h
+            .get_all_by_label_contains("alternative ")
+            .next()
+            .expect("the original alternatives strip")
+            .rect();
+        lasso_points(&mut h, 4);
+        let brush = h.state().brushes().spikes.as_ref().unwrap().key();
+        wheel_zoom(&mut h, "feature cell 1");
+        for (cell, rect) in before.iter().enumerate() {
+            assert_eq!(
+                h.get_by_label(format!("feature cell {cell}").as_str())
+                    .rect(),
+                *rect,
+                "wheel zoom changes the contents, never the projection box"
+            );
+        }
+        assert_eq!(h.state().brushes().spikes.as_ref().unwrap().key(), brush);
+
+        // Start away from lasso nodes: a plain drag moves the windows, not
+        // their data-space centres or the surrounding controls.
+        let start = before[0].center();
+        let end = start + egui::vec2(15.0, 12.0);
+        h.hover_at(start);
+        h.event(egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_ok();
+        h.hover_at(end);
+        h.run_ok();
+        h.event(egui::Event::PointerButton {
+            pos: end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        settle(&mut h);
+        let after = [
+            h.get_by_label("feature cell 0").rect(),
+            h.get_by_label("feature cell 1").rect(),
+        ];
+        let movement = after[0].center() - before[0].center();
+        assert!(movement.length() > 1.0, "dragging must move the windows");
+        assert!(
+            ((after[1].center() - before[1].center()) - movement).length() < 1.0,
+            "the windows move together"
+        );
+        assert_eq!(after[0].size(), before[0].size());
+        assert_eq!(after[1].size(), before[1].size());
+        // Check actual paint clips, not just accessibility bounds. Moving
+        // a window must expose it past its old slot instead of merely
+        // reporting a full rect while cropping its paint there.
+        for rect in after {
+            assert!(
+                h.output().shapes.iter().any(|s| {
+                    s.clip_rect.contains_rect(rect.shrink(0.5)) && shape_draws_rect(&s.shape, rect)
+                }),
+                "a translated window is painted in the shared viewport, not cropped to its old slot"
+            );
+        }
+        assert_eq!(h.get_by_label("k-means").rect(), controls);
+        assert_eq!(
+            h.get_all_by_label_contains("alternative ")
+                .next()
+                .unwrap()
+                .rect(),
+            alternative
+        );
+        assert_eq!(h.state().brushes().spikes.as_ref().unwrap().key(), brush);
         h
     });
 }
@@ -1656,6 +2011,9 @@ fn features_lasso_freehand_and_edit() {
             .chain([at(corners[4])])
             .collect();
         drag_path(&mut h, &stroke, egui::Modifiers::COMMAND);
+        // The lasso's live-tracking switch joins the top toolbar row; it
+        // starts off, so dragging a node settles the hits on release.
+        h.get_by_label("live tracking");
         snap(&mut h, "features_lasso_freehand", name);
         // Pull the bottom-right node towards the middle.
         drag_path(
@@ -1749,9 +2107,8 @@ fn features_kmeans_collision() {
     if no_gpu() {
         return;
     }
-    // k-means on two clusters in a wide window (the Features pane gets the
-    // Regular layout): every cell gets a collision badge, the part's hull is
-    // dashed in the other cells and the mini matrix names the best.
+    // k-means on two clusters in a wide window: collision evidence and the
+    // part's hull are drawn on the actual sixteen projections, not a navigator.
     each_theme(|theme, name| {
         let root = dataset(&format!("features-collision-{name}"), 3);
         let mut h = harness_sized(theme, [2200.0, 1100.0], move || {
@@ -1764,11 +2121,7 @@ fn features_kmeans_collision() {
         select_two_and_open_features(&mut h);
         h.get_by_label("k-means").click();
         settle(&mut h);
-        assert_eq!(
-            h.query_all_by_label_contains("collision ").count(),
-            16,
-            "one matrix tile per grid cell"
-        );
+        assert_full_feature_grid(&h);
         snap(&mut h, "features_kmeans_collision", name);
         h
     });
@@ -1779,24 +2132,19 @@ fn features_compact() {
     if no_gpu() {
         return;
     }
-    // The default window's Features pane is narrow: one large cell, the
-    // k-means row and the collision matrix as navigator; a tile focuses
-    // its cell.
+    // The default narrow pane still shows the complete matrix. Focusing a
+    // projection never replaces its fifteen siblings with a navigator.
     each_theme(|theme, name| {
         let mut h = fixture(&format!("features-compact-{name}"), 3, theme);
         select_two_and_open_features(&mut h);
-        h.get_by_label("feature cell 1");
+        assert_full_feature_grid(&h);
         h.get_by_label("k-means").click();
         settle(&mut h);
         snap(&mut h, "features_compact", name);
-        h.get_all_by_label_contains("collision ")
-            .nth(6)
-            .expect("navigator tile")
-            // Below the alternatives strip, past the end of the short pane.
-            .click_accesskit();
+        h.get_by_label("feature cell 6").click();
         settle(&mut h);
         h.get_by_label("feature cell 6");
-        assert!(h.query_by_label("feature cell 1").is_none(), "one cell");
+        assert_full_feature_grid(&h);
         h
     });
 }
@@ -1849,9 +2197,12 @@ fn waveforms_feature_link() {
         settle(&mut h);
         select_two_and_open_features(&mut h);
         click_tab(&mut h, "Waveforms");
-        // A box in the middle of the Waveforms pane.
-        let tab = h.get_by_label("Waveforms").rect();
-        let pane = egui::pos2(tab.center().x + 150.0, tab.bottom() + 300.0);
+        let pane = h
+            .get_all_by_label_contains("waveform channel ")
+            .next()
+            .expect("a real waveform channel box")
+            .rect()
+            .center();
         h.hover_at(pane);
         h.input_mut().modifiers = egui::Modifiers::SHIFT;
         for pressed in [true, false] {
@@ -1878,7 +2229,7 @@ fn features_alternatives() {
     if no_gpu() {
         return;
     }
-    // Regular layout: with a lasso drawn, the first click on an alternative
+    // With a lasso drawn, the first click on an alternative
     // only arms its promotion (a warning row names what is dropped), the
     // second promotes it to A/B and the lasso is gone.
     each_theme(|theme, name| {
@@ -1891,25 +2242,41 @@ fn features_alternatives() {
         });
         settle(&mut h);
         select_two_and_open_features(&mut h);
+        h.get_by_label("ALTERNATIVES").click();
+        settle(&mut h);
         assert!(
             h.query_all_by_label_contains("alternative ").count() > 0,
             "the strip lists alternative views"
         );
         lasso_points(&mut h, 4);
-        h.get_by_label("K: split · Esc: clear");
+        let brush = h
+            .state()
+            .brushes()
+            .spikes
+            .as_ref()
+            .expect("lasso brush")
+            .key();
         h.get_all_by_label_contains("alternative ")
             .next()
             .expect("first alternative")
             .click();
         snap(&mut h, "features_alternatives", name);
-        h.get_by_label("K: split · Esc: clear");
+        assert_eq!(
+            h.state()
+                .brushes()
+                .spikes
+                .as_ref()
+                .expect("first click preserves the lasso")
+                .key(),
+            brush
+        );
         h.get_all_by_label_contains("alternative ")
             .next()
             .expect("first alternative")
             .click();
         settle(&mut h);
         assert!(
-            h.query_by_label("K: split · Esc: clear").is_none(),
+            h.state().brushes().spikes.is_none(),
             "promoting drops the lasso"
         );
         h
@@ -1921,16 +2288,13 @@ fn features_3d_pinned() {
     if no_gpu() {
         return;
     }
-    // Focus another 2-D cell from the navigator, then switch to 3-D: the
+    // Focus another actual 2-D projection, then switch to 3-D: the
     // focused plot's pair is pinned (the chip), so only its third axis is
     // chosen. The chip's × lists every triple again.
     each_theme(|theme, name| {
         let mut h = fixture(&format!("features-3d-pinned-{name}"), 3, theme);
         select_two_and_open_features(&mut h);
-        h.get_all_by_label_contains("collision ")
-            .nth(2)
-            .expect("navigator tile")
-            .click_accesskit();
+        h.get_by_label("feature cell 2").click();
         settle(&mut h);
         h.get_by_label("feature cell 2");
         h.get_by_label("3D").click();

@@ -125,6 +125,9 @@ pub struct WaveformParams {
     pub show_labels: bool,
     /// phy `n_spikes_waveforms`.
     pub n_spikes: usize,
+    /// Total channels in the waveform pane, shared by all selected clusters.
+    /// Four is the tetrode default; larger probes can opt in to more.
+    pub max_channels: usize,
     /// Box width/height factors (`ctrl+left/right`, `ctrl+wheel`).
     pub box_scale: [f32; 2],
     /// Probe spread factors (`shift+arrows`).
@@ -143,6 +146,7 @@ impl Default for WaveformParams {
             overlap: true,
             show_labels: true,
             n_spikes: 100,
+            max_channels: 4,
             box_scale: [1.0, 1.0],
             probe_scale: [1.0, 1.0],
             amp_scale: 1.0,
@@ -224,6 +228,23 @@ impl UiPrefs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waveform_channel_limit_defaults_to_four_and_survives_old_preferences() {
+        assert_eq!(WaveformParams::default().max_channels, 4);
+        let old: WaveformParams =
+            serde_json::from_str(r#"{"n_spikes":80,"overlap":false}"#).unwrap();
+        assert_eq!(old.max_channels, 4);
+        assert_eq!(old.n_spikes, 80);
+        assert!(!old.overlap);
+        let changed = WaveformParams {
+            max_channels: 12,
+            ..Default::default()
+        };
+        let back: WaveformParams =
+            serde_json::from_str(&serde_json::to_string(&changed).unwrap()).unwrap();
+        assert_eq!(back.max_channels, 12);
+    }
 
     #[test]
     fn rate_x_range_clamps_and_falls_back_to_the_recording() {
