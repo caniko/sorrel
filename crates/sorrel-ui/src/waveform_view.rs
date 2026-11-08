@@ -5,16 +5,22 @@
 //! scaling keys follow phy v2.1's `WaveformView`. Parameters live in
 //! [`WaveformParams`] so they persist with the other prefs.
 
-use egui::{Color32, Pos2, Sense, Stroke, Ui};
+use egui::{Color32, Pos2, Rect, Sense, Stroke, Ui};
 use sorrel_data::Session;
 use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 use sorrel_render::{extract_snippet, snippet_window, TracePreproc};
 
 use crate::feature_view::{ChannelEdit, FeatureLink};
+use crate::jobs::JobCtx;
 use crate::layout::ViewAction;
-use crate::prefs::{WaveformMode, WaveformParams};
+use crate::prefs::{WaveformMode, WaveformParams, WaveformSource};
 use crate::theme::{selection_colour, Theme};
 use crate::views::{alloc_plot, grid_colour, nice_ticks, pad_range, tick_label, TICK_PX};
+
+#[path = "waveform_all.rs"]
+mod waveform_all;
+
+use waveform_all::{AllCache, AllKey, AllResult, ProgressSnapshot};
 
 /// Templates drawn per cluster in `Templates` mode (a heavily merged cluster
 /// can span hundreds); the rest are dropped, smallest share first.
@@ -22,6 +28,8 @@ use crate::views::{alloc_plot, grid_colour, nice_ticks, pad_range, tick_label, T
 const MAX_TEMPLATES: usize = 16;
 /// phy `_overlap_transform` ratio of waveform width to the gap between slots.
 const SLOT_K: f32 = 8.0;
+/// Density textures uploaded per UI frame (see `prepare_textures`).
+const MAX_TEXTURE_UPLOADS_PER_FRAME: usize = 2;
 
 // ---- Waveform extraction & cache ---------------------------------------
 
@@ -56,11 +64,16 @@ pub(crate) fn subtract_median_baseline(snip: &mut [f32], nc: usize) {
 /// extraction walks the trace mmap N times per spike, which is fast in the
 /// steady state thanks to the page cache, but recomputing it every paint
 /// stalls the egui thread on cluster switches.
-#[derive(Debug)]
+///
+/// This legacy path is the <= `n_spikes` sample used by Probe/Trace for peak
+/// fallback and by small linked/ghost overlays. The Waveforms pane's default
+/// all-spike mean/traces live in [`waveform_all`] and are computed on a
+/// background job; `ensure` here never cancels or restarts that job.
 pub struct WaveformCache {
     key: Option<WaveformKey>,
     cfg: TracePreproc,
-    /// Spikes sampled per cluster (phy `n_spikes_waveforms`).
+    /// Spikes sampled per cluster (phy `n_spikes_waveforms`). Only the
+    /// explicit `Sampled` source uses this for the main pane.
     n_spikes: usize,
     /// Shank id per channel for per-shank CMR (empty = global).
     shanks: Vec<u32>,
@@ -72,8 +85,9 @@ pub struct WaveformCache {
     /// share first; empty when spike templates are not seeded.
     templates: Vec<Vec<(u32, f32)>>,
     /// y range frozen on first draw (phy v2.1 `data_bounds or ...`):
-    /// `(mode, n_channels, lo, hi)`. Resets on mode change and `R`.
-    frozen: Option<(WaveformMode, usize, f32, f32)>,
+    /// `(mode, n_channels, all_generation, lo, hi)`. Resets on mode change,
+    /// a new complete all-spike result, and `R`.
+    frozen: Option<(WaveformMode, usize, u64, f32, f32)>,
     /// Snippets of the lassoed / k-means spikes the Features pane links in.
     linked: Option<LinkedSnippets>,
     /// Snippets of the spike brush's split what-if part / ISI violators.
@@ -88,6 +102,52 @@ pub struct WaveformCache {
     ghost: Option<Box<WaveformCache>>,
     /// Whether the ghost is drawn this frame.
     ghost_on: bool,
+    /// All-spike extraction keyed independently of the legacy sample above.
+    all: AllCache,
+    /// Uploaded density images, keyed `(cluster slot, channel)` and tagged
+    /// with the all-result generation they came from.
+    textures: std::collections::HashMap<(usize, usize), (u64, egui::TextureHandle)>,
+    texture_generation: u64,
+}
+
+impl std::fmt::Debug for WaveformCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaveformCache")
+            .field("key", &self.key)
+            .field("n_spikes", &self.n_spikes)
+            .field("all_ready", &self.all.current().is_some())
+            .field("all_loading", &self.all.is_loading())
+            .finish()
+    }
+}
+
+/// Read-only, allocation-light summary of the all-spike worker for UI tests
+/// and status tooling. Counts are exactly what the pane reports; `clusters`
+/// follows the current selection slots when a result is ready.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WaveformSpikeCounts {
+    pub total: usize,
+    pub valid: usize,
+    pub invalid: usize,
+    pub out_of_range: usize,
+    pub missing: usize,
+    pub drawn: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WaveformAllSummary {
+    pub ready: bool,
+    pub loading: bool,
+    pub incomplete: bool,
+    pub generation: u64,
+    pub total: usize,
+    pub valid: usize,
+    pub invalid: usize,
+    pub out_of_range: usize,
+    pub missing: usize,
+    pub drawn: usize,
+    pub raster_failed: usize,
+    pub clusters: Vec<WaveformSpikeCounts>,
 }
 
 /// `[inside, outside]`, each `[channel][sample]`.
@@ -152,6 +212,9 @@ impl Default for WaveformCache {
             whatif: None,
             ghost: None,
             ghost_on: false,
+            all: AllCache::default(),
+            textures: std::collections::HashMap::new(),
+            texture_generation: 0,
         }
     }
 }
@@ -176,20 +239,230 @@ impl WaveformCache {
 
     /// Preprocess snippets like the trace pane; re-extracts on change.
     pub(crate) fn set_preproc(&mut self, cfg: TracePreproc, shanks: &[u32]) {
-        if self.shanks != shanks {
+        let preproc_changed = self.cfg != cfg;
+        if self.shanks != shanks || preproc_changed {
             self.shanks = shanks.to_vec();
             self.key = None;
             self.linked = None;
             self.brushed = None;
             self.hovered = None;
+            // The old all-spike result was extracted with other filters or
+            // channel mapping; it must not be shown as if it were current.
+            self.all.invalidate();
+            self.textures.clear();
+            self.texture_generation = 0;
         }
         self.cfg = cfg;
     }
 
-    /// Spikes per cluster for the next [`ensure`](Self::ensure); a change
-    /// invalidates the key.
+    /// Spikes per cluster for the legacy sample used by Probe/Trace and the
+    /// explicit `Sampled` preview; a change invalidates only that key.
     pub(crate) fn set_n_spikes(&mut self, n: usize) {
         self.n_spikes = n.max(1);
+    }
+
+    /// Stop any in-flight all-spike worker immediately. Call this before a
+    /// curation write so the writer does not wait on the worker's read lock.
+    /// The last complete result is kept but stays key-checked, so it can
+    /// never be rendered for a newer selection.
+    pub fn cancel(&mut self) {
+        self.all.cancel();
+    }
+
+    fn all_progress(&self) -> Option<ProgressSnapshot> {
+        self.all.progress()
+    }
+
+    /// Read-only snapshot of the all-spike worker: exact drawn/valid counts and
+    /// per-selection-slot validity. Cheap enough for tests and status text.
+    pub fn all_spikes_summary(&self) -> WaveformAllSummary {
+        let loading = self.all.is_loading();
+        if let Some(result) = self.all.current() {
+            let uploading = self.texture_uploads_pending(result, &result.render_channels);
+            return WaveformAllSummary {
+                ready: result.raster_complete
+                    && !result.incomplete
+                    && result.raster_failed == 0
+                    && result.drawn >= result.valid
+                    && !uploading,
+                loading: loading || uploading,
+                incomplete: result.incomplete,
+                generation: result.generation,
+                total: result.total,
+                valid: result.valid,
+                invalid: result.invalid,
+                out_of_range: result.out_of_range,
+                missing: result.missing,
+                drawn: result.drawn,
+                raster_failed: result.raster_failed,
+                clusters: result
+                    .clusters
+                    .iter()
+                    .map(|cluster| WaveformSpikeCounts {
+                        total: cluster.total,
+                        valid: cluster.valid,
+                        invalid: cluster.invalid,
+                        out_of_range: cluster.out_of_range,
+                        missing: cluster.missing,
+                        drawn: cluster.drawn,
+                    })
+                    .collect(),
+            };
+        }
+        if let Some(progress) = self.all.progress() {
+            return WaveformAllSummary {
+                ready: false,
+                loading: true,
+                generation: 0,
+                total: progress.total,
+                valid: progress.valid,
+                invalid: progress.invalid,
+                out_of_range: progress.out_of_range,
+                missing: progress.missing,
+                drawn: progress.drawn,
+                clusters: Vec::new(),
+                ..Default::default()
+            };
+        }
+        WaveformAllSummary {
+            loading,
+            ..Default::default()
+        }
+    }
+
+    /// The current all-spike result, if the matching request is complete.
+    fn all_current(&self) -> Option<&AllResult> {
+        self.all.current()
+    }
+
+    /// Start or reuse the off-thread all-spike extraction for `chans`.
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_all<P: DataProvider>(
+        &mut self,
+        session: &Session<P>,
+        jobs: &JobCtx<Session<P>>,
+        selection: &[ClusterId],
+        pre: u32,
+        post: u32,
+        chans: &[usize],
+    ) {
+        let key = AllKey {
+            clusters: selection.to_vec(),
+            pre,
+            post,
+            cfg: self.cfg,
+            shanks: self.shanks.clone(),
+            render_channels: chans.to_vec(),
+            n_channels: session.provider.n_channels(),
+            n_samples: session.provider.n_samples().0,
+            sample_rate: session.provider.sample_rate(),
+            version: session.version(),
+        };
+        if self.all.requested() != Some(&key) {
+            // Do not leave textures from another selection/key around.
+            self.textures.clear();
+            self.texture_generation = 0;
+        }
+        let total = selection
+            .iter()
+            .map(|&cluster| session.spike_times(cluster).len())
+            .sum();
+        self.all.ensure(&key, jobs, total);
+    }
+
+    /// Stop the worker and forget the result/textures. Used when the pane no
+    /// longer has a current unit (empty selection or no channels), so an old
+    /// unit's summary can never claim to be ready for the new state.
+    fn clear_all(&mut self) {
+        self.all.invalidate();
+        self.textures.clear();
+        self.texture_generation = 0;
+    }
+
+    fn all_scope_matches(&self, selection: &[ClusterId], version: u64) -> bool {
+        self.all
+            .requested()
+            .is_some_and(|key| key.clusters == selection && key.version == version)
+    }
+
+    /// Upload the worker's density images once per all-result generation.
+    /// Painting then reuses a handful of textures instead of rebuilding
+    /// per-spike egui polylines every frame.
+    ///
+    /// A frame uploads at most [`MAX_TEXTURE_UPLOADS_PER_FRAME`] images: one
+    /// 512×256 texture costs a full RGBA conversion plus a GPU copy, and a
+    /// selection with many clusters would otherwise stall the first frame
+    /// after the worker lands. Returns true while more uploads are pending.
+    fn prepare_textures(&mut self, ctx: &egui::Context, chans: &[usize]) -> bool {
+        let mut pending = Vec::new();
+        let Some(result) = self.all.current() else {
+            self.textures.clear();
+            self.texture_generation = 0;
+            return false;
+        };
+        if result.generation != self.texture_generation {
+            self.textures.clear();
+            self.texture_generation = result.generation;
+        }
+        if !result.raster_complete {
+            // Provisional exact mean: no density images exist yet.
+            return false;
+        }
+        for (slot, cluster) in result.clusters.iter().enumerate() {
+            if cluster.valid == 0 {
+                continue;
+            }
+            for (raster_index, &ch) in result.render_channels.iter().enumerate() {
+                if !chans.contains(&ch) || self.textures.contains_key(&(slot, ch)) {
+                    continue;
+                }
+                let Some(alpha) = cluster.raster.get(raster_index) else {
+                    continue;
+                };
+                if alpha.len() != waveform_all::RASTER_SIZE[0] * waveform_all::RASTER_SIZE[1] {
+                    continue;
+                }
+                let image = coverage_image(alpha);
+                let name = format!("waveform-all-{}-{slot}-{ch}", result.generation);
+                pending.push((
+                    slot,
+                    ch,
+                    result.generation,
+                    ctx.load_texture(name, image, egui::TextureOptions::LINEAR),
+                ));
+                if pending.len() >= MAX_TEXTURE_UPLOADS_PER_FRAME {
+                    break;
+                }
+            }
+            if pending.len() >= MAX_TEXTURE_UPLOADS_PER_FRAME {
+                break;
+            }
+        }
+        for (slot, ch, generation, handle) in pending {
+            self.textures.insert((slot, ch), (generation, handle));
+        }
+        // More images remain when any current slot/channel has no texture yet.
+        self.texture_uploads_pending(result, chans)
+    }
+
+    fn texture_uploads_pending(&self, result: &AllResult, chans: &[usize]) -> bool {
+        result.raster_complete
+            && result.clusters.iter().enumerate().any(|(slot, cluster)| {
+                if cluster.valid == 0 {
+                    return false;
+                }
+                result
+                    .render_channels
+                    .iter()
+                    .filter(|ch| chans.contains(ch))
+                    .any(|&ch| !self.textures.contains_key(&(slot, ch)))
+            })
+    }
+
+    fn texture_id(&self, slot: usize, ch: usize) -> Option<egui::TextureId> {
+        self.textures
+            .get(&(slot, ch))
+            .map(|(_, handle)| handle.id())
     }
 
     fn whatif_on(&self) -> bool {
@@ -511,18 +784,19 @@ impl WaveformCache {
     }
 
     /// Frozen y range for `mode`, computing it with `f` the first time (and
-    /// after a mode change or reset).
+    /// after a mode change, a new all-spike generation, or reset).
     fn frozen_range(
         &mut self,
         mode: WaveformMode,
         nc: usize,
+        generation: u64,
         f: impl FnOnce(&Self) -> (f32, f32),
     ) -> (f32, f32) {
         match self.frozen {
-            Some((m, n, lo, hi)) if m == mode && n == nc => (lo, hi),
+            Some((m, n, g, lo, hi)) if m == mode && n == nc && g == generation => (lo, hi),
             _ => {
                 let (lo, hi) = f(self);
-                self.frozen = Some((mode, nc, lo, hi));
+                self.frozen = Some((mode, nc, generation, lo, hi));
                 (lo, hi)
             }
         }
@@ -535,6 +809,25 @@ pub(crate) fn channel_peak_abs(means: &[Vec<Vec<f32>>], n_channels: usize) -> Ve
     let mut peaks = vec![0.0f32; n_channels];
     for cluster_means in means {
         for (ch, mean) in cluster_means.iter().enumerate() {
+            if ch >= peaks.len() {
+                continue;
+            }
+            for &v in mean {
+                let a = v.abs();
+                if a > peaks[ch] {
+                    peaks[ch] = a;
+                }
+            }
+        }
+    }
+    peaks
+}
+
+/// Same channel ranking over the all-spike means.
+fn all_channel_peak_abs(all: &AllResult, n_channels: usize) -> Vec<f32> {
+    let mut peaks = vec![0.0f32; n_channels];
+    for cluster in &all.clusters {
+        for (ch, mean) in cluster.mean.iter().enumerate() {
             if ch >= peaks.len() {
                 continue;
             }
@@ -643,6 +936,10 @@ pub(crate) fn next_mode(mode: WaveformMode, dir: i32, has_templates: bool) -> Wa
 /// (the global keymap) sees it.
 /// Pane-local keys (only called while the pane is hovered). Returns true
 /// when `R` asked for a reset of the scaling.
+///
+/// `waveforms.mean` is deliberately handled separately (see
+/// [`consume_mean_presses`]): the pane hover gate must not depend on which
+/// widget happens to hold egui focus, only on real text input.
 fn handle_keys(ctx: &egui::Context, p: &mut WaveformParams, has_templates: bool) -> bool {
     use crate::shortcuts::{Action, Scope, WaveformAction as W};
     const STEP: f32 = 1.1;
@@ -654,14 +951,6 @@ fn handle_keys(ctx: &egui::Context, p: &mut WaveformParams, has_templates: bool)
     }
     if has(W::Next) {
         p.mode = next_mode(p.mode, 1, has_templates);
-    }
-    // phy `toggle_mean_waveforms`: mean-only <-> spikes with the mean on top.
-    if has(W::Mean) {
-        p.mode = if p.mode == WaveformMode::Mean {
-            WaveformMode::Waveforms
-        } else {
-            WaveformMode::Mean
-        };
     }
     if has(W::Overlap) {
         p.overlap = !p.overlap;
@@ -700,6 +989,61 @@ fn handle_keys(ctx: &egui::Context, p: &mut WaveformParams, has_templates: bool)
         reset = true;
     }
     reset
+}
+
+/// phy `toggle_mean_waveforms`: mean-only <-> spikes with the mean on top.
+/// `M` is all-spike semantics, so it always leaves the explicit sampled
+/// preview and restores [`WaveformSource::AllSpikes`].
+fn toggle_mean(p: &mut WaveformParams) {
+    p.source = WaveformSource::AllSpikes;
+    p.mode = if p.mode == WaveformMode::Mean {
+        WaveformMode::Waveforms
+    } else {
+        WaveformMode::Mean
+    };
+}
+
+/// True when pane-local keys may run: pointer over this pane (egui's layer
+/// check protects panes behind windows), no modal/settings dialog/popup, and
+/// no actual text editor focused. A focused button or table must *not* block
+/// the hovered keys (phy's behaviour, and the reason the old broad
+/// `egui_wants_keyboard_input` gate was wrong).
+fn waveform_keys_allowed(
+    hovered: bool,
+    text_input: bool,
+    dialog_or_modal: bool,
+    popup_open: bool,
+) -> bool {
+    hovered && !text_input && !dialog_or_modal && !popup_open
+}
+
+/// Consume every plain (non-auto-repeat) press of the configured
+/// `waveforms.mean` chord. Returns how many presses to apply this frame.
+/// Using the keymap (rather than a hard-coded `M`) keeps remapping working.
+fn consume_mean_presses(ctx: &egui::Context) -> usize {
+    let map = crate::settings::shared(ctx).lock().unwrap().keymap.clone();
+    let mut presses = 0usize;
+    ctx.input_mut(|input| {
+        input.events.retain(|event| {
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                repeat: false,
+                modifiers,
+                ..
+            } = event
+            else {
+                return true;
+            };
+            if map.matches("waveforms.mean", *key, *modifiers) {
+                presses += 1;
+                false
+            } else {
+                true
+            }
+        });
+    });
+    presses
 }
 
 /// How the Features link marks one channel box.
@@ -774,6 +1118,17 @@ fn mean_of<'a>(
         .collect()
 }
 
+/// Density coverage (one byte per texel) as a white-alpha image. The pane
+/// tints it with the slot colour, so one upload serves both themes and the
+/// dim/fade overlays.
+fn coverage_image(alpha: &[u8]) -> egui::ColorImage {
+    let pixels = alpha
+        .iter()
+        .map(|&a| Color32::from_white_alpha(a))
+        .collect();
+    egui::ColorImage::new(waveform_all::RASTER_SIZE, pixels)
+}
+
 // ---- Drawing -----------------------------------------------------------
 
 /// Multi-cluster waveform view. Shows all selected clusters on one shared
@@ -785,6 +1140,10 @@ fn mean_of<'a>(
 /// channel A / B. `link` is the Features pane's cross-talk state (see
 /// [`FeatureLink`]): it marks the set, dims all but the focused plot's
 /// channels, and adds the linked spikes and PC shapes.
+///
+/// This compatibility entry point has no background-job context, so the
+/// pane can only show the sampled preview. App/layout integration should
+/// call [`waveform_view_with_jobs`].
 #[allow(clippy::too_many_arguments)]
 pub fn waveform_view<P: DataProvider>(
     ui: &mut Ui,
@@ -798,7 +1157,58 @@ pub fn waveform_view<P: DataProvider>(
     brushes: &crate::brush::Brushes,
     actions: &mut Vec<ViewAction>,
 ) {
+    waveform_view_impl(
+        ui, session, selection, geometry, shanks, cache, params, link, brushes, None, actions,
+    );
+}
+
+/// Waveform pane with the app's shared job context. All-spike extraction
+/// runs on a cancellable worker and never touches the UI thread.
+#[allow(clippy::too_many_arguments)]
+pub fn waveform_view_with_jobs<P: DataProvider>(
+    ui: &mut Ui,
+    session: &Session<P>,
+    selection: &[ClusterId],
+    geometry: &[[f32; 2]],
+    shanks: &[u32],
+    cache: &mut WaveformCache,
+    params: &mut WaveformParams,
+    link: &FeatureLink,
+    brushes: &crate::brush::Brushes,
+    jobs: &JobCtx<Session<P>>,
+    actions: &mut Vec<ViewAction>,
+) {
+    waveform_view_impl(
+        ui,
+        session,
+        selection,
+        geometry,
+        shanks,
+        cache,
+        params,
+        link,
+        brushes,
+        Some(jobs),
+        actions,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn waveform_view_impl<P: DataProvider>(
+    ui: &mut Ui,
+    session: &Session<P>,
+    selection: &[ClusterId],
+    geometry: &[[f32; 2]],
+    shanks: &[u32],
+    cache: &mut WaveformCache,
+    params: &mut WaveformParams,
+    link: &FeatureLink,
+    brushes: &crate::brush::Brushes,
+    jobs: Option<&JobCtx<Session<P>>>,
+    actions: &mut Vec<ViewAction>,
+) {
     if selection.is_empty() {
+        cache.clear_all();
         ui.label("no selection");
         return;
     }
@@ -809,19 +1219,44 @@ pub fn waveform_view<P: DataProvider>(
     let snippet_len = (pre + post + 1) as usize;
     let nc = session.provider.n_channels() as usize;
     if nc == 0 || snippet_len < 3 {
+        cache.clear_all();
         ui.label("no channels");
         return;
     }
 
-    // Pane-local keys, consumed before anything downstream can see them; the
-    // global keymap binds none of these chords (plain m/w/o/r, ctrl+l, ctrl
-    // and shift + arrows), so there is no clash even for unhovered panes.
+    // A result for another unit (or an older curation version) must not keep
+    // claiming readiness, even while the explicit sampled preview is active.
+    if !cache.all_scope_matches(selection, session.version()) {
+        cache.clear_all();
+    }
+
+    // Pane-local keys are consumed before anything downstream can see them.
+    // Only a real text editor, a modal/settings dialog, an open popup or
+    // another pane owning the pointer suppresses them; a focused button or
+    // table must not (the old `egui_wants_keyboard_input` gate did).
     let has_templates = session.has_template_waveforms();
-    if ui.rect_contains_pointer(ui.max_rect()) && !ui.ctx().egui_wants_keyboard_input() {
+    let hovered = ui.rect_contains_pointer(ui.max_rect());
+    let keys_allowed = waveform_keys_allowed(
+        hovered,
+        crate::settings::text_input_active(ui.ctx()),
+        crate::settings::blocked(ui.ctx()),
+        egui::Popup::is_any_open(ui.ctx()),
+    );
+    if hovered && !crate::settings::blocked(ui.ctx()) {
         let pinch = ui.input(|i| i.zoom_delta());
         if pinch != 1.0 {
             // egui reports Ctrl+wheel as a zoom gesture.
             params.box_scale[1] = (params.box_scale[1] * pinch).clamp(0.05, 50.0);
+        }
+    }
+    if keys_allowed {
+        // `M` is consumed via the configured chord, once per plain press,
+        // even while an unrelated button/table has focus. Then the remaining
+        // pane keys go through the normal settings consumer.
+        let presses = consume_mean_presses(ui.ctx());
+        for _ in 0..presses {
+            toggle_mean(params);
+            cache.frozen = None;
         }
         if handle_keys(ui.ctx(), params, has_templates) {
             cache.frozen = None;
@@ -892,6 +1327,32 @@ pub fn waveform_view<P: DataProvider>(
         .unwrap_or(0);
     let chans = display_channels(nc, peak, geometry, shanks, params.max_channels);
 
+    // All-spike extraction starts only once the shared channel set is known,
+    // so comparisons keep one four-channel layout. The worker is keyed
+    // independently of the legacy sample cache used by Probe/Trace.
+    let all_source = params.source == WaveformSource::AllSpikes;
+    if all_source {
+        if let Some(jobs) = jobs {
+            cache.ensure_all(session, jobs, selection, pre, post, &chans);
+            if cache.prepare_textures(ui.ctx(), &chans) {
+                // Spread the remaining density uploads over later frames
+                // instead of blocking this one.
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(16));
+            }
+            if cache.all.is_loading() {
+                // Progress is atomic; wake the pane even if the worker is
+                // between repaint throttles.
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        } else {
+            cache.cancel();
+        }
+    } else {
+        cache.cancel();
+    }
+
     let theme = Theme::from_ui(ui);
     let hp = if cache.cfg.hp().is_some() {
         "filtered"
@@ -912,17 +1373,38 @@ pub fn waveform_view<P: DataProvider>(
     // every cluster in the cell; unchecked is phy's side-by-side slots.
     let compact = ui.available_width() < 300.0;
     let (mut overlap, mut pc_shapes) = (params.overlap, params.pc_shapes);
+    let reset_frozen = std::cell::Cell::new(false);
     crate::views::param_bar(
         ui,
         &head,
         |ui| {
-            ui.add(
-                egui::DragValue::new(&mut params.n_spikes)
-                    .range(1..=2000)
-                    .speed(1.0)
-                    .suffix(" spikes"),
-            )
-            .on_hover_text("spikes sampled per cluster (phy n_spikes_waveforms)");
+            let mut sampled = params.source == WaveformSource::Sampled;
+            if ui
+                .checkbox(&mut sampled, "sample")
+                .on_hover_text(
+                    "Fast preview from n_spikes per cluster. Off (default) uses every \
+                     spike; M always restores all spikes.",
+                )
+                .changed()
+            {
+                params.source = if sampled {
+                    WaveformSource::Sampled
+                } else {
+                    WaveformSource::AllSpikes
+                };
+                reset_frozen.set(true);
+            }
+            if sampled {
+                ui.add(
+                    egui::DragValue::new(&mut params.n_spikes)
+                        .range(1..=2000)
+                        .speed(1.0)
+                        .suffix(" spikes"),
+                )
+                .on_hover_text(
+                    "sampled preview only (phy n_spikes_waveforms); the all-spike mean is unaffected",
+                );
+            }
             if !compact {
                 ui.checkbox(&mut params.overlap, "overlap")
                     .on_hover_text(format!(
@@ -950,7 +1432,7 @@ pub fn waveform_view<P: DataProvider>(
                 .on_hover_text("Total channels for all selected clusters; default 4 for a tetrode")
                 .changed()
             {
-                cache.frozen = None;
+                reset_frozen.set(true);
             }
             ui.selectable_value(&mut params.mode, WaveformMode::Waveforms, "spikes + mean");
             ui.selectable_value(&mut params.mode, WaveformMode::Mean, "mean");
@@ -965,14 +1447,154 @@ pub fn waveform_view<P: DataProvider>(
         params.overlap = overlap;
         params.pc_shapes = pc_shapes;
     }
+    if reset_frozen.get() {
+        cache.frozen = None;
+    }
+    if all_source {
+        let all = cache.all_current();
+        let progress = cache.all_progress();
+        let elapsed = cache
+            .all
+            .started()
+            .map_or(0.0, |start| start.elapsed().as_secs_f32());
+        if let Some(all) = all.filter(|all| !all.raster_complete) {
+            // Pass 1 landed: show the exact full-set mean while pass 2 paints
+            // the density images. This is progress, not a sampled fallback.
+            let mut line = match mode {
+                WaveformMode::Mean => format!(
+                    "mean of all {}/{} valid spikes · rasterizing every spike {}/{}",
+                    all.valid,
+                    all.total,
+                    progress.map_or(all.valid, |p| p.raster_done),
+                    progress.map_or(all.total, |p| p.raster_total),
+                ),
+                _ => format!(
+                    "all-spike mean ready ({}/{} valid) · rasterizing every spike {}/{}",
+                    all.valid,
+                    all.total,
+                    progress.map_or(all.valid, |p| p.raster_done),
+                    progress.map_or(all.total, |p| p.raster_total),
+                ),
+            };
+            if all.invalid > 0 {
+                line.push_str(&format!(" · {} missing/edge", all.invalid));
+            }
+            line.push_str(&format!(" · {elapsed:.1}s"));
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.weak(line);
+            });
+        } else if let Some(all) = all {
+            let mut line = match mode {
+                WaveformMode::Mean => {
+                    format!("mean of all {}/{} valid spikes", all.valid, all.total)
+                }
+                WaveformMode::Waveforms => format!("all spikes: {}/{} valid", all.valid, all.total),
+                WaveformMode::Templates => {
+                    format!("templates · {}/{} valid raw spikes", all.valid, all.total)
+                }
+            };
+            if all.invalid > 0 {
+                line.push_str(&format!(
+                    " · {} missing/edge ({} edge, {} unavailable/invalid)",
+                    all.invalid, all.out_of_range, all.missing
+                ));
+            }
+            if all.raster_failed > 0 {
+                line.push_str(&format!(
+                    " · ERROR: {} valid spikes could not be rasterized (no sample substituted)",
+                    all.raster_failed
+                ));
+            } else if mode == WaveformMode::Waveforms {
+                if cache.texture_uploads_pending(all, &chans) {
+                    line.push_str(" · uploading all-spike images");
+                } else {
+                    line.push_str(&format!(" · drawing all {}", all.drawn));
+                }
+            }
+            if all.incomplete {
+                line.push_str(" · retrying missing trace bytes");
+            }
+            let status = if all.raster_failed > 0 {
+                ui.colored_label(ui.visuals().warn_fg_color, line)
+            } else {
+                ui.weak(line)
+            };
+            status.on_hover_text(format!(
+                "Full-set extraction and rendering: {:.1}s",
+                all.elapsed_ms as f32 / 1000.0
+            ));
+        } else if let Some(progress) = progress {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                if progress.stage == waveform_all::STAGE_RASTER {
+                    ui.weak(format!(
+                        "rasterizing every spike {}/{} · {} valid · sampled preview · {elapsed:.1}s",
+                        progress.raster_done, progress.raster_total, progress.valid,
+                    ));
+                } else {
+                    ui.weak(format!(
+                        "loading all spikes {}/{} · {} valid · {} missing/edge · preview ≤{} sampled · {elapsed:.1}s",
+                        progress.done,
+                        progress.total,
+                        progress.valid,
+                        progress.invalid,
+                        params.n_spikes,
+                    ));
+                }
+            });
+        } else if jobs.is_none() {
+            ui.weak("all-spike extraction needs a background job context");
+        }
+    } else {
+        ui.weak(format!(
+            "sampled preview: ≤{} spikes per cluster · {} uses all spikes",
+            params.n_spikes,
+            crate::settings::hint(ui.ctx(), "waveforms.mean")
+        ));
+    }
     ui.add(egui::Label::new(egui::RichText::new(link_hint(&link.set)).small().weak()).truncate())
         .on_hover_text(link_legend(link, params.pc_shapes));
-    // V6.2 legend: swatch + cluster id per selection slot.
+    // V6.2 legend: swatch, cluster id and honest spike counts per slot.
     ui.horizontal_wrapped(|ui| {
         for (slot, c) in selection.iter().enumerate() {
             let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
             ui.painter().rect_filled(r, 2.0, selection_colour(slot));
-            ui.label(egui::RichText::new(format!("c{c}")).size(TICK_PX));
+            let all_now = all_source.then(|| cache.all_current()).flatten();
+            let raster_complete = all_now.is_some_and(|all| all.raster_complete);
+            let counts = all_now.and_then(|all| all.cluster(slot));
+            let (text, detail) = match counts {
+                Some(counts) if raster_complete && counts.drawn < counts.valid => (
+                    format!(
+                        "c{c} {}/{} · drawn {}",
+                        counts.valid, counts.total, counts.drawn
+                    ),
+                    format!(
+                        "total {} · valid {} · edge {} · missing {} · drawn {}",
+                        counts.total,
+                        counts.valid,
+                        counts.out_of_range,
+                        counts.missing,
+                        counts.drawn
+                    ),
+                ),
+                Some(counts) => (
+                    format!("c{c} {}/{} spk", counts.valid, counts.total),
+                    format!(
+                        "total {} · valid {} · edge {} · missing {} · drawn {}",
+                        counts.total,
+                        counts.valid,
+                        counts.out_of_range,
+                        counts.missing,
+                        counts.drawn
+                    ),
+                ),
+                None => (format!("c{c}"), String::new()),
+            };
+            let label = ui.label(egui::RichText::new(text).size(TICK_PX));
+            if !detail.is_empty() {
+                label.on_hover_text(detail);
+            }
         }
     });
 
@@ -1025,25 +1647,48 @@ impl<P: DataProvider> Ctx<'_, P> {
     /// Signed `(lo, hi)` range for the mode, frozen on first use.
     fn range(&mut self, chans: &[usize]) -> (f32, f32) {
         let (mode, nc, snippet_len, session) = (self.mode, self.nc, self.snippet_len, self.session);
-        self.cache.frozen_range(mode, nc, |cache| match mode {
-            WaveformMode::Waveforms => signed_range(cache, chans, nc, snippet_len, true),
-            WaveformMode::Mean => signed_range(cache, chans, nc, snippet_len, false),
-            WaveformMode::Templates => {
-                let (_, ns, nch) = session.template_shape();
-                let (mut lo, mut hi) = (0.0f32, 0.0f32);
-                for &(tid, _) in cache.templates.iter().flatten() {
-                    let w = session.template_waveform(tid).unwrap_or(&[]);
-                    for row in w.chunks_exact(nch.max(1)).take(ns) {
-                        for &ch in chans {
-                            let v = row.get(ch).copied().unwrap_or(0.0);
-                            lo = lo.min(v);
-                            hi = hi.max(v);
+        let all_source = self.params.source == WaveformSource::AllSpikes;
+        let generation = if all_source {
+            self.cache
+                .all_current()
+                .map_or(0, |result| result.generation)
+        } else {
+            0
+        };
+        self.cache
+            .frozen_range(mode, nc, generation, |cache| match mode {
+                WaveformMode::Waveforms => {
+                    if all_source {
+                        if let Some(all) = cache.all_current() {
+                            return all_signed_range(all, chans, true);
                         }
                     }
+                    signed_range(cache, chans, nc, snippet_len, true)
                 }
-                pad_range(lo, hi, 0.08)
-            }
-        })
+                WaveformMode::Mean => {
+                    if all_source {
+                        if let Some(all) = cache.all_current() {
+                            return all_signed_range(all, chans, false);
+                        }
+                    }
+                    signed_range(cache, chans, nc, snippet_len, false)
+                }
+                WaveformMode::Templates => {
+                    let (_, ns, nch) = session.template_shape();
+                    let (mut lo, mut hi) = (0.0f32, 0.0f32);
+                    for &(tid, _) in cache.templates.iter().flatten() {
+                        let w = session.template_waveform(tid).unwrap_or(&[]);
+                        for row in w.chunks_exact(nch.max(1)).take(ns) {
+                            for &ch in chans {
+                                let v = row.get(ch).copied().unwrap_or(0.0);
+                                lo = lo.min(v);
+                                hi = hi.max(v);
+                            }
+                        }
+                    }
+                    pad_range(lo, hi, 0.08)
+                }
+            })
     }
 
     /// Returns the channel edit a click on a box asks for.
@@ -1054,7 +1699,14 @@ impl<P: DataProvider> Ctx<'_, P> {
         chans: &[usize],
     ) -> Option<ChannelEdit> {
         let theme = self.theme;
-        let peaks = channel_peak_abs(&self.cache.means, self.nc);
+        let peaks = if self.params.source == WaveformSource::AllSpikes {
+            self.cache
+                .all_current()
+                .map(|all| all_channel_peak_abs(all, self.nc))
+                .unwrap_or_else(|| channel_peak_abs(&self.cache.means, self.nc))
+        } else {
+            channel_peak_abs(&self.cache.means, self.nc)
+        };
         if chans.iter().all(|&c| peaks[c] <= 0.0) && self.mode != WaveformMode::Templates {
             ui.label("no waveforms in range — try expanding the selection");
             return None;
@@ -1295,6 +1947,12 @@ impl<P: DataProvider> Ctx<'_, P> {
 
         let alpha = if theme.dark { 55 } else { 45 };
         let cache = &*self.cache;
+        let all = (self.params.source == WaveformSource::AllSpikes)
+            .then(|| cache.all_current())
+            .flatten();
+        // Once the full-set mean exists, show that exact mean while the
+        // complete cloud is rasterized/uploaded, never a capped substitute.
+        let all_raster = all.filter(|all| all.raster_complete);
         if self.mode == WaveformMode::Templates {
             let (_, ns, nch) = self.session.template_shape();
             for (k, &ci) in present.iter().enumerate() {
@@ -1320,7 +1978,7 @@ impl<P: DataProvider> Ctx<'_, P> {
             return;
         }
         if self.mode == WaveformMode::Waveforms {
-            for (k, &ci) in present.iter().enumerate() {
+            let draw_preview = |k: usize, ci: usize| {
                 let c = selection_colour(ci);
                 let faint = Stroke::new(
                     0.75_f32,
@@ -1336,6 +1994,38 @@ impl<P: DataProvider> Ctx<'_, P> {
                         .map(|t| map(k, t as f32 / last, snip[t * self.nc + ch]))
                         .collect();
                     painter.add(egui::Shape::line(pts, faint));
+                }
+            };
+            if let Some(all) = all_raster {
+                // One cached density image per cluster/channel: every drawn
+                // trace is already composited off the paint path, so even
+                // thousands of raw waveforms cost one textured quad each.
+                let (raster_lo, raster_hi) = (all.raster_lo, all.raster_hi);
+                for (k, &ci) in present.iter().enumerate() {
+                    let Some(texture) = cache.texture_id(ci, ch) else {
+                        // Upload budget still has this complete image queued.
+                        // The exact mean below is already available; do not
+                        // claim "all" while substituting a sampled cloud.
+                        continue;
+                    };
+                    let (a, b) = span(k);
+                    let rect =
+                        density_image_rect(sub, (a, b), base, y_scale, (raster_lo, raster_hi));
+                    if rect.is_positive() {
+                        painter.image(
+                            texture,
+                            rect,
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            selection_colour(ci).gamma_multiply(fade),
+                        );
+                    }
+                }
+            } else if self.params.source == WaveformSource::Sampled || all.is_none() {
+                // Sampled preview (explicit `Sampled`, or before the worker
+                // delivers its first result). Bounded by n_spikes, and the
+                // pane labels it as a preview.
+                for (k, &ci) in present.iter().enumerate() {
+                    draw_preview(k, ci);
                 }
             }
         }
@@ -1387,7 +2077,11 @@ impl<P: DataProvider> Ctx<'_, P> {
             painter.add(egui::Shape::line(pts, Stroke::new(2.0_f32, self.accent)));
         }
         for (k, &ci) in present.iter().enumerate() {
-            let Some(mean) = cache.means.get(ci).and_then(|m| m.get(ch)) else {
+            let mean = all
+                .and_then(|all| all.cluster(k))
+                .and_then(|cluster| cluster.mean.get(ch))
+                .or_else(|| cache.means.get(ci).and_then(|m| m.get(ch)));
+            let Some(mean) = mean else {
                 continue;
             };
             let pts: Vec<Pos2> = mean
@@ -1486,6 +2180,22 @@ impl<P: DataProvider> Ctx<'_, P> {
     }
 }
 
+/// Keep the full texture geometry and let the painter clip it. Intersecting
+/// this rectangle with the channel box would stretch all UVs into the clipped
+/// area and make the spike cloud disagree with the mean at higher gain.
+fn density_image_rect(
+    sub: Rect,
+    span: (f32, f32),
+    base: f32,
+    y_scale: f32,
+    range: (f32, f32),
+) -> Rect {
+    Rect::from_min_max(
+        Pos2::new(sub.left() + sub.width() * span.0, base - range.1 * y_scale),
+        Pos2::new(sub.left() + sub.width() * span.1, base - range.0 * y_scale),
+    )
+}
+
 /// L-shaped scale bar with its label to the right.
 pub(crate) fn scale_bar(
     painter: &egui::Painter,
@@ -1546,9 +2256,97 @@ pub(crate) fn signed_range(
     pad_range(lo, hi, 0.08)
 }
 
+/// Signed range over an all-spike result: actual min/max of every valid
+/// snippet for `Waveforms`, means only for `Mean`.
+fn all_signed_range(all: &AllResult, chans: &[usize], snips: bool) -> (f32, f32) {
+    let (mut lo, mut hi) = (0.0f32, 0.0f32);
+    for cluster in &all.clusters {
+        if snips {
+            for &ch in chans {
+                if let (Some(&a), Some(&b)) = (cluster.min.get(ch), cluster.max.get(ch)) {
+                    lo = lo.min(a);
+                    hi = hi.max(b);
+                }
+            }
+        } else {
+            for &ch in chans {
+                for &v in cluster.mean.get(ch).map_or(&[][..], Vec::as_slice) {
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                }
+            }
+        }
+    }
+    pad_range(lo, hi, 0.08)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texture_upload_progress_waits_for_all_channels_but_not_empty_clusters() {
+        let ctx = egui::Context::default();
+        let mut cache = WaveformCache::default();
+        let mut result = AllResult {
+            clusters: vec![waveform_all::AllCluster {
+                total: 0,
+                valid: 0,
+                invalid: 0,
+                out_of_range: 0,
+                missing: 0,
+                drawn: 0,
+                mean: vec![],
+                min: vec![],
+                max: vec![],
+                raster: vec![],
+            }],
+            render_channels: vec![0, 1, 2, 3],
+            raster_lo: -1.0,
+            raster_hi: 1.0,
+            total: 0,
+            valid: 0,
+            invalid: 0,
+            out_of_range: 0,
+            missing: 0,
+            drawn: 0,
+            raster_failed: 0,
+            raster_complete: true,
+            incomplete: false,
+            cancelled: false,
+            elapsed_ms: 0,
+            generation: 1,
+        };
+        assert!(!cache.texture_uploads_pending(&result, &result.render_channels));
+        result.clusters[0].valid = 1;
+        assert!(cache.texture_uploads_pending(&result, &result.render_channels));
+        for &ch in &result.render_channels {
+            let texture = ctx.load_texture(
+                format!("test-all-channel-{ch}"),
+                egui::ColorImage::filled([1, 1], Color32::TRANSPARENT),
+                egui::TextureOptions::LINEAR,
+            );
+            cache.textures.insert((0, ch), (1, texture));
+            assert_eq!(
+                cache.texture_uploads_pending(&result, &result.render_channels),
+                ch != 3,
+                "not ready until every displayed channel has its complete image"
+            );
+        }
+    }
+
+    #[test]
+    fn density_gain_keeps_full_uv_geometry_for_clipping_like_the_mean() {
+        let sub = Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 100.0));
+        let rect = density_image_rect(sub, (0.25, 0.75), 50.0, 100.0, (-1.0, 1.0));
+        assert_eq!(rect.min, Pos2::new(25.0, -50.0));
+        assert_eq!(rect.max, Pos2::new(75.0, 150.0));
+        assert_eq!(rect.center().y, 50.0);
+        assert!(
+            rect.height() > sub.height(),
+            "gain crops via painter clip, not by stretching the whole texture"
+        );
+    }
 
     #[test]
     fn spread_covers_the_whole_list() {
@@ -1713,5 +2511,100 @@ mod tests {
         // 2 samples x 3 channels
         assert_eq!(template_peak(&[0.0, 1.0, -0.5, 0.2, -3.0, 0.1], 3), Some(1));
         assert_eq!(template_peak(&[0.0; 6], 3), None);
+    }
+
+    #[test]
+    fn mean_toggle_is_mean_only_versus_all_spike_waveforms() {
+        let mut p = WaveformParams {
+            mode: WaveformMode::Waveforms,
+            source: WaveformSource::Sampled,
+            n_spikes: 100,
+            ..Default::default()
+        };
+        toggle_mean(&mut p);
+        assert_eq!(p.mode, WaveformMode::Mean);
+        assert_eq!(
+            p.source,
+            WaveformSource::AllSpikes,
+            "M must not keep a stored 100-spike cap"
+        );
+        toggle_mean(&mut p);
+        assert_eq!(p.mode, WaveformMode::Waveforms);
+        assert_eq!(p.source, WaveformSource::AllSpikes);
+        // From Templates, the first press is mean-only (phy's toggle).
+        p.mode = WaveformMode::Templates;
+        toggle_mean(&mut p);
+        assert_eq!(p.mode, WaveformMode::Mean);
+        toggle_mean(&mut p);
+        assert_eq!(p.mode, WaveformMode::Waveforms);
+        assert_eq!(p.source, WaveformSource::AllSpikes);
+    }
+
+    #[test]
+    fn pane_hover_gate_ignores_focused_buttons_but_not_text_or_dialogs() {
+        assert!(waveform_keys_allowed(true, false, false, false));
+        assert!(
+            !waveform_keys_allowed(false, false, false, false),
+            "an unrelated pane owns the pointer"
+        );
+        assert!(
+            !waveform_keys_allowed(true, true, false, false),
+            "typing in a text editor is protected"
+        );
+        assert!(
+            !waveform_keys_allowed(true, false, true, false),
+            "settings/modal dialogs own the keys"
+        );
+        assert!(
+            !waveform_keys_allowed(true, false, false, true),
+            "an open popup owns the keys"
+        );
+        // A focused button/table is neither text input nor a modal: allowed.
+        assert!(waveform_keys_allowed(true, false, false, false));
+    }
+
+    #[test]
+    fn configured_mean_chord_fires_once_per_plain_press_and_ignores_auto_repeat() {
+        let ctx = egui::Context::default();
+        let key = |repeat| egui::Event::Key {
+            key: egui::Key::M,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let release = egui::Event::Key {
+            key: egui::Key::M,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // egui rewrites `repeat` from keys-down state, so a real second press
+        // must have a release between it and the first; the middle event
+        // exercises auto-repeat suppression.
+        let input = egui::RawInput {
+            events: vec![key(false), key(false), release, key(false)],
+            ..Default::default()
+        };
+        let mut presses = 0;
+        let mut left = 0;
+        let _ = ctx.run_ui(input, |ui| {
+            presses = consume_mean_presses(ui.ctx());
+            left = ui.ctx().input(|i| {
+                i.events
+                    .iter()
+                    .filter(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+                    .count()
+            });
+        });
+        assert_eq!(
+            presses, 2,
+            "every physical press toggles; auto-repeat does not"
+        );
+        assert_eq!(
+            left, 1,
+            "only the repeat event is left for downstream widgets"
+        );
     }
 }

@@ -60,7 +60,7 @@ Views show the best clusters first, then the similar ones.
 | `G`                            | Merge the selection into the first-selected cluster.                                                  |
 | `K`                            | Split off the spikes inside the Features lasso.                                                       |
 | `L`                            | Open the snippet bar with `:l ` typed (set a label).                                                  |
-| `Alt+G` / `M` / `N` / `U`      | Move the **best** clusters to good / MUA / noise / unsorted.                                          |
+| `Alt+G` / `Alt+M` / `Alt+N` / `Alt+U` | Mark the cluster-table selection good / MUA / noise / unsorted.                                    |
 | `Ctrl+G` / `M` / `N` / `U`     | Move the **similar** clusters.                                                                        |
 | `Ctrl+Alt+G` / `M` / `N` / `U` | Move **all** selected clusters.                                                                       |
 | `Ctrl+Z`                       | Undo.                                                                                                 |
@@ -72,6 +72,9 @@ Views show the best clusters first, then the similar ones.
 A move is journaled as a single entry, so one undo reverts it. Afterwards
 the wizard advances as phy's does. Moving the best clusters selects the
 next table row. Moving a similar cluster steps to the next similar one.
+`G` requires at least two selected clusters and combines their actual spike
+memberships into the first-selected cluster; it is not just a visual group.
+One Undo restores all of the merged memberships.
 
 ## Navigation
 
@@ -134,6 +137,14 @@ field has focus. They are configurable in Settings too.
 | Waveforms | `R` / `Shift+R` | Reset scales. |
 | CCG | `N` | Toggle uniform normalization. |
 
+While hovering Waveforms, each `M` press switches between the mean alone
+and individual waveforms from **every valid spike**, with the same full-set
+mean overlaid. No click in the pane is needed. Loading counts distinguish
+available waveforms from the total cluster spike count; text fields and
+dialogs keep their keyboard input.
+An explicitly selected sample preview is separate; `M` always restores the
+all-spike source, even with older preferences that stored a 100-spike cap.
+
 Undo moves to the previous edit and redo to the branch you visited last.
 An edit after an undo starts a new branch, and the old one stays in the
 [History](./history.md) pane. The top bar's Undo/Redo buttons name the
@@ -172,10 +183,10 @@ every view (first selected = blue, second = orange, …).
 | ISI                             | click the shaded refractory band / a `<1 ms` chip         | Brush the violating spikes (both of each pair < 1 ms) of every shown / that cluster; Esc clears.                                                                                                                                                                                                                  |
 | Waveforms                       | Ctrl-click / Ctrl-right-click a channel box               | Make that channel Features channel A / B (phy `select_channel`).                                                                                                                                                                                                                                                  |
 | Features                        | Ctrl-click / Ctrl-drag                                    | Ctrl-click adds a lasso node in that subplot; Ctrl-drag draws one freehand (simplified to at most 64 nodes on release, replacing the old lasso); `Ctrl`-right-click or `Esc` clears; `K` splits the spikes inside.                                                                                                |
-| Features                        | Drag / double-click / right-click on a lasso              | On a closed lasso: drag a node to move it, double-click an edge to insert a node, right-click a node to delete it (never below three). A plain drag elsewhere moves all projection windows together, not the dots within a window. |
+| Features                        | Drag / double-click / right-click on a lasso              | On a closed lasso: drag a node to move it, double-click an edge to insert a node, right-click a node to delete it (never below three). A plain drag elsewhere pans the whole projection grid — squares, gaps and captions together — not the dots within one square. |
 | Features                        | **k-means** button / `:km`                                | Lasso the smallest k-means part of the first selected cluster (exact members highlighted, a chip per part to switch); **auto-run** refits as the selection changes. `K` splits.                                                                                                                                   |
 | Features                        | Alt+click a spike / Shift+drag a time cell                | Alt+click on a spike (6 px) seeks the Trace to it; elsewhere it picks the amplitude feature. Shift+drag along a time cell sets the time range, Shift+click clears it.                                                                                                                                             |
-| Features                        | wheel / Ctrl-wheel / Alt-wheel / drag / double-click      | Zoom each projection's contents about its centre / scale PC features / marker size / move all projection windows together / reset. These gestures do not resize the projection windows; reset returns to the full 4×4 grid. |
+| Features                        | wheel / Ctrl-wheel / Alt-wheel / drag / double-click      | Zoom the whole 4×4 projection grid like one image around the pointer, scaling squares, gaps and captions together / scale PC features / marker size / pan that canvas / reset the zoom and pan so all 16 projections fit again. Plain wheel and drag do not change data ranges, the lasso, the spike brush or cluster data; the toolbar and alternatives strip stay fixed. |
 | Features 3D                     | drag / Shift-drag (or middle-drag) / wheel / double-click | Orbit / pan / zoom / reset the camera; click a triple in the AXES list (or the combo box) to change the axes; the **pinned** chip holds the focused 2D plot's pair so only its third axis is chosen, **×** on it lists every triple. Inspection only: no lasso here, and drags with Ctrl or Alt held are ignored. |
 | Similar                         | click a row                                               | Select the primary cluster together with that candidate.                                                                                                                                                                                                                                                          |
 | Similar                         | Cmd/Ctrl-click a row                                      | Add that candidate to the current selection.                                                                                                                                                                                                                                                                      |

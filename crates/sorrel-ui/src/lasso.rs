@@ -30,6 +30,14 @@ pub struct Lasso {
     /// Node being dragged, and the live Ctrl+drag stroke (screen space).
     drag: Option<usize>,
     stroke: Vec<Pos2>,
+    stroke_previous_cell: usize,
+    /// A Ctrl-click polygon stays a draft between its mouse clicks.
+    polygon_draft: bool,
+    /// Latch the gesture's modifier at press, not at a later release/K frame.
+    pressed_command: Option<(usize, bool)>,
+    /// Escape may run before a captured click's release reaches the pane.
+    /// Ignore the old gesture until a genuinely new press begins.
+    discard_until_press: bool,
     /// Hover feedback from the last `interact`: node under the pointer, or
     /// the projection of the pointer on a nearby edge (screen space).
     hot: Option<usize>,
@@ -72,13 +80,41 @@ impl Lasso {
         self.drag.is_some() || !self.stroke.is_empty()
     }
 
+    pub fn is_drafting(&self) -> bool {
+        self.polygon_draft || self.is_editing()
+    }
+
+    /// Ctrl release completes a clicked polygon, but never finishes a mouse
+    /// gesture before its captured release has been processed.
+    pub fn finish_polygon_on_release(&mut self, command: bool, pointer_down: bool) -> bool {
+        if self.polygon_draft && !command && !pointer_down && !self.is_editing() {
+            self.polygon_draft = false;
+            return true;
+        }
+        false
+    }
+
+    /// K is an explicit finish as well as a split; it does not depend on a
+    /// preview having computed the polygon's members already.
+    pub fn finish_polygon(&mut self) {
+        if !self.is_editing() {
+            self.polygon_draft = false;
+        }
+    }
+
     pub fn clear(&mut self) {
         *self = Self::default();
+        self.discard_until_press = true;
     }
 
     #[cfg(test)]
     pub(crate) fn set_test_editing(&mut self, editing: bool) {
         self.drag = editing.then_some(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_drafting(&mut self, drafting: bool) {
+        self.polygon_draft = drafting;
     }
 
     /// Delete node `i`; a polygon never drops below three nodes.
@@ -104,15 +140,64 @@ impl Lasso {
         let at = resp.interact_pointer_pos().map(|p| resp.rect.clamp(p));
         let screen = |s: &Self| s.points.iter().map(|&p| to_screen(p)).collect::<Vec<_>>();
         let mine = self.is_closed() && self.cell == cell;
+        let (pressed, released) = resp.ctx.input(|i| {
+            (
+                i.pointer.button_pressed(Primary),
+                i.pointer.button_released(Primary),
+            )
+        });
+        if self.discard_until_press {
+            if pressed && (resp.is_pointer_button_down_on() || resp.clicked()) {
+                self.discard_until_press = false;
+            } else {
+                ev.consumed = released || resp.ctx.input(|i| i.pointer.primary_down());
+                return ev;
+            }
+        }
+        if pressed && (resp.is_pointer_button_down_on() || resp.clicked()) {
+            let command = resp.ctx.input(|i| {
+                i.events
+                    .iter()
+                    .find_map(|event| match event {
+                        egui::Event::PointerButton {
+                            pressed: true,
+                            modifiers,
+                            pos,
+                            ..
+                        } if resp.rect.contains(*pos) => Some(modifiers.command),
+                        _ => None,
+                    })
+                    .unwrap_or(m.command)
+            });
+            self.pressed_command = Some((cell, command));
+        }
 
         // Ctrl+drag: record, draw live, close on release.
         if m.command && resp.drag_started_by(Primary) {
+            // egui only blurs text editors on clicks by default, not drags.
+            // Drawing a lasso must leave the cluster filter's text focus so
+            // the next K is a curation command rather than filter input.
+            resp.request_focus();
+            self.stroke_previous_cell = self.cell;
             self.cell = cell;
             self.stroke = press.into_iter().collect();
         }
         // A shared lasso is visited by every projection each frame. Only
         // the projection where the gesture began may extend or finish it.
         if self.is_editing() && self.cell != cell {
+            return ev;
+        }
+        // A modifier change must not leave a captured node drag stuck in
+        // "editing", which would reject every subsequent K press.
+        if released && self.drag.is_some() {
+            if let (Some(i), Some(p)) = (self.drag.take(), at) {
+                let point = to_data(p);
+                ev.changed = self.points[i] != point;
+                self.points[i] = point;
+            }
+            self.pressed_command = None;
+            ev.consumed = true;
+            resp.ctx.request_repaint();
             return ev;
         }
         if !self.stroke.is_empty() && resp.dragged_by(Primary) {
@@ -131,10 +216,30 @@ impl Lasso {
         }
         if !self.stroke.is_empty() {
             ev.consumed = true;
-            if resp.drag_stopped() {
+            if resp.drag_stopped() || released {
+                self.stroke.extend(at);
+                let stationary = self.stroke.first().is_some_and(|first| {
+                    self.stroke
+                        .iter()
+                        .all(|point| point.distance(*first) <= NODE_HIT)
+                });
                 let nodes = simplify_stroke(&self.stroke);
                 self.stroke.clear();
-                if nodes.len() >= 3 {
+                self.pressed_command = None;
+                if stationary {
+                    // Long stationary clicks can be classified as drags by
+                    // egui. They are still polygon vertices, not empty loops.
+                    if self.points.is_empty() || self.stroke_previous_cell == cell {
+                        if let Some(p) = at {
+                            self.points.push(to_data(p));
+                            self.polygon_draft = m.command;
+                            ev.changed = true;
+                            ev.drawn = true;
+                        }
+                    } else {
+                        self.cell = self.stroke_previous_cell;
+                    }
+                } else if nodes.len() >= 3 {
                     *self = Self {
                         cell,
                         points: nodes.iter().map(|&p| to_data(p)).collect(),
@@ -150,7 +255,34 @@ impl Lasso {
             return ev;
         }
 
-        if m.command {
+        // A Ctrl+click release, Ctrl release, and plain K can share one
+        // native frame. The frame's final modifiers then omit Ctrl: use
+        // the pointer event's modifiers or the last polygon node is lost.
+        let click_command = self
+            .pressed_command
+            .filter(|(owner, _)| *owner == cell)
+            .map(|(_, command)| command)
+            .unwrap_or_else(|| {
+                resp.ctx.input(|i| {
+                    i.events
+                        .iter()
+                        .rev()
+                        .find_map(|event| match event {
+                            egui::Event::PointerButton {
+                                pos,
+                                pressed: false,
+                                modifiers,
+                                ..
+                            } if resp.rect.contains(*pos) => Some(modifiers.command),
+                            _ => None,
+                        })
+                        .unwrap_or(m.command)
+                })
+            });
+        if released && self.pressed_command.is_some_and(|(owner, _)| owner == cell) {
+            self.pressed_command = None;
+        }
+        if click_command {
             if resp.secondary_clicked() {
                 self.clear();
                 return LassoEvent {
@@ -164,7 +296,9 @@ impl Lasso {
                     self.cell = cell;
                 }
                 if self.cell == cell {
+                    resp.request_focus();
                     self.points.push(to_data(p));
+                    self.polygon_draft = m.command;
                     return LassoEvent {
                         changed: true,
                         consumed: true,
@@ -177,6 +311,9 @@ impl Lasso {
             let pts = screen(self);
             if resp.drag_started_by(Primary) {
                 self.drag = press.and_then(|p| nearest_node(&pts, p, NODE_HIT));
+                if self.drag.is_some() {
+                    resp.request_focus();
+                }
             }
             if let Some(i) = self.drag {
                 ev.consumed = true;
@@ -354,13 +491,22 @@ mod tests {
     use super::*;
 
     fn frame(ctx: &egui::Context, lasso: &mut Lasso, events: Vec<egui::Event>) -> [LassoEvent; 2] {
+        frame_with_modifiers(ctx, lasso, events, egui::Modifiers::COMMAND)
+    }
+
+    fn frame_with_modifiers(
+        ctx: &egui::Context,
+        lasso: &mut Lasso,
+        events: Vec<egui::Event>,
+        modifiers: egui::Modifiers,
+    ) -> [LassoEvent; 2] {
         let mut result = [LassoEvent::default(); 2];
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 Pos2::ZERO,
                 egui::vec2(260.0, 160.0),
             )),
-            modifiers: egui::Modifiers::COMMAND,
+            modifiers,
             events,
             ..Default::default()
         };
@@ -384,6 +530,73 @@ mod tests {
             pressed,
             modifiers: egui::Modifiers::COMMAND,
         }
+    }
+
+    #[test]
+    fn clicked_polygon_remains_a_draft_between_clicks_and_uses_press_modifiers() {
+        let ctx = egui::Context::default();
+        let mut lasso = Lasso::default();
+        frame(&ctx, &mut lasso, vec![]);
+        for pos in [
+            egui::pos2(25.0, 25.0),
+            egui::pos2(95.0, 25.0),
+            egui::pos2(95.0, 95.0),
+        ] {
+            frame(
+                &ctx,
+                &mut lasso,
+                vec![egui::Event::PointerMoved(pos), pointer_button(pos, true)],
+            );
+            frame(&ctx, &mut lasso, vec![pointer_button(pos, false)]);
+            assert!(lasso.is_drafting());
+            assert!(
+                !lasso.is_editing(),
+                "mouse is up, but polygon construction is not finished"
+            );
+        }
+        assert!(lasso.is_closed());
+        assert!(lasso.finish_polygon_on_release(false, false));
+        assert!(!lasso.is_drafting());
+        let pos = egui::pos2(25.0, 95.0);
+        frame(
+            &ctx,
+            &mut lasso,
+            vec![egui::Event::PointerMoved(pos), pointer_button(pos, true)],
+        );
+        let release = egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame_with_modifiers(&ctx, &mut lasso, vec![release], egui::Modifiers::NONE);
+        assert_eq!(
+            lasso.points.len(),
+            4,
+            "releasing Ctrl before mouse-up does not lose the last vertex"
+        );
+    }
+
+    #[test]
+    fn a_ctrl_click_uses_its_own_modifiers_not_the_frames_final_keys() {
+        let ctx = egui::Context::default();
+        let mut lasso = Lasso::new(0, vec![[30.0, 30.0], [90.0, 30.0]]);
+        frame(&ctx, &mut lasso, vec![]);
+        let pos = egui::pos2(90.0, 90.0);
+        frame(
+            &ctx,
+            &mut lasso,
+            vec![egui::Event::PointerMoved(pos), pointer_button(pos, true)],
+        );
+        let event = frame_with_modifiers(
+            &ctx,
+            &mut lasso,
+            vec![pointer_button(pos, false)],
+            egui::Modifiers::NONE,
+        );
+        assert!(event[0].drawn && event[0].changed);
+        assert!(lasso.is_closed());
+        assert_eq!(lasso.points[2], [pos.x, pos.y]);
     }
 
     #[test]

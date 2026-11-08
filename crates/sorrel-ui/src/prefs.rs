@@ -114,6 +114,20 @@ pub enum WaveformMode {
     Templates,
 }
 
+/// Which spikes drive the waveform pane.
+///
+/// `AllSpikes` is the default and what `M` always restores: every spike the
+/// selected cluster owns contributes to the mean, not the legacy
+/// `n_spikes`-capped sample. `Sampled` is an explicit, clearly-labelled
+/// opt-in for a fast preview and is never selected by old preferences.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaveformSource {
+    #[default]
+    AllSpikes,
+    Sampled,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WaveformParams {
@@ -123,8 +137,11 @@ pub struct WaveformParams {
     pub overlap: bool,
     /// `ctrl+l`: channel id labels.
     pub show_labels: bool,
-    /// phy `n_spikes_waveforms`.
+    /// phy `n_spikes_waveforms`, used only by the explicit `Sampled` source.
+    /// Old files keep the value, but it no longer caps the default view.
     pub n_spikes: usize,
+    /// All spikes (default) or an explicit `n_spikes` preview.
+    pub source: WaveformSource,
     /// Total channels in the waveform pane, shared by all selected clusters.
     /// Four is the tetrode default; larger probes can opt in to more.
     pub max_channels: usize,
@@ -146,6 +163,7 @@ impl Default for WaveformParams {
             overlap: true,
             show_labels: true,
             n_spikes: 100,
+            source: WaveformSource::AllSpikes,
             max_channels: 4,
             box_scale: [1.0, 1.0],
             probe_scale: [1.0, 1.0],
@@ -232,18 +250,42 @@ mod tests {
     #[test]
     fn waveform_channel_limit_defaults_to_four_and_survives_old_preferences() {
         assert_eq!(WaveformParams::default().max_channels, 4);
+        assert_eq!(
+            WaveformParams::default().source,
+            WaveformSource::AllSpikes,
+            "M and the default view use every spike"
+        );
         let old: WaveformParams =
             serde_json::from_str(r#"{"n_spikes":80,"overlap":false}"#).unwrap();
         assert_eq!(old.max_channels, 4);
         assert_eq!(old.n_spikes, 80);
+        assert_eq!(
+            old.source,
+            WaveformSource::AllSpikes,
+            "a stored legacy cap must not become the default source"
+        );
         assert!(!old.overlap);
         let changed = WaveformParams {
             max_channels: 12,
+            source: WaveformSource::Sampled,
             ..Default::default()
         };
         let back: WaveformParams =
             serde_json::from_str(&serde_json::to_string(&changed).unwrap()).unwrap();
         assert_eq!(back.max_channels, 12);
+        assert_eq!(back.source, WaveformSource::Sampled);
+    }
+
+    #[test]
+    fn a_stored_hundred_spike_cap_does_not_become_all_spike_semantics() {
+        let old: WaveformParams =
+            serde_json::from_str(r#"{"mode":"Waveforms","n_spikes":100}"#).unwrap();
+        assert_eq!(old.n_spikes, 100, "the preview setting round-trips");
+        assert_eq!(
+            old.source,
+            WaveformSource::AllSpikes,
+            "but M/all spikes ignore it unless the user opts in"
+        );
     }
 
     #[test]
