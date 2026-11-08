@@ -219,6 +219,11 @@ pub struct SpikeDiff {
     pub exclusion: Pr,
     /// Adjusted Rand index of the two spike partitions.
     pub ari: f64,
+    /// Every spike has the same unit membership (up to a bijective id rename)
+    /// and the same original label, including noise units. False for empty
+    /// comparisons or any excluded disputed root; binary folding and tolerant
+    /// Jaccard matches cannot establish exact agreement.
+    pub exact_match: bool,
     pub misses: Vec<Miss>,
 }
 
@@ -557,6 +562,16 @@ pub fn diff_spikes(
     };
     misses.sort_by(|a, b| (order(a.category), &a.roots).cmp(&(order(b.category), &b.roots)));
 
+    let strict_t = label_map(truth.labels);
+    let strict_s = label_map(test.labels);
+    let exact_match = n_spikes > 0
+        && disputed_seen.is_empty()
+        && ts.len() == size_t.len()
+        && ts.len() == size_s.len()
+        && ts
+            .keys()
+            .all(|&(t, s)| label(&strict_t, t) == label(&strict_s, s));
+
     Ok(SpikeDiff {
         n_spikes,
         n_root_clusters: roots.len() as u32,
@@ -572,6 +587,7 @@ pub fn diff_spikes(
         splits,
         exclusion,
         ari,
+        exact_match,
         misses,
     })
 }
@@ -759,6 +775,10 @@ impl SpikeDiff {
             "labels: agree {}/{} kappa {:.3}\nARI {:.3}\n",
             self.labels.n_agree, self.labels.n_clusters, self.labels.kappa, self.ari
         );
+        s += &format!(
+            "exact match (all spikes, original labels): {}\n",
+            self.exact_match
+        );
         for m in &self.misses {
             let ids: Vec<String> = m.roots.iter().map(u32::to_string).collect();
             s += &format!("{}\t{}", m.category, ids.join(","));
@@ -849,6 +869,73 @@ mod tests {
             (1.0, 1.0, d.labels.n_clusters)
         );
         assert_eq!((d.merges.n_truth, d.splits.n_truth), (1, 1));
+        assert!(d.exact_match);
+    }
+
+    #[test]
+    fn exact_match_allows_id_renaming_but_not_noise_repartition_or_label_folding() {
+        let root = [0, 0, 1, 1];
+        let truth = Curation {
+            clusters: &root,
+            labels: &[(0, PhyLabel::Good), (1, PhyLabel::Noise)],
+        };
+        let renamed = [7, 7, 8, 8];
+        let test = Curation {
+            clusters: &renamed,
+            labels: &[(7, PhyLabel::Good), (8, PhyLabel::Noise)],
+        };
+        assert!(
+            diff_spikes(&root, &truth, &test, &SpikeDiffOpts::default())
+                .unwrap()
+                .exact_match
+        );
+        let folded = Curation {
+            clusters: &renamed,
+            labels: &[(7, PhyLabel::Good), (8, PhyLabel::Mua)],
+        };
+        let d = diff_spikes(&root, &truth, &folded, &SpikeDiffOpts::default()).unwrap();
+        assert_eq!(d.good_units.recall, 1.0);
+        assert!(
+            !d.exact_match,
+            "binary scoring must not hide an original label mismatch"
+        );
+        let split_noise = [7, 7, 8, 9];
+        let test = Curation {
+            clusters: &split_noise,
+            labels: &[
+                (7, PhyLabel::Good),
+                (8, PhyLabel::Noise),
+                (9, PhyLabel::Noise),
+            ],
+        };
+        assert!(
+            !diff_spikes(&root, &truth, &test, &SpikeDiffOpts::default())
+                .unwrap()
+                .exact_match
+        );
+        let opts = SpikeDiffOpts {
+            disputed: HashSet::from([1]),
+            ..Default::default()
+        };
+        assert!(
+            !diff_spikes(&root, &truth, &truth, &opts)
+                .unwrap()
+                .exact_match,
+            "excluding a root cannot certify the whole recording"
+        );
+    }
+
+    #[test]
+    fn empty_comparison_is_not_evidence_of_exact_agreement() {
+        let empty = Curation {
+            clusters: &[],
+            labels: &[],
+        };
+        assert!(
+            !diff_spikes(&[], &empty, &empty, &SpikeDiffOpts::default())
+                .unwrap()
+                .exact_match
+        );
     }
 
     #[test]

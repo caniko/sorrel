@@ -53,6 +53,29 @@ impl DiagGmm {
             })
             .collect()
     }
+
+    /// Winning component, its posterior probability and its squared
+    /// Mahalanobis distance for each row. Posterior distinguishes overlapping
+    /// components; distance also rejects remote tails with high posterior.
+    pub fn assign_with_confidence(&self, data: &[f32]) -> Vec<(u32, f64, f64)> {
+        let mut lj = vec![0.0; self.k];
+        data.chunks_exact(self.d)
+            .map(|row| {
+                self.log_joint(row, &mut lj);
+                let j = (0..self.k)
+                    .max_by(|&a, &b| lj[a].total_cmp(&lj[b]))
+                    .unwrap_or(0);
+                let sum: f64 = lj.iter().map(|&v| (v - lj[j]).exp()).sum();
+                let distance = (0..self.d)
+                    .map(|i| {
+                        (row[i] as f64 - self.means[j * self.d + i]).powi(2)
+                            / self.vars[j * self.d + i]
+                    })
+                    .sum();
+                (j as u32, 1.0 / sum, distance)
+            })
+            .collect()
+    }
 }
 
 /// Fit `k` components to `data` (`d` columns). `None` for too few rows or
@@ -187,5 +210,28 @@ mod tests {
             .min_by(|a, b| a.bic().total_cmp(&b.bic()))
             .unwrap();
         assert_eq!(best.k, 1);
+    }
+
+    #[test]
+    fn confidence_distinguishes_overlap_and_remote_high_posterior_tails() {
+        let g = DiagGmm {
+            k: 2,
+            d: 1,
+            weights: vec![0.5, 0.5],
+            means: vec![-3.0, 3.0],
+            vars: vec![1.0, 1.0],
+            log_lik: 0.0,
+            n: 10,
+        };
+        let rows = [-3.0, 0.0, 3.0, 1000.0];
+        let details = g.assign_with_confidence(&rows);
+        assert_eq!(
+            details.iter().map(|x| x.0).collect::<Vec<_>>(),
+            g.assign(&rows)
+        );
+        assert!(details[0].1 > 0.99 && details[0].2 == 0.0);
+        assert!((details[1].1 - 0.5).abs() < 1e-12);
+        assert!(details[3].1 > 0.99 && details[3].2 > 100_000.0);
+        assert!(details.iter().all(|x| x.1.is_finite() && x.2.is_finite()));
     }
 }

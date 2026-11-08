@@ -305,6 +305,7 @@ impl DevDb {
         }
         let mut conn =
             Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL)")?;
         let have: i64 = conn.query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -366,6 +367,34 @@ impl DevDb {
 
     fn guard_opt<'a>(&self, what: &str, v: Option<&'a str>) -> Result<Option<&'a str>> {
         v.map(|v| self.guard(what, v)).transpose()
+    }
+
+    /// A qualified model reference is not a filesystem path. Permit exactly
+    /// provider/model[#variant], while retaining the deny list and rejecting
+    /// absolute paths, traversal, backslashes and extra path components.
+    fn guard_model<'a>(&self, value: &'a str) -> Result<&'a str> {
+        if !value.contains('/') {
+            return self.guard("model", value);
+        }
+        let token = |part: &str| {
+            part.as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        };
+        let (provider, model) = value.split_once('/').unwrap();
+        let valid_model = model.split_once('#').map_or_else(
+            || token(model),
+            |(name, variant)| token(name) && token(variant),
+        );
+        ensure!(
+            token(provider) && valid_model,
+            "privacy guard: invalid qualified model reference"
+        );
+        self.deny_check("model", value)?;
+        Ok(value)
     }
 
     fn split_of(&self, sid: &str) -> Result<Option<String>> {
@@ -569,7 +598,10 @@ impl DevDb {
             self.guard("status", &r.status)?,
         );
         let (model, usage) = (
-            self.guard_opt("model", r.model.as_deref())?,
+            r.model
+                .as_deref()
+                .map(|m| self.guard_model(m))
+                .transpose()?,
             self.guard_opt("usage", r.usage.as_deref())?,
         );
         let (prompt_rev, sorrel_rev, learned_rev) = (
@@ -697,6 +729,7 @@ impl DevDb {
             "split_share",
         ];
         flatten(&serde_json::to_value(d)?, "", &skip, &mut metrics);
+        metrics.insert("exact_match".into(), if d.exact_match { 1.0 } else { 0.0 });
         // Miss text reaches the DB twice (misses rows, misses.<category> metric
         // names): guard it before either write.
         for m in &d.misses {
@@ -1409,6 +1442,17 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_recorders_wait_for_brief_writer_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = db(dir.path());
+        let timeout: i64 = d
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(timeout, 30_000);
+    }
+
+    #[test]
     fn privacy_guard_refuses_paths_basenames_and_sealed_sids() {
         let dir = tempfile::tempdir().unwrap();
         let mut d = db(dir.path());
@@ -1472,6 +1516,46 @@ mod tests {
             d.query("SELECT COUNT(*) FROM runs").unwrap(),
             "COUNT(*)\n0\n"
         );
+    }
+
+    #[test]
+    fn qualified_models_are_recorded_without_relaxing_other_privacy_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = db(dir.path());
+        d.record_session(&dev("s1", "fp1")).unwrap();
+        let run = |model: &str| RunRow {
+            rid: "r1".into(),
+            sid: "s1".into(),
+            variant: "base".into(),
+            arm: "mcp-review".into(),
+            status: "failed".into(),
+            model: Some(model.into()),
+            ..Default::default()
+        };
+        for model in [
+            "openai/gpt-6.1-sol",
+            "opencode-go/deepseek-v4.1-flash#max",
+            "claude-test",
+        ] {
+            d.record_run(&run(model), &[]).unwrap();
+            assert!(d.query("SELECT model FROM runs").unwrap().contains(model));
+        }
+        for model in [
+            "/data/x",
+            "C:/lab",
+            "../recording",
+            "a/b/c",
+            "a\\b",
+            "openai/model#",
+            "sess_ks4/model",
+            "openai/deadbeef",
+        ] {
+            assert!(
+                d.record_run(&run(model), &[]).is_err(),
+                "accepted invalid model"
+            );
+        }
+        assert!(d.guard("variant", "openai/model").is_err());
     }
 
     #[test]
