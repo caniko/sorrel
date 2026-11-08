@@ -1201,6 +1201,16 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         true
     }
 
+    /// Undo/redo/checkout can free a split's new cluster id. The selection
+    /// still naming it would make every view rebuild for a cluster that no
+    /// longer exists (and would miss the cached pre-split feature set).
+    fn drop_missing_clusters(&mut self) {
+        let n = read(&self.session).n_clusters() as usize;
+        if self.selection.as_slice().iter().any(|c| c.idx() >= n) {
+            self.selection.retain(|c| c.idx() < n);
+        }
+    }
+
     /// Undo or redo; the toast names what moved ("undid: relabel cluster 12
     /// as MUA"), and nothing is said at the end of the walk.
     fn move_head(&mut self, cmd: CurationCommand) {
@@ -1209,6 +1219,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         match self.host.apply(Actor::Human, cmd) {
             Err(e) => self.error = Some(format!("journal write failed: {e}")),
             Ok(ev) if ev.version != before => {
+                self.drop_missing_clusters();
                 self.cancel_feature_interaction();
                 self.status = toast(ev.desc);
             }
@@ -2137,7 +2148,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             ViewAction::Checkout(node) => {
                 self.cancel_jobs();
                 match self.host.checkout(Actor::Human, node) {
-                    Ok(ev) => self.status = toast(ev.desc),
+                    Ok(ev) => {
+                        self.drop_missing_clusters();
+                        self.status = toast(ev.desc);
+                    }
                     Err(e) => self.error = Some(format!("checkout failed: {e}")),
                 }
             }
@@ -3491,6 +3505,27 @@ mod tests {
         assert_eq!(history_len(&app), 0);
         assert_eq!(read(&app.session).spike_clusters_global(), before);
         assert!(app.status.as_ref().unwrap().0.contains("no spikes inside"));
+    }
+
+    #[test]
+    fn undoing_a_split_drops_the_freed_half_from_the_selection() {
+        let (mut app, _dir) = make_app();
+        app.selection.replace(ClusterId(0));
+        app.apply_lasso_splits(vec![(ClusterId(0), vec![0])]);
+        assert_eq!(read(&app.session).n_clusters(), 4);
+        assert_eq!(
+            app.selection.as_slice(),
+            &[ClusterId(0), ClusterId(3)],
+            "a split selects both halves"
+        );
+        app.dispatch_intent(Intent::Undo);
+        assert_eq!(read(&app.session).n_clusters(), 3);
+        assert_eq!(
+            app.selection.as_slice(),
+            &[ClusterId(0)],
+            "Undo freed cluster 3; the selection must not keep naming it"
+        );
+        assert_eq!(app.selection.anchor(), Some(ClusterId(0)));
     }
 
     #[test]

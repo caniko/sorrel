@@ -72,6 +72,17 @@ impl SelectionSet {
         }
     }
 
+    /// Drop every id for which `keep` is false. Undo of a split frees the new
+    /// half's id, so the selection must not keep naming it. The anchor falls
+    /// back to the last surviving id.
+    pub fn retain(&mut self, mut keep: impl FnMut(ClusterId) -> bool) {
+        self.items.retain(|&c| keep(c));
+        if self.anchor.is_some_and(|a| !self.items.contains(&a)) {
+            self.anchor = self.items.last().copied();
+        }
+        self.n_best = self.n_best.min(self.items.len());
+    }
+
     /// Add or remove one similar cluster (Ctrl+click in the Similar pane).
     pub fn toggle_similar(&mut self, c: ClusterId) {
         match self.items[self.n_best..].iter().position(|&x| x == c) {
@@ -404,6 +415,19 @@ mod tests {
         assert_eq!(s.as_slice(), &[ClusterId(4), ClusterId(5)]);
         s.extend_to(ClusterId(3), &ids(10));
         assert_eq!(s.as_slice(), &[ClusterId(3), ClusterId(4)]);
+    }
+
+    #[test]
+    fn retain_drops_freed_ids_and_repairs_the_anchor() {
+        let mut s = SelectionSet::single(ClusterId(0));
+        s.toggle(ClusterId(3));
+        s.retain(|c| c.0 < 3);
+        assert_eq!(s.as_slice(), &[ClusterId(0)]);
+        assert_eq!(s.anchor(), Some(ClusterId(0)));
+        // No anchor left: clear it rather than name a missing cluster.
+        s.retain(|_| false);
+        assert!(s.is_empty());
+        assert_eq!(s.anchor(), None);
     }
 
     #[test]

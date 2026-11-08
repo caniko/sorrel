@@ -1180,7 +1180,9 @@ impl Default for FeatureViewState {
             shown_channels: None,
             amplitude_dim: None,
             membership: None,
-            memo: Memo::new(),
+            // Undo restores the pre-split key; keep its set instead of
+            // recomputing a million spikes.
+            memo: Memo::with_history(),
             basis: Basis::default(),
             cells: None,
             cell_jobs: Memo::new(),
