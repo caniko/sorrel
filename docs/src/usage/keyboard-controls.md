@@ -93,20 +93,20 @@ next table row. Moving a similar cluster steps to the next similar one.
 
 ## Views and snippets
 
-| Key              | Action                                                                                                                  |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `C`              | Features: fix the current channels, or follow the selection again.                                                      |
-| `A` / `Shift+A`  | Amplitudes: next / previous type (template, feature, raw, template feature).                                            |
-| `Ctrl+R`         | Time axes use `spike_reorder.npy` (when present).                                                                       |
-| `:`              | Snippet bar. Enter runs the snippet, Esc closes it.                                                                     |
-| `H` / `?` / `F1` | Toggle the help overlay.                                                                                                |
-| `Ctrl+Q`         | Quit (asks first when there is unsaved curation).                                                                       |
-| `Ctrl+O` / `Ctrl+W` | Open a dataset / close the active dataset tab. |
-| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous dataset tab (physical Ctrl on macOS too). |
-| `Ctrl+Comma` | Open Settings (`Cmd+Comma` on macOS). |
-| `Ctrl+Shift+M`   | Maximize the pane under the pointer over the whole view area, or restore.                                               |
-| `F11`            | Full screen for the window the key is pressed in (main or a popped-out one).                                            |
-| `Esc`            | Close a dialog, the snippet bar or the help, or clear the lasso; with nothing else to cancel, restore a maximized pane. |
+| Key                           | Action                                                                                                                  |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `C`                           | Features: fix the current channels, or follow the selection again.                                                      |
+| `A` / `Shift+A`               | Amplitudes: next / previous type (template, feature, raw, template feature).                                            |
+| `Ctrl+R`                      | Time axes use `spike_reorder.npy` (when present).                                                                       |
+| `:`                           | Snippet bar. Enter runs the snippet, Esc closes it.                                                                     |
+| `H` / `?` / `F1`              | Toggle the help overlay.                                                                                                |
+| `Ctrl+Q`                      | Quit (asks first when there is unsaved curation).                                                                       |
+| `Ctrl+O` / `Ctrl+W`           | Open a dataset / close the active dataset tab.                                                                          |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous dataset tab (physical Ctrl on macOS too).                                                               |
+| `Ctrl+Comma`                  | Open Settings (`Cmd+Comma` on macOS).                                                                                   |
+| `Ctrl+Shift+M`                | Maximize the pane under the pointer over the whole view area, or restore.                                               |
+| `F11`                         | Full screen for the window the key is pressed in (main or a popped-out one).                                            |
+| `Esc`                         | Close a dialog, the snippet bar or the help, or clear the lasso; with nothing else to cancel, restore a maximized pane. |
 
 Snippets: `:g` merge, `:k` split, `:c 3 7 10-12` select, `:l name value`
 custom label (`:l group good` moves the selection), `:note text` unit note
@@ -123,16 +123,16 @@ Plain-key shortcuts never fire while a text field has focus. `Ctrl` chords,
 These shortcuts apply only while the pointer is over the pane and no text
 field has focus. They are configurable in Settings too.
 
-| Pane | Key | Action |
-| --- | --- | --- |
-| Waveforms | `W` / `Shift+W` | Next / previous waveform mode. |
-| Waveforms | `M` / `O` / `Ctrl+L` | Mean toggle / overlap / channel labels. |
-| Waveforms | `Ctrl+↑` / `Ctrl+↓` | Increase / decrease amplitude scale. |
-| Waveforms | `Ctrl+→` / `Ctrl+←` | Widen / narrow waveform boxes. |
-| Waveforms | `Shift+↑` / `Shift+↓` | Spread / shrink the probe vertically. |
+| Pane      | Key                   | Action                                  |
+| --------- | --------------------- | --------------------------------------- |
+| Waveforms | `W` / `Shift+W`       | Next / previous waveform mode.          |
+| Waveforms | `M` / `O` / `Ctrl+L`  | Mean toggle / overlap / channel labels. |
+| Waveforms | `Ctrl+↑` / `Ctrl+↓`   | Increase / decrease amplitude scale.    |
+| Waveforms | `Ctrl+→` / `Ctrl+←`   | Widen / narrow waveform boxes.          |
+| Waveforms | `Shift+↑` / `Shift+↓` | Spread / shrink the probe vertically.   |
 | Waveforms | `Shift+→` / `Shift+←` | Spread / shrink the probe horizontally. |
-| Waveforms | `R` / `Shift+R` | Reset scales. |
-| CCG | `N` | Toggle uniform normalization. |
+| Waveforms | `R` / `Shift+R`       | Reset scales.                           |
+| CCG       | `N`                   | Toggle uniform normalization.           |
 
 Undo moves to the previous edit and redo to the branch you visited last.
 An edit after an undo starts a new branch, and the old one stays in the

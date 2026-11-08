@@ -333,12 +333,13 @@ pub fn capture_input(ctx: &Context) {
             })
         });
         if let Some(chord) = chord {
-            let current = rt
-                .keymap
-                .chords(id)
+            // A missing draft entry means defaults (e.g. after Reset), not the saved keymap.
+            let current = COMMANDS
                 .iter()
-                .map(|c| c.text(false))
-                .collect::<Vec<_>>();
+                .find(|c| c.id == id)
+                .map_or_else(Vec::new, |c| {
+                    c.defaults.iter().map(|s| (*s).into()).collect()
+                });
             let keys = rt
                 .draft
                 .as_mut()
@@ -629,6 +630,37 @@ mod tests {
             .unwrap()
             .keybindings
             .contains_key("curation.split"));
+        open(&h.ctx);
+        h.run_ok();
+        h.get_by_label("K ×").click();
+        h.run_ok();
+        h.get_by_label("Add shortcut").click();
+        h.run_ok();
+        h.key_press(egui::Key::F8);
+        h.run_ok();
+        h.get_by_label("Save settings").click();
+        h.run_ok();
+        open(&h.ctx);
+        h.run_ok();
+        h.get_by_label("Reset").click();
+        h.run_ok();
+        h.get_by_label("Add shortcut").click();
+        h.run_ok();
+        h.key_press(egui::Key::F9);
+        h.run_ok();
+        assert_eq!(
+            shared(&h.ctx)
+                .lock()
+                .unwrap()
+                .draft
+                .as_ref()
+                .unwrap()
+                .keybindings["curation.split"],
+            vec!["K".to_string(), "F9".to_string()],
+            "Add after Reset starts from the defaults"
+        );
+        h.key_press(egui::Key::Escape);
+        h.run_ok();
         open(&h.ctx);
         h.run_ok();
         h.key_press(egui::Key::Escape);
