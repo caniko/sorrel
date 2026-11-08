@@ -86,3 +86,18 @@ debug = false
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# The app is normally run from a debug build, where the Feature view walks
+# every spike of a selection (millions on KS4 data). Optimise the workspace
+# crates on that path too; without this a two-cluster feature reload takes
+# ~19 s instead of ~1 s (the rest of the dependency graph is already opt 2).
+[profile.dev.package.sorrel-data]
+opt-level = 2
+[profile.dev.package.sorrel-io]
+opt-level = 2
+[profile.dev.package.sorrel-render]
+opt-level = 2
+[profile.dev.package.sorrel-compute]
+opt-level = 2
+[profile.dev.package.sorrel-ui]
+opt-level = 2
