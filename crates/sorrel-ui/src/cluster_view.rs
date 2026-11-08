@@ -907,15 +907,16 @@ pub fn cluster_table<P: DataProvider>(
                         .labelled_by(label.id);
                     // Esc clears the field; egui drops focus on Esc in the same frame.
                     if (edit.has_focus() || edit.lost_focus())
-                        && ui.input(|i| i.key_pressed(egui::Key::Escape))
+                        && crate::settings::pressed(ui.ctx(), "app.cancel")
                     {
                         state.filter_text.clear();
                     }
-                    edit.on_hover_text(
+                    edit.on_hover_text(format!(
                         "Cluster id or part of a tag (e.g. merged, src:llm, bc:snr), or a phy \
                      expression: columns, == != < <= > >=, and/or/not, parentheses; \
-                     `group` is the label, e.g. n_spikes > 50 and group == \"good\". Esc clears",
-                    );
+                     `group` is the label, e.g. n_spikes > 50 and group == \"good\". {} clears",
+                        crate::settings::hint(ui.ctx(), "app.cancel")
+                    ));
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.checkbox(&mut state.hide_empty, "hide empty");

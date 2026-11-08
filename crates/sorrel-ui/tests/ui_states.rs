@@ -434,6 +434,44 @@ fn help_overlay() {
     });
 }
 
+/// The real settings modal also exports editable OpenPencil frames through
+/// `snap`, alongside its dark/light snapshot references.
+#[test]
+fn keyboard_settings() {
+    if no_gpu() {
+        return;
+    }
+    each_theme(|theme, name| {
+        let mut h = fixture(&format!("settings-{name}"), 3, theme);
+        sorrel_ui::settings::open(&h.ctx);
+        snap(&mut h, "keyboard_settings", name);
+        h
+    });
+}
+
+#[test]
+fn keyboard_settings_capture_and_conflict() {
+    if no_gpu() {
+        return;
+    }
+    each_theme(|theme, name| {
+        let mut h = fixture(&format!("settings-capture-{name}"), 3, theme);
+        sorrel_ui::settings::open(&h.ctx);
+        settle(&mut h);
+        h.get_by_label("Search shortcuts").focus();
+        settle(&mut h);
+        h.get_by_label("Search shortcuts")
+            .type_text("inside the lasso");
+        settle(&mut h);
+        h.get_by_label("Add shortcut").click();
+        snap(&mut h, "keyboard_settings_capture", name);
+        h.key_press(egui::Key::G);
+        snap(&mut h, "keyboard_settings_conflict", name);
+        assert!(sorrel_ui::settings::shared(&h.ctx).lock().unwrap().open);
+        h
+    });
+}
+
 #[test]
 fn quit_with_unsaved_edits() {
     if no_gpu() {
@@ -599,7 +637,7 @@ fn launcher() {
             .with_theme(theme)
             .wgpu_setup(vulkan_only())
             .build_eframe(|cc| {
-                Shell::new(cc, Box::new(|_, _, _| anyhow::bail!("no opener")), None)
+                Shell::new_in_memory(cc, Box::new(|_, _, _| anyhow::bail!("no opener")), None)
             });
         h.run_ok();
         h.remove_cursor();
