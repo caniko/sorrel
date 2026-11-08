@@ -216,14 +216,10 @@ pub fn cross_validate(
     );
     validate_labels(problem.y, objective)?;
     let fold_of = assign_folds(problem.groups, options.folds)?;
-    let mut params = options.params.clone().unwrap_or(Params {
+    let base_params = options.params.clone().unwrap_or(Params {
         seed: options.seed,
         ..Params::default()
     });
-    // A leaf floor of 20 rows is right for thousands of roots and fatal for a
-    // 40-row smoke table, where nothing can split and every fold predicts one
-    // class. Lower it to n/20 (never below 2) so small tables can learn at all.
-    params.min_samples_leaf = params.min_samples_leaf.min((n / 20).max(2));
     let mut predictions = vec![f64::NAN; n];
     let mut per_fold = Vec::with_capacity(options.folds);
     let mut fold_sizes = Vec::with_capacity(options.folds);
@@ -236,6 +232,11 @@ pub fn cross_validate(
             !train_rows.is_empty() && !test_rows.is_empty(),
             "fold {fold} is empty; use more groups or fewer folds"
         );
+        // Everything a fold fits must see training rows only. Class weights
+        // below, the missing-class dummy rows and the trainer's binning are
+        // all built from `train_rows`; so is the leaf floor.
+        let mut params = base_params.clone();
+        params.min_samples_leaf = leaf_floor(params.min_samples_leaf, train_rows.len());
         let mut distinct: Vec<&str> = test_rows
             .iter()
             .map(|&i| problem.groups[i].as_str())
@@ -346,7 +347,7 @@ pub fn fit_full(problem: &Problem<'_>, seed: u64, objective: Objective) -> Resul
         seed,
         ..Params::default()
     };
-    params.min_samples_leaf = params.min_samples_leaf.min((n / 20).max(2));
+    params.min_samples_leaf = leaf_floor(params.min_samples_leaf, n);
     gbdt::train(
         &x,
         problem.n_features,
@@ -355,6 +356,15 @@ pub fn fit_full(problem: &Problem<'_>, seed: u64, objective: Objective) -> Resul
         objective,
         &params,
     )
+}
+
+/// A leaf floor of 20 rows is right for thousands of roots and fatal for a
+/// 40-row smoke table, where nothing can split and every fold predicts one
+/// class. Lower it to `n/20` (never below 2) for the rows the model actually
+/// trains on. Callers must pass *training* row counts: validation rows must
+/// never influence a fitted parameter.
+fn leaf_floor(default: usize, n_train: usize) -> usize {
+    default.min((n_train / 20).max(2))
 }
 
 /// Append one zero-weight, all-NaN row per class absent from `y`.
@@ -594,5 +604,75 @@ mod tests {
             objective_name(Objective::Softmax { n_classes: 3 }),
             "softmax:3"
         );
+    }
+
+    #[test]
+    fn leaf_floor_uses_the_training_row_count() {
+        assert_eq!(leaf_floor(20, 2000), 20);
+        assert_eq!(leaf_floor(20, 40), 2);
+        assert_eq!(leaf_floor(1000, 40), 2);
+        assert_eq!(leaf_floor(1000, 200), 10);
+
+        // 207 rows in five folds: the global floor would be 10, the training
+        // floor 7. A 9-row leaf at x=10 is therefore only reachable when the
+        // floor is computed from training rows, as it must be.
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        let mut groups = Vec::new();
+        for g in 0..6 {
+            for _ in 0..23 {
+                x.push(0.0);
+                y.push(0.0);
+                groups.push(format!("g{g}"));
+            }
+        }
+        for _ in 0..60 {
+            x.push(10.0);
+            y.push(1.0);
+            groups.push("a".to_string());
+        }
+        for _ in 0..9 {
+            x.push(10.0);
+            y.push(1.0);
+            groups.push("b".to_string());
+        }
+        let columns = vec!["f_a".to_string()];
+        let problem = Problem {
+            x: &x,
+            n_features: 1,
+            columns: &columns,
+            y: &y,
+            groups: &groups,
+        };
+        let params = Params {
+            n_rounds: 1,
+            learning_rate: 1.0,
+            max_depth: 1,
+            max_leaves: 2,
+            l2: 0.0,
+            min_gain: 0.0,
+            ..Params::default()
+        };
+        let out = cross_validate(
+            &problem,
+            &CvOptions {
+                folds: 5,
+                seed: 0,
+                params: Some(params),
+            },
+            Objective::SquaredError,
+        )
+        .unwrap();
+        let fold_of = assign_folds(&groups, 5).unwrap();
+        let fold_a = fold_of[groups.iter().position(|g| g == "a").unwrap()];
+        let special: Vec<usize> = (0..groups.len()).filter(|&i| groups[i] == "a").collect();
+        assert!(special.iter().all(|&i| fold_of[i] == fold_a));
+        for &i in &special {
+            assert!(
+                out.predictions[i] > 0.5,
+                "row {i} predicted {} with the wrong leaf floor",
+                out.predictions[i]
+            );
+        }
     }
 }

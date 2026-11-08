@@ -46,6 +46,9 @@ pub struct LearnDatasetArgs {
     pub max_spikes_per_root: usize,
     /// Extraction seed (recorded; the extractor itself is deterministic)
     pub seed: u64,
+    /// Recompute only truth targets from stored features; no proposers, no
+    /// feature work, and the raw recording is not opened
+    pub retarget: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -152,6 +155,9 @@ enum BenchCmd {
         /// Extraction seed (recorded; the extractor itself is deterministic)
         #[arg(long, default_value_t = 0)]
         seed: u64,
+        /// Recompute only truth targets from stored features (no proposers)
+        #[arg(long)]
+        retarget: bool,
     },
 }
 
@@ -698,12 +704,14 @@ pub(super) fn run(a: &BenchArgs, db: Option<&Path>) -> Result<()> {
             jobs,
             max_spikes_per_root,
             seed,
+            retarget,
         } => b.learn_dataset(&LearnDatasetArgs {
             out: out.clone(),
             dev_limit: *dev_limit,
             jobs: *jobs,
             max_spikes_per_root: *max_spikes_per_root,
             seed: *seed,
+            retarget: *retarget,
         })?,
         BenchCmd::Score {
             split,

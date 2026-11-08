@@ -251,6 +251,29 @@ fn learn_dataset_cv_and_train_over_a_synthetic_bench() {
         .collect();
     assert_eq!(labels.iter().filter(|v| **v == 2.0).count(), 2);
     assert_eq!(labels.iter().filter(|v| **v == 0.0).count(), 2);
+    assert!(
+        units.column("f_n_roots").is_none(),
+        "edit footprint removed"
+    );
+    assert!(units.column("f_root_share").is_none());
+
+    // `cand_units` is one row per sorrel-producible candidate membership.
+    let cand_units = read_table(&out, "cand_units");
+    let candidates = read_table(&out, "candidates");
+    assert_eq!(cand_units.n_rows(), candidates.n_rows());
+    let cand_labels: Vec<f32> = (0..cand_units.n_rows())
+        .map(|r| cand_units.get(r, "y_label"))
+        .collect();
+    assert!(cand_labels.contains(&2.0));
+    assert!(cand_labels.contains(&0.0));
+    // Both versions are recorded in every output header.
+    let header: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("roots.json")).unwrap()).unwrap();
+    assert_eq!(
+        header["extractor_version"],
+        sorrel_data::learn::EXTRACTOR_VERSION
+    );
+    assert_eq!(header["target_version"], sorrel_data::learn::TARGET_VERSION);
 
     let spikes = read_table(&out, "spikes");
     assert_eq!(spikes.n_rows(), 800, "every spike of both roots");
@@ -301,6 +324,97 @@ fn learn_dataset_cv_and_train_over_a_synthetic_bench() {
         ],
     ));
     assert_eq!(before, std::fs::read(out.join("roots.f32")).unwrap());
+
+    // --retarget recomputes only targets from the stored features: identical
+    // tables, no input copy and no proposer run (the retarget path never
+    // constructs a session or opens the recording).
+    let tables = [
+        "roots",
+        "candidates",
+        "pairs",
+        "units",
+        "cand_units",
+        "spikes",
+    ];
+    let mut baseline = Vec::new();
+    for name in tables {
+        let (_, data) = sorrel_data::learn::table::paths(&out, name);
+        baseline.push(std::fs::read(&data).unwrap());
+    }
+    let retarget = ok(&sorrel(
+        tmp.path(),
+        &[
+            "dev",
+            "bench",
+            "--bench",
+            &s(&bench),
+            "learn-dataset",
+            "--out",
+            &s(&out),
+            "--retarget",
+        ],
+    ));
+    assert!(retarget.contains("retargeted"), "{retarget}");
+    assert!(!retarget.contains("seeded"), "{retarget}");
+    for (name, expected) in tables.iter().zip(&baseline) {
+        let (_, data) = sorrel_data::learn::table::paths(&out, name);
+        assert_eq!(
+            &std::fs::read(&data).unwrap(),
+            expected,
+            "--retarget changed {name}"
+        );
+    }
+    // Retarget refuses extraction options the features were not built with.
+    let stale = sorrel(
+        tmp.path(),
+        &[
+            "dev",
+            "bench",
+            "--bench",
+            &s(&bench),
+            "learn-dataset",
+            "--out",
+            &s(&out),
+            "--retarget",
+            "--max-spikes-per-root",
+            "10",
+        ],
+    );
+    assert!(!stale.status.success());
+    let err = String::from_utf8_lossy(&stale.stderr);
+    assert!(
+        err.contains("--max-spikes-per-root") && err.contains("10"),
+        "{err}"
+    );
+
+    // An --out inside the immutable session copies or the sealed home is
+    // refused before anything is written.
+    for bad in [
+        bench.join("sessions/learn-out"),
+        bench.join(".sealed/learn-out"),
+    ] {
+        let refused = sorrel(
+            tmp.path(),
+            &[
+                "dev",
+                "bench",
+                "--bench",
+                &s(&bench),
+                "learn-dataset",
+                "--out",
+                &s(&bad),
+                "--dev-limit",
+                "1",
+            ],
+        );
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("protected"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert!(!bad.exists());
+    }
 
     // Tiny data: CV plumbing only, not a performance claim.
     let cv = ok(&sorrel(
@@ -480,4 +594,42 @@ fn learn_cv_refuses_a_table_from_another_extractor_or_a_missing_target() {
     );
     assert!(!o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("no target column"));
+}
+
+#[test]
+fn learn_cv_refuses_targets_from_another_target_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("ds");
+    let mut t = sorrel_data::learn::table::Table::new(
+        sorrel_data::learn::EXTRACTOR_VERSION,
+        vec!["sid_idx".into(), "f_a".into(), "y_verdict".into()],
+    );
+    t.sids = vec!["s".into()];
+    t.target_version = Some("targets-old".into());
+    t.push_row(&[0.0, 1.0, 1.0]).unwrap();
+    t.save(&dir, "roots").unwrap();
+    let o = sorrel(
+        tmp.path(),
+        &[
+            "dev",
+            "learn",
+            "cv",
+            "--data",
+            dir.to_str().unwrap(),
+            "--table",
+            "roots",
+            "--target",
+            "y_verdict",
+            "--objective",
+            "softmax:5",
+            "--folds",
+            "2",
+        ],
+    );
+    assert!(!o.status.success());
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("targets from"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
 }

@@ -8,8 +8,8 @@
 //! is deliberate: a caller cannot accidentally let a human decision steer a
 //! feature, and the ordering is visible at the call site.
 //!
-//! Five tables come out of one session (see [`super::table`] for the file
-//! format):
+//! Five input-only tables and two truth-derived ones come out of one session
+//! (see [`super::table`] for the file format):
 //!
 //! * `roots`: one row per non-empty Kilosort root, with the brief's
 //!   level-2 card metrics plus ACG/amplitude-shape/mixture/proposer summaries
@@ -25,9 +25,19 @@
 //! * `units`: one row per human final cluster (all labels), with its own
 //!   spike-train statistics and its spread inside its parent roots' feature
 //!   spaces. Target: the phy label.
+//! * `cand_units`: one row per candidate membership, with the same feature
+//!   set as `units` but built from a sorrel-producible membership rather than
+//!   the human's editing footprint. Target: the label of the human unit with
+//!   the largest Jaccard overlap, if that overlap is at least 0.5, else noise.
 //! * `spikes`: a deterministic time-stratified subsample per root with
 //!   root-relative feature-space, amplitude and timing features. Targets: the
 //!   spike's label and its root's majority good unit.
+//!
+//! `roots`, `candidates`, `pairs` and `spikes` carry both input-only `f_*`
+//! columns and truth-derived `y_*` columns; [`super::shard`] stores those two
+//! halves separately so targets can be recomputed without proposers or the
+//! raw recording. `units` and `cand_units` features are membership-shaped and
+//! depend on the truth's membership, so they live with the target shard.
 //!
 //! Every membership-shaped feature is computed from a `Vec<u32>` of root-local
 //! spike indices, so the same code scores sorrel's own candidate memberships
@@ -125,7 +135,7 @@ impl Default for ExtractOpts {
     }
 }
 
-/// The five tables of one session.
+/// The tables of one session.
 pub struct SessionTables {
     /// One row per non-empty root.
     pub roots: Table,
@@ -135,6 +145,8 @@ pub struct SessionTables {
     pub pairs: Table,
     /// One row per human final cluster (filled by [`label`]).
     pub units: Table,
+    /// One row per candidate membership (filled by [`label`]).
+    pub cand_units: Table,
     /// Per-spike rows for roots with at least [`MIN_ROOT_SPIKES`].
     pub spikes: Table,
 }
@@ -142,9 +154,11 @@ pub struct SessionTables {
 /// Everything [`extract`] computed, plus the side data [`label`] needs.
 ///
 /// Owns plain vectors (no borrow of the session), so a worker thread can move
-/// it to the main thread before the truth is opened.
+/// it to the main thread before the truth is opened. [`super::shard`] persists
+/// it in two parts: the input-only tables and side vectors here, then the
+/// truth-derived `y_*` columns after [`label`].
 pub struct ExtractData {
-    /// The five tables.
+    /// The tables.
     pub tables: SessionTables,
     /// Root spike id per session-global spike.
     pub root_of_spike: Vec<u32>,
@@ -170,6 +184,12 @@ pub struct ExtractData {
     pub spike_rows: Vec<u32>,
     /// `(root_a, root_b)` of each `tables.pairs` row, `root_a < root_b`.
     pub pair_roots: Vec<(u32, u32)>,
+    /// Original NPY row per session-global spike, from the provider's
+    /// validated permutation (`None` when the provider has no row map).
+    pub row_map: Vec<Option<u32>>,
+    /// Input cluster id per session-global spike, used to crosscheck truth
+    /// alignment against the input roots.
+    pub session_roots: Vec<u32>,
     /// Session sample rate.
     pub sr: f32,
     /// Recording length in samples.
@@ -372,14 +392,19 @@ pub fn pair_columns() -> Vec<String> {
     c
 }
 
-/// All feature/target column names of the `units` table.
-pub fn unit_columns() -> Vec<String> {
-    let mut c = cols(&["sid_idx", "unit"]);
-    c.extend(cols(&[
+/// Feature columns shared by `units` and `cand_units`.
+///
+/// Every one is a function of a membership's spikes and its parent roots'
+/// input-only statistics, so sorrel can compute it for its own candidate
+/// memberships at inference time. Deliberately absent: `f_n_roots` and
+/// `f_root_share`, which encode how many Kilosort roots the *human* left the
+/// unit spread across. On an untouched Kilosort root the human has not edited
+/// anything yet, so those are always 1; training on them would teach the
+/// model an inference-time constant that carries no curation signal.
+pub fn unit_feature_columns() -> Vec<String> {
+    let mut c = cols(&[
         "f_n_spikes",
         "f_log_n_spikes",
-        "f_n_roots",
-        "f_root_share",
         "f_rpc",
         "f_isi_violation_ratio",
         "f_presence",
@@ -391,9 +416,26 @@ pub fn unit_columns() -> Vec<String> {
         "f_maha_frac3",
         "f_maha_frac5",
         "f_maha_median",
-    ]));
+    ]);
     c.extend(numbered("f_acg_", ACG_BINS));
     c.extend(numbered("f_amp_time_", AMP_TIME_BINS));
+    c
+}
+
+/// All feature/target column names of the `units` table.
+pub fn unit_columns() -> Vec<String> {
+    let mut c = cols(&["sid_idx", "unit"]);
+    c.extend(unit_feature_columns());
+    c.push("y_label".to_owned());
+    c
+}
+
+/// All feature/target column names of the `cand_units` table.
+///
+/// The ids are the matching `candidates` row, so the two tables join 1:1.
+pub fn cand_unit_columns() -> Vec<String> {
+    let mut c = cols(&["sid_idx", "root", "cand_idx"]);
+    c.extend(unit_feature_columns());
     c.push("y_label".to_owned());
     c
 }
@@ -549,14 +591,24 @@ pub fn extract<P: DataProvider + HasGeometry>(
     roots.sids = vec![sid.to_owned()];
     roots.codes.insert(
         "y_verdict".into(),
-        [("noise", 0), ("kept", 1), ("cleanup", 2), ("cores", 3)]
-            .into_iter()
-            .map(|(name, code)| (name.to_owned(), code))
-            .collect(),
+        [
+            ("noise", 0),
+            ("kept", 1),
+            ("cleanup", 2),
+            ("cores", 3),
+            ("other", 4),
+        ]
+        .into_iter()
+        .map(|(name, code)| (name.to_owned(), code))
+        .collect(),
     );
     roots.notes.insert(
         "y_verdict".into(),
-        "the dev DB's root_truths verdict; `other` is folded into cores (3)".into(),
+        "the dev DB's root_truths verdict with its default ten-spike floor (the same function and \
+         thresholds the bench records): noise, kept, cleanup, cores, other (4; e.g. a root wholly \
+         good but split between several good units). NaN for roots below the floor, whose verdict \
+         is undefined"
+            .into(),
     );
     roots.notes.insert(
         "f_root_size_rank".into(),
@@ -588,7 +640,8 @@ pub fn extract<P: DataProvider + HasGeometry>(
     );
     candidates.notes.insert(
         "y_jaccard_any".into(),
-        "max Jaccard against any human unit whose label is not noise (mua and unsorted count)"
+        "max Jaccard against any human unit whose label is not noise (good, mua and unsorted \
+         count); 0 when the candidate shares no spike with any such unit"
             .into(),
     );
     candidates.notes.insert(
@@ -615,7 +668,9 @@ pub fn extract<P: DataProvider + HasGeometry>(
     );
     pairs.notes.insert(
         "y_shared".into(),
-        "max over human good units of Jaccard(root_a ∪ root_b, unit) with global unit totals"
+        "max over human good units of Jaccard(root_a ∪ root_b, unit) with global unit totals; \
+         the union of both roots' truth units is searched, so a unit present only in root_b \
+         still counts, and 0 means no shared good spike"
             .into(),
     );
     let mut units = Table::new(EXTRACTOR_VERSION, unit_columns());
@@ -630,9 +685,13 @@ pub fn extract<P: DataProvider + HasGeometry>(
         "y_label".into(),
         "phy label; unsorted is folded into noise (0)".into(),
     );
-    units.notes.insert(
-        "f_root_share".into(),
-        "unit spikes over the spike counts of the roots it spans".into(),
+    let mut cand_units = Table::new(EXTRACTOR_VERSION, cand_unit_columns());
+    cand_units.codes = units.codes.clone();
+    cand_units.notes.insert(
+        "y_label".into(),
+        "label of the human unit with the largest Jaccard overlap with this candidate; 0 (noise) \
+         when that best overlap is below 0.5. Unsorted folds into noise"
+            .into(),
     );
     let mut spikes = Table::new(EXTRACTOR_VERSION, spike_columns());
     spikes.sids = vec![sid.to_owned()];
@@ -1150,12 +1209,24 @@ pub fn extract<P: DataProvider + HasGeometry>(
     }
 
     phase("spikes");
+    let row_map: Vec<Option<u32>> = session
+        .cluster_index()
+        .spike_pc_indices()
+        .iter()
+        .map(|row| row.get())
+        .collect();
+    let session_roots: Vec<u32> = session
+        .spike_clusters_global()
+        .iter()
+        .map(|c| c.0)
+        .collect();
     Ok(ExtractData {
         tables: SessionTables {
             roots,
             candidates,
             pairs,
             units,
+            cand_units,
             spikes,
         },
         root_of_spike,
@@ -1170,6 +1241,8 @@ pub fn extract<P: DataProvider + HasGeometry>(
         candidate_members,
         spike_rows,
         pair_roots,
+        row_map,
+        session_roots,
         sr,
         total_samples: total,
     })
@@ -1224,8 +1297,15 @@ pub fn label(data: &mut ExtractData, truth: &Truth) -> Result<()> {
         }
     }
 
-    // Root verdicts come from the one classifier the dev DB uses, with the
-    // `min_spikes` floor disabled so even tiny roots get a verdict.
+    // Root verdicts come from the one classifier the dev DB records, called
+    // with its default options exactly as the bench does
+    // (`root_truths_dirs` in `dev.rs`): the ten-spike floor is therefore NOT
+    // disabled here. That makes `other` reachable (e.g. a root wholly good but
+    // split between two good units) and keeps `cores`/`cleanup`/`kept` on the
+    // same thresholds as every recorded verdict. Roots below the floor are
+    // absent from `root_truths`, so their verdict is undefined and stays NaN;
+    // their whole-root Jaccard below is still well defined (0 when no human
+    // good unit shares a spike with them).
     let seq_roots: Vec<u32> = data.root_of_spike.clone();
     let truths = root_truths(
         &seq_roots,
@@ -1233,10 +1313,7 @@ pub fn label(data: &mut ExtractData, truth: &Truth) -> Result<()> {
             clusters: &truth.cluster,
             labels: &truth.labels,
         },
-        &SpikeDiffOpts {
-            min_spikes: 0,
-            ..Default::default()
-        },
+        &SpikeDiffOpts::default(),
     )?;
     let by_root: BTreeMap<u32, _> = truths.into_iter().map(|t| (t.root, t)).collect();
     {
@@ -1246,32 +1323,28 @@ pub fn label(data: &mut ExtractData, truth: &Truth) -> Result<()> {
         );
         for row in 0..roots.n_rows() {
             let r = roots.get(row, "root") as u32;
-            let Some(t) = by_root.get(&r) else {
-                continue;
-            };
             let hits = &root_units[root_row[&r]];
+            let root_n: usize = hits.values().sum();
+            // An absent intersection is a Jaccard of 0, not an undefined
+            // target: every candidate/root must stay trainable.
             let best = hits
                 .iter()
                 .filter(|(u, _)| label(**u) == PhyLabel::Good)
-                .map(|(&u, &c)| jaccard(c, t.n_spikes as usize, unit_sizes[&u]))
-                .fold(f64::NAN, |acc, v| {
-                    if v.is_nan() {
-                        acc
-                    } else if acc.is_nan() {
-                        v
-                    } else {
-                        acc.max(v)
-                    }
-                });
-            let verdict = match t.verdict {
-                "noise" => 0.0,
-                "kept" => 1.0,
-                "cleanup" => 2.0,
-                _ => 3.0,
-            };
-            set(&mut roots, row, "y_verdict", verdict);
-            set(&mut roots, row, "y_n_good", t.n_good as f32);
-            set(&mut roots, row, "y_good_share", t.good_share as f32);
+                .map(|(&u, &c)| jaccard(c, root_n, unit_sizes[&u]))
+                .fold(0.0f64, f64::max);
+            if let Some(t) = by_root.get(&r) {
+                let verdict = match t.verdict {
+                    "noise" => 0.0,
+                    "kept" => 1.0,
+                    "cleanup" => 2.0,
+                    "cores" => 3.0,
+                    "other" => 4.0,
+                    _ => 4.0,
+                };
+                set(&mut roots, row, "y_verdict", verdict);
+                set(&mut roots, row, "y_n_good", t.n_good as f32);
+                set(&mut roots, row, "y_good_share", t.good_share as f32);
+            }
             set(&mut roots, row, "y_whole_jaccard", best as f32);
         }
         data.tables.roots = roots;
@@ -1293,20 +1366,23 @@ pub fn label(data: &mut ExtractData, truth: &Truth) -> Result<()> {
             for &g in members {
                 *hits.entry(truth.cluster[g as usize]).or_default() += 1;
             }
-            let mut best_good = f64::NAN;
-            let mut best_any = f64::NAN;
+            // Absent overlap means Jaccard 0. `y_best_unit` stays NaN when no
+            // good unit is present, because no id "achieves" a 0 overlap.
+            let mut best_good = 0.0f64;
+            let mut best_any = 0.0f64;
             let mut best_unit = f32::NAN;
             for (&u, &count) in &hits {
                 let j = jaccard(count, members.len(), unit_sizes[&u]);
                 match label(u) {
                     PhyLabel::Good => {
-                        if j.is_finite() && (best_good.is_nan() || j > best_good) {
+                        best_any = best_any.max(j);
+                        if best_unit.is_nan() || j > best_good {
                             best_good = j;
                             best_unit = u as f32;
                         }
                     }
                     PhyLabel::Noise => {}
-                    _ => best_any = max_f64(best_any, j),
+                    _ => best_any = best_any.max(j),
                 }
             }
             set(&mut table, row, "y_jaccard", best_good as f32);
@@ -1315,18 +1391,16 @@ pub fn label(data: &mut ExtractData, truth: &Truth) -> Result<()> {
                 &mut table,
                 row,
                 "y_hit",
-                if best_good.is_finite() && best_good >= 0.8 {
-                    1.0
-                } else {
-                    0.0
-                },
+                if best_good >= 0.8 { 1.0 } else { 0.0 },
             );
             set(&mut table, row, "y_best_unit", best_unit);
         }
         data.tables.candidates = table;
     }
 
-    // Pair targets.
+    // Pair targets. The shared-unit search iterates the union of both roots'
+    // truth units: a good unit that only has spikes in root B still shares the
+    // pair, and a missing intersection contributes 0 to the Jaccard.
     {
         let mut table = std::mem::replace(
             &mut data.tables.pairs,
@@ -1339,13 +1413,15 @@ pub fn label(data: &mut ExtractData, truth: &Truth) -> Result<()> {
             let (ha, hb) = (&root_units[ra], &root_units[rb]);
             let (na, nb) = (ha.values().sum::<usize>(), hb.values().sum::<usize>());
             let mut merge = 0.0;
-            let mut shared = f64::NAN;
-            for (&u, &ca) in ha {
+            let mut shared = 0.0f64;
+            let units: BTreeSet<u32> = ha.keys().chain(hb.keys()).copied().collect();
+            for u in units {
                 if label(u) != PhyLabel::Good {
                     continue;
                 }
+                let ca = ha.get(&u).copied().unwrap_or(0);
                 let cb = hb.get(&u).copied().unwrap_or(0);
-                shared = max_f64(shared, jaccard(ca + cb, na + nb, unit_sizes[&u]));
+                shared = shared.max(jaccard(ca + cb, na + nb, unit_sizes[&u]));
                 let size = unit_sizes[&u] as f64;
                 if ca as f64 >= 0.2 * na as f64
                     && cb as f64 >= 0.2 * nb as f64
@@ -1407,106 +1483,152 @@ pub fn label(data: &mut ExtractData, truth: &Truth) -> Result<()> {
         let mut table = Table::new(EXTRACTOR_VERSION, unit_columns());
         table.sids = data.tables.spikes.sids.clone();
         for (&u, globals) in &members {
-            let mut row = Row::new(&table.columns);
+            let mut row = unit_feature_row(data, &table.columns, globals);
             row.set("sid_idx", 0.0);
             row.set("unit", u as f32);
-            let times: Vec<SampleIndex> = globals
-                .iter()
-                .map(|&g| data.time_of_spike[g as usize])
-                .collect();
-            let amps: Vec<f32> = globals
-                .iter()
-                .map(|&g| data.amp_of_spike[g as usize])
-                .collect();
-            let amps = if amps.is_empty() || amps.iter().any(|v| !v.is_finite()) {
-                Vec::new()
-            } else {
-                amps
-            };
-            let stats = unit_stats(&times, &amps, data.sr, data.total_samples);
-            row.set("f_n_spikes", stats.n as f32);
-            row.set("f_log_n_spikes", (1.0 + stats.n as f32).log10());
-            row.set("f_rpc", stats.rp_contamination);
-            row.set("f_isi_violation_ratio", stats.isi_violation_ratio);
-            row.set("f_presence", stats.presence_ratio);
-            row.set("f_amp_cutoff", stats.amplitude_cutoff);
-            row.set("f_drift_corr", stats.drift_correlation);
-            if !amps.is_empty() {
-                row.set("f_mean_amplitude", mean_amplitude(&amps));
-            }
-            for (i, v) in acg_log_bins(&times, data.sr).into_iter().enumerate() {
-                row.set(&format!("f_acg_{i:02}"), v);
-            }
-            for (i, v) in amp_time_bins(&times, &amps, data.total_samples, AMP_TIME_BINS)
-                .into_iter()
-                .enumerate()
-            {
-                row.set(&format!("f_amp_time_{i:02}"), v);
-            }
-            let roots: BTreeSet<u32> = globals
-                .iter()
-                .map(|&g| data.root_of_spike[g as usize])
-                .collect();
-            row.set("f_n_roots", roots.len() as f32);
-            let parent_n: usize = roots.iter().map(|&r| data.root_sizes[r as usize]).sum();
-            if parent_n > 0 {
-                row.set("f_root_share", globals.len() as f32 / parent_n as f32);
-            }
-            if !amps.is_empty() {
-                let (sum, count) = roots.iter().fold((0.0f64, 0usize), |(s, n), &r| {
-                    (
-                        s + data.root_amp_sum[r as usize],
-                        n + data.root_amp_count[r as usize],
-                    )
-                });
-                if count > 0 {
-                    row.set(
-                        "f_amp_ratio",
-                        ratio_of(mean_amplitude(&amps), (sum / count as f64) as f32),
-                    );
-                }
-            }
-            let mut d_max = 0usize;
-            let mut maha: Vec<f32> = Vec::new();
-            for &g in globals {
-                let r = data.root_of_spike[g as usize] as usize;
-                if let (Some((f, d)), Some((centre, scale))) =
-                    (&data.root_feats[r], &data.root_center[r])
-                {
-                    d_max = d_max.max(*d);
-                    let local = data.local_index[g as usize] as usize;
-                    if local * d >= f.len() {
-                        continue;
-                    }
-                    let sum: f32 = (0..*d)
-                        .map(|j| {
-                            let z = (f[local * d + j] - centre[j]) / scale[j];
-                            z * z
-                        })
-                        .sum();
-                    maha.push(sum.sqrt());
-                }
-            }
-            if d_max > 0 {
-                row.set("f_feature_dim", d_max as f32);
-                if !maha.is_empty() {
-                    row.set("f_maha_frac3", fraction_above(&maha, 3.0));
-                    row.set("f_maha_frac5", fraction_above(&maha, 5.0));
-                    row.set("f_maha_median", median(&mut maha.clone()));
-                }
-            }
-            let target = match label(u) {
-                PhyLabel::Good => 2.0,
-                PhyLabel::Mua => 1.0,
-                PhyLabel::Noise | PhyLabel::Unsorted => 0.0,
-            };
-            row.set("y_label", target);
+            row.set("y_label", phy_label_code(label(u)));
             table.push_row(&row.values)?;
         }
         data.tables.units = table;
     }
 
+    // Candidate-unit rows: one per sorrel candidate membership, with the same
+    // f_* set as `units` but a membership sorrel can actually produce at
+    // inference. y_label is the human unit with the largest Jaccard overlap if
+    // that overlap reaches 0.5, else noise. Ties keep the smallest truth id.
+    {
+        let mut table = Table::new(EXTRACTOR_VERSION, cand_unit_columns());
+        table.sids = data.tables.spikes.sids.clone();
+        ensure!(
+            data.tables.candidates.n_rows() == data.candidate_members.len(),
+            "candidate side data is out of sync for cand_units"
+        );
+        for (row, members) in data.candidate_members.iter().enumerate() {
+            if members.is_empty() {
+                continue;
+            }
+            let mut values = unit_feature_row(data, &table.columns, members);
+            let root = data.root_of_spike[members[0] as usize];
+            let cand_idx = data.tables.candidates.get(row, "cand_idx");
+            values.set("sid_idx", 0.0);
+            values.set("root", root as f32);
+            values.set("cand_idx", cand_idx);
+            let mut hits: BTreeMap<u32, usize> = BTreeMap::new();
+            for &g in members {
+                *hits.entry(truth.cluster[g as usize]).or_default() += 1;
+            }
+            let mut best = (0.0f64, None);
+            for (&u, &count) in &hits {
+                let j = jaccard(count, members.len(), unit_sizes[&u]);
+                if j > best.0 {
+                    best = (j, Some(u));
+                }
+            }
+            let target = match best {
+                (j, Some(u)) if j >= 0.5 => phy_label_code(label(u)),
+                _ => 0.0,
+            };
+            values.set("y_label", target);
+            table.push_row(&values.values)?;
+        }
+        data.tables.cand_units = table;
+    }
+
     Ok(())
+}
+
+/// The `y_label` code of a phy label (unsorted folds into noise).
+fn phy_label_code(label: PhyLabel) -> f32 {
+    match label {
+        PhyLabel::Good => 2.0,
+        PhyLabel::Mua => 1.0,
+        PhyLabel::Noise | PhyLabel::Unsorted => 0.0,
+    }
+}
+
+/// Fill one membership's unit-level features into a row. Ids and `y_label`
+/// are left NaN for the caller.
+fn unit_feature_row<'a>(data: &ExtractData, names: &'a [String], globals: &[u32]) -> Row<'a> {
+    let mut row = Row::new(names);
+    let times: Vec<SampleIndex> = globals
+        .iter()
+        .map(|&g| data.time_of_spike[g as usize])
+        .collect();
+    let amps: Vec<f32> = globals
+        .iter()
+        .map(|&g| data.amp_of_spike[g as usize])
+        .collect();
+    let amps = if amps.is_empty() || amps.iter().any(|v| !v.is_finite()) {
+        Vec::new()
+    } else {
+        amps
+    };
+    let stats = unit_stats(&times, &amps, data.sr, data.total_samples);
+    row.set("f_n_spikes", stats.n as f32);
+    row.set("f_log_n_spikes", (1.0 + stats.n as f32).log10());
+    row.set("f_rpc", stats.rp_contamination);
+    row.set("f_isi_violation_ratio", stats.isi_violation_ratio);
+    row.set("f_presence", stats.presence_ratio);
+    row.set("f_amp_cutoff", stats.amplitude_cutoff);
+    row.set("f_drift_corr", stats.drift_correlation);
+    if !amps.is_empty() {
+        row.set("f_mean_amplitude", mean_amplitude(&amps));
+    }
+    for (i, v) in acg_log_bins(&times, data.sr).into_iter().enumerate() {
+        row.set(&format!("f_acg_{i:02}"), v);
+    }
+    for (i, v) in amp_time_bins(&times, &amps, data.total_samples, AMP_TIME_BINS)
+        .into_iter()
+        .enumerate()
+    {
+        row.set(&format!("f_amp_time_{i:02}"), v);
+    }
+    let roots: BTreeSet<u32> = globals
+        .iter()
+        .map(|&g| data.root_of_spike[g as usize])
+        .collect();
+    if !amps.is_empty() {
+        let (sum, count) = roots.iter().fold((0.0f64, 0usize), |(s, n), &r| {
+            (
+                s + data.root_amp_sum[r as usize],
+                n + data.root_amp_count[r as usize],
+            )
+        });
+        if count > 0 {
+            row.set(
+                "f_amp_ratio",
+                ratio_of(mean_amplitude(&amps), (sum / count as f64) as f32),
+            );
+        }
+    }
+    let mut d_max = 0usize;
+    let mut maha: Vec<f32> = Vec::new();
+    for &g in globals {
+        let r = data.root_of_spike[g as usize] as usize;
+        if let (Some((f, d)), Some((centre, scale))) = (&data.root_feats[r], &data.root_center[r]) {
+            d_max = d_max.max(*d);
+            let local = data.local_index[g as usize] as usize;
+            if local * d >= f.len() {
+                continue;
+            }
+            let sum: f32 = (0..*d)
+                .map(|j| {
+                    let z = (f[local * d + j] - centre[j]) / scale[j];
+                    z * z
+                })
+                .sum();
+            maha.push(sum.sqrt());
+        }
+    }
+    if d_max > 0 {
+        row.set("f_feature_dim", d_max as f32);
+        if !maha.is_empty() {
+            row.set("f_maha_frac3", fraction_above(&maha, 3.0));
+            row.set("f_maha_frac5", fraction_above(&maha, 5.0));
+            row.set("f_maha_median", median(&mut maha.clone()));
+        }
+    }
+    row
 }
 
 fn set(table: &mut Table, row: usize, name: &str, value: f32) {
@@ -1577,16 +1699,6 @@ fn push_candidate(
             spec.depth,
             complement,
         ));
-    }
-}
-
-fn max_f64(a: f64, b: f64) -> f64 {
-    if a.is_nan() {
-        b
-    } else if b.is_nan() {
-        a
-    } else {
-        a.max(b)
     }
 }
 
@@ -1797,7 +1909,7 @@ fn stride_rows_pick(feats: &[f32], d: usize, pick: &[usize]) -> Vec<f32> {
 }
 
 /// Per-dimension median and `1.4826 × MAD` (floored at 1e-6).
-fn robust_center_scale_dims(feats: &[f32], d: usize) -> (Vec<f32>, Vec<f32>) {
+pub(crate) fn robust_center_scale_dims(feats: &[f32], d: usize) -> (Vec<f32>, Vec<f32>) {
     let n = feats.len() / d;
     let mut centre = vec![0.0f32; d];
     let mut scale = vec![1.0f32; d];
@@ -1997,5 +2109,276 @@ mod tests {
         assert_eq!(density.iter().filter(|v| v.is_finite()).count(), 1000);
         let rank = percentile_rank(&[1.0, 2.0, 2.0, 4.0], 2.0);
         assert!((rank - 0.5).abs() < 1e-6);
+    }
+
+    /// A minimal `ExtractData` for label-only tests: `root_of_spike` gives
+    /// each global spike's root, `candidates` lists global memberships.
+    fn test_data(
+        root_of_spike: Vec<u32>,
+        root_sizes: Vec<usize>,
+        candidates: Vec<Vec<u32>>,
+        pairs: Vec<(u32, u32)>,
+    ) -> ExtractData {
+        let mut local = vec![0u32; root_of_spike.len()];
+        let mut next = vec![0u32; root_sizes.len()];
+        for (g, &r) in root_of_spike.iter().enumerate() {
+            local[g] = next[r as usize];
+            next[r as usize] += 1;
+        }
+        let mut roots = Table::new(EXTRACTOR_VERSION, root_columns());
+        roots.sids = vec!["s0".into()];
+        for root in 0..root_sizes.len() {
+            let mut values = vec![f32::NAN; roots.columns.len()];
+            values[roots.column("sid_idx").unwrap()] = 0.0;
+            values[roots.column("root").unwrap()] = root as f32;
+            roots.push_row(&values).unwrap();
+        }
+        let mut cand = Table::new(EXTRACTOR_VERSION, candidate_columns());
+        cand.sids = vec!["s0".into()];
+        for (row, members) in candidates.iter().enumerate() {
+            let mut values = vec![f32::NAN; cand.columns.len()];
+            values[cand.column("sid_idx").unwrap()] = 0.0;
+            values[cand.column("root").unwrap()] = root_of_spike[members[0] as usize] as f32;
+            values[cand.column("cand_idx").unwrap()] = row as f32;
+            cand.push_row(&values).unwrap();
+        }
+        let mut pair_table = Table::new(EXTRACTOR_VERSION, pair_columns());
+        pair_table.sids = vec!["s0".into()];
+        for &(a, b) in &pairs {
+            let mut values = vec![f32::NAN; pair_table.columns.len()];
+            values[pair_table.column("sid_idx").unwrap()] = 0.0;
+            values[pair_table.column("root_a").unwrap()] = a as f32;
+            values[pair_table.column("root_b").unwrap()] = b as f32;
+            pair_table.push_row(&values).unwrap();
+        }
+        let mut spikes = Table::new(EXTRACTOR_VERSION, spike_columns());
+        spikes.sids = vec!["s0".into()];
+        for (g, &r) in root_of_spike.iter().enumerate() {
+            let mut values = vec![f32::NAN; spikes.columns.len()];
+            values[spikes.column("sid_idx").unwrap()] = 0.0;
+            values[spikes.column("root").unwrap()] = r as f32;
+            values[spikes.column("local_idx").unwrap()] = local[g] as f32;
+            spikes.push_row(&values).unwrap();
+        }
+        let n = root_of_spike.len();
+        let n_roots = root_sizes.len();
+        ExtractData {
+            tables: SessionTables {
+                roots,
+                candidates: cand,
+                pairs: pair_table,
+                units: Table::new(EXTRACTOR_VERSION, unit_columns()),
+                cand_units: Table::new(EXTRACTOR_VERSION, cand_unit_columns()),
+                spikes,
+            },
+            root_of_spike,
+            local_index: local,
+            time_of_spike: (0..n).map(|i| SampleIndex(i as u64 * 100)).collect(),
+            amp_of_spike: vec![1.0; n],
+            root_feats: vec![None; n_roots],
+            root_center: vec![None; n_roots],
+            root_sizes,
+            root_amp_sum: vec![0.0; n_roots],
+            root_amp_count: vec![0; n_roots],
+            candidate_members: candidates,
+            spike_rows: (0..n as u32).collect(),
+            pair_roots: pairs,
+            row_map: (0..n as u32).map(Some).collect(),
+            session_roots: vec![0; n],
+            sr: 30_000.0,
+            total_samples: 30_000,
+        }
+    }
+
+    fn truth(cluster: &[u32], labels: &[(u32, PhyLabel)]) -> Truth {
+        Truth {
+            cluster: cluster.to_vec(),
+            labels: labels.to_vec(),
+        }
+    }
+
+    #[test]
+    fn an_empty_intersection_is_jaccard_zero_not_nan() {
+        let mut data = test_data(
+            vec![0, 0, 1, 1],
+            vec![2, 2],
+            vec![vec![0, 1], vec![2]],
+            vec![(0, 1)],
+        );
+        label(
+            &mut data,
+            &truth(
+                &[10, 10, 11, 11],
+                &[(10, PhyLabel::Good), (11, PhyLabel::Noise)],
+            ),
+        )
+        .unwrap();
+        let c = &data.tables.candidates;
+        // Candidate 0 is exactly the good unit; candidate 1 only touches noise.
+        assert_eq!(c.get(0, "y_jaccard"), 1.0);
+        assert_eq!(c.get(1, "y_jaccard"), 0.0);
+        assert!(!c.get(1, "y_jaccard").is_nan());
+        assert_eq!(c.get(1, "y_jaccard_any"), 0.0);
+        assert_eq!(data.tables.roots.get(1, "y_whole_jaccard"), 0.0);
+        // Unit 10 exists only in root A; the union still sees it, and its
+        // 2 spikes are 2 / (4 + 2 - 2) of the pair's spikes.
+        assert_eq!(data.tables.pairs.get(0, "y_shared"), 0.5);
+        assert!(!data.tables.pairs.get(0, "y_shared").is_nan());
+    }
+
+    #[test]
+    fn good_units_count_in_y_jaccard_any() {
+        let mut data = test_data(vec![0, 0, 0, 0, 1], vec![4, 1], vec![vec![0, 1]], vec![]);
+        label(
+            &mut data,
+            &truth(
+                &[10, 10, 10, 10, 11],
+                &[(10, PhyLabel::Good), (11, PhyLabel::Noise)],
+            ),
+        )
+        .unwrap();
+        let c = &data.tables.candidates;
+        // 2 of the unit's 4 spikes: Jaccard 2 / (2 + 4 - 2) = 0.5.
+        assert!((c.get(0, "y_jaccard") - 0.5).abs() < 1e-6);
+        assert!((c.get(0, "y_jaccard_any") - 0.5).abs() < 1e-6);
+        assert_eq!(c.get(0, "y_best_unit"), 10.0);
+    }
+
+    #[test]
+    fn verdicts_are_the_bench_verdicts_with_the_ten_spike_floor() {
+        let mut root = Vec::new();
+        // Root 0: wholly good, split 20/20 between two good units -> `other`.
+        root.extend(std::iter::repeat_n(0u32, 40));
+        // Root 1: 9 good spikes (under the piece floor) + 11 noise -> `noise`.
+        root.extend(std::iter::repeat_n(1u32, 20));
+        // Root 2: below the root floor -> no verdict.
+        root.extend(std::iter::repeat_n(2u32, 5));
+        let cluster: Vec<u32> = (0..40)
+            .map(|i| if i < 20 { 10 } else { 11 })
+            .chain(std::iter::repeat_n(12u32, 9))
+            .chain(std::iter::repeat_n(13u32, 11))
+            .chain(std::iter::repeat_n(14u32, 5))
+            .collect();
+        let mut data = test_data(root, vec![40, 20, 5], vec![], vec![]);
+        label(
+            &mut data,
+            &truth(
+                &cluster,
+                &[
+                    (10, PhyLabel::Good),
+                    (11, PhyLabel::Good),
+                    (12, PhyLabel::Good),
+                    (13, PhyLabel::Noise),
+                    (14, PhyLabel::Good),
+                ],
+            ),
+        )
+        .unwrap();
+        let roots = &data.tables.roots;
+        assert_eq!(roots.get(0, "y_verdict"), 4.0, "other is its own class");
+        assert_eq!(roots.get(1, "y_verdict"), 0.0, "9 good spikes are noise");
+        assert_eq!(roots.get(1, "y_n_good"), 0.0);
+        assert!(roots.get(2, "y_verdict").is_nan(), "undefined below floor");
+        assert_eq!(roots.get(2, "y_whole_jaccard"), 1.0);
+    }
+
+    #[test]
+    fn pair_shared_searches_the_union_of_both_roots() {
+        let mut data = test_data(vec![0, 0, 1, 1, 1, 1], vec![2, 4], vec![], vec![(0, 1)]);
+        label(
+            &mut data,
+            &truth(
+                &[20, 21, 10, 10, 10, 10],
+                &[
+                    (10, PhyLabel::Good),
+                    (20, PhyLabel::Noise),
+                    (21, PhyLabel::Noise),
+                ],
+            ),
+        )
+        .unwrap();
+        // Unit 10 has no spike in root A; the old code could not see it.
+        let shared = data.tables.pairs.get(0, "y_shared");
+        assert!((shared - 4.0 / 6.0).abs() < 1e-6, "{shared}");
+    }
+
+    #[test]
+    fn unit_features_have_no_edit_footprint_and_cand_units_are_labeled() {
+        assert!(!unit_columns().contains(&"f_n_roots".to_string()));
+        assert!(!unit_columns().contains(&"f_root_share".to_string()));
+        assert!(!cand_unit_columns().contains(&"f_n_roots".to_string()));
+        let mut data = test_data(vec![0, 0, 0, 0], vec![4], vec![vec![0, 1], vec![0]], vec![]);
+        label(
+            &mut data,
+            &truth(&[10, 10, 10, 10], &[(10, PhyLabel::Good)]),
+        )
+        .unwrap();
+        assert_eq!(data.tables.units.n_rows(), 1);
+        assert_eq!(data.tables.units.get(0, "f_n_spikes"), 4.0);
+        let c = &data.tables.cand_units;
+        assert_eq!(c.n_rows(), 2, "one row per candidate");
+        assert_eq!(c.get(0, "f_n_spikes"), 2.0);
+        assert_eq!(c.get(0, "y_label"), 2.0, "Jaccard exactly 0.5");
+        assert_eq!(c.get(1, "f_n_spikes"), 1.0);
+        assert_eq!(c.get(1, "y_label"), 0.0, "Jaccard 0.25 is noise");
+        assert_eq!(c.get(0, "root"), 0.0);
+        assert_eq!(c.get(1, "cand_idx"), 1.0);
+    }
+
+    #[test]
+    fn features_and_targets_round_trip_and_retarget_identically() {
+        let root_of_spike = vec![0, 0, 0, 0, 1, 1];
+        let cluster = [10, 10, 10, 11, 10, 12];
+        let labels = [
+            (10, PhyLabel::Good),
+            (11, PhyLabel::Noise),
+            (12, PhyLabel::Mua),
+        ];
+        let mut data = test_data(
+            root_of_spike,
+            vec![4, 2],
+            vec![vec![0, 1, 2], vec![4, 5]],
+            vec![(0, 1)],
+        );
+        let key = super::super::shard::FeatureKey {
+            extractor_version: EXTRACTOR_VERSION.into(),
+            max_spikes_per_root: 99,
+            seed: 3,
+            input_fingerprint: "fp".into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let fdir = dir.path().join(super::super::shard::FEATURES_DIR);
+        let tdir = dir.path().join(super::super::shard::TARGETS_DIR);
+        super::super::shard::save_features(&fdir, &key, &data).unwrap();
+        let mut loaded = super::super::shard::load_features(&fdir, &key).unwrap();
+        let t = truth(&cluster, &labels);
+        label(&mut data, &t).unwrap();
+        label(&mut loaded, &t).unwrap();
+        assert_eq!(loaded.tables.roots, data.tables.roots);
+        assert_eq!(loaded.tables.candidates, data.tables.candidates);
+        assert_eq!(loaded.tables.pairs, data.tables.pairs);
+        assert_eq!(loaded.tables.units, data.tables.units);
+        assert_eq!(loaded.tables.cand_units, data.tables.cand_units);
+        assert_eq!(loaded.tables.spikes, data.tables.spikes);
+
+        let hash = "truth-hash";
+        super::super::shard::save_targets(&tdir, &key.id(), hash, &data).unwrap();
+        assert!(super::super::shard::targets_match(&tdir, &key.id(), hash));
+        assert!(!super::super::shard::targets_match(
+            &tdir,
+            &key.id(),
+            "other"
+        ));
+        let targets = super::super::shard::load_targets(&tdir, &key.id(), hash).unwrap();
+        let features = super::super::shard::load_features(&fdir, &key).unwrap();
+        let joined = super::super::shard::join(
+            "candidates",
+            &features.tables.candidates,
+            &targets.candidates,
+        )
+        .unwrap();
+        let mut expected = data.tables.candidates.clone();
+        expected.target_version = Some(crate::learn::TARGET_VERSION.to_owned());
+        assert_eq!(joined, expected);
     }
 }

@@ -16,7 +16,7 @@ use sorrel_data::learn::cv::{
 };
 use sorrel_data::learn::metrics::{root_ranking, RootRanking};
 use sorrel_data::learn::table::Table;
-use sorrel_data::learn::EXTRACTOR_VERSION;
+use sorrel_data::learn::{EXTRACTOR_VERSION, TARGET_VERSION};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -116,6 +116,13 @@ struct Selection {
 
 /// Load `data/<table>`, select features (`f_*` plus optional joined root
 /// features) and the target, and drop rows without a usable label.
+///
+/// Only targets that are truly undefined stay non-finite and are dropped here:
+/// `y_verdict`, `y_n_good` and `y_good_share` for roots below the bench's
+/// ten-spike floor (the dev DB's `root_truths` omits them), and
+/// `y_best_unit`, which is an id rather than a target and is NaN when a
+/// candidate touches no good unit. Every overlap target is 0, never NaN, when
+/// the intersection is empty.
 fn select(data: &Path, a: TableArgs<'_>) -> Result<Selection> {
     let table = Table::load(data, a.table)?;
     ensure!(
@@ -123,6 +130,13 @@ fn select(data: &Path, a: TableArgs<'_>) -> Result<Selection> {
         "table was extracted with {:?}, this binary expects {EXTRACTOR_VERSION}; re-extract",
         table.extractor_version
     );
+    if table.columns.iter().any(|c| c.starts_with("y_")) {
+        ensure!(
+            table.target_version.as_deref() == Some(TARGET_VERSION),
+            "table carries targets from {:?}, this binary expects {TARGET_VERSION}; re-extract",
+            table.target_version
+        );
+    }
     ensure!(
         table.column(a.target).is_some(),
         "table {:?} has no target column {:?}",
@@ -156,6 +170,13 @@ fn select(data: &Path, a: TableArgs<'_>) -> Result<Selection> {
             roots.extractor_version == EXTRACTOR_VERSION,
             "roots table has a different extractor version"
         );
+        if roots.columns.iter().any(|c| c.starts_with("y_")) {
+            ensure!(
+                roots.target_version.as_deref() == Some(TARGET_VERSION),
+                "roots table has targets from {:?}, expected {TARGET_VERSION}",
+                roots.target_version
+            );
+        }
         let root_sid: Vec<Option<usize>> = roots
             .sids
             .iter()
@@ -402,8 +423,11 @@ fn train(a: &TrainArgs) -> Result<()> {
     )?;
     let model = fit_full(&problem, 0, objective)?;
 
-    let schema_key = format!("{}.{}", a.table, a.target);
     let schema = FeatureSchema::new(sel.names.clone(), EXTRACTOR_VERSION);
+    // Key by content hash, not by table/target: two heads trained on the same
+    // columns share one schema, and a retrained head with different columns
+    // adds a new entry instead of overwriting a schema another head uses.
+    let schema_key = schema.key();
     let mut head = Head::new(schema_key.clone(), model);
     for (key, value) in head_metrics(&output.report) {
         head = head.with_metric(key, value);
@@ -450,7 +474,7 @@ fn train(a: &TrainArgs) -> Result<()> {
         .provenance
         .n_rows
         .insert(a.head.clone(), sel.y.len() as u64);
-    bundle.add_schema(schema_key.clone(), schema);
+    bundle.add_schema_checked(schema_key.clone(), schema)?;
     bundle.add_head(a.head.clone(), head);
     bundle.validate()?;
     bundle.save(&a.out)?;
@@ -556,6 +580,7 @@ mod tests {
             .collect(),
         );
         t.sids = vec!["s0".into()];
+        t.target_version = Some(TARGET_VERSION.into());
         t.push_row(&[0.0, 1.0, 2.0, f32::NAN, 0.9, 1.0, 7.0])
             .unwrap();
         t.push_row(&[0.0, 1.0, 3.0, 0.0, f32::NAN, 0.0, f32::NAN])
@@ -590,5 +615,23 @@ mod tests {
         assert_eq!(sel.x[2], 0.5);
         assert_eq!(sel.roots, vec![1]);
         assert!(sel.hit[0]);
+    }
+
+    #[test]
+    fn schema_keys_are_content_hashes_so_two_heads_share_one_schema() {
+        let a = FeatureSchema::new(vec!["f_a".into(), "f_b".into()], EXTRACTOR_VERSION);
+        let same = FeatureSchema::new(vec!["f_a".into(), "f_b".into()], EXTRACTOR_VERSION);
+        let different = FeatureSchema::new(vec!["f_a".into(), "f_c".into()], EXTRACTOR_VERSION);
+        assert_eq!(a.key(), same.key());
+        assert_ne!(a.key(), different.key());
+        assert_eq!(a.key(), format!("schema:{}", a.hash));
+
+        let mut bundle = CuratorBundle::new(Provenance::new(0, "0.4.0", None, EXTRACTOR_VERSION));
+        bundle.add_schema_checked(a.key(), a.clone()).unwrap();
+        bundle.add_schema_checked(same.key(), same.clone()).unwrap();
+        bundle
+            .add_schema_checked(different.key(), different.clone())
+            .unwrap();
+        assert_eq!(bundle.feature_schemas.len(), 2);
     }
 }

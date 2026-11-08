@@ -40,6 +40,10 @@ pub const DATA_SUFFIX: &str = ".f32";
 pub struct TableHeader {
     /// Identifies the feature extractor that produced the columns.
     pub extractor_version: String,
+    /// Target definition version, when the table carries (or joins) `y_*`
+    /// columns. `None` for an input-only feature shard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_version: Option<String>,
     /// Column names in data order.
     pub columns: Vec<String>,
     /// Number of rows in the data file.
@@ -62,6 +66,8 @@ pub struct TableHeader {
 pub struct Table {
     /// Identifies the extractor that produced the columns.
     pub extractor_version: String,
+    /// Target definition version when the table carries `y_*` columns.
+    pub target_version: Option<String>,
     /// Column names in data order; unique and non-empty.
     pub columns: Vec<String>,
     /// Session ids, indexed by `sid_idx` values.
@@ -77,6 +83,7 @@ pub struct Table {
 impl PartialEq for Table {
     fn eq(&self, other: &Self) -> bool {
         self.extractor_version == other.extractor_version
+            && self.target_version == other.target_version
             && self.columns == other.columns
             && self.sids == other.sids
             && self.codes == other.codes
@@ -96,6 +103,7 @@ impl Table {
     pub fn new(extractor_version: impl Into<String>, columns: Vec<String>) -> Self {
         Self {
             extractor_version: extractor_version.into(),
+            target_version: None,
             columns,
             sids: Vec::new(),
             data: Vec::new(),
@@ -194,6 +202,7 @@ impl Table {
         }
         let n = self.n_rows();
         let mut out = Table::new(self.extractor_version.clone(), names.to_vec());
+        out.target_version = self.target_version.clone();
         out.sids = self.sids.clone();
         out.codes = self.codes.clone();
         out.notes = self.notes.clone();
@@ -230,6 +239,7 @@ impl Table {
         );
         Ok(TableHeader {
             extractor_version: self.extractor_version.clone(),
+            target_version: self.target_version.clone(),
             columns: self.columns.clone(),
             n_rows: n,
             sids: self.sids.clone(),
@@ -284,6 +294,36 @@ impl Table {
         serde_json::from_slice::<TableHeader>(&text).is_ok_and(|h| h.extractor_version == version)
     }
 
+    /// Whether a shard is complete and current: its header names the expected
+    /// extractor and target versions, and its data file is exactly the size
+    /// the header promises. A truncated or missing `.f32` is not "ready".
+    pub fn integrity(
+        dir: &Path,
+        name: &str,
+        extractor_version: &str,
+        target_version: Option<&str>,
+    ) -> bool {
+        let (header_path, data_path) = paths(dir, name);
+        let Ok(text) = fs::read(&header_path) else {
+            return false;
+        };
+        let Ok(header) = serde_json::from_slice::<TableHeader>(&text) else {
+            return false;
+        };
+        if header.extractor_version != extractor_version
+            || header.target_version.as_deref() != target_version
+        {
+            return false;
+        }
+        let Some(columns) = header.columns.len().checked_mul(header.n_rows) else {
+            return false;
+        };
+        let Some(expected) = columns.checked_mul(4) else {
+            return false;
+        };
+        fs::metadata(&data_path).is_ok_and(|m| m.len() == expected as u64)
+    }
+
     fn from_parts(header: TableHeader, bytes: &[u8]) -> Result<Table> {
         let stride = header.columns.len();
         ensure!(!header.columns.is_empty(), "table header has no columns");
@@ -300,6 +340,7 @@ impl Table {
         }
         Ok(Table {
             extractor_version: header.extractor_version,
+            target_version: header.target_version,
             columns: header.columns,
             sids: header.sids,
             data,

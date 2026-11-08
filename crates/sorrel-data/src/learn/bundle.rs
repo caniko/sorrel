@@ -86,6 +86,13 @@ impl FeatureSchema {
     pub fn matches(&self, caller_hash: &str) -> bool {
         self.hash == caller_hash
     }
+
+    /// Bundle key for this schema: derived from its hash, so two heads trained
+    /// on the same columns and extractor version share one entry and a
+    /// different schema can never overwrite it.
+    pub fn key(&self) -> String {
+        format!("schema:{}", self.hash)
+    }
 }
 
 /// One learned model plus the schema and metadata needed to interpret it.
@@ -167,6 +174,8 @@ impl Head {
     ///
     /// The return value follows [`gbdt::Model::predict`]: a class index for
     /// classification (binary uses 0/1) or the predicted value for regression.
+    /// For a binary head with a stored [`Head::threshold`], the positive class
+    /// is decided against that threshold instead of the model's default 0.5.
     pub fn predict(
         &self,
         bundle: &CuratorBundle,
@@ -180,7 +189,12 @@ impl Head {
             self.model.n_features,
             features.len()
         );
-        Ok(self.model.predict(features))
+        match (self.threshold, self.model.objective) {
+            (Some(threshold), Objective::Logistic) => Ok(f64::from(
+                self.model.predict_proba(features)[0] >= threshold,
+            )),
+            _ => Ok(self.model.predict(features)),
+        }
     }
 
     /// Probabilities for one row, aligned to [`Head::classes`] when this is a
@@ -291,6 +305,28 @@ impl CuratorBundle {
     pub fn add_schema(&mut self, key: impl Into<String>, schema: FeatureSchema) -> &mut Self {
         self.feature_schemas.insert(key.into(), schema);
         self
+    }
+
+    /// Add a feature schema without ever replacing one that a different hash
+    /// already owns. Two heads on the same table and target share a schema;
+    /// retraining a head with different columns must add a new entry instead of
+    /// silently changing the schema another head still depends on.
+    pub fn add_schema_checked(
+        &mut self,
+        key: impl Into<String>,
+        schema: FeatureSchema,
+    ) -> Result<&mut Self> {
+        let key = key.into();
+        if let Some(existing) = self.feature_schemas.get(&key) {
+            ensure!(
+                existing.hash == schema.hash,
+                "schema {key:?} already exists with hash {} and would be overwritten with {}; \
+                 a head may still depend on the old schema",
+                existing.hash,
+                schema.hash
+            );
+        }
+        Ok(self.add_schema(key, schema))
     }
 
     /// Add a learned head.
@@ -803,5 +839,54 @@ mod tests {
         bundle.feature_schemas.get_mut("cluster").unwrap().hash = "deadbeefdeadbeef".to_string();
         let err = bundle.validate().unwrap_err().to_string();
         assert!(err.contains("hash"), "{err}");
+    }
+
+    #[test]
+    fn schema_keys_are_hashes_and_never_overwrite_a_different_schema() {
+        let mut bundle = CuratorBundle::new(Provenance::new(0, "0.4.0", None, "ex"));
+        let a = FeatureSchema::new(vec!["a".to_string()], "ex");
+        let b = FeatureSchema::new(vec!["b".to_string()], "ex");
+        assert_eq!(a.key(), format!("schema:{}", a.hash));
+        assert_ne!(a.key(), b.key());
+        bundle.add_schema_checked(a.key(), a.clone()).unwrap();
+        // Same content is a no-op, not a conflict.
+        bundle.add_schema_checked(a.key(), a.clone()).unwrap();
+        bundle.add_schema_checked(b.key(), b.clone()).unwrap();
+        assert_eq!(bundle.feature_schemas.len(), 2);
+        // A fixed key that already holds a different hash is refused.
+        let mut other = CuratorBundle::new(Provenance::new(0, "0.4.0", None, "ex"));
+        other.add_schema_checked("fixed", a.clone()).unwrap();
+        let err = other
+            .add_schema_checked("fixed", b.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("would be overwritten"), "{err}");
+    }
+
+    #[test]
+    fn binary_threshold_is_applied_to_predict() {
+        let extractor = "ex-threshold";
+        let mut bundle = CuratorBundle::new(Provenance::new(0, "0.4.0", None, extractor));
+        let schema = FeatureSchema::new(vec!["a".to_string()], extractor);
+        let key = schema.key();
+        bundle.add_schema(key.clone(), schema);
+        // A base-only model with positive probability 0.8.
+        let model = gbdt::Model {
+            n_features: 1,
+            objective: Objective::Logistic,
+            base_score: vec![(0.8f64 / 0.2).ln()],
+            trees_per_round: 1,
+            trees: Vec::new(),
+            importance: vec![0.0],
+        };
+        let mut head = Head::new(key.clone(), model);
+        let hash = bundle.feature_schemas[&key].hash.clone();
+        assert_eq!(head.predict(&bundle, &[0.0], &hash).unwrap(), 1.0);
+        head = head.with_threshold(0.9);
+        assert_eq!(head.predict(&bundle, &[0.0], &hash).unwrap(), 0.0);
+        head = head.with_threshold(0.5);
+        assert_eq!(head.predict(&bundle, &[0.0], &hash).unwrap(), 1.0);
+        let p = head.predict_proba(&bundle, &[0.0], &hash).unwrap();
+        assert!((p[1] - 0.8).abs() < 1e-12, "{p:?}");
     }
 }

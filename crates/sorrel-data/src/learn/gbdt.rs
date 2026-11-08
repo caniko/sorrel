@@ -319,18 +319,38 @@ impl Model {
     /// Structural validation, used when reading a model from a bundle.
     pub fn validate(&self) -> Result<()> {
         ensure!(self.n_features > 0, "model has no input features");
+        if let Objective::Softmax { n_classes } = self.objective {
+            ensure!(
+                n_classes >= 2,
+                "softmax model has {n_classes} classes; at least two are required"
+            );
+        }
+        let n_outputs = self.n_outputs();
+        ensure!(n_outputs > 0, "model objective has no outputs");
         ensure!(self.trees_per_round > 0, "model has no trees per round");
         ensure!(
-            self.base_score.len() == self.n_outputs(),
-            "model has {} base scores for {} outputs",
-            self.base_score.len(),
-            self.n_outputs()
+            self.trees_per_round == n_outputs,
+            "model has {} trees per round for {n_outputs} outputs",
+            self.trees_per_round
+        );
+        ensure!(
+            self.base_score.len() == n_outputs,
+            "model has {} base scores for {n_outputs} outputs",
+            self.base_score.len()
+        );
+        ensure!(
+            self.base_score.iter().all(|v| v.is_finite()),
+            "model has a non-finite base score"
         );
         ensure!(
             self.importance.len() == self.n_features,
             "model importance has {} entries for {} features",
             self.importance.len(),
             self.n_features
+        );
+        ensure!(
+            self.importance.iter().all(|v| v.is_finite()),
+            "model has a non-finite feature importance"
         );
         ensure!(
             self.trees.len().is_multiple_of(self.trees_per_round),
@@ -537,7 +557,16 @@ pub fn train(
 
     let mut trees = Vec::new();
     let mut round_importance: Vec<Vec<f64>> = Vec::new();
-    let mut best: Option<(f64, usize)> = None;
+    // Early stopping judges round 0 too: the base-score-only model is the
+    // candidate every round has to beat, and a zero-tree model is allowed.
+    let mut best: Option<(f64, usize)> = match (
+        params.early_stopping.as_ref(),
+        val_raw.as_deref(),
+        val_weights.as_deref(),
+    ) {
+        (Some(es), Some(val), Some(vw)) => Some((validation_loss(objective, val, &es.y, vw), 0)),
+        _ => None,
+    };
     let mut since_best = 0usize;
     let mut probs = if matches!(objective, Objective::Softmax { .. }) {
         vec![0.0; n * n_out]
@@ -1755,6 +1784,83 @@ mod tests {
             model.n_rounds()
         );
         assert!(model.n_rounds() >= 1);
+    }
+
+    #[test]
+    fn early_stopping_can_keep_the_base_score_only_model() {
+        // Training is balanced, so the base score is p=0.5. Validation labels
+        // are the opposite of the fitted direction on both sides of the split,
+        // so every round makes the validation loss worse: the base-score-only
+        // model must be kept and a zero-tree model is allowed.
+        let mut x = Vec::with_capacity(200);
+        let mut y = Vec::with_capacity(200);
+        for i in 0..200 {
+            x.push(if i < 100 { 0.0f32 } else { 1.0 });
+            y.push(if i < 100 { 0.0f32 } else { 1.0 });
+        }
+        let mut xv = Vec::with_capacity(200);
+        let mut yv = Vec::with_capacity(200);
+        for i in 0..200 {
+            xv.push(if i < 100 { 0.0f32 } else { 1.0 });
+            yv.push(if i < 100 { 1.0f32 } else { 0.0 });
+        }
+        let params = Params {
+            n_rounds: 10,
+            learning_rate: 0.5,
+            min_samples_leaf: 5,
+            l2: 0.0,
+            early_stopping: Some(EarlyStopping {
+                x: xv,
+                y: yv,
+                weights: None,
+                patience: 2,
+            }),
+            ..Params::default()
+        };
+        let model = train(&x, 1, &y, None, Objective::Logistic, &params).unwrap();
+        assert!(model.trees.is_empty(), "kept {} trees", model.trees.len());
+        assert_eq!(model.n_rounds(), 0);
+        assert!(model.importance.iter().all(|&g| g == 0.0));
+        // Prediction still works from the base score alone.
+        let p = model.predict_proba(&[1.0])[0];
+        assert!((p - 0.5).abs() < 1e-9, "{p}");
+    }
+
+    #[test]
+    fn model_validation_rejects_inconsistent_or_non_finite_models() {
+        let valid = || Model {
+            n_features: 2,
+            objective: Objective::Logistic,
+            base_score: vec![0.0],
+            trees_per_round: 1,
+            trees: Vec::new(),
+            importance: vec![0.0, 0.0],
+        };
+        assert!(valid().validate().is_ok());
+
+        let mut m = valid();
+        m.objective = Objective::Softmax { n_classes: 0 };
+        let err = m.validate().unwrap_err().to_string();
+        assert!(err.contains("at least two"), "{err}");
+
+        let mut m = valid();
+        m.objective = Objective::Softmax { n_classes: 1 };
+        assert!(m.validate().is_err());
+
+        let mut m = valid();
+        m.trees_per_round = 2;
+        let err = m.validate().unwrap_err().to_string();
+        assert!(err.contains("trees per round"), "{err}");
+
+        let mut m = valid();
+        m.base_score = vec![f64::NAN];
+        let err = m.validate().unwrap_err().to_string();
+        assert!(err.contains("base score"), "{err}");
+
+        let mut m = valid();
+        m.importance[1] = f64::INFINITY;
+        let err = m.validate().unwrap_err().to_string();
+        assert!(err.contains("importance"), "{err}");
     }
 
     #[test]

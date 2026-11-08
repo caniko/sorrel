@@ -13,13 +13,20 @@ pub mod cv;
 pub mod features;
 pub mod gbdt;
 pub mod metrics;
+pub mod shard;
 pub mod table;
 
 /// Version stamped into every extracted table and into a head's feature
-/// schema. Bump it whenever a column is added, removed, renamed or its
-/// definition changes: a model trained on another version must refuse to
-/// score silently.
-pub const EXTRACTOR_VERSION: &str = "learn-v1";
+/// schema. Bump it whenever an input-only column is added, removed, renamed or
+/// its definition changes: a model trained on another version must refuse to
+/// score silently. Target-only changes bump [`TARGET_VERSION`] instead, so a
+/// retarget can reuse the expensive input-only shard.
+pub const EXTRACTOR_VERSION: &str = "learn-v2";
+
+/// Version of the truth-derived `y_*` columns. It is independent of
+/// [`EXTRACTOR_VERSION`] so changing a target definition (or the truth behind
+/// it) invalidates only the cheap target shard, never the input-only features.
+pub const TARGET_VERSION: &str = "targets-v1";
 
 #[cfg(test)]
 pub(crate) mod test_support {
