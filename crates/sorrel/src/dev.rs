@@ -19,6 +19,8 @@ use sorrel_io::{DataProvider, HasGeometry};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+mod bench;
+
 #[derive(Args, Debug)]
 pub struct DevArgs {
     /// Results DB (default: $SORREL_DEV_DB, else bench/results.sqlite of the enclosing repo)
@@ -33,6 +35,8 @@ pub struct DevArgs {
 
 #[derive(Subcommand, Debug)]
 enum DevCmd {
+    /// Native double-blind curation bench: discover, seal, run, score and report
+    Bench(bench::BenchArgs),
     /// Create, inspect or query the DB
     Db {
         #[command(subcommand)]
@@ -158,6 +162,7 @@ pub fn run(a: DevArgs) -> Result<()> {
         open_db(&a.db, &a.deny)
     };
     match &a.cmd {
+        DevCmd::Bench(args) => bench::run(args, a.db.as_deref())?,
         DevCmd::Db {
             action: DbCmd::Init,
         } => print!("{}", open_db(&a.db, &a.deny)?.status()?),

@@ -33,6 +33,10 @@ env_logger.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 serde_json.workspace = true
+serde = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+rand = { version = "0.9", optional = true }
 
 # eframe's Linux window backends are deliberately enabled only for Linux
 # targets. Windows uses the native Win32 backend and macOS uses Cocoa/Metal;
@@ -46,7 +50,7 @@ default = ["phy-export"]
 phy-export = ["sorrel-data/phy-export"]
 hdf5 = ["sorrel-io/hdf5", "sorrel-data/hdf5"]
 # `sorrel dev ...` and `sorrel diff --record`: the bench results DB.
-dev = ["sorrel-data/dev"]
+dev = ["sorrel-data/dev", "dep:serde", "dep:blake3", "dep:tempfile", "dep:rand"]
 
 # Windows icon, version info and manifest (build.rs; a no-op off Windows).
 [build-dependencies]

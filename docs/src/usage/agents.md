@@ -113,6 +113,14 @@ the batch.
 - `compare A B`: template cosine over the union of active channels,
   peak-channel distance in µm, trough-to-peak and half-width deltas,
   amplitude ratio.
+- `waveform C`: current-membership raw waveform evidence from at most 128
+  jittered, time-stratified spikes on up to eight channels. Reports valid/sample
+  counts, peak channel, baseline-MAD SNR, early/late waveform cosine and shape
+  landmarks. Unlike primary sorter-template descriptors, this evidence follows
+  split memberships. DC subtraction only; the response states whether the raw
+  input was high-pass filtered. Do not apply filtered-template shape cutoffs to
+  unfiltered or unknown raw. Missing/incomplete raw fails explicitly, never
+  silently falling back to a parent template. No spike indices are returned.
 - `window C T0 T1`: n, rate, contamination, amplitude and presence of that
   slice against the whole unit.
 - `split C by=amp|time|pc|kmeans|core|robust|axis [at=X]`: registers a new
@@ -122,7 +130,9 @@ the batch.
   with the smaller side as minor; `kmeans` uses the same proposer as `brief`
   level 3; `core`
   isolates a small clean refractory core of a contaminated unit (diagonal GMM,
-  BIC-chosen k <= 8; run it again on the remainder for a second core), or,
+  BIC-chosen k <= 8; a contaminated component may offer a high-posterior
+  dense interior with the same size, separation and refractory gates;
+  run it again on the remainder for a second core), or,
   when a contaminated minority is dropped to leave a clean majority, the
   `cleanup` reading (minor part = the dropped minority; the handle line names
   `core` or `cleanup`, the better of the two is returned). `robust` fits one
@@ -130,8 +140,19 @@ the batch.
   30 alternative PC/amplitude mixture handles instead of one. Act on
   the handle with `split`, `decide` or `eval`.
 - `eval merge A B ..`, `eval s12.1`, `eval m3`: as the `eval` tool.
+- Experimental `split C by=robust` fits a correlated majority cloud plus broad
+  tails, returning `robust-cleanup` (minor = dropped tail). No `at=` is allowed.
+  It requires a BIC-supported broad component, at least 100 spikes per part,
+  majority retained, retained rpc <= .1 and no refractory regression. A handle
+  is a boundary hypothesis, not a good label. Inspect each part independently.
 
 A parse error in one query lists the grammar and does not stop the others.
+
+Experimental `split C by=axis` lists at most 30 alternative PC-coordinate and
+amplitude-mixture handles, with remaining/moved counts, rpc and BIC evidence.
+It accepts no `at=`. Listing is read-only and does not compute every CCG; use
+`eval` for a handle worth considering. Alternatives can overlap: applying one
+invalidates the others for that parent. rpc support is NOT a good label.
 
 ## The review protocol
 
