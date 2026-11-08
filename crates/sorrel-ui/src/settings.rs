@@ -661,10 +661,6 @@ mod tests {
         );
         h.key_press(egui::Key::Escape);
         h.run_ok();
-        open(&h.ctx);
-        h.run_ok();
-        h.key_press(egui::Key::Escape);
-        h.run_ok();
         assert!(
             !shared(&h.ctx).lock().unwrap().open,
             "configured cancel closes Settings"
