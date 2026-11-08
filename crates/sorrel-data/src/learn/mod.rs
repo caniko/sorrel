@@ -3,11 +3,23 @@
 //! [`gbdt`] is a dependency-free, deterministic gradient-boosted decision
 //! tree trainer and predictor; [`bundle`] packages one or more fitted models
 //! ("heads") with their feature schemas and provenance into a single portable
-//! `.sorrel-model` file. Dataset extraction, training orchestration and the
-//! CLI/MCP surfaces build on these two pieces in later work.
+//! `.sorrel-model` file; [`table`] is the on-disk feature/target dataset
+//! format; [`features`] extracts those tables from a session; and [`cv`]/
+//! [`metrics`] run grouped cross-validation and score it. The CLI/MCP
+//! surfaces build on these pieces in later work.
 
 pub mod bundle;
+pub mod cv;
+pub mod features;
 pub mod gbdt;
+pub mod metrics;
+pub mod table;
+
+/// Version stamped into every extracted table and into a head's feature
+/// schema. Bump it whenever a column is added, removed, renamed or its
+/// definition changes: a model trained on another version must refuse to
+/// score silently.
+pub const EXTRACTOR_VERSION: &str = "learn-v1";
 
 #[cfg(test)]
 pub(crate) mod test_support {

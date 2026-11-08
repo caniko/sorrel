@@ -15,6 +15,13 @@ fn main() {
     if env("CARGO_CFG_TARGET_ENV") == "gnu" {
         println!("cargo:rustc-link-arg-bins=-Wl,--no-gc-sections");
     }
+    // The clap command tree is deep (dev -> bench -> arm-specific args);
+    // debug builds of `--help`/`--version` exceed Windows' 1 MB default
+    // main-thread stack. Reserve 8 MB (the usual Linux default); pages are
+    // committed lazily, so idle memory is unchanged.
+    if env("CARGO_CFG_TARGET_ENV") == "msvc" {
+        println!("cargo:rustc-link-arg-bins=/STACK:8388608");
+    }
     let dir = std::path::PathBuf::from(env("CARGO_MANIFEST_DIR")).join("assets");
     let version = env("CARGO_PKG_VERSION");
     // 0.3.1-rc1 -> 0,3,1,0: the numeric prefix of each dotted part.

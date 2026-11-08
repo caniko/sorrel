@@ -2,6 +2,7 @@
 //! enter the results database. No external Python runner is used.
 
 mod coverage;
+mod learn;
 mod process;
 mod reporting;
 mod runner;
@@ -30,6 +31,21 @@ pub struct BenchArgs {
     scorer: Option<PathBuf>,
     #[command(subcommand)]
     cmd: BenchCmd,
+}
+
+/// Arguments of `learn-dataset`, filled from the clap variant below.
+#[derive(Debug)]
+pub struct LearnDatasetArgs {
+    /// Output directory (tables and `shards/`; must not be inside a session)
+    pub out: PathBuf,
+    /// Extract at most this many dev sessions (deterministic first-N cohort)
+    pub dev_limit: Option<usize>,
+    /// Concurrent sessions (1-8)
+    pub jobs: usize,
+    /// Upper bound on `spikes` rows per root
+    pub max_spikes_per_root: usize,
+    /// Extraction seed (recorded; the extractor itself is deterministic)
+    pub seed: u64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -118,6 +134,24 @@ enum BenchCmd {
         dev_limit: usize,
         #[arg(long, value_enum, default_value = "robust")]
         method: CoverageMethod,
+    },
+    /// DEV only: extract the learned curator's feature/target tables
+    LearnDataset {
+        /// Output directory (tables and `shards/`; must not be inside a session)
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+        /// Extract at most this many dev sessions (deterministic first-N cohort)
+        #[arg(long)]
+        dev_limit: Option<usize>,
+        /// Concurrent sessions (1-8)
+        #[arg(long, default_value_t = 1)]
+        jobs: usize,
+        /// Upper bound on `spikes` rows per root
+        #[arg(long, default_value_t = 1500)]
+        max_spikes_per_root: usize,
+        /// Extraction seed (recorded; the extractor itself is deterministic)
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
     },
 }
 
@@ -658,6 +692,19 @@ pub(super) fn run(a: &BenchArgs, db: Option<&Path>) -> Result<()> {
         }
         BenchCmd::Run { .. } => b.run_arm(&a.cmd)?,
         BenchCmd::Coverage { dev_limit, method } => b.coverage(*dev_limit, *method)?,
+        BenchCmd::LearnDataset {
+            out,
+            dev_limit,
+            jobs,
+            max_spikes_per_root,
+            seed,
+        } => b.learn_dataset(&LearnDatasetArgs {
+            out: out.clone(),
+            dev_limit: *dev_limit,
+            jobs: *jobs,
+            max_spikes_per_root: *max_spikes_per_root,
+            seed: *seed,
+        })?,
         BenchCmd::Score {
             split,
             match_jaccard,

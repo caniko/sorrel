@@ -20,6 +20,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 mod bench;
+mod learn;
 
 #[derive(Args, Debug)]
 pub struct DevArgs {
@@ -37,6 +38,11 @@ pub struct DevArgs {
 enum DevCmd {
     /// Native double-blind curation bench: discover, seal, run, score and report
     Bench(bench::BenchArgs),
+    /// Learned-curator datasets and models: grouped CV and bundle training
+    Learn {
+        #[command(subcommand)]
+        action: learn::LearnCmd,
+    },
     /// Create, inspect or query the DB
     Db {
         #[command(subcommand)]
@@ -163,6 +169,7 @@ pub fn run(a: DevArgs) -> Result<()> {
     };
     match &a.cmd {
         DevCmd::Bench(args) => bench::run(args, a.db.as_deref())?,
+        DevCmd::Learn { action } => learn::run(action)?,
         DevCmd::Db {
             action: DbCmd::Init,
         } => print!("{}", open_db(&a.db, &a.deny)?.status()?),
