@@ -58,6 +58,7 @@
           "formatting"
           "hm-module"
           "workspace-tests"
+          "binstall-metadata"
         ];
       in {
         flake.mode = "custom";
