@@ -2,7 +2,7 @@
   description = "Sorrel — spike-sorting curation GUI";
 
   inputs = {
-    harbor-rs.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk";
+    harbor-rs.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk&rev=6055d7d2b3a05d7d91d50938c7fb6f862a5eec85";
 
     # Pinned SDK used by harbor-rs's reproducible osxcross builder.
     harbor-macos-sdk-pin.url = "git+https://github.com/caniko/harbor-macos-sdk-pin.git?ref=trunk";
@@ -58,6 +58,7 @@
           "formatting"
           "hm-module"
           "workspace-tests"
+          "binstall-metadata"
         ];
       in {
         flake.mode = "custom";
@@ -514,6 +515,16 @@
         })
         // {
           formatting = treefmtEval.config.build.check self;
+        }
+        // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          # The crate's [package.metadata.binstall] must match the release
+          # bundle's archives (bin-dir included), and every archive has to
+          # ship every [[bin]] without required-features.
+          binstall-metadata = harbor-rs.lib.mkBinstallCheck {
+            inherit pkgs;
+            bundle = self.packages.${system}.release-bundle;
+            cargoToml = ./crates/sorrel/Cargo.toml;
+          };
         };
 
       devShells = import ./nix/devshell.nix {
