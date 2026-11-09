@@ -38,7 +38,7 @@ pub struct DevArgs {
 enum DevCmd {
     /// Native double-blind curation bench: discover, seal, run, score and report
     Bench(bench::BenchArgs),
-    /// Learned-curator datasets and models: grouped CV and bundle training
+    /// Learned-curator datasets and models: grouped CV, bundle training and prediction
     Learn {
         #[command(subcommand)]
         action: learn::LearnCmd,

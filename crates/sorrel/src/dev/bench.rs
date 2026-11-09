@@ -11,7 +11,9 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sorrel_data::learn::features::{ExtractData, Truth};
 use sorrel_data::learn::shard::{InputFile, InputManifest};
+use sorrel_io::kilosort::read_cluster_group_tsv;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -77,6 +79,10 @@ enum BenchCmd {
         dev: bool,
         #[arg(long)]
         phy_curated: bool,
+        /// A second human curation of a recording already in dev: ingest it
+        /// as an extra dev session instead of skipping it as a duplicate
+        #[arg(long, requires = "dev")]
+        recuration: bool,
     },
     /// Run one arm on fresh copies; OpenCode gets only the sorrel MCP tools
     Run {
@@ -235,6 +241,10 @@ struct SessionEntry {
     /// Input-only hash: duplicate recordings cannot straddle dev and holdout.
     #[serde(default)]
     fingerprint: String,
+    /// The dev session whose recording this is a second curation of; group
+    /// both together in cross-validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recuration_of: Option<String>,
 }
 
 struct Bench {
@@ -296,6 +306,52 @@ fn is_link(metadata: &fs::Metadata) -> bool {
     {
         metadata.file_type().is_symlink()
     }
+}
+
+/// Canonical path of `path`, resolving existing ancestors even when the leaf
+/// does not exist yet. Nothing is created.
+pub(super) fn canonical_target(path: &Path) -> Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut missing = Vec::new();
+    let mut current = path.as_path();
+    loop {
+        if current.exists() {
+            let mut resolved = current.canonicalize()?;
+            for part in missing.iter().rev() {
+                resolved.push(part);
+            }
+            return Ok(normalize(resolved));
+        }
+        let name = current
+            .file_name()
+            .with_context(|| format!("{} has no existing ancestor", path.display()))?;
+        missing.push(name.to_owned());
+        current = current
+            .parent()
+            .with_context(|| format!("{} has no existing ancestor", path.display()))?;
+    }
+}
+
+/// Lexically resolve `.` and `..` in an already-canonical prefix. Missing tail
+/// components cannot be symlinks, so removing `..` there cannot change which
+/// filesystem directory a later write reaches.
+fn normalize(path: PathBuf) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 fn discover(root: &Path, integer_ids: bool) -> Result<Vec<Candidate>> {
@@ -482,13 +538,61 @@ impl Bench {
         Ok(())
     }
 
-    fn add(&mut self, paths: Vec<PathBuf>, force_dev: bool, phy: bool) -> Result<()> {
+    /// The dev session a re-curation with this input `fingerprint` and
+    /// `truth` belongs to, or `None` when a session already holds this exact
+    /// truth. A recording with any holdout session is refused: its second
+    /// curation would put the sealed truth's recording in dev.
+    fn recuration_target(&self, fingerprint: &str, truth: &Path) -> Result<Option<String>> {
+        let same: Vec<_> = self
+            .map
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.fingerprint == fingerprint)
+            .collect();
+        ensure!(
+            !same.is_empty(),
+            "--recuration: this recording is not in the bench yet; add it without --recuration"
+        );
+        ensure!(
+            same.iter().all(|(_, s)| s.split == Split::Dev),
+            "--recuration: this recording is in holdout; promote it with `add --dev` first"
+        );
+        // Either truth file may be absent (phy saved no labels or no splits).
+        let read = |dir: &Path| {
+            ["spike_clusters.npy", "cluster_group.tsv"].map(|name| fs::read(dir.join(name)).ok())
+        };
+        let incoming = read(truth);
+        for (sid, _) in &same {
+            if read(&self.session(sid).join("truth")) == incoming {
+                return Ok(None);
+            }
+        }
+        let original = same
+            .iter()
+            .find(|(_, s)| s.recuration_of.is_none())
+            .unwrap_or(&same[0]);
+        Ok(Some(original.0.clone()))
+    }
+
+    fn add(
+        &mut self,
+        paths: Vec<PathBuf>,
+        force_dev: bool,
+        phy: bool,
+        recuration: bool,
+    ) -> Result<()> {
         ensure!(phy, "native intake currently requires --phy-curated");
         let mut added = 0;
         let mut skipped = 0;
         for path in paths {
             let path = path.canonicalize()?;
-            if let Some((sid, entry)) = self.map.sessions.iter().find(|(_, s)| s.path == path) {
+            // A re-curation may reuse a known path; the fingerprint/truth checks decide.
+            if let Some((sid, entry)) = self
+                .map
+                .sessions
+                .iter()
+                .find(|(_, s)| !recuration && s.path == path)
+            {
                 let sid = sid.clone();
                 if force_dev && entry.split == Split::Holdout {
                     self.promote(&sid)?;
@@ -523,7 +627,16 @@ impl Bench {
                 .context("new-session describe preflight failed")?;
             let pure = provenance["pure_manual"] == true && provenance["anchored"] != true;
             let fingerprint = input_hash(&input)?;
-            if let Some((sid, entry)) = self
+            let mut recuration_of = None;
+            if recuration {
+                match self.recuration_target(&fingerprint, &truth)? {
+                    Some(sid) => recuration_of = Some(sid),
+                    None => {
+                        skipped += 1;
+                        continue;
+                    }
+                }
+            } else if let Some((sid, entry)) = self
                 .map
                 .sessions
                 .iter()
@@ -558,6 +671,7 @@ impl Bench {
                     pure_manual: pure,
                     keep,
                     fingerprint,
+                    recuration_of,
                 },
             );
             self.save_map()?;
@@ -636,6 +750,48 @@ fn input_hash(input: &Path) -> Result<String> {
         }
     }
     Ok(h.finalize().to_hex().to_string())
+}
+
+/// Read the truth in `truth_dir`, align it through the stored row map and hash
+/// it. Shared by `learn-dataset` and `learn predict`; the caller decides
+/// whether a truth directory is present at all.
+pub(super) fn load_truth(truth_dir: &Path, data: &ExtractData) -> Result<(Truth, String, f64)> {
+    let started = std::time::Instant::now();
+    let truth_rows = sorrel_io::npy::read_1d_u32(&truth_dir.join("spike_clusters.npy"))?;
+    ensure!(
+        truth_rows.len() == data.root_of_spike.len(),
+        "{}: truth has {} spikes, session {}",
+        truth_dir.display(),
+        truth_rows.len(),
+        data.root_of_spike.len()
+    );
+    // The row map and session roots were validated against the input roots at
+    // extraction time; rebuild the original-order roots from them so a
+    // retarget never has to open the input.
+    let mut input_roots = vec![u32::MAX; truth_rows.len()];
+    for (global, row) in data.row_map.iter().enumerate() {
+        let row = row.context("truth needs a complete original NPY-row map")? as usize;
+        ensure!(
+            row < input_roots.len() && input_roots[row] == u32::MAX,
+            "{}: stored NPY-row map is not a permutation",
+            truth_dir.display()
+        );
+        input_roots[row] = data.session_roots[global];
+    }
+    let cluster = coverage::aligned_truth(
+        &data.row_map,
+        &truth_rows,
+        &input_roots,
+        &data.session_roots,
+    )?;
+    let labels = read_cluster_group_tsv(&truth_dir.join("cluster_group.tsv"))
+        .context("dev truth labels missing or unreadable")?;
+    let hash = sorrel_data::devdb::truth_hash(truth_dir)?;
+    Ok((
+        Truth { cluster, labels },
+        hash,
+        started.elapsed().as_secs_f64(),
+    ))
 }
 
 /// Files at or below this size are hashed in full for a feature-key manifest.
@@ -742,12 +898,13 @@ pub(super) fn run(a: &BenchArgs, db: Option<&Path>) -> Result<()> {
             integer_ids,
             dev,
             phy_curated,
+            recuration,
         } => {
             let mut paths = sessions.clone();
             for root in roots {
                 paths.extend(discover(root, *integer_ids)?.into_iter().map(|c| c.path));
             }
-            b.add(paths, *dev, *phy_curated)?;
+            b.add(paths, *dev, *phy_curated, *recuration)?;
         }
         BenchCmd::Status => {
             for split in [Split::Dev, Split::Holdout] {
@@ -840,6 +997,56 @@ mod tests {
         assert!(read_json(&t.path().join(".sealed/map.json")).unwrap()["sessions"].is_object());
         drop(b);
         assert!(Bench::open(&args, None).is_ok());
+    }
+
+    #[test]
+    fn recuration_joins_its_dev_recording_unless_the_truth_is_already_there() {
+        let t = tempfile::tempdir().unwrap();
+        let args = BenchArgs {
+            bench: Some(t.path().to_owned()),
+            sorrel: None,
+            scorer: None,
+            cmd: BenchCmd::Status,
+        };
+        let mut b = Bench::open(&args, None).unwrap();
+        let truth = |dir: &Path, clusters: &[u8]| {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join("spike_clusters.npy"), clusters).unwrap();
+            fs::write(dir.join("cluster_group.tsv"), b"cluster_id\tgroup\n").unwrap();
+        };
+        let entry = |split, fingerprint: &str, recuration_of: Option<&str>| SessionEntry {
+            path: PathBuf::new(),
+            split,
+            forced_dev: false,
+            pure_manual: true,
+            keep: Vec::new(),
+            fingerprint: fingerprint.into(),
+            recuration_of: recuration_of.map(Into::into),
+        };
+        b.map
+            .sessions
+            .insert("orig".into(), entry(Split::Dev, "rec", None));
+        truth(&b.session("orig").join("truth"), b"phy");
+        let incoming = t.path().join("incoming");
+
+        truth(&incoming, b"phy");
+        assert_eq!(b.recuration_target("rec", &incoming).unwrap(), None);
+        truth(&incoming, b"sorrel");
+        assert_eq!(
+            b.recuration_target("rec", &incoming).unwrap().as_deref(),
+            Some("orig")
+        );
+        b.map
+            .sessions
+            .insert("again".into(), entry(Split::Dev, "rec", Some("orig")));
+        truth(&b.session("again").join("truth"), b"sorrel");
+        assert_eq!(b.recuration_target("rec", &incoming).unwrap(), None);
+
+        assert!(b.recuration_target("unknown", &incoming).is_err());
+        b.map
+            .sessions
+            .insert("sealed".into(), entry(Split::Holdout, "held", None));
+        assert!(b.recuration_target("held", &incoming).is_err());
     }
 
     #[test]

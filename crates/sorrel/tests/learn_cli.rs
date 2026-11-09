@@ -662,3 +662,177 @@ fn learn_cv_refuses_targets_from_another_target_version() {
         String::from_utf8_lossy(&o.stderr)
     );
 }
+
+/// Every path under `dir` with its bytes; a directory carries an empty payload.
+/// Comparing two snapshots proves both "same bytes" and "no file added".
+fn dir_snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let name = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if entry.file_type().unwrap().is_dir() {
+                out.push((name, Vec::new()));
+                walk(root, &path, out);
+            } else {
+                out.push((name, std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+#[test]
+fn learn_predict_scores_roots_and_leaves_the_phy_folder_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = tmp.path().join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let bench = tmp.path().join("bench");
+    write_bench(&bench, &scratch);
+    let out = tmp.path().join("learn");
+    let s = |p: &Path| p.to_str().unwrap().to_owned();
+    ok(&sorrel(
+        tmp.path(),
+        &[
+            "dev",
+            "bench",
+            "--bench",
+            &s(&bench),
+            "learn-dataset",
+            "--out",
+            &s(&out),
+            "--jobs",
+            "2",
+        ],
+    ));
+
+    let bundle = tmp.path().join("curator.sorrel-model");
+    ok(&sorrel(
+        tmp.path(),
+        &[
+            "dev",
+            "learn",
+            "train",
+            "--data",
+            &s(&out),
+            "--table",
+            "roots",
+            "--target",
+            "y_verdict",
+            "--objective",
+            "softmax:5",
+            "--folds",
+            "2",
+            "--out",
+            &s(&bundle),
+            "--head",
+            "verdict",
+        ],
+    ));
+
+    // A synthetic phy folder: the sorter output plus a human curation.
+    let phy = scratch.join("source-sid-a");
+    std::fs::write(
+        phy.join("cluster_group.tsv"),
+        "cluster_id\tgroup\n0\tgood\n1\tnoise\n",
+    )
+    .unwrap();
+    let before = dir_snapshot(&phy);
+
+    // An --out inside PHY_DIR is refused before anything is written.
+    let refused = sorrel(
+        tmp.path(),
+        &[
+            "dev",
+            "learn",
+            "predict",
+            "--model",
+            &s(&bundle),
+            "--out",
+            &s(&phy.join("predict-out")),
+            &s(&phy),
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("inside PHY_DIR"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(before, dir_snapshot(&phy), "--out was created in PHY_DIR");
+
+    let predictions_dir = tmp.path().join("predict");
+    let stdout = ok(&sorrel(
+        tmp.path(),
+        &[
+            "dev",
+            "learn",
+            "predict",
+            "--model",
+            &s(&bundle),
+            "--out",
+            &s(&predictions_dir),
+            &s(&phy),
+        ],
+    ));
+    let summary_lines = stdout.lines().count();
+    assert!(
+        (3..=6).contains(&summary_lines),
+        "summary has {summary_lines} lines:\n{stdout}"
+    );
+    assert_eq!(before, dir_snapshot(&phy), "PHY_DIR changed during predict");
+
+    let text = std::fs::read_to_string(predictions_dir.join("predictions.tsv")).unwrap();
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().unwrap().split('\t').collect();
+    assert_eq!(header[0], "cluster_id");
+    assert_eq!(header[1], "n_spikes");
+    assert_eq!(header[2], "predicted");
+    assert_eq!(header.last(), Some(&"truth"));
+    assert_eq!(header.len(), 3 + 5 + 1, "{header:?}");
+    for class in ["noise", "kept", "cleanup", "cores", "other"] {
+        let column = format!("p_{class}");
+        assert!(header.iter().any(|h| *h == column), "{header:?}");
+    }
+    let rows: Vec<&str> = lines.collect();
+    assert_eq!(rows.len(), 2, "one row per root:\n{text}");
+    for row in &rows {
+        let fields: Vec<&str> = row.split('\t').collect();
+        assert_eq!(fields.len(), header.len(), "{row}");
+        assert!(!fields[2].is_empty(), "no predicted class: {row}");
+        assert!(
+            !fields[header.len() - 1].is_empty(),
+            "no truth class: {row}"
+        );
+        for p in &fields[3..header.len() - 1] {
+            let value: f64 = p.parse().unwrap();
+            assert!((0.0..=1.0).contains(&value), "{row}");
+        }
+    }
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(predictions_dir.join("report.json")).unwrap())
+            .unwrap();
+    assert_eq!(report["head"], "verdict");
+    assert_eq!(report["n_roots"], 2);
+    assert_eq!(report["truth"], true);
+    assert!(report["accuracy"].as_f64().is_some(), "{report}");
+    let classes = report["confusion"]["classes"].as_array().unwrap();
+    assert_eq!(classes.len(), 5, "{report}");
+    let cells: u64 = report["confusion"]["matrix"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|row| row.as_array().unwrap())
+        .map(|cell| cell.as_u64().unwrap())
+        .sum();
+    assert_eq!(cells, 2, "confusion cells must cover every root:\n{report}");
+    assert_eq!(report["per_class"].as_array().unwrap().len(), 5);
+}

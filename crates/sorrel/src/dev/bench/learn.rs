@@ -25,15 +25,15 @@
 //! pair similarity is evaluated from roots with at least 100 spikes; and the
 //! spike rows are a deterministic time-stratified subsample.
 
-use super::coverage::{aligned_truth, dev_sessions};
+use super::coverage::dev_sessions;
 use super::{Bench, LearnDatasetArgs};
 use anyhow::{bail, ensure, Context, Result};
-use sorrel_data::learn::features::{self, ExtractData, ExtractOpts, Truth};
+use sorrel_data::learn::features::{self, ExtractOpts};
 use sorrel_data::learn::shard::{self, FeatureKey, FEATURES_DIR, TARGETS_DIR};
 use sorrel_data::learn::table::{append_remapped, Table};
 use sorrel_data::learn::{EXTRACTOR_VERSION, TARGET_VERSION};
 use sorrel_data::{Journal, Session};
-use sorrel_io::kilosort::{read_cluster_group_tsv, KilosortProvider};
+use sorrel_io::kilosort::KilosortProvider;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -369,7 +369,7 @@ impl OutGuard {
                 }
             }
         }
-        let resolved = canonical_target(dir)?;
+        let resolved = super::canonical_target(dir)?;
         ensure!(
             resolved.starts_with(&self.root),
             "{} resolves outside --out {} (a junction/symlink?)",
@@ -394,10 +394,10 @@ impl OutGuard {
 fn ensure_out_safe(bench: &Bench, out: &Path) -> Result<OutGuard> {
     // Resolve the nearest existing ancestor so a not-yet-created --out still
     // compares canonically (and through a junction/symlink) without writing.
-    let root = canonical_target(out)?;
+    let root = super::canonical_target(out)?;
     let mut protected = Vec::new();
     for p in [bench.root.join("sessions"), bench.root.join(".sealed")] {
-        if let Ok(p) = canonical_target(&p) {
+        if let Ok(p) = super::canonical_target(&p) {
             protected.push(p);
         }
     }
@@ -417,52 +417,6 @@ fn ensure_out_safe(bench: &Bench, out: &Path) -> Result<OutGuard> {
     }
     fs::create_dir_all(&root).with_context(|| format!("create --out {}", root.display()))?;
     Ok(OutGuard { root, protected })
-}
-
-/// Canonical path of `path`, resolving existing ancestors even when the leaf
-/// does not exist yet. Nothing is created.
-fn canonical_target(path: &Path) -> Result<PathBuf> {
-    let path = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let mut missing = Vec::new();
-    let mut current = path.as_path();
-    loop {
-        if current.exists() {
-            let mut resolved = current.canonicalize()?;
-            for part in missing.iter().rev() {
-                resolved.push(part);
-            }
-            return Ok(normalize(resolved));
-        }
-        let name = current
-            .file_name()
-            .with_context(|| format!("{} has no existing ancestor", path.display()))?;
-        missing.push(name.to_owned());
-        current = current
-            .parent()
-            .with_context(|| format!("{} has no existing ancestor", path.display()))?;
-    }
-}
-
-/// Lexically resolve `.` and `..` in an already-canonical prefix. Missing tail
-/// components cannot be symlinks, so removing `..` there cannot change which
-/// filesystem directory a later write reaches.
-fn normalize(path: PathBuf) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }
 
 fn feature_key(bench: &Bench, sid: &str, opts: &ExtractOpts) -> Result<FeatureKey> {
@@ -550,7 +504,8 @@ fn process_session(
     };
 
     // Truth now: only after every input-only feature exists.
-    let (truth, truth_hash, truth_secs) = load_truth(bench, sid, &data)?;
+    let truth_dir = bench.session(sid).join("truth");
+    let (truth, truth_hash, truth_secs) = super::load_truth(&truth_dir, &data)?;
     if shard::targets_match(&tdir, &key.id(), &truth_hash) {
         eprintln!("dev {sid}: reused targets (truth hash read in {truth_secs:.1}s)");
         return Ok(("reused", None));
@@ -593,7 +548,8 @@ fn retarget_session(
     let shard = out.shard_dir(sid);
     let mut data = shard::load_features(&shard.join(FEATURES_DIR), key)?;
     let loaded = Instant::now();
-    let (truth, truth_hash, truth_secs) = load_truth(bench, sid, &data)?;
+    let truth_dir = bench.session(sid).join("truth");
+    let (truth, truth_hash, truth_secs) = super::load_truth(&truth_dir, &data)?;
     let label_started = Instant::now();
     features::label(&mut data, &truth)?;
     out.prepare_dir(&shard.join(TARGETS_DIR))?;
@@ -617,49 +573,11 @@ fn retarget_session(
     ))
 }
 
-/// Read the truth, align it through the stored row map and hash it.
-fn load_truth(bench: &Bench, sid: &str, data: &ExtractData) -> Result<(Truth, String, f64)> {
-    let started = Instant::now();
-    let truth_dir = bench.session(sid).join("truth");
-    let truth_rows = sorrel_io::npy::read_1d_u32(&truth_dir.join("spike_clusters.npy"))?;
-    ensure!(
-        truth_rows.len() == data.root_of_spike.len(),
-        "{sid}: truth has {} spikes, session {}",
-        truth_rows.len(),
-        data.root_of_spike.len()
-    );
-    // The row map and session roots were validated against the input roots at
-    // extraction time; rebuild the original-order roots from them so a
-    // retarget never has to open the input.
-    let mut input_roots = vec![u32::MAX; truth_rows.len()];
-    for (global, row) in data.row_map.iter().enumerate() {
-        let row = row.context("truth needs a complete original NPY-row map")? as usize;
-        ensure!(
-            row < input_roots.len() && input_roots[row] == u32::MAX,
-            "{sid}: stored NPY-row map is not a permutation"
-        );
-        input_roots[row] = data.session_roots[global];
-    }
-    let cluster = aligned_truth(
-        &data.row_map,
-        &truth_rows,
-        &input_roots,
-        &data.session_roots,
-    )?;
-    let labels = read_cluster_group_tsv(&truth_dir.join("cluster_group.tsv"))
-        .context("dev truth labels missing or unreadable")?;
-    let hash = sorrel_data::devdb::truth_hash(&truth_dir)?;
-    Ok((
-        Truth { cluster, labels },
-        hash,
-        started.elapsed().as_secs_f64(),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dev::bench::{SessionEntry, SessionMap, Split};
+    use sorrel_data::learn::features::ExtractData;
     use sorrel_io::SampleIndex;
 
     fn entry(split: Split, path: &str) -> SessionEntry {
@@ -670,6 +588,7 @@ mod tests {
             pure_manual: false,
             keep: Vec::new(),
             fingerprint: String::new(),
+            recuration_of: None,
         }
     }
 

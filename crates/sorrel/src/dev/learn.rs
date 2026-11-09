@@ -1,5 +1,6 @@
-//! `sorrel dev learn cv|train`: grouped cross-validation and model fitting on
-//! an extracted `learn-dataset` directory.
+//! `sorrel dev learn cv|train|predict`: grouped cross-validation, model
+//! fitting on an extracted `learn-dataset` directory, and scoring of one phy
+//! folder with a stored head.
 //!
 //! Only the plumbing lives here. Feature selection, fold assignment, metrics
 //! and model training are in `sorrel_data::learn`, so the same code can be
@@ -14,10 +15,16 @@ use sorrel_data::learn::cv::{
     cross_validate, fit_full, objective_name, parse_objective, read_groups, row_groups, CvOptions,
     CvReport, FoldMetrics, Problem,
 };
-use sorrel_data::learn::metrics::{root_ranking, RootRanking};
+use sorrel_data::learn::features::{self, ExtractOpts};
+use sorrel_data::learn::gbdt::Objective;
+use sorrel_data::learn::metrics::{classification, root_ranking, RootRanking};
 use sorrel_data::learn::table::Table;
 use sorrel_data::learn::{EXTRACTOR_VERSION, TARGET_VERSION};
+use sorrel_data::{Journal, Session};
+use sorrel_io::kilosort::KilosortProvider;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Subcommand, Debug)]
@@ -26,6 +33,8 @@ pub enum LearnCmd {
     Cv(CvArgs),
     /// Fit on every row and write/update a `.sorrel-model` bundle head
     Train(TrainArgs),
+    /// Score one phy folder's roots with a stored head; the folder is not written
+    Predict(PredictArgs),
 }
 
 #[derive(Args, Debug)]
@@ -89,6 +98,28 @@ pub struct TrainArgs {
     head: String,
 }
 
+#[derive(Args, Debug)]
+pub struct PredictArgs {
+    /// phy/Kilosort folder (with params.py); its input and curation are only read
+    #[arg(value_name = "PHY_DIR")]
+    phy_dir: PathBuf,
+    /// `.sorrel-model` bundle holding the head
+    #[arg(long, value_name = "FILE")]
+    model: PathBuf,
+    /// Head key; default: the bundle's only head
+    #[arg(long, value_name = "KEY")]
+    head: Option<String>,
+    /// Output directory (predictions.tsv and report.json; must be outside PHY_DIR)
+    #[arg(long, value_name = "DIR")]
+    out: PathBuf,
+    /// Upper bound on `spikes` rows per root used by extraction
+    #[arg(long, default_value_t = 1500)]
+    max_spikes_per_root: usize,
+    /// Extraction seed (recorded; the extractor itself is deterministic)
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+}
+
 fn objective_parser(text: &str) -> std::result::Result<String, String> {
     parse_objective(text).map_err(|e| e.to_string())?;
     Ok(text.to_owned())
@@ -109,6 +140,8 @@ type RootJoin = (BTreeMap<(u32, u32), usize>, Table);
 #[derive(Debug)]
 struct Selection {
     names: Vec<String>,
+    /// Class-index -> name for classification targets (empty for regression).
+    classes: Vec<String>,
     x: Vec<f32>,
     y: Vec<f32>,
     groups: Vec<String>,
@@ -242,6 +275,11 @@ fn select(data: &Path, a: TableArgs<'_>) -> Result<Selection> {
     if !matches!(objective, sorrel_data::learn::gbdt::Objective::SquaredError) {
         check_documented_classes(&table, a.target, n_classes, &class_map)?;
     }
+    // Names travel with the head so predict can label its probability columns.
+    let classes = match objective {
+        Objective::SquaredError => Vec::new(),
+        _ => class_names(&table, a.target, n_classes, &class_map),
+    };
     let has_hit = table.column("y_hit");
     let has_unit = table.column("y_best_unit");
     let has_root = table.column("root");
@@ -397,6 +435,7 @@ fn select(data: &Path, a: TableArgs<'_>) -> Result<Selection> {
     );
     Ok(Selection {
         names,
+        classes,
         x,
         y,
         groups,
@@ -491,6 +530,35 @@ fn check_documented_classes(
     Ok(())
 }
 
+/// Class-index -> name, from the target's documented codes after `--class-map`.
+/// Codes with no documented name (or several names mapping to one class) fall
+/// back to `class_<k>`, so a stored head always names every probability column.
+fn class_names(
+    table: &Table,
+    target: &str,
+    n_classes: usize,
+    class_map: &BTreeMap<i64, i64>,
+) -> Vec<String> {
+    let mut names = vec![String::new(); n_classes];
+    if let Some(codes) = table.codes.get(target) {
+        for (name, &code) in codes {
+            let mapped = class_map.get(&code).copied().unwrap_or(code);
+            if mapped >= 0 && (mapped as usize) < n_classes {
+                let slot = &mut names[mapped as usize];
+                if slot.is_empty() {
+                    *slot = name.clone();
+                }
+            }
+        }
+    }
+    for (k, name) in names.iter_mut().enumerate() {
+        if name.is_empty() {
+            *name = format!("class_{k}");
+        }
+    }
+    names
+}
+
 /// Arguments shared by `cv` and `train`.
 struct TableArgs<'a> {
     table: &'a str,
@@ -514,6 +582,7 @@ pub fn run(cmd: &LearnCmd) -> Result<()> {
     match cmd {
         LearnCmd::Cv(a) => cv(a),
         LearnCmd::Train(a) => train(a),
+        LearnCmd::Predict(a) => predict(a),
     }
 }
 
@@ -609,7 +678,7 @@ fn train(a: &TrainArgs) -> Result<()> {
     // columns share one schema, and a retrained head with different columns
     // adds a new entry instead of overwriting a schema another head uses.
     let schema_key = schema.key();
-    let mut head = Head::new(schema_key.clone(), model);
+    let mut head = Head::new(schema_key.clone(), model).with_classes(sel.classes.clone());
     for (key, value) in head_metrics(&output.report) {
         head = head.with_metric(key, value);
     }
@@ -673,6 +742,334 @@ fn train(a: &TrainArgs) -> Result<()> {
             "metrics": bundle.heads[&a.head].metrics,
             "ranking": ranking,
         }))?
+    );
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct ConfusionReport {
+    classes: Vec<String>,
+    matrix: Vec<Vec<usize>>,
+}
+
+#[derive(Serialize)]
+struct ClassScore {
+    class: String,
+    support: usize,
+    predicted: usize,
+    precision: f64,
+    recall: f64,
+    f1: f64,
+}
+
+#[derive(Serialize)]
+struct PredictReport {
+    model: String,
+    head: String,
+    n_roots: usize,
+    truth: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n_truth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accuracy: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confusion: Option<ConfusionReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_class: Option<Vec<ClassScore>>,
+}
+
+/// The head's classes in class-index order: stored names when the bundle has
+/// them, else positional names so every probability column still has a header.
+fn head_class_names(key: &str, head: &Head) -> Result<Vec<String>> {
+    match head.model.objective {
+        Objective::Softmax { n_classes } => {
+            if head.classes.is_empty() {
+                Ok((0..n_classes).map(|k| format!("class_{k}")).collect())
+            } else {
+                ensure!(
+                    head.classes.len() == n_classes,
+                    "head {key:?} names {} classes but its softmax has {n_classes}",
+                    head.classes.len()
+                );
+                Ok(head.classes.clone())
+            }
+        }
+        Objective::Logistic => Ok(if head.classes.is_empty() {
+            vec!["neg".to_owned(), "pos".to_owned()]
+        } else {
+            head.classes.clone()
+        }),
+        Objective::SquaredError => {
+            bail!("head {key:?} is a regression head; predict needs a classification head")
+        }
+    }
+}
+
+/// `sorrel dev learn predict`: blind PHY_DIR, extract exactly as
+/// `learn-dataset`, score the roots table with a stored head, and write the
+/// predictions plus an optional truth report. PHY_DIR is never opened for
+/// writing and no temporary file is created in it.
+fn predict(a: &PredictArgs) -> Result<()> {
+    ensure!(
+        a.max_spikes_per_root > 0,
+        "--max-spikes-per-root must be positive"
+    );
+    ensure!(
+        a.phy_dir.is_dir(),
+        "PHY_DIR {} is not a directory",
+        a.phy_dir.display()
+    );
+    ensure!(
+        a.phy_dir.join("params.py").is_file(),
+        "PHY_DIR {} has no params.py; pass a phy/Kilosort output folder",
+        a.phy_dir.display()
+    );
+    // Resolve both sides through junctions/symlinks before anything is written:
+    // --out must never land inside the folder the command promises not to touch.
+    let phy = super::bench::canonical_target(&a.phy_dir)?;
+    let out = super::bench::canonical_target(&a.out)?;
+    ensure!(
+        !out.starts_with(&phy),
+        "--out {} is inside PHY_DIR {}; choose a directory outside it",
+        out.display(),
+        phy.display()
+    );
+
+    let bundle = CuratorBundle::load(&a.model)?;
+    ensure!(
+        bundle.provenance.extractor_version == EXTRACTOR_VERSION,
+        "bundle was built with extractor {:?}, this binary uses {EXTRACTOR_VERSION}; retrain",
+        bundle.provenance.extractor_version
+    );
+    let key = match a.head.as_deref() {
+        Some(key) => key,
+        None => match bundle.heads.len() {
+            1 => bundle.heads.keys().next().expect("one head"),
+            0 => bail!("bundle {} has no heads", a.model.display()),
+            n => bail!(
+                "bundle {} has {n} heads ({}); pass --head KEY",
+                a.model.display(),
+                bundle.heads.keys().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        },
+    };
+    let head = bundle.heads.get(key).with_context(|| {
+        format!(
+            "bundle has no head {key:?}; heads: {}",
+            bundle.heads.keys().cloned().collect::<Vec<_>>().join(", ")
+        )
+    })?;
+    let schema = bundle
+        .feature_schemas
+        .get(&head.schema)
+        .with_context(|| format!("head {key:?} references missing schema {:?}", head.schema))?;
+    let classes = head_class_names(key, head)?;
+
+    // The blinded copy lives under --out, not the system temp dir: blinding
+    // hard-links on one volume, so --out on another volume gives a real copy.
+    fs::create_dir_all(&a.out).with_context(|| format!("create --out {}", a.out.display()))?;
+    let temp = tempfile::Builder::new()
+        .prefix("predict-")
+        .tempdir_in(&a.out)?;
+    let input = temp.path().join("input");
+    let truth_dir = temp.path().join("truth");
+    // Reads PHY_DIR only; the session below opens the blinded copy.
+    sorrel_data::blind::write_phy_curated_pair(&phy, None, &input, &truth_dir)?;
+    let params = sorrel_io::PhyParams::read(&input.join("params.py"))?;
+    let raw = params
+        .dat_path
+        .unwrap_or_else(|| PathBuf::from("recording.dat"));
+    ensure!(
+        raw.components().count() == 1 && input.join(&raw).is_file(),
+        "blind input has no self-contained raw recording; not a phy/Kilosort folder"
+    );
+
+    let provider = KilosortProvider::open(&input, Default::default())?;
+    let mut session = Session::new(
+        provider,
+        Journal::open(&temp.path().join("predict.journal"))?,
+    );
+    session.seed_pc_features();
+    session.seed_templates();
+    session.seed_template_waveforms();
+    session.seed_amplitudes();
+    let opts = ExtractOpts {
+        max_spikes_per_root: a.max_spikes_per_root,
+        seed: a.seed,
+    };
+    let mut data = features::extract(&session, "predict", &opts)?;
+
+    // Truth last, exactly as learn-dataset: only after every input-only feature.
+    // An uncurated Kilosort folder has spike_clusters.npy but no labels.
+    let truth_present = truth_dir.join("spike_clusters.npy").is_file()
+        && truth_dir.join("cluster_group.tsv").is_file();
+    if truth_present {
+        let (truth, _, _) = super::bench::load_truth(&truth_dir, &data)?;
+        features::label(&mut data, &truth)?;
+    }
+    let roots = &data.tables.roots;
+    let n_roots = roots.n_rows();
+
+    let mut columns = Vec::with_capacity(schema.names.len());
+    let mut missing = Vec::new();
+    for name in &schema.names {
+        // A head trained on the roots table with joined root features stores
+        // `root_f_*`; on the roots table itself that is the same column.
+        match roots
+            .column(name)
+            .or_else(|| name.strip_prefix("root_").and_then(|n| roots.column(n)))
+        {
+            Some(column) => columns.push(column),
+            None => missing.push(name.clone()),
+        }
+    }
+    ensure!(
+        missing.is_empty(),
+        "roots table has no column(s) {} required by head {key:?} schema {}; \
+         was the head trained on the roots table?",
+        missing.join(", "),
+        head.schema
+    );
+
+    let mut predicted = Vec::with_capacity(n_roots);
+    let mut probabilities = Vec::with_capacity(n_roots);
+    for row in 0..n_roots {
+        let x: Vec<f32> = columns.iter().map(|&c| roots.value(row, c)).collect();
+        let mut p = head.predict_proba(&bundle, &x, &schema.hash)?;
+        if matches!(head.model.objective, Objective::Logistic) && p.len() == 1 {
+            p = vec![1.0 - p[0], p[0]];
+        }
+        ensure!(
+            p.len() == classes.len(),
+            "head {key:?} returned {} probabilities for {} classes",
+            p.len(),
+            classes.len()
+        );
+        let mut best = 0;
+        for (k, value) in p.iter().enumerate() {
+            if *value > p[best] {
+                best = k;
+            }
+        }
+        predicted.push(best);
+        probabilities.push(p);
+    }
+
+    let truth_classes: Option<Vec<Option<usize>>> = truth_present.then(|| {
+        (0..n_roots)
+            .map(|row| {
+                let value = roots.get(row, "y_verdict");
+                let class = value as usize;
+                if value.is_finite()
+                    && value >= 0.0
+                    && class < classes.len()
+                    && (value - value.round()).abs() < 1e-4
+                {
+                    Some(class)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    });
+
+    let mut metrics = None;
+    let mut n_truth = 0usize;
+    let mut correct = 0usize;
+    if let Some(truth) = &truth_classes {
+        let pairs: Vec<(usize, usize)> = predicted
+            .iter()
+            .copied()
+            .zip(truth.iter().copied())
+            .filter_map(|(p, t)| t.map(|t| (t, p)))
+            .collect();
+        n_truth = pairs.len();
+        if n_truth > 0 {
+            let y: Vec<usize> = pairs.iter().map(|&(t, _)| t).collect();
+            let p: Vec<usize> = pairs.iter().map(|&(_, p)| p).collect();
+            let m = classification(&y, &p, classes.len())?;
+            correct = m.confusion.iter().enumerate().map(|(k, row)| row[k]).sum();
+            metrics = Some(m);
+        }
+    }
+
+    let mut tsv = String::new();
+    let _ = write!(tsv, "cluster_id\tn_spikes\tpredicted");
+    for class in &classes {
+        let _ = write!(tsv, "\tp_{class}");
+    }
+    tsv.push_str("\ttruth\n");
+    for row in 0..n_roots {
+        let _ = write!(
+            tsv,
+            "{}\t{}\t{}",
+            roots.get(row, "root") as u32,
+            roots.get(row, "f_n_spikes") as usize,
+            classes[predicted[row]]
+        );
+        for p in &probabilities[row] {
+            let _ = write!(tsv, "\t{p:.6}");
+        }
+        let truth = truth_classes
+            .as_ref()
+            .and_then(|t| t[row])
+            .map(|c| classes[c].as_str())
+            .unwrap_or("");
+        let _ = writeln!(tsv, "\t{truth}");
+    }
+
+    let predictions_path = a.out.join("predictions.tsv");
+    let report_path = a.out.join("report.json");
+    fs::write(&predictions_path, tsv)
+        .with_context(|| format!("write {}", predictions_path.display()))?;
+    let report = PredictReport {
+        model: a.model.display().to_string(),
+        head: key.to_owned(),
+        n_roots,
+        truth: truth_present,
+        n_truth: truth_present.then_some(n_truth),
+        accuracy: metrics.as_ref().map(|m| m.accuracy),
+        confusion: metrics.as_ref().map(|m| ConfusionReport {
+            classes: classes.clone(),
+            matrix: m.confusion.clone(),
+        }),
+        per_class: metrics.as_ref().map(|m| {
+            m.classes
+                .iter()
+                .enumerate()
+                .map(|(k, class)| ClassScore {
+                    class: classes[k].clone(),
+                    support: class.support,
+                    predicted: class.predicted,
+                    precision: class.precision,
+                    recall: class.recall,
+                    f1: class.f1,
+                })
+                .collect()
+        }),
+    };
+    fs::write(&report_path, serde_json::to_vec_pretty(&report)?)
+        .with_context(|| format!("write {}", report_path.display()))?;
+
+    println!("predict: {n_roots} root(s) from {}", a.phy_dir.display());
+    println!(
+        "head {key:?}: {} class(es), {} feature(s), model {}",
+        classes.len(),
+        schema.names.len(),
+        a.model.display()
+    );
+    if truth_present {
+        println!("truth: {n_truth}/{n_roots} root(s) labelled");
+        if let Some(m) = &metrics {
+            println!("accuracy {:.3} ({correct}/{n_truth})", m.accuracy);
+        }
+    } else {
+        println!("truth: none");
+    }
+    println!(
+        "wrote {} and {}",
+        predictions_path.display(),
+        report_path.display()
     );
     Ok(())
 }

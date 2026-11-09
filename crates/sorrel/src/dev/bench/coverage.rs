@@ -420,6 +420,7 @@ mod tests {
                     pure_manual: false,
                     keep: vec![],
                     fingerprint: String::new(),
+                    recuration_of: None,
                 },
             );
         }
