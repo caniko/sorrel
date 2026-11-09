@@ -34,8 +34,10 @@
       preBuild = ''
         export HOME=$TMPDIR ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local
       '';
+      # Both bins: cargo-binstall rejects an archive missing any [[bin]].
       installPhaseCommand = ''
         install -Dm755 target/${rustTarget}/release/sorrel $out/bin/sorrel
+        install -Dm755 target/${rustTarget}/release/sorrelw $out/bin/sorrelw
       '';
     };
 

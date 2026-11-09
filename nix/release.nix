@@ -14,7 +14,7 @@
     system,
     rustTarget,
     format ? "tar.gz",
-    binaries ? ["sorrel"],
+    binaries ? ["sorrel" "sorrelw"],
   }:
     mkReleaseArchive {
       inherit pkgs pname version package system rustTarget format;
