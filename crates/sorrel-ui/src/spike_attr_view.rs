@@ -166,9 +166,9 @@ pub fn spike_attr_view<P: DataProvider>(
                 }
             });
         ui.weak(if state.lasso.is_closed() {
-            "k splits · Esc clears"
+            crate::settings::split_hint(ui.ctx())
         } else {
-            "Ctrl+click: lasso · Shift+drag: time range (1-D) · Shift+click clears"
+            "Ctrl+click: lasso · Shift+drag: time range (1-D) · Shift+click clears".into()
         });
     });
     let key: AttrKey = (selection.to_vec(), session.version(), name.clone(), reorder);

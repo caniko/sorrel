@@ -624,68 +624,59 @@ pub(crate) fn next_mode(mode: WaveformMode, dir: i32, has_templates: bool) -> Wa
 
 /// Consume one exact `key` press (ctrl = command), so nothing downstream
 /// (the global keymap) sees it.
-fn take_key(i: &mut egui::InputState, key: egui::Key, command: bool, shift: bool) -> bool {
-    let mut hit = false;
-    i.events.retain(|e| match e {
-        egui::Event::Key {
-            key: k,
-            pressed: true,
-            modifiers: m,
-            ..
-        } if *k == key && m.command == command && m.shift == shift && !m.alt => {
-            hit = true;
-            false
-        }
-        _ => true,
-    });
-    hit
-}
-
 /// Pane-local keys (only called while the pane is hovered). Returns true
 /// when `R` asked for a reset of the scaling.
-fn handle_keys(i: &mut egui::InputState, p: &mut WaveformParams, has_templates: bool) -> bool {
-    use egui::Key as K;
+fn handle_keys(ctx: &egui::Context, p: &mut WaveformParams, has_templates: bool) -> bool {
+    use crate::shortcuts::{Action, Scope, WaveformAction as W};
     const STEP: f32 = 1.1;
     let mut reset = false;
-    if take_key(i, K::W, false, true) {
+    let actions = crate::settings::consume(ctx, Scope::Waveforms);
+    let has = |a| actions.contains(&Action::Waveform(a));
+    if has(W::Previous) {
         p.mode = next_mode(p.mode, -1, has_templates);
     }
-    if take_key(i, K::W, false, false) {
+    if has(W::Next) {
         p.mode = next_mode(p.mode, 1, has_templates);
     }
     // phy `toggle_mean_waveforms`: mean-only <-> spikes with the mean on top.
-    if take_key(i, K::M, false, false) {
+    if has(W::Mean) {
         p.mode = if p.mode == WaveformMode::Mean {
             WaveformMode::Waveforms
         } else {
             WaveformMode::Mean
         };
     }
-    if take_key(i, K::O, false, false) {
+    if has(W::Overlap) {
         p.overlap = !p.overlap;
     }
-    if take_key(i, K::L, true, false) {
+    if has(W::Labels) {
         p.show_labels = !p.show_labels;
     }
     let scale =
         |v: &mut f32, up: bool| *v = (*v * if up { STEP } else { 1.0 / STEP }).clamp(0.05, 50.0);
-    for (key, up) in [(K::ArrowUp, true), (K::ArrowDown, false)] {
-        if take_key(i, key, true, false) {
+    for (amplitude, spread, up) in [
+        (W::AmplitudeUp, W::SpreadUp, true),
+        (W::AmplitudeDown, W::SpreadDown, false),
+    ] {
+        if has(amplitude) {
             scale(&mut p.amp_scale, up);
         }
-        if take_key(i, key, false, true) {
+        if has(spread) {
             scale(&mut p.probe_scale[1], up);
         }
     }
-    for (key, up) in [(K::ArrowRight, true), (K::ArrowLeft, false)] {
-        if take_key(i, key, true, false) {
+    for (box_width, spread, up) in [
+        (W::BoxWider, W::SpreadWider, true),
+        (W::BoxNarrower, W::SpreadNarrower, false),
+    ] {
+        if has(box_width) {
             scale(&mut p.box_scale[0], up);
         }
-        if take_key(i, key, false, true) {
+        if has(spread) {
             scale(&mut p.probe_scale[0], up);
         }
     }
-    if take_key(i, K::R, false, false) || take_key(i, K::R, false, true) {
+    if has(W::Reset) {
         p.box_scale = [1.0; 2];
         p.probe_scale = [1.0; 2];
         p.amp_scale = 1.0;
@@ -815,7 +806,7 @@ pub fn waveform_view<P: DataProvider>(
             // egui reports Ctrl+wheel as a zoom gesture.
             params.box_scale[1] = (params.box_scale[1] * pinch).clamp(0.05, 50.0);
         }
-        if ui.input_mut(|i| handle_keys(i, params, has_templates)) {
+        if handle_keys(ui.ctx(), params, has_templates) {
             cache.frozen = None;
         }
     }

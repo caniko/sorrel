@@ -148,9 +148,9 @@ pub fn template_feature_view<P: DataProvider>(
         return None;
     };
     let hint = if state.lasso.is_closed() {
-        "k splits · Esc clears"
+        crate::settings::split_hint(ui.ctx())
     } else {
-        "Ctrl+click: lasso"
+        "Ctrl+click: lasso".into()
     };
     ui.add(egui::Label::new(egui::RichText::new(hint).weak()).truncate());
 

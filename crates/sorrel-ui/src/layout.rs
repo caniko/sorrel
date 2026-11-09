@@ -390,7 +390,10 @@ pub fn show_tiles<P: DataProvider>(
         ui.strong(format!("{} · maximized", pane.title()));
         if ui
             .button("Restore")
-            .on_hover_text("Back to the full layout (Esc)")
+            .on_hover_text(format!(
+                "Back to the full layout ({})",
+                crate::settings::hint(ui.ctx(), "app.cancel")
+            ))
             .clicked()
         {
             b.actions.push(ViewAction::ToggleMaximize(tile));
@@ -427,6 +430,7 @@ pub fn show_popouts<P: DataProvider>(
             .with_fullscreen(b.detached.fullscreen.contains(&pane));
         b.in_popout = true;
         let closed = ctx.show_viewport_immediate(id, builder, |ui, class| {
+            crate::settings::capture_input(ui.ctx());
             if class == egui::ViewportClass::EmbeddedWindow {
                 // No native windows here (tests, exotic backends): a floating
                 // egui window; its close is the placeholder's button.
@@ -440,10 +444,18 @@ pub fn show_popouts<P: DataProvider>(
                 });
                 return false;
             }
-            // F11 flips the stored state; the builder above applies it.
-            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
-                b.detached.toggle_fullscreen(pane);
-                ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+            // The builder above applies the stored fullscreen state.
+            for action in crate::settings::consume(ui.ctx(), crate::shortcuts::Scope::Window) {
+                match action {
+                    crate::shortcuts::Action::Fullscreen => {
+                        b.detached.toggle_fullscreen(pane);
+                        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                    }
+                    crate::shortcuts::Action::Settings => {
+                        crate::settings::request_window(ui.ctx(), action);
+                    }
+                    _ => {}
+                }
             }
             b.actions.extend(
                 screenshot_events(ui.ctx())
@@ -453,8 +465,10 @@ pub fn show_popouts<P: DataProvider>(
             // Only the focused window receives key events, so a chord is
             // handled once, by whichever window has focus. Esc here runs the
             // normal cancel chain (lasso first) and never closes the window.
-            let typing = ui.ctx().egui_wants_keyboard_input();
-            let keys = ui.input(|i| key_intents(&i.events, typing));
+            for action in crate::settings::consume(ui.ctx(), crate::shortcuts::Scope::Application) {
+                crate::settings::request_window(ui.ctx(), action);
+            }
+            let keys = configured_key_intents(ui.ctx());
             b.actions.extend(keys.into_iter().map(ViewAction::Intent));
             egui::CentralPanel::default().show_inside(ui, |ui| {
                 let _ = b.pane_ui(ui, tile, &mut pane);
@@ -468,18 +482,29 @@ pub fn show_popouts<P: DataProvider>(
     }
 }
 
-/// The intents for this viewport's key presses; the main window and pop-outs
-/// share it. Plain keys are dropped while a text field has focus.
-pub fn key_intents(events: &[egui::Event], text_input_active: bool) -> Vec<crate::intent::Intent> {
-    events
-        .iter()
-        .filter_map(|ev| match ev {
-            egui::Event::Key {
-                key,
-                pressed: true,
-                modifiers,
-                ..
-            } => crate::intent::from_key_in_context(*key, *modifiers, text_input_active),
+/// Default-map test adapter. Production dispatch always uses the shared,
+/// user-configured map in `configured_key_intents`.
+#[cfg(test)]
+fn key_intents(events: &[egui::Event], text_input_active: bool) -> Vec<crate::intent::Intent> {
+    crate::shortcuts::Keymap::default()
+        .actions(
+            events,
+            crate::shortcuts::Scope::Recording,
+            text_input_active,
+        )
+        .into_iter()
+        .filter_map(|a| match a {
+            crate::shortcuts::Action::Intent(i) => Some(i),
+            _ => None,
+        })
+        .collect()
+}
+
+pub fn configured_key_intents(ctx: &egui::Context) -> Vec<crate::intent::Intent> {
+    crate::settings::actions(ctx, crate::shortcuts::Scope::Recording)
+        .into_iter()
+        .filter_map(|a| match a {
+            crate::shortcuts::Action::Intent(i) => Some(i),
             _ => None,
         })
         .collect()
@@ -518,11 +543,18 @@ fn screenshots_in(
         .collect()
 }
 
-/// F11 toggles full screen on the viewport the key was pressed in.
-pub fn toggle_fullscreen_on_f11(ctx: &egui::Context) {
-    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
-        let on = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));
+/// Configured window actions for the root viewport (pop-outs keep their
+/// fullscreen state in `Detached` instead).
+pub fn window_shortcuts(ctx: &egui::Context) {
+    for action in crate::settings::consume(ctx, crate::shortcuts::Scope::Window) {
+        match action {
+            crate::shortcuts::Action::Fullscreen => {
+                let on = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));
+            }
+            crate::shortcuts::Action::Settings => crate::settings::open(ctx),
+            _ => {}
+        }
     }
 }
 
@@ -935,7 +967,10 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
             Pane::Summary => {
                 selection_summary(ui, session, selected, self.label_str);
                 ui.separator();
-                ui.weak("Press ? for keyboard and mouse help.");
+                ui.weak(format!(
+                    "Keyboard and mouse help: {}.",
+                    crate::settings::hint(ui.ctx(), "app.help")
+                ));
             }
             Pane::Waveforms => waveform_view(
                 ui,

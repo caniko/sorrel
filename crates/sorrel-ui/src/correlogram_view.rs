@@ -222,8 +222,10 @@ fn header(ui: &mut Ui, p: &mut CcgParams) {
                 );
                 ui.end_row();
             });
-            ui.checkbox(uniform, "uniform")
-                .on_hover_text("One y scale for every cell instead of per-cell (N)");
+            ui.checkbox(uniform, "uniform").on_hover_text(format!(
+                "One y scale for every cell instead of per-cell ({})",
+                crate::settings::hint(ui.ctx(), "ccg.normalize")
+            ));
         },
     );
 }
@@ -252,7 +254,8 @@ pub fn correlogram_grid_view<P: DataProvider>(
     // Pane-local keys. Plain `N` is unbound in the global keymap (only
     // Ctrl+N is), so no conflict, but skip it while a text field has focus.
     if ui.rect_contains_pointer(ui.clip_rect()) && !ui.ctx().egui_wants_keyboard_input() {
-        let n = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::N));
+        let n = crate::settings::consume(ui.ctx(), crate::shortcuts::Scope::Ccg)
+            .contains(&crate::shortcuts::Action::CcgNormalize);
         p.uniform ^= n;
     }
     p.window_ms *= wheel_scale(ui, true);

@@ -218,7 +218,10 @@ pub fn chips(ui: &mut egui::Ui, b: &mut Brushes) {
         let text = format!("brush: {} spikes · {}  ×", s.len(), s.source.label());
         let resp = ui
             .add(egui::Button::new(text).corner_radius(10.0).selected(true))
-            .on_hover_text("Highlighted in every spike view · click or Esc clears");
+            .on_hover_text(format!(
+                "Highlighted in every spike view · click or {} clears",
+                crate::settings::hint(ui.ctx(), "app.cancel")
+            ));
         if resp.clicked() {
             b.spikes = None;
         }
@@ -227,7 +230,10 @@ pub fn chips(ui: &mut egui::Ui, b: &mut Brushes) {
         let text = format!("time {:.1}–{:.1} s  ×", t.start, t.end);
         let resp = ui
             .add(egui::Button::new(text).corner_radius(10.0).selected(true))
-            .on_hover_text("Spikes outside the range fade · click or Esc clears");
+            .on_hover_text(format!(
+                "Spikes outside the range fade · click or {} clears",
+                crate::settings::hint(ui.ctx(), "app.cancel")
+            ));
         let mut only = t.only;
         ui.checkbox(&mut only, "only in range")
             .on_hover_text("Hide spikes outside the time range instead of fading them");

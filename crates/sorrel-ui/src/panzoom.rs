@@ -65,6 +65,9 @@ impl PanZoom {
                 (p.x - data.left()) / data.width(),
                 (data.bottom() - p.y) / data.height(),
             ];
+            // Two axes are updated from the same pointer-relative `u`, so the
+            // index loop keeps the x/y symmetry visible.
+            #[allow(clippy::needless_range_loop)]
             for a in 0..2 {
                 let new_zoom = (self.zoom[a] * f).clamp(1.0, 200.0);
                 let at = self.centre[a] + (u[a] - 0.5) / self.zoom[a];

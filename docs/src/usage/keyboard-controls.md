@@ -3,8 +3,51 @@
 Sorrel uses phy's TemplateGUI shortcuts, so phy muscle memory carries
 over. Press `h` (or `?`, `F1`, or the `?` button in the top bar) for this
 list as an overlay. The overlay is generated from the same keymap table the
-app dispatches from. [phy parity](../reference/phy-parity.md) tracks what is
+app dispatches from. The tables below describe the defaults; **Help** shows
+your active bindings. [phy parity](../reference/phy-parity.md) tracks what is
 still missing.
+
+Letter keys below are unshifted unless `Shift` is explicitly shown. On
+macOS, use Cmd for the primary Ctrl shortcuts, except the physical Ctrl+Tab
+dataset-tab navigation noted below.
+
+## Configure shortcuts and settings
+
+Open **Settings** from the launcher, dataset tab bar or top bar. Under
+**Keyboard shortcuts**, search an action, remove a binding with its × button,
+or choose **Add shortcut** and press the new chord. Multiple alternatives are
+supported. **Reset** restores one action; **Restore all shortcut defaults**
+restores every action. Conflicting shortcuts in overlapping scopes prevent
+saving. Waveforms and CCG shortcuts apply only while their pane is hovered.
+
+**Save settings** applies changes immediately to every tab and pop-out and
+writes `~/.sorrel/settings.toml` (`%USERPROFILE%\.sorrel\settings.toml` on
+Windows). This file also stores the theme and recent datasets. Set
+`SORREL_CONFIG_DIR` to use another settings directory. It is separate from
+the host registry/runtime directory (`SORREL_USER_DIR`). Recording-specific
+layout, selection and view state remain in `<dataset>/.sorrel/ui.json`.
+
+You can also edit the TOML while Sorrel is closed:
+
+```toml
+version = 1
+
+[appearance]
+theme = "system" # system, dark or light
+
+[keybindings]
+"curation.split" = ["F8"]
+"curation.merge" = ["G"]
+"app.open_dataset" = ["Primary+O"]
+"waveforms.mean" = [] # explicitly unbound
+```
+
+Missing action entries inherit their defaults; arrays replace all bindings
+for that action. `Primary` means Ctrl on Windows/Linux and Cmd on macOS;
+`Ctrl` means the physical Control key. Use named keys such as `Plus`,
+`ArrowDown` and `PageUp`. Settings lists the stable action IDs on hover.
+Invalid settings cause a visible warning and are never silently overwritten.
+Mouse/wheel gestures and native text-editing shortcuts are unchanged.
 
 "Best" clusters are the ones picked in the cluster table; "similar"
 clusters are picked in the Similar pane or stepped through with `Space`.
@@ -50,17 +93,20 @@ next table row. Moving a similar cluster steps to the next similar one.
 
 ## Views and snippets
 
-| Key              | Action                                                                                                                  |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `C`              | Features: fix the current channels, or follow the selection again.                                                      |
-| `A` / `Shift+A`  | Amplitudes: next / previous type (template, feature, raw, template feature).                                            |
-| `Ctrl+R`         | Time axes use `spike_reorder.npy` (when present).                                                                       |
-| `:`              | Snippet bar. Enter runs the snippet, Esc closes it.                                                                     |
-| `H` / `?` / `F1` | Toggle the help overlay.                                                                                                |
-| `Ctrl+Q`         | Quit (asks first when there is unsaved curation).                                                                       |
-| `Ctrl+Shift+M`   | Maximize the pane under the pointer over the whole view area, or restore.                                               |
-| `F11`            | Full screen for the window the key is pressed in (main or a popped-out one).                                            |
-| `Esc`            | Close a dialog, the snippet bar or the help, or clear the lasso; with nothing else to cancel, restore a maximized pane. |
+| Key                           | Action                                                                                                                  |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `C`                           | Features: fix the current channels, or follow the selection again.                                                      |
+| `A` / `Shift+A`               | Amplitudes: next / previous type (template, feature, raw, template feature).                                            |
+| `Ctrl+R`                      | Time axes use `spike_reorder.npy` (when present).                                                                       |
+| `:`                           | Snippet bar. Enter runs the snippet, Esc closes it.                                                                     |
+| `H` / `?` / `F1`              | Toggle the help overlay.                                                                                                |
+| `Ctrl+Q`                      | Quit (asks first when there is unsaved curation).                                                                       |
+| `Ctrl+O` / `Ctrl+W`           | Open a dataset / close the active dataset tab.                                                                          |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous dataset tab (physical Ctrl on macOS too).                                                               |
+| `Ctrl+Comma`                  | Open Settings (`Cmd+Comma` on macOS).                                                                                   |
+| `Ctrl+Shift+M`                | Maximize the pane under the pointer over the whole view area, or restore.                                               |
+| `F11`                         | Full screen for the window the key is pressed in (main or a popped-out one).                                            |
+| `Esc`                         | Close a dialog, the snippet bar or the help, or clear the lasso; with nothing else to cancel, restore a maximized pane. |
 
 Snippets: `:g` merge, `:k` split, `:c 3 7 10-12` select, `:l name value`
 custom label (`:l group good` moves the selection), `:note text` unit note
@@ -71,6 +117,22 @@ window.
 
 Plain-key shortcuts never fire while a text field has focus. `Ctrl` chords,
 `Esc` and `F1` always do.
+
+### Pane-local defaults
+
+These shortcuts apply only while the pointer is over the pane and no text
+field has focus. They are configurable in Settings too.
+
+| Pane      | Key                   | Action                                  |
+| --------- | --------------------- | --------------------------------------- |
+| Waveforms | `W` / `Shift+W`       | Next / previous waveform mode.          |
+| Waveforms | `M` / `O` / `Ctrl+L`  | Mean toggle / overlap / channel labels. |
+| Waveforms | `Ctrl+↑` / `Ctrl+↓`   | Increase / decrease amplitude scale.    |
+| Waveforms | `Ctrl+→` / `Ctrl+←`   | Widen / narrow waveform boxes.          |
+| Waveforms | `Shift+↑` / `Shift+↓` | Spread / shrink the probe vertically.   |
+| Waveforms | `Shift+→` / `Shift+←` | Spread / shrink the probe horizontally. |
+| Waveforms | `R` / `Shift+R`       | Reset scales.                           |
+| CCG       | `N`                   | Toggle uniform normalization.           |
 
 Undo moves to the previous edit and redo to the branch you visited last.
 An edit after an undo starts a new branch, and the old one stays in the
