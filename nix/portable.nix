@@ -29,15 +29,18 @@
       AWS_LC_SYS_CMAKE_BUILDER = "1";
       dontUseCmakeConfigure = true;
       cargoBuildCommand = "cargo zigbuild --profile release --target ${rustTarget}.${glibc}";
-      cargoExtraArgs = "-p sorrel --locked";
+      # sorrel-relay ships in the same tarball: `cargo binstall sorrel-remote`
+      # needs it next to sorrel's binaries.
+      cargoExtraArgs = "-p sorrel -p sorrel-remote --locked";
       doCheck = false;
       preBuild = ''
         export HOME=$TMPDIR ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local
       '';
-      # Both bins: cargo-binstall rejects an archive missing any [[bin]].
+      # Every bin: cargo-binstall rejects an archive missing any [[bin]].
       installPhaseCommand = ''
         install -Dm755 target/${rustTarget}/release/sorrel $out/bin/sorrel
         install -Dm755 target/${rustTarget}/release/sorrelw $out/bin/sorrelw
+        install -Dm755 target/${rustTarget}/release/sorrel-relay $out/bin/sorrel-relay
       '';
     };
 
