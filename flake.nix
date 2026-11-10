@@ -59,6 +59,7 @@
           "hm-module"
           "workspace-tests"
           "binstall-metadata"
+          "binstall-metadata-sorrel-remote"
         ];
       in {
         flake.mode = "custom";
@@ -352,7 +353,9 @@
           version = sorrelVersion;
           strictDeps = true;
           inherit (deps) nativeBuildInputs;
-          cargoExtraArgs = "-p sorrel --locked";
+          # sorrel-relay rides along in every archive (cargo binstall
+          # sorrel-remote); crane installs every executable in the build log.
+          cargoExtraArgs = "-p sorrel -p sorrel-remote --locked";
         };
         targetArgs = {
           aarch64-linux = {
@@ -524,6 +527,12 @@
             inherit pkgs;
             bundle = self.packages.${system}.release-bundle;
             cargoToml = ./crates/sorrel/Cargo.toml;
+          };
+          # sorrel-remote's sorrel-relay ships in the same archives.
+          binstall-metadata-sorrel-remote = harbor-rs.lib.mkBinstallCheck {
+            inherit pkgs;
+            bundle = self.packages.${system}.release-bundle;
+            cargoToml = ./crates/sorrel-remote/Cargo.toml;
           };
         };
 
