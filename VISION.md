@@ -3,12 +3,12 @@
 Sorrel is a native, high-performance GUI for manual curation of spike-sorted
 electrophysiology data, with a headless CLI for the same operations. It targets
 the phy workflow — cluster-by-cluster inspection, relabelling, merging, and
-splitting — on a Rust core that is generic over a data provider and a
+splitting — on a Rust core that is generic over a data provider, with a
 wgpu-backed renderer.
 
 The `sorrel mcp` server serves MCP over stdio so agents can read a dataset's
-metrics, evaluate and apply threshold rules, and make handle-based relabel,
-merge, and split edits through the same journaled session host as the GUI.
+metrics, evaluate and apply threshold rules, and make relabel, merge, and split
+edits through the same journaled session host as the GUI.
 
 ## Problem
 
