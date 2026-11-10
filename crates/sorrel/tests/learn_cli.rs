@@ -835,4 +835,96 @@ fn learn_predict_scores_roots_and_leaves_the_phy_folder_untouched() {
         .sum();
     assert_eq!(cells, 2, "confusion cells must cover every root:\n{report}");
     assert_eq!(report["per_class"].as_array().unwrap().len(), 5);
+
+    // A spike keep/drop head in the same bundle, then the full curation.
+    ok(&sorrel(
+        tmp.path(),
+        &[
+            "dev",
+            "learn",
+            "train",
+            "--data",
+            &s(&out),
+            "--table",
+            "spikes",
+            "--target",
+            "y_good",
+            "--objective",
+            "logistic",
+            "--row-stride",
+            "2",
+            "--folds",
+            "2",
+            "--out",
+            &s(&bundle),
+            "--head",
+            "spikes_keep",
+        ],
+    ));
+    ok(&sorrel(
+        tmp.path(),
+        &[
+            "dev",
+            "learn",
+            "train",
+            "--data",
+            &s(&out),
+            "--table",
+            "candidates",
+            "--target",
+            "y_hit",
+            "--objective",
+            "logistic",
+            "--join-roots",
+            "--folds",
+            "2",
+            "--out",
+            &s(&bundle),
+            "--head",
+            "cands_hit",
+        ],
+    ));
+    let curated = tmp.path().join("curated");
+    ok(&sorrel(
+        tmp.path(),
+        &[
+            "dev",
+            "learn",
+            "curate",
+            "--model",
+            &s(&bundle),
+            "--verdict-head",
+            "verdict",
+            "--split-head",
+            "cands_hit",
+            "--min-spikes",
+            "50",
+            "--rounds",
+            "2",
+            "--out",
+            &s(&curated),
+            &s(&phy),
+        ],
+    ));
+    assert_eq!(before, dir_snapshot(&phy), "PHY_DIR changed during curate");
+    let clusters = sorrel_io::npy::read_1d_u32(&curated.join("spike_clusters.npy")).unwrap();
+    let input = sorrel_io::npy::read_1d_u32(&phy.join("spike_clusters.npy")).unwrap();
+    assert_eq!(clusters.len(), input.len());
+    let groups = std::fs::read_to_string(curated.join("cluster_group.tsv")).unwrap();
+    for id in clusters.iter().collect::<std::collections::BTreeSet<_>>() {
+        assert!(
+            groups.lines().any(|l| l.starts_with(&format!("{id}\t"))),
+            "unit {id} has no label:\n{groups}"
+        );
+    }
+    // A spike either stays in its root or moves to a new unit above every root.
+    let top = *input.iter().max().unwrap();
+    assert!(clusters.iter().zip(&input).all(|(c, r)| c == r || *c > top));
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(curated.join("report.json")).unwrap()).unwrap();
+    assert_eq!(report["n_spikes"], input.len());
+    assert!(
+        report["score"]["good_units"]["recall"].is_number(),
+        "{report}"
+    );
 }

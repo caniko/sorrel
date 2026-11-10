@@ -35,6 +35,8 @@ pub enum LearnCmd {
     Train(TrainArgs),
     /// Score one phy folder's roots with a stored head; the folder is not written
     Predict(PredictArgs),
+    /// Curate one phy folder with a verdict head and a spike head, into `--out`
+    Curate(CurateArgs),
 }
 
 #[derive(Args, Debug)]
@@ -65,6 +67,13 @@ pub struct CvArgs {
     /// Append the roots table's f_* columns (from `--data`) as root_*
     #[arg(long)]
     join_roots: bool,
+    /// Keep only rows whose root has one of these true `y_verdict` names
+    /// (comma-separated, e.g. kept,cleanup,cores); needs the roots table
+    #[arg(long = "root-verdict", value_name = "NAMES", value_delimiter = ',')]
+    root_verdict: Vec<String>,
+    /// Keep every Nth usable row: a uniform subsample of a large table
+    #[arg(long = "row-stride", value_name = "N", default_value_t = 1)]
+    row_stride: usize,
 }
 
 #[derive(Args, Debug)]
@@ -90,6 +99,13 @@ pub struct TrainArgs {
     exclude_prefix: Vec<String>,
     #[arg(long)]
     join_roots: bool,
+    /// Keep only rows whose root has one of these true `y_verdict` names
+    /// (comma-separated, e.g. kept,cleanup,cores); needs the roots table
+    #[arg(long = "root-verdict", value_name = "NAMES", value_delimiter = ',')]
+    root_verdict: Vec<String>,
+    /// Keep every Nth usable row: a uniform subsample of a large table
+    #[arg(long = "row-stride", value_name = "N", default_value_t = 1)]
+    row_stride: usize,
     /// Destination `.sorrel-model` (created, or extended with `--head`)
     #[arg(long, value_name = "FILE")]
     out: PathBuf,
@@ -118,6 +134,63 @@ pub struct PredictArgs {
     /// Extraction seed (recorded; the extractor itself is deterministic)
     #[arg(long, default_value_t = 0)]
     seed: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct CurateArgs {
+    /// phy/Kilosort folder (with params.py); its input and curation are only read
+    #[arg(value_name = "PHY_DIR")]
+    phy_dir: PathBuf,
+    /// `.sorrel-model` bundle holding both heads
+    #[arg(long, value_name = "FILE")]
+    model: PathBuf,
+    /// Head that labels each root (softmax with a `noise` class)
+    #[arg(
+        long = "verdict-head",
+        value_name = "KEY",
+        default_value = "roots_verdict"
+    )]
+    verdict_head: String,
+    /// Logistic head that scores each spike of a kept root (1 = keep)
+    #[arg(long = "spike-head", value_name = "KEY", default_value = "spikes_keep")]
+    spike_head: String,
+    /// A spike stays in its unit when the spike head gives at least this
+    #[arg(long, value_name = "P", default_value_t = 0.5)]
+    threshold: f64,
+    /// Logistic head on `candidates` (1 = the membership is a human good
+    /// unit). A kept root with two or more disjoint candidates at
+    /// `--split-threshold` becomes those units; without it roots never split
+    #[arg(long = "split-head", value_name = "KEY")]
+    split_head: Option<String>,
+    #[arg(long = "split-threshold", value_name = "P", default_value_t = 0.5)]
+    split_threshold: f64,
+    /// A unit with fewer spikes than this after cleanup is noise
+    #[arg(long = "min-spikes", value_name = "N", default_value_t = 300)]
+    min_spikes: usize,
+    /// Exception to `--min-spikes`: a unit that was silent for this fraction
+    /// of the recording and then fired at least 100 spikes is kept
+    #[arg(long = "late-onset", value_name = "FRACTION", default_value_t = 0.5)]
+    late_onset: f64,
+    /// A unit whose ACG centre bar (lags within 0.5 ms, per ms) is above
+    /// this fraction of its 20-50 ms baseline is noise; the centre must be
+    /// empty or barely there
+    #[arg(long = "max-centre", value_name = "RATIO", default_value_t = 0.1)]
+    max_centre: f64,
+    /// Passes over the folder. Each pass after the first reopens it with the
+    /// previous pass's clusters and curates what that pass set aside (dropped
+    /// spikes, split remainders), which is where a root's second unit is.
+    /// Experimental: the heads were not trained on leftovers, and on day13
+    /// a second pass called nearly every leftover pile good
+    #[arg(long, value_name = "N", default_value_t = 1, hide = true)]
+    rounds: usize,
+    /// Output directory (spike_clusters.npy, cluster_group.tsv, roots.tsv,
+    /// report.json; must be outside PHY_DIR)
+    #[arg(long, value_name = "DIR")]
+    out: PathBuf,
+    /// Size of the per-root reference subsample; use the value the spike
+    /// head's training data was extracted with
+    #[arg(long, default_value_t = 1500)]
+    max_spikes_per_root: usize,
 }
 
 fn objective_parser(text: &str) -> std::result::Result<String, String> {
@@ -198,14 +271,17 @@ fn select(data: &Path, a: TableArgs<'_>) -> Result<Selection> {
         .map(|name| Source::Base(table.column(name).expect("selected feature exists")))
         .collect();
 
-    // Optional joined root features, keyed by (sid_idx, root).
-    let joined: Option<RootJoin> = if a.join_roots {
+    ensure!(a.row_stride > 0, "--row-stride must be positive");
+    // The roots table, keyed by (sid_idx, root): optional joined features
+    // and the optional --root-verdict row filter.
+    let joined: Option<RootJoin> = if a.join_roots || !a.root_verdict.is_empty() {
         ensure!(
             table.column("root").is_some(),
             "table {:?} has no root column to join the roots table on",
             a.table
         );
-        let roots = Table::load(data, "roots").context("--join-roots needs the roots table")?;
+        let roots = Table::load(data, "roots")
+            .context("--join-roots and --root-verdict need the roots table")?;
         ensure!(
             roots.extractor_version == EXTRACTOR_VERSION,
             "roots table has a different extractor version"
@@ -236,11 +312,14 @@ fn select(data: &Path, a: TableArgs<'_>) -> Result<Selection> {
                 index.insert((*sid as u32, root as u32), row);
             }
         }
-        let mut any = false;
+        let mut any = !a.join_roots;
         let mut column = 0;
         while column < roots.columns.len() {
             let name = &roots.columns[column];
-            if name.starts_with("f_") && !a.exclude.iter().any(|p| name.starts_with(p)) {
+            if a.join_roots
+                && name.starts_with("f_")
+                && !a.exclude.iter().any(|p| name.starts_with(p))
+            {
                 // The roots table is a different table: build its column list
                 // first, then push the paired sources in the same order.
                 names.push(format!("root_{name}"));
@@ -253,6 +332,33 @@ fn select(data: &Path, a: TableArgs<'_>) -> Result<Selection> {
         Some((index, roots))
     } else {
         None
+    };
+
+    // --root-verdict: the y_verdict codes a row's root may have.
+    let verdicts: Option<(usize, BTreeSet<i64>)> = match &joined {
+        Some((_, roots)) if !a.root_verdict.is_empty() => {
+            let column = roots
+                .column("y_verdict")
+                .context("--root-verdict: the roots table has no y_verdict")?;
+            let codes = roots
+                .codes
+                .get("y_verdict")
+                .context("--root-verdict: the roots table documents no y_verdict codes")?;
+            let wanted = a
+                .root_verdict
+                .iter()
+                .map(|name| {
+                    codes.get(name).copied().with_context(|| {
+                        format!(
+                            "--root-verdict {name:?} is not a y_verdict name ({})",
+                            codes.keys().cloned().collect::<Vec<_>>().join(", ")
+                        )
+                    })
+                })
+                .collect::<Result<_>>()?;
+            Some((column, wanted))
+        }
+        _ => None,
     };
 
     let n_features = names.len();
@@ -291,6 +397,7 @@ fn select(data: &Path, a: TableArgs<'_>) -> Result<Selection> {
     let mut hit = Vec::new();
     let mut unit = Vec::new();
     let mut sid_indices = Vec::new();
+    let mut usable = 0usize;
     let mut outside: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
     let mut fractional: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
@@ -328,6 +435,18 @@ fn select(data: &Path, a: TableArgs<'_>) -> Result<Selection> {
                 u32::MAX
             }
         });
+        if let (Some((column, wanted)), Some((index, roots_table))) = (&verdicts, &joined) {
+            let verdict = index
+                .get(&(sid_idx as u32, root))
+                .map_or(f32::NAN, |&r| roots_table.value(r, *column));
+            if !verdict.is_finite() || !wanted.contains(&(verdict as i64)) {
+                continue;
+            }
+        }
+        usable += 1;
+        if !(usable - 1).is_multiple_of(a.row_stride) {
+            continue;
+        }
         for source in &sources {
             let v = match source {
                 Source::Base(column) => table.value(row, *column),
@@ -567,6 +686,8 @@ struct TableArgs<'a> {
     class_map: &'a [String],
     exclude: &'a [String],
     join_roots: bool,
+    root_verdict: &'a [String],
+    row_stride: usize,
     groups: Option<&'a Path>,
 }
 
@@ -583,6 +704,7 @@ pub fn run(cmd: &LearnCmd) -> Result<()> {
         LearnCmd::Cv(a) => cv(a),
         LearnCmd::Train(a) => train(a),
         LearnCmd::Predict(a) => predict(a),
+        LearnCmd::Curate(a) => curate(a),
     }
 }
 
@@ -597,6 +719,8 @@ fn cv(a: &CvArgs) -> Result<()> {
             class_map: &a.class_map,
             exclude: &a.exclude_prefix,
             join_roots: a.join_roots,
+            root_verdict: &a.root_verdict,
+            row_stride: a.row_stride,
             groups: a.groups.as_deref(),
         },
     )?;
@@ -644,6 +768,8 @@ fn train(a: &TrainArgs) -> Result<()> {
             class_map: &a.class_map,
             exclude: &a.exclude_prefix,
             join_roots: a.join_roots,
+            root_verdict: &a.root_verdict,
+            row_stride: a.row_stride,
             groups: a.groups.as_deref(),
         },
     )?;
@@ -805,54 +931,17 @@ fn head_class_names(key: &str, head: &Head) -> Result<Vec<String>> {
     }
 }
 
-/// `sorrel dev learn predict`: blind PHY_DIR, extract exactly as
-/// `learn-dataset`, score the roots table with a stored head, and write the
-/// predictions plus an optional truth report. PHY_DIR is never opened for
-/// writing and no temporary file is created in it.
-fn predict(a: &PredictArgs) -> Result<()> {
-    ensure!(
-        a.max_spikes_per_root > 0,
-        "--max-spikes-per-root must be positive"
-    );
-    ensure!(
-        a.phy_dir.is_dir(),
-        "PHY_DIR {} is not a directory",
-        a.phy_dir.display()
-    );
-    ensure!(
-        a.phy_dir.join("params.py").is_file(),
-        "PHY_DIR {} has no params.py; pass a phy/Kilosort output folder",
-        a.phy_dir.display()
-    );
-    // Resolve both sides through junctions/symlinks before anything is written:
-    // --out must never land inside the folder the command promises not to touch.
-    let phy = super::bench::canonical_target(&a.phy_dir)?;
-    let out = super::bench::canonical_target(&a.out)?;
-    ensure!(
-        !out.starts_with(&phy),
-        "--out {} is inside PHY_DIR {}; choose a directory outside it",
-        out.display(),
-        phy.display()
-    );
-
-    let bundle = CuratorBundle::load(&a.model)?;
+fn load_bundle(path: &Path) -> Result<CuratorBundle> {
+    let bundle = CuratorBundle::load(path)?;
     ensure!(
         bundle.provenance.extractor_version == EXTRACTOR_VERSION,
         "bundle was built with extractor {:?}, this binary uses {EXTRACTOR_VERSION}; retrain",
         bundle.provenance.extractor_version
     );
-    let key = match a.head.as_deref() {
-        Some(key) => key,
-        None => match bundle.heads.len() {
-            1 => bundle.heads.keys().next().expect("one head"),
-            0 => bail!("bundle {} has no heads", a.model.display()),
-            n => bail!(
-                "bundle {} has {n} heads ({}); pass --head KEY",
-                a.model.display(),
-                bundle.heads.keys().cloned().collect::<Vec<_>>().join(", ")
-            ),
-        },
-    };
+    Ok(bundle)
+}
+
+fn head_schema<'a>(bundle: &'a CuratorBundle, key: &str) -> Result<(&'a Head, &'a FeatureSchema)> {
     let head = bundle.heads.get(key).with_context(|| {
         format!(
             "bundle has no head {key:?}; heads: {}",
@@ -863,14 +952,54 @@ fn predict(a: &PredictArgs) -> Result<()> {
         .feature_schemas
         .get(&head.schema)
         .with_context(|| format!("head {key:?} references missing schema {:?}", head.schema))?;
-    let classes = head_class_names(key, head)?;
+    Ok((head, schema))
+}
+
+/// A phy folder blinded under `--out`, extracted, and labelled when it has a
+/// curation. `temp` owns the blinded copy the session reads.
+struct Blinded {
+    session: Session<KilosortProvider>,
+    data: features::ExtractData,
+    /// The folder's own curation in session spike order, when it has one.
+    truth: Option<features::Truth>,
+    temp: tempfile::TempDir,
+}
+
+/// Blind PHY_DIR into a temporary directory under `out` and extract exactly as
+/// `learn-dataset` does. PHY_DIR is never opened for writing and no temporary
+/// file is created in it.
+fn extract_blinded(phy_dir: &Path, out_dir: &Path, opts: &ExtractOpts) -> Result<Blinded> {
+    ensure!(
+        opts.max_spikes_per_root > 0,
+        "--max-spikes-per-root must be positive"
+    );
+    ensure!(
+        phy_dir.is_dir(),
+        "PHY_DIR {} is not a directory",
+        phy_dir.display()
+    );
+    ensure!(
+        phy_dir.join("params.py").is_file(),
+        "PHY_DIR {} has no params.py; pass a phy/Kilosort output folder",
+        phy_dir.display()
+    );
+    // Resolve both sides through junctions/symlinks before anything is written:
+    // --out must never land inside the folder the command promises not to touch.
+    let phy = super::bench::canonical_target(phy_dir)?;
+    let out = super::bench::canonical_target(out_dir)?;
+    ensure!(
+        !out.starts_with(&phy),
+        "--out {} is inside PHY_DIR {}; choose a directory outside it",
+        out.display(),
+        phy.display()
+    );
 
     // The blinded copy lives under --out, not the system temp dir: blinding
     // hard-links on one volume, so --out on another volume gives a real copy.
-    fs::create_dir_all(&a.out).with_context(|| format!("create --out {}", a.out.display()))?;
+    fs::create_dir_all(out_dir).with_context(|| format!("create --out {}", out_dir.display()))?;
     let temp = tempfile::Builder::new()
         .prefix("predict-")
-        .tempdir_in(&a.out)?;
+        .tempdir_in(out_dir)?;
     let input = temp.path().join("input");
     let truth_dir = temp.path().join("truth");
     // Reads PHY_DIR only; the session below opens the blinded copy.
@@ -884,58 +1013,132 @@ fn predict(a: &PredictArgs) -> Result<()> {
         "blind input has no self-contained raw recording; not a phy/Kilosort folder"
     );
 
-    let provider = KilosortProvider::open(&input, Default::default())?;
-    let mut session = Session::new(
-        provider,
-        Journal::open(&temp.path().join("predict.journal"))?,
-    );
+    let (session, mut data) = open_extract(&input, &temp.path().join("predict.journal"), opts)?;
+
+    // Truth last, exactly as learn-dataset: only after every input-only feature.
+    // An uncurated Kilosort folder has spike_clusters.npy but no labels.
+    let truth = if truth_dir.join("spike_clusters.npy").is_file()
+        && truth_dir.join("cluster_group.tsv").is_file()
+    {
+        let (truth, _, _) = super::bench::load_truth(&truth_dir, &data)?;
+        features::label(&mut data, &truth)?;
+        Some(truth)
+    } else {
+        None
+    };
+    Ok(Blinded {
+        session,
+        data,
+        truth,
+        temp,
+    })
+}
+
+/// Open the phy folder `input` with a fresh journal and extract its tables,
+/// with its current clusters as the roots.
+fn open_extract(
+    input: &Path,
+    journal: &Path,
+    opts: &ExtractOpts,
+) -> Result<(Session<KilosortProvider>, features::ExtractData)> {
+    let provider = KilosortProvider::open(input, Default::default())?;
+    let mut session = Session::new(provider, Journal::open(journal)?);
     session.seed_pc_features();
     session.seed_templates();
     session.seed_template_waveforms();
     session.seed_amplitudes();
-    let opts = ExtractOpts {
-        max_spikes_per_root: a.max_spikes_per_root,
-        seed: a.seed,
-    };
-    let mut data = features::extract(&session, "predict", &opts)?;
+    let data = features::extract(&session, "predict", opts)?;
+    Ok((session, data))
+}
 
-    // Truth last, exactly as learn-dataset: only after every input-only feature.
-    // An uncurated Kilosort folder has spike_clusters.npy but no labels.
-    let truth_present = truth_dir.join("spike_clusters.npy").is_file()
-        && truth_dir.join("cluster_group.tsv").is_file();
-    if truth_present {
-        let (truth, _, _) = super::bench::load_truth(&truth_dir, &data)?;
-        features::label(&mut data, &truth)?;
+/// Row-major feature matrix of `table` in `schema` order. A `root_f_*` name
+/// the table lacks is read from `roots` at the row's root; on the roots table
+/// itself it is the same column.
+fn schema_matrix(
+    table: &Table,
+    roots: &Table,
+    schema: &FeatureSchema,
+    key: &str,
+) -> Result<Vec<f32>> {
+    enum Source {
+        Own(usize),
+        Root(usize),
     }
-    let roots = &data.tables.roots;
-    let n_roots = roots.n_rows();
-
-    let mut columns = Vec::with_capacity(schema.names.len());
+    let mut sources = Vec::with_capacity(schema.names.len());
     let mut missing = Vec::new();
     for name in &schema.names {
-        // A head trained on the roots table with joined root features stores
-        // `root_f_*`; on the roots table itself that is the same column.
-        match roots
-            .column(name)
-            .or_else(|| name.strip_prefix("root_").and_then(|n| roots.column(n)))
-        {
-            Some(column) => columns.push(column),
-            None => missing.push(name.clone()),
+        let joined = name.strip_prefix("root_").and_then(|n| roots.column(n));
+        match (table.column(name), joined) {
+            (Some(column), _) => sources.push(Source::Own(column)),
+            (None, Some(column)) => sources.push(Source::Root(column)),
+            (None, None) => missing.push(name.clone()),
         }
     }
     ensure!(
         missing.is_empty(),
-        "roots table has no column(s) {} required by head {key:?} schema {}; \
-         was the head trained on the roots table?",
+        "the scored table has no column(s) {} required by head {key:?} schema {}; \
+         was the head trained on this table?",
         missing.join(", "),
-        head.schema
+        schema.hash
     );
+    let root_row: BTreeMap<u32, usize> = (0..roots.n_rows())
+        .map(|row| (roots.get(row, "root") as u32, row))
+        .collect();
+    let root_column = table.column("root");
+    let mut x = Vec::with_capacity(table.n_rows() * sources.len());
+    for row in 0..table.n_rows() {
+        let joined = root_column.and_then(|c| root_row.get(&(table.value(row, c) as u32)));
+        for source in &sources {
+            x.push(match source {
+                Source::Own(column) => table.value(row, *column),
+                Source::Root(column) => joined.map_or(f32::NAN, |&r| roots.value(r, *column)),
+            });
+        }
+    }
+    Ok(x)
+}
 
+/// `sorrel dev learn predict`: blind PHY_DIR, extract exactly as
+/// `learn-dataset`, score the roots table with a stored head, and write the
+/// predictions plus an optional truth report. PHY_DIR is never opened for
+/// writing and no temporary file is created in it.
+fn predict(a: &PredictArgs) -> Result<()> {
+    let bundle = load_bundle(&a.model)?;
+    let key = match a.head.as_deref() {
+        Some(key) => key,
+        None => match bundle.heads.len() {
+            1 => bundle.heads.keys().next().expect("one head"),
+            0 => bail!("bundle {} has no heads", a.model.display()),
+            n => bail!(
+                "bundle {} has {n} heads ({}); pass --head KEY",
+                a.model.display(),
+                bundle.heads.keys().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        },
+    };
+    let (head, schema) = head_schema(&bundle, key)?;
+    let classes = head_class_names(key, head)?;
+    let opts = ExtractOpts {
+        max_spikes_per_root: a.max_spikes_per_root,
+        seed: a.seed,
+    };
+    let Blinded {
+        data,
+        truth,
+        temp: _temp,
+        ..
+    } = extract_blinded(&a.phy_dir, &a.out, &opts)?;
+    let truth_present = truth.is_some();
+    let roots = &data.tables.roots;
+    let n_roots = roots.n_rows();
+
+    let matrix = schema_matrix(roots, roots, schema, key)?;
+    let n_features = schema.names.len();
     let mut predicted = Vec::with_capacity(n_roots);
     let mut probabilities = Vec::with_capacity(n_roots);
     for row in 0..n_roots {
-        let x: Vec<f32> = columns.iter().map(|&c| roots.value(row, c)).collect();
-        let mut p = head.predict_proba(&bundle, &x, &schema.hash)?;
+        let x = &matrix[row * n_features..(row + 1) * n_features];
+        let mut p = head.predict_proba(&bundle, x, &schema.hash)?;
         if matches!(head.model.objective, Objective::Logistic) && p.len() == 1 {
             p = vec![1.0 - p[0], p[0]];
         }
@@ -1074,6 +1277,508 @@ fn predict(a: &PredictArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Serialize)]
+struct CurateReport {
+    model: String,
+    verdict_head: String,
+    spike_head: String,
+    threshold: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    split_head: Option<String>,
+    split_threshold: f64,
+    min_spikes: usize,
+    late_onset: f64,
+    max_centre: f64,
+    rounds: usize,
+    n_roots: usize,
+    n_units_centre_bar: usize,
+    n_roots_split: usize,
+    n_units_under_floor: usize,
+    n_good_units: usize,
+    n_spikes: usize,
+    n_spikes_dropped: usize,
+    /// The bench score against PHY_DIR's own curation, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score: Option<sorrel_data::diff::SpikeDiff>,
+}
+
+/// The units a root splits into: candidate memberships scored at least
+/// `threshold`, taken best first, each keeping only the spikes no better
+/// candidate took and accepted while that is at least 90% of it. Fewer than
+/// two such units is no split (empty).
+fn pick_split(mut scored: Vec<(f64, &[u32])>, threshold: f64) -> Vec<Vec<u32>> {
+    scored.retain(|(p, _)| *p >= threshold);
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(b.1.len().cmp(&a.1.len())));
+    let mut taken: BTreeSet<u32> = BTreeSet::new();
+    let mut units = Vec::new();
+    for (_, members) in scored {
+        let fresh: Vec<u32> = members
+            .iter()
+            .copied()
+            .filter(|g| !taken.contains(g))
+            .collect();
+        if fresh.len() * 10 >= members.len() * 9 {
+            taken.extend(&fresh);
+            units.push(fresh);
+        }
+    }
+    if units.len() < 2 {
+        units.clear();
+    }
+    units
+}
+
+/// The spike-count floor: at least `min_spikes`, or a late-onset unit (at
+/// least `MIN_ROOT_SPIKES`, 95% of them after `late_onset` of the recording).
+fn passes_floor(mut times: Vec<u64>, total: u64, min_spikes: usize, late_onset: f64) -> bool {
+    if times.len() >= min_spikes {
+        return true;
+    }
+    if times.len() < features::MIN_ROOT_SPIKES {
+        return false;
+    }
+    times.sort_unstable();
+    times[times.len() / 20] as f64 >= late_onset * total as f64
+}
+
+/// The ACG centre bar of a spike train against its baseline: spike pairs
+/// within 0.5 ms per ms of lag, over pairs 20-50 ms apart per ms (both
+/// signs count alike). 0 when the baseline is empty.
+fn centre_ratio(mut times: Vec<u64>, sr: f32) -> f64 {
+    times.sort_unstable();
+    let ms = |m: f64| (m * sr as f64 / 1e3).round() as u64;
+    let (centre, lo, hi) = (ms(0.5), ms(20.0), ms(50.0));
+    let (mut near, mut far) = (0u64, 0u64);
+    for (i, &t) in times.iter().enumerate() {
+        for &u in &times[i + 1..] {
+            let d = u - t;
+            if d > hi {
+                break;
+            }
+            if d <= centre {
+                near += 1;
+            } else if d > lo {
+                far += 1;
+            }
+        }
+    }
+    if far == 0 {
+        return 0.0;
+    }
+    (near as f64 / 0.5) / (far as f64 / 30.0)
+}
+
+/// `sorrel dev learn curate`: the verdict head decides which roots are units.
+/// A kept root either splits into the split head's candidate units, or stays
+/// one unit that the spike head cleans up. Units under the spike floor, or
+/// with an ACG centre bar above `--max-centre`, become noise. The result is written as phy files under `--out` (never into
+/// PHY_DIR), and scored against PHY_DIR's own curation when it has one.
+///
+/// ponytail: no merges yet, and split units get no spike cleanup. Later
+/// rounds score clusters the heads were not trained on (leftovers, not
+/// sorter roots).
+fn curate(a: &CurateArgs) -> Result<()> {
+    ensure!(
+        (0.0..=1.0).contains(&a.threshold),
+        "--threshold must be within 0..=1"
+    );
+    ensure!(
+        (0.0..=1.0).contains(&a.late_onset),
+        "--late-onset must be within 0..=1"
+    );
+    ensure!(a.rounds > 0, "--rounds must be positive");
+    let bundle = load_bundle(&a.model)?;
+    let (verdict, verdict_schema) = head_schema(&bundle, &a.verdict_head)?;
+    let (spike, spike_schema) = head_schema(&bundle, &a.spike_head)?;
+    let classes = head_class_names(&a.verdict_head, verdict)?;
+    let noise = classes.iter().position(|c| c == "noise").with_context(|| {
+        format!(
+            "verdict head {:?} has no `noise` class ({})",
+            a.verdict_head,
+            classes.join(", ")
+        )
+    })?;
+    ensure!(
+        matches!(spike.model.objective, Objective::Logistic),
+        "spike head {:?} must be a logistic keep/drop head",
+        a.spike_head
+    );
+    let split = a
+        .split_head
+        .as_deref()
+        .map(|key| {
+            let (head, schema) = head_schema(&bundle, key)?;
+            ensure!(
+                matches!(head.model.objective, Objective::Logistic),
+                "split head {key:?} must be a logistic head"
+            );
+            Ok((key, head, schema))
+        })
+        .transpose()?;
+    let opts = ExtractOpts {
+        max_spikes_per_root: a.max_spikes_per_root,
+        seed: 0,
+    };
+    let Blinded {
+        session,
+        data,
+        truth,
+        temp,
+    } = extract_blinded(&a.phy_dir, &a.out, &opts)?;
+    let n_spikes = data.root_of_spike.len();
+    let n_roots = data.tables.roots.n_rows();
+
+    // Spikes are indexed in the first session's order throughout. A later
+    // round reopens the folder with this round's clusters as its roots, and
+    // its spikes are mapped back through their original NPY rows.
+    let input_roots = data.root_of_spike.clone();
+    let mut first_of_row = vec![u32::MAX; n_spikes];
+    for (g, row) in data.row_map.iter().enumerate() {
+        let row = row.context("the session has no original NPY-row map")? as usize;
+        ensure!(
+            row < n_spikes && first_of_row[row] == u32::MAX,
+            "the session's NPY-row map is not a permutation"
+        );
+        first_of_row[row] = g as u32;
+    }
+    let by_row = |cluster: &[u32]| -> Vec<u32> {
+        let mut out = vec![0; n_spikes];
+        for (row, &g) in first_of_row.iter().enumerate() {
+            out[row] = cluster[g as usize];
+        }
+        out
+    };
+
+    // Every spike starts in its root; dropped spikes move to a new noise unit.
+    let mut cluster = input_roots.clone();
+    let mut next_id = input_roots.iter().max().map_or(0, |&r| r + 1);
+    let mut labels: BTreeMap<u32, &str> = BTreeMap::new();
+    let mut rows = String::from(
+        "cluster_id\tn_spikes\tverdict\tgroup\tn_dropped\tdropped_to\tsplit_into\tnote\tround\n",
+    );
+    let mut cand_rows =
+        String::from("round\troot\tcand_idx\tmethod\tn_spikes\tp_hit\ty_jaccard\ty_best_unit\n");
+    let (mut n_good, mut n_dropped_total) = (0usize, 0usize);
+    let (mut n_split, mut n_floored, mut n_centre) = (0usize, 0usize, 0usize);
+    // The clusters this round looks at; `None` is every root.
+    let mut todo: Option<BTreeSet<u32>> = None;
+    let mut pass = (session, data);
+    for round in 1..=a.rounds {
+        if round > 1 {
+            let input = temp.path().join("input");
+            sorrel_io::npy::write_1d_u32_atomic(
+                &input.join("spike_clusters.npy"),
+                &by_row(&cluster),
+            )?;
+            drop(pass);
+            pass = open_extract(
+                &input,
+                &temp.path().join(format!("round{round}.journal")),
+                &opts,
+            )?;
+        }
+        let (session, data) = &pass;
+        ensure!(
+            data.root_of_spike.len() == n_spikes,
+            "round {round} sees {} spikes, not {n_spikes}",
+            data.root_of_spike.len()
+        );
+        // First-session index of each of this session's spikes.
+        let first: Vec<u32> = data
+            .row_map
+            .iter()
+            .map(|row| {
+                let row = row.context("the session has no original NPY-row map")? as usize;
+                first_of_row
+                    .get(row)
+                    .copied()
+                    .context("the session's NPY-row map is out of range")
+            })
+            .collect::<Result<_>>()?;
+        let roots = &data.tables.roots;
+        let mut globals: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for (g, &r) in data.root_of_spike.iter().enumerate() {
+            globals.entry(r).or_default().push(g as u32);
+        }
+        // Candidate rows per root with the split head's score of each.
+        let cands = &data.tables.candidates;
+        let mut cand_scores: BTreeMap<u32, Vec<(f64, usize)>> = BTreeMap::new();
+        if let Some((key, head, schema)) = split {
+            if cands.n_rows() > 0 {
+                let x = schema_matrix(cands, roots, schema, key)?;
+                let p = head
+                    .model
+                    .predict_proba_batch(&x, schema.names.len())
+                    .context("score the candidates")?;
+                for (row, &p) in p.iter().enumerate() {
+                    let root = cands.get(row, "root") as u32;
+                    if todo.as_ref().is_some_and(|t| !t.contains(&root)) {
+                        continue;
+                    }
+                    // Truth overlap is only labelled in the first round.
+                    let _ = writeln!(
+                        cand_rows,
+                        "{round}\t{root}\t{}\t{}\t{}\t{p:.3}\t{:.3}\t{}",
+                        cands.get(row, "cand_idx"),
+                        cands.get(row, "f_method"),
+                        data.candidate_members[row].len(),
+                        cands.get(row, "y_jaccard"),
+                        cands.get(row, "y_best_unit"),
+                    );
+                    // The whole root is the no-split case, not a split unit.
+                    if cands.get(row, "f_method") != 0.0 {
+                        cand_scores.entry(root).or_default().push((p, row));
+                    }
+                }
+            }
+        }
+        let floor = |unit: &[u32]| {
+            passes_floor(
+                unit.iter()
+                    .map(|&g| data.time_of_spike[g as usize].0)
+                    .collect(),
+                data.total_samples,
+                a.min_spikes,
+                a.late_onset,
+            )
+        };
+        let clean_centre = |unit: &[u32]| {
+            centre_ratio(
+                unit.iter()
+                    .map(|&g| data.time_of_spike[g as usize].0)
+                    .collect(),
+                data.sr,
+            ) <= a.max_centre
+        };
+        let verdict_x = schema_matrix(roots, roots, verdict_schema, &a.verdict_head)?;
+        let n_verdict = verdict_schema.names.len();
+        // Leftovers of this round that are big enough to hold a unit.
+        let mut leftovers: BTreeSet<u32> = BTreeSet::new();
+        for row in 0..roots.n_rows() {
+            let root = roots.get(row, "root") as u32;
+            if todo.as_ref().is_some_and(|t| !t.contains(&root)) {
+                continue;
+            }
+            let p = verdict.predict_proba(
+                &bundle,
+                &verdict_x[row * n_verdict..(row + 1) * n_verdict],
+                &verdict_schema.hash,
+            )?;
+            ensure!(
+                p.len() == classes.len(),
+                "head {:?} returned {} probabilities for {} classes",
+                a.verdict_head,
+                p.len(),
+                classes.len()
+            );
+            let mut best = 0;
+            for (k, value) in p.iter().enumerate() {
+                if *value > p[best] {
+                    best = k;
+                }
+            }
+            let members = globals.get(&root).map_or(&[][..], Vec::as_slice);
+            let units = if best == noise {
+                Vec::new()
+            } else {
+                let scored = cand_scores.get(&root).map_or(Vec::new(), |rows| {
+                    rows.iter()
+                        .map(|&(p, row)| (p, data.candidate_members[row].as_slice()))
+                        .collect()
+                });
+                let mut units = pick_split(scored, a.split_threshold);
+                let before = units.len();
+                units.retain(|unit| floor(unit));
+                n_floored += before - units.len();
+                let before = units.len();
+                units.retain(|unit| clean_centre(unit));
+                n_centre += before - units.len();
+                if units.len() < 2 {
+                    units.clear();
+                }
+                units
+            };
+            if !units.is_empty() {
+                // The root id keeps the remainder as noise; each unit is new.
+                n_split += 1;
+                let mut ids = Vec::new();
+                let mut moved = 0;
+                for unit in &units {
+                    for &g in unit {
+                        cluster[first[g as usize] as usize] = next_id;
+                    }
+                    moved += unit.len();
+                    labels.insert(next_id, "good");
+                    ids.push(next_id.to_string());
+                    next_id += 1;
+                }
+                n_good += units.len();
+                n_dropped_total += members.len() - moved;
+                labels.insert(root, "noise");
+                if members.len() - moved >= a.min_spikes {
+                    leftovers.insert(root);
+                }
+                let _ = writeln!(
+                    rows,
+                    "{root}\t{}\t{}\tnoise\t{}\t\t{}\tsplit\t{round}",
+                    members.len(),
+                    classes[best],
+                    members.len() - moved,
+                    ids.join(","),
+                );
+                continue;
+            }
+            let mut dropped: Vec<u32> = Vec::new();
+            if best != noise {
+                // Root-local order equals global order within a root, so spike
+                // row `i` is `members[i]`. A root too small for spike rows is
+                // kept whole.
+                let table = features::root_spike_features(session, data, root, &opts)?;
+                ensure!(
+                    table.n_rows() == 0 || table.n_rows() == members.len(),
+                    "root {root} has {} spike rows for {} spikes",
+                    table.n_rows(),
+                    members.len()
+                );
+                let x = schema_matrix(&table, roots, spike_schema, &a.spike_head)?;
+                if table.n_rows() > 0 {
+                    let p_keep = spike
+                        .model
+                        .predict_proba_batch(&x, spike_schema.names.len())
+                        .with_context(|| format!("score the spikes of root {root}"))?;
+                    dropped = members
+                        .iter()
+                        .zip(&p_keep)
+                        .filter(|(_, &p)| p < a.threshold)
+                        .map(|(&g, _)| g)
+                        .collect();
+                }
+            }
+            let mut note = "";
+            let group = if best == noise || dropped.len() == members.len() {
+                "noise"
+            } else {
+                let gone: BTreeSet<u32> = dropped.iter().copied().collect();
+                let kept: Vec<u32> = members
+                    .iter()
+                    .copied()
+                    .filter(|g| !gone.contains(g))
+                    .collect();
+                if !floor(&kept) {
+                    n_floored += 1;
+                    note = "under the spike floor";
+                    "noise"
+                } else if !clean_centre(&kept) {
+                    n_centre += 1;
+                    note = "ACG centre bar";
+                    "noise"
+                } else {
+                    n_good += 1;
+                    "good"
+                }
+            };
+            labels.insert(root, group);
+            n_dropped_total += dropped.len();
+            let dropped_to = if dropped.is_empty() || group == "noise" {
+                String::new()
+            } else {
+                for &g in &dropped {
+                    cluster[first[g as usize] as usize] = next_id;
+                }
+                labels.insert(next_id, "noise");
+                if dropped.len() >= a.min_spikes {
+                    leftovers.insert(next_id);
+                }
+                next_id += 1;
+                (next_id - 1).to_string()
+            };
+            let _ = writeln!(
+                rows,
+                "{root}\t{}\t{}\t{group}\t{}\t{dropped_to}\t\t{note}\t{round}",
+                members.len(),
+                classes[best],
+                dropped.len(),
+            );
+        }
+        if leftovers.is_empty() {
+            break;
+        }
+        todo = Some(leftovers);
+    }
+    drop(pass);
+
+    let labels: Vec<(u32, &str)> = labels.into_iter().collect();
+    let score = truth
+        .as_ref()
+        .map(|truth| {
+            let test_labels: Vec<(u32, sorrel_io::kilosort::PhyLabel)> = labels
+                .iter()
+                .map(|&(id, group)| (id, sorrel_io::kilosort::PhyLabel::parse_tsv_value(group)))
+                .collect();
+            sorrel_data::diff::diff_spikes(
+                &input_roots,
+                &sorrel_data::diff::Curation {
+                    clusters: &truth.cluster,
+                    labels: &truth.labels,
+                },
+                &sorrel_data::diff::Curation {
+                    clusters: &cluster,
+                    labels: &test_labels,
+                },
+                &Default::default(),
+            )
+        })
+        .transpose()?;
+
+    // phy files are in original NPY row order, not session order.
+    sorrel_io::npy::write_1d_u32_atomic(&a.out.join("spike_clusters.npy"), &by_row(&cluster))?;
+    let mut tsv = String::from("cluster_id\tgroup\n");
+    for (id, group) in &labels {
+        let _ = writeln!(tsv, "{id}\t{group}");
+    }
+    let mut files = vec![("cluster_group.tsv", &tsv), ("roots.tsv", &rows)];
+    if split.is_some() {
+        files.push(("candidates.tsv", &cand_rows));
+    }
+    for (name, text) in files {
+        let path = a.out.join(name);
+        fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+    }
+    let report = CurateReport {
+        model: a.model.display().to_string(),
+        verdict_head: a.verdict_head.clone(),
+        spike_head: a.spike_head.clone(),
+        threshold: a.threshold,
+        split_head: a.split_head.clone(),
+        split_threshold: a.split_threshold,
+        min_spikes: a.min_spikes,
+        late_onset: a.late_onset,
+        max_centre: a.max_centre,
+        rounds: a.rounds,
+        n_units_centre_bar: n_centre,
+        n_roots,
+        n_roots_split: n_split,
+        n_units_under_floor: n_floored,
+        n_good_units: n_good,
+        n_spikes,
+        n_spikes_dropped: n_dropped_total,
+        score,
+    };
+    let report_path = a.out.join("report.json");
+    fs::write(&report_path, serde_json::to_vec_pretty(&report)?)
+        .with_context(|| format!("write {}", report_path.display()))?;
+
+    println!(
+        "curate: {n_roots} root(s), {n_split} split, {n_good} good unit(s), {n_floored} under the spike floor, {n_centre} with an ACG centre bar, {n_dropped_total}/{n_spikes} spike(s) dropped",
+    );
+    match &report.score {
+        Some(score) => print!("{}", score.render()),
+        None => println!("truth: none"),
+    }
+    println!("wrote {}", a.out.display());
+    Ok(())
+}
+
 fn sorrel_rev() -> Option<String> {
     std::env::var("SORREL_REV")
         .ok()
@@ -1140,6 +1845,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_split_needs_two_disjoint_candidates_over_the_threshold() {
+        let (a, b, both, low): (&[u32], &[u32], &[u32], &[u32]) =
+            (&[0, 1, 2], &[3, 4, 5], &[0, 1, 2, 3, 4, 5], &[6, 7]);
+        // `both` overlaps the better picks entirely; `low` is under the bar.
+        let units = pick_split(vec![(0.7, both), (0.9, a), (0.8, b), (0.2, low)], 0.5);
+        assert_eq!(units, vec![a.to_vec(), b.to_vec()]);
+        assert!(pick_split(vec![(0.9, a), (0.2, b)], 0.5).is_empty());
+    }
+
+    #[test]
+    fn the_centre_ratio_sees_only_pairs_inside_half_a_millisecond() {
+        // sr 1 kHz: one sample is 1 ms. Spikes 30 ms apart fill the baseline.
+        let clean: Vec<u64> = (0..100).map(|i| i * 30).collect();
+        assert_eq!(centre_ratio(clean.clone(), 1000.0), 0.0);
+        let mut dirty = clean;
+        dirty.extend((0..100).map(|i| i * 30)); // same-sample doubles
+        assert!(centre_ratio(dirty, 1000.0) > 1.0);
+        assert_eq!(centre_ratio(vec![0, 1000], 1000.0), 0.0);
+    }
+
+    #[test]
+    fn the_spike_floor_spares_only_a_late_onset_unit() {
+        let late: Vec<u64> = (0..150).map(|i| 800 + i).collect();
+        let early: Vec<u64> = (0..150).collect();
+        assert!(passes_floor(late.clone(), 1000, 300, 0.5));
+        assert!(!passes_floor(early, 1000, 300, 0.5));
+        assert!(!passes_floor(late[..15].to_vec(), 1000, 300, 0.5));
+        assert!(passes_floor((0..300).collect(), 1000, 300, 0.5));
+    }
+
+    #[test]
     fn lesioned_table_selection_drops_rows_and_joins_roots() {
         let dir = tempfile::tempdir().unwrap();
         let mut t = Table::new(
@@ -1183,6 +1919,8 @@ mod tests {
                 class_map: &[],
                 exclude: &[],
                 join_roots: true,
+                root_verdict: &[],
+                row_stride: 1,
                 groups: None,
             },
         )
@@ -1238,6 +1976,8 @@ mod tests {
                 class_map,
                 exclude: &[],
                 join_roots: false,
+                root_verdict: &[],
+                row_stride: 1,
                 groups: None,
             },
         )

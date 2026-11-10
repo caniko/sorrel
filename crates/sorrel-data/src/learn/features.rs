@@ -49,6 +49,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{ensure, Result};
+use rayon::prelude::*;
 use sorrel_compute::{
     auto_correlogram, bimodality_coefficient, fit_diag_gmm, ks_two_sample, mean_amplitude,
     sliding_refractory_argmin,
@@ -1042,106 +1043,18 @@ pub fn extract<P: DataProvider + HasGeometry>(
     // Per-spike rows from a deterministic time-stratified subsample.
     let mut spike_rows: Vec<u32> = Vec::new();
     for rd in &root_data {
-        if rd.n < MIN_ROOT_SPIKES || opts.max_spikes_per_root == 0 {
-            continue;
-        }
         let r = rd.root as usize;
-        let g = &globals[r];
-        let times = session.spike_times(ClusterId(rd.root));
-        let amps = session.spike_amplitudes(ClusterId(rd.root));
-        let amps = if amps.len() == times.len() { amps } else { &[] };
-        let n = rd.n;
-        let m = n.min(opts.max_spikes_per_root);
-        let pick: Vec<usize> = (0..m)
-            .map(|i| {
-                let lo = i * n / m;
-                let hi = (i + 1) * n / m;
-                lo + (hi - lo) / 2
-            })
-            .collect();
-        let feats = root_feats[r].as_ref();
-        let maha = feats.map(|(f, d)| mahalanobis(f, *d));
-        let centre_scale: Option<(Vec<f32>, Vec<f32>)> =
-            feats.as_ref().map(|(f, d)| robust_center_scale_dims(f, *d));
-        let maha_sorted = maha.as_ref().map(|m| {
-            let mut s = m.clone();
-            s.sort_by(f32::total_cmp);
-            s
-        });
-        let (med_amp, mad_amp) = robust_center_scale(amps);
-        let amp_bins = amp_drift_bins(times, amps, total, AMP_DRIFT_BINS);
-        let mut sorted_amps: Vec<f32> = amps.iter().copied().filter(|v| v.is_finite()).collect();
-        sorted_amps.sort_by(f32::total_cmp);
-        let knn = feats.map(|(f, d)| {
-            let sub = stride_rows_pick(f, *d, &pick);
-            knn_relative_density(&sub, *d)
-        });
-        let refractory = (sr * REFRACTORY_MS / 1000.0).round() as u64;
-        for (j, &i) in pick.iter().enumerate() {
-            let mut row = Row::new(&spikes.columns);
-            row.set("sid_idx", 0.0);
-            row.set("root", rd.root as f32);
-            row.set("local_idx", i as f32);
-            if let (Some(maha), Some((f, d))) = (&maha, feats) {
-                row.set("f_maha", maha[i]);
-                if let Some(sorted) = &maha_sorted {
-                    row.set("f_maha_pct", percentile_rank(sorted, maha[i]));
-                }
-                if let Some((centre, scale)) = &centre_scale {
-                    for k in 0..6.min(*d) {
-                        let z = (f[i * d + k] - centre[k]) / scale[k];
-                        row.set(&format!("f_z_pc{k}"), z.abs());
-                    }
-                }
-            }
-            if !amps.is_empty() {
-                let a = amps[i];
-                row.set(
-                    "f_amp_z",
-                    if mad_amp.is_finite() && mad_amp > 0.0 {
-                        (a - med_amp) / mad_amp
-                    } else {
-                        f32::NAN
-                    },
-                );
-                row.set("f_amp_pct", percentile_rank(&sorted_amps, a));
-                let bin = amp_bins.get(i).copied().unwrap_or(None);
-                row.set(
-                    "f_amp_z_drift",
-                    match bin {
-                        Some((bmed, bmad)) if bmad.is_finite() && bmad > 0.0 => (a - bmed) / bmad,
-                        _ => f32::NAN,
-                    },
-                );
-            }
-            if let Some(k) = &knn {
-                row.set("f_knn_density_ratio", k[j]);
-            }
-            row.set("f_time_frac", times[i].0 as f32 / total.max(1) as f32);
-            let prev = if i > 0 {
-                Some(times[i].0.saturating_sub(times[i - 1].0))
-            } else {
-                None
-            };
-            let next = if i + 1 < n {
-                Some(times[i + 1].0.saturating_sub(times[i].0))
-            } else {
-                None
-            };
-            let ms = |s: u64| (s as f32) * 1000.0 / sr;
-            row.set(
-                "f_log_isi_prev",
-                prev.map_or(f32::NAN, |s| (1.0 + ms(s)).log10()),
-            );
-            row.set(
-                "f_log_isi_next",
-                next.map_or(f32::NAN, |s| (1.0 + ms(s)).log10()),
-            );
-            let close = |s: Option<u64>| s.is_some_and(|s| s <= refractory);
-            row.set_bool("f_refractory", close(prev) || close(next));
-            spikes.push_row(&row.values)?;
-            spike_rows.push(g[i]);
-        }
+        let picked = push_spike_rows(
+            &mut spikes,
+            rd.root,
+            session.spike_times(ClusterId(rd.root)),
+            session.spike_amplitudes(ClusterId(rd.root)),
+            root_feats[r].as_ref(),
+            (sr, total),
+            opts.max_spikes_per_root,
+            false,
+        )?;
+        spike_rows.extend(picked.into_iter().map(|i| globals[r][i]));
     }
 
     phase("spikes");
@@ -1182,6 +1095,151 @@ pub fn extract<P: DataProvider + HasGeometry>(
         sr,
         total_samples: total,
     })
+}
+
+/// Push `spikes` rows for one root and return the root-local index of each.
+///
+/// The rows are the time-stratified subsample of at most `max_per_root`
+/// spikes, or with `all` every spike of the root. Every feature except
+/// `f_knn_density_ratio` is a function of the whole root, so it is the same
+/// either way. The kNN ratio is always measured against the subsample (the
+/// reference the training rows used), so a spike outside it gets a value on
+/// the scale the model was trained on.
+#[allow(clippy::too_many_arguments)]
+fn push_spike_rows(
+    spikes: &mut Table,
+    root: u32,
+    times: &[SampleIndex],
+    amps: &[f32],
+    feats: Option<&(Vec<f32>, usize)>,
+    (sr, total): (f32, u64),
+    max_per_root: usize,
+    all: bool,
+) -> Result<Vec<usize>> {
+    let n = times.len();
+    if n < MIN_ROOT_SPIKES || max_per_root == 0 {
+        return Ok(Vec::new());
+    }
+    let amps = if amps.len() == n { amps } else { &[] };
+    let m = n.min(max_per_root);
+    let pick: Vec<usize> = (0..m)
+        .map(|i| {
+            let lo = i * n / m;
+            let hi = (i + 1) * n / m;
+            lo + (hi - lo) / 2
+        })
+        .collect();
+    let maha = feats.map(|(f, d)| mahalanobis(f, *d));
+    let centre_scale: Option<(Vec<f32>, Vec<f32>)> =
+        feats.map(|(f, d)| robust_center_scale_dims(f, *d));
+    let maha_sorted = maha.as_ref().map(|m| {
+        let mut s = m.clone();
+        s.sort_by(f32::total_cmp);
+        s
+    });
+    let (med_amp, mad_amp) = robust_center_scale(amps);
+    let amp_bins = amp_drift_bins(times, amps, total, AMP_DRIFT_BINS);
+    let mut sorted_amps: Vec<f32> = amps.iter().copied().filter(|v| v.is_finite()).collect();
+    sorted_amps.sort_by(f32::total_cmp);
+    // One kNN ratio per returned row.
+    let knn = feats.map(|(f, d)| {
+        if all {
+            knn_relative_density_all(f, *d, &pick)
+        } else {
+            knn_relative_density(&stride_rows_pick(f, *d, &pick), *d)
+        }
+    });
+    let rows: Vec<usize> = if all { (0..n).collect() } else { pick };
+    let refractory = (sr * REFRACTORY_MS / 1000.0).round() as u64;
+    for (j, &i) in rows.iter().enumerate() {
+        let mut row = Row::new(&spikes.columns);
+        row.set("sid_idx", 0.0);
+        row.set("root", root as f32);
+        row.set("local_idx", i as f32);
+        if let (Some(maha), Some((f, d))) = (&maha, feats) {
+            row.set("f_maha", maha[i]);
+            if let Some(sorted) = &maha_sorted {
+                row.set("f_maha_pct", percentile_rank(sorted, maha[i]));
+            }
+            if let Some((centre, scale)) = &centre_scale {
+                for k in 0..6.min(*d) {
+                    let z = (f[i * d + k] - centre[k]) / scale[k];
+                    row.set(&format!("f_z_pc{k}"), z.abs());
+                }
+            }
+        }
+        if !amps.is_empty() {
+            let a = amps[i];
+            row.set(
+                "f_amp_z",
+                if mad_amp.is_finite() && mad_amp > 0.0 {
+                    (a - med_amp) / mad_amp
+                } else {
+                    f32::NAN
+                },
+            );
+            row.set("f_amp_pct", percentile_rank(&sorted_amps, a));
+            let bin = amp_bins.get(i).copied().unwrap_or(None);
+            row.set(
+                "f_amp_z_drift",
+                match bin {
+                    Some((bmed, bmad)) if bmad.is_finite() && bmad > 0.0 => (a - bmed) / bmad,
+                    _ => f32::NAN,
+                },
+            );
+        }
+        if let Some(k) = &knn {
+            row.set("f_knn_density_ratio", k[j]);
+        }
+        row.set("f_time_frac", times[i].0 as f32 / total.max(1) as f32);
+        let prev = if i > 0 {
+            Some(times[i].0.saturating_sub(times[i - 1].0))
+        } else {
+            None
+        };
+        let next = if i + 1 < n {
+            Some(times[i + 1].0.saturating_sub(times[i].0))
+        } else {
+            None
+        };
+        let ms = |s: u64| (s as f32) * 1000.0 / sr;
+        row.set(
+            "f_log_isi_prev",
+            prev.map_or(f32::NAN, |s| (1.0 + ms(s)).log10()),
+        );
+        row.set(
+            "f_log_isi_next",
+            next.map_or(f32::NAN, |s| (1.0 + ms(s)).log10()),
+        );
+        let close = |s: Option<u64>| s.is_some_and(|s| s <= refractory);
+        row.set_bool("f_refractory", close(prev) || close(next));
+        spikes.push_row(&row.values)?;
+    }
+    Ok(rows)
+}
+
+/// The `spikes` feature rows of *every* spike of `root`, in root-local order
+/// (targets are NaN). Empty for a root below [`MIN_ROOT_SPIKES`]. A row that
+/// is also in the training subsample for `opts` is identical to the row
+/// [`extract`] wrote for it.
+pub fn root_spike_features<P: DataProvider + HasGeometry>(
+    session: &Session<P>,
+    data: &ExtractData,
+    root: u32,
+    opts: &ExtractOpts,
+) -> Result<Table> {
+    let mut table = Table::new(EXTRACTOR_VERSION, spike_columns());
+    push_spike_rows(
+        &mut table,
+        root,
+        session.spike_times(ClusterId(root)),
+        session.spike_amplitudes(ClusterId(root)),
+        data.root_feats.get(root as usize).and_then(Option::as_ref),
+        (data.sr, data.total_samples),
+        opts.max_spikes_per_root,
+        true,
+    )?;
+    Ok(table)
 }
 
 /// Header metadata owned by the target columns of `name`. It is applied by
@@ -2077,10 +2135,20 @@ fn percentile_rank(sorted: &[f32], value: f32) -> f32 {
 /// Mean distance to the `KNN_K` nearest other rows, divided by the median of
 /// that distance over the same rows.
 fn knn_relative_density(points: &[f32], d: usize) -> Vec<f32> {
+    let (mean_dist, reference) = knn_mean_dist(points, d);
+    if !reference.is_finite() || reference <= 0.0 {
+        return mean_dist.iter().map(|_| f32::NAN).collect();
+    }
+    mean_dist.iter().map(|v| v / reference).collect()
+}
+
+/// Mean distance of each row to its `KNN_K` nearest other rows, and the
+/// median of those means (`NaN` when there are too few rows).
+fn knn_mean_dist(points: &[f32], d: usize) -> (Vec<f32>, f32) {
     let m = points.len() / d;
     let mut mean_dist = vec![f32::NAN; m];
     if m <= KNN_K || d == 0 {
-        return mean_dist;
+        return (mean_dist, f32::NAN);
     }
     let mut scratch = vec![0.0f32; m];
     for i in 0..m {
@@ -2104,10 +2172,40 @@ fn knn_relative_density(points: &[f32], d: usize) -> Vec<f32> {
         mean_dist[i] = sum / KNN_K as f32;
     }
     let reference = median(&mut mean_dist.clone());
+    (mean_dist, reference)
+}
+
+/// [`knn_relative_density`] for every row of `feats`, each measured against
+/// the subsample `pick`. A row in `pick` gets exactly the subsample's value;
+/// any other row gets its mean distance to its `KNN_K` nearest subsample rows
+/// over the same reference.
+fn knn_relative_density_all(feats: &[f32], d: usize, pick: &[usize]) -> Vec<f32> {
+    let n = feats.len() / d;
+    let sub = stride_rows_pick(feats, d, pick);
+    let (mean_dist, reference) = knn_mean_dist(&sub, d);
     if !reference.is_finite() || reference <= 0.0 {
-        return mean_dist.iter().map(|_| f32::NAN).collect();
+        return vec![f32::NAN; n];
     }
-    mean_dist.iter().map(|v| v / reference).collect()
+    let mut out: Vec<f32> = (0..n)
+        .into_par_iter()
+        .map_init(Vec::new, |scratch: &mut Vec<f32>, i| {
+            let row = &feats[i * d..(i + 1) * d];
+            scratch.clear();
+            scratch.extend(sub.chunks_exact(d).map(|p| {
+                row.iter()
+                    .zip(p)
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f32>()
+                    .sqrt()
+            }));
+            let (_, _, _) = scratch.select_nth_unstable_by(KNN_K - 1, f32::total_cmp);
+            scratch[..KNN_K].iter().sum::<f32>() / KNN_K as f32 / reference
+        })
+        .collect();
+    for (j, &i) in pick.iter().enumerate() {
+        out[i] = mean_dist[j] / reference;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -2142,6 +2240,26 @@ mod tests {
             .iter()
             .all(|v| v.is_nan()));
         assert!(acg_log_bins(&[], sr).iter().all(|v| v.is_nan()));
+    }
+
+    #[test]
+    fn knn_ratio_of_every_row_matches_the_subsample_on_its_rows() {
+        // 40 points on a line; the subsample is every other one.
+        let feats: Vec<f32> = (0..40).flat_map(|i| [i as f32, 0.0]).collect();
+        let pick: Vec<usize> = (0..40).step_by(2).collect();
+        let sub = knn_relative_density(&stride_rows_pick(&feats, 2, &pick), 2);
+        let all = knn_relative_density_all(&feats, 2, &pick);
+        assert_eq!(all.len(), 40);
+        for (j, &i) in pick.iter().enumerate() {
+            assert_eq!(all[i], sub[j], "row {i}");
+        }
+        // A row between two subsample rows is on the same scale as they are.
+        assert!(
+            (all[21] / all[20] - 1.0).abs() < 0.2,
+            "{} {}",
+            all[21],
+            all[20]
+        );
     }
 
     #[test]
