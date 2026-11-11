@@ -14,6 +14,9 @@
 //! wrapper: per-cluster scalars are tiny, and it keeps the native module
 //! free of numpy at build time.
 
+// PyO3 0.22's #[pymethods] expansion trips this on every `-> PyResult<_>`.
+#![allow(clippy::useless_conversion)]
+
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use sorrel_data::session::ApplyPhyLabel;

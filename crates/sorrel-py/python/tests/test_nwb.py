@@ -149,3 +149,40 @@ def test_rejects_multi_segment(tmp_path: Path) -> None:
     nwb = NWBFile("x", "x", datetime(2026, 1, 1, tzinfo=timezone.utc))
     with pytest.raises(ValueError, match="multi-segment"):
         add_units_to_nwbfile(tmp_path / "sa", nwb)
+
+
+def test_converter_pipe_with_recording(curated: Path, tmp_path: Path) -> None:
+    # The usual NeuroConv shape: a recording interface next to the sorting.
+    from neuroconv import ConverterPipe
+    from neuroconv.tools.testing.mock_interfaces import MockRecordingInterface
+
+    rec = MockRecordingInterface(num_channels=4, sampling_frequency=RATE, durations=(1.0,))
+    # NeuroConv writes "unknown" otherwise, which is not a CCF term.
+    rec.recording_extractor.set_property("brain_area", ["CA1"] * 4)
+    sorting = SorrelSortingInterface(folder_path=curated)
+    sorting.set_aligned_starting_time(START)
+    pipe = ConverterPipe(data_interfaces=dict(Recording=rec, Sorting=sorting))
+    metadata = pipe.get_metadata()
+    metadata["NWBFile"].update(session_start_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                               session_description="tiny")
+    metadata["Subject"] = SUBJECT
+    out = tmp_path / "pipe.nwb"
+    pipe.run_conversion(nwbfile_path=out, metadata=metadata, overwrite=True)
+
+    with NWBHDF5IO(out, "r") as io:
+        nwb = io.read()
+        assert "ElectricalSeries" in nwb.acquisition
+        assert sorted(nwb.units.id[:]) == sorted(expected_trains())
+    assert not validate(path=out)
+    serious = [m for m in inspect_nwbfile(nwbfile_path=out, config=load_config("dandi"))
+               if m.importance in (Importance.CRITICAL, Importance.BEST_PRACTICE_VIOLATION)]
+    assert not serious, serious
+
+
+def test_keeps_callers_was_generated_by(curated: Path) -> None:
+    # pynwb accepts a tuple here and the attribute is write-once.
+    nwb = NWBFile("x", "x", datetime(2026, 1, 1, tzinfo=timezone.utc),
+                  was_generated_by=(("acq", "1.0"),))
+    add_units_to_nwbfile(curated, nwb)
+    assert [tuple(e) for e in nwb.was_generated_by] == [("acq", "1.0"),
+                                                        ("sorrel-ephys", sorrel.__version__)]

@@ -180,10 +180,10 @@ def add_units_to_nwbfile(
     nwbfile.units = units
 
     entry = ("sorrel-ephys", __version__)
-    if nwbfile.was_generated_by is None:
-        nwbfile.was_generated_by = [entry]
-    elif isinstance(nwbfile.was_generated_by, list) and entry not in nwbfile.was_generated_by:
-        nwbfile.was_generated_by.append(entry)
+    existing = [tuple(e) for e in nwbfile.was_generated_by or ()]
+    if entry not in existing:
+        # The attribute is write-once and may be a tuple; replace the field.
+        nwbfile.fields["was_generated_by"] = [*existing, entry]
     return units
 
 
