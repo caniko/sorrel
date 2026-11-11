@@ -33,9 +33,12 @@ external funding.
 
 ## Acknowledgments
 
-Sorrel was developed and evaluated on tetrode recordings from CINPLA, sorted
-with Kilosort 2 and curated in phy. Among other uses, spike rescue was verified
-end to end on one of these sorts. The double-blind curation bench also scores
+Sorrel was developed and evaluated on tetrode recordings from
+[CINPLA](https://www.mn.uio.no/ibv/english/research/sections/fyscell/cinpla/about/),
+the Centre for Integrative Neuroplasticity at the University of Oslo, sorted
+with Kilosort 2 and curated in phy. They were used to verify spike rescue end
+to end and measure its speed and recall, and to evaluate `sorrel auto` on
+tetrode geometry. The double-blind curation bench also scores
 Sorrel against human-curated sorts that the repository identifies only by
 opaque session ids.
 

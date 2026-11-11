@@ -129,7 +129,7 @@ rescued spikes as approximate.
 Rescue runs on the GPU through wgpu. If no GPU is available, it falls back to
 a CPU reference and prints a warning. The CPU reference is about 100× slower.
 
-On a 297 s, 32-channel Kilosort 2 tetrode recording with 62 clusters, 12
+On a 297 s, 32-channel Kilosort 2 tetrode recording from CINPLA with 62 clusters, 12
 target units took 3.5 s on the GPU and 9.5 min on the CPU. That is about
 160× on this recording.
 
