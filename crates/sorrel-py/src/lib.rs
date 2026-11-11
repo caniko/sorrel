@@ -18,9 +18,9 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::{
-    collect_qc_rows_with, curation_json, open_phy, open_sorting_analyzer, rank_merge_candidates,
-    rank_split_candidates, save_session, seed_phy, CurationCommand, JournalOpts, Method,
-    PhyLabelOp, SuggestConfig,
+    collect_qc_rows_with, curation_json, open_phy, open_sorting_analyzer, provenance,
+    rank_merge_candidates, rank_split_candidates, save_session, seed_phy, CurationCommand,
+    JournalOpts, Method, PhyLabelOp, SuggestConfig,
 };
 use sorrel_io::kilosort::{KilosortOpenParams, KilosortProvider, PhyLabel};
 use sorrel_io::{
@@ -159,6 +159,24 @@ impl Session {
     /// Direct parents of `cluster` (the split source or the merged-in units).
     fn parents(&self, cluster: u32) -> Vec<u32> {
         with_session!(self, s => s.parents(ClusterId(cluster)).iter().map(|p| p.0).collect())
+    }
+
+    /// The backend's unit id of `cluster` (phy: the cluster id itself;
+    /// SortingAnalyzer: its `unit_ids` entry), as `curation.json` uses it.
+    fn unit_id(&self, cluster: u32) -> u32 {
+        with_session!(self, s => s.provider.unit_id(ClusterId(cluster)))
+    }
+
+    /// Tags of `cluster` (`src:human`, `review:*`, ...).
+    fn tags(&self, cluster: u32) -> Vec<String> {
+        with_session!(self, s => s.tags(ClusterId(cluster)).to_vec())
+    }
+
+    /// Who made the curation on the applied path, as JSON: counts by actor
+    /// and method, the journal's xxh3 and whether the head is sealed.
+    fn provenance_json(&self) -> PyResult<String> {
+        let p = with_session!(self, s => provenance(s)).map_err(err)?;
+        serde_json::to_string(&p).map_err(|e| err(e.into()))
     }
 
     /// Free-text note of `cluster` (empty when none).

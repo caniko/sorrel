@@ -42,9 +42,13 @@ sorrel open my_run/sorting_analyzer
 ```
 
 The current implementation reads `recording.json` (sample rate, channel
-count, dtype, bin path), the flat sorting arrays, the optional
-`probe.json` for geometry, and `extensions/quality_metrics/metrics.csv`
-into the cluster table. The Zarr (`zarr_folder`) variant is not
+count, dtype, bin path), the flat sorting arrays, the unit ids
+(`sorting/numpysorting_info.json`, or `sorting/unit_ids.npy` from older
+layouts), the optional `probe.json` for geometry, and
+`extensions/quality_metrics/metrics.csv` into the cluster table.
+`recording.json` has to describe a raw binary file (a recording from
+`spikeinterface.read_binary`). A recording saved as a SpikeInterface
+binary folder, or one backed by another extractor, does not open yet. The Zarr (`zarr_folder`) variant is not
 supported; export to `binary_folder` first.
 
 ### Round-tripping curation back into SI
@@ -113,6 +117,99 @@ Limitations:
 - Trace data is loaded eagerly into RAM (NWB datasets are typically
   chunked + compressed, no mmap).
 - Local files only — DANDI streaming is not yet wired up.
+
+### Writing curated units to NWB
+
+`sorrel.nwb.add_units_to_nwbfile` writes a curated session (phy directory
+or SortingAnalyzer folder) into an `NWBFile` as its Units table. It needs
+PyNWB: `pip install "sorrel-ephys[nwb]"`.
+
+```python
+from datetime import datetime, timezone
+from pynwb import NWBFile, NWBHDF5IO
+from sorrel.nwb import add_units_to_nwbfile
+
+nwbfile = NWBFile("session", "id-1", datetime(2026, 1, 1, tzinfo=timezone.utc))
+add_units_to_nwbfile("my_run/phy", nwbfile, starting_time=0.0)
+with NWBHDF5IO("session.nwb", "w") as io:
+    io.write(nwbfile)
+```
+
+Each cluster that still has spikes gets one row. The row id is the
+backend's unit id, the same id `curation.json` uses. The columns are:
+
+| column            | content                                                                     |
+| ----------------- | --------------------------------------------------------------------------- |
+| `spike_times`     | seconds, see the timing contract below                                      |
+| `quality`         | `good`, `mua`, `noise` or `unsorted`                                        |
+| `origin`          | `Auto[<sorter>]`, or `Sorrel[<method>]` for a unit a split created          |
+| `parent_unit_ids` | ragged: the unit a split came from, or the units merged into this one       |
+| `tags`            | ragged: Sorrel's tags (`src:*`, `review:*`, `split`, `tuned`)               |
+| QC metrics        | every `cluster_qc.tsv` column that is not NaN for all units, with its units |
+
+A parent id can be missing from the table when that unit has no spikes
+left, e.g. a unit merged into another. That is why the column holds plain
+ids and not a `DynamicTableRegion`.
+
+**Timing contract.** `spike_times = sample_index / sample_rate +
+starting_time`. `sample_index` counts from the first sample of the
+recording the sort ran on. `sample_rate` is the exact rate from
+`params.py` or `recording.json`, not Sorrel's single-precision copy.
+`Units.resolution` is `1 / sample_rate`. Pass `starting_time` (seconds)
+when that recording does not start at the NWB session start. The
+recording's `ElectricalSeries` needs the same offset. Multi-segment
+SortingAnalyzers are rejected: their sample indices restart per segment.
+
+**Provenance.** The table's `description` records the Sorrel version, the
+sorter, the journal's xxh3 hash, whether the saved state is sealed, and the
+edits on the applied path counted by actor (human, agent, algo, remote) and
+by method (manual, algo, llm). `NWBFile.was_generated_by` gets
+`("sorrel-ephys", <version>)`. NWB has no core slot for curation
+provenance. The other options were each worse:
+
+- a one-row `DynamicTable` trips NWB Inspector's `check_single_row`;
+- JSON in a column trips `check_table_values_for_dict`;
+- `LabMetaData` needs an NDX extension;
+- the schema says `scratch` data "is not intended for sharing".
+
+The function refuses an `NWBFile` that already has a units table. It does
+not write traces, the electrodes table or waveforms. Use the recording's
+own NeuroConv interface for those.
+
+### NeuroConv
+
+`sorrel.neuroconv.SorrelSortingInterface` wraps the same function as a
+NeuroConv data interface (`pip install "sorrel-ephys[neuroconv]"`), so a
+`-to-nwb` converter can put Sorrel's curated units next to its recording
+interfaces:
+
+```python
+from neuroconv import ConverterPipe
+from neuroconv.datainterfaces import SpikeGLXRecordingInterface
+from sorrel.neuroconv import SorrelSortingInterface
+
+sorting = SorrelSortingInterface(folder_path="my_run/phy")
+sorting.set_aligned_starting_time(0.0)  # offset of the sorted recording
+converter = ConverterPipe(data_interfaces={
+    "recording": SpikeGLXRecordingInterface(file_path="run_g0_t0.imec0.ap.bin"),
+    "sorting": sorting,
+})
+```
+
+`add_to_nwbfile` takes `units_description`, which goes in front of the
+provenance summary. Opening the folder takes the curation journal's
+writer lock, so close the Sorrel window on it first.
+
+The interface does not go through NeuroConv's `add_sorting_to_nwbfile`,
+for three reasons:
+
+- that writer concatenates the segments of a multi-segment sorting into
+  one spike train, where Sorrel refuses to guess;
+- it renumbers rows `0..N-1` and moves the sorter's ids into `unit_name`,
+  where `parent_unit_ids` and `curation.json` need the ids themselves;
+- it would make SpikeInterface a dependency of the NWB path.
+
+The interface does not link units to electrodes.
 
 ## Kilosort 4 `rez.mat`
 

@@ -53,8 +53,9 @@ class Session:
     Thin wrapper over the native class that decodes its JSON payloads.
     """
 
-    def __init__(self, native: Any):
+    def __init__(self, native: Any, path: str | os.PathLike | None = None):
         self._n = native
+        self.path = None if path is None else Path(path)
 
     @classmethod
     def open(
@@ -69,7 +70,8 @@ class Session:
                 str(path),
                 None if journal is None else str(journal),
                 discard_journal,
-            )
+            ),
+            path,
         )
 
     # -- read -------------------------------------------------------------
@@ -125,6 +127,20 @@ class Session:
 
     def note(self, cluster: int) -> str:
         return self._n.note(cluster)
+
+    def unit_id(self, cluster: int) -> int:
+        """The backend's id for ``cluster``, as ``curation.json`` uses it
+        (phy: the cluster id; SortingAnalyzer: its ``unit_ids`` entry)."""
+        return self._n.unit_id(cluster)
+
+    def tags(self, cluster: int) -> list[str]:
+        return self._n.tags(cluster)
+
+    def provenance(self) -> dict[str, Any]:
+        """Who made the curation on the applied path: ``by_actor``
+        (human/agent/algo/remote), ``by_method`` (manual/algo/llm),
+        ``journal_xxh3``, node counts and whether the head is ``sealed``."""
+        return json.loads(self._n.provenance_json())
 
     def sorter(self) -> str:
         return self._n.sorter()

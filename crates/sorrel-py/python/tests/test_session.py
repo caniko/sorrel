@@ -58,7 +58,9 @@ def test_edit_save_reopen(phy_dir: Path) -> None:
     assert (Path(out) / "cluster_group.tsv").read_text() == "cluster_id\tgroup\n0\tgood\n"
     assert sorrel.read_curation(out)["merges"] == []   # resealed → labels only
 
-    # Reopen: the saved state loads once, with an empty undo stack.
+    # Reopen: the saved state loads once, with an empty undo stack. The
+    # journal admits one writer, so the first session must go first.
+    del s
     s2 = sorrel.Session.open(phy_dir)
     assert s2.n_clusters == 4
     assert s2.labels()[0] == "good"

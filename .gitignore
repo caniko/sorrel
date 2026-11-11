@@ -2,6 +2,9 @@ result*
 /target
 # sorrel-py is outside the workspace and builds into its own target dir
 /crates/sorrel-py/target/
+# `maturin develop` drops the extension next to the sources
+/crates/sorrel-py/python/sorrel/_native*.so
+/crates/sorrel-py/python/sorrel/_native*.pyd
 *.sqlite
 # ... except the bench results DB, versioned with git-lfs (.gitattributes)
 !/bench/results.sqlite
