@@ -46,9 +46,12 @@ count, dtype, bin path), the flat sorting arrays, the unit ids
 (`sorting/numpysorting_info.json`, or `sorting/unit_ids.npy` from older
 layouts), the optional `probe.json` for geometry, and
 `extensions/quality_metrics/metrics.csv` into the cluster table.
-`recording.json` has to describe a raw binary file (a recording from
-`spikeinterface.read_binary`). A recording saved as a SpikeInterface
-binary folder, or one backed by another extractor, does not open yet. The Zarr (`zarr_folder`) variant is not
+`recording.json` may describe a raw binary file (a recording from
+`spikeinterface.read_binary`) or a SpikeInterface binary folder
+(`rec.save(folder=..., format='binary')`, a `BinaryFolderRecording`): for
+the latter Sorrel follows its `folder_path` to that folder's `binary.json`.
+A recording backed by another extractor (a preprocessing chain) does not
+open yet. The Zarr (`zarr_folder`) variant is not
 supported; export to `binary_folder` first.
 
 ### Round-tripping curation back into SI
