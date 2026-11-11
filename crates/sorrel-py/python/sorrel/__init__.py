@@ -166,12 +166,32 @@ class Session:
 
 def read_curation(path: str | os.PathLike) -> dict[str, Any]:
     """Load ``curation.json`` from a dataset directory (or the file itself),
-    ready for ``spikeinterface.curation.apply_curation``."""
+    ready for ``spikeinterface.curation.apply_curation``.
+
+    The file keeps every unit's own labels, which Sorrel reloads.
+    ``apply_curation`` labels before it merges and keeps an exclusive label
+    only when all members agree, so here each merge into a member hands that
+    member's labels to the others: the merged unit keeps Sorrel's label."""
     p = Path(path)
     if p.is_dir():
         p = p / "curation.json"
     with p.open() as f:
-        return json.load(f)
+        doc = json.load(f)
+    labels = {e["unit_id"]: e for e in doc.get("manual_labels") or []}
+    for m in doc.get("merges") or []:
+        target, members = m.get("new_unit_id"), m.get("unit_ids", [])
+        if target not in members:
+            continue
+        for u in members:
+            if u == target:
+                continue
+            if target in labels:
+                labels[u] = {"unit_id": u, "labels": labels[target]["labels"]}
+            else:
+                labels.pop(u, None)
+    if labels:
+        doc["manual_labels"] = list(labels.values())
+    return doc
 
 
 def inspect_phy(path: str | os.PathLike) -> tuple[int, int, float]:

@@ -16,9 +16,11 @@
 //!
 //! `apply_curation` applies one curation in a single pass (labels, merges,
 //! splits) against the sorter's units, so it reproduces relabels, merges
-//! and at most one split per sorter unit that no merge touches. It rejects
-//! the rest (a unit both merged and split, a second split of a unit, a
-//! split or merge of a unit sorrel created) instead of applying it wrongly.
+//! and at most one split per sorter unit that no merge touches; both halves
+//! of a split take the parent's labels, and a label on a unit sorrel created
+//! has no slot. It rejects the rest (a unit both merged and split, a second
+//! split of a unit, a split or merge of a unit sorrel created) instead of
+//! applying it wrongly.
 //! ponytail: one document for the whole history; emit SpikeInterface's
 //! list form (`SequentialCuration`, one step per edit) when those are needed.
 

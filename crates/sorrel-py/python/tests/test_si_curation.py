@@ -1,6 +1,7 @@
 """The round trip docs/src/usage/saving.md promises: edit a SortingAnalyzer
 in sorrel.Session, save, and spikeinterface.curation.apply_curation
 reproduces the units. Expected trains come from the original sorting."""
+import json
 import warnings
 from pathlib import Path
 
@@ -14,7 +15,7 @@ import sorrel
 MOVED = [0, 1, 2, 5]
 
 
-def test_apply_curation_reproduces_session(tmp_path: Path) -> None:
+def make_analyzer(tmp_path: Path):
     warnings.simplefilter("ignore")
     # SI 0.105's generator names units "0".."4" (strings), as many extractors do.
     rec, sort = si.generate_ground_truth_recording(durations=[3.0], num_units=5, seed=0)
@@ -26,6 +27,11 @@ def test_apply_curation_reproduces_session(tmp_path: Path) -> None:
     raw.set_probe(rec.get_probe(), in_place=True)
     analyzer = si.create_sorting_analyzer(sort, raw, format="binary_folder",
                                           folder=tmp_path / "sa", sparse=False)
+    return analyzer, sort
+
+
+def test_apply_curation_reproduces_session(tmp_path: Path) -> None:
+    analyzer, sort = make_analyzer(tmp_path)
     train = {str(u): sort.get_unit_spike_train(u) for u in sort.unit_ids}
     # Sorrel merges into the target id; SI gives both halves of a split new
     # ids, so the left-behind spikes of "3" get the next free one.
@@ -40,6 +46,8 @@ def test_apply_curation_reproduces_session(tmp_path: Path) -> None:
     s = sorrel.Session.open(tmp_path / "sa")
     assert [s.unit_id(c) for c in range(s.n_clusters)] == [0, 1, 2, 3, 4]
     s.set_label(0, "good")
+    s.set_label(1, "noise")  # merged away: the merged unit keeps "good"
+    s.set_label(2, "good")
     s.merge([1], 2)
     new = s.split(3, MOVED)
     np.testing.assert_array_equal(s.spike_times(new), want["5"])
@@ -52,3 +60,29 @@ def test_apply_curation_reproduces_session(tmp_path: Path) -> None:
         np.testing.assert_array_equal(np.sort(curated.get_unit_spike_train(uid)), spikes)
     quality = dict(zip(curated.unit_ids, curated.get_property("quality")))
     assert quality["0"] == "good"
+    assert quality["2"] == "good"
+
+
+def test_reopen_undo_merge_restores_source_label(tmp_path: Path) -> None:
+    # read_curation gives merge members the merged unit's labels for SI; the
+    # file must keep their own, which Sorrel reloads. Unit 1's "noise" comes
+    # from an earlier curation.json, so no journal entry can restore it.
+    make_analyzer(tmp_path)
+    (tmp_path / "sa" / "curation.json").write_text(json.dumps({
+        "format_version": "2",
+        "unit_ids": ["0", "1", "2", "3", "4"],
+        "label_definitions": {"quality": {"label_options": ["good", "mua", "noise"],
+                                          "exclusive": True}},
+        "manual_labels": [{"unit_id": "1", "labels": {"quality": ["noise"]}}],
+    }))
+    s = sorrel.Session.open(tmp_path / "sa")
+    assert s.labels()[1] == "noise"
+    s.set_label(2, "good")
+    s.merge([1], 2)
+    s.save()
+    del s
+    s = sorrel.Session.open(tmp_path / "sa")
+    assert s.labels()[2] == "good"
+    s.undo()
+    assert s.labels()[1] == "noise"
+    assert s.labels()[2] == "good"
