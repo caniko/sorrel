@@ -97,6 +97,17 @@
                 paths = ["smoke-out/**"];
               };
             }
+            # The release wheel with the nwb/neuroconv extras: sorrel-py's
+            # pytest suite (NWB export, NeuroConv interface, the SpikeInterface
+            # apply_curation round trip). uv installs the Python stack cold.
+            {
+              id = "python";
+              nix_build = ".#packages.x86_64-linux.sorrel-linux-py-smoke";
+              runner = "ubuntu-24.04";
+              shell = "bash";
+              run = "./release/smoke-python.sh";
+              timeout_minutes = 30;
+            }
             # No arm64 wheel is built, so the wheel step is skipped there.
             {
               id = "windows-arm64";
@@ -501,6 +512,14 @@
               mkdir -p $out
               cp ${self.packages.${system}.sorrel-windows}/bin/sorrel.exe $out/
               cp ${self.packages.${system}.sorrel-windows}/bin/sorrelw.exe $out/
+              cp ${wheel}/${wheel.file} $out/
+            '';
+          # What release/smoke-python.sh installs on a Linux runner.
+          sorrel-linux-py-smoke = let
+            wheel = self.packages.${system}.release-bundle.wheels.x86_64-linux;
+          in
+            pkgs.runCommand "sorrel-linux-py-smoke-${sorrelVersion}" {} ''
+              mkdir -p $out
               cp ${wheel}/${wheel.file} $out/
             '';
           sorrel-windows-aarch64-smoke = pkgs.runCommand "sorrel-windows-aarch64-smoke-${sorrelVersion}" {} ''
