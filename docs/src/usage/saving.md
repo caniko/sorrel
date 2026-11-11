@@ -85,7 +85,8 @@ The list form is one structural step per run of edits that touch disjoint
 units, followed by a single labels-only step keyed by the final unit ids.
 That expresses histories one pass cannot: a unit both merged and split, a
 second split of a unit, and labels or merges on units Sorrel created. Unit
-ids keep their SpikeInterface type (`"7"` stays a string). A merge keeps
+ids keep their SpikeInterface type (`"7"` stays a string), and strings
+that are not integers (`"unit_a"`, `"007"`) are written back verbatim. A merge keeps
 its target's id and the merged unit's own label; the sources' labels leave
 with them. SpikeInterface never reuses a split unit's id, so a split's
 child gets the id Sorrel allocated for it and the spikes that stay behind

@@ -159,7 +159,12 @@ with NWBHDF5IO("session.nwb", "w") as io:
 ```
 
 Each cluster that still has spikes gets one row. The row id is the
-backend's unit id, the same id `curation.json` uses. The columns are:
+backend's integer unit id, the one `curation.json` uses, with one
+exception: SpikeInterface gives the spikes a split leaves behind a fresh
+id, while Sorrel and this table keep the parent's id. When a
+SortingAnalyzer's ids are strings that are not distinct integers
+(`"unit_a"`, `"007"` beside `"7"`), rows are numbered densely and a
+`unit_name` column holds SpikeInterface's ids. The columns are:
 
 | column            | content                                                                     |
 | ----------------- | --------------------------------------------------------------------------- |
