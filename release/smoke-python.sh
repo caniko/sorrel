@@ -14,5 +14,5 @@ venv=$(mktemp -d)/venv
 uv venv --python 3.12 "$venv"
 # hdmf-zarr<0.14: neuroconv 0.10.2 still uses the zarr 2 API.
 uv pip install --python "$venv/bin/python" "${wheels[0]}[nwb,neuroconv]" \
-  "neuroconv==0.10.2" "hdmf-zarr<0.14" nwbinspector spikeinterface pytest
+  "neuroconv==0.10.2" "hdmf-zarr<0.14" nwbinspector spikeinterface scipy pytest
 "$venv/bin/python" -m pytest crates/sorrel-py/python/tests -q -rA

@@ -74,7 +74,7 @@ commands with `nix shell nixpkgs#uv -c`, and run `maturin develop` inside
 ```sh
 uv venv --python-preference only-managed --python 3.12 .venv
 uv pip install --python .venv/bin/python pip "maturin>=1.4,<2" pytest \
-  pynwb "neuroconv==0.10.2" "hdmf-zarr<0.14" nwbinspector spikeinterface
+  pynwb "neuroconv==0.10.2" "hdmf-zarr<0.14" nwbinspector spikeinterface scipy
 (cd crates/sorrel-py && VIRTUAL_ENV=$PWD/../../.venv PATH=$PWD/../../.venv/bin:$PATH maturin develop --release)
 .venv/bin/python -m pytest crates/sorrel-py/python/tests
 ```
