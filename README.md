@@ -41,19 +41,23 @@ sorrel open <KILOSORT_DIR> --dat recording.dat --sample-rate 30000 --channels 32
 
 ### Keyboard
 
-| Key                               | Action                                                                   |
-| --------------------------------- | ------------------------------------------------------------------------ |
-| `G` / `M` / `N` / `U`             | Label the selection Good / MUA / Noise / Unsorted                        |
-| `J` / `K` / arrows                | Next / previous cluster in table order                                   |
-| `H` / `L`                         | Pan trace window (drag / wheel in the trace also pans; Ctrl-wheel zooms) |
-| `Cmd/Ctrl-G`                      | Merge the selection into the first-selected cluster                      |
-| `Cmd/Ctrl-Z` / `Cmd/Ctrl-Shift-Z` | Undo / redo                                                              |
-| `Cmd/Ctrl-S`                      | Save `spike_clusters.npy` + `cluster_group.tsv`                          |
-| `?` / `F1`                        | Keyboard & mouse help overlay                                            |
+Defaults; `Ctrl` is `Cmd` on macOS. Rebind in **Settings → Keyboard shortcuts**.
+
+| Key                                   | Action                                                                                                  |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `G`                                   | Merge the selection into the first-selected cluster                                                     |
+| `K`                                   | Split off the spikes inside the Features lasso                                                          |
+| `Alt+G` / `Alt+M` / `Alt+N` / `Alt+U` | Label the **best** clusters Good / MUA / Noise / Unsorted (`Ctrl+…` similar, `Ctrl+Alt+…` all selected) |
+| `↓` / `↑` / `Space` / `Shift+Space`   | Next / previous best cluster in table order; next / previous similar cluster                            |
+| `Alt+←` / `Alt+→`                     | Pan trace window (drag / wheel in the trace also pans; Ctrl-wheel zooms)                                |
+| `Ctrl+Z` / `Ctrl+Shift+Z`             | Undo / redo (`Ctrl+Y` also redoes)                                                                      |
+| `Ctrl+S`                              | Save `spike_clusters.npy` + `cluster_group.tsv`                                                         |
+| `H` / `?` / `F1`                      | Keyboard & mouse help overlay                                                                           |
 
 Views are dockable tiles: drag tabs to rearrange, `×` to close, the
-**View** menu to reopen. See `docs/src/usage/views.md` and
-`docs/src/usage/keyboard-controls.md`.
+**View** menu to reopen. The complete keymap, snippets and mouse gestures are in
+[`docs/src/usage/keyboard-controls.md`](docs/src/usage/keyboard-controls.md);
+[`docs/src/usage/views.md`](docs/src/usage/views.md) covers the panes.
 
 ## Build
 

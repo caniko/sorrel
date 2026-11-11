@@ -94,25 +94,48 @@ For SpikeGLX or Open Ephys, point `--dat` at the bin file and pass
 `--sample-rate`/`--channels` from the `.meta`/`.oebin` (or let Sorrel
 auto-detect — see [Backend detection](#backend-detection)).
 
-## NWB / DANDI
+## NWB
 
 ```sh
 sorrel open my_session.nwb            # build with --features hdf5
 ```
 
-Reads `/units/spike_times` (vlen) bucketed by `/units/id`, picks the first
-`ElectricalSeries` under `/acquisition` for the trace, and pulls
-`x`/`y`/`rel_x`/`rel_y` from `/general/extracellular_ephys/electrodes` for
-probe geometry. Spike times are converted from seconds to samples using
-the `ElectricalSeries` rate.
+What Sorrel reads:
+
+- **Units.** `/units/spike_times` and `spike_times_index`, one unit per
+  row. The row's `/units/id` is the unit id Sorrel reports in
+  `curation.json` and MCP evidence, so a table with ids `5, 7, 9` stays
+  `5, 7, 9`. Units with no spikes are kept. Spike times (seconds) become
+  sample indices as `round((t - starting_time) × rate)`.
+- **Trace.** The first group under `/acquisition` whose `neurodata_type`
+  is `ElectricalSeries`, or an extension subtype declared in the file's
+  cached `/specifications`, with 2-D `data`. A file with none is rejected.
+  If there are several, Sorrel reads the first by name and logs the rest.
+- **Time base.** `starting_time` and its `rate`. A series with per-sample
+  `timestamps` is rejected rather than given an assumed rate.
+- **Units of the samples.** int16, uint16, int32 and float32 `data` are
+  read in their stored type and converted to microvolts:
+  `data × conversion × channel_conversion[ch] + offset`, times 10⁶.
+  Other dtypes (float64, int64, …) are rejected. Amplitudes from an NWB
+  file are therefore in µV.
+- **Channels.** The series' `electrodes` region maps each data column to
+  an electrodes-table row. That row's `id` becomes the channel id and its
+  `rel_x`/`rel_y` the probe position. `x`/`y`/`z` are brain coordinates
+  and are not used as probe geometry; without `rel_x`/`rel_y` the session
+  has no channel positions.
 
 Limitations:
 
 - HDF5 backend is opt-in (`cargo build --features hdf5`); the default
-  build does not link libhdf5.
-- Trace data is loaded eagerly into RAM (NWB datasets are typically
-  chunked + compressed, no mmap).
-- Local files only — DANDI streaming is not yet wired up.
+  build and the release binaries do not link libhdf5.
+- Trace data is loaded eagerly into RAM as float32 (NWB datasets are
+  typically chunked and compressed, so there is no mmap).
+- One `ElectricalSeries`; multi-segment recordings are not modelled.
+- Local files only; DANDI streaming is not wired up. Sorrel does not write
+  NWB.
+
+The test fixtures in `release/fixtures/nwb/` are written by PyNWB
+(`generate.py` pins the version).
 
 ## Kilosort 4 `rez.mat`
 
