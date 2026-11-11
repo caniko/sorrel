@@ -910,7 +910,7 @@ mod tests {
 
         // The list form's final step seeds labels: untouched unit 2 keeps its
         // id, the split remainder's id 4 is past the dense mapping here.
-        let labels = read_curation_labels(&path, 6, |u| Some(u as usize)).unwrap();
+        let labels = read_curation_labels(&path, 6, |u| u.parse().ok()).unwrap();
         assert_eq!(labels[2].as_str(), "unsorted");
         assert_eq!(labels[4].as_str(), "good");
 
@@ -1007,11 +1007,19 @@ mod tests {
         let (mut s, _d) = fresh_session();
         let doc = CurationImport {
             labels: vec![
-                (0, Some(PhyLabel::Good), vec!["agree".into()]),
-                (1, Some(PhyLabel::Noise), vec!["merged:consensus".into()]),
-                (2, Some(PhyLabel::Noise), vec!["merged:consensus".into()]),
+                ("0".into(), Some(PhyLabel::Good), vec!["agree".into()]),
+                (
+                    "1".into(),
+                    Some(PhyLabel::Noise),
+                    vec!["merged:consensus".into()],
+                ),
+                (
+                    "2".into(),
+                    Some(PhyLabel::Noise),
+                    vec!["merged:consensus".into()],
+                ),
             ],
-            merges: vec![vec![2, 1]],
+            merges: vec![vec!["2".into(), "1".into()]],
         };
         let current = |c: ClusterId| label_str(&s.label(c).unwrap_or_default());
         let cmds = import_commands(&s, &doc, current).unwrap();
@@ -1036,18 +1044,18 @@ mod tests {
 
         let current = |_| "unsorted";
         let unknown = CurationImport {
-            labels: vec![(9, None, vec![])],
+            labels: vec![("9".into(), None, vec![])],
             merges: vec![],
         };
         assert!(import_commands(&s, &unknown, current).is_err());
         let bad_tag = CurationImport {
-            labels: vec![(0, None, vec!["a,b".into()])],
+            labels: vec![("0".into(), None, vec!["a,b".into()])],
             merges: vec![],
         };
         assert!(import_commands(&s, &bad_tag, current).is_err());
         let twice = CurationImport {
             labels: vec![],
-            merges: vec![vec![0, 1], vec![1, 2]],
+            merges: vec![vec!["0".into(), "1".into()], vec!["1".into(), "2".into()]],
         };
         assert!(import_commands(&s, &twice, current).is_err());
     }
@@ -1060,11 +1068,11 @@ mod tests {
         let doc = CurationImport {
             labels: vec![
                 (
-                    0,
+                    "0".into(),
                     None,
                     vec!["agree".into(), "tuned".into(), "external".into()],
                 ),
-                (1, None, vec!["tuned".into()]),
+                ("1".into(), None, vec!["tuned".into()]),
             ],
             merges: vec![],
         };

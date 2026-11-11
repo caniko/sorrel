@@ -33,7 +33,7 @@ pub const QUALITY_KEY: &str = "quality";
 pub fn read_curation_labels(
     path: &Path,
     n_clusters: usize,
-    unit_index_of: impl Fn(u64) -> Option<usize>,
+    unit_index_of: impl Fn(&str) -> Option<usize>,
 ) -> Option<Vec<PhyLabel>> {
     let text = std::fs::read_to_string(path).ok()?;
     let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -46,7 +46,7 @@ pub fn read_curation_labels(
     let entries = step.get("manual_labels")?.as_array()?;
     let mut out = vec![PhyLabel::Unsorted; n_clusters];
     for entry in entries {
-        let Some(uid) = entry.get("unit_id").and_then(unit_id_as_u64) else {
+        let Some(uid) = entry.get("unit_id").and_then(unit_id_text) else {
             continue;
         };
         // v2 nests label sets under "labels"; v1 keeps them at the top level.
@@ -57,7 +57,7 @@ pub fn read_curation_labels(
         let Some(first) = quality.and_then(|q| q.as_array()).and_then(|a| a.first()) else {
             continue;
         };
-        if let (Some(idx), Some(s)) = (unit_index_of(uid), first.as_str()) {
+        if let (Some(idx), Some(s)) = (unit_index_of(&uid), first.as_str()) {
             if idx < n_clusters {
                 out[idx] = PhyLabel::parse_tsv_value(s);
             }
@@ -74,9 +74,9 @@ pub const TAGS_KEY: &str = "tags";
 #[derive(Debug, Default, PartialEq)]
 pub struct CurationImport {
     /// `(unit_id, quality, tags)` per `manual_labels` entry.
-    pub labels: Vec<(u64, Option<PhyLabel>, Vec<String>)>,
+    pub labels: Vec<(String, Option<PhyLabel>, Vec<String>)>,
     /// Unit-id groups to merge (v2 `merges[].unit_ids`, v1 `merge_unit_groups`).
-    pub merges: Vec<Vec<u64>>,
+    pub merges: Vec<Vec<String>>,
 }
 
 /// Read labels, tags and merges from `path`. Unlike
@@ -127,7 +127,7 @@ pub fn read_curation(path: &Path) -> anyhow::Result<CurationImport> {
     {
         let uid = entry
             .get("unit_id")
-            .and_then(unit_id_as_u64)
+            .and_then(unit_id_text)
             .with_context(|| format!("manual_labels entry without unit_id: {entry}"))?;
         let sets = entry.get("labels").unwrap_or(entry);
         let quality = strings(sets.get(QUALITY_KEY))
@@ -150,9 +150,9 @@ pub fn read_curation(path: &Path) -> anyhow::Result<CurationImport> {
         })
         .unwrap_or_default();
     for group in merges {
-        let ids: Option<Vec<u64>> = group
+        let ids: Option<Vec<String>> = group
             .as_array()
-            .map(|a| a.iter().map(unit_id_as_u64).collect())
+            .map(|a| a.iter().map(unit_id_text).collect())
             .unwrap_or(None);
         match ids {
             Some(ids) if ids.len() >= 2 => out.merges.push(ids),
@@ -162,9 +162,14 @@ pub fn read_curation(path: &Path) -> anyhow::Result<CurationImport> {
     Ok(out)
 }
 
-/// SpikeInterface writes unit ids as ints or strings depending on the sorter.
-fn unit_id_as_u64(v: &serde_json::Value) -> Option<u64> {
-    v.as_u64().or_else(|| v.as_str()?.trim().parse().ok())
+/// A unit id as text: SpikeInterface writes ints or strings depending on
+/// the sorter, and strings need not be numbers (`"unit_a"`). Callers fall
+/// back to the number a string reads as (`"7"` vs `7`).
+pub fn unit_id_text(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.trim().to_owned()),
+        other => other.as_u64().map(|u| u.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -183,7 +188,7 @@ mod tests {
                 "merges":[],"splits":[],"removed":[]}"#,
         )
         .unwrap();
-        let labels = read_curation_labels(&v2, 3, |u| Some(u as usize)).unwrap();
+        let labels = read_curation_labels(&v2, 3, |u| u.parse().ok()).unwrap();
         assert_eq!(
             labels,
             vec![PhyLabel::Good, PhyLabel::Unsorted, PhyLabel::Noise]
@@ -197,12 +202,13 @@ mod tests {
         )
         .unwrap();
         let sparse = [10u64, 20];
-        let labels = read_curation_labels(&v1, 2, |u| sparse.iter().position(|&x| x == u)).unwrap();
+        let labels =
+            read_curation_labels(&v1, 2, |u| sparse.iter().position(|x| x.to_string() == u))
+                .unwrap();
         assert_eq!(labels, vec![PhyLabel::Unsorted, PhyLabel::Mua]);
 
         assert!(
-            read_curation_labels(&dir.path().join("missing.json"), 2, |u| Some(u as usize))
-                .is_none()
+            read_curation_labels(&dir.path().join("missing.json"), 2, |u| u.parse().ok()).is_none()
         );
     }
 
@@ -224,11 +230,11 @@ mod tests {
         assert_eq!(
             got.labels,
             vec![
-                (0, Some(PhyLabel::Good), vec!["agree".to_string()]),
-                (3, None, vec!["review:merge".to_string()]),
+                ("0".into(), Some(PhyLabel::Good), vec!["agree".to_string()]),
+                ("3".into(), None, vec!["review:merge".to_string()]),
             ]
         );
-        assert_eq!(got.merges, vec![vec![1, 2]]);
+        assert_eq!(got.merges, vec![vec!["1".to_string(), "2".into()]]);
 
         std::fs::write(&p, r#"{"splits":[{"unit_id":0,"mode":"indices"}]}"#).unwrap();
         assert!(read_curation(&p).is_err());
@@ -254,19 +260,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_curation_labels(&p, 3, |u| Some(u as usize)).unwrap(),
+            read_curation_labels(&p, 3, |u| u.parse().ok()).unwrap(),
             vec![PhyLabel::Good, PhyLabel::Unsorted, PhyLabel::Noise]
         );
         // Ids the history created are not in the dense mapping: skipped.
         let sparse = [0u64, 9];
         assert_eq!(
-            read_curation_labels(&p, 2, |u| sparse.iter().position(|&x| x == u)).unwrap(),
+            read_curation_labels(&p, 2, |u| sparse.iter().position(|x| x.to_string() == u))
+                .unwrap(),
             vec![PhyLabel::Good, PhyLabel::Unsorted]
         );
         let err = read_curation(&p).unwrap_err().to_string();
         assert!(err.contains("sequential curation list"), "{err}");
 
         std::fs::write(&p, "[]").unwrap();
-        assert!(read_curation_labels(&p, 1, |u| Some(u as usize)).is_none());
+        assert!(read_curation_labels(&p, 1, |u| u.parse().ok()).is_none());
     }
 }

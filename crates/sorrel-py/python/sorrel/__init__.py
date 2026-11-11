@@ -135,6 +135,13 @@ class Session:
         (phy: the cluster id; SortingAnalyzer: its ``unit_ids`` entry)."""
         return self._n.unit_id(cluster)
 
+    def unit_name(self, cluster: int) -> str:
+        """The unit id as ``curation.json`` writes it, as text. Differs from
+        ``unit_id`` when SpikeInterface's ids are strings that are not
+        distinct integers (``"unit_a"``): ``unit_id`` then numbers units
+        densely."""
+        return self._n.unit_name(cluster)
+
     def tags(self, cluster: int) -> list[str]:
         return self._n.tags(cluster)
 

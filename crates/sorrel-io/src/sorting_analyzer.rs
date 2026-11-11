@@ -43,11 +43,16 @@ pub struct SortingAnalyzerProvider {
 
     spikes_per_cluster: Vec<Vec<SampleIndex>>,
     initial_labels: Vec<PhyLabel>,
-    /// SI unit ids, parallel to `spikes_per_cluster`. Can be sparse.
+    /// Numeric unit ids, parallel to `spikes_per_cluster`. Can be sparse.
+    /// Dense indices when SI's ids are not all integers.
     unit_ids: Vec<u32>,
-    /// SI stored them as strings (`"0"`, `"7"`), as SpikeInterface 0.105's
-    /// generators and many extractors do.
-    string_unit_ids: bool,
+    /// SI's own ids when it stored strings (`"0"`, `"007"`, `"unit_a"`), as
+    /// SpikeInterface 0.105's generators and many extractors do; written
+    /// back verbatim because SpikeInterface compares ids by value and type.
+    unit_names: Option<Vec<String>>,
+    /// First id for clusters sorrel creates: past every numeric id and every
+    /// SI string that reads as one, so a new id never names an old unit.
+    next_unit_id: u32,
 
     channel_positions: Vec<[f32; 2]>,
     channel_map: Vec<ChannelId>,
@@ -87,16 +92,22 @@ impl SortingAnalyzerProvider {
         let (times, unit_indices) = load_sorting(root)?;
 
         let unit_ids_path = root.join("sorting").join("unit_ids.npy");
-        let (unit_ids, string_unit_ids) = if unit_ids_path.exists() {
-            (read_1d_u32(&unit_ids_path)?, false)
+        let (unit_ids, unit_names) = if unit_ids_path.exists() {
+            (read_1d_u32(&unit_ids_path)?, None)
         } else if let Some(ids) = numpysorting_unit_ids(root)? {
             ids
         } else {
             // Fall back to dense unit numbering [0..max+1).
             let max = unit_indices.iter().copied().max().unwrap_or(0);
-            ((0..=max).collect(), false)
+            ((0..=max).collect(), None)
         };
         let n_clusters = unit_ids.len();
+        let next_unit_id = unit_ids
+            .iter()
+            .copied()
+            .chain(unit_names.iter().flatten().filter_map(|s| s.parse().ok()))
+            .max()
+            .map_or(0, |m: u32| m + 1);
 
         let mut spikes_per_cluster: Vec<Vec<SampleIndex>> = vec![Vec::new(); n_clusters];
         for (i, &uidx) in unit_indices.iter().enumerate() {
@@ -113,7 +124,17 @@ impl SortingAnalyzerProvider {
         let initial_labels = crate::curation_json::read_curation_labels(
             labels.unwrap_or(&default_labels),
             n_clusters,
-            |uid| unit_ids.iter().position(|&u| u as u64 == uid),
+            |uid| {
+                match &unit_names {
+                    // SI's own string first, then the number it reads as ("7" vs 7).
+                    Some(names) => names.iter().position(|n| n == uid),
+                    None => None,
+                }
+                .or_else(|| {
+                    let u: u32 = uid.parse().ok()?;
+                    unit_ids.iter().position(|&x| x == u)
+                })
+            },
         )
         .unwrap_or_else(|| vec![PhyLabel::Unsorted; n_clusters]);
 
@@ -162,7 +183,8 @@ impl SortingAnalyzerProvider {
             spikes_per_cluster,
             initial_labels,
             unit_ids,
-            string_unit_ids,
+            unit_names,
+            next_unit_id,
             channel_positions,
             channel_map,
             metrics,
@@ -211,9 +233,12 @@ fn resolve_path(base: &Path, p: &Path) -> PathBuf {
 
 /// Unit ids from `sorting/numpysorting_info.json` (SpikeInterface's
 /// `NumpyFolderSorting`, the sorting of every binary_folder analyzer since
-/// 0.101), and whether they were strings. `None` if the file is absent or an
-/// id is not a non-negative integer (sorrel's ids are `u32`).
-fn numpysorting_unit_ids(root: &Path) -> Result<Option<(Vec<u32>, bool)>> {
+/// 0.101): the numeric ids, plus SI's strings when it stored strings. String
+/// ids that are not distinct integers (`"unit_a"`, `"7"` beside `"007"`)
+/// number the units densely. `None` if the file is absent or a numeric id
+/// does not fit sorrel's `u32`.
+type UnitIds = (Vec<u32>, Option<Vec<String>>);
+fn numpysorting_unit_ids(root: &Path) -> Result<Option<UnitIds>> {
     let p = root.join("sorting").join("numpysorting_info.json");
     if !p.exists() {
         return Ok(None);
@@ -224,15 +249,22 @@ fn numpysorting_unit_ids(root: &Path) -> Result<Option<(Vec<u32>, bool)>> {
     let Some(ids) = v.get("unit_ids").and_then(|x| x.as_array()) else {
         return Ok(None);
     };
-    let strings = ids.iter().any(|x| x.is_string());
-    let parsed: Option<Vec<u32>> = ids
+    if !ids.iter().any(|x| x.is_string()) {
+        let parsed: Option<Vec<u32>> = ids
+            .iter()
+            .map(|x| x.as_u64().and_then(|u| u32::try_from(u).ok()))
+            .collect();
+        return Ok(parsed.map(|ids| (ids, None)));
+    }
+    let names: Vec<String> = ids
         .iter()
-        .map(|x| match x {
-            serde_json::Value::String(s) => s.parse().ok(),
-            other => other.as_u64().and_then(|u| u32::try_from(u).ok()),
-        })
+        .map(|x| x.as_str().map_or_else(|| x.to_string(), str::to_owned))
         .collect();
-    Ok(parsed.map(|ids| (ids, strings)))
+    let parsed: Option<Vec<u32>> = names.iter().map(|s| s.parse().ok()).collect();
+    let numeric = parsed
+        .filter(|p| p.iter().collect::<std::collections::HashSet<_>>().len() == p.len())
+        .unwrap_or_else(|| (0..names.len() as u32).collect());
+    Ok(Some((numeric, Some(names))))
 }
 
 fn load_recording_json(root: &Path) -> Result<RecordingMeta> {
@@ -686,15 +718,19 @@ impl DataProvider for SortingAnalyzerProvider {
     fn unit_id(&self, cluster: ClusterId) -> u32 {
         match self.unit_ids.get(cluster.idx()) {
             Some(&u) => u,
-            None => {
-                let max = self.unit_ids.iter().copied().max().unwrap_or(0);
-                max + 1 + (cluster.0 - self.unit_ids.len() as u32)
-            }
+            None => self.next_unit_id + (cluster.0 - self.unit_ids.len() as u32),
         }
     }
 
-    fn unit_ids_are_strings(&self) -> bool {
-        self.string_unit_ids
+    fn unit_id_json(&self, cluster: ClusterId) -> serde_json::Value {
+        match (
+            &self.unit_names,
+            self.unit_names.as_ref().and_then(|n| n.get(cluster.idx())),
+        ) {
+            (_, Some(name)) => name.as_str().into(),
+            (Some(_), None) => self.unit_id(cluster).to_string().into(),
+            (None, None) => self.unit_id(cluster).into(),
+        }
     }
 
     fn initial_labels(&self) -> Vec<Self::Label> {
@@ -933,7 +969,7 @@ mod tests {
             }
             other => panic!("expected I16 trace, got {other:?}"),
         }
-        assert!(!p.unit_ids_are_strings());
+        assert_eq!(p.unit_id_json(ClusterId(1)), serde_json::json!(1));
 
         // SpikeInterface 0.105 keeps the ids in numpysorting_info.json, as
         // strings for its generators; sparse ones must survive.
@@ -944,9 +980,23 @@ mod tests {
         )
         .unwrap();
         let p = SortingAnalyzerProvider::open(root).unwrap();
-        assert!(p.unit_ids_are_strings());
+        assert_eq!(p.unit_id_json(ClusterId(1)), serde_json::json!("7"));
         assert_eq!(p.unit_id(ClusterId(1)), 7);
         assert_eq!(p.unit_id(ClusterId(3)), 13); // a sorrel split appends
+        assert_eq!(p.unit_id_json(ClusterId(3)), serde_json::json!("13"));
+
+        // Ids that are not distinct integers keep SI's strings verbatim and
+        // number the units densely; new ids clear every numeric-looking one.
+        std::fs::write(
+            sorting_dir.join("numpysorting_info.json"),
+            r#"{"sampling_frequency": 30000.0, "unit_ids": ["unit_a", "007", "5"], "num_segments": 1}"#,
+        )
+        .unwrap();
+        let p = SortingAnalyzerProvider::open(root).unwrap();
+        assert_eq!(p.unit_id_json(ClusterId(0)), serde_json::json!("unit_a"));
+        assert_eq!(p.unit_id_json(ClusterId(1)), serde_json::json!("007"));
+        assert_eq!(p.unit_id(ClusterId(1)), 1);
+        assert_eq!(p.unit_id_json(ClusterId(3)), serde_json::json!("8"));
     }
 
     #[test]

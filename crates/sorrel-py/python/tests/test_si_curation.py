@@ -16,10 +16,12 @@ import sorrel
 MOVED = [0, 1, 2, 5]
 
 
-def make_analyzer(tmp_path: Path):
+def make_analyzer(tmp_path: Path, unit_ids=None):
     warnings.simplefilter("ignore")
     # SI 0.105's generator names units "0".."4" (strings), as many extractors do.
     rec, sort = si.generate_ground_truth_recording(durations=[3.0], num_units=5, seed=0)
+    if unit_ids is not None:
+        sort = sort.rename_units(unit_ids)
     # Sorrel maps the trace from a raw binary named in recording.json.
     si.write_binary_recording(rec, file_paths=[tmp_path / "rec.raw"], dtype="int16")
     raw = se.read_binary(tmp_path / "rec.raw", sampling_frequency=rec.sampling_frequency,
@@ -168,3 +170,37 @@ def test_read_curation_rejects_unrepresentable_edits(tmp_path: Path) -> None:
     }))
     with pytest.raises(ValueError, match="add 3 spikes"):
         sorrel.read_curation(p)
+
+
+def test_string_unit_ids_survive(tmp_path: Path) -> None:
+    # Ids that are not distinct integers: written back verbatim, and the
+    # NWB Units table keeps them in unit_name beside integer row ids.
+    from datetime import datetime, timezone
+
+    from pynwb import NWBFile
+
+    from sorrel.nwb import add_units_to_nwbfile
+
+    names = ["unit_a", "007", "7", "b", "12"]
+    analyzer, sort = make_analyzer(tmp_path, names)
+    t = {u: np.sort(sort.get_unit_spike_train(u)) for u in names}
+    s = sorrel.Session.open(tmp_path / "sa")
+    assert [s.unit_name(c) for c in range(5)] == names
+    s.set_label(0, "good")
+    s.merge([2], 1)  # "7" into "007"
+    child = s.split(3, [0])
+    s.save()
+
+    curated = sc.apply_curation(analyzer, sorrel.read_curation(tmp_path / "sa")).sorting
+    # New ids clear every id that reads as a number ("12"): child "13", remainder "14".
+    want = {"unit_a": t["unit_a"], "007": np.sort(np.concatenate([t["007"], t["7"]])),
+            "12": t["12"], "13": t["b"][[0]], "14": t["b"][1:]}
+    assert s.unit_name(child) == "13"
+    assert sorted(curated.unit_ids) == sorted(want)
+    for uid, spikes in want.items():
+        np.testing.assert_array_equal(np.sort(curated.get_unit_spike_train(uid)), spikes)
+    assert dict(zip(curated.unit_ids, curated.get_property("quality")))["unit_a"] == "good"
+
+    nwb = NWBFile("x", "x", datetime(2026, 1, 1, tzinfo=timezone.utc))
+    df = add_units_to_nwbfile(s, nwb).to_dataframe()
+    assert sorted(df["unit_name"]) == sorted(["unit_a", "007", "12", "13", "b"])

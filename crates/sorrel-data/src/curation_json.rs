@@ -90,15 +90,7 @@ where
     F: Fn(&P::Label) -> &'static str,
 {
     let p = &session.provider;
-    let strings = p.unit_ids_are_strings();
-    let uid = |c: ClusterId| -> Value {
-        let u = p.unit_id(c);
-        if strings {
-            json!(u.to_string())
-        } else {
-            json!(u)
-        }
-    };
+    let uid = |c: ClusterId| p.unit_id_json(c);
     let sealed = history.is_empty();
     let mut cmds = Vec::new();
     flatten(&history, &mut cmds);
@@ -474,24 +466,30 @@ pub fn import_commands<P: DataProvider>(
     use sorrel_io::kilosort::valid_tag;
     use sorrel_io::ClusterId;
 
-    let by_unit: std::collections::HashMap<u64, ClusterId> = (0..session.provider.n_clusters())
-        .map(|c| {
-            (
-                u64::from(session.provider.unit_id(ClusterId(c))),
-                ClusterId(c),
-            )
+    let p = &session.provider;
+    let clusters = (0..p.n_clusters()).map(ClusterId);
+    // The backend's own id text first, then the number a string reads as.
+    let by_text: std::collections::HashMap<String, ClusterId> = clusters
+        .clone()
+        .filter_map(|c| {
+            Some((
+                sorrel_io::curation_json::unit_id_text(&p.unit_id_json(c))?,
+                c,
+            ))
         })
         .collect();
-    let cluster = |uid: u64| {
-        by_unit
-            .get(&uid)
+    let by_num: std::collections::HashMap<u32, ClusterId> =
+        clusters.map(|c| (p.unit_id(c), c)).collect();
+    let cluster = |uid: &str| {
+        by_text
+            .get(uid)
+            .or_else(|| by_num.get(&uid.parse().ok()?))
             .copied()
             .with_context(|| format!("unit id {uid} is not in this dataset"))
     };
-
     let mut out = Vec::new();
     for (uid, quality, tags) in &doc.labels {
-        let c = cluster(*uid)?;
+        let c = cluster(uid)?;
         if let Some(q) = quality {
             let op = label_op(q.as_str())?;
             if label_op(current(c))? != op {
@@ -525,7 +523,7 @@ pub fn import_commands<P: DataProvider>(
     for group in &doc.merges {
         let mut members = group
             .iter()
-            .map(|&u| cluster(u))
+            .map(|u| cluster(u))
             .collect::<Result<Vec<_>>>()?;
         members.sort_unstable();
         members.dedup();

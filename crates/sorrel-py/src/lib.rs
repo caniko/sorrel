@@ -170,6 +170,13 @@ impl Session {
         with_session!(self, s => s.provider.unit_id(ClusterId(cluster)))
     }
 
+    /// The unit id as `curation.json` writes it, as text: SpikeInterface's
+    /// own string (`"007"`, `"unit_a"`) when it stored strings.
+    fn unit_name(&self, cluster: u32) -> String {
+        let v = with_session!(self, s => s.provider.unit_id_json(ClusterId(cluster)));
+        sorrel_io::curation_json::unit_id_text(&v).unwrap_or_else(|| v.to_string())
+    }
+
     /// Tags of `cluster` (`src:human`, `review:*`, ...).
     fn tags(&self, cluster: u32) -> Vec<String> {
         with_session!(self, s => s.tags(ClusterId(cluster)).to_vec())

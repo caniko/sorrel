@@ -472,10 +472,11 @@ pub trait DataProvider: Send + Sync + 'static {
         cluster.0
     }
 
-    /// The backend stores unit ids as strings, so interchange files must
-    /// write `"7"` rather than `7` (SpikeInterface compares ids by type).
-    fn unit_ids_are_strings(&self) -> bool {
-        false
+    /// The unit id exactly as interchange files must write it: `7`, or the
+    /// backend's own string (`"7"`, `"unit_a"`) when it stores strings,
+    /// because SpikeInterface compares ids by value and type.
+    fn unit_id_json(&self, cluster: ClusterId) -> serde_json::Value {
+        self.unit_id(cluster).into()
     }
 
     /// Stable bytes identifying this provider's input data, not its path.

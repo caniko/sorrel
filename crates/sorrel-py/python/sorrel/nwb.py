@@ -170,6 +170,13 @@ def add_units_to_nwbfile(
             for m in metrics
         ),
     ]
+    names = [session.unit_name(c) for c in clusters]
+    if any(n != str(session.unit_id(c)) for n, c in zip(names, clusters)):
+        # NWB ids are integers; keep the sorter's own ids beside them, under
+        # the column name NeuroConv uses.
+        columns.append(VectorData(name="unit_name", description="The sorter's unit id "
+                                  "(SpikeInterface unit_ids) when it is not an integer.",
+                                  data=names))
     units = Units(
         name="units",
         description=f"{description} {summary}" if description else summary,
