@@ -105,6 +105,13 @@ pub struct Head {
     /// Output names. Empty for regression and softmax (where class order is
     /// implicit), or `["neg", "pos"]` for a binary head.
     pub classes: Vec<String>,
+    /// Target column the head was trained on, so scoring raw curation rows
+    /// uses the same target rather than assuming one.
+    pub target: String,
+    /// `OLD=NEW` class-code remap applied at training time; scoring applies it
+    /// again, so a model never silently skips a class it was trained to merge.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub class_map: BTreeMap<i64, i64>,
     /// Optional decision threshold for a binary or score head.
     pub threshold: Option<f64>,
     /// Evaluation metrics, e.g. `auc` or `jaccard`, for reporting.
@@ -124,6 +131,8 @@ impl Head {
             schema: schema.into(),
             model,
             classes,
+            target: String::new(),
+            class_map: BTreeMap::new(),
             threshold: None,
             metrics: BTreeMap::new(),
         }

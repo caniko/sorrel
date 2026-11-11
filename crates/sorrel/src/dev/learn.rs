@@ -215,6 +215,8 @@ struct Selection {
     names: Vec<String>,
     /// Class-index -> name for classification targets (empty for regression).
     classes: Vec<String>,
+    /// Training-time class-code remap, reused when scoring predictions.
+    class_map: BTreeMap<i64, i64>,
     x: Vec<f32>,
     y: Vec<f32>,
     groups: Vec<String>,
@@ -555,6 +557,7 @@ fn select(data: &Path, a: TableArgs<'_>) -> Result<Selection> {
     Ok(Selection {
         names,
         classes,
+        class_map,
         x,
         y,
         groups,
@@ -805,6 +808,8 @@ fn train(a: &TrainArgs) -> Result<()> {
     // adds a new entry instead of overwriting a schema another head uses.
     let schema_key = schema.key();
     let mut head = Head::new(schema_key.clone(), model).with_classes(sel.classes.clone());
+    head.target = a.target.clone();
+    head.class_map = sel.class_map.clone();
     for (key, value) in head_metrics(&output.report) {
         head = head.with_metric(key, value);
     }
@@ -1160,19 +1165,7 @@ fn predict(a: &PredictArgs) -> Result<()> {
 
     let truth_classes: Option<Vec<Option<usize>>> = truth_present.then(|| {
         (0..n_roots)
-            .map(|row| {
-                let value = roots.get(row, "y_verdict");
-                let class = value as usize;
-                if value.is_finite()
-                    && value >= 0.0
-                    && class < classes.len()
-                    && (value - value.round()).abs() < 1e-4
-                {
-                    Some(class)
-                } else {
-                    None
-                }
-            })
+            .map(|row| truth_class(roots.get(row, &head.target), &head.class_map, classes.len()))
             .collect()
     });
 
@@ -1275,6 +1268,19 @@ fn predict(a: &PredictArgs) -> Result<()> {
         report_path.display()
     );
     Ok(())
+}
+
+/// Map one raw target cell to a stored class index through the training
+/// class map. Non-integer, negative and out-of-range codes have no class, the
+/// same rows training skipped.
+fn truth_class(value: f32, class_map: &BTreeMap<i64, i64>, n_classes: usize) -> Option<usize> {
+    let code = value as i64;
+    let class = class_map.get(&code).copied().unwrap_or(code);
+    (value.is_finite()
+        && (value - code as f32).abs() < 1e-4
+        && class >= 0
+        && (class as usize) < n_classes)
+        .then_some(class as usize)
 }
 
 #[derive(Serialize)]

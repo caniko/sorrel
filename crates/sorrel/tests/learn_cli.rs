@@ -928,3 +928,124 @@ fn learn_predict_scores_roots_and_leaves_the_phy_folder_untouched() {
         "{report}"
     );
 }
+
+#[test]
+fn predict_scores_with_the_training_target_and_class_map() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = tmp.path().join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let bench = tmp.path().join("bench");
+    write_bench(&bench, &scratch);
+    let out = tmp.path().join("learn");
+    let s = |p: &Path| p.to_str().unwrap().to_owned();
+    ok(&sorrel(
+        tmp.path(),
+        &[
+            "dev",
+            "bench",
+            "--bench",
+            &s(&bench),
+            "learn-dataset",
+            "--out",
+            &s(&out),
+        ],
+    ));
+
+    // `other` (4) is folded into `noise` (0), leaving four classes.
+    let bundle = tmp.path().join("curator.sorrel-model");
+    ok(&sorrel(
+        tmp.path(),
+        &[
+            "dev",
+            "learn",
+            "train",
+            "--data",
+            &s(&out),
+            "--table",
+            "roots",
+            "--target",
+            "y_verdict",
+            "--objective",
+            "softmax:4",
+            "--class-map",
+            "4=0",
+            "--folds",
+            "2",
+            "--out",
+            &s(&bundle),
+            "--head",
+            "verdict",
+        ],
+    ));
+    let loaded = sorrel_data::learn::bundle::CuratorBundle::load(&bundle).unwrap();
+    let head = &loaded.heads["verdict"];
+    assert_eq!(head.target, "y_verdict");
+    assert_eq!(
+        head.class_map.get(&4),
+        Some(&0),
+        "the map was not persisted"
+    );
+    assert_eq!(head.classes.len(), 4);
+
+    // Two good units split one sorter root, so its truth verdict is `other`;
+    // the other root stays `noise`. Scoring the raw code would drop the
+    // mapped root as out of range and under-report the accuracy denominator.
+    let phy = scratch.join("source-sid-a");
+    let templates = sorrel_io::npy::read_1d_u32(&phy.join("spike_templates.npy")).unwrap();
+    // Root 0's rows alternate by parity, so split by their own count.
+    let mut root0: u32 = 0;
+    let human: Vec<u32> = templates
+        .iter()
+        .map(|&root| {
+            if root != 0 {
+                return root;
+            }
+            root0 += 1;
+            if root0.is_multiple_of(2) {
+                2
+            } else {
+                0
+            }
+        })
+        .collect();
+    sorrel_io::npy::write_1d_u32_atomic(&phy.join("spike_clusters.npy"), &human).unwrap();
+    std::fs::write(
+        phy.join("cluster_group.tsv"),
+        "cluster_id\tgroup\n0\tgood\n1\tnoise\n2\tgood\n",
+    )
+    .unwrap();
+    let predictions = tmp.path().join("predict");
+    ok(&sorrel(
+        tmp.path(),
+        &[
+            "dev",
+            "learn",
+            "predict",
+            "--model",
+            &s(&bundle),
+            "--out",
+            &s(&predictions),
+            &s(&phy),
+        ],
+    ));
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(predictions.join("report.json")).unwrap()).unwrap();
+    assert_eq!(
+        report["n_truth"], 2,
+        "a mapped class must not be dropped: {report}"
+    );
+    let cells: u64 = report["confusion"]["matrix"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|row| row.as_array().unwrap())
+        .map(|cell| cell.as_u64().unwrap())
+        .sum();
+    assert_eq!(cells, 2, "{report}");
+    let text = std::fs::read_to_string(predictions.join("predictions.tsv")).unwrap();
+    let rows: Vec<&str> = text.lines().skip(1).collect();
+    assert_eq!(rows.len(), 2, "{text}");
+    for row in rows {
+        assert_eq!(row.split('\t').next_back(), Some("noise"), "{row}");
+    }
+}
