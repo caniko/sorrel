@@ -596,17 +596,8 @@ impl DataProvider for SortingAnalyzerProvider {
         }
     }
 
-    /// Clusters created by sorrel splits (index past the analyzer's units)
-    /// get ids appended after the largest SI id, matching
-    /// `apply_curation(new_id_strategy="append")`.
     fn unit_id(&self, cluster: ClusterId) -> u32 {
-        match self.unit_ids.get(cluster.idx()) {
-            Some(&u) => u,
-            None => {
-                let max = self.unit_ids.iter().copied().max().unwrap_or(0);
-                max + 1 + (cluster.0 - self.unit_ids.len() as u32)
-            }
-        }
+        crate::provider::appended_unit_id(&self.unit_ids, cluster)
     }
 
     fn initial_labels(&self) -> Vec<Self::Label> {

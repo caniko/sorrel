@@ -1,27 +1,33 @@
-//! NWB / DANDI backend.
+//! NWB backend (local files).
 //!
 //! Reads the canonical NWB extracellular layout:
 //!
-//! - `/units/spike_times` + `/units/spike_times_index` — ragged vlen array
-//!   collapsed into one `Vec<u64>` per cluster (samples, not seconds).
-//! - `/units/id` — sorted unit ids (the column order in `spike_times_index`).
-//! - `/general/extracellular_ephys/electrodes` — column-store table; we read
-//!   `x`, `y`, `rel_x`, `rel_y` (any of those that exist) for channel positions.
-//! - `/acquisition/<name>/data` — first `ElectricalSeries` we find; loaded
-//!   into RAM (NWB datasets are usually chunked + compressed, so memory
-//!   mapping isn't an option).
-//!
-//! NWB stores spike times in **seconds**. We multiply by the recording's
-//! sample rate (read from the same `ElectricalSeries`'s `starting_time`
-//! attribute or from `/general/extracellular_ephys/.../sampling_frequency`)
-//! to get sample indices.
+//! - `/acquisition/<name>` — the first group (by name) whose
+//!   `neurodata_type` is `ElectricalSeries` or a subtype declared in the
+//!   file's cached `/specifications`, with 2-D `data` (time × channels).
+//!   Other acquisitions are ignored; a file without one is rejected.
+//!   - Time base: `starting_time` (seconds) and its `rate` attribute. A
+//!     series with per-sample `timestamps` instead is rejected.
+//!   - Samples: int16, uint16, int32 or float32 `data`, scaled to
+//!     microvolts as `data × conversion × channel_conversion[ch] + offset`
+//!     (volts × 10⁶). Any other dtype is rejected.
+//!   - Channels: the series' `electrodes` region maps each data column to a
+//!     row of `/general/extracellular_ephys/electrodes`; that row's `id` is
+//!     the channel id and its `rel_x`/`rel_y` the probe position. The `x`/`y`
+//!     columns are brain coordinates and are not used as probe geometry.
+//! - `/units` — `id`, `spike_times` and `spike_times_index`. The table's own
+//!   ids are the unit ids Sorrel reports (`curation.json`, MCP evidence).
+//!   Spike times (seconds on the session clock) become sample indices
+//!   relative to the series' `starting_time`.
 //!
 //! Compiled out by default — enable with `--features hdf5`.
 //!
 //! Limitations:
-//! - DANDI streaming is local-only (we open the file with the `hdf5` crate).
-//! - Multi-segment recordings collapse to the first segment's sample rate.
-//! - Trace data is loaded eagerly; a large recording will use that much RAM.
+//! - Local files only; no DANDI streaming.
+//! - One series: multiple segments or probes collapse to the first
+//!   `ElectricalSeries`.
+//! - The trace is loaded eagerly as float32 µV; a large recording uses that
+//!   much RAM.
 
 #[cfg(not(feature = "hdf5"))]
 mod stub {
@@ -45,70 +51,56 @@ mod imp {
     use crate::extras::HasGeometry;
     use crate::kilosort::PhyLabel;
     use crate::provider::{
-        ChannelId, ClusterId, DataProvider, SampleIndex, TraceDtype, TraceSamples, TraceSlice,
+        appended_unit_id, ChannelId, ClusterId, DataProvider, SampleIndex, TraceSamples, TraceSlice,
     };
-    use anyhow::{anyhow, bail, Context, Result};
+    use anyhow::{anyhow, bail, ensure, Context, Result};
     use hdf5_metno as hdf5;
+    use hdf5_metno::types::{FloatSize, IntSize, TypeDescriptor, VarLenAscii, VarLenUnicode};
     use hdf5_metno::File as H5File;
+    use std::collections::HashMap;
     use std::path::Path;
+
+    const ELECTRODES: &str = "/general/extracellular_ephys/electrodes";
 
     pub struct NwbProvider {
         sample_rate: f32,
         n_channels: u32,
         n_samples: SampleIndex,
-        dtype: TraceDtype,
         spikes_per_cluster: Vec<Vec<SampleIndex>>,
+        unit_ids: Vec<u32>,
         initial_labels: Vec<PhyLabel>,
         channel_positions: Vec<[f32; 2]>,
+        channel_map: Vec<ChannelId>,
         identity_bytes: Vec<u8>,
-        // Eagerly-loaded trace buffer; HDF5 datasets are typically chunked
-        // and compressed so we can't mmap. Stored as raw bytes and reinterpreted
-        // at access time, just like the other providers.
-        trace_buf: Vec<u8>,
+        /// Interleaved samples in µV. HDF5 datasets are usually chunked and
+        /// compressed, so there is no file to map.
+        trace: Vec<f32>,
     }
 
     impl NwbProvider {
         pub fn open(path: impl AsRef<Path>) -> Result<Self> {
             let path = path.as_ref();
             let f = H5File::open(path).with_context(|| format!("open NWB {}", path.display()))?;
-            let identity_bytes = provider_identity_bytes(path);
-
-            // 1. ElectricalSeries: first dataset under /acquisition that has
-            // both `data` and a sampling rate (either explicit field or
-            // derivable from `starting_time`'s `rate` attribute).
-            let (sample_rate, n_channels, n_samples, dtype, trace_buf) =
-                load_electrical_series(&f)?;
-
-            // 2. Units table.
-            let (spikes_per_cluster, n_clusters) =
-                load_units(&f, sample_rate).context("load /units")?;
-            let initial_labels = vec![PhyLabel::Unsorted; n_clusters];
-
-            // 3. Channel positions from /general/extracellular_ephys/electrodes.
-            let channel_positions =
-                load_electrode_positions(&f, n_channels as usize).unwrap_or_default();
-
+            let (name, series) = find_electrical_series(&f)?;
+            let data = series.dataset("data")?;
+            let shape = data.shape();
+            let (n_samples, n_channels) = (shape[0], shape[1]);
+            let (rate, t0) = read_time_base(&series, &name)?;
+            let (channel_map, channel_positions) = read_channels(&f, &series, &name, n_channels)?;
+            let trace = read_microvolts(&series, &data, &name, n_channels)?;
+            let (spikes_per_cluster, unit_ids) = load_units(&f, rate, t0).context("load /units")?;
             Ok(Self {
-                sample_rate,
-                n_channels,
-                n_samples,
-                dtype,
+                sample_rate: rate as f32,
+                n_channels: n_channels as u32,
+                n_samples: SampleIndex::new(n_samples as u64),
+                initial_labels: vec![PhyLabel::Unsorted; unit_ids.len()],
                 spikes_per_cluster,
-                initial_labels,
+                unit_ids,
                 channel_positions,
-                identity_bytes,
-                trace_buf,
+                channel_map,
+                identity_bytes: provider_identity_bytes(path),
+                trace,
             })
-        }
-
-        fn samples_window(&self, start: SampleIndex, len: u32) -> TraceSamples<'_> {
-            if self.trace_buf.is_empty() {
-                return TraceSamples::I16(&[]);
-            }
-            let nc = self.n_channels as usize;
-            let s = start.idx().saturating_mul(nc);
-            let e = s + (len as usize) * nc;
-            TraceSamples::from_bytes_clamped(&self.trace_buf, self.dtype, s, e)
         }
     }
 
@@ -136,11 +128,22 @@ mod imp {
         }
 
         fn trace(&self, start: SampleIndex, len: u32) -> TraceSlice<'_> {
+            let nc = self.n_channels as usize;
+            let e = start
+                .idx()
+                .saturating_add(len as usize)
+                .saturating_mul(nc)
+                .min(self.trace.len());
+            let s = start.idx().saturating_mul(nc).min(e);
             TraceSlice {
                 start,
                 n_channels: self.n_channels,
-                samples: self.samples_window(start, len),
+                samples: TraceSamples::F32(&self.trace[s..e]),
             }
+        }
+
+        fn unit_id(&self, cluster: ClusterId) -> u32 {
+            appended_unit_id(&self.unit_ids, cluster)
         }
 
         fn initial_labels(&self) -> Vec<Self::Label> {
@@ -150,9 +153,14 @@ mod imp {
         fn identity_bytes(&self) -> Vec<u8> {
             self.identity_bytes.clone()
         }
+    }
 
-        fn amplitude_full_scale(&self) -> f32 {
-            self.dtype.nominal_full_scale()
+    impl HasGeometry for NwbProvider {
+        fn channel_positions(&self) -> &[[f32; 2]] {
+            &self.channel_positions
+        }
+        fn channel_map(&self) -> &[ChannelId] {
+            &self.channel_map
         }
     }
 
@@ -177,171 +185,296 @@ mod imp {
         hasher.finalize().as_bytes().to_vec()
     }
 
-    impl HasGeometry for NwbProvider {
-        fn channel_positions(&self) -> &[[f32; 2]] {
-            &self.channel_positions
-        }
-        fn channel_map(&self) -> &[ChannelId] {
-            &[]
-        }
+    fn read_str(attr: hdf5::Attribute) -> Option<String> {
+        attr.read_scalar::<VarLenUnicode>()
+            .map(|s| s.to_string())
+            .or_else(|_| attr.read_scalar::<VarLenAscii>().map(|s| s.to_string()))
+            .ok()
     }
 
-    /// Walk `/acquisition/*` looking for the first dataset that smells like
-    /// an `ElectricalSeries` (has `data` + a rate). Returns
-    /// `(sample_rate, n_channels, n_samples, dtype, raw_bytes)`.
-    fn load_electrical_series(f: &H5File) -> Result<(f32, u32, SampleIndex, TraceDtype, Vec<u8>)> {
+    /// `neurodata_type_def → neurodata_type_inc` for every type in the
+    /// file's cached specifications (core and extensions).
+    fn type_parents(f: &H5File) -> HashMap<String, String> {
+        fn collect(v: &serde_json::Value, out: &mut HashMap<String, String>) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    if let (Some(def), Some(inc)) = (
+                        m.get("neurodata_type_def").and_then(|v| v.as_str()),
+                        m.get("neurodata_type_inc").and_then(|v| v.as_str()),
+                    ) {
+                        out.insert(def.to_owned(), inc.to_owned());
+                    }
+                    m.values().for_each(|v| collect(v, out));
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(|v| collect(v, out)),
+                _ => {}
+            }
+        }
+        let mut out = HashMap::new();
+        let specs = f.group("/specifications").and_then(|g| g.groups());
+        for version in specs
+            .into_iter()
+            .flatten()
+            .flat_map(|ns| ns.groups())
+            .flatten()
+        {
+            for ds in version.datasets().into_iter().flatten() {
+                let text = ds
+                    .read_scalar::<VarLenUnicode>()
+                    .map(|s| s.to_string())
+                    .or_else(|_| ds.read_scalar::<VarLenAscii>().map(|s| s.to_string()));
+                if let Some(v) = text.ok().and_then(|t| serde_json::from_str(&t).ok()) {
+                    collect(&v, &mut out);
+                }
+            }
+        }
+        out
+    }
+
+    /// The first `/acquisition` group typed `ElectricalSeries` (or a
+    /// subtype) with 2-D data.
+    fn find_electrical_series(f: &H5File) -> Result<(String, hdf5::Group)> {
         let acq = f
             .group("/acquisition")
             .context("missing /acquisition group")?;
-        let names = acq.member_names().unwrap_or_default();
-        for name in names {
-            let g = match acq.group(&name) {
-                Ok(g) => g,
-                Err(_) => continue,
-            };
-            let Ok(data) = g.dataset("data") else {
-                continue;
-            };
-            let shape = data.shape();
-            // ElectricalSeries data is (n_samples, n_channels).
-            if shape.len() != 2 {
-                continue;
-            }
-            let n_samples = shape[0] as u64;
-            let n_channels = shape[1] as u32;
-
-            // Sample rate: prefer `starting_time/rate` attribute, fall back
-            // to a sibling `sampling_rate` dataset / attribute.
-            let sample_rate =
-                read_rate(&g).ok_or_else(|| anyhow!("ElectricalSeries {name} has no rate"))?;
-
-            // Read the dataset into a typed Vec then cast to bytes. This
-            // lets the `hdf5` crate do dtype coercion without us juggling
-            // every numpy dtype.
-            let dt = data.dtype()?;
-            let (dtype, bytes) = if dt.size() == 2 {
-                let v: Vec<i16> = data.read_raw()?;
-                (TraceDtype::I16, bytemuck::cast_slice(&v).to_vec())
-            } else if dt.size() == 4 {
-                // Pick float vs int by trying float first.
-                if let Ok(v) = data.read_raw::<f32>() {
-                    (TraceDtype::F32, bytemuck::cast_slice(&v).to_vec())
-                } else {
-                    let v: Vec<i32> = data.read_raw()?;
-                    (TraceDtype::I32, bytemuck::cast_slice(&v).to_vec())
+        let parents = type_parents(f);
+        let is_series = |t: &str| {
+            let mut t = t;
+            // Bounded walk: a malformed spec could loop.
+            for _ in 0..32 {
+                if t == "ElectricalSeries" {
+                    return true;
                 }
-            } else {
-                bail!(
-                    "ElectricalSeries {name}: unsupported element size {}",
-                    dt.size()
-                );
-            };
-            return Ok((
-                sample_rate,
-                n_channels,
-                SampleIndex::new(n_samples),
-                dtype,
-                bytes,
-            ));
-        }
-        bail!("no ElectricalSeries (with shape (n_samples, n_channels)) under /acquisition")
-    }
-
-    fn read_rate(g: &hdf5::Group) -> Option<f32> {
-        // NWB convention: `starting_time` dataset has a `rate` attribute (Hz).
-        if let Ok(st) = g.dataset("starting_time") {
-            if let Ok(attr) = st.attr("rate") {
-                if let Ok(v) = attr.read_scalar::<f32>() {
-                    return Some(v);
-                }
-                if let Ok(v) = attr.read_scalar::<f64>() {
-                    return Some(v as f32);
+                match parents.get(t) {
+                    Some(p) => t = p,
+                    None => return false,
                 }
             }
-        }
-        // Some writers stash a top-level `sampling_rate` attribute instead.
-        for name in ["sampling_rate", "rate"] {
-            if let Ok(attr) = g.attr(name) {
-                if let Ok(v) = attr.read_scalar::<f32>() {
-                    return Some(v);
-                }
-                if let Ok(v) = attr.read_scalar::<f64>() {
-                    return Some(v as f32);
-                }
-            }
-        }
-        None
-    }
-
-    /// Load `/units/spike_times` (vlen) bucketed by unit. NWB stores the
-    /// ragged offsets in `/units/spike_times_index`.
-    fn load_units(f: &H5File, sample_rate: f32) -> Result<(Vec<Vec<SampleIndex>>, usize)> {
-        let units = f.group("/units").context("missing /units")?;
-        let times = units
-            .dataset("spike_times")
-            .context("missing /units/spike_times")?;
-        let index = units
-            .dataset("spike_times_index")
-            .context("missing /units/spike_times_index")?;
-
-        // spike_times is 1-D (concatenated), spike_times_index is 1-D ends.
-        let all: Vec<f64> = times.read_raw()?;
-        let ends: Vec<u64> = match index.read_raw::<u64>() {
-            Ok(v) => v,
-            Err(_) => index
-                .read_raw::<i64>()?
-                .into_iter()
-                .map(|x| x as u64)
-                .collect(),
+            false
         };
-        let n_clusters = ends.len();
-        let mut out: Vec<Vec<SampleIndex>> = Vec::with_capacity(n_clusters);
-        let mut start = 0u64;
-        for &end in &ends {
-            let slice = &all[start as usize..end as usize];
-            let mut bucket: Vec<SampleIndex> = slice
+        let mut seen = Vec::new();
+        let mut found = Vec::new();
+        for name in acq.member_names()? {
+            let Ok(g) = acq.group(&name) else { continue };
+            let ty = g.attr("neurodata_type").ok().and_then(read_str);
+            let ty = ty.unwrap_or_else(|| "untyped".into());
+            let two_d = g.dataset("data").is_ok_and(|d| d.ndim() == 2);
+            if is_series(&ty) && two_d {
+                found.push((name, g));
+            } else {
+                seen.push(format!("{name} ({ty})"));
+            }
+        }
+        let mut found = found.into_iter();
+        let Some(first) = found.next() else {
+            bail!(
+                "no ElectricalSeries with 2-D data under /acquisition (found: {})",
+                if seen.is_empty() {
+                    "nothing".to_owned()
+                } else {
+                    seen.join(", ")
+                }
+            );
+        };
+        let rest: Vec<String> = found.map(|(n, _)| n).collect();
+        if !rest.is_empty() {
+            log::warn!(
+                "NWB: reading ElectricalSeries {}; ignoring {}",
+                first.0,
+                rest.join(", ")
+            );
+        }
+        Ok(first)
+    }
+
+    /// `(rate Hz, starting_time s)`. Only a constant rate is supported.
+    fn read_time_base(g: &hdf5::Group, name: &str) -> Result<(f64, f64)> {
+        let Ok(st) = g.dataset("starting_time") else {
+            if g.link_exists("timestamps") {
+                bail!(
+                    "ElectricalSeries {name} has per-sample timestamps instead of \
+                     starting_time + rate; Sorrel needs a constant sample rate"
+                );
+            }
+            bail!("ElectricalSeries {name} has neither starting_time nor timestamps");
+        };
+        let rate: f64 = st
+            .attr("rate")
+            .and_then(|a| a.read_scalar())
+            .with_context(|| format!("ElectricalSeries {name}: starting_time has no rate"))?;
+        ensure!(
+            rate.is_finite() && rate > 0.0,
+            "ElectricalSeries {name}: invalid rate {rate}"
+        );
+        Ok((rate, st.read_scalar()?))
+    }
+
+    /// Channel ids and probe positions for each data column, through the
+    /// series' `electrodes` region.
+    fn read_channels(
+        f: &H5File,
+        series: &hdf5::Group,
+        name: &str,
+        n_channels: usize,
+    ) -> Result<(Vec<ChannelId>, Vec<[f32; 2]>)> {
+        // ponytail: assumes the region points at the canonical electrodes
+        // table rather than dereferencing its `table` object reference.
+        let rows: Vec<i64> = series
+            .dataset("electrodes")
+            .and_then(|d| d.read_raw())
+            .with_context(|| format!("ElectricalSeries {name}: no electrodes region"))?;
+        ensure!(
+            rows.len() == n_channels,
+            "ElectricalSeries {name}: {} electrodes for {n_channels} data columns",
+            rows.len()
+        );
+        let table = f.group(ELECTRODES).context("missing electrodes table")?;
+        let ids: Vec<i64> = table.dataset("id")?.read_raw()?;
+        let rows = rows
+            .into_iter()
+            .map(|r| {
+                usize::try_from(r)
+                    .ok()
+                    .filter(|&r| r < ids.len())
+                    .ok_or_else(|| anyhow!("electrodes region row {r} is outside the table"))
+            })
+            .collect::<Result<Vec<usize>>>()?;
+        let map = rows
+            .iter()
+            .map(|&r| {
+                u32::try_from(ids[r])
+                    .map(ChannelId)
+                    .map_err(|_| anyhow!("electrode id {} does not fit u32", ids[r]))
+            })
+            .collect::<Result<_>>()?;
+        let column = |c: &str| -> Option<Vec<f32>> {
+            let v: Vec<f32> = table.dataset(c).and_then(|d| d.read_raw()).ok()?;
+            (v.len() == ids.len()).then_some(v)
+        };
+        let positions = match (column("rel_x"), column("rel_y")) {
+            (Some(x), Some(y)) => rows.iter().map(|&r| [x[r], y[r]]).collect(),
+            _ => Vec::new(),
+        };
+        Ok((map, positions))
+    }
+
+    /// The samples in µV: `data × conversion × channel_conversion + offset`
+    /// volts, times 10⁶.
+    fn read_microvolts(
+        series: &hdf5::Group,
+        data: &hdf5::Dataset,
+        name: &str,
+        n_channels: usize,
+    ) -> Result<Vec<f32>> {
+        if let Some(unit) = data.attr("unit").ok().and_then(read_str) {
+            ensure!(
+                unit.eq_ignore_ascii_case("volts"),
+                "ElectricalSeries {name}: data unit is {unit:?}, expected volts"
+            );
+        }
+        let scalar = |attr: &str, default: f64| -> Result<f64> {
+            match data.attr(attr) {
+                Ok(a) => Ok(a.read_scalar()?),
+                Err(_) => Ok(default),
+            }
+        };
+        let conversion = scalar("conversion", 1.0)?;
+        let offset_uv = scalar("offset", 0.0)? * 1e6;
+        let channel_conversion: Vec<f64> = match series.dataset("channel_conversion") {
+            Ok(d) => d.read_raw()?,
+            Err(_) => vec![1.0; n_channels],
+        };
+        ensure!(
+            channel_conversion.len() == n_channels,
+            "ElectricalSeries {name}: channel_conversion has {} entries for {n_channels} channels",
+            channel_conversion.len()
+        );
+        let gain: Vec<f64> = channel_conversion
+            .iter()
+            .map(|c| c * conversion * 1e6)
+            .collect();
+        fn scale<T: Copy + Into<f64>>(raw: Vec<T>, gain: &[f64], offset: f64) -> Vec<f32> {
+            raw.iter()
+                .zip(gain.iter().cycle())
+                .map(|(&v, g)| (v.into() * g + offset) as f32)
+                .collect()
+        }
+        // Read in the stored dtype: HDF5 would otherwise convert on read and
+        // clip (uint16 → int16 saturates at 32767).
+        Ok(match data.dtype()?.to_descriptor()? {
+            TypeDescriptor::Integer(IntSize::U2) => {
+                scale(data.read_raw::<i16>()?, &gain, offset_uv)
+            }
+            TypeDescriptor::Unsigned(IntSize::U2) => {
+                scale(data.read_raw::<u16>()?, &gain, offset_uv)
+            }
+            TypeDescriptor::Integer(IntSize::U4) => {
+                scale(data.read_raw::<i32>()?, &gain, offset_uv)
+            }
+            TypeDescriptor::Float(FloatSize::U4) => {
+                scale(data.read_raw::<f32>()?, &gain, offset_uv)
+            }
+            other => bail!(
+                "ElectricalSeries {name}: {other} samples are not supported \
+                 (int16, uint16, int32 or float32)"
+            ),
+        })
+    }
+
+    /// Spike sample indices per unit (relative to `t0`) and the units
+    /// table's ids.
+    fn load_units(f: &H5File, rate: f64, t0: f64) -> Result<(Vec<Vec<SampleIndex>>, Vec<u32>)> {
+        let units = f.group("/units").context("missing /units")?;
+        let ids: Vec<i64> = units
+            .dataset("id")
+            .context("missing /units/id")?
+            .read_raw()?;
+        let all: Vec<f64> = units
+            .dataset("spike_times")
+            .context("missing /units/spike_times")?
+            .read_raw()?;
+        let ends: Vec<i64> = units
+            .dataset("spike_times_index")
+            .context("missing /units/spike_times_index")?
+            .read_raw()?;
+        ensure!(
+            ids.len() == ends.len(),
+            "/units/id has {} rows but spike_times_index has {}",
+            ids.len(),
+            ends.len()
+        );
+        let unit_ids = ids
+            .iter()
+            .map(|&id| u32::try_from(id).map_err(|_| anyhow!("unit id {id} does not fit u32")))
+            .collect::<Result<Vec<u32>>>()?;
+        let mut sorted = unit_ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        ensure!(sorted.len() == unit_ids.len(), "/units/id has duplicates");
+
+        let mut out = Vec::with_capacity(ends.len());
+        let mut start = 0usize;
+        for (&end, &id) in ends.iter().zip(&unit_ids) {
+            let end = usize::try_from(end)
+                .ok()
+                .filter(|&e| e >= start && e <= all.len())
+                .ok_or_else(|| anyhow!("/units/spike_times_index is not a valid ragged index"))?;
+            let mut bucket = all[start..end]
                 .iter()
-                .map(|&t| SampleIndex::new((t * sample_rate as f64).round() as u64))
-                .collect();
+                .map(|&t| {
+                    let s = ((t - t0) * rate).round();
+                    ensure!(
+                        s.is_finite() && s >= 0.0,
+                        "unit {id}: spike at {t} s precedes the recording's starting_time {t0} s"
+                    );
+                    Ok(SampleIndex::new(s as u64))
+                })
+                .collect::<Result<Vec<_>>>()?;
             bucket.sort_unstable();
             out.push(bucket);
             start = end;
         }
-        Ok((out, n_clusters))
-    }
-
-    fn load_electrode_positions(f: &H5File, n_channels: usize) -> Result<Vec<[f32; 2]>> {
-        let g = f
-            .group("/general/extracellular_ephys/electrodes")
-            .context("no electrodes table")?;
-        let xs = read_optional_f32_column(&g, &["rel_x", "x"]).unwrap_or_default();
-        let ys = read_optional_f32_column(&g, &["rel_y", "y"]).unwrap_or_default();
-        let n = xs.len().max(ys.len()).min(n_channels);
-        if n == 0 {
-            bail!("electrodes table has no x/y columns");
-        }
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            out.push([
-                xs.get(i).copied().unwrap_or(0.0),
-                ys.get(i).copied().unwrap_or(0.0),
-            ]);
-        }
-        Ok(out)
-    }
-
-    fn read_optional_f32_column(g: &hdf5::Group, candidates: &[&str]) -> Option<Vec<f32>> {
-        for name in candidates {
-            if let Ok(ds) = g.dataset(name) {
-                if let Ok(v) = ds.read_raw::<f32>() {
-                    return Some(v);
-                }
-                if let Ok(v) = ds.read_raw::<f64>() {
-                    return Some(v.into_iter().map(|x| x as f32).collect());
-                }
-            }
-        }
-        None
+        Ok((out, unit_ids))
     }
 }
 

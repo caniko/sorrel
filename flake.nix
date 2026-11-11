@@ -58,6 +58,8 @@
           "formatting"
           "hm-module"
           "workspace-tests"
+          "sorrel-hdf5"
+          "hdf5-tests"
           "binstall-metadata"
           "binstall-metadata-sorrel-remote"
         ];
@@ -512,8 +514,8 @@
 
       checks =
         (import ./nix/checks.nix {
-          inherit pkgs craneLib commonArgs cargoArtifacts sorrel testSrc;
-          inherit (deps) runtimeLibs;
+          inherit pkgs craneLib commonArgs cargoArtifacts sorrel sorrelHdf5 testSrc;
+          inherit (deps) runtimeLibs hdf5C;
           hmModule = self.homeManagerModules.default;
         })
         // {
