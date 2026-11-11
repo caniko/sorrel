@@ -151,12 +151,29 @@ def test_rejects_multi_segment(tmp_path: Path) -> None:
         add_units_to_nwbfile(tmp_path / "sa", nwb)
 
 
-def test_converter_pipe_with_recording(curated: Path, tmp_path: Path) -> None:
+def whitematter_interface(curated: Path):
+    # A real recorder reader (SpikeInterface's WhiteMatter: an 8-byte header,
+    # then int16 samples) over the session's own raw file.
+    from neuroconv.datainterfaces import WhiteMatterRecordingInterface
+
+    bin_path = curated / "recording.bin"
+    bin_path.write_bytes(bytes(8) + (curated / "recording.dat").read_bytes())
+    params = curated / "params.py"
+    params.write_text(params.read_text()
+                      .replace("'recording.dat'", "'recording.bin'").replace("offset = 0", "offset = 8"))
+    return WhiteMatterRecordingInterface(file_path=bin_path, sampling_frequency=RATE, num_channels=4)
+
+
+@pytest.mark.parametrize("recorder", ["mock", "whitematter"])
+def test_converter_pipe_with_recording(curated: Path, tmp_path: Path, recorder: str) -> None:
     # The usual NeuroConv shape: a recording interface next to the sorting.
     from neuroconv import ConverterPipe
     from neuroconv.tools.testing.mock_interfaces import MockRecordingInterface
 
-    rec = MockRecordingInterface(num_channels=4, sampling_frequency=RATE, durations=(1.0,))
+    if recorder == "mock":
+        rec = MockRecordingInterface(num_channels=4, sampling_frequency=RATE, durations=(1.0,))
+    else:
+        rec = whitematter_interface(curated)
     # NeuroConv writes "unknown" otherwise, which is not a CCF term.
     rec.recording_extractor.set_property("brain_area", ["CA1"] * 4)
     sorting = SorrelSortingInterface(folder_path=curated)
@@ -173,6 +190,9 @@ def test_converter_pipe_with_recording(curated: Path, tmp_path: Path) -> None:
         nwb = io.read()
         assert "ElectricalSeries" in nwb.acquisition
         assert sorted(nwb.units.id[:]) == sorted(expected_trains())
+        if recorder == "whitematter":
+            raw = np.fromfile(curated / "recording.dat", dtype=np.int16).reshape(-1, 4)
+            np.testing.assert_array_equal(nwb.acquisition["ElectricalSeries"].data[:], raw)
     assert not validate(path=out)
     serious = [m for m in inspect_nwbfile(nwbfile_path=out, config=load_config("dandi"))
                if m.importance in (Importance.CRITICAL, Importance.BEST_PRACTICE_VIOLATION)]
