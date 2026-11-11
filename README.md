@@ -64,3 +64,8 @@ Views are dockable tiles: drag tabs to rearrange, `×` to close, the
 ```
 cargo build --release -p sorrel
 ```
+
+## Citing
+
+See [Citing Sorrel](docs/src/project/citing.md) for BibTeX, authorship and
+acknowledgments. The metadata lives in [`CITATION.cff`](CITATION.cff).

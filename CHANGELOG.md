@@ -9,6 +9,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
+- **Citation guide.** `CITATION.cff` and a "Citing Sorrel" docs page with BibTeX, authorship and the acknowledgment of the data used in development. The release steps now update its version and date.
 - **Curation bench loop.** The `curation-bench-loop` skill turns the double-blind improvement loop into steps with sealing rules, a cost guard and an acceptance rule. Both it and `export-curated-sort` gain an Agent tiers section (`flash`, `worker`, `lead`) that names the jobs a cheap agent can do; the invoker names its own agents.
 - **`bench_curation.py`:** `add --dev` forces sessions whose truth was seen into dev, and `run --max-budget-usd` caps each `mcp-review` run.
 - **`sorrel diff --split-share`:** a root counts as split when two or more kept (non-noise) units each hold that share of its kept spikes, so good cores cut out of a large noise remainder register as a split.

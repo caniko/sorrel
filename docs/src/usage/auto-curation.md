@@ -65,7 +65,7 @@ mostly Neuropixels. If any two channels in `channel_positions.npy` are less
 than 5 µm apart, as with tetrode sorts that store channel indices instead of
 µm, the spatial metrics are meaningless. In that case every unit gets
 `review:geometry` and the run is only a starting point. On two such
-tetrode recordings, `sorrel auto` called 58 of 65 human-kept units noise,
+CINPLA tetrode recordings, `sorrel auto` called 58 of 65 human-kept units noise,
 while never keeping a unit the human had marked noise.
 
 ## Tags
