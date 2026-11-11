@@ -147,7 +147,7 @@ pub fn parse(q: &str) -> Result<Query, String> {
                 Some("robust") => By::Robust,
                 Some("axis") => By::Axis,
                 Some(o) => return Err(format!("unknown by={o}")),
-                None => return Err("split needs by=amp|time|pc|kmeans|core|robust".into()),
+                None => return Err("split needs by=amp|time|pc|kmeans|core|robust|axis".into()),
             };
             if matches!(by, By::Robust | By::Axis) && opt("at")?.is_some() {
                 return Err("by=robust/axis takes no at=".into());
