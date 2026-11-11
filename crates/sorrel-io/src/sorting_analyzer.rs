@@ -463,6 +463,14 @@ fn provider_identity_bytes(root: &Path, rec: &RecordingMeta) -> Vec<u8> {
 
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"sorrel-provider-identity-v1/sorting-analyzer");
+    // The ids below `sorting/` name the units a curation.json addresses;
+    // a rewrite of the ids must invalidate the journal, not replay onto
+    // different units. Content, not metadata: size and mtime can survive
+    // an id swap.
+    if let Ok(bytes) = std::fs::read(root.join("sorting").join("numpysorting_info.json")) {
+        hasher.update(b"numpysorting_info.json");
+        hasher.update(&bytes);
+    }
     hasher.update(&rec.sample_rate.to_le_bytes());
     hasher.update(&rec.n_channels.to_le_bytes());
     hasher.update(&rec.offset.to_le_bytes());

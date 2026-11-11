@@ -23,10 +23,12 @@
 
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::{
-    artifacts_hash, save_and_seal, save_to_phy, ClusterIndex, CurationCommand, Journal, PhyLabelOp,
-    Record, Session,
+    artifacts_hash, open_sorting_analyzer, save_and_seal, save_to_phy, ClusterIndex,
+    CurationCommand, Journal, JournalOpts, PhyLabelOp, Record, Session,
 };
-use sorrel_io::{ClusterId, DataProvider, SampleIndex, TraceSamples, TraceSlice};
+use sorrel_io::{
+    ClusterId, DataProvider, SampleIndex, SortingAnalyzerProvider, TraceSamples, TraceSlice,
+};
 
 // ---- Stub provider ------------------------------------------------------
 
@@ -432,6 +434,58 @@ fn external_edit_to_spike_clusters_invalidates_journal() {
     );
 }
 
+/// Rewriting only the unit ids in `sorting/numpysorting_info.json` changes
+/// the analyzer's identity, so a journal sealed against the old ids refuses
+/// to replay a curation.json keyed by them onto the new ones.
+#[test]
+fn external_edit_to_numpysorting_unit_ids_invalidates_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("recording.json"),
+        r#"{"sampling_frequency": 30000.0, "num_channels": 1, "dtype": "int16", "file_paths": []}"#,
+    )
+    .unwrap();
+    let sorting = root.join("sorting");
+    std::fs::create_dir_all(&sorting).unwrap();
+    write_npy_u32(&sorting.join("spike_times.npy"), &[10, 20, 30]);
+    write_npy_u32(&sorting.join("unit_indices.npy"), &[0, 0, 1]);
+    std::fs::write(
+        sorting.join("numpysorting_info.json"),
+        r#"{"unit_ids": [3, 7]}"#,
+    )
+    .unwrap();
+
+    let opts = JournalOpts::default();
+    let session = open_sorting_analyzer(root, &opts).unwrap();
+    assert_eq!(session.provider.n_clusters(), 2);
+    let identity = session.provider.identity_bytes();
+    let baseline = session.journal().baseline();
+    drop(session);
+
+    // Same length: only the ids differ, so neither size nor an unchanged
+    // mtime could stand in for the content.
+    std::fs::write(
+        sorting.join("numpysorting_info.json"),
+        r#"{"unit_ids": [4, 8]}"#,
+    )
+    .unwrap();
+    let after = SortingAnalyzerProvider::open(root)
+        .unwrap()
+        .identity_bytes();
+    assert_ne!(identity, after);
+    assert_ne!(baseline, sorrel_data::baseline_hash(&after));
+
+    let msg = open_sorting_analyzer(root, &opts)
+        .err()
+        .expect("changed ids must invalidate the journal")
+        .to_string();
+    assert!(
+        msg.contains("sealed against different data"),
+        "expected divergence error, got: {msg}",
+    );
+}
+
 /// Saving without a seal (`save_to_phy`) leaves the journal alone.
 #[test]
 fn save_to_phy_alone_does_not_touch_journal() {
@@ -514,6 +568,25 @@ fn label_str_u8(l: &u8) -> &'static str {
         3 => "noise",
         _ => "unsorted",
     }
+}
+
+/// Minimal `.npy` v1 writer for the SortingAnalyzer fixture: one 1-D
+/// little-endian `u32` array, no descriptors beyond numpy's required keys.
+fn write_npy_u32(path: &std::path::Path, values: &[u32]) {
+    let header = format!(
+        "{{'descr': '<u4', 'fortran_order': False, 'shape': ({},), }}",
+        values.len()
+    );
+    let pad = (64 - (10 + header.len() + 1) % 64) % 64;
+    let header = format!("{header}{}\n", " ".repeat(pad));
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"\x93NUMPY\x01\x00");
+    bytes.extend_from_slice(&(header.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(path, bytes).unwrap();
 }
 
 #[allow(dead_code)]
