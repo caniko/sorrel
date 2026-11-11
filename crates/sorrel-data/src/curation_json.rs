@@ -31,6 +31,13 @@
 //! Sorrel's `Split.spike_idx` indexes the cluster's time-sorted train at
 //! that point, which is exactly the train `mode: "indices"` indexes.
 //!
+//! A merge into a target an earlier merge emptied keeps the target's own
+//! original id. With two or more live sources the merge's `new_unit_id` is
+//! that id: SpikeInterface keeps it in place when a source already carries
+//! it (after a re-key) and appends it otherwise; with one source
+//! there is nothing to merge and no rename step, so no step is emitted and
+//! the target simply takes over that unit's SpikeInterface id.
+//!
 //! A command with no SpikeInterface slot (a rescue: `AddSpikes`) does not
 //! fail the save; the document names it under `sorrel_unrepresentable`
 //! and `sorrel-py`'s `read_curation` raises. SpikeInterface's pydantic
@@ -162,13 +169,6 @@ where
     for &cmd in cmds {
         let op = match cmd {
             CurationCommand::Merge { sources, target } => {
-                let Some(target_si) = si_of.get(target).cloned() else {
-                    bad.push(format!(
-                        "{}: an earlier command removed the unit it merges into",
-                        describe_command(cmd)
-                    ));
-                    continue;
-                };
                 let mut live: Vec<ClusterId> = Vec::new();
                 for &s in sources.iter().filter(|s| *s != target) {
                     if !live.contains(&s) && si_of.contains_key(&s) {
@@ -179,15 +179,52 @@ where
                     // Every source is already empty: membership does not move.
                     continue;
                 }
-                let group: Vec<Value> = live
-                    .iter()
-                    .map(|s| si_of[s].clone())
-                    .chain([target_si.clone()])
-                    .collect();
-                Op::Merge {
-                    group,
-                    new: target_si,
-                    sources: live,
+                match si_of.get(target).cloned() {
+                    Some(target_si) => {
+                        let group: Vec<Value> = live
+                            .iter()
+                            .map(|s| si_of[s].clone())
+                            .chain([target_si.clone()])
+                            .collect();
+                        Op::Merge {
+                            group,
+                            new: target_si,
+                            sources: live,
+                            target: None,
+                        }
+                    }
+                    // An earlier merge emptied the target. SpikeInterface
+                    // accepts a merge into a new unit id (it appends the new
+                    // unit); a single source has nothing to merge with, so the
+                    // target just takes over that unit's id and no step is
+                    // emitted.
+                    None => {
+                        if live.len() == 1 {
+                            let from = live[0];
+                            let id = si_of.remove(&from).expect("a live source");
+                            si_of.insert(*target, id);
+                            if let Some(i) = order.iter().position(|c| *c == from) {
+                                order[i] = *target;
+                            }
+                            continue;
+                        }
+                        let new = uid(*target);
+                        // A source may carry the id (after a re-key); SI then
+                        // keeps it in place. Any other holder is a clash.
+                        if si_of.iter().any(|(c, v)| *v == new && !live.contains(c)) {
+                            bad.push(format!(
+                                "{}: its target's unit id is still in use in SpikeInterface",
+                                describe_command(cmd)
+                            ));
+                            continue;
+                        }
+                        Op::Merge {
+                            group: live.iter().map(|s| si_of[s].clone()).collect(),
+                            new,
+                            sources: live,
+                            target: Some(*target),
+                        }
+                    }
                 }
             }
             CurationCommand::Split {
@@ -305,6 +342,9 @@ enum Op {
         group: Vec<Value>,
         new: Value,
         sources: Vec<ClusterId>,
+        /// The sorrel target when SpikeInterface no longer has it: the merge
+        /// creates a new unit, appended at the end of the list.
+        target: Option<ClusterId>,
     },
     Split {
         unit: Value,
@@ -319,7 +359,13 @@ impl Op {
     /// Every unit id the command names.
     fn touches(&self) -> Vec<Value> {
         match self {
-            Self::Merge { group, .. } => group.clone(),
+            Self::Merge { group, new, .. } => {
+                let mut ids = group.clone();
+                if !ids.contains(new) {
+                    ids.push(new.clone());
+                }
+                ids
+            }
             Self::Split { unit, .. } => vec![unit.clone()],
         }
     }
@@ -327,11 +373,29 @@ impl Op {
     /// Move the mapped ids the way `apply_curation` moves the unit list.
     fn apply(self, si_of: &mut HashMap<ClusterId, Value>, order: &mut Vec<ClusterId>) {
         match self {
-            Self::Merge { sources, .. } => {
+            Self::Merge {
+                sources,
+                new,
+                target,
+                ..
+            } => {
+                // SI keeps a new id a source already holds in that source's
+                // place, and appends any other (`_get_ids_after_merging`).
+                let kept = sources.iter().find(|s| si_of[*s] == new).copied();
                 for s in &sources {
                     si_of.remove(s);
                 }
+                if let (Some(t), Some(k)) = (target, kept) {
+                    let i = order.iter().position(|c| *c == k).expect("a live source");
+                    order[i] = t;
+                }
                 order.retain(|c| !sources.contains(c));
+                if let Some(t) = target {
+                    si_of.insert(t, new);
+                    if kept.is_none() {
+                        order.push(t);
+                    }
+                }
             }
             Self::Split {
                 cluster,
@@ -353,7 +417,7 @@ impl Op {
 /// touch them.
 fn op_seals(op: &Op) -> Vec<Value> {
     match op {
-        Op::Merge { group, .. } => group.clone(),
+        Op::Merge { group, new, .. } => std::iter::once(new.clone()).chain(group.clone()).collect(),
         Op::Split { unit, new, .. } => std::iter::once(unit.clone()).chain(new.clone()).collect(),
     }
 }
@@ -635,6 +699,25 @@ mod tests {
         (Session::new(provider, journal), dir)
     }
 
+    /// `n` clusters with one spike each, in time order.
+    fn session_with(n: u32) -> (Session<Mock>, tempfile::TempDir) {
+        let provider = Mock {
+            spikes: (0..n)
+                .map(|c| vec![SampleIndex(u64::from(c) * 10)])
+                .collect(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("s.journal")).unwrap();
+        (Session::new(provider, journal), dir)
+    }
+
+    fn merge(sources: &[u32], target: u32) -> CurationCommand {
+        CurationCommand::Merge {
+            sources: sources.iter().copied().map(ClusterId).collect(),
+            target: ClusterId(target),
+        }
+    }
+
     fn split(cluster: u32, idx: u32) -> CurationCommand {
         CurationCommand::Split {
             cluster: ClusterId(cluster),
@@ -676,6 +759,82 @@ mod tests {
         // Sources leave the unit list; targets keep their ids.
         assert_eq!(steps[1]["unit_ids"], json!([1, 2]));
         assert_eq!(steps[1]["manual_labels"][0]["unit_id"], 1);
+    }
+
+    #[test]
+    fn merge_into_an_emptied_target_recreates_its_id_at_the_end() {
+        let (mut s, _d) = session_with(4);
+        s.dispatch(merge(&[1], 0)).unwrap();
+        // Unit 1 is gone from SpikeInterface; the second merge recreates it.
+        s.dispatch(merge(&[2, 3], 1)).unwrap();
+        let doc = curation_document(&s, label_str);
+        let steps = steps(&doc);
+        assert_eq!(steps.len(), 3, "one step per merge + the label step");
+        assert_eq!(steps[0]["unit_ids"], json!([0, 1, 2, 3]));
+        assert_eq!(
+            steps[0]["merges"],
+            json!([{ "unit_ids": [1, 0], "new_unit_id": 0 }])
+        );
+        // The new unit id 1 is not in the step's unit list, so it is appended.
+        assert_eq!(steps[1]["unit_ids"], json!([0, 2, 3]));
+        assert_eq!(
+            steps[1]["merges"],
+            json!([{ "unit_ids": [2, 3], "new_unit_id": 1 }])
+        );
+        assert_eq!(steps[2]["unit_ids"], json!([0, 1]));
+        assert!(steps[2].get(UNREPRESENTABLE_KEY).is_none());
+    }
+
+    #[test]
+    fn merge_of_one_source_into_an_emptied_target_only_rekeys() {
+        let (mut s, _d) = session_with(4);
+        s.dispatch(merge(&[1], 0)).unwrap();
+        // Nothing to merge with: cluster 2's unit keeps its id, renamed to 1.
+        s.dispatch(merge(&[2], 1)).unwrap();
+        let doc = curation_document(&s, label_str);
+        let steps = steps(&doc);
+        assert_eq!(steps.len(), 2, "a re-key emits no structural step");
+        assert_eq!(
+            steps[0]["merges"],
+            json!([{ "unit_ids": [1, 0], "new_unit_id": 0 }])
+        );
+        assert_eq!(steps[1]["unit_ids"], json!([0, 2, 3]));
+        assert!(steps[1].get(UNREPRESENTABLE_KEY).is_none());
+    }
+
+    #[test]
+    fn rekeyed_ids_chain_and_merge_back_in_place() {
+        // 1 -> 0, then 2 re-keys onto 1 (cluster 1 holds SI id 2), then
+        // 3 re-keys onto 2: no SI step for either.
+        let (mut s, _d) = session_with(5);
+        s.dispatch(merge(&[1], 0)).unwrap();
+        s.dispatch(merge(&[2], 1)).unwrap();
+        s.dispatch(merge(&[3], 2)).unwrap();
+        let doc = curation_document(&s, label_str);
+        let chained = steps(&doc);
+        assert_eq!(chained.len(), 2);
+        assert_eq!(chained[1]["unit_ids"], json!([0, 2, 3, 4]));
+        assert!(chained[1].get(UNREPRESENTABLE_KEY).is_none());
+
+        // Merging into emptied 2 from cluster 1, which carries SI id 2: SI
+        // takes the group's own id and keeps it in place.
+        let (mut s, _d) = session_with(5);
+        s.dispatch(merge(&[1], 0)).unwrap();
+        s.dispatch(merge(&[2], 1)).unwrap();
+        s.dispatch(merge(&[1, 3], 2)).unwrap();
+        let doc = curation_document(&s, label_str);
+        let merged = steps(&doc);
+        // The re-key leaves SI untouched, so both merges share step 0.
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged[0]["merges"],
+            json!([
+                { "unit_ids": [1, 0], "new_unit_id": 0 },
+                { "unit_ids": [2, 3], "new_unit_id": 2 }
+            ])
+        );
+        assert_eq!(merged[1]["unit_ids"], json!([0, 2, 4]));
+        assert!(merged[1].get(UNREPRESENTABLE_KEY).is_none());
     }
 
     #[test]

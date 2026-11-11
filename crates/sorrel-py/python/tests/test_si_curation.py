@@ -68,6 +68,52 @@ def test_apply_curation_reproduces_session(tmp_path: Path) -> None:
     assert quality["2"] == "good"
 
 
+def test_apply_curation_of_a_merge_into_an_emptied_target(tmp_path: Path) -> None:
+    """A target an earlier merge emptied takes its own id back: SI creates
+    that unit anew at the end of the list and the merge is representable."""
+    analyzer, sort = make_analyzer(tmp_path)
+    t = {str(u): np.sort(sort.get_unit_spike_train(u)) for u in sort.unit_ids}
+
+    s = sorrel.Session.open(tmp_path / "sa")
+    s.merge([1], 0)          # sorrel cluster 1 is empty now
+    s.merge([2, 3], 1)       # refill it: a new unit under id 1
+    s.save()
+    del s
+
+    want = {
+        "0": np.concatenate([t["0"], t["1"]]),
+        "1": np.concatenate([t["2"], t["3"]]),
+        "4": t["4"],
+    }
+    doc = sorrel.read_curation(tmp_path / "sa")
+    assert [m["new_unit_id"] for step in doc for m in step["merges"]] == ["0", "1"]
+    curated = sc.apply_curation(analyzer, doc).sorting
+    assert sorted(curated.unit_ids) == sorted(want)
+    for uid, spikes in want.items():
+        np.testing.assert_array_equal(np.sort(curated.get_unit_spike_train(uid)), np.sort(spikes))
+
+
+def test_apply_curation_after_a_one_source_rekey(tmp_path: Path) -> None:
+    """A one-source merge into an emptied unit emits no SI step (cluster 1
+    takes unit 2's id); a later merge into emptied cluster 2 from cluster 1
+    reuses id 2, which SI accepts because the group holds it."""
+    analyzer, sort = make_analyzer(tmp_path)
+    t = {str(u): np.sort(sort.get_unit_spike_train(u)) for u in sort.unit_ids}
+
+    s = sorrel.Session.open(tmp_path / "sa")
+    s.merge([1], 0)
+    s.merge([2], 1)
+    s.merge([1, 3], 2)
+    s.save()
+    del s
+
+    want = {"0": np.concatenate([t["0"], t["1"]]), "2": np.concatenate([t["2"], t["3"]]), "4": t["4"]}
+    curated = sc.apply_curation(analyzer, sorrel.read_curation(tmp_path / "sa")).sorting
+    assert sorted(curated.unit_ids) == sorted(want)
+    for uid, spikes in want.items():
+        np.testing.assert_array_equal(np.sort(curated.get_unit_spike_train(uid)), np.sort(spikes))
+
+
 def test_apply_curation_reproduces_split_labels_and_repeated_edits(tmp_path: Path) -> None:
     """A history one Curation cannot express: a label on a split child,
     merging a split child, splitting a merged unit and splitting one unit
