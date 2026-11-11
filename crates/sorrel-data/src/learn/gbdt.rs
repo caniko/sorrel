@@ -1200,8 +1200,7 @@ impl BinData {
         };
         let mut best: Option<Split> = None;
         for &feature in features {
-            let n_edges = self.edges[feature].len();
-            if n_edges == 0 {
+            if self.edges[feature].is_empty() {
                 continue;
             }
             let base = feature * stride;
@@ -1222,7 +1221,7 @@ impl BinData {
                     (0.0, 0.0, 0.0)
                 };
                 let (mut gr, mut hr, mut wr) = (totals.g - gl, totals.h - hl, totals.w - wl);
-                for b in 0..n_edges {
+                for (b, &edge) in self.edges[feature].iter().enumerate() {
                     let slot = base + b * HIST_STATS;
                     gl += hist[slot];
                     hl += hist[slot + 1];
@@ -1243,7 +1242,7 @@ impl BinData {
                         best = Some(Split {
                             feature,
                             bin: b as u8,
-                            threshold: self.edges[feature][b],
+                            threshold: edge,
                             default_left: missing_left,
                             gain,
                         });
