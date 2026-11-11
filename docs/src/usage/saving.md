@@ -67,9 +67,10 @@ every open, so they need no copies or checks.
 ### `curation.json`
 
 Every save also writes SpikeInterface's manual-curation document next to
-the phy files. It carries the `good` / `mua` / `noise` labels and, for
-SortingAnalyzer, NWB and `rez.mat` sessions, the merges and splits made
-since the sort was loaded, so a SortingAnalyzer round trip is one call:
+the phy files. It carries the `good` / `mua` / `noise` labels, `tags` and
+the `origin` of every unit. A session that merged or split units also
+carries the edit history in SpikeInterface's list form
+(`SequentialCuration`), so a SortingAnalyzer round trip is one call:
 
 ```python
 import sorrel
@@ -78,29 +79,33 @@ curated = sc.apply_curation(analyzer, sorrel.read_curation("my_run/sorting_analy
 ```
 
 `crates/sorrel-py/python/tests/test_si_curation.py` runs this against
-SpikeInterface in CI and checks every unit's spikes. Unit ids keep their
-SpikeInterface type (`"7"` stays a string). A merge keeps its target's id
-and label. `apply_curation` keeps a merged unit's label only when every
-member has it, so `read_curation` hands the target's labels to the other
-members. The file itself keeps each unit's own labels, which Sorrel
-reloads.
-SpikeInterface never reuses a split unit's id, so after a split the spikes
-that stay behind get the next free id too, not the original one.
+SpikeInterface in CI and checks every unit's ids, spikes and labels.
 
-`apply_curation` applies the document in one pass against the sorter's
-units: labels, merges and at most one split per sorter unit that no merge
-touches. Both halves of a split take the parent's labels there. The
-document has no slot for a label on a unit Sorrel created, so such a label
-does not carry over. A history beyond that makes `apply_curation` raise a
-validation error rather than apply something else: a unit both merged and
-split, two splits of one unit, or a merge or split of a unit Sorrel
-created. Use the phy files or `export_phy` for those sessions.
+The list form is one structural step per run of edits that touch disjoint
+units, followed by a single labels-only step keyed by the final unit ids.
+That expresses histories one pass cannot: a unit both merged and split, a
+second split of a unit, and labels or merges on units Sorrel created. Unit
+ids keep their SpikeInterface type (`"7"` stays a string). A merge keeps
+its target's id and the merged unit's own label; the sources' labels leave
+with them. SpikeInterface never reuses a split unit's id, so a split's
+child gets the id Sorrel allocated for it and the spikes that stay behind
+get the next free id, not the original one.
+
+A rescue (`AddSpikes`, phy directories only) has no SpikeInterface
+curation slot. Its document still saves; it lists the edits under
+`sorrel_unrepresentable`, and `sorrel.read_curation` raises naming them
+instead of silently dropping spikes.
 
 For phy directories the saved `spike_clusters.npy` already contains the
 merges and splits, so there `curation.json` is labels only and must not
 be applied on top of the npy a second time. Sorrel reads the file back
 on open when no `cluster_group.tsv` is present (phy dirs) and always for
-SortingAnalyzer folders, so labels made in SpikeInterface show up too.
+SortingAnalyzer folders, so labels made in SpikeInterface show up too. A
+SortingAnalyzer session keeps the label source it started from beside its
+journal (`sorrel.journal.labels.json`): its own saves rewrite
+`curation.json` with the head's labels, and replaying the journal onto
+those would make undo restore the edit instead of the pre-session value.
+The copy goes away with the journal (`--discard-journal` sets both aside).
 
 ## Exporting a phy directory
 

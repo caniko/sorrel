@@ -101,8 +101,10 @@ class Session:
     def suggest(self) -> dict[str, list[dict[str, Any]]]:
         return json.loads(self._n.suggest_json())
 
-    def curation(self) -> dict[str, Any]:
-        """SpikeInterface curation document for the current state."""
+    def curation(self) -> dict[str, Any] | list[dict[str, Any]]:
+        """SpikeInterface curation document for the current state: one
+        ``Curation`` dict for a labels-only history, or the list form
+        (``SequentialCuration``) once the history has a merge or split."""
         return json.loads(self._n.curation_json())
 
     # -- edit (journaled, undoable) --------------------------------------
@@ -164,33 +166,32 @@ class Session:
         return self._n.export_phy(os.fspath(out_dir), copy_raw)
 
 
-def read_curation(path: str | os.PathLike) -> dict[str, Any]:
+def read_curation(path: str | os.PathLike) -> dict[str, Any] | list[dict[str, Any]]:
     """Load ``curation.json`` from a dataset directory (or the file itself),
     ready for ``spikeinterface.curation.apply_curation``.
 
-    The file keeps every unit's own labels, which Sorrel reloads.
-    ``apply_curation`` labels before it merges and keeps an exclusive label
-    only when all members agree, so here each merge into a member hands that
-    member's labels to the others: the merged unit keeps Sorrel's label."""
+    A session with merges or splits is SpikeInterface's list form
+    (``SequentialCuration``), one structural step per group of edits plus one
+    final labels-only step; it is returned as that list. A labels-only
+    session is a single ``Curation`` dict. ``apply_curation`` accepts either
+    as-is.
+
+    Raises ``ValueError`` when the file lists edits SpikeInterface has no
+    curation slot for (a rescue that added spikes): the document cannot
+    reproduce the session, and applying it would silently drop them.
+    """
     p = Path(path)
     if p.is_dir():
         p = p / "curation.json"
     with p.open() as f:
         doc = json.load(f)
-    labels = {e["unit_id"]: e for e in doc.get("manual_labels") or []}
-    for m in doc.get("merges") or []:
-        target, members = m.get("new_unit_id"), m.get("unit_ids", [])
-        if target not in members:
-            continue
-        for u in members:
-            if u == target:
-                continue
-            if target in labels:
-                labels[u] = {"unit_id": u, "labels": labels[target]["labels"]}
-            else:
-                labels.pop(u, None)
-    if labels:
-        doc["manual_labels"] = list(labels.values())
+    steps = doc if isinstance(doc, list) else [doc]
+    bad = [text for step in steps for text in step.get("sorrel_unrepresentable") or []]
+    if bad:
+        raise ValueError(
+            "this session's edits cannot be expressed as a SpikeInterface curation: "
+            + "; ".join(bad)
+        )
     return doc
 
 

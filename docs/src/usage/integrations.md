@@ -67,6 +67,26 @@ import spikeinterface.extractors as se
 sorting = se.read_phy("my_run/phy")  # picks up sorrel's edits
 ```
 
+It also writes `curation.json` for SI's `apply_curation`. A session with
+merges or splits is SI's list form (`SequentialCuration`): structural
+steps, then one labels-only step. That expresses histories a single pass
+cannot — a unit both merged and split, a repeated split, edits of units
+Sorrel created — and the round trip is one call:
+
+```python
+import sorrel
+import spikeinterface.curation as sc
+curated = sc.apply_curation(analyzer, sorrel.read_curation(result_dir))
+```
+
+`read_curation` returns the list as-is; a labels-only session, and a phy
+directory saved onto itself, stay one `Curation` dict. Ids are SI's own: a
+merge keeps its target's id, a split's child keeps the id Sorrel gave it
+and the spikes left behind get a fresh one. A rescue (`AddSpikes`) has no
+SI curation slot, so its document lists the edits under
+`sorrel_unrepresentable` and `read_curation` raises instead of silently
+dropping spikes.
+
 ## Quality metrics
 
 Sorrel auto-loads sidecar metrics at startup:

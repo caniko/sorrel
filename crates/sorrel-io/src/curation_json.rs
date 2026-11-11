@@ -8,7 +8,11 @@
 //!
 //! Both `format_version` `"1"` (`manual_labels[].quality`) and `"2"`
 //! (`manual_labels[].labels.quality`) are accepted, matching what
-//! `spikeinterface.curation.apply_curation` reads.
+//! `spikeinterface.curation.apply_curation` reads. A document with merges or
+//! splits on the path to the head is SpikeInterface's list form
+//! (`SequentialCuration`): `read_curation_labels` takes the final labels-only
+//! step, and `read_curation` refuses the list — replaying a history needs the
+//! session's own journal.
 
 use crate::kilosort::PhyLabel;
 use std::path::Path;
@@ -21,6 +25,11 @@ pub const QUALITY_KEY: &str = "quality";
 /// onto the dense cluster index (identity for phy directories). Returns
 /// `None` when the file is absent or not a curation document, so callers
 /// fall through to their next label source.
+///
+/// A list document's final step carries labels keyed by the final unit ids;
+/// units untouched by structure keep their ids, so the dense mapping
+/// resolves them. Ids the history created are skipped (the journal that
+/// made them also replays their labels).
 pub fn read_curation_labels(
     path: &Path,
     n_clusters: usize,
@@ -28,7 +37,13 @@ pub fn read_curation_labels(
 ) -> Option<Vec<PhyLabel>> {
     let text = std::fs::read_to_string(path).ok()?;
     let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let entries = doc.get("manual_labels")?.as_array()?;
+    // The list form ends with one labels-only step; earlier steps carry no
+    // labels of their own.
+    let step = match &doc {
+        serde_json::Value::Array(steps) => steps.last()?,
+        _ => &doc,
+    };
+    let entries = step.get("manual_labels")?.as_array()?;
     let mut out = vec![PhyLabel::Unsorted; n_clusters];
     for entry in entries {
         let Some(uid) = entry.get("unit_id").and_then(unit_id_as_u64) else {
@@ -66,14 +81,23 @@ pub struct CurationImport {
 
 /// Read labels, tags and merges from `path`. Unlike
 /// [`read_curation_labels`] this is an explicit import, so a missing or
-/// malformed file is an error rather than a fall-through. Splits and
-/// `removed` units are rejected: the auto pipeline never emits them and
-/// silently dropping them would misrepresent the document.
+/// malformed file is an error rather than a fall-through. A list document
+/// (a session with merges or splits replayed as steps) is refused: replaying
+/// it needs the edits in order, which only sorrel's own journal has.
+/// Splits and `removed` units are rejected: the auto pipeline never emits
+/// them and silently dropping them would misrepresent the document.
 pub fn read_curation(path: &Path) -> anyhow::Result<CurationImport> {
     use anyhow::{bail, Context};
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let doc: serde_json::Value =
         serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    if doc.is_array() {
+        bail!(
+            "{}: a sequential curation list (a history with merges or splits) cannot be \
+             replayed from JSON; apply it in SpikeInterface or export phy instead",
+            path.display()
+        );
+    }
     let non_empty = |k: &str| {
         doc.get(k)
             .and_then(|v| v.as_array())
@@ -209,5 +233,40 @@ mod tests {
         std::fs::write(&p, r#"{"splits":[{"unit_id":0,"mode":"indices"}]}"#).unwrap();
         assert!(read_curation(&p).is_err());
         assert!(read_curation(&dir.path().join("missing.json")).is_err());
+    }
+
+    /// A history with merges/splits is SpikeInterface's list form: labels
+    /// live in the final labels-only step and are keyed by the final unit
+    /// ids; the explicit import refuses the list rather than dropping the
+    /// structure.
+    #[test]
+    fn reads_list_form_labels_and_refuses_the_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.json");
+        std::fs::write(
+            &p,
+            r#"[{"format_version":"2","unit_ids":[0,1],"manual_labels":[],
+                 "merges":[{"unit_ids":[1,0],"new_unit_id":0}],"splits":[],"removed":[]},
+                {"format_version":"2","unit_ids":[0,2],
+                 "manual_labels":[{"unit_id":0,"labels":{"quality":["good"]}},
+                                  {"unit_id":2,"labels":{"quality":["noise"]}}],
+                 "merges":[],"splits":[],"removed":[]}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_curation_labels(&p, 3, |u| Some(u as usize)).unwrap(),
+            vec![PhyLabel::Good, PhyLabel::Unsorted, PhyLabel::Noise]
+        );
+        // Ids the history created are not in the dense mapping: skipped.
+        let sparse = [0u64, 9];
+        assert_eq!(
+            read_curation_labels(&p, 2, |u| sparse.iter().position(|&x| x == u)).unwrap(),
+            vec![PhyLabel::Good, PhyLabel::Unsorted]
+        );
+        let err = read_curation(&p).unwrap_err().to_string();
+        assert!(err.contains("sequential curation list"), "{err}");
+
+        std::fs::write(&p, "[]").unwrap();
+        assert!(read_curation_labels(&p, 1, |u| Some(u as usize)).is_none());
     }
 }

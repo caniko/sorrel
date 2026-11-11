@@ -68,6 +68,15 @@ unsafe impl Sync for SortingAnalyzerProvider {}
 
 impl SortingAnalyzerProvider {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_labels(root, None)
+    }
+
+    /// [`Self::open`] with the initial labels read from `labels` instead of
+    /// `<root>/curation.json`: the copy taken when the session's journal was
+    /// created (see `sorrel_data::open::open_sorting_analyzer`), so a save
+    /// that rewrote `curation.json` cannot change what the journal replays
+    /// onto. `None` reads `<root>/curation.json`, as before.
+    pub fn open_with_labels(root: impl AsRef<Path>, labels: Option<&Path>) -> Result<Self> {
         let root = root.as_ref();
         let recording_meta = load_recording_json(root)?;
 
@@ -100,8 +109,9 @@ impl SortingAnalyzerProvider {
         }
         // SI has no phy-style label sidecar; a previous sorrel session (or
         // `spikeinterface.curation`) may have left a `curation.json`.
+        let default_labels = root.join("curation.json");
         let initial_labels = crate::curation_json::read_curation_labels(
-            &root.join("curation.json"),
+            labels.unwrap_or(&default_labels),
             n_clusters,
             |uid| unit_ids.iter().position(|&u| u as u64 == uid),
         )
