@@ -16,3 +16,12 @@ uv venv --python 3.12 "$venv"
 uv pip install --python "$venv/bin/python" "${wheels[0]}[nwb,neuroconv]" \
   "neuroconv==0.10.2" "hdmf-zarr<0.14" nwbinspector spikeinterface scipy pytest
 "$venv/bin/python" -m pytest crates/sorrel-py/python/tests -q -rA
+
+# SpikeInterface floor: 0.104 is the first release whose apply_curation
+# accepts sorrel's list form (SequentialCuration) for merges/splits. Pin it
+# in its own venv — the suite above resolved the newest release.
+minvenv=$(mktemp -d)/venv
+uv venv --python 3.12 "$minvenv"
+uv pip install --python "$minvenv/bin/python" "${wheels[0]}[spikeinterface,nwb]" \
+  "spikeinterface==0.104.0" scipy pytest
+"$minvenv/bin/python" -m pytest crates/sorrel-py/python/tests/test_si_curation.py -q -rA
