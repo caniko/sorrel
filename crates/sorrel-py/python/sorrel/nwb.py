@@ -250,6 +250,10 @@ def _analyzer_sample_rate(root: Path) -> float:
         if p.is_file():
             v = json.loads(p.read_text())
             kwargs = v.get("kwargs", v)
+            while "sampling_frequency" not in kwargs and isinstance(kwargs.get("recording"), dict):
+                # A preprocessing chain (the native reader already refused any
+                # that drops channels or samples): the rate is at its source.
+                kwargs = kwargs["recording"].get("kwargs", kwargs["recording"])
             if "sampling_frequency" not in kwargs and "folder_path" in kwargs:
                 # A BinaryFolderRecording: the rate is in its folder's binary.json.
                 kwargs = json.loads((root / kwargs["folder_path"] / "binary.json")

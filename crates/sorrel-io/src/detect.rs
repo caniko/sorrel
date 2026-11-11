@@ -37,6 +37,15 @@ pub fn detect_backend(root: &Path) -> Result<Backend> {
     if root.join("spike_times.npy").exists() && root.join("spike_clusters.npy").exists() {
         return Ok(Backend::Kilosort);
     }
+    // A zarr SortingAnalyzer has no recording.json to read: zarr v2 marks the
+    // store with `.zgroup`, zarr v3 with `zarr.json`.
+    if root.join(".zgroup").exists() || root.join("zarr.json").exists() {
+        bail!(
+            "{} is a zarr SortingAnalyzer: convert it with \
+             analyzer.save_as(format=\"binary_folder\", folder=...)",
+            root.display()
+        );
+    }
     if (root.join("recording.json").exists() || root.join("binary.json").exists())
         && root.join("sorting").is_dir()
     {
@@ -114,6 +123,21 @@ mod tests {
         let rez = dir.path().join("rez.mat");
         std::fs::write(&rez, b"").unwrap();
         assert_eq!(detect_backend(&rez).unwrap(), Backend::Ks4Rez);
+    }
+
+    #[test]
+    fn zarr_sorting_analyzer_points_at_the_binary_conversion() {
+        for marker in [".zgroup", "zarr.json"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(marker), b"{}").unwrap();
+            std::fs::create_dir(dir.path().join("sorting")).unwrap();
+            let err = detect_backend(dir.path()).unwrap_err().to_string();
+            assert!(err.contains("zarr SortingAnalyzer"), "got: {err}");
+            assert!(
+                err.contains("save_as(format=\"binary_folder\""),
+                "got: {err}"
+            );
+        }
     }
 
     #[test]

@@ -9,7 +9,9 @@
 //!     unit_ids.npy
 //!     properties/...
 //!   recording.json          BinaryRecordingExtractor or BinaryFolderRecording
-//!                           description (or binary.json) — rate, dtype, bin path
+//!                           description (or binary.json) — rate, dtype, bin path —
+//!                           optionally under channel- and sample-preserving
+//!                           preprocessors (bandpass, CAR, whiten, ...)
 //!   extensions/
 //!     waveforms/
 //!     templates/templates_average.npy
@@ -274,7 +276,7 @@ fn load_recording_json(root: &Path) -> Result<RecordingMeta> {
             let text =
                 std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
             // SI dumps these relative to the analyzer folder.
-            return parse_recording_json_at(&text, &p, root, 0);
+            return parse_recording_json_at(&text, &p, root, false);
         }
     }
     bail!(
@@ -286,33 +288,86 @@ fn load_recording_json(root: &Path) -> Result<RecordingMeta> {
 #[cfg(test)]
 fn parse_recording_json(text: &str, json_path: &Path) -> Result<RecordingMeta> {
     let base = json_path.parent().unwrap_or(Path::new("."));
-    parse_recording_json_at(text, json_path, base, 0)
+    parse_recording_json_at(text, json_path, base, false)
 }
 
+/// Preprocessors that keep every channel and every sample. Sorrel reads the
+/// binary source beneath them and does **not** re-apply the chain: the trace
+/// is the source samples through sorrel's own highpass, and the provider
+/// reports `hp_filtered: false`.
+const CHANNEL_AND_SAMPLE_PRESERVING: &[&str] = &[
+    "BandpassFilterRecording",
+    "HighpassFilterRecording",
+    "FilterRecording",
+    "NotchFilterRecording",
+    "CommonReferenceRecording",
+    "WhitenRecording",
+    "PhaseShiftRecording",
+    "ScaleRecording",
+    "CenterRecording",
+    "ZScoreRecording",
+    "NormalizeByQuantileRecording",
+    "HighpassSpatialFilterRecording",
+];
+
 /// Parse a recording description whose relative paths resolve against `base`.
+/// `from_binary` is set once a BinaryFolderRecording was followed into its
+/// `binary.json`, which must itself describe a binary extractor.
 fn parse_recording_json_at(
     text: &str,
     json_path: &Path,
     base: &Path,
-    depth: usize,
+    from_binary: bool,
 ) -> Result<RecordingMeta> {
     let v: serde_json::Value =
         serde_json::from_str(text).with_context(|| format!("parse {}", json_path.display()))?;
-    let kwargs = v.get("kwargs").unwrap_or(&v);
+    parse_recording_value(&v, json_path, base, from_binary)
+}
+
+fn parse_recording_value(
+    v: &serde_json::Value,
+    json_path: &Path,
+    base: &Path,
+    from_binary: bool,
+) -> Result<RecordingMeta> {
+    let kwargs = v.get("kwargs").unwrap_or(v);
+    let class = v.get("class").and_then(|x| x.as_str()).unwrap_or("unknown");
+    // SI writes the Python path, e.g.
+    // `spikeinterface.preprocessing.filter.BandpassFilterRecording`.
+    let class_name = class.rsplit('.').next().unwrap_or(class);
+    if class_name == "ZarrRecordingExtractor" {
+        bail!(
+            "{}: zarr recording ({class}): sorrel cannot read zarr; re-save the recording \
+             as binary with recording.save(format=\"binary\", folder=...) and recreate the \
+             analyzer on it (analyzer.save_as keeps the zarr recording)",
+            json_path.display()
+        );
+    }
     let Some(sample_rate) = kwargs.get("sampling_frequency").and_then(|x| x.as_f64()) else {
+        // A preprocessing chain only names its inner recording, with the
+        // chain's own kwargs; the rate/dtype/bin live at the binary source.
+        if CHANNEL_AND_SAMPLE_PRESERVING.contains(&class_name) {
+            let inner = kwargs.get("recording").ok_or_else(|| {
+                anyhow!(
+                    "{}: {class_name} without a nested recording",
+                    json_path.display()
+                )
+            })?;
+            return parse_recording_value(inner, json_path, base, from_binary);
+        }
         // `rec.save(folder=...)` / `si.load(folder)` produce a
         // BinaryFolderRecording, whose own kwargs are only `folder_path`;
         // the extractor's description lives in that folder's `binary.json`
         // (SI itself asserts it is a BinaryRecordingExtractor there).
-        let class = v.get("class").and_then(|x| x.as_str()).unwrap_or("unknown");
-        if !class.ends_with("BinaryFolderRecording") {
+        if class_name != "BinaryFolderRecording" {
             bail!(
-                "{}: unsupported recording class {class} (missing sampling_frequency); \
-                 expected a BinaryRecordingExtractor or BinaryFolderRecording",
+                "{}: unsupported recording class {class} (missing sampling_frequency); sorrel \
+                 reads only channel- and sample-preserving preprocessing chains over a binary \
+                 recording — re-save it with recording.save(format=\"binary\", folder=...)",
                 json_path.display()
             );
         }
-        if depth > 0 {
+        if from_binary {
             bail!("{}: nested BinaryFolderRecording", json_path.display());
         }
         let folder = kwargs
@@ -328,7 +383,7 @@ fn parse_recording_json_at(
         let binary_json = folder.join("binary.json");
         let text = std::fs::read_to_string(&binary_json)
             .with_context(|| format!("read {}", binary_json.display()))?;
-        return parse_recording_json_at(&text, &binary_json, &folder, depth + 1);
+        return parse_recording_json_at(&text, &binary_json, &folder, true);
     };
     let sample_rate = sample_rate as f32;
     let n_channels = kwargs
@@ -1104,21 +1159,91 @@ mod tests {
         );
     }
 
+    /// A chain of channel- and sample-preserving preprocessors names its
+    /// source through nested `kwargs.recording` dicts; the source's rate,
+    /// dtype and bin are what sorrel opens.
     #[test]
-    fn rejects_non_binary_recording_naming_its_class() {
+    fn follows_two_level_preprocessing_chain_to_binary_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let rec = root.join("rec");
+        write_binary_folder_rec(&rec, 30000.0, 3, 40);
+        std::fs::write(
+            root.join("recording.json"),
+            serde_json::json!({
+                "class": "spikeinterface.preprocessing.filter.BandpassFilterRecording",
+                "module": "spikeinterface",
+                "relative_paths": true,
+                "kwargs": {
+                    "freq_min": 300.0,
+                    "recording": {
+                        "class": "spikeinterface.preprocessing.common_reference.CommonReferenceRecording",
+                        "relative_paths": false,
+                        "kwargs": {
+                            "reference": "global",
+                            "recording": {
+                                "class": "spikeinterface.core.binaryfolder.BinaryFolderRecording",
+                                "relative_paths": false,
+                                "kwargs": {"folder_path": "rec"}
+                            }
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        write_tiny_sorting(root);
+
+        let p = SortingAnalyzerProvider::open(root).unwrap();
+        assert_eq!(p.sample_rate(), 30000.0);
+        assert_eq!(p.n_channels(), 3);
+        assert_eq!(p.n_samples(), SampleIndex(40));
+        assert_eq!(
+            p.raw_file().unwrap().path,
+            rec.join("traces_cached_seg0.raw")
+        );
+    }
+
+    /// Slicing changes which channels or samples exist, so the source binary
+    /// is not the analyzer's recording; refuse instead of showing it.
+    #[test]
+    fn refuses_channel_slice_recording_naming_its_class() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("recording.json"),
             r#"{
-                "class": "spikeinterface.preprocessing.phase_shift.PhaseShiftRecording",
+                "class": "spikeinterface.core.channelslice.ChannelSliceRecording",
                 "module": "spikeinterface",
                 "relative_paths": true,
-                "kwargs": {"recording": {"class": "x.BinaryRecordingExtractor", "kwargs": {}}}
+                "kwargs": {"channel_ids": ["0"], "recording": {"class": "x.BinaryRecordingExtractor", "kwargs": {}}}
             }"#,
         )
         .unwrap();
         let err = load_recording_json(dir.path()).unwrap_err().to_string();
-        assert!(err.contains("PhaseShiftRecording"), "got: {err}");
+        assert!(err.contains("ChannelSliceRecording"), "got: {err}");
+        assert!(err.contains("channel- and sample-preserving"), "got: {err}");
+    }
+
+    #[test]
+    fn refuses_zarr_recording_with_conversion_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("recording.json"),
+            r#"{
+                "class": "spikeinterface.core.zarrextractors.ZarrRecordingExtractor",
+                "module": "spikeinterface",
+                "relative_paths": true,
+                "kwargs": {"folder_path": "rec.zarr", "storage_options": null}
+            }"#,
+        )
+        .unwrap();
+        let err = load_recording_json(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("ZarrRecordingExtractor"), "got: {err}");
+        assert!(
+            err.contains("recording.save(format=\"binary\""),
+            "got: {err}"
+        );
     }
 
     fn write_binary_folder_rec(folder: &Path, sample_rate: f64, n_channels: u32, n_samples: usize) {
