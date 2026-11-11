@@ -525,6 +525,20 @@ pub trait DataProvider: Send + Sync + 'static {
     }
 }
 
+/// [`DataProvider::unit_id`] for a backend with its own unit ids: clusters
+/// sorrel creates by splitting (indices past `ids`) get ids appended after
+/// the largest one, matching SpikeInterface's
+/// `apply_curation(new_id_strategy="append")`.
+pub fn appended_unit_id(ids: &[u32], cluster: ClusterId) -> u32 {
+    match ids.get(cluster.idx()) {
+        Some(&u) => u,
+        None => {
+            let max = ids.iter().copied().max().unwrap_or(0);
+            max + 1 + (cluster.0 - ids.len() as u32)
+        }
+    }
+}
+
 /// Fills a trace mirror on demand. Implemented by remote backends; a provider
 /// holding one consults it before reading a window and returns an empty
 /// window while the bytes are still in flight.
