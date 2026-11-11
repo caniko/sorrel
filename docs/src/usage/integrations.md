@@ -50,9 +50,16 @@ layouts), the optional `probe.json` for geometry, and
 `spikeinterface.read_binary`) or a SpikeInterface binary folder
 (`rec.save(folder=..., format='binary')`, a `BinaryFolderRecording`): for
 the latter Sorrel follows its `folder_path` to that folder's `binary.json`.
-A recording backed by another extractor (a preprocessing chain) does not
-open yet. The Zarr (`zarr_folder`) variant is not
-supported; export to `binary_folder` first.
+Either may sit under a preprocessing chain that keeps every channel and
+sample (bandpass, highpass or notch filters, common reference, whitening,
+phase shift, scaling, centering, z-scoring, highpass spatial filter).
+Sorrel reads the binary source beneath it and does not re-apply the chain:
+traces show the source samples through Sorrel's own highpass. A chain that
+slices channels or frames, resamples or aggregates fails with an error
+naming the class. Zarr is not read: a Zarr analyzer converts with
+`analyzer.save_as(format="binary_folder", folder=...)`, and a Zarr
+recording needs `recording.save(format="binary", folder=...)` and a new
+analyzer on it (`save_as` keeps the Zarr recording).
 
 ### Round-tripping curation back into SI
 
@@ -82,7 +89,9 @@ curated = sc.apply_curation(analyzer, sorrel.read_curation(result_dir))
 `read_curation` returns the list as-is; a labels-only session, and a phy
 directory saved onto itself, stay one `Curation` dict. Ids are SI's own: a
 merge keeps its target's id, a split's child keeps the id Sorrel gave it
-and the spikes left behind get a fresh one. A rescue (`AddSpikes`) has no
+and the spikes left behind get a fresh one. A merge into a unit an earlier
+merge emptied brings back the target's id; when it has a single source
+there is nothing for SI to merge, so that unit keeps the source's SI id. A rescue (`AddSpikes`) has no
 SI curation slot, so its document lists the edits under
 `sorrel_unrepresentable` and `read_curation` raises instead of silently
 dropping spikes.
@@ -184,7 +193,9 @@ with NWBHDF5IO("session.nwb", "w") as io:
 Each cluster that still has spikes gets one row. The row id is the
 backend's integer unit id, the one `curation.json` uses, with one
 exception: SpikeInterface gives the spikes a split leaves behind a fresh
-id, while Sorrel and this table keep the parent's id. When a
+id, while Sorrel and this table keep the parent's id (likewise a
+single-source merge into an emptied unit keeps the source's id in
+SpikeInterface). When a
 SortingAnalyzer's ids are strings that are not distinct integers
 (`"unit_a"`, `"007"` beside `"7"`), rows are numbered densely and a
 `unit_name` column holds SpikeInterface's ids. The columns are:

@@ -90,7 +90,10 @@ that are not integers (`"unit_a"`, `"007"`) are written back verbatim. A merge k
 its target's id and the merged unit's own label; the sources' labels leave
 with them. SpikeInterface never reuses a split unit's id, so a split's
 child gets the id Sorrel allocated for it and the spikes that stay behind
-get the next free id, not the original one.
+get the next free id, not the original one. A merge into a unit that an
+earlier merge emptied re-creates the target's id (SpikeInterface appends
+it, or keeps it in place when a source already holds it); with one source there is nothing to merge, so that unit keeps the
+source's SpikeInterface id.
 
 A rescue (`AddSpikes`, phy directories only) has no SpikeInterface
 curation slot. Its document still saves; it lists the edits under
@@ -107,6 +110,9 @@ journal (`sorrel.journal.labels.json`): its own saves rewrite
 `curation.json` with the head's labels, and replaying the journal onto
 those would make undo restore the edit instead of the pre-session value.
 The copy goes away with the journal (`--discard-journal` sets both aside).
+A journal created before Sorrel 0.5 has no copy, and the labels it started
+from were overwritten by its saves; Sorrel warns on open, and undoing a
+relabel past the start restores the last saved label.
 
 ## Exporting a phy directory
 

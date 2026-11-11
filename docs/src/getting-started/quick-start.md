@@ -50,8 +50,8 @@ sorrel open my_run/sorting_analyzer
 ```
 
 The analyzer must be saved with `format='binary_folder'` and have a
-flattened sorting under `<root>/sorting/`. The Zarr variant is not yet
-supported.
+flattened sorting under `<root>/sorting/`. A Zarr analyzer converts with
+`analyzer.save_as(format="binary_folder", folder=...)`.
 
 ## NWB and KS4 rez
 
