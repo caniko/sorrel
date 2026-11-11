@@ -1343,7 +1343,9 @@ fn passes_floor(mut times: Vec<u64>, total: u64, min_spikes: usize, late_onset: 
 
 /// The ACG centre bar of a spike train against its baseline: spike pairs
 /// within 0.5 ms per ms of lag, over pairs 20-50 ms apart per ms (both
-/// signs count alike). 0 when the baseline is empty.
+/// signs count alike). 0 when neither side has a pair; centre pairs with an
+/// empty baseline are infinite, because there is no baseline to normalise
+/// against and those spikes are still refractory violations.
 fn centre_ratio(mut times: Vec<u64>, sr: f32) -> f64 {
     times.sort_unstable();
     let ms = |m: f64| (m * sr as f64 / 1e3).round() as u64;
@@ -1363,7 +1365,7 @@ fn centre_ratio(mut times: Vec<u64>, sr: f32) -> f64 {
         }
     }
     if far == 0 {
-        return 0.0;
+        return if near == 0 { 0.0 } else { f64::INFINITY };
     }
     (near as f64 / 0.5) / (far as f64 / 30.0)
 }
@@ -1862,6 +1864,17 @@ mod tests {
         let mut dirty = clean;
         dirty.extend((0..100).map(|i| i * 30)); // same-sample doubles
         assert!(centre_ratio(dirty, 1000.0) > 1.0);
+        assert_eq!(centre_ratio(vec![0, 1000], 1000.0), 0.0);
+    }
+
+    #[test]
+    fn centre_violations_without_a_baseline_fail_the_acg_gate() {
+        // sr 1 kHz: one sample is 1 ms. Each pair is 1 ms apart and pairs are
+        // 1000 ms apart, so every pair is in the centre bin and the 20-50 ms
+        // baseline is empty: no baseline can dilute the contamination.
+        let paired: Vec<u64> = (0..100).flat_map(|i| [i * 1000, i * 1000 + 1]).collect();
+        assert!(centre_ratio(paired, 1000.0) > 0.1);
+        // No pairs on either side is still "no evidence".
         assert_eq!(centre_ratio(vec![0, 1000], 1000.0), 0.0);
     }
 
