@@ -1513,7 +1513,14 @@ fn waveform_view_impl<P: DataProvider>(
                 }
             }
             if all.incomplete {
-                line.push_str(" · retrying missing trace bytes");
+                if all.unavailable > 0 {
+                    line.push_str(&format!(
+                        " · retrying {} spikes whose trace was still fetching",
+                        all.unavailable
+                    ));
+                } else {
+                    line.push_str(" · retrying missing trace bytes");
+                }
             }
             let status = if all.raster_failed > 0 {
                 ui.colored_label(ui.visuals().warn_fg_color, line)
