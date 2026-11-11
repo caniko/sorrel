@@ -127,6 +127,10 @@ def test_reopen_undo_relabel_restores_presession_label(tmp_path: Path) -> None:
     assert s.labels()[2] == "mua"
     s.set_label(2, "good")
     s.save()
+    # A competing --discard-journal open fails while the session holds the
+    # journal, and must leave the label snapshot alone.
+    with pytest.raises(Exception):
+        sorrel.Session.open(tmp_path / "sa", discard_journal=True)
     del s
     s = sorrel.Session.open(tmp_path / "sa")
     assert s.labels()[2] == "good"

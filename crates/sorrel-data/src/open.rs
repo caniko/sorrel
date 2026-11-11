@@ -245,27 +245,23 @@ pub fn open_sorting_analyzer(
     opts: &JournalOpts,
 ) -> Result<Session<SortingAnalyzerProvider>> {
     let path = journal_path(opts, root, "sorrel");
-    // A journal about to be created (none yet, or `--discard-journal`) starts
-    // from the labels on disk now; the provider reads `curation.json`
-    // directly and the snapshot is written once the journal exists. An
-    // existing journal replays onto its own snapshot.
-    let fresh = opts.discard || !path.exists();
+    // Held from here (before the journal or its snapshot is touched) until
+    // the session drops; `--discard-journal` sets both aside.
+    let lock = lock_journal(&path)?;
+    discard_journal(opts, &path)?;
     let snapshot = labels_snapshot_path(&path);
-    if fresh {
-        if opts.discard && snapshot.exists() {
-            // Keep the old copy with the journal `discard_journal` moves aside.
-            set_aside(&snapshot)?;
-        } else {
-            // A snapshot whose journal is gone must not seed the new one.
-            let _ = std::fs::remove_file(&snapshot);
-        }
+    if !path.exists() {
+        // A snapshot whose journal is gone must not seed a new one.
+        let _ = std::fs::remove_file(&snapshot);
     }
-    let labels = (!fresh && snapshot.exists()).then_some(snapshot.as_path());
+    let labels = snapshot.exists().then_some(snapshot.as_path());
     let provider = SortingAnalyzerProvider::open_with_labels(root, labels)?;
-    let mut session = open_identity_sealed(provider, &path, opts)?;
-    if fresh || !snapshot.exists() {
-        snapshot_labels(&path, &root.join("curation.json"))?;
-    }
+    let baseline = baseline_hash(&provider.identity_bytes());
+    let journal = open_journal_locked(lock, opts, &path, baseline, provider.n_clusters())?;
+    let mut session = Session::new(provider, journal);
+    // A new journal starts from the labels on disk now. A journal from
+    // before snapshots existed starts from them too: the best left.
+    snapshot_labels(&path, &root.join("curation.json"))?;
     session.fill_detected_sorter(detect_sorter(root, Backend::SortingAnalyzer));
     Ok(session)
 }

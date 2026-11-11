@@ -5,13 +5,16 @@ the analyzer's `recording.json` only names that folder and the extractor's
 own kwargs (rate, dtype, bin path) live in the folder's `binary.json`.
 Sorrel has to follow that link to open it.
 """
+from datetime import datetime, timezone
 from pathlib import Path
 import warnings
 
 import numpy as np
 import spikeinterface.core as si
+from pynwb import NWBFile
 
 import sorrel
+from sorrel.nwb import add_units_to_nwbfile
 
 
 def test_open_analyzer_on_binary_folder_recording(tmp_path: Path) -> None:
@@ -37,3 +40,7 @@ def test_open_analyzer_on_binary_folder_recording(tmp_path: Path) -> None:
         rec.get_num_samples(segment_index=0) * rec.get_num_channels()
         * np.dtype(saved.get_dtype()).itemsize
     )
+
+    nwb = NWBFile("x", "x", datetime(2026, 1, 1, tzinfo=timezone.utc))
+    units = add_units_to_nwbfile(s, nwb)
+    assert units.resolution == 1.0 / rec.sampling_frequency

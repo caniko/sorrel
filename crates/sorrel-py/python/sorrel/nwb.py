@@ -249,5 +249,10 @@ def _analyzer_sample_rate(root: Path) -> float:
         p = root / name
         if p.is_file():
             v = json.loads(p.read_text())
-            return float(v.get("kwargs", v)["sampling_frequency"])
+            kwargs = v.get("kwargs", v)
+            if "sampling_frequency" not in kwargs and "folder_path" in kwargs:
+                # A BinaryFolderRecording: the rate is in its folder's binary.json.
+                kwargs = json.loads((root / kwargs["folder_path"] / "binary.json")
+                                    .read_text())["kwargs"]
+            return float(kwargs["sampling_frequency"])
     raise ValueError(f"{root}: no recording.json with sampling_frequency")
