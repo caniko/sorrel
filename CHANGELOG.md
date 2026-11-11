@@ -28,6 +28,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 
+- **SortingAnalyzer unit ids.** SpikeInterface 0.101+ binary folders keep the unit ids in `sorting/numpysorting_info.json`, often as strings. Sorrel used to number those units densely and write integers, so `apply_curation` refused the `curation.json` whenever the ids were not `0..n-1` integers. Sorrel now reads the real ids and writes them back with their original type.
+- **Splits in `curation.json` apply in SpikeInterface.** SpikeInterface gives both halves of a split new ids and asserts that `new_unit_ids` covers both. Sorrel listed only the split-off half, so any document with a split failed. The spikes left behind now get the next free id. The docs also name the histories SpikeInterface's one-pass model rejects.
+- **`saving.md` round-trip example** passed a path to `apply_curation`, which only takes a dict; it now uses `sorrel.read_curation`.
 - **Kilosort 4 phy folders open.** Kilosort 4 writes `channel_shanks.npy` as float32. Id arrays now accept floats holding whole non-negative numbers and still refuse anything else.
 - **`sorrel blind` drops partial sorter label files.** phy rewrites `cluster_KSLabel.tsv`, `cluster_ContamPct.tsv` and `cluster_Amplitude.tsv` on save with rows only for the clusters that exist then, so the rows left over marked the roots the human never edited. A file that doesn't cover every root no longer reaches the blind input.
 

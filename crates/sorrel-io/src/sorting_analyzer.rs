@@ -44,6 +44,9 @@ pub struct SortingAnalyzerProvider {
     initial_labels: Vec<PhyLabel>,
     /// SI unit ids, parallel to `spikes_per_cluster`. Can be sparse.
     unit_ids: Vec<u32>,
+    /// SI stored them as strings (`"0"`, `"7"`), as SpikeInterface 0.105's
+    /// generators and many extractors do.
+    string_unit_ids: bool,
 
     channel_positions: Vec<[f32; 2]>,
     channel_map: Vec<ChannelId>,
@@ -74,12 +77,14 @@ impl SortingAnalyzerProvider {
         let (times, unit_indices) = load_sorting(root)?;
 
         let unit_ids_path = root.join("sorting").join("unit_ids.npy");
-        let unit_ids = if unit_ids_path.exists() {
-            read_1d_u32(&unit_ids_path)?
+        let (unit_ids, string_unit_ids) = if unit_ids_path.exists() {
+            (read_1d_u32(&unit_ids_path)?, false)
+        } else if let Some(ids) = numpysorting_unit_ids(root)? {
+            ids
         } else {
             // Fall back to dense unit numbering [0..max+1).
             let max = unit_indices.iter().copied().max().unwrap_or(0);
-            (0..=max).collect()
+            ((0..=max).collect(), false)
         };
         let n_clusters = unit_ids.len();
 
@@ -148,6 +153,7 @@ impl SortingAnalyzerProvider {
             spikes_per_cluster,
             initial_labels,
             unit_ids,
+            string_unit_ids,
             channel_positions,
             channel_map,
             metrics,
@@ -179,6 +185,32 @@ struct RecordingMeta {
     file_paths: Vec<PathBuf>,
     /// Bytes to skip at the start of the bin file (rare; SI usually 0).
     offset: u64,
+}
+
+/// Unit ids from `sorting/numpysorting_info.json` (SpikeInterface's
+/// `NumpyFolderSorting`, the sorting of every binary_folder analyzer since
+/// 0.101), and whether they were strings. `None` if the file is absent or an
+/// id is not a non-negative integer (sorrel's ids are `u32`).
+fn numpysorting_unit_ids(root: &Path) -> Result<Option<(Vec<u32>, bool)>> {
+    let p = root.join("sorting").join("numpysorting_info.json");
+    if !p.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", p.display()))?;
+    let Some(ids) = v.get("unit_ids").and_then(|x| x.as_array()) else {
+        return Ok(None);
+    };
+    let strings = ids.iter().any(|x| x.is_string());
+    let parsed: Option<Vec<u32>> = ids
+        .iter()
+        .map(|x| match x {
+            serde_json::Value::String(s) => s.parse().ok(),
+            other => other.as_u64().and_then(|u| u32::try_from(u).ok()),
+        })
+        .collect();
+    Ok(parsed.map(|ids| (ids, strings)))
 }
 
 fn load_recording_json(root: &Path) -> Result<RecordingMeta> {
@@ -609,6 +641,10 @@ impl DataProvider for SortingAnalyzerProvider {
         }
     }
 
+    fn unit_ids_are_strings(&self) -> bool {
+        self.string_unit_ids
+    }
+
     fn initial_labels(&self) -> Vec<Self::Label> {
         self.initial_labels.clone()
     }
@@ -845,6 +881,20 @@ mod tests {
             }
             other => panic!("expected I16 trace, got {other:?}"),
         }
+        assert!(!p.unit_ids_are_strings());
+
+        // SpikeInterface 0.105 keeps the ids in numpysorting_info.json, as
+        // strings for its generators; sparse ones must survive.
+        std::fs::remove_file(sorting_dir.join("unit_ids.npy")).unwrap();
+        std::fs::write(
+            sorting_dir.join("numpysorting_info.json"),
+            r#"{"sampling_frequency": 30000.0, "unit_ids": ["3", "7", "12"], "num_segments": 1}"#,
+        )
+        .unwrap();
+        let p = SortingAnalyzerProvider::open(root).unwrap();
+        assert!(p.unit_ids_are_strings());
+        assert_eq!(p.unit_id(ClusterId(1)), 7);
+        assert_eq!(p.unit_id(ClusterId(3)), 13); // a sorrel split appends
     }
 
     #[test]

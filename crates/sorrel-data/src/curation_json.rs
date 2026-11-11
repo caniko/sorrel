@@ -6,15 +6,21 @@
 //! labels-only form instead, because its `spike_clusters.npy` already
 //! carries the structure. For SortingAnalyzer folders the file is the
 //! carrier, and `spikeinterface.curation.apply_curation(analyzer,
-//! "curation.json")` reproduces the session.
+//! sorrel.read_curation(dir))` reproduces the session
+//! (`crates/sorrel-py/python/tests/test_si_curation.py`).
 //!
 //! Field names follow `spikeinterface/curation/curation_model.py`:
 //! `format_version`, `unit_ids`, `label_definitions`, `manual_labels`,
 //! `merges`, `splits`, `removed`. Notes have no slot and are dropped; the
 //! unit origin travels as an exclusive `origin` label.
-//! `apply_curation` applies merges before splits, so a split recorded
-//! after a merge into the same unit indexes the merged, time-sorted spike
-//! train — the same order sorrel's buckets keep.
+//!
+//! `apply_curation` applies one curation in a single pass (labels, merges,
+//! splits) against the sorter's units, so it reproduces relabels, merges
+//! and at most one split per sorter unit that no merge touches. It rejects
+//! the rest (a unit both merged and split, a second split of a unit, a
+//! split or merge of a unit sorrel created) instead of applying it wrongly.
+//! ponytail: one document for the whole history; emit SpikeInterface's
+//! list form (`SequentialCuration`, one step per edit) when those are needed.
 
 use crate::command::{CurationCommand, Method, UnitOrigin};
 use crate::session::{Session, TAG_SPLIT, TAG_TUNED};
@@ -65,7 +71,15 @@ where
     F: Fn(&P::Label) -> &'static str,
 {
     let p = &session.provider;
-    let uid = |c| p.unit_id(c);
+    let strings = p.unit_ids_are_strings();
+    let uid = |c| -> Value {
+        let u = p.unit_id(c);
+        if strings {
+            json!(u.to_string())
+        } else {
+            json!(u)
+        }
+    };
     // With edits on the path, the units are the backend's originals; in a
     // sealed save every cluster in the artifacts is a unit.
     let n_units = if history.is_empty() {
@@ -73,7 +87,7 @@ where
     } else {
         p.n_clusters()
     };
-    let unit_ids: Vec<u32> = (0..n_units).map(|c| uid(sorrel_io::ClusterId(c))).collect();
+    let unit_ids: Vec<Value> = (0..n_units).map(|c| uid(sorrel_io::ClusterId(c))).collect();
 
     let mut tag_options = std::collections::BTreeSet::new();
     // Every unit has exactly one origin; SpikeInterface needs each used value
@@ -115,9 +129,12 @@ where
 
     let mut merges = Vec::new();
     let mut splits = Vec::new();
+    // SpikeInterface never reuses a split unit's id: the spikes left behind
+    // need a new one too. Take ids past every cluster the session has.
+    let mut next_free = session.n_clusters();
     let mut visit = |cmd: &CurationCommand| match cmd {
         CurationCommand::Merge { sources, target } => {
-            let mut ids: Vec<u32> = sources.iter().map(|&s| uid(s)).collect();
+            let mut ids: Vec<Value> = sources.iter().map(|&s| uid(s)).collect();
             ids.push(uid(*target));
             merges.push(json!({ "unit_ids": ids, "new_unit_id": uid(*target) }));
         }
@@ -126,12 +143,16 @@ where
             spike_idx,
             new_cluster,
             ..
-        } => splits.push(json!({
-            "unit_id": uid(*cluster),
-            "mode": "indices",
-            "indices": [spike_idx],
-            "new_unit_ids": [uid(*new_cluster)],
-        })),
+        } => {
+            let rest = uid(sorrel_io::ClusterId(next_free));
+            next_free += 1;
+            splits.push(json!({
+                "unit_id": uid(*cluster),
+                "mode": "indices",
+                "indices": [spike_idx],
+                "new_unit_ids": [uid(*new_cluster), rest],
+            }))
+        }
         _ => {}
     };
     for cmd in &history {

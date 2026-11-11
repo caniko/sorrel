@@ -876,8 +876,9 @@ mod tests {
         assert_eq!(doc["merges"][0]["new_unit_id"], 2);
         assert_eq!(doc["splits"][0]["unit_id"], 0);
         assert_eq!(doc["splits"][0]["indices"], serde_json::json!([[1]]));
-        // The journal placeholder (u32::MAX) was resolved to the allocated id.
-        assert_eq!(doc["splits"][0]["new_unit_ids"], serde_json::json!([3]));
+        // The journal placeholder (u32::MAX) was resolved to the allocated id;
+        // the spikes left in unit 0 get the next free id (SI never reuses 0).
+        assert_eq!(doc["splits"][0]["new_unit_ids"], serde_json::json!([3, 4]));
         assert_eq!(doc["removed"], serde_json::json!([]));
 
         let labels = read_curation_labels(&path, 4, |u| Some(u as usize)).unwrap();

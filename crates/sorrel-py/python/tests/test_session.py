@@ -52,7 +52,7 @@ def test_edit_save_reopen(phy_dir: Path) -> None:
     doc = s.curation()
     assert doc["format_version"] == "2"
     assert doc["merges"][0]["unit_ids"] == [1, 2]
-    assert doc["splits"][0]["new_unit_ids"] == [3]
+    assert doc["splits"][0]["new_unit_ids"] == [3, 4]
 
     out = s.save()
     assert (Path(out) / "cluster_group.tsv").read_text() == "cluster_id\tgroup\n0\tgood\n"

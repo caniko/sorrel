@@ -472,6 +472,12 @@ pub trait DataProvider: Send + Sync + 'static {
         cluster.0
     }
 
+    /// The backend stores unit ids as strings, so interchange files must
+    /// write `"7"` rather than `7` (SpikeInterface compares ids by type).
+    fn unit_ids_are_strings(&self) -> bool {
+        false
+    }
+
     /// Stable bytes identifying this provider's input data, not its path.
     ///
     /// Concrete file-backed providers should prefer content headers for

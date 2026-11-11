@@ -72,9 +72,23 @@ SortingAnalyzer, NWB and `rez.mat` sessions, the merges and splits made
 since the sort was loaded, so a SortingAnalyzer round trip is one call:
 
 ```python
+import sorrel
 import spikeinterface.curation as sc
-curated = sc.apply_curation(analyzer, "my_run/sorting_analyzer/curation.json")
+curated = sc.apply_curation(analyzer, sorrel.read_curation("my_run/sorting_analyzer"))
 ```
+
+`crates/sorrel-py/python/tests/test_si_curation.py` runs this against
+SpikeInterface in CI and checks every unit's spikes. Unit ids keep their
+SpikeInterface type (`"7"` stays a string). A merge keeps its target's id.
+SpikeInterface never reuses a split unit's id, so after a split the spikes
+that stay behind get the next free id too, not the original one.
+
+`apply_curation` applies the document in one pass against the sorter's
+units: labels, merges and at most one split per sorter unit that no merge
+touches. A history beyond that (a unit both merged and split, two splits of
+one unit, an edit to a unit Sorrel created) makes `apply_curation` raise a
+validation error rather than apply something else. Use the phy files or
+`export_phy` for those sessions.
 
 For phy directories the saved `spike_clusters.npy` already contains the
 merges and splits, so there `curation.json` is labels only and must not
