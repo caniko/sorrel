@@ -47,7 +47,11 @@ successful runs with identical configuration and repeat number are skipped.
 repeats of a session stay sequential. Use the same job count for comparative
 rounds and check memory before increasing it. Any failure stops new work;
 already active runs finish and are accounted for before the command returns
-an error. Per-run timeouts and cost caps still apply to each active model.
+an error. Per-run timeouts apply to every arm. `--max-budget-usd` caps the
+`mcp-review` arm (Claude receives the flag; OpenCode is stopped once its
+reported cost reaches it) and defaults to 10 USD. The `auto-llm` arm runs
+`sorrel auto`, whose LLM calls take no cap, so a capped run of that arm is
+refused; omit the flag to run it uncapped.
 
 `sorrel dev bench --bench /private/BENCH coverage --dev-limit 6` is a lead-only,
 dev-only boundary diagnostic. It fits the experimental robust majority-cleanup

@@ -84,8 +84,10 @@ enum BenchCmd {
         /// Commit of the pinned arm binary (required for reproducibility)
         #[arg(long)]
         sorrel_rev: String,
-        #[arg(long, default_value_t = 10.0)]
-        max_budget_usd: f64,
+        /// Per-run cost cap for the mcp-review arm (default 10 USD). The
+        /// auto-llm arm cannot enforce a cap and refuses one; omit it there
+        #[arg(long)]
+        max_budget_usd: Option<f64>,
         #[arg(long, default_value_t = 3600)]
         timeout: u64,
     },

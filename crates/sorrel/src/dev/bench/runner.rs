@@ -55,6 +55,26 @@ fn review_turns_ok(turns: u64, plumbing_check: bool) -> bool {
     turns >= if plumbing_check { 4 } else { 1 }
 }
 
+/// Default cap of the MCP arm, so omitting the flag never turns a review
+/// unbounded.
+const DEFAULT_CAP_USD: f64 = 10.0;
+
+/// The cap a run of `arm` can actually enforce. `sorrel auto` gives its LLM
+/// backend no per-call budget, so a capped auto-llm run is refused before any
+/// process starts instead of being silently billed past the limit.
+fn budget_cap(arm: Arm, max_budget_usd: Option<f64>) -> Result<f64> {
+    ensure!(
+        !matches!(arm, Arm::AutoLlm) || max_budget_usd.is_none(),
+        "the auto-llm arm runs `sorrel auto`, which cannot enforce --max-budget-usd; omit the flag to run it uncapped or use --arm mcp-review"
+    );
+    let cap = max_budget_usd.unwrap_or(DEFAULT_CAP_USD);
+    ensure!(
+        cap.is_finite() && cap > 0.0,
+        "--max-budget-usd must be finite and positive"
+    );
+    Ok(cap)
+}
+
 /// Bounded session-level parallelism. On an error, finish/account for work
 /// already in flight but start no further sessions or repeats. Per-run caps
 /// and timeouts still apply independently to each active subprocess.
@@ -148,10 +168,7 @@ impl Bench {
             "repeats and timeout must be positive"
         );
         ensure!((1..=8).contains(jobs), "--jobs must be in 1..=8");
-        ensure!(
-            max_budget_usd.is_finite() && *max_budget_usd > 0.0,
-            "per-run cap must be finite and positive"
-        );
+        let cap = budget_cap(*arm, *max_budget_usd)?;
         ensure!(
             sorrel_rev.len() >= 7 && sorrel_rev.bytes().all(|b| b.is_ascii_hexdigit()),
             "--sorrel-rev must name a commit"
@@ -273,7 +290,7 @@ impl Bench {
                                 &data,
                                 &prompt,
                                 model.as_deref(),
-                                *max_budget_usd,
+                                cap,
                                 duration,
                                 &env,
                             )?;
@@ -442,6 +459,20 @@ impl Bench {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_llm_refuses_a_cap_it_cannot_enforce() {
+        assert_eq!(budget_cap(Arm::McpReview, None).unwrap(), DEFAULT_CAP_USD);
+        assert_eq!(budget_cap(Arm::McpReview, Some(2.0)).unwrap(), 2.0);
+        assert!(budget_cap(Arm::McpReview, Some(0.0)).is_err());
+        let error = budget_cap(Arm::AutoLlm, Some(2.0)).unwrap_err().to_string();
+        assert!(
+            error.contains("auto-llm") && error.contains("--max-budget-usd"),
+            "{error}"
+        );
+        // No cap was requested, so the arm may run: sorrel auto is uncapped.
+        assert!(budget_cap(Arm::AutoLlm, None).is_ok());
+    }
 
     #[test]
     fn missing_override_unsets_inherited_prompt() {
