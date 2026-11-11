@@ -203,6 +203,11 @@ pub(crate) struct AllResult {
     /// provisional result carries the exact all-spike mean and extrema but no
     /// density images yet, so the pane can show the full mean immediately.
     pub raster_complete: bool,
+    /// Spikes extraction skipped while their trace window was still being
+    /// fetched. Such a result is never cached as complete: the fetch can land
+    /// after the skip but before the final `pending_fetches()` check, and the
+    /// skipped spikes would stay out of the mean and the raster for good.
+    pub unavailable: usize,
     /// Some trace bytes were still in flight when extraction ended. The
     /// result is usable (counts are honest) and the cache retries shortly.
     pub incomplete: bool,
@@ -559,6 +564,8 @@ struct Pass1Chunk {
     invalid: usize,
     out_of_range: usize,
     missing: usize,
+    /// Of `missing`, the spikes skipped while a trace fetch was in flight.
+    unavailable: usize,
     cancelled: bool,
 }
 
@@ -600,6 +607,9 @@ fn extract_pass1_chunk<P: DataProvider>(
             })
             .collect();
         session.provider.prefetch(&windows);
+        // A window this batch cannot serve may be in flight right now; the
+        // skip must not be final even if the fetch lands before the run ends.
+        let fetching = session.provider.pending_fetches() > 0;
         for &t in batch {
             if cancel.load(Ordering::Relaxed) {
                 out.cancelled = true;
@@ -627,6 +637,9 @@ fn extract_pass1_chunk<P: DataProvider>(
             ) {
                 out.invalid += 1;
                 out.missing += 1;
+                if fetching {
+                    out.unavailable += 1;
+                }
                 progress.invalid.fetch_add(1, Ordering::Relaxed);
                 progress.missing.fetch_add(1, Ordering::Relaxed);
                 local += 1;
@@ -708,6 +721,7 @@ fn merge_pass1(mut chunks: Vec<Pass1Chunk>, nc: usize, snippet_len: usize) -> Pa
         merged.invalid += chunk.invalid;
         merged.out_of_range += chunk.out_of_range;
         merged.missing += chunk.missing;
+        merged.unavailable += chunk.unavailable;
         merged.cancelled |= chunk.cancelled;
     }
     merged
@@ -755,7 +769,7 @@ fn run_all_emit<P: DataProvider>(
     // the mean, even if remote trace availability changes between passes.
     let mut valid_spikes = Vec::with_capacity(key.clusters.len());
     let (mut all_total, mut all_valid, mut all_invalid) = (0usize, 0usize, 0usize);
-    let (mut all_edge, mut all_missing) = (0usize, 0usize);
+    let (mut all_edge, mut all_missing, mut all_unavailable) = (0usize, 0usize, 0usize);
 
     // Pass 1: every valid spike for the mean and the true amplitude range.
     for &cluster in &key.clusters {
@@ -839,6 +853,7 @@ fn run_all_emit<P: DataProvider>(
         all_invalid += counts.invalid;
         all_edge += counts.out_of_range;
         all_missing += counts.missing;
+        all_unavailable += stats.unavailable;
         out.push(counts);
         progress.clusters_done.fetch_add(1, Ordering::Relaxed);
     }
@@ -869,6 +884,7 @@ fn run_all_emit<P: DataProvider>(
         missing: all_missing,
         drawn: 0,
         raster_failed: 0,
+        unavailable: all_unavailable,
         raster_complete: false,
         incomplete: false,
         cancelled: false,
@@ -928,8 +944,11 @@ fn run_all_emit<P: DataProvider>(
     if cancel.load(Ordering::Relaxed) {
         return cancelled(key, started, all_total);
     }
-    let incomplete =
-        (all_missing > 0 || raster_failed > 0) && session.provider.pending_fetches() > 0;
+    // A skip recorded while its fetch was in flight is never final: the fetch
+    // itself may land between that skip and this check, which would leave the
+    // mean and the raster short of that spike with no retry scheduled.
+    let incomplete = all_unavailable > 0
+        || ((all_missing > 0 || raster_failed > 0) && session.provider.pending_fetches() > 0);
     AllResult {
         clusters: out,
         render_channels: render_channels.clone(),
@@ -942,6 +961,7 @@ fn run_all_emit<P: DataProvider>(
         missing: all_missing,
         drawn: all_drawn,
         raster_failed,
+        unavailable: all_unavailable,
         raster_complete: true,
         incomplete,
         cancelled: false,
@@ -981,6 +1001,7 @@ fn cancelled(key: &AllKey, started: Instant, total: usize) -> AllResult {
         missing: 0,
         drawn: 0,
         raster_failed: 0,
+        unavailable: 0,
         raster_complete: false,
         incomplete: false,
         cancelled: true,
@@ -1662,6 +1683,99 @@ mod tests {
     }
 
     #[test]
+    fn a_fetch_landing_between_a_skip_and_the_final_check_keeps_the_result_incomplete() {
+        struct LandingFetch {
+            inner: StubProvider,
+            landed: AtomicBool,
+        }
+        impl DataProvider for LandingFetch {
+            type Label = u8;
+            fn sample_rate(&self) -> f32 {
+                self.inner.sample_rate()
+            }
+            fn n_channels(&self) -> u32 {
+                self.inner.n_channels()
+            }
+            fn n_samples(&self) -> SampleIndex {
+                self.inner.n_samples()
+            }
+            fn n_clusters(&self) -> u32 {
+                self.inner.n_clusters()
+            }
+            fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
+                self.inner.spike_times(c)
+            }
+            fn initial_labels(&self) -> Vec<u8> {
+                self.inner.initial_labels()
+            }
+            fn trace(&self, start: SampleIndex, len: u32) -> TraceSlice<'_> {
+                if self.landed.load(Ordering::Relaxed) {
+                    return self.inner.trace(start, len);
+                }
+                // The first spike's window is still being fetched. Touching any
+                // other window is the fetch landing, exactly as a remote
+                // provider completes it while extraction runs.
+                let fetched =
+                    self.inner.spikes[0][0].0 - super::super::waveform_window_samples(SR) as u64;
+                if start.0 == fetched {
+                    return TraceSlice {
+                        start,
+                        n_channels: NC as u32,
+                        samples: TraceSamples::F32(&[]),
+                    };
+                }
+                self.landed.store(true, Ordering::Relaxed);
+                self.inner.trace(start, len)
+            }
+            fn pending_fetches(&self) -> usize {
+                usize::from(!self.landed.load(Ordering::Relaxed))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open_or_create(&dir.path().join("journal"), 0, 1).unwrap();
+        let session = Session::new(
+            LandingFetch {
+                inner: provider_with_spikes(2),
+                landed: AtomicBool::new(false),
+            },
+            journal,
+        );
+        let key = all_key(&session, &[ClusterId(0)]);
+        let first = run_all(
+            &session,
+            &key,
+            &AllProgress::new(2, 1),
+            &AtomicBool::new(false),
+            None,
+        );
+        assert_eq!(first.missing, 1, "the still-fetching spike is skipped");
+        assert!(first.raster_complete);
+        assert!(
+            first.incomplete,
+            "a skip taken during an in-flight fetch cannot be cached as complete: \
+             the fetch landed before the final pending_fetches() check"
+        );
+        // The retry the flag schedules finds the landed bytes and the exact set.
+        let second = run_all(
+            &session,
+            &key,
+            &AllProgress::new(2, 1),
+            &AtomicBool::new(false),
+            None,
+        );
+        assert!(!second.incomplete);
+        assert_eq!(
+            (
+                second.valid,
+                second.drawn,
+                second.missing,
+                second.unavailable
+            ),
+            (2, 2, 0, 0)
+        );
+    }
+
+    #[test]
     fn a_cancelled_worker_returns_no_publishable_result() {
         let (session, _dir) = session(provider_with_spikes(20));
         let key = all_key(&session, &[ClusterId(0)]);
@@ -1760,6 +1874,7 @@ mod tests {
             missing: 0,
             drawn: 7,
             raster_failed: 0,
+            unavailable: 0,
             raster_complete: true,
             incomplete: false,
             cancelled: false,

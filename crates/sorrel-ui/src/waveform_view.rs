@@ -2311,6 +2311,7 @@ mod tests {
             missing: 0,
             drawn: 0,
             raster_failed: 0,
+            unavailable: 0,
             raster_complete: true,
             incomplete: false,
             cancelled: false,
