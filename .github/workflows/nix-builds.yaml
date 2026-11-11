@@ -26,7 +26,7 @@ jobs:
       matrix:
         include:
           - group: "checks"
-            installables: '[".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.default",".#checks.x86_64-linux.formatting",".#checks.x86_64-linux.hm-module",".#checks.x86_64-linux.workspace-tests",".#checks.x86_64-linux.binstall-metadata",".#checks.x86_64-linux.binstall-metadata-sorrel-remote"]'
+            installables: '[".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.default",".#checks.x86_64-linux.formatting",".#checks.x86_64-linux.hm-module",".#checks.x86_64-linux.workspace-tests",".#checks.x86_64-linux.sorrel-hdf5",".#checks.x86_64-linux.hdf5-tests",".#checks.x86_64-linux.binstall-metadata",".#checks.x86_64-linux.binstall-metadata-sorrel-remote"]'
     env:
       NIX_CONFIG: "experimental-features = nix-command flakes"
     steps:
@@ -132,7 +132,7 @@ jobs:
         run: |
           case "$SIMIT_NIX_GROUP" in
             checks)
-              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.default",".#checks.x86_64-linux.formatting",".#checks.x86_64-linux.hm-module",".#checks.x86_64-linux.workspace-tests",".#checks.x86_64-linux.binstall-metadata",".#checks.x86_64-linux.binstall-metadata-sorrel-remote"],"plan":[".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.default",".#checks.x86_64-linux.formatting",".#checks.x86_64-linux.hm-module",".#checks.x86_64-linux.workspace-tests",".#checks.x86_64-linux.binstall-metadata",".#checks.x86_64-linux.binstall-metadata-sorrel-remote"],"check_systems":["x86_64-linux"],"limits":[],"post_build":[],"post_build_always":[],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
+              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.default",".#checks.x86_64-linux.formatting",".#checks.x86_64-linux.hm-module",".#checks.x86_64-linux.workspace-tests",".#checks.x86_64-linux.sorrel-hdf5",".#checks.x86_64-linux.hdf5-tests",".#checks.x86_64-linux.binstall-metadata",".#checks.x86_64-linux.binstall-metadata-sorrel-remote"],"plan":[".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.default",".#checks.x86_64-linux.formatting",".#checks.x86_64-linux.hm-module",".#checks.x86_64-linux.workspace-tests",".#checks.x86_64-linux.sorrel-hdf5",".#checks.x86_64-linux.hdf5-tests",".#checks.x86_64-linux.binstall-metadata",".#checks.x86_64-linux.binstall-metadata-sorrel-remote"],"check_systems":["x86_64-linux"],"limits":[],"post_build":[],"post_build_always":[],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
               ;;
             *) echo 'Unknown Nix execution group' >&2; exit 1 ;;
           esac

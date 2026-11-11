@@ -712,9 +712,8 @@ impl DataProvider for SortingAnalyzerProvider {
         }
     }
 
-    /// Clusters created by sorrel splits (index past the analyzer's units)
-    /// get ids appended after the largest SI id, matching
-    /// `apply_curation(new_id_strategy="append")`.
+    /// Like [`crate::provider::appended_unit_id`], but new ids also clear
+    /// every SI string id that reads as a number.
     fn unit_id(&self, cluster: ClusterId) -> u32 {
         match self.unit_ids.get(cluster.idx()) {
             Some(&u) => u,

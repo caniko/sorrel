@@ -10,7 +10,7 @@ Sorrel reads several sorting and recording formats. The general rule:
 | --------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | Sorting   | phy / Kilosort directory                                 | First-class. Reads phy artefacts as-is.                                                                                         |
 | Sorting   | SpikeInterface `SortingAnalyzer` (binary folder)         | Reads `recording.json`, the flat sorting under `sorting/`, optional `probe.json`, and `extensions/quality_metrics/metrics.csv`. |
-| Sorting   | NWB                                                      | Requires `--features hdf5`. Reads `/units/spike_times` + `/general/extracellular_ephys/electrodes`.                             |
+| Sorting   | NWB                                                      | Requires `--features hdf5`. Reads `/units` and the first `ElectricalSeries`; see [NWB](integrations.md#nwb).                    |
 | Sorting   | Kilosort 4 `rez.mat`                                     | Requires `--features hdf5`. Reads `rez/st3`, `rez/ops/*`, `rez/xc`, `rez/yc`.                                                   |
 | Recording | SpikeGLX (`*.bin` + `*.meta`)                            | Use as `--dat`; pass `--spikeglx-meta` for sample rate / channels / dtype.                                                      |
 | Recording | Open Ephys binary (`continuous.dat` + `structure.oebin`) | Use as `--dat`; pass `--oebin` to inherit metadata.                                                                             |
