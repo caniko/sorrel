@@ -32,6 +32,7 @@
 # Project
 
 - [Code signing policy](./project/code-signing.md)
+- [Citing Sorrel](./project/citing.md)
 
 # Reference
 

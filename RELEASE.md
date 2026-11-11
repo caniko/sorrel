@@ -5,7 +5,9 @@ Every channel publishes from simit-generated GitHub Actions when a signed
 published by hand.
 
 1. Bump `[workspace.package] version`, move `[Unreleased]` to
-   `## [<version>] - YYYY-MM-DD` in `CHANGELOG.md`, and land it on trunk
+   `## [<version>] - YYYY-MM-DD` in `CHANGELOG.md`, set `version` and
+   `date-released` in `CITATION.cff` to match, regenerate the BibTeX in
+   `docs/src/project/citing.md` (commands there), and land it on trunk
    with green CI, prebuild and both Target smokes (`windows-2025` for x64,
    `windows-11-arm` for ARM64).
 2. Push a signed annotated tag on that commit. Release validation needs

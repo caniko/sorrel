@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use Sorrel in your work, please cite it using these metadata."
+type: software
+title: Sorrel
+abstract: >-
+  Sorrel is a native, high-performance GUI for manual curation of spike-sorted
+  electrophysiology data, with a headless CLI for the same operations. It
+  targets the phy workflow (cluster-by-cluster inspection, relabelling,
+  merging, and splitting) on a Rust core that is generic over a data provider,
+  with a wgpu-backed renderer.
+authors:
+  - family-names: Tartanoglu
+    given-names: Can H.
+version: 0.4.0
+date-released: "2026-11-03"
+license:
+  - MIT
+  - Apache-2.0
+repository-code: "https://github.com/caniko/sorrel"
+url: "https://sorrel.tartanoglu.com/"
+keywords:
+  - electrophysiology
+  - spike sorting
+  - manual curation
+  - phy
+  - Kilosort
+  - SpikeInterface
+  - neuroscience
+  - Rust
