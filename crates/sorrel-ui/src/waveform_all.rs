@@ -433,6 +433,12 @@ impl AllCache {
         if needs_job && self.job.is_none() {
             self.spawn::<P>(key, jobs, total);
         }
+        // No worker means no progress repaints: without this the retry waits
+        // for the next unrelated interaction and the incomplete mean stays up.
+        if let Some(at) = self.retry_at.filter(|_| self.job.is_none()) {
+            jobs.egui
+                .request_repaint_after(at.saturating_duration_since(Instant::now()));
+        }
     }
 }
 
@@ -1396,7 +1402,7 @@ mod tests {
         }
     }
 
-    fn session(provider: StubProvider) -> (Session<StubProvider>, tempfile::TempDir) {
+    fn session<P: DataProvider>(provider: P) -> (Session<P>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::open_or_create(&dir.path().join("journal"), 0, 1).unwrap();
         (Session::new(provider, journal), dir)
@@ -1682,55 +1688,60 @@ mod tests {
         );
     }
 
+    /// A provider whose first spike's trace window is still in flight until
+    /// another window is touched, exactly like a remote fetch landing while
+    /// extraction runs.
+    struct LandingFetch {
+        inner: StubProvider,
+        landed: AtomicBool,
+    }
+
+    impl DataProvider for LandingFetch {
+        type Label = u8;
+        fn sample_rate(&self) -> f32 {
+            self.inner.sample_rate()
+        }
+        fn n_channels(&self) -> u32 {
+            self.inner.n_channels()
+        }
+        fn n_samples(&self) -> SampleIndex {
+            self.inner.n_samples()
+        }
+        fn n_clusters(&self) -> u32 {
+            self.inner.n_clusters()
+        }
+        fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
+            self.inner.spike_times(c)
+        }
+        fn initial_labels(&self) -> Vec<u8> {
+            self.inner.initial_labels()
+        }
+        fn trace(&self, start: SampleIndex, len: u32) -> TraceSlice<'_> {
+            if self.landed.load(Ordering::Relaxed) {
+                return self.inner.trace(start, len);
+            }
+            // The first spike's window is still being fetched. Touching any
+            // other window is the fetch landing, exactly as a remote
+            // provider completes it while extraction runs.
+            let fetched =
+                self.inner.spikes[0][0].0 - super::super::waveform_window_samples(SR) as u64;
+            if start.0 == fetched {
+                return TraceSlice {
+                    start,
+                    n_channels: NC as u32,
+                    samples: TraceSamples::F32(&[]),
+                };
+            }
+            self.landed.store(true, Ordering::Relaxed);
+            self.inner.trace(start, len)
+        }
+        fn pending_fetches(&self) -> usize {
+            usize::from(!self.landed.load(Ordering::Relaxed))
+        }
+    }
+
     #[test]
     fn a_fetch_landing_between_a_skip_and_the_final_check_keeps_the_result_incomplete() {
-        struct LandingFetch {
-            inner: StubProvider,
-            landed: AtomicBool,
-        }
-        impl DataProvider for LandingFetch {
-            type Label = u8;
-            fn sample_rate(&self) -> f32 {
-                self.inner.sample_rate()
-            }
-            fn n_channels(&self) -> u32 {
-                self.inner.n_channels()
-            }
-            fn n_samples(&self) -> SampleIndex {
-                self.inner.n_samples()
-            }
-            fn n_clusters(&self) -> u32 {
-                self.inner.n_clusters()
-            }
-            fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
-                self.inner.spike_times(c)
-            }
-            fn initial_labels(&self) -> Vec<u8> {
-                self.inner.initial_labels()
-            }
-            fn trace(&self, start: SampleIndex, len: u32) -> TraceSlice<'_> {
-                if self.landed.load(Ordering::Relaxed) {
-                    return self.inner.trace(start, len);
-                }
-                // The first spike's window is still being fetched. Touching any
-                // other window is the fetch landing, exactly as a remote
-                // provider completes it while extraction runs.
-                let fetched =
-                    self.inner.spikes[0][0].0 - super::super::waveform_window_samples(SR) as u64;
-                if start.0 == fetched {
-                    return TraceSlice {
-                        start,
-                        n_channels: NC as u32,
-                        samples: TraceSamples::F32(&[]),
-                    };
-                }
-                self.landed.store(true, Ordering::Relaxed);
-                self.inner.trace(start, len)
-            }
-            fn pending_fetches(&self) -> usize {
-                usize::from(!self.landed.load(Ordering::Relaxed))
-            }
-        }
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::open_or_create(&dir.path().join("journal"), 0, 1).unwrap();
         let session = Session::new(
@@ -1772,6 +1783,74 @@ mod tests {
                 second.unavailable
             ),
             (2, 2, 0, 0)
+        );
+    }
+
+    /// Nothing repaints an idle pane while no worker runs, so `ensure` must
+    /// request the retry itself or the incomplete mean stays on screen until
+    /// the next unrelated interaction.
+    #[test]
+    fn an_idle_pane_is_woken_when_an_incomplete_result_is_due_for_retry() {
+        use std::sync::RwLock;
+
+        let (session, _dir) = session(LandingFetch {
+            inner: provider_with_spikes(2),
+            landed: AtomicBool::new(false),
+        });
+        let key = all_key(&session, &[ClusterId(0)]);
+        let egui = egui::Context::default();
+        let jobs = JobCtx {
+            session: Arc::new(RwLock::new(session)),
+            egui: egui.clone(),
+        };
+        let mut cache = AllCache::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cache.is_loading() || cache.current().is_none() {
+            assert!(Instant::now() < deadline, "the first result never landed");
+            cache.ensure(&key, &jobs, 2);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            cache.current().is_some_and(|result| result.incomplete),
+            "the first pass skipped the still-fetching spike"
+        );
+
+        // The worker's own repaint is its last act; let it land, then drain
+        // the queue so only the retry path can request a repaint.
+        std::thread::sleep(Duration::from_millis(20));
+        let clear = Instant::now() + Duration::from_secs(5);
+        while egui.has_requested_repaint() {
+            assert!(Instant::now() < clear, "repaint requests never cleared");
+            let _ = egui.run_ui(egui::RawInput::default(), |_| {});
+        }
+
+        // Not due yet, so nothing else will wake the pane: the retry deadline
+        // itself must be a scheduled repaint.
+        cache.ensure(&key, &jobs, 2);
+        assert!(
+            egui.has_requested_repaint(),
+            "the pane must be woken at the retry deadline, not on the next click"
+        );
+
+        // That wake-up lands past the deadline and completes the result.
+        std::thread::sleep(Duration::from_millis(500));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            cache.ensure(&key, &jobs, 2);
+            if !cache.is_loading() && cache.current().is_some_and(|result| !result.incomplete) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the retry never completed");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            cache.current().map(|result| (
+                result.valid,
+                result.drawn,
+                result.missing,
+                result.unavailable
+            )),
+            Some((2, 2, 0, 0))
         );
     }
 
