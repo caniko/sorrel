@@ -93,6 +93,7 @@ def test_units_round_trip(curated: Path, tmp_path: Path, write) -> None:
     assert df.loc[3, "origin"] == "Sorrel[Manual]"
     assert df.loc[0, "origin"].startswith("Auto[")
     assert {u: list(p) for u, p in df["parent_unit_ids"].items()} == {0: [], 2: [1], 3: [0]}
+    assert df.loc[2, "parent_unit_ids"].dtype.kind == "i"
     assert df.loc[2, "n_spikes"] == len(want[2])
     assert "by actor: human=" in description and "journal_xxh3=" in description
     assert ("sorrel-ephys", sorrel.__version__) in generated
@@ -105,6 +106,23 @@ def test_units_round_trip(curated: Path, tmp_path: Path, write) -> None:
     assert not serious, serious
     for m in messages:  # suggestions are allowed; show them with -s
         print(m.importance.name, m.check_function_name, m.location, m.message)
+
+
+def test_label_only_session(tmp_path: Path) -> None:
+    # No merge or split: every lineage row is empty, which hdmf cannot type.
+    d = tmp_path / "phy"
+    shutil.copytree(FIXTURE, d)
+    s = sorrel.Session.open(d)
+    s.set_label(0, "good")
+    s.save()
+    del s
+    out = tmp_path / "labels.nwb"
+    write_direct(d, out)
+    with NWBHDF5IO(out, "r") as io:
+        df = io.read().units.to_dataframe()
+    assert sorted(df.index) == [0, 1, 2]
+    assert df.loc[0, "quality"] == "good"
+    assert all(len(p) == 0 for p in df["parent_unit_ids"])
 
 
 def test_refuses_existing_units(curated: Path) -> None:

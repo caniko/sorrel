@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from hdmf.common import VectorData, VectorIndex
 from pynwb.misc import Units
 
 if TYPE_CHECKING:
@@ -123,44 +124,59 @@ def add_units_to_nwbfile(
         f"pure_manual={str(prov['pure_manual']).lower()}, "
         f"machine_anchored={str(prov['anchored']).lower()}."
     )
+    # Every column is built typed up front: hdmf cannot write a ragged
+    # column whose rows are all empty (a session without merges or splits
+    # has no parents), and add_unit turns appended ints into floats.
+    def ragged(name: str, rows: list, dtype: Any, doc: str) -> list:
+        data = VectorData(name=name, description=doc,
+                          data=np.array([x for r in rows for x in r], dtype=dtype))
+        offsets = np.cumsum([len(r) for r in rows], dtype=np.int64)
+        return [data, VectorIndex(name=f"{name}_index", data=offsets, target=data)]
+
+    rows = [qc[c] for c in clusters]
+    columns = [
+        *ragged(
+            "spike_times",
+            [np.asarray(session.spike_times(c), dtype=np.float64) / rate + starting_time
+             for c in clusters],
+            np.float64,
+            "Spike times in seconds: sample_index / sample_rate + starting_time.",
+        ),
+        VectorData(name="quality", description="Sorrel curation label: good, mua, noise or unsorted.",
+                   data=[labels[c] for c in clusters]),
+        VectorData(
+            name="origin",
+            description="How the unit was made: Auto[<sorter>] if the sorter produced it, "
+            "Sorrel[<method>] if a Sorrel split created it (Manual, Algo:<name>, LLM:<name>).",
+            data=[session.origin(c) for c in clusters],
+        ),
+        *ragged(
+            "parent_unit_ids",
+            [[session.unit_id(p) for p in session.parents(c)] for c in clusters],
+            np.int64,
+            "Unit ids this unit came from in Sorrel: the unit it was split from, or the "
+            "units merged into it. A parent with no spikes left has no row in this table.",
+        ),
+        *ragged(
+            "tags",
+            [session.tags(c) for c in clusters],
+            str,
+            "Sorrel tags: src:* is who last touched the unit, review:* asks for review, "
+            "split/tuned mark structural edits.",
+        ),
+        *(
+            VectorData(name=m, description=f"Sorrel QC metric. {METRIC_DESCRIPTIONS[m]}",
+                       data=[_metric(m, r.get(m)) for r in rows])
+            for m in metrics
+        ),
+    ]
     units = Units(
         name="units",
         description=f"{description} {summary}" if description else summary,
         resolution=1.0 / rate,
+        id=[session.unit_id(c) for c in clusters],
+        columns=columns,
     )
-    units.add_column("quality", "Sorrel curation label: good, mua, noise or unsorted.")
-    units.add_column(
-        "origin",
-        "How the unit was made: Auto[<sorter>] if the sorter produced it, "
-        "Sorrel[<method>] if a Sorrel split created it (Manual, Algo:<name>, LLM:<name>).",
-    )
-    units.add_column(
-        "parent_unit_ids",
-        "Unit ids this unit came from in Sorrel: the unit it was split from, or the "
-        "units merged into it. A parent with no spikes left has no row in this table.",
-        index=True,
-    )
-    units.add_column(
-        "tags",
-        "Sorrel tags: src:* is who last touched the unit, review:* asks for review, "
-        "split/tuned mark structural edits.",
-        index=True,
-    )
-    for m in metrics:
-        units.add_column(m, f"Sorrel QC metric. {METRIC_DESCRIPTIONS[m]}")
-
-    for c in clusters:
-        row = qc[c]
-        units.add_unit(
-            id=session.unit_id(c),
-            spike_times=np.asarray(session.spike_times(c), dtype=np.float64) / rate
-            + starting_time,
-            quality=labels[c],
-            origin=session.origin(c),
-            parent_unit_ids=[session.unit_id(p) for p in session.parents(c)],
-            tags=session.tags(c),
-            **{m: _metric(m, row.get(m)) for m in metrics},
-        )
     nwbfile.units = units
 
     entry = ("sorrel-ephys", __version__)
