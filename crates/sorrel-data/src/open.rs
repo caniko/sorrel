@@ -255,9 +255,21 @@ pub fn open_sorting_analyzer(
         let _ = std::fs::remove_file(&snapshot);
     }
     let labels = snapshot.exists().then_some(snapshot.as_path());
+    // A journal from before snapshots existed: its starting labels were the
+    // `curation.json` a save has since overwritten, and the journal records
+    // only new labels, so they are gone.
+    let unsnapshotted = path.exists() && labels.is_none();
     let provider = SortingAnalyzerProvider::open_with_labels(root, labels)?;
     let baseline = baseline_hash(&provider.identity_bytes());
     let journal = open_journal_locked(lock, opts, &path, baseline, provider.n_clusters())?;
+    if unsnapshotted && journal.n_records() > 0 {
+        log::warn!(
+            "{} predates label snapshots: it replays onto the labels last saved \
+             to curation.json, so undoing a relabel back past this session's \
+             start restores the saved label, not the original one",
+            path.display()
+        );
+    }
     let mut session = Session::new(provider, journal);
     // A new journal starts from the labels on disk now. A journal from
     // before snapshots existed starts from them too: the best left.
