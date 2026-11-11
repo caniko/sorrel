@@ -231,7 +231,8 @@ fn load_recording_json(root: &Path) -> Result<RecordingMeta> {
         if p.exists() {
             let text =
                 std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
-            return parse_recording_json(&text, &p);
+            // SI dumps these relative to the analyzer folder.
+            return parse_recording_json_at(&text, &p, root, 0);
         }
     }
     bail!(
@@ -240,14 +241,21 @@ fn load_recording_json(root: &Path) -> Result<RecordingMeta> {
     );
 }
 
+#[cfg(test)]
 fn parse_recording_json(text: &str, json_path: &Path) -> Result<RecordingMeta> {
-    parse_recording_json_at(text, json_path, 0)
+    let base = json_path.parent().unwrap_or(Path::new("."));
+    parse_recording_json_at(text, json_path, base, 0)
 }
 
-fn parse_recording_json_at(text: &str, json_path: &Path, depth: usize) -> Result<RecordingMeta> {
+/// Parse a recording description whose relative paths resolve against `base`.
+fn parse_recording_json_at(
+    text: &str,
+    json_path: &Path,
+    base: &Path,
+    depth: usize,
+) -> Result<RecordingMeta> {
     let v: serde_json::Value =
         serde_json::from_str(text).with_context(|| format!("parse {}", json_path.display()))?;
-    let base = json_path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let kwargs = v.get("kwargs").unwrap_or(&v);
     let Some(sample_rate) = kwargs.get("sampling_frequency").and_then(|x| x.as_f64()) else {
         // `rec.save(folder=...)` / `si.load(folder)` produce a
@@ -274,10 +282,11 @@ fn parse_recording_json_at(text: &str, json_path: &Path, depth: usize) -> Result
                     json_path.display()
                 )
             })?;
-        let binary_json = resolve_path(&base, Path::new(folder)).join("binary.json");
+        let folder = resolve_path(base, Path::new(folder));
+        let binary_json = folder.join("binary.json");
         let text = std::fs::read_to_string(&binary_json)
             .with_context(|| format!("read {}", binary_json.display()))?;
-        return parse_recording_json_at(&text, &binary_json, depth + 1);
+        return parse_recording_json_at(&text, &binary_json, &folder, depth + 1);
     };
     let sample_rate = sample_rate as f32;
     let n_channels = kwargs
@@ -310,7 +319,7 @@ fn parse_recording_json_at(text: &str, json_path: &Path, depth: usize) -> Result
         n_channels,
         dtype,
         file_paths,
-        base,
+        base: base.to_path_buf(),
         offset,
     })
 }
