@@ -167,10 +167,35 @@ pub(crate) fn sample_trains(
                 .iter()
                 .map(|t| in_chunks(t, chunks.as_deref()))
                 .collect();
-            return (chunks, kept);
+            return (chunks, thin_to_cap(kept, max));
         }
         budget = next_budget(budget, max, n);
     }
+}
+
+/// The cap is a hard bound: a burst denser than `max` inside a chunk the
+/// budget cannot shrink any further (down to one sample) still holds more
+/// spikes than advertised. Keep an evenly spaced `max` of the survivors,
+/// spread across the trains in proportion to their size.
+fn thin_to_cap(kept: Vec<Vec<SampleIndex>>, max: usize) -> Vec<Vec<SampleIndex>> {
+    let total: usize = kept.iter().map(Vec::len).sum();
+    if total <= max {
+        return kept;
+    }
+    let mut seen = 0usize;
+    kept.into_iter()
+        .map(|train| {
+            train
+                .into_iter()
+                .filter(|_| {
+                    // Bresenham selection: exactly `max` of `total`, in order.
+                    let pick = seen * max / total != (seen + 1) * max / total;
+                    seen += 1;
+                    pick
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// The budget after a pass kept `n > max` spikes: shrunk by the overshoot and
@@ -723,6 +748,21 @@ mod tests {
         assert!(in_chunks(&t, naive.as_deref()).len() > MAX_SPIKES);
         let (_, kept) = sample_trains(&[&t], n, MAX_SPIKES, 1600);
         assert!(kept[0].len() <= MAX_SPIKES, "kept {}", kept[0].len());
+    }
+
+    #[test]
+    fn a_burst_denser_than_the_cap_is_still_capped() {
+        // 250k coincident detections at one sample: no chunk set can thin
+        // them, so the budget bottoms out at one sample and the cap must
+        // still hold.
+        let n_samples = 1_000_000;
+        let t = vec![SampleIndex(500_000); 250_000];
+        let (_, kept) = sample_trains(&[&t], n_samples, MAX_SPIKES, 150_000);
+        assert!(
+            kept[0].len() <= MAX_SPIKES,
+            "kept {} over the hard cap",
+            kept[0].len()
+        );
     }
 
     #[test]
