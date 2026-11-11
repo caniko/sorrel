@@ -929,6 +929,124 @@ fn learn_predict_scores_roots_and_leaves_the_phy_folder_untouched() {
     );
 }
 
+/// A second curation of one recording: identical sorter input, different
+/// human labels, so the bench must ingest it with the same fingerprint.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+    }
+}
+
+#[test]
+fn two_curations_of_one_recording_extract_into_one_cv_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = tmp.path().join("scratch");
+    let s = |p: &Path| p.to_str().unwrap().to_owned();
+    for (name, seed) in [("rec-a", 11), ("rec-b", 12)] {
+        let dir = scratch.join(name);
+        write_fixture(&dir, seed);
+        std::fs::write(
+            dir.join("cluster_group.tsv"),
+            "cluster_id\tgroup\n0\tgood\n1\tnoise\n",
+        )
+        .unwrap();
+    }
+    copy_dir(&scratch.join("rec-a"), &scratch.join("rec-a-again"));
+    std::fs::write(
+        scratch.join("rec-a-again/cluster_group.tsv"),
+        "cluster_id\tgroup\n0\tnoise\n1\tgood\n",
+    )
+    .unwrap();
+    let bench = tmp.path().join("bench");
+    let (a, b, again) = (
+        s(&scratch.join("rec-a")),
+        s(&scratch.join("rec-b")),
+        s(&scratch.join("rec-a-again")),
+    );
+    ok(&sorrel(
+        tmp.path(),
+        &[
+            "dev",
+            "bench",
+            "--bench",
+            &s(&bench),
+            "add",
+            "--phy-curated",
+            "--dev",
+            &a,
+            &b,
+        ],
+    ));
+    ok(&sorrel(
+        tmp.path(),
+        &[
+            "dev",
+            "bench",
+            "--bench",
+            &s(&bench),
+            "add",
+            "--phy-curated",
+            "--dev",
+            "--recuration",
+            &again,
+        ],
+    ));
+    let out = tmp.path().join("learn");
+    ok(&sorrel(
+        tmp.path(),
+        &[
+            "dev",
+            "bench",
+            "--bench",
+            &s(&bench),
+            "learn-dataset",
+            "--out",
+            &s(&out),
+        ],
+    ));
+    let roots = read_table(&out, "roots");
+    let mut by_recording: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for sid in &roots.sids {
+        by_recording
+            .entry(roots.recordings[sid].as_str())
+            .or_default()
+            .push(sid);
+    }
+    assert_eq!(by_recording.len(), 2, "one recording id per recording");
+    let pair: Vec<String> = by_recording
+        .values()
+        .find(|sids| sids.len() == 2)
+        .expect("the re-curation shares its recording id")
+        .iter()
+        .map(|sid| (*sid).to_owned())
+        .collect();
+    assert_eq!(roots.sids.len(), 3, "two recordings, one re-curation");
+    let groups = sorrel_data::learn::cv::row_groups(
+        &roots.sids,
+        &roots.recordings,
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    let folds = sorrel_data::learn::cv::assign_folds(&groups, 2).unwrap();
+    let fold_of = |sid: &str| folds[roots.sids.iter().position(|s| s == sid).unwrap()];
+    assert_eq!(
+        fold_of(&pair[0]),
+        fold_of(&pair[1]),
+        "a re-curation changed folds"
+    );
+    assert_eq!(
+        folds
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        2,
+        "both recordings must fill both folds"
+    );
+}
+
 #[test]
 fn predict_scores_with_the_training_target_and_class_map() {
     let tmp = tempfile::tempdir().unwrap();

@@ -50,6 +50,10 @@ pub struct TableHeader {
     pub n_rows: usize,
     /// Session ids, indexed by the `sid_idx` column.
     pub sids: Vec<String>,
+    /// Recording id per session id: re-curations of one recording share it,
+    /// so cross-validation can keep them in one fold.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub recordings: BTreeMap<String, String>,
     /// Optional integer encoding of a column, e.g. `{"f_method": {"whole": 0}}`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub codes: BTreeMap<String, BTreeMap<String, i64>>,
@@ -72,6 +76,8 @@ pub struct Table {
     pub columns: Vec<String>,
     /// Session ids, indexed by `sid_idx` values.
     pub sids: Vec<String>,
+    /// Recording id per session id; see [`TableHeader::recordings`].
+    pub recordings: BTreeMap<String, String>,
     /// `n_rows × columns.len()` values, row-major.
     pub data: Vec<f32>,
     /// Integer encodings of any categorical columns.
@@ -86,6 +92,7 @@ impl PartialEq for Table {
             && self.target_version == other.target_version
             && self.columns == other.columns
             && self.sids == other.sids
+            && self.recordings == other.recordings
             && self.codes == other.codes
             && self.notes == other.notes
             && self.data.len() == other.data.len()
@@ -106,6 +113,7 @@ impl Table {
             target_version: None,
             columns,
             sids: Vec::new(),
+            recordings: BTreeMap::new(),
             data: Vec::new(),
             codes: BTreeMap::new(),
             notes: BTreeMap::new(),
@@ -204,6 +212,7 @@ impl Table {
         let mut out = Table::new(self.extractor_version.clone(), names.to_vec());
         out.target_version = self.target_version.clone();
         out.sids = self.sids.clone();
+        out.recordings = self.recordings.clone();
         out.codes = self.codes.clone();
         out.notes = self.notes.clone();
         out.data.reserve(n * names.len());
@@ -243,6 +252,7 @@ impl Table {
             columns: self.columns.clone(),
             n_rows: n,
             sids: self.sids.clone(),
+            recordings: self.recordings.clone(),
             codes: self.codes.clone(),
             notes: self.notes.clone(),
         })
@@ -343,6 +353,7 @@ impl Table {
             target_version: header.target_version,
             columns: header.columns,
             sids: header.sids,
+            recordings: header.recordings,
             data,
             codes: header.codes,
             notes: header.notes,

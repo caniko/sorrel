@@ -56,7 +56,8 @@ pub struct CvArgs {
     /// Merge one integer class into another: OLD=NEW (repeatable, one step)
     #[arg(long = "class-map", value_name = "OLD=NEW")]
     class_map: Vec<String>,
-    /// JSON `{"groups": {sid: group}}`; default: one group per sid
+    /// JSON `{"groups": {sid: group}}`; default: one group per recording.
+    /// Every session must be mapped when supplied
     #[arg(long, value_name = "FILE")]
     groups: Option<PathBuf>,
     #[arg(long, default_value_t = 5)]
@@ -549,7 +550,7 @@ fn select(data: &Path, a: TableArgs<'_>) -> Result<Selection> {
         a.target
     );
     let by_sid = a.groups.map(read_groups).transpose()?.unwrap_or_default();
-    let groups = row_groups(&sids, &by_sid);
+    let groups = row_groups(&sids, &table.recordings, &by_sid)?;
     ensure!(
         x.len() == y.len() * n_features,
         "feature matrix shape drifted during selection"
@@ -1913,6 +1914,7 @@ mod tests {
             .collect(),
         );
         t.sids = vec!["s0".into()];
+        t.recordings = [("s0".into(), "r0".into())].into();
         t.target_version = Some(TARGET_VERSION.into());
         t.push_row(&[0.0, 1.0, 2.0, f32::NAN, 0.9, 1.0, 7.0])
             .unwrap();
@@ -1963,6 +1965,7 @@ mod tests {
                 .collect(),
         );
         t.sids = vec!["s0".into()];
+        t.recordings = [("s0".into(), "r0".into())].into();
         t.target_version = Some(TARGET_VERSION.into());
         if documented {
             t.codes.insert(

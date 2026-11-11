@@ -248,6 +248,10 @@ impl Bench {
             let Some(mut table) = all else {
                 continue;
             };
+            table.recordings = sids
+                .iter()
+                .map(|sid| (sid.clone(), self.map.sessions[sid].fingerprint.clone()))
+                .collect();
             sort_rows(&mut table, row_keys(name));
             guard.prepare_dir(guard.root())?;
             table.save(guard.root(), name)?;

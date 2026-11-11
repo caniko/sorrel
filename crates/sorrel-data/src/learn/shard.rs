@@ -257,6 +257,7 @@ fn expand(name: &str, projected: &Table) -> Result<Table> {
     let mut out = Table::new(EXTRACTOR_VERSION, columns.clone());
     out.target_version = projected.target_version.clone();
     out.sids = projected.sids.clone();
+    out.recordings = projected.recordings.clone();
     out.codes = projected.codes.clone();
     out.notes = projected.notes.clone();
     let mut row = vec![f32::NAN; columns.len()];
@@ -529,6 +530,7 @@ pub fn join(name: &str, features: &Table, targets: &Table) -> Result<Table> {
     let mut out = Table::new(EXTRACTOR_VERSION, columns.clone());
     out.target_version = Some(TARGET_VERSION.to_owned());
     out.sids = features.sids.clone();
+    out.recordings = features.recordings.clone();
     // Metadata is partitioned by column ownership: a feature shard owns only
     // its id/f_* entries (old shards may still carry stale y_* copies) and
     // the target shard owns the y_* entries regenerated at labeling. Targets

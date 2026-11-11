@@ -1,7 +1,7 @@
 //! Grouped K-fold cross-validation and full-data fitting for the learned
 //! curator, on top of [`super::gbdt`].
 //!
-//! Folds are assigned to whole groups, never rows: sessions (or animals, when
+//! Folds are assigned to whole groups, never rows: recordings (or animals, when
 //! a groups file is supplied) must not straddle the train/test boundary, or a
 //! model can memorise a recording's quirks instead of learning curation.
 //! Assignment is deterministic and greedy-balanced: groups sorted by size
@@ -13,7 +13,7 @@
 //! Spearman. Feature importances are mean split gains across folds, so a
 //! feature that only one fold used does not rank like one all folds used.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -182,15 +182,75 @@ pub fn read_groups(path: &Path) -> Result<BTreeMap<String, String>> {
         .with_context(|| format!("read groups file {}", path.display()))?;
     let file: File = serde_json::from_str(&text)
         .with_context(|| format!("parse groups file {}", path.display()))?;
+    // An empty map would read as "no --groups" and skip the animal checks.
+    ensure!(
+        !file.groups.is_empty(),
+        "groups file {} maps no sessions",
+        path.display()
+    );
     Ok(file.groups)
 }
 
-/// Group name per row: the session id, unless `by_sid` maps it to a coarser
-/// group (an animal).
-pub fn row_groups(sid: &[String], by_sid: &BTreeMap<String, String>) -> Vec<String> {
-    sid.iter()
-        .map(|s| by_sid.get(s).cloned().unwrap_or_else(|| s.clone()))
-        .collect()
+/// Group name per row: the recording id, unless `by_sid` maps the session to a
+/// coarser group (an animal). Re-curations of one recording share its id, so
+/// they cannot land in different folds. A requested animal mapping must cover
+/// every session: falling back to the sid would turn an unmapped re-curation
+/// into its own group again.
+pub fn row_groups(
+    sids: &[String],
+    recordings: &BTreeMap<String, String>,
+    by_sid: &BTreeMap<String, String>,
+) -> Result<Vec<String>> {
+    let missing: BTreeSet<&str> = sids
+        .iter()
+        .filter(|sid| !recordings.contains_key(*sid))
+        .map(String::as_str)
+        .collect();
+    ensure!(
+        missing.is_empty(),
+        "the table has no recording id for session(s) {}; regenerate it with \
+         `sorrel dev bench learn-dataset` so re-curations of one recording share a fold",
+        missing.into_iter().collect::<Vec<_>>().join(", ")
+    );
+    if by_sid.is_empty() {
+        return Ok(sids.iter().map(|sid| recordings[sid].clone()).collect());
+    }
+    let mut unmapped: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for sid in sids {
+        if !by_sid.contains_key(sid) {
+            let recording = recordings[sid].as_str();
+            unmapped.entry(recording).or_default().insert(sid);
+        }
+    }
+    ensure!(
+        unmapped.is_empty(),
+        "the groups file maps no animal for recording(s) {}; map every session so one recording cannot span folds",
+        unmapped
+            .iter()
+            .map(|(rec, missing)| format!(
+                "{rec:?} ({})",
+                missing.iter().copied().collect::<Vec<_>>().join(", ")
+            ))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    // One recording must also agree with itself: two curations mapped to
+    // different animals would still be split by the animal grouping.
+    let mut group_of: BTreeMap<&str, &str> = BTreeMap::new();
+    for sid in sids {
+        let recording = recordings[sid].as_str();
+        let group = by_sid[sid].as_str();
+        if let Some(&other) = group_of.get(recording) {
+            ensure!(
+                other == group,
+                "recording {recording:?} has sessions in two animals ({other:?} and {group:?}); \
+                 one recording must stay in one group"
+            );
+        } else {
+            group_of.insert(recording, group);
+        }
+    }
+    Ok(sids.iter().map(|s| by_sid[s].clone()).collect())
 }
 
 /// Train on all but one fold at a time and score the held-out rows.
@@ -510,6 +570,63 @@ mod tests {
         assert_eq!(loads.iter().sum::<usize>(), groups.len());
         assert!(loads.iter().max().unwrap() - loads.iter().min().unwrap() <= 4);
         assert!(assign_folds(&groups, 8).is_err());
+    }
+
+    #[test]
+    fn re_curations_of_one_recording_share_a_fold_and_an_animal_needs_a_full_map() {
+        // Two curations of recording r1 and two of r2: four sessions, two
+        // recordings. Grouping by session would scatter r1 across folds.
+        let sids: Vec<String> = ["a1", "a2", "b1", "b2"].map(str::to_owned).to_vec();
+        let recordings: BTreeMap<String, String> =
+            [("a1", "r1"), ("a2", "r1"), ("b1", "r2"), ("b2", "r2")]
+                .map(|(sid, rec)| (sid.to_owned(), rec.to_owned()))
+                .into();
+        let groups = row_groups(&sids, &recordings, &BTreeMap::new()).unwrap();
+        assert_eq!(groups, ["r1", "r1", "r2", "r2"]);
+        // A table without recording ids (stale) is refused, not grouped by sid.
+        let mut stale = recordings.clone();
+        stale.remove("a2");
+        let error = row_groups(&sids, &stale, &BTreeMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("a2") && error.contains("learn-dataset"),
+            "{error}"
+        );
+        let folds = assign_folds(&groups, 2).unwrap();
+        assert_eq!(folds[0], folds[1], "a re-curation changed folds");
+        assert_eq!(folds[2], folds[3], "a re-curation changed folds");
+        assert_ne!(folds[0], folds[2]);
+
+        // Animal grouping: a partial map is refused, naming the recording and
+        // its unmapped session, instead of falling back to a session group.
+        let partial: BTreeMap<String, String> = [("a1".to_owned(), "animal-7".to_owned())].into();
+        let error = row_groups(&sids, &recordings, &partial)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("r1") && error.contains("a2"), "{error}");
+
+        // A recording mapped to two animals is refused too.
+        let split: BTreeMap<String, String> = [
+            ("a1".to_owned(), "animal-7".to_owned()),
+            ("a2".to_owned(), "animal-8".to_owned()),
+            ("b1".to_owned(), "animal-8".to_owned()),
+            ("b2".to_owned(), "animal-8".to_owned()),
+        ]
+        .into();
+        assert!(row_groups(&sids, &recordings, &split).is_err());
+
+        let complete: BTreeMap<String, String> = [
+            ("a1".to_owned(), "animal-7".to_owned()),
+            ("a2".to_owned(), "animal-7".to_owned()),
+            ("b1".to_owned(), "animal-8".to_owned()),
+            ("b2".to_owned(), "animal-8".to_owned()),
+        ]
+        .into();
+        assert_eq!(
+            row_groups(&sids, &recordings, &complete).unwrap(),
+            ["animal-7", "animal-7", "animal-8", "animal-8"]
+        );
     }
 
     #[test]
