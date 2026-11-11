@@ -61,6 +61,35 @@ fn group(command: &mut Command) {
     }
 }
 
+/// Kills and reaps the child's process tree when dropped, so an error while
+/// reading or logging its output cannot leave a backend running. Disarm it once
+/// the child is reaped: `stop` would otherwise signal a recycled pid.
+struct KillOnDrop(Option<Child>);
+
+impl KillOnDrop {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn child(&mut self) -> &mut Child {
+        self.0
+            .as_mut()
+            .expect("the guard is disarmed only after use")
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            stop(child);
+        }
+    }
+}
+
 fn capture(
     command: &mut Command,
     timeout: Duration,
@@ -74,18 +103,19 @@ fn capture(
         .stderr(err.try_clone()?)
         .stdin(Stdio::null());
     group(command);
-    let mut child = command.spawn().context("start subprocess")?;
+    let mut child = KillOnDrop::new(command.spawn().context("start subprocess")?);
     let start = Instant::now();
     let status = loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = child.child().try_wait()? {
             break Some(status);
         }
         if start.elapsed() >= timeout {
-            stop(&mut child);
+            stop(child.child());
             break None;
         }
         std::thread::sleep(Duration::from_millis(50));
     };
+    child.disarm();
     out.rewind()?;
     err.rewind()?;
     let mut stdout = Vec::new();
@@ -350,8 +380,12 @@ pub(super) fn review(
     }))?;
     c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(stderr);
     group(&mut c);
-    let mut child = c.spawn().context("start curation backend")?;
-    let stdout = child.stdout.take().context("backend has no stdout")?;
+    let mut child = KillOnDrop::new(c.spawn().context("start curation backend")?);
+    let stdout = child
+        .child()
+        .stdout
+        .take()
+        .context("backend has no stdout")?;
     let (tx, rx) = mpsc::channel();
     let reader = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
@@ -369,7 +403,7 @@ pub(super) fn review(
     loop {
         if start.elapsed() >= timeout {
             result.error = Some("timeout".into());
-            stop(&mut child);
+            stop(child.child());
             break;
         }
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -384,7 +418,7 @@ pub(super) fn review(
                 }
                 if result.cost >= cap {
                     result.error = Some("budget cap reached".into());
-                    stop(&mut child);
+                    stop(child.child());
                     break;
                 }
             }
@@ -393,7 +427,7 @@ pub(super) fn review(
         }
     }
     loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = child.child().try_wait()? {
             if !status.success() && result.error.is_none() {
                 result.error = Some(format!("backend exited {status}; inspect agent.stderr"));
             }
@@ -401,11 +435,12 @@ pub(super) fn review(
         }
         if start.elapsed() >= timeout {
             result.error.get_or_insert_with(|| "timeout".into());
-            stop(&mut child);
+            stop(child.child());
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    child.disarm();
     drop(rx);
     // stop() closes the complete process tree on Windows, including MCP hosts.
     let _ = reader.join();
@@ -451,6 +486,57 @@ mod tests {
         ])
         .env("SORREL_TEST_RAW_LOG_EXIT", code);
         c
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture, invoked only by kill_on_drop test"]
+    fn linger_fixture() {
+        let Some(marker) = std::env::var_os("SORREL_TEST_LINGER") else {
+            return;
+        };
+        fs::write(marker, b"up").unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    fn linger_child(marker: &Path) -> Command {
+        let mut c = Command::new(std::env::current_exe().unwrap());
+        c.args([
+            "--exact",
+            "dev::bench::process::tests::linger_fixture",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("SORREL_TEST_LINGER", marker);
+        c
+    }
+
+    #[test]
+    fn dropping_the_guard_kills_and_reaps_a_running_child() {
+        let d = tempfile::tempdir().unwrap();
+        let marker = d.path().join("up");
+        let mut guard = KillOnDrop::new(linger_child(&marker).spawn().unwrap());
+        let start = Instant::now();
+        while !marker.exists() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "fixture did not start");
+        let pid = guard.child().id().to_string();
+        // The fixture sleeps for a minute: returning quickly means the guard
+        // killed and reaped it instead of waiting for it to exit.
+        let dropped = Instant::now();
+        drop(guard);
+        assert!(dropped.elapsed() < Duration::from_secs(10));
+        #[cfg(unix)]
+        assert!(
+            !Command::new("kill")
+                .args(["-0", &pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success(),
+            "child survived the guard"
+        );
     }
 
     #[test]
