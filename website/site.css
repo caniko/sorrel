@@ -21,9 +21,9 @@ main > section,
 
 /* Nav: icon + wordmark lockup. */
 body .nav-brand { display: inline-flex; align-items: center; gap: .625rem; font-size: 1.125rem; font-weight: 700; text-transform: none; letter-spacing: -.01em; }
-body:has(.hero--split) .nav-brand::before { width: 1.75rem; height: 1.75rem; border-radius: .45rem; background: url("/sorrel.svg") center / contain no-repeat; }
+body .nav-brand::before { content: ""; width: 2.25rem; height: 2.25rem; border-radius: .5rem; background: url("/sorrel.svg") center / contain no-repeat; }
 body .nav-links a { font-size: 1rem; }
-body .nav-links .nav-primary { background: var(--sorrel-green); color: #0d1117; padding: .45rem 1rem; border-radius: .5rem; min-height: 0; font-weight: 650; }
+body .nav-links .nav-primary { background: var(--sorrel-green); color: #0d1117; padding: .45rem 1rem; border-radius: .5rem; min-height: 2.75rem; font-weight: 650; }
 body .nav-links .nav-primary:hover { color: #0d1117; filter: brightness(1.08); }
 
 /* Hero: centred copy over the product at nearly full width (plinth's split layout, restacked). */
@@ -31,44 +31,40 @@ body .nav-links .nav-primary:hover { color: #0d1117; filter: brightness(1.08); }
   position: relative;
   max-width: 1440px;
   margin: 0 auto;
-  padding: clamp(2rem, 3.5vw, 3.25rem) var(--sorrel-gutter) clamp(2rem, 4vw, 3rem);
+  padding: clamp(1.75rem, 3vw, 2.5rem) var(--sorrel-gutter) 1.5rem;
   grid-template-columns: minmax(0, 1fr);
   justify-items: center;
-  gap: clamp(1.75rem, 3vw, 2.75rem);
+  gap: 1.5rem;
   text-align: center;
   isolation: isolate;
 }
 .hero.hero--split::before {
   content: "";
   position: absolute;
-  inset: 0 -20%;
+  inset: 0;
   z-index: -1;
   pointer-events: none;
   /* Light from behind the product; every gradient fades out inside the box. */
   background:
-    radial-gradient(34% 22% at 50% 14%, color-mix(in srgb, var(--sorrel-green) 18%, transparent), transparent),
-    radial-gradient(38% 30% at 50% 66%, color-mix(in srgb, var(--sorrel-green) 40%, transparent), transparent),
-    radial-gradient(24% 22% at 72% 52%, color-mix(in srgb, var(--sorrel-blue) 30%, transparent), transparent),
-    radial-gradient(22% 20% at 30% 80%, color-mix(in srgb, var(--sorrel-orange) 16%, transparent), transparent);
+    radial-gradient(45% 30% at 50% 60%, color-mix(in srgb, var(--sorrel-green) 18%, transparent), transparent),
+    radial-gradient(30% 30% at 80% 70%, color-mix(in srgb, var(--sorrel-blue) 12%, transparent), transparent);
 }
 .hero-logo { display: none; }
-.hero--split .hero-copy { justify-items: center; max-width: 56rem; }
+.hero--split .hero-copy { justify-items: center; max-width: 56rem; gap: 1rem; }
+.hero-eyebrow { color: var(--sorrel-green); font-size: .8125rem; font-weight: 650; letter-spacing: .1em; text-transform: uppercase; }
 .hero.hero--split h1 {
-  font-size: clamp(2.75rem, 6.4vw, 6rem);
-  line-height: .98;
+  font-size: clamp(2.5rem, 5.2vw, 4.5rem);
+  line-height: 1.06;
   text-wrap: balance;
   font-weight: 750;
   letter-spacing: -.04em;
-  max-width: 14ch;
-  background: linear-gradient(180deg, #fff 38%, #9ad98a 62%, var(--sorrel-green) 92%);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  max-width: 24ch;
+  color: var(--pp-ink);
 }
-.hero--split .tagline { font-size: clamp(1.125rem, 1.5vw, 1.35rem); line-height: 1.55; color: var(--pp-ink-soft); max-width: 42rem; text-wrap: pretty; }
+.hero--split .tagline { font-size: 1.125rem; line-height: 1.55; color: var(--pp-ink-soft); max-width: 42rem; text-wrap: pretty; }
 .hero--split .subtitle { display: none; }
-.hero--split .hero-actions { justify-content: center; gap: .75rem; margin-top: .75rem; }
-.hero .btn { min-width: 11.5rem; text-align: center; padding: .9rem 1.6rem; border-radius: .6rem; font-size: 1.05rem; font-weight: 650; transition: transform .15s ease, box-shadow .15s ease; }
+.hero--split .hero-actions { justify-content: center; gap: .75rem; margin-top: .25rem; }
+.hero .btn { min-width: 10rem; text-align: center; padding: .75rem 1.5rem; border-radius: .5rem; font-size: 1rem; font-weight: 650; transition: transform .15s ease, box-shadow .15s ease; }
 .hero .btn-primary { background: var(--sorrel-green); color: #0d1117; box-shadow: 0 .75rem 2rem -0.75rem color-mix(in srgb, var(--sorrel-green) 70%, transparent); }
 .hero .btn-primary:hover { color: #0d1117; transform: translateY(-1px); box-shadow: 0 1rem 2.5rem -0.75rem var(--sorrel-green); }
 .hero .btn-secondary:hover { color: var(--pp-ink); border-color: var(--pp-ink-soft); }
@@ -81,13 +77,52 @@ body .nav-links .nav-primary:hover { color: #0d1117; filter: brightness(1.08); }
 .hero-media { position: relative; width: 100%; max-width: 1360px; }
 .hero-preview {
   width: 100%;
-  border-radius: 1rem;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+  border-radius: .75rem;
   border: 1px solid rgb(255 255 255 / .12);
   box-shadow:
-    0 0 0 8px rgb(255 255 255 / .03),
-    0 3rem 9rem -2rem color-mix(in srgb, var(--sorrel-green) 50%, transparent),
-    0 2rem 4rem -1rem rgb(0 0 0 / .75);
+    0 0 0 4px rgb(255 255 255 / .025),
+    0 1.5rem 4rem -1rem rgb(0 0 0 / .6);
 }
+
+/* No platform guess: the Windows shortcut is hidden unless the browser identifies Windows. */
+#windows-downloads:has([hidden]) { display: none; }
+main > #windows-downloads { padding-block: .75rem 0; }
+.windows-options { display: flex; justify-content: center; align-items: center; flex-wrap: wrap; gap: .75rem; font-size: .875rem; }
+.windows-options[hidden] { display: none; }
+.windows-options code { font-size: .8125rem; }
+
+/* The linked-view sequence is a single, large feature—not a tiny gallery thumbnail. */
+#workflow .screenshots-grid { grid-template-columns: minmax(0, 1fr); max-width: 1056px; margin-top: 1.5rem; margin-inline: auto; }
+#workflow .screenshot-slot img { aspect-ratio: 1140 / 650; object-fit: contain; }
+#workflow .lightbox-cue { font-size: .875rem; }
+
+/* Content bricks: authored workflow and compatibility list keep the page-wide measure. */
+#workflow .prose,
+#backends .prose { max-width: none; }
+#workflow .prose h2,
+#backends .prose h2 {
+  margin-top: 0;
+  font-size: clamp(2rem, 3.4vw, 2.75rem);
+  font-weight: 750;
+  letter-spacing: -.025em;
+}
+#workflow .prose > p:first-of-type { font-size: 1.125rem; max-width: 44rem; }
+
+/* Compatibility list: native disclosure rows keep every format reachable without JS. */
+#backends details { border-top: 1px solid var(--pp-line); }
+#backends details:last-of-type { border-bottom: 1px solid var(--pp-line); }
+#backends summary {
+  display: list-item;
+  min-height: 2.75rem;
+  padding-block: .75rem;
+  font-weight: 650;
+  cursor: pointer;
+}
+#backends summary span { color: var(--pp-ink-soft); font-family: var(--sorrel-mono); font-size: .8125rem; font-weight: 400; }
+#backends details p { margin: .25rem 0 1.25rem; max-width: 62rem; color: var(--pp-ink-soft); }
+#backends code { overflow-wrap: anywhere; }
 
 /* Section rhythm and headings. */
 main > section:not(.hero) { padding-block: clamp(3rem, 7vw, 6rem) 0; }
@@ -105,8 +140,8 @@ main h2 { text-wrap: balance; }
 .screenshot-slot:hover { transform: translateY(-3px); border-color: color-mix(in srgb, var(--sorrel-green) 55%, transparent); box-shadow: 0 1.5rem 3rem -1.5rem rgb(0 0 0 / .8); }
 .screenshot-slot figcaption { padding: 1rem 1.25rem 1.25rem; font-size: 1rem; color: var(--pp-ink-soft); }
 
-/* Cards: four a row, so 8 features and 4 backends fill whole rows. */
-.hero--split ~ .features .features-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+/* Cards: three a row, so six benefits fill both rows without orphans. */
+.hero--split ~ .features .features-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .install-routes { grid-template-columns: minmax(0, 1fr); }
 .hero--split ~ .features .feature-card { padding: 1.25rem 0 0; border: 0; border-top: 1px solid var(--pp-line); border-radius: 0; background: none; }
 .hero--split ~ .features .features-grid { column-gap: 2rem; row-gap: 2.25rem; }
@@ -117,20 +152,72 @@ main h2 { text-wrap: balance; }
 
 footer { margin-top: clamp(4rem, 8vw, 7rem); }
 
+.hero:not(.hero--split) { max-width: var(--sorrel-wrap); margin-inline: auto; padding: 3rem var(--sorrel-gutter) 0; }
+.hero:not(.hero--split) h1 { font-size: clamp(2.5rem, 5vw, 4rem); max-width: 20ch; line-height: 1.08; letter-spacing: -.035em; }
+.hero:not(.hero--split) .tagline { max-width: 42rem; font-size: 1.125rem; color: var(--pp-ink-soft); }
+body:not(:has(.hero--split)) .install-routes { grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr)); }
+
+/* Wide screens: compact editorial band. Headline left; tagline, actions and note right.
+   The workspace stays full width underneath, so product evidence comes first. */
+@media (min-width: 1000px) {
+  .hero.hero--split {
+    justify-items: stretch;
+    padding-top: clamp(1.5rem, 2.5vw, 2rem);
+    gap: 1.25rem;
+    text-align: left;
+  }
+  .hero--split .hero-copy {
+    display: grid;
+    width: 100%;
+    max-width: none;
+    grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+    grid-template-areas:
+      "eyebrow eyebrow"
+      "headline tagline"
+      "headline actions"
+      "headline note";
+    align-items: start;
+    justify-items: start;
+    column-gap: clamp(2rem, 5vw, 5rem);
+    row-gap: .875rem;
+    text-align: left;
+  }
+  .hero-eyebrow { grid-area: eyebrow; }
+  .hero--split h1 {
+    grid-area: headline;
+    align-self: center;
+    max-width: 20ch;
+    font-size: clamp(2.5rem, 4.5vw, 4rem);
+  }
+  .hero--split .tagline { grid-area: tagline; max-width: 34rem; font-size: 1.0625rem; }
+  .hero--split .hero-actions { grid-area: actions; justify-content: flex-start; flex-wrap: wrap; margin-top: 0; }
+  .hero--split .hero-note { grid-area: note; }
+}
+
 @media (max-width: 1100px) {
   .hero--split ~ .features .features-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+@media (max-width: 900px) {
+  .secondary-routes { grid-template-columns: minmax(0, 1fr); }
+}
 @media (max-width: 700px) {
-  .hero.hero--split h1 { font-size: 2.75rem; }
+  body:not(:has(.nav-menu)) .nav-inner { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: .5rem 0; }
+  body:not(:has(.nav-menu)) .nav-brand { grid-column: 1 / 4; grid-row: 1; }
+  body:not(:has(.nav-menu)) .nav-links { display: contents; }
+  body:not(:has(.nav-menu)) .nav-links a { display: block; grid-column: span 2; min-height: 2.75rem; padding: .625rem .25rem; text-align: center; font-size: .875rem; }
+  body:not(:has(.nav-menu)) .nav-links .nav-primary { grid-column: 4 / -1; grid-row: 1; justify-self: end; padding-inline: 1rem; }
+  .hero.hero--split h1 { font-size: 2.5rem; }
   .hero--split .tagline { font-size: 1.0625rem; line-height: 1.5; }
   .hero--split .hero-actions .btn-secondary { display: inline-block; }
-  .hero--split .hero-note { display: block; font-size: .65rem; word-spacing: 0; white-space: nowrap; }
+  .hero--split .hero-note { display: block; font-size: .75rem; word-spacing: 0; }
   .hero--split .hero-actions .btn { width: 100%; }
   .hero.hero--split { text-align: left; justify-items: stretch; }
   .hero--split .hero-copy { justify-items: start; }
   .hero--split .hero-actions { justify-self: stretch; }
+  .hero-preview { aspect-ratio: 4 / 5; }
+  .windows-options { justify-content: flex-start; }
   .screenshots-grid { grid-template-columns: minmax(0, 1fr); }
-  .hero--split ~ .features .features-grid { column-gap: 1.25rem; }
+  .hero--split ~ .features .features-grid { grid-template-columns: minmax(0, 1fr); column-gap: 1.25rem; }
   .hero--split ~ .features .feature-card { display: block; min-height: 0; padding: 1rem 0 0; }
   .hero--split ~ .features .feature-index { display: none; }
   .hero--split ~ .features .feature-card p { font-size: .9375rem; }
