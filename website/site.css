@@ -143,6 +143,8 @@ main h2 { text-wrap: balance; }
 /* Cards: three a row, so six benefits fill both rows without orphans. */
 .hero--split ~ .features .features-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .install-routes { grid-template-columns: minmax(0, 1fr); }
+/* Platform-filtered route cards (platform.js hides the Windows ones off Windows). */
+.install-routes article[hidden], .secondary-routes article[hidden] { display: none; }
 .hero--split ~ .features .feature-card { padding: 1.25rem 0 0; border: 0; border-top: 1px solid var(--pp-line); border-radius: 0; background: none; }
 .hero--split ~ .features .features-grid { column-gap: 2rem; row-gap: 2.25rem; }
 .hero--split ~ .features .feature-card p { font-size: 1rem; line-height: 1.55; }

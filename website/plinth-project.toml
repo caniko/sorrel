@@ -173,6 +173,8 @@ html = '''
     <figcaption>The viewer plays the linked-selection sequence; with reduced motion it shows this still.</figcaption>
   </figure>
 </div>
+<!-- Plinth's lightbox opens the image but leaves the anchor's href to navigate; cancel it here until Plinth ships the fix. The href stays for the no-JS fallback. -->
+<script>document.addEventListener('click', event => { if (event.target.closest('a[data-lightbox-image]')) event.preventDefault(); });</script>
 '''
 
 [[pages.sections]]
@@ -309,6 +311,13 @@ primary = true
 [[pages.sections.ctas]]
 label = "Installation guide"
 href = "/docs/getting-started/installation.html"
+
+[[pages.sections]]
+type = "content"
+id = "platform"
+html = '''
+<script src="/platform.js" defer></script>
+'''
 
 [[pages.sections]]
 type = "install"
