@@ -19,6 +19,7 @@ pub mod feature_subspace;
 pub mod host;
 pub mod instance;
 pub mod journal;
+pub mod learn;
 pub mod open;
 #[cfg(feature = "phy-export")]
 pub mod phy_export;

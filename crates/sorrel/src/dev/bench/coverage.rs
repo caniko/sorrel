@@ -38,7 +38,7 @@ fn jaccard(intersection: usize, predicted: usize, truth: usize) -> f64 {
 
 /// Session globals are time-sorted with cluster-ID tie breaking; NPY rows
 /// need not be. Never silently compare these two index spaces directly.
-fn aligned_truth(
+pub(super) fn aligned_truth(
     rows: &[Option<u32>],
     truth: &[u32],
     input_roots: &[u32],
@@ -48,19 +48,19 @@ fn aligned_truth(
         rows.len() == truth.len()
             && input_roots.len() == truth.len()
             && session_roots.len() == truth.len(),
-        "coverage row-map lengths differ"
+        "truth row-map lengths differ"
     );
     let mut seen = vec![false; truth.len()];
     let mut aligned = Vec::with_capacity(truth.len());
     for (global, row) in rows.iter().enumerate() {
-        let row = row.context("coverage needs a complete original NPY-row map")? as usize;
+        let row = row.context("truth needs a complete original NPY-row map")? as usize;
         ensure!(
             row < truth.len() && !seen[row],
-            "coverage row map is not a permutation"
+            "truth row map is not a permutation"
         );
         ensure!(
             input_roots[row] == session_roots[global],
-            "coverage row map disagrees with the input cluster"
+            "truth row map disagrees with the input cluster"
         );
         seen[row] = true;
         aligned.push(truth[row]);
@@ -420,6 +420,7 @@ mod tests {
                     pure_manual: false,
                     keep: vec![],
                     fingerprint: String::new(),
+                    recuration_of: None,
                 },
             );
         }

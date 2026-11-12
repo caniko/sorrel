@@ -2,6 +2,7 @@
 //! enter the results database. No external Python runner is used.
 
 mod coverage;
+mod learn;
 mod process;
 mod reporting;
 mod runner;
@@ -10,9 +11,12 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sorrel_data::learn::features::{ExtractData, Truth};
+use sorrel_data::learn::shard::{InputFile, InputManifest};
+use sorrel_io::kilosort::read_cluster_group_tsv;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,6 +34,24 @@ pub struct BenchArgs {
     scorer: Option<PathBuf>,
     #[command(subcommand)]
     cmd: BenchCmd,
+}
+
+/// Arguments of `learn-dataset`, filled from the clap variant below.
+#[derive(Debug)]
+pub struct LearnDatasetArgs {
+    /// Output directory (tables and `shards/`; must not be inside a session)
+    pub out: PathBuf,
+    /// Extract at most this many dev sessions (deterministic first-N cohort)
+    pub dev_limit: Option<usize>,
+    /// Concurrent sessions (1-8)
+    pub jobs: usize,
+    /// Upper bound on `spikes` rows per root
+    pub max_spikes_per_root: usize,
+    /// Extraction seed (recorded; the extractor itself is deterministic)
+    pub seed: u64,
+    /// Recompute only truth targets from stored features; no proposers, no
+    /// feature work, and the raw recording is not opened
+    pub retarget: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -57,6 +79,10 @@ enum BenchCmd {
         dev: bool,
         #[arg(long)]
         phy_curated: bool,
+        /// A second human curation of a recording already in dev: ingest it
+        /// as an extra dev session instead of skipping it as a duplicate
+        #[arg(long, requires = "dev")]
+        recuration: bool,
     },
     /// Run one arm on fresh copies; OpenCode gets only the sorrel MCP tools
     Run {
@@ -118,6 +144,27 @@ enum BenchCmd {
         dev_limit: usize,
         #[arg(long, value_enum, default_value = "robust")]
         method: CoverageMethod,
+    },
+    /// DEV only: extract the learned curator's feature/target tables
+    LearnDataset {
+        /// Output directory (tables and `shards/`; must not be inside a session)
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+        /// Extract at most this many dev sessions (deterministic first-N cohort)
+        #[arg(long)]
+        dev_limit: Option<usize>,
+        /// Concurrent sessions (1-8)
+        #[arg(long, default_value_t = 1)]
+        jobs: usize,
+        /// Upper bound on `spikes` rows per root
+        #[arg(long, default_value_t = 1500)]
+        max_spikes_per_root: usize,
+        /// Extraction seed (recorded; the extractor itself is deterministic)
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Recompute only truth targets from stored features (no proposers)
+        #[arg(long)]
+        retarget: bool,
     },
 }
 
@@ -194,6 +241,10 @@ struct SessionEntry {
     /// Input-only hash: duplicate recordings cannot straddle dev and holdout.
     #[serde(default)]
     fingerprint: String,
+    /// The dev session whose recording this is a second curation of; group
+    /// both together in cross-validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recuration_of: Option<String>,
 }
 
 struct Bench {
@@ -255,6 +306,52 @@ fn is_link(metadata: &fs::Metadata) -> bool {
     {
         metadata.file_type().is_symlink()
     }
+}
+
+/// Canonical path of `path`, resolving existing ancestors even when the leaf
+/// does not exist yet. Nothing is created.
+pub(super) fn canonical_target(path: &Path) -> Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut missing = Vec::new();
+    let mut current = path.as_path();
+    loop {
+        if current.exists() {
+            let mut resolved = current.canonicalize()?;
+            for part in missing.iter().rev() {
+                resolved.push(part);
+            }
+            return Ok(normalize(resolved));
+        }
+        let name = current
+            .file_name()
+            .with_context(|| format!("{} has no existing ancestor", path.display()))?;
+        missing.push(name.to_owned());
+        current = current
+            .parent()
+            .with_context(|| format!("{} has no existing ancestor", path.display()))?;
+    }
+}
+
+/// Lexically resolve `.` and `..` in an already-canonical prefix. Missing tail
+/// components cannot be symlinks, so removing `..` there cannot change which
+/// filesystem directory a later write reaches.
+fn normalize(path: PathBuf) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 fn discover(root: &Path, integer_ids: bool) -> Result<Vec<Candidate>> {
@@ -441,13 +538,61 @@ impl Bench {
         Ok(())
     }
 
-    fn add(&mut self, paths: Vec<PathBuf>, force_dev: bool, phy: bool) -> Result<()> {
+    /// The dev session a re-curation with this input `fingerprint` and
+    /// `truth` belongs to, or `None` when a session already holds this exact
+    /// truth. A recording with any holdout session is refused: its second
+    /// curation would put the sealed truth's recording in dev.
+    fn recuration_target(&self, fingerprint: &str, truth: &Path) -> Result<Option<String>> {
+        let same: Vec<_> = self
+            .map
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.fingerprint == fingerprint)
+            .collect();
+        ensure!(
+            !same.is_empty(),
+            "--recuration: this recording is not in the bench yet; add it without --recuration"
+        );
+        ensure!(
+            same.iter().all(|(_, s)| s.split == Split::Dev),
+            "--recuration: this recording is in holdout; promote it with `add --dev` first"
+        );
+        // Either truth file may be absent (phy saved no labels or no splits).
+        let read = |dir: &Path| {
+            ["spike_clusters.npy", "cluster_group.tsv"].map(|name| fs::read(dir.join(name)).ok())
+        };
+        let incoming = read(truth);
+        for (sid, _) in &same {
+            if read(&self.session(sid).join("truth")) == incoming {
+                return Ok(None);
+            }
+        }
+        let original = same
+            .iter()
+            .find(|(_, s)| s.recuration_of.is_none())
+            .unwrap_or(&same[0]);
+        Ok(Some(original.0.clone()))
+    }
+
+    fn add(
+        &mut self,
+        paths: Vec<PathBuf>,
+        force_dev: bool,
+        phy: bool,
+        recuration: bool,
+    ) -> Result<()> {
         ensure!(phy, "native intake currently requires --phy-curated");
         let mut added = 0;
         let mut skipped = 0;
         for path in paths {
             let path = path.canonicalize()?;
-            if let Some((sid, entry)) = self.map.sessions.iter().find(|(_, s)| s.path == path) {
+            // A re-curation may reuse a known path; the fingerprint/truth checks decide.
+            if let Some((sid, entry)) = self
+                .map
+                .sessions
+                .iter()
+                .find(|(_, s)| !recuration && s.path == path)
+            {
                 let sid = sid.clone();
                 if force_dev && entry.split == Split::Holdout {
                     self.promote(&sid)?;
@@ -482,7 +627,16 @@ impl Bench {
                 .context("new-session describe preflight failed")?;
             let pure = provenance["pure_manual"] == true && provenance["anchored"] != true;
             let fingerprint = input_hash(&input)?;
-            if let Some((sid, entry)) = self
+            let mut recuration_of = None;
+            if recuration {
+                match self.recuration_target(&fingerprint, &truth)? {
+                    Some(sid) => recuration_of = Some(sid),
+                    None => {
+                        skipped += 1;
+                        continue;
+                    }
+                }
+            } else if let Some((sid, entry)) = self
                 .map
                 .sessions
                 .iter()
@@ -517,6 +671,7 @@ impl Bench {
                     pure_manual: pure,
                     keep,
                     fingerprint,
+                    recuration_of,
                 },
             );
             self.save_map()?;
@@ -597,6 +752,119 @@ fn input_hash(input: &Path) -> Result<String> {
     Ok(h.finalize().to_hex().to_string())
 }
 
+/// Read the truth in `truth_dir`, align it through the stored row map and hash
+/// it. Shared by `learn-dataset` and `learn predict`; the caller decides
+/// whether a truth directory is present at all.
+pub(super) fn load_truth(truth_dir: &Path, data: &ExtractData) -> Result<(Truth, String, f64)> {
+    let started = std::time::Instant::now();
+    let truth_rows = sorrel_io::npy::read_1d_u32(&truth_dir.join("spike_clusters.npy"))?;
+    ensure!(
+        truth_rows.len() == data.root_of_spike.len(),
+        "{}: truth has {} spikes, session {}",
+        truth_dir.display(),
+        truth_rows.len(),
+        data.root_of_spike.len()
+    );
+    // The row map and session roots were validated against the input roots at
+    // extraction time; rebuild the original-order roots from them so a
+    // retarget never has to open the input.
+    let mut input_roots = vec![u32::MAX; truth_rows.len()];
+    for (global, row) in data.row_map.iter().enumerate() {
+        let row = row.context("truth needs a complete original NPY-row map")? as usize;
+        ensure!(
+            row < input_roots.len() && input_roots[row] == u32::MAX,
+            "{}: stored NPY-row map is not a permutation",
+            truth_dir.display()
+        );
+        input_roots[row] = data.session_roots[global];
+    }
+    let cluster = coverage::aligned_truth(
+        &data.row_map,
+        &truth_rows,
+        &input_roots,
+        &data.session_roots,
+    )?;
+    let labels = read_cluster_group_tsv(&truth_dir.join("cluster_group.tsv"))
+        .context("dev truth labels missing or unreadable")?;
+    let hash = sorrel_data::devdb::truth_hash(truth_dir)?;
+    Ok((
+        Truth { cluster, labels },
+        hash,
+        started.elapsed().as_secs_f64(),
+    ))
+}
+
+/// Files at or below this size are hashed in full for a feature-key manifest.
+const MANIFEST_FULL_MAX: u64 = 8 << 20;
+/// Large files contribute their size plus a digest of this many bytes at each
+/// end. See [`InputManifest`] for why.
+const MANIFEST_EDGE: u64 = 1 << 20;
+
+/// Content identity of the files a feature extraction will consume, for the
+/// feature key.
+///
+/// `input_hash` above stays exactly as it was: it is the legacy key that
+/// feature shards from earlier builds recorded, and a new build must still be
+/// able to recognise (and warn about) those shards. The manifest is the
+/// superset that also covers amplitudes, PC features, `params.py`, probe
+/// geometry, templates, similarity and the recording length. `names` is the
+/// bench's blind allowlist, exactly what `copy_input` places in the temporary
+/// input the extractor opens (the sealed session also holds sorrel journals,
+/// which are not consumed).
+fn input_manifest(input: &Path, names: &[String]) -> Result<InputManifest> {
+    let mut files = Vec::with_capacity(names.len());
+    for name in names {
+        ensure!(
+            Path::new(name).components().count() == 1,
+            "input allowlist entry {name:?} is not a plain file name"
+        );
+        let path = input.join(name);
+        let meta = fs::symlink_metadata(&path)
+            .with_context(|| format!("session input file {}", path.display()))?;
+        ensure!(
+            meta.file_type().is_file() && !is_link(&meta),
+            "session input {} is not a regular file; the manifest cannot identify it",
+            path.display()
+        );
+        files.push(input_file(path, name.clone(), meta.len())?);
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(InputManifest { files })
+}
+
+fn input_file(path: PathBuf, name: String, size: u64) -> Result<InputFile> {
+    let mut h = blake3::Hasher::new();
+    let sampled = size > MANIFEST_FULL_MAX;
+    if sampled {
+        // Size plus both edges, never mtime: a bench copy legitimately gets a
+        // fresh mtime while keeping the same bytes.
+        h.update(&size.to_le_bytes());
+        let mut f = fs::File::open(&path)?;
+        let mut buf = vec![0; MANIFEST_EDGE as usize];
+        f.read_exact(&mut buf)?;
+        h.update(&buf);
+        f.seek(SeekFrom::Start(size - MANIFEST_EDGE))?;
+        f.read_exact(&mut buf)?;
+        h.update(&buf);
+    } else {
+        let mut f = fs::File::open(&path)?;
+        let mut buf = vec![0; 1 << 20];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
+    }
+    Ok(InputFile {
+        name,
+        size,
+        sampled,
+        digest: h.finalize().to_hex().to_string(),
+    })
+}
+
 pub(super) fn run(a: &BenchArgs, db: Option<&Path>) -> Result<()> {
     if let BenchCmd::Discover {
         root,
@@ -630,12 +898,13 @@ pub(super) fn run(a: &BenchArgs, db: Option<&Path>) -> Result<()> {
             integer_ids,
             dev,
             phy_curated,
+            recuration,
         } => {
             let mut paths = sessions.clone();
             for root in roots {
                 paths.extend(discover(root, *integer_ids)?.into_iter().map(|c| c.path));
             }
-            b.add(paths, *dev, *phy_curated)?;
+            b.add(paths, *dev, *phy_curated, *recuration)?;
         }
         BenchCmd::Status => {
             for split in [Split::Dev, Split::Holdout] {
@@ -658,6 +927,21 @@ pub(super) fn run(a: &BenchArgs, db: Option<&Path>) -> Result<()> {
         }
         BenchCmd::Run { .. } => b.run_arm(&a.cmd)?,
         BenchCmd::Coverage { dev_limit, method } => b.coverage(*dev_limit, *method)?,
+        BenchCmd::LearnDataset {
+            out,
+            dev_limit,
+            jobs,
+            max_spikes_per_root,
+            seed,
+            retarget,
+        } => b.learn_dataset(&LearnDatasetArgs {
+            out: out.clone(),
+            dev_limit: *dev_limit,
+            jobs: *jobs,
+            max_spikes_per_root: *max_spikes_per_root,
+            seed: *seed,
+            retarget: *retarget,
+        })?,
         BenchCmd::Score {
             split,
             match_jaccard,
@@ -716,6 +1000,56 @@ mod tests {
     }
 
     #[test]
+    fn recuration_joins_its_dev_recording_unless_the_truth_is_already_there() {
+        let t = tempfile::tempdir().unwrap();
+        let args = BenchArgs {
+            bench: Some(t.path().to_owned()),
+            sorrel: None,
+            scorer: None,
+            cmd: BenchCmd::Status,
+        };
+        let mut b = Bench::open(&args, None).unwrap();
+        let truth = |dir: &Path, clusters: &[u8]| {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join("spike_clusters.npy"), clusters).unwrap();
+            fs::write(dir.join("cluster_group.tsv"), b"cluster_id\tgroup\n").unwrap();
+        };
+        let entry = |split, fingerprint: &str, recuration_of: Option<&str>| SessionEntry {
+            path: PathBuf::new(),
+            split,
+            forced_dev: false,
+            pure_manual: true,
+            keep: Vec::new(),
+            fingerprint: fingerprint.into(),
+            recuration_of: recuration_of.map(Into::into),
+        };
+        b.map
+            .sessions
+            .insert("orig".into(), entry(Split::Dev, "rec", None));
+        truth(&b.session("orig").join("truth"), b"phy");
+        let incoming = t.path().join("incoming");
+
+        truth(&incoming, b"phy");
+        assert_eq!(b.recuration_target("rec", &incoming).unwrap(), None);
+        truth(&incoming, b"sorrel");
+        assert_eq!(
+            b.recuration_target("rec", &incoming).unwrap().as_deref(),
+            Some("orig")
+        );
+        b.map
+            .sessions
+            .insert("again".into(), entry(Split::Dev, "rec", Some("orig")));
+        truth(&b.session("again").join("truth"), b"sorrel");
+        assert_eq!(b.recuration_target("rec", &incoming).unwrap(), None);
+
+        assert!(b.recuration_target("unknown", &incoming).is_err());
+        b.map
+            .sessions
+            .insert("sealed".into(), entry(Split::Holdout, "held", None));
+        assert!(b.recuration_target("held", &incoming).is_err());
+    }
+
+    #[test]
     fn holdout_alias_is_db_compatible_and_unlinkable() {
         let alias = holdout_alias("salt-a", "sealed-session-id");
         assert_eq!(alias.len(), 9);
@@ -737,6 +1071,89 @@ mod tests {
         assert_eq!(before, input_hash(t.path()).unwrap());
         fs::write(t.path().join("spike_times.npy"), b"another recording").unwrap();
         assert_ne!(before, input_hash(t.path()).unwrap());
+    }
+
+    #[test]
+    fn input_manifest_covers_files_beyond_the_legacy_fingerprint() {
+        let t = tempfile::tempdir().unwrap();
+        let files = [
+            "spike_times.npy",
+            "spike_templates.npy",
+            "templates.npy",
+            "amplitudes.npy",
+            "pc_features.npy",
+            "params.py",
+            "channel_positions.npy",
+            "similar_templates.npy",
+        ];
+        for file in files {
+            fs::write(t.path().join(file), file.as_bytes()).unwrap();
+        }
+        let names: Vec<String> = files.iter().map(|name| (*name).to_owned()).collect();
+        let before = input_manifest(t.path(), &names).unwrap();
+        assert_eq!(before.files.len(), 8);
+        assert!(before.files.iter().all(|f| !f.sampled));
+        // Files the blind allowlist does not copy are not consumed and must
+        // not enter the key (sealed inputs also hold sorrel's own journals).
+        fs::write(t.path().join("sorrel.journal"), b"not an input").unwrap();
+        assert_eq!(before, input_manifest(t.path(), &names).unwrap());
+        let legacy_before = input_hash(t.path()).unwrap();
+        // An amplitude edit leaves the legacy three-NPY key untouched but
+        // must change the manifest that the new feature key records.
+        fs::write(t.path().join("amplitudes.npy"), b"new amplitudes").unwrap();
+        assert_eq!(legacy_before, input_hash(t.path()).unwrap());
+        assert_ne!(before, input_manifest(t.path(), &names).unwrap());
+        fs::write(t.path().join("amplitudes.npy"), b"amplitudes.npy").unwrap();
+        assert_eq!(before, input_manifest(t.path(), &names).unwrap());
+        fs::write(t.path().join("params.py"), b"sample_rate = 1").unwrap();
+        assert_ne!(before, input_manifest(t.path(), &names).unwrap());
+    }
+
+    #[test]
+    fn large_inputs_use_size_and_both_edge_digests() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("recording.dat");
+        let names = vec!["recording.dat".to_owned()];
+        let mut bytes = vec![0u8; (MANIFEST_FULL_MAX + 1024) as usize];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = (i % 251) as u8;
+        }
+        fs::write(&path, &bytes).unwrap();
+        let before = input_manifest(t.path(), &names).unwrap();
+        assert!(before.files[0].sampled);
+
+        bytes[0] ^= 0xFF;
+        fs::write(&path, &bytes).unwrap();
+        assert_ne!(
+            before,
+            input_manifest(t.path(), &names).unwrap(),
+            "first edge"
+        );
+        bytes[0] ^= 0xFF;
+
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        fs::write(&path, &bytes).unwrap();
+        assert_ne!(
+            before,
+            input_manifest(t.path(), &names).unwrap(),
+            "last edge"
+        );
+        bytes[last] ^= 0xFF;
+
+        // The documented heuristic: a middle-only edit and an unchanged
+        // length are not detected. This keeps resumes cheap.
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xFF;
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(before, input_manifest(t.path(), &names).unwrap());
+
+        fs::write(&path, &bytes[..bytes.len() - 8]).unwrap();
+        assert_ne!(
+            before,
+            input_manifest(t.path(), &names).unwrap(),
+            "truncation"
+        );
     }
 
     #[test]
