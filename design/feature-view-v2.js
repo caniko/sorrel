@@ -283,6 +283,8 @@ async function toolbar(parent, x, y, w, t, mode, o = {}) {
   cx += (await segmented(parent, ["2D", "3D"], mode, cx, y, t)) + 10;
   await text(parent, "ch 3 · 5", cx, y + 3, { color: t.body }); cx += 52;
   if (!o.compact) { cx += await check(parent, "fixed (c)", cx, y, t, false); cx += 10; }
+  // Shown while a lasso is in play; off (default) settles hits on release.
+  if (o.live) await check(parent, "live tracking", x + w - 140, y, t, false);
   if (mode === 1) {
     const s = o.compact ? `${T3.d.map((d) => DIMS[d].replace(/^ch(\d+) PC(\d)$/, "$1·$2")).join("  ")}  ★${T3.s.toFixed(2)}` : `${T3.d.map((d) => DIMS[d]).join(" · ")}   sil ${T3.s.toFixed(2)}`;
     const w3 = Math.min(o.compact ? w - (cx - x) - 30 : 260, tw(s) + 30);
@@ -395,7 +397,7 @@ async function compact2d(X, Y, th) {
   const t = THEMES[th], W = 360, Hh = 560, name = `2D · compact · ${th}`; rm(name);
   const F = frame(page, name, X, Y, W, Hh, t.panel);
   await tabStrip(F, 0, 0, W, t, ["Features", "CCG", "Amp…"], 0);
-  await toolbar(F, 8, 34, W - 16, t, 0, { compact: true });
+  await toolbar(F, 8, 34, W - 16, t, 0, { compact: true, live: true });
   await kmRow(F, 8, 60, W - 16, t, { compact: true });
   await cell(F, 8, 88, W - 16, BEST, t, { km: true, lasso: "closed", focus: true });
   await matrix(F, 8, 452, 20, t);
@@ -406,13 +408,13 @@ async function compact2d(X, Y, th) {
   rect(F, lx, 526, 10, 10, { fill: t.good, fa: 0.55, r: 2 }); await text(F, "0", lx + 14, 524, { size: 10, color: t.body });
   rect(F, lx + 32, 526, 10, 10, { fill: t.warn, fa: 0.6, r: 2 }); await text(F, "≤15% of part", lx + 46, 524, { size: 10, color: t.body });
   rect(F, lx + 126, 526, 10, 10, { fill: t.danger, fa: 0.8, r: 2 }); await text(F, ">15%", lx + 140, 524, { size: 10, color: t.body });
-  await caption(X, Y, `Compact (< 480 px): one focused cell + 4×4 navigator/collision heatmap · fixed (c), auto-run, marker size live in ⚙`);
+  await caption(X, Y, `Compact (< 480 px): one focused cell + 4×4 navigator/collision heatmap · live tracking in the toolbar; fixed (c), auto-run, marker size in ⚙`);
 }
 async function regular2d(X, Y, th) {
   const t = THEMES[th], W = 720, Hh = 560, name = `2D · regular · ${th}`; rm(name);
   const F = frame(page, name, X, Y, W, Hh, t.panel);
   await tabStrip(F, 0, 0, W, t, ["CCG", "Features", "Amplitudes", "ISI", "Similar"], 1);
-  await toolbar(F, 8, 34, W - 16, t, 0);
+  await toolbar(F, 8, 34, W - 16, t, 0, { live: true });
   const end = await kmRow(F, 8, 60, W - 16, t);
   await matrix(F, end, 58, 5, t);
   await text(F, `collisions · best ${label([BEST.dx, BEST.dy])}: ${BEST.total} of ${P2.length}`, end + 32, 62, { size: 11, color: t.body });
@@ -423,7 +425,7 @@ async function regular2d(X, Y, th) {
     await cell(F, 8 + k * (side + 6), yy, side, c, t, { km: true, lasso: "closed" });
   }
   rect(F, W - 6, 92, 4, 180, { fill: t.widget, r: 2, name: "scrollbar" });
-  await caption(X, Y, `Regular (480–1100 px): 4-col grid, k-means strip with mini collision matrix, per-cell collision badges, faint part hull in every view`);
+  await caption(X, Y, `Regular (480–1100 px): 4-col grid, k-means strip with mini collision matrix, per-cell collision badges, faint part hull in every view · live tracking toggle while a lasso is active`);
 }
 async function expansive2d(X, Y, th) {
   const t = THEMES[th], W = 1920, Hh = 1080, name = `2D · expansive (maximized) · ${th}`; rm(name);
@@ -450,8 +452,9 @@ async function expansive2d(X, Y, th) {
   yy = py;
   await text(F, "LASSO", lx, yy, { size: 11, color: t.weak }); yy += 20;
   await text(F, `${LASSO.length} nodes · ${LASSO_HITS} spikes · ${label([BEST.dx, BEST.dy])}`, lx, yy, { size: 12, color: t.strong }); yy += 24;
+  await check(F, "live tracking", lx, yy, t, false); yy += 22;
   for (const s of ["Ctrl+drag  draw freehand (simplified to nodes)", "Ctrl+click  add a node · Ctrl+right-click  clear", "drag node  move · right-click node  delete", "double-click edge  insert node", "K  split the lassoed spikes · Esc  clear"]) { await text(F, s, lx, yy, { size: 11, color: t.hint }); yy += 18; }
-  await caption(X, Y, `Expansive (≥ 1100 px, maximized or popped out): grid fit to height + focused cell large (lasso editing: hovered node, edge ghost) + k-means / lasso panels under it`);
+  await caption(X, Y, `Expansive (≥ 1100 px, maximized or popped out): grid fit to height + focused cell large (lasso editing: hovered node, edge ghost) + k-means / lasso panels under it · live tracking off settles hits on release`);
 }
 async function compact3d(X, Y, th) {
   const t = THEMES[th], W = 360, Hh = 560, name = `3D · compact · ${th}`; rm(name);
@@ -508,6 +511,8 @@ async function sheet(X, Y, th) {
   await text(F, "COLLISION SCALE", 640, 12, { size: 11, color: t.weak });
   await matrix(F, 640, 32, 40, t);
   await text(F, "tile = spikes of the other parts + other\nselected clusters inside the part's hull\nin that view (background excluded)", 640, 214, { size: 11, color: t.body });
+  await check(F, "live tracking — off (default): hits settle on release", 16, 258, t, false);
+  await check(F, "live tracking — on: hits follow the drag", 390, 258, t, true);
   await text(F, "PANE HEADER", 16, 290, { size: 11, color: t.weak });
   await tabStrip(F, 16, 310, 420, t, ["Features", "CCG"], 0);
   await tabStrip(F, 16, 346, 420, t, ["Features"], 0, { maximized: true });

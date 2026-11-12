@@ -1177,9 +1177,28 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         let before = read(&self.session).version();
         match self.host.apply(Actor::Human, cmd) {
             Err(e) => self.error = Some(format!("journal write failed: {e}")),
-            Ok(ev) if ev.version != before => self.status = toast(ev.desc),
+            Ok(ev) if ev.version != before => {
+                self.cancel_feature_interaction();
+                self.status = toast(ev.desc);
+            }
             Ok(_) => {}
         }
+    }
+
+    /// Abandon only Features' spike-selection operation. Clearing its brush
+    /// here also updates linked panes when Features is hidden. This is not
+    /// a journal Undo: an unrelated edit must never be reverted by Cancel.
+    fn cancel_feature_interaction(&mut self) -> bool {
+        let was_cutting = self.feature_state.cancel_operation();
+        if self.brushes.spikes.as_ref().is_some_and(|b| {
+            matches!(
+                b.source,
+                crate::brush::BrushSource::FeatureLasso | crate::brush::BrushSource::KMeansPart
+            )
+        }) {
+            self.brushes.spikes = None;
+        }
+        was_cutting
     }
 
     /// Turn lasso hits into one journal entry (a batch when several
@@ -1661,19 +1680,12 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 } else if self.amplitude_state.cancel_split() {
                     self.status = toast("amplitude split cancelled");
                 } else if self.feature_state.lasso_active() {
-                    self.feature_state.cancel_lasso();
-                    // The lasso's brush goes with it; sync_brush only runs
-                    // when Features draws.
-                    if self.brushes.spikes.as_ref().is_some_and(|b| {
-                        matches!(
-                            b.source,
-                            crate::brush::BrushSource::FeatureLasso
-                                | crate::brush::BrushSource::KMeansPart
-                        )
-                    }) {
-                        self.brushes.spikes = None;
-                    }
-                    self.status = toast("lasso cancelled");
+                    let was_cutting = self.cancel_feature_interaction();
+                    self.status = toast(if was_cutting {
+                        "cut cancelled — cluster unchanged"
+                    } else {
+                        "lasso cancelled"
+                    });
                 } else if self.brushes.cancel() {
                     self.status = toast("brush cleared");
                 } else if self.detached.maximized.take().is_some() {
@@ -3317,6 +3329,78 @@ mod tests {
         };
         assert!(app.commit(cmd));
         assert!(history_len(&app) > baseline);
+    }
+
+    #[test]
+    fn cancelling_a_pending_feature_cut_discards_selection_without_undoing_an_edit() {
+        use crate::brush::{BrushSource, SpikeBrush, TimeBrush};
+        let (mut app, _dir) = make_app();
+        assert!(app.commit(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetGood,
+        }));
+        app.selection.replace(ClusterId(0));
+        let before = {
+            let session = read(&app.session);
+            (
+                session.version(),
+                session.history_len(),
+                session.n_clusters(),
+                session.spike_clusters_global().to_vec(),
+                session.labels().to_vec(),
+            )
+        };
+        let time = TimeBrush::new(0.1, 0.5);
+        app.brushes.time = time;
+        app.brushes.spikes = SpikeBrush::new(
+            BrushSource::FeatureLasso,
+            before.0,
+            [(ClusterId(0), vec![0])],
+        );
+        app.feature_state.set_test_lasso();
+        app.feature_state.request_split();
+        app.feature_state.km.auto_run = true;
+
+        app.dispatch_intent(Intent::Cancel);
+        assert!(!app.feature_state.lasso_active());
+        assert!(!app.feature_state.can_split());
+        assert!(app.brushes.spikes.is_none());
+        assert_eq!(app.brushes.time, time);
+        assert_eq!(app.selection.as_slice(), &[ClusterId(0)]);
+        assert!(
+            !app.feature_state.km.auto_run,
+            "Cancel must not re-arm the lasso"
+        );
+        // Pressing Split again cannot reuse the abandoned spike subset.
+        app.dispatch_intent(Intent::Split);
+        let session = read(&app.session);
+        assert_eq!(session.version(), before.0);
+        assert_eq!(session.history_len(), before.1);
+        assert_eq!(session.n_clusters(), before.2);
+        assert_eq!(session.spike_clusters_global(), before.3);
+        assert_eq!(session.labels(), before.4);
+    }
+
+    #[test]
+    fn undoing_a_completed_lasso_batch_restores_membership_and_clears_its_selection() {
+        use crate::brush::{BrushSource, SpikeBrush};
+        let (mut app, _dir) = make_app();
+        let before = read(&app.session).spike_clusters_global().to_vec();
+        app.apply_lasso_splits(vec![(ClusterId(0), vec![0]), (ClusterId(1), vec![0])]);
+        assert_eq!(history_len(&app), 1, "a multi-cluster cut is one Undo step");
+        assert_eq!(read(&app.session).n_clusters(), 5);
+        app.feature_state.set_test_lasso();
+        app.brushes.spikes = SpikeBrush::new(
+            BrushSource::FeatureLasso,
+            read(&app.session).version(),
+            [(ClusterId(0), vec![0])],
+        );
+        app.dispatch_intent(Intent::Undo);
+        let session = read(&app.session);
+        assert_eq!(session.n_clusters(), 3);
+        assert_eq!(session.spike_clusters_global(), before);
+        assert!(!app.feature_state.lasso_active());
+        assert!(app.brushes.spikes.is_none());
     }
 
     #[test]
