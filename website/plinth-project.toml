@@ -11,6 +11,9 @@ og_image = "/showcase/social.png"
 [theme]
 paper = "#0d1117"
 surface = "#161b22"
+ink = "#e6edf3"
+ink_soft = "#8b949e"
+line = "#30363d"
 accent = "#59a14f"
 accent_soft = "rgba(89, 161, 79, 0.16)"
 secondary = "#4e79a7"
@@ -32,7 +35,7 @@ href = "https://github.com/caniko/sorrel"
 
 [[nav]]
 label = "Download"
-href = "https://github.com/caniko/sorrel/releases/latest"
+href = "/download/"
 primary = true
 
 [[footer_links]]
@@ -58,6 +61,18 @@ target = "sorrel.svg"
 [[assets]]
 source = "site.css"
 target = "site.css"
+
+[[assets]]
+source = "platform.js"
+target = "platform.js"
+
+[[assets]]
+source = "../assets/showcase/workspace.webp"
+target = "showcase/workspace.webp"
+
+[[assets]]
+source = "../assets/showcase/workspace-mobile.webp"
+target = "showcase/workspace-mobile.webp"
 
 [[assets]]
 source = "fonts/InterVariable-latin.woff2"
@@ -114,18 +129,18 @@ description = "Native spike-sorting curation: a high-performance GUI for manual 
 
 [[pages.sections]]
 type = "hero"
-title = "Curate spike sorts at native speed."
-tagline = "Open phy, Kilosort, SpikeInterface or NWB output. Merge, split and label clusters against waveforms, features, correlograms and rasters. Every edit is journaled, and nothing is lost."
+eyebrow = "Native spike-sorting curation"
+title = "Spike curation, in full view."
+tagline = "Waveforms, features and timing, linked in one workspace. Inspect the evidence. Merge, split and label with confidence."
 subtitle = ""
-preview_src = "/showcase/hero-loop.webp"
-preview_still = "/showcase/hero-still.webp"
-preview_mobile_src = "/showcase/hero-mobile.webp"
-preview_alt = "Sorrel's waveform and feature views: a lasso drawn around a cloud of spikes lights the same spikes up in the waveforms, then the selection moves through the 3D feature space and the time brush."
-note = "winget install Caniko.Sorrel  ·  choco install sorrel"
+preview_src = "/showcase/workspace.webp"
+preview_mobile_src = "/showcase/workspace-mobile.webp"
+preview_alt = "Sorrel's native curation workspace, with linked views for inspecting clusters, waveforms and spike timing."
+note = "phy · Kilosort · SpikeInterface · NWB"
 
 [[pages.sections.ctas]]
 label = "Download"
-href = "https://github.com/caniko/sorrel/releases/latest"
+href = "/download/"
 primary = true
 
 [[pages.sections.ctas]]
@@ -133,10 +148,40 @@ label = "Documentation"
 href = "/docs/"
 
 [[pages.sections]]
+type = "content"
+id = "windows-downloads"
+html = '''
+<div class="windows-options" data-windows-downloads hidden>
+  <a href="/download/#downloads">Install on Windows</a>
+  <code>winget install Caniko.Sorrel</code><span>or</span><code>choco install sorrel</code>
+</div>
+<script src="/platform.js" defer></script>
+'''
+
+[[pages.sections]]
+type = "content"
+id = "workflow"
+heading = "One selection. Every view."
+html = '''
+<p>Brush a group of spikes and follow it through waveforms, feature space and time. The evidence stays connected while you decide what belongs together.</p>
+<div class="screenshots-grid">
+  <figure class="screenshot-slot">
+    <a href="/showcase/hero-still.webp" class="lightbox-trigger" aria-label="View linked selections" data-lightbox-image="/showcase/hero-loop.webp" data-lightbox-still="/showcase/hero-still.webp" data-lightbox-alt="The same spikes highlighted across waveforms, feature plots, 3D space and the time brush." data-lightbox-caption="Linked selections across waveforms and features.">
+      <img src="/showcase/hero-still.webp" alt="The same spikes highlighted across waveforms, feature plots, 3D space and the time brush." width="1824" height="1040" loading="lazy">
+      <span class="lightbox-cue">View linked selections</span>
+    </a>
+    <figcaption>The viewer plays the linked-selection sequence; with reduced motion it shows this still.</figcaption>
+  </figure>
+</div>
+<!-- Plinth's lightbox opens the image but leaves the anchor's href to navigate; cancel it here until Plinth ships the fix. The href stays for the no-JS fallback. -->
+<script>document.addEventListener('click', event => { const trigger = event.target.closest('a[data-lightbox-image]'); if (!trigger || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button !== 0) return; event.preventDefault(); });</script>
+'''
+
+[[pages.sections]]
 type = "screenshot_grid"
 id = "gallery"
-heading = "See it work"
-intro = "Every image is rendered headlessly from Sorrel's own UI tests, so what you see is what Sorrel draws."
+heading = "Look closer. Make the call."
+intro = "Explore the tools behind a curation decision. These are Sorrel's own UI-test states, composed in OpenPencil—not mock interfaces. Select any image to enlarge it."
 
 [[pages.sections.screenshots]]
 src = "/showcase/gallery-3d.webp"
@@ -174,85 +219,139 @@ id = "features"
 heading = "Built for curation work"
 
 [[pages.sections.features]]
-title = "Phy & Kilosort, natively"
-description = "Reads spike_times, spike_clusters, params.py, templates, PC features, amplitudes, similar_templates, channel_positions, and quality-metric sidecars exactly as phy does."
+title = "Linked views, one decision"
+description = "Trace, raster, ISI, CCG, waveform, template, feature, drift, probe, similarity and quality views share a selection, so every merge, split and label is checked against the same spikes."
 
 [[pages.sections.features]]
-title = "Multiple backends"
-description = "phy / Kilosort, SpikeInterface SortingAnalyzer (binary folder), Kilosort 4 rez.mat, and NWB. SpikeGLX, Open Ephys, and MDA work as raw trace sources."
+title = "Review agent proposals"
+description = "Agents connect over MCP and can propose relabels, merges and splits with confidence and reasons. In Direct mode their edits are journaled and undoable; in Propose mode nothing changes until you accept."
 
 [[pages.sections.features]]
-title = "Fast on every format"
-description = "Each data format gets its own compiled fast path: drawing, downsampling and journaling never go through a runtime lookup."
+title = "A journal that keeps every edit"
+description = "Every edit from you, an agent or an algorithm lands in a branching journal before the session moves. Undo walks back; editing after undo branches instead of discarding. The tree survives save and reopen."
 
 [[pages.sections.features]]
-title = "GPU trace pipeline"
-description = "Optional wgpu kernels for common-median referencing, high-pass filtering, and mean-snippet extraction, sharing the renderer's device and queue, with a transparent CPU fallback."
-
-[[pages.sections.features]]
-title = "Durable curation journal"
-description = "Every relabel, merge, split, and undo/redo lands in the journal before the in-memory session moves. Replay on open is idempotent; resealed at save."
-
-[[pages.sections.features]]
-title = "Built-in views"
-description = "Trace, raster, ISI, CCG, waveform, template, feature, drift, probe, similarity, quality, and merge/split suggestions, all in one window."
+title = "Optional GPU trace processing"
+description = "wgpu kernels for common-median referencing, high-pass filtering and mean-snippet extraction share the renderer's device and queue. Without a GPU adapter, the trace path falls back to the CPU implementations; headless QC uses them directly."
 
 [[pages.sections.features]]
 title = "Headless QC export"
-description = "sorrel qc DIR --out DIR runs every metric on the loaded session and writes cluster_qc.tsv + cluster_qc.json without spawning a window."
+description = "sorrel qc DIR --out DIR runs firing rate, presence, refractory contamination, amplitude stats, ISI violations, isolation distance where PC features exist, and composite quality, writing cluster_qc.tsv and cluster_qc.json without a window."
 
 [[pages.sections.features]]
 title = "Python bridge"
-description = "sorrel.open(recording, sorting) opens a SpikeInterface analyzer in the native GUI via the sorrel-py bridge."
+description = "sorrel.open(recording, sorting) builds a SortingAnalyzer and launches the native GUI; sorrel.Session.open(\"my_run/phy\") edits the same journal from a notebook, with the same save and undo history."
 
 [[pages.sections]]
-type = "feature_grid"
+type = "content"
 id = "backends"
 heading = "Reads what you already have"
-
-[[pages.sections.features]]
-title = "phy / Kilosort"
-description = "Directory of spike_times.npy, spike_clusters.npy, params.py, plus optional templates, PC features, amplitudes, channel positions, similarity, and quality-metric sidecars."
-
-[[pages.sections.features]]
-title = "SpikeInterface"
-description = "SortingAnalyzer saved as binary_folder: recording.json, the flat sorting under sorting/, optional probe.json, and quality_metrics extension."
-
-[[pages.sections.features]]
-title = "NWB & KS4 rez"
-description = "*.nwb via /units/spike_times and the electrodes table; rez.mat via rez/st3 and rez/ops. Both gated behind --features hdf5."
-
-[[pages.sections.features]]
-title = "Recording sources"
-description = "SpikeGLX .bin+.meta, Open Ephys continuous.dat+structure.oebin, and Mountainsort MDA plug in via --dat, --spikeglx-meta, --oebin."
+html = '''
+<p>Point <code>sorrel open</code> at the sorting directory you already have; it detects the backend from the files inside.</p>
+<details>
+  <summary>phy / Kilosort <span>spike_times.npy · spike_clusters.npy · params.py</span></summary>
+  <p>A directory of <code>spike_times.npy</code>, <code>spike_clusters.npy</code> and <code>params.py</code>, plus optional <code>templates</code>, PC features, amplitudes, <code>channel_positions</code>, <code>similar_templates</code> and quality-metric sidecars — read exactly as phy does.</p>
+</details>
+<details>
+  <summary>SpikeInterface <span>SortingAnalyzer · binary_folder</span></summary>
+  <p>A SortingAnalyzer saved as <code>binary_folder</code>: <code>recording.json</code>, the flat sorting under <code>sorting/</code>, an optional <code>probe.json</code>, and the <code>quality_metrics</code> extension.</p>
+</details>
+<details>
+  <summary>NWB &amp; Kilosort 4 rez <span>*.nwb · rez.mat · --features hdf5</span></summary>
+  <p><code>*.nwb</code> via <code>/units/spike_times</code> and the electrodes table; <code>rez.mat</code> via <code>rez/st3</code> and <code>rez/ops</code>. Both are gated behind <code>--features hdf5</code>. Without it, open the phy export KS4 writes under <code>&lt;output&gt;/phy/</code>.</p>
+</details>
+<details>
+  <summary>Raw recording sources <span>SpikeGLX · Open Ephys · MDA</span></summary>
+  <p>SpikeGLX <code>.bin</code> + <code>.meta</code>, Open Ephys <code>continuous.dat</code> + <code>structure.oebin</code>, and Mountainsort MDA plug in via <code>--dat</code>, <code>--spikeglx-meta</code> and <code>--oebin</code>.</p>
+</details>
+'''
 
 [[pages.sections]]
 type = "install"
 id = "install"
 heading = "Install"
-intro = "Prebuilt binaries for Linux, macOS and Windows (x64 and ARM64) on every release. Point Sorrel at a sorting directory (sorrel open my_run/phy) and it detects the backend."
+intro = "Prebuilt binaries for Linux, macOS and Windows (x64 and ARM64) on every release, or one pip command for the GUI and Python API. Point Sorrel at a sorting directory (sorrel open my_run/phy) and it detects the backend."
 guide_href = "/docs/getting-started/installation.html"
 
 [[pages.sections.primary_routes]]
-label = "Download a release"
+label = "Choose your download"
 audience = "Linux (AppImage, tar.gz), macOS (Apple silicon), Windows (x64, ARM64)"
-href = "https://github.com/caniko/sorrel/releases/latest"
+href = "/download/#downloads"
+
+[[pages.sections.primary_routes]]
+label = "Python"
+audience = "Linux x86_64 / ARM64, macOS ARM64, Windows x64 · Python 3.8+"
+href = "/docs/getting-started/installation.html#python"
+command = "pip install sorrel-ephys"
 recommended = true
-
-[[pages.sections.secondary_routes]]
-label = "Windows (winget)"
-audience = "Stable releases, x64 and ARM64"
-href = "/docs/getting-started/installation.html#windows"
-command = "winget install Caniko.Sorrel"
-
-[[pages.sections.secondary_routes]]
-label = "Windows (Chocolatey)"
-audience = "Stable releases, x64"
-href = "/docs/getting-started/installation.html#windows"
-command = "choco install sorrel"
 
 [[pages.sections.secondary_routes]]
 label = "Build from source"
 audience = "Cargo, all platforms"
+href = "/docs/getting-started/installation.html#with-cargo"
+command = "cargo build --release -p sorrel"
+
+[[pages]]
+slug = "download"
+title = "Download Sorrel"
+description = "Download Sorrel for Linux, macOS or Windows, or install through Python, winget and Chocolatey."
+
+[[pages.sections]]
+type = "hero"
+eyebrow = "Linux · macOS · Windows"
+title = "Download Sorrel"
+tagline = "Native builds for Linux (x86_64 and ARM64), macOS (Apple silicon) and Windows (x64 and ARM64). Package managers, Python wheels and build instructions are below."
+subtitle = ""
+
+[[pages.sections.ctas]]
+label = "Latest release"
+href = "https://github.com/caniko/sorrel/releases/latest"
+primary = true
+
+[[pages.sections.ctas]]
+label = "Installation guide"
+href = "/docs/getting-started/installation.html"
+
+[[pages.sections]]
+type = "content"
+id = "platform"
+html = '''
+<script src="/platform.js" defer></script>
+'''
+
+[[pages.sections]]
+type = "install"
+id = "downloads"
+heading = "Downloads and install options"
+intro = "Choose your operating system and architecture from the release assets: Linux x86_64 or ARM64 (AppImage / tar.gz, glibc 2.31+), macOS Apple silicon, or Windows x64 / ARM64 (zip)."
+guide_href = "/docs/getting-started/installation.html"
+
+[[pages.sections.primary_routes]]
+label = "Download a release"
+audience = "Native builds for Linux, macOS and Windows"
+href = "https://github.com/caniko/sorrel/releases/latest"
+recommended = true
+
+[[pages.sections.secondary_routes]]
+label = "Windows · winget"
+audience = "PowerShell · native x64 or ARM64"
+href = "/docs/getting-started/installation.html#windows"
+command = "winget install Caniko.Sorrel"
+
+[[pages.sections.secondary_routes]]
+label = "Windows · Chocolatey"
+audience = "PowerShell · x64"
+href = "/docs/getting-started/installation.html#windows"
+command = "choco install sorrel"
+
+[[pages.sections.secondary_routes]]
+label = "Python"
+audience = "API and GUI · Linux x86_64 / ARM64, macOS ARM64, Windows x64 · Python 3.8+"
+href = "/docs/getting-started/installation.html#python"
+command = "pip install sorrel-ephys"
+
+[[pages.sections.secondary_routes]]
+label = "Build from source"
+audience = "Requires the Rust toolchain and a source checkout"
 href = "/docs/getting-started/installation.html#with-cargo"
 command = "cargo build --release -p sorrel"

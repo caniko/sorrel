@@ -12,6 +12,7 @@
       fileset = pkgs.lib.fileset.unions [
         (root + "/website/plinth-project.toml")
         (root + "/website/site.css")
+        (root + "/website/platform.js")
         (root + "/website/fonts")
         (root + "/assets/showcase")
         (root + "/assets/icon/sorrel.svg")

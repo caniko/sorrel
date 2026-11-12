@@ -15,16 +15,25 @@
 // Loop assembly: export the five loop pages as DIR/loop1.png .. loop5.png (-f png -s 1.6), then run
 //   design/showcase-loop.sh DIR      (writes assets/showcase/hero-loop.webp, starting on loop 2)
 // hero-still.webp is `cwebp -q 90 -m 6` of the loop 2 PNG.
+const { readFile } = await import("node:fs/promises");
+const { importSVG } = await import("@open-pencil/core/tools");
+const logoSvg = await readFile("logo/logo-clean.svg", "utf8");
 const LOOP = { x: 490, y: 44, w: 1140, h: 650, states: ["xtalk_probe_set", "waveforms_feature_link", "xtalk_features_brush", "xtalk_3d_space", "xtalk_time_brush"] };
 // [name, state, crop x, y, w (source px)]: the crop is w x w*0.625 and exports at -s = 1600/w (rounded down
 // to 4 decimals, which keeps the output at exactly 1600x1000; frame sizes must be whole numbers).
 const GALLERY = [
-  ["3d", "xtalk_3d_space", 1046, 266, 584], // 3D cube with the lasso prism + third-axis list (2.74x)
-  ["kmeans", "features_kmeans_collision", 1046, 135, 584], // part buttons, collision matrix, first two tile rows (2.74x)
+  // 3D cube + full third-axis list, with quality context. The pane itself clips the right
+  // legend text at x=1624; that clipping is authentic and remains (1.63x).
+  ["3d", "xtalk_3d_space", 1061, 76, 984],
+  // control row + all nine collision tiles, with quality context. The pane's bottom edge
+  // clips the third row's plot tails; the row labels are visible (1.63x).
+  ["kmeans", "features_kmeans_collision", 1061, 76, 984],
   ["isi-whatif", "xtalk_isi_whatif_split", 748, 132, 880], // split waveforms + ISI histogram with inside/outside split (1.82x)
   ["probe", "dense_features", 308, 112, 640], // probe map + feature navigator (2.5x)
   ["proposals", "proposals_pane", 760, 50, 512], // CCG + agent proposals with Accept/Reject (3.13x)
-  ["history", "history_branch", 760, 50, 512], // CCG + branching history (3.13x)
+  // waveforms context + full CCG (with its x-axis labels) + full history rows; the app
+  // clips the row time at its right edge, and the lower trace is partial context (1.65x).
+  ["history", "history_branch", 308, 46, 968],
 ];
 const SOURCES = ["wide_shell", "xtalk_3d_space", "dense_features", ...LOOP.states, ...GALLERY.map((g) => g[1])];
 const PAGES = ["Showcase · hero", "Showcase · social", ...LOOP.states.map((_, i) => `Showcase · loop ${i + 1}`), ...GALLERY.map((g) => `Showcase · gallery · ${g[0]}`)];
@@ -78,20 +87,12 @@ const buildHero = async (name, W, H, k, ts = 1) => {
     e.fills = [{ type: "GRADIENT_RADIAL", visible: true, opacity: 1, gradientTransform: { m00: 1, m01: 0, m02: 0, m10: 0, m11: 1, m12: 0 }, gradientStops: stops([[0, c, a], [1, c, 0]]) }];
   }
 
-  // Wordmark: the icon's leaf + spike, then name and tagline.
-  const icon = figma.createFrame(); hero.appendChild(icon);
-  // assets/icon/sorrel.svg is drawn on 256 px; scale its geometry to K (rescale() misplaces vectors).
-  const K = m(96) / 256;
-  icon.name = "icon"; icon.x = m(96); icon.y = m(84); icon.resize(m(96), m(96)); icon.fills = []; icon.clipsContent = false;
-  const vec = (d, o) => {
-    const v = figma.createVector(); icon.appendChild(v); v.x = 0; v.y = 0;
-    v.vectorPaths = [{ windingRule: "NONZERO", data: d.replace(/\d+/g, (n) => +(n * K).toFixed(2)) }];
-    Object.assign(v, o); return v;
-  };
-  const bg = figma.createRectangle(); icon.appendChild(bg); bg.x = 8 * K; bg.y = 8 * K; bg.resize(240 * K, 240 * K); bg.cornerRadius = 56 * K; bg.fills = [solid("#161B22")];
-  vec("M 128 22 C 164 66 198 108 196 150 C 195 172 194 190 206 214 C 178 200 152 186 128 180 C 104 186 78 200 50 214 C 62 190 61 172 60 150 C 58 108 92 66 128 22 Z", { fills: [solid("#59A14F")], strokes: [] });
-  vec("M 128 180 L 128 238", { fills: [], strokes: [solid("#59A14F")], strokeWeight: 12 * K, strokeCap: "ROUND" });
-  vec("M 68 118 L 104 118 L 114 186 L 128 92 L 138 128 L 148 118 L 188 118", { fills: [], strokes: [solid("#F0F6FC")], strokeWeight: 11 * K, strokeCap: "ROUND", strokeJoin: "ROUND" });
+  // Wordmark: the canonical ribbon/pulse logo, then name and tagline.
+  const icon = await importSVG.execute(figma, {
+    svg: logoSvg.replace('width="2048" height="2048"', `width="${m(96)}" height="${m(96)}"`),
+    name: "icon", parent_id: hero.id, x: m(96), y: m(84),
+  });
+  if (icon.error) throw new Error(icon.error);
 
   const text = async (s, x, y, size, style, color, a = 1) => {
     await figma.loadFontAsync({ family: "Ubuntu", style });
@@ -127,4 +128,47 @@ const buildHero = async (name, W, H, k, ts = 1) => {
 const hero = await buildHero("Showcase · hero", 2400, 1350, 1);
 await buildHero("Showcase · social", 1200, 630, 0.5, 1.3);
 
-return hero.id;
+// Landing workspace: the complete wide_shell (1920x1080) at 1.12x, framed on the dark
+// gradient without the marketing wordmark. No inset covers the implemented panes.
+//   openpencil export design/showcase.fig --page "Showcase · workspace" -f webp -q 90 -s 1 -o assets/showcase/workspace.webp
+const buildWorkspace = (name, W, H, scale, x, y) => {
+  const page = freshPage(name);
+  const f = figma.createFrame(); page.appendChild(f);
+  f.name = "workspace"; f.resize(W, H); f.clipsContent = true;
+  f.fills = [{ type: "GRADIENT_LINEAR", visible: true, opacity: 1, gradientTransform: { m00: 1, m01: 0.6, m02: 0, m10: -0.6, m11: 1, m12: 0 }, gradientStops: stops([[0, "#0B1410", 1], [0.55, "#0D1117", 1], [1, "#101826", 1]]) }];
+  for (const [gx, gy, gw, gh, c, a] of [[-200, 150, 1900, 1300, "#59A14F", 0.3], [1600, -200, 1000, 1000, "#4E79A7", 0.22]]) {
+    const e = figma.createEllipse(); f.appendChild(e);
+    e.x = gx; e.y = gy; e.resize(gw, gh); e.name = "glow";
+    e.fills = [{ type: "GRADIENT_RADIAL", visible: true, opacity: 1, gradientTransform: { m00: 1, m01: 0, m02: 0, m10: 0, m11: 1, m12: 0 }, gradientStops: stops([[0, c, a], [1, c, 0]]) }];
+  }
+  const shell = frameOf("wide_shell").clone(); f.appendChild(shell);
+  shell.rescale(scale); shell.x = x; shell.y = y; shell.name = "workspace";
+  shell.cornerRadius = 18; shell.strokes = [solid("#FFFFFF", 0.12)]; shell.strokeWeight = 2; shell.strokeAlign = "OUTSIDE";
+  shell.effects = [shadow(16, 40, 0.6)];
+  return f;
+};
+
+// Mobile: the left 920x1080 of wide_shell at 1.25x, letterboxed on a 4:5 canvas. It keeps the
+// full cluster table and waveforms pane; the lower trace pane is a partial view at the crop
+// edge. No invented content.
+//   openpencil export design/showcase.fig --page "Showcase · workspace mobile" -f webp -q 90 -s 1 -o assets/showcase/workspace-mobile.webp
+const buildWorkspaceMobile = (name, W, H) => {
+  const page = freshPage(name);
+  const f = figma.createFrame(); page.appendChild(f);
+  f.name = "workspace mobile"; f.resize(W, H); f.clipsContent = true;
+  f.fills = [{ type: "GRADIENT_LINEAR", visible: true, opacity: 1, gradientTransform: { m00: 1, m01: 0.6, m02: 0, m10: -0.6, m11: 1, m12: 0 }, gradientStops: stops([[0, "#0B1410", 1], [0.55, "#0D1117", 1], [1, "#101826", 1]]) }];
+  const win = figma.createFrame(); f.appendChild(win);
+  const innerW = 1150, innerH = 1350;
+  win.name = "window"; win.x = (W - innerW) / 2; win.y = (H - innerH) / 2;
+  win.resize(innerW, innerH); win.clipsContent = true;
+  win.fills = [solid("#0A0A0A")]; win.cornerRadius = 18;
+  win.strokes = [solid("#FFFFFF", 0.14)]; win.strokeWeight = 2; win.strokeAlign = "INSIDE";
+  win.effects = [shadow(12, 36, 0.6)];
+  const shell = frameOf("wide_shell").clone(); win.appendChild(shell);
+  shell.rescale(innerW / 920); shell.x = 0; shell.y = 0; shell.name = "workspace";
+  return f;
+};
+
+const workspace = buildWorkspace("Showcase · workspace", 2400, 1350, 1.12, 125, 70);
+buildWorkspaceMobile("Showcase · workspace mobile", 1200, 1500);
+return workspace.id;
