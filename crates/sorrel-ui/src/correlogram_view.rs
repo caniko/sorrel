@@ -23,6 +23,12 @@ use crate::views::{
 const MAX_CLUSTERS: usize = 20;
 /// phylib `n_spikes_correlograms`: spikes fed to the correlogram, in total.
 const MAX_SPIKES: usize = 100_000;
+/// Time chunks kept when the selection is over [`MAX_SPIKES`] (phy keeps 20).
+const N_CHUNKS: u64 = 20;
+/// A kept chunk spans at least this many correlogram windows, so pairs lost
+/// at chunk edges stay a small fraction of every lag bin, unless the spike
+/// budget allows less time than one such chunk.
+const MIN_CHUNK_WINDOWS: u64 = 20;
 
 /// One finished computation; carries the parameters it was computed for so
 /// a stale grid (shown while a new one computes) still draws consistently.
@@ -33,7 +39,9 @@ pub struct CcgData {
     counts: Vec<Vec<Vec<u32>>>,
     /// Spikes actually used per cluster (after subsampling).
     n_used: Vec<usize>,
-    stride: usize,
+    /// Fraction of the recording the kept chunks cover (1 = every spike).
+    coverage: f64,
+    /// Seconds the used spikes come from: the baseline's duration.
     duration_s: f64,
 }
 
@@ -68,20 +76,21 @@ impl CcgCache {
                 // seconds at 100k spikes can hold the read lock for a while.
                 // Upgrade path: a cancel parameter in the pairing loop.
                 let sr = s.provider.sample_rate().max(1.0);
-                let total: usize = cl.iter().map(|&c| s.spike_times(c).len()).sum();
-                let stride = subsample_stride(total, MAX_SPIKES);
-                let trains: Vec<Vec<SampleIndex>> = cl
-                    .iter()
-                    .map(|&c| s.spike_times(c).iter().copied().step_by(stride).collect())
-                    .collect();
+                let n_samples = s.provider.n_samples().0;
+                let window = (window_ms as f64 / 1e3 * sr as f64).ceil() as u64;
+                let all: Vec<&[SampleIndex]> = cl.iter().map(|&c| s.spike_times(c)).collect();
+                let (chunks, trains) = sample_trains(&all, n_samples, MAX_SPIKES, window);
                 let refs: Vec<&[SampleIndex]> = trains.iter().map(Vec::as_slice).collect();
+                let covered = chunks
+                    .as_ref()
+                    .map_or(n_samples, |ch| ch.iter().map(|(a, b)| b - a).sum());
                 Arc::new(CcgData {
                     counts: correlograms(&refs, sr, bin_ms as f64 / 1e3, window_ms as f64 / 1e3),
                     n_used: trains.iter().map(Vec::len).collect(),
                     clusters: cl,
                     bin_ms,
-                    stride,
-                    duration_s: s.provider.n_samples().0 as f64 / sr as f64,
+                    coverage: covered as f64 / n_samples.max(1) as f64,
+                    duration_s: covered as f64 / sr as f64,
                 })
             })
             .cloned();
@@ -93,9 +102,142 @@ impl CcgCache {
     }
 }
 
-/// Every `stride`-th spike keeps at most `max` of `total` (deterministic).
-pub(crate) fn subsample_stride(total: usize, max: usize) -> usize {
-    total.div_ceil(max).max(1)
+/// `[start, end)` sample ranges to keep when `total` spikes exceed `max`, or
+/// `None` to keep every spike.
+///
+/// Like phy's spike selector for correlograms, this keeps *every* spike inside
+/// a few evenly spaced time chunks rather than every n-th spike. Thinning a
+/// train by a stride removes short intervals (consecutive kept spikes are n
+/// intervals apart), which empties the bins around lag 0 and makes a
+/// contaminated or noise cluster look refractory. Chunks keep all short-lag
+/// pairs inside them. The chunks are shared by every cluster in the grid, so
+/// cross-correlograms compare the same stretches of time.
+pub(crate) fn time_chunks(
+    n_samples: u64,
+    total: usize,
+    max: usize,
+    window_samples: u64,
+) -> Option<Vec<(u64, u64)>> {
+    if total <= max || n_samples == 0 {
+        return None;
+    }
+    let keep = (n_samples as f64 * max as f64 / total as f64) as u64;
+    let min_len = window_samples.max(1).saturating_mul(MIN_CHUNK_WINDOWS);
+    // Fewer, longer chunks when the kept time is short, never below one.
+    let k = N_CHUNKS.min(keep / min_len.max(1)).max(1);
+    let len = (keep / k).clamp(1, n_samples);
+    let stride = n_samples / k;
+    Some(
+        (0..k)
+            .map(|i| {
+                // Centre each chunk in its share of the recording.
+                let start = (i * stride + stride.saturating_sub(len) / 2).min(n_samples - len);
+                (start, start + len)
+            })
+            .collect(),
+    )
+}
+
+/// `[start, end)` sample ranges, ascending.
+type Chunks = Vec<(u64, u64)>;
+
+/// `trains` restricted to shared [`time_chunks`] holding at most `max` spikes
+/// in total. Chunks are sized from the average rate, so when bursts put more
+/// than `max` spikes inside them the kept time shrinks by the overshoot.
+pub(crate) fn sample_trains(
+    trains: &[&[SampleIndex]],
+    n_samples: u64,
+    max: usize,
+    window_samples: u64,
+) -> (Option<Chunks>, Vec<Vec<SampleIndex>>) {
+    let total: usize = trains.iter().map(|t| t.len()).sum();
+    let mut budget = max;
+    loop {
+        let chunks = time_chunks(n_samples, total, budget, window_samples);
+        // Count by binary search; copy only the accepted chunks.
+        let n: usize = match chunks.as_deref() {
+            None => total,
+            Some(ch) => trains
+                .iter()
+                .flat_map(|t| ch.iter().map(move |&(a, b)| count_in(t, a, b)))
+                .sum(),
+        };
+        if n <= max || budget <= 1 {
+            let kept = trains
+                .iter()
+                .map(|t| in_chunks(t, chunks.as_deref()))
+                .collect();
+            return (chunks, thin_to_cap(kept, max));
+        }
+        budget = next_budget(budget, max, n);
+    }
+}
+
+/// The cap is a hard bound: a burst denser than `max` inside a chunk the
+/// budget cannot shrink any further (down to one sample) still holds more
+/// spikes than advertised. Keep a uniformly random `max` of the survivors,
+/// spread across the trains, so spikes sharing a sample survive together as
+/// often as any other pair; a stride would drop every zero-lag partner.
+/// Seeded from the counts, so the same selection is drawn frame after frame.
+fn thin_to_cap(kept: Vec<Vec<SampleIndex>>, max: usize) -> Vec<Vec<SampleIndex>> {
+    let total: usize = kept.iter().map(Vec::len).sum();
+    if total <= max {
+        return kept;
+    }
+    // Selection sampling over the flattened trains: each survivor is taken
+    // with probability `need / left`, so every `max`-subset of `total` is
+    // equally likely and the trains come back in ascending order.
+    let mut state = ((total as u64) << 32) ^ max as u64;
+    let (mut left, mut need) = (total, max);
+    kept.into_iter()
+        .map(|train| {
+            train
+                .into_iter()
+                .filter(|_| {
+                    let pick = need > 0 && next_u64(&mut state) % (left as u64) < need as u64;
+                    left -= 1;
+                    need -= usize::from(pick);
+                    pick
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// SplitMix64 step: tiny, good enough for the cap draw.
+fn next_u64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The budget after a pass kept `n > max` spikes: shrunk by the overshoot and
+/// by at least a tenth, so a near-cap burst takes a few dozen passes, not one
+/// per spike.
+fn next_budget(budget: usize, max: usize, n: usize) -> usize {
+    ((budget as f64 * max as f64 / n as f64) as usize).min(budget * 9 / 10)
+}
+
+/// Spikes of an ascending train in `[a, b)`.
+fn count_in(times: &[SampleIndex], a: u64, b: u64) -> usize {
+    times.partition_point(|t| t.0 < b) - times.partition_point(|t| t.0 < a)
+}
+
+/// The spikes of an ascending train that fall inside `chunks` (all of them
+/// when `chunks` is `None`).
+pub(crate) fn in_chunks(times: &[SampleIndex], chunks: Option<&[(u64, u64)]>) -> Vec<SampleIndex> {
+    let Some(chunks) = chunks else {
+        return times.to_vec();
+    };
+    let mut out = Vec::new();
+    for &(a, b) in chunks {
+        let lo = times.partition_point(|t| t.0 < a);
+        let hi = times.partition_point(|t| t.0 < b);
+        out.extend_from_slice(&times[lo..hi]);
+    }
+    out
 }
 
 /// phy status text: `f'{window:.1f} ms ({bin:.1f} ms)'`.
@@ -544,8 +686,11 @@ fn grid<P: DataProvider>(
             }
         }
     }
-    let note = if data.stride > 1 {
-        format!(" Every {}th spike used (100k cap).", data.stride)
+    let note = if data.coverage < 1.0 {
+        format!(
+            " All spikes in {:.0}% of the recording, in time chunks (100k cap).",
+            data.coverage * 100.0
+        )
     } else {
         String::new()
     };
@@ -563,14 +708,140 @@ fn grid<P: DataProvider>(
 mod tests {
     use super::*;
 
+    fn train(n: u64, step: u64) -> Vec<SampleIndex> {
+        (0..n).map(|i| SampleIndex(i * step)).collect()
+    }
+
     #[test]
-    fn stride_caps_total_at_max() {
-        assert_eq!(subsample_stride(0, MAX_SPIKES), 1);
-        assert_eq!(subsample_stride(100_000, MAX_SPIKES), 1);
-        assert_eq!(subsample_stride(100_001, MAX_SPIKES), 2);
-        assert_eq!(subsample_stride(1_000_000, MAX_SPIKES), 10);
-        let (total, s) = (250_001usize, subsample_stride(250_001, MAX_SPIKES));
-        assert!(total.div_ceil(s) <= MAX_SPIKES);
+    fn small_selections_keep_every_spike() {
+        assert_eq!(time_chunks(1_000_000, 100_000, MAX_SPIKES, 1600), None);
+        let t = train(10, 7);
+        assert_eq!(in_chunks(&t, None), t);
+    }
+
+    #[test]
+    fn chunks_cap_a_uniform_train_near_max() {
+        // 1M spikes, one every 300 samples, 50 ms window at 32 kHz.
+        let t = train(1_000_000, 300);
+        let n = 300 * 1_000_000;
+        let ch = time_chunks(n, t.len(), MAX_SPIKES, 1600).unwrap();
+        assert_eq!(ch.len() as u64, N_CHUNKS);
+        assert!(ch.windows(2).all(|w| w[0].1 <= w[1].0), "chunks overlap");
+        let kept = in_chunks(&t, Some(&ch)).len();
+        assert!((90_000..=110_000).contains(&kept), "kept {kept}");
+    }
+
+    #[test]
+    fn short_recordings_use_fewer_longer_chunks() {
+        // 100k kept samples fit only 3 chunks of 20 windows (32k samples).
+        let ch = time_chunks(1_000_000, 1_000_000, MAX_SPIKES, 1600).unwrap();
+        assert_eq!(ch.len(), 3);
+        assert!(ch.iter().all(|c| c.1 - c.0 >= 1600 * MIN_CHUNK_WINDOWS));
+        assert!(ch.windows(2).all(|w| w[0].1 <= w[1].0) && ch[2].1 <= 1_000_000);
+        // Kept time under one minimum chunk: one chunk of just the kept time.
+        let ch = time_chunks(20_000, 1_000_000, MAX_SPIKES, 1600).unwrap();
+        assert_eq!(ch, vec![(9_000, 11_000)]);
+    }
+
+    #[test]
+    fn long_windows_on_short_recordings_stay_under_the_cap() {
+        // 1M spikes in 2M samples (about a minute) with a 5 s window.
+        let t = train(1_000_000, 2);
+        let (ch, kept) = sample_trains(&[&t], 2_000_000, MAX_SPIKES, 150_000);
+        assert!(ch.is_some());
+        assert!(kept[0].len() <= MAX_SPIKES, "kept {}", kept[0].len());
+    }
+
+    #[test]
+    fn bursts_inside_the_chunks_stay_under_the_cap() {
+        // A uniform background plus a 200k-spike burst inside the first chunk.
+        let mut t = train(1_000_000, 20);
+        t.extend((0..200_000u64).map(|i| SampleIndex(500_000 + i % 1000)));
+        t.sort_unstable();
+        let n = 20_000_000;
+        let naive = time_chunks(n, t.len(), MAX_SPIKES, 1600);
+        assert!(in_chunks(&t, naive.as_deref()).len() > MAX_SPIKES);
+        let (_, kept) = sample_trains(&[&t], n, MAX_SPIKES, 1600);
+        assert!(kept[0].len() <= MAX_SPIKES, "kept {}", kept[0].len());
+    }
+
+    #[test]
+    fn a_burst_denser_than_the_cap_is_still_capped() {
+        // 250k coincident detections at one sample: no chunk set can thin
+        // them, so the budget bottoms out at one sample and the cap must
+        // still hold.
+        let n_samples = 1_000_000;
+        let t = vec![SampleIndex(500_000); 250_000];
+        let (_, kept) = sample_trains(&[&t], n_samples, MAX_SPIKES, 150_000);
+        assert!(
+            kept[0].len() <= MAX_SPIKES,
+            "kept {} over the hard cap",
+            kept[0].len()
+        );
+    }
+
+    /// The cap's own thinning must stay unbiased: a stride over the sorted
+    /// train keeps one of every two duplicates, so it erases every zero-lag
+    /// pair it was meant to preserve. Uniform selection keeps a pair with
+    /// probability `p²`.
+    #[test]
+    fn an_over_cap_burst_keeps_zero_lag_pairs_at_the_uniform_rate() {
+        // 1000 timestamps, each detected twice, packed into the one-sample
+        // chunk the budget bottoms out at. The cap is scaled down from
+        // MAX_SPIKES so the burst fits that chunk.
+        let t: Vec<SampleIndex> = (0..1_000u64)
+            .flat_map(|i| [SampleIndex(4_997_500 + i), SampleIndex(4_997_500 + i)])
+            .collect();
+        let (_, kept) = sample_trains(&[&t], 10_000_000, 1_000, 150_000);
+        let kept = &kept[0];
+        assert_eq!(kept.len(), 1_000, "the cap must hold exactly");
+        let pairs = kept.windows(2).filter(|w| w[0] == w[1]).count();
+        // p = 1000/2000, so a pair survives with p² = 1/4: about 250 of 1000.
+        assert!(pairs > 1_000 / 8, "kept {pairs} of 1000 zero-lag pairs");
+        let (_, again) = sample_trains(&[&t], 10_000_000, 1_000, 150_000);
+        assert_eq!(again[0], *kept, "the draw must be reproducible");
+    }
+
+    #[test]
+    fn a_near_cap_burst_shrinks_the_budget_geometrically() {
+        // One spike over the cap must not cost one pass per spike.
+        assert!(next_budget(MAX_SPIKES, MAX_SPIKES, MAX_SPIKES + 1) <= MAX_SPIKES * 9 / 10);
+        assert_eq!(next_budget(2, MAX_SPIKES, MAX_SPIKES + 1), 1);
+        // 20 trains stacked on one burst, 100,001 spikes in total.
+        let trains: Vec<Vec<SampleIndex>> = (0..20)
+            .map(|i| {
+                let n = if i == 0 { 5_001 } else { 5_000 };
+                (0..n).map(|j| SampleIndex(52_000_000 + 200 * j)).collect()
+            })
+            .collect();
+        let refs: Vec<&[SampleIndex]> = trains.iter().map(Vec::as_slice).collect();
+        let (_, kept) = sample_trains(&refs, 100_000_000, MAX_SPIKES, 150_000);
+        let n: usize = kept.iter().map(Vec::len).sum();
+        assert!(n <= MAX_SPIKES, "kept {n}");
+    }
+
+    /// The regression: a cluster with many near-coincident (duplicate)
+    /// detections must keep its lag-0 peak after subsampling. Thinning by a
+    /// stride erased it and drew a fake refractory dip.
+    #[test]
+    fn chunked_acg_keeps_the_zero_lag_peak() {
+        // Pairs of spikes 3 samples apart every 400 samples: 1M spikes.
+        let t: Vec<SampleIndex> = (0..500_000u64)
+            .flat_map(|i| [SampleIndex(i * 400), SampleIndex(i * 400 + 3)])
+            .collect();
+        let n = 400 * 500_000;
+        let (sr, window) = (32_000.0, 0.05);
+        let ch = time_chunks(n, t.len(), MAX_SPIKES, (window * sr as f64) as u64);
+        let kept = in_chunks(&t, ch.as_deref());
+        assert!(kept.len() <= 2 * MAX_SPIKES);
+        let acg = &correlograms(&[&kept], sr, 0.001, window)[0][0];
+        let half = acg.len() / 2;
+        let flank = acg[half + 5] as f64;
+        assert!(
+            acg[half] as f64 > 5.0 * flank.max(1.0),
+            "lag-0 {} vs {flank}",
+            acg[half]
+        );
     }
 
     #[test]

@@ -131,6 +131,10 @@ impl<K, T> Drop for Job<K, T> {
 /// Last computed value plus, possibly, a job computing the next one.
 pub struct Memo<K, T> {
     value: Option<(K, T)>,
+    /// One superseded value, kept only with [`Memo::with_history`]: Undo
+    /// restores an earlier key and must not recompute it from scratch.
+    previous: Option<(K, T)>,
+    history: bool,
     job: Option<Job<K, T>>,
 }
 
@@ -138,12 +142,49 @@ impl<K, T> Default for Memo<K, T> {
     fn default() -> Self {
         Self {
             value: None,
+            previous: None,
+            history: false,
             job: None,
         }
     }
 }
 
 impl<K: PartialEq + Clone, T> Memo<K, T> {
+    /// Keep the value a newer one supersedes, so flipping back to it is
+    /// instant. Opt-in because a value can be large.
+    pub fn with_history() -> Self {
+        Self {
+            history: true,
+            ..Self::default()
+        }
+    }
+
+    /// Take a finished job's value; with history, keep the value it replaces.
+    fn settle_job(&mut self) {
+        let Some(job) = &self.job else { return };
+        let Some(value) = job.try_take() else { return };
+        let key = job.key().clone();
+        if let Some(old) = self.value.take() {
+            if self.history && old.0 != key {
+                self.previous = Some(old);
+            }
+        }
+        self.value = Some((key, value));
+        self.job = None;
+    }
+
+    /// Make a kept superseded value current again (Undo), cancelling any job
+    /// chasing the key we just left.
+    fn recall_previous(&mut self, key: &K) -> bool {
+        if self.previous.as_ref().is_some_and(|(k, _)| k == key) {
+            std::mem::swap(&mut self.value, &mut self.previous);
+            self.job = None;
+            true
+        } else {
+            false
+        }
+    }
+
     /// As `ensure`, but the closure owns its inputs and takes no session lock.
     pub fn ensure_owned<F>(
         &mut self,
@@ -155,14 +196,12 @@ impl<K: PartialEq + Clone, T> Memo<K, T> {
         T: Send + 'static,
         F: FnOnce(&AtomicBool) -> T + Send + 'static,
     {
-        if let Some(job) = &self.job {
-            if let Some(value) = job.try_take() {
-                self.value = Some((job.key().clone(), value));
-                self.job = None;
-            }
-        }
+        self.settle_job();
         if self.value.as_ref().is_some_and(|(k, _)| *k == key) {
             self.job = None;
+            return self.value.as_ref().map(|(_, value)| value);
+        }
+        if self.recall_previous(&key) {
             return self.value.as_ref().map(|(_, value)| value);
         }
         if !matches!(&self.job, Some(job) if *job.key() == key) {
@@ -191,15 +230,13 @@ impl<K: PartialEq + Clone, T> Memo<K, T> {
         T: Send + 'static,
         F: FnOnce(&S, &AtomicBool) -> T + Send + 'static,
     {
-        if let Some(job) = &self.job {
-            if let Some(v) = job.try_take() {
-                self.value = Some((job.key().clone(), v));
-                self.job = None;
-            }
-        }
+        self.settle_job();
         if self.value.as_ref().is_some_and(|(k, _)| *k == key) {
             // Current: drop any job still chasing an older key.
             self.job = None;
+            return self.value.as_ref().map(|(_, v)| v);
+        }
+        if self.recall_previous(&key) {
             return self.value.as_ref().map(|(_, v)| v);
         }
         if !matches!(&self.job, Some(j) if *j.key() == key) {
@@ -219,10 +256,11 @@ impl<K: PartialEq + Clone, T> Memo<K, T> {
     }
 
     /// Cancel the running job (before a curation write) and forget the
-    /// value so the next `ensure` recomputes.
+    /// values so the next `ensure` recomputes.
     pub fn invalidate(&mut self) {
         self.job = None;
         self.value = None;
+        self.previous = None;
     }
 
     /// Cancel the running job but keep the value.
@@ -256,6 +294,35 @@ mod tests {
         // Different key: the old value is not reported as current.
         assert!(memo.ensure(2, &session, || {}, |s, _| *s * 3).is_none());
         wait_until(|| memo.ensure(2, &session, || {}, |s, _| *s * 3) == Some(&30));
+    }
+
+    #[test]
+    fn memo_history_reuses_the_previous_value_without_a_job() {
+        let session = Arc::new(RwLock::new(10u32));
+        let mut memo: Memo<u32, u32> = Memo::with_history();
+        assert!(memo.ensure(1, &session, || {}, |s, _| *s).is_none());
+        wait_until(|| memo.ensure(1, &session, || {}, |s, _| *s).is_some());
+        assert!(memo.ensure(2, &session, || {}, |s, _| *s * 2).is_none());
+        wait_until(|| memo.ensure(2, &session, || {}, |s, _| *s * 2) == Some(&20));
+        // Back to the superseded key (Undo): the value is kept, no job.
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        let back = memo
+            .ensure(
+                1,
+                &session,
+                || {},
+                move |s, _| {
+                    flag.store(true, Ordering::Relaxed);
+                    *s
+                },
+            )
+            .copied();
+        assert_eq!(back, Some(10));
+        assert!(!ran.load(Ordering::Relaxed), "must not recompute");
+        assert!(!memo.pending());
+        // And forward again is still kept too.
+        assert_eq!(memo.ensure(2, &session, || {}, |s, _| *s * 2), Some(&20));
     }
 
     #[test]
