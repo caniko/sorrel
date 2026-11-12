@@ -838,6 +838,7 @@ mod tests {
 
     #[test]
     fn save_writes_spikeinterface_curation_json_and_seal_drops_structure() {
+        use serde_json::json;
         use sorrel_io::read_curation_labels;
         let (mut s, dir) = fresh_session();
         s.dispatch(CurationCommand::Relabel {
@@ -864,34 +865,63 @@ mod tests {
         let doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
 
-        assert_eq!(doc["format_version"], "2");
-        assert_eq!(doc["unit_ids"], serde_json::json!([0, 1, 2]));
-        assert_eq!(doc["label_definitions"]["quality"]["exclusive"], true);
+        // A history with merges or splits is SpikeInterface's list form:
+        // the merge and the split touch disjoint units, so they share one
+        // structural step, and a labels-only step follows.
+        let steps = doc.as_array().expect("list form");
+        assert_eq!(steps.len(), 2);
+        let structural = &steps[0];
+        assert_eq!(structural["format_version"], "2");
+        assert_eq!(structural["unit_ids"], json!([0, 1, 2]));
+        assert_eq!(
+            structural["label_definitions"]["quality"]["exclusive"],
+            true
+        );
         // Every unit carries its exclusive origin label.
-        assert_eq!(doc["label_definitions"]["origin"]["exclusive"], true);
-        let first = &doc["manual_labels"][0]["labels"];
-        assert_eq!(first["quality"], serde_json::json!(["good"]));
-        assert_eq!(first["origin"], serde_json::json!(["Auto[unknown]"]));
-        assert_eq!(doc["merges"][0]["unit_ids"], serde_json::json!([1, 2]));
-        assert_eq!(doc["merges"][0]["new_unit_id"], 2);
-        assert_eq!(doc["splits"][0]["unit_id"], 0);
-        assert_eq!(doc["splits"][0]["indices"], serde_json::json!([[1]]));
-        // The journal placeholder (u32::MAX) was resolved to the allocated id.
-        assert_eq!(doc["splits"][0]["new_unit_ids"], serde_json::json!([3]));
-        assert_eq!(doc["removed"], serde_json::json!([]));
+        assert_eq!(structural["label_definitions"]["origin"]["exclusive"], true);
+        assert_eq!(structural["manual_labels"], json!([]));
+        assert_eq!(structural["merges"][0]["unit_ids"], json!([1, 2]));
+        assert_eq!(structural["merges"][0]["new_unit_id"], 2);
+        assert_eq!(structural["splits"][0]["unit_id"], 0);
+        assert_eq!(structural["splits"][0]["indices"], json!([[1]]));
+        // The journal placeholder (u32::MAX) was resolved to the allocated id;
+        // the spikes left in unit 0 get a fresh id (SI never reuses 0).
+        assert_eq!(structural["splits"][0]["new_unit_ids"], json!([3, 4]));
+        assert_eq!(structural["removed"], json!([]));
 
-        let labels = read_curation_labels(&path, 4, |u| Some(u as usize)).unwrap();
-        assert_eq!(labels[0].as_str(), "good");
-        assert_eq!(labels[1].as_str(), "unsorted");
+        // The final step labels the units that remain, keyed by their final
+        // ids: 0 is the split remainder (fresh id 4), 3 the split child.
+        let unit = |id: u64| {
+            steps[1]["manual_labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["unit_id"] == id)
+                .unwrap_or_else(|| panic!("no label entry for {id}"))
+                .clone()
+        };
+        assert_eq!(steps[1]["unit_ids"], json!([2, 3, 4]));
+        assert_eq!(steps[1]["merges"], json!([]));
+        assert_eq!(steps[1]["splits"], json!([]));
+        assert_eq!(unit(4)["labels"]["quality"], json!(["good"]));
+        assert_eq!(unit(2)["labels"]["origin"], json!(["Auto[unknown]"]));
+        assert_eq!(unit(3)["labels"]["origin"], json!(["Sorrel[Manual]"]));
+        assert_eq!(unit(3)["labels"]["quality"], serde_json::Value::Null);
+
+        // The list form's final step seeds labels: untouched unit 2 keeps its
+        // id, the split remainder's id 4 is past the dense mapping here.
+        let labels = read_curation_labels(&path, 6, |u| u.parse().ok()).unwrap();
+        assert_eq!(labels[2].as_str(), "unsorted");
+        assert_eq!(labels[4].as_str(), "good");
 
         // Seal: the artifacts now carry the merge and split, so the JSON
         // becomes labels-only over every cluster.
         save_and_seal(&mut s, dir.path(), label_str).unwrap();
         let doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(doc["unit_ids"], serde_json::json!([0, 1, 2, 3]));
-        assert_eq!(doc["merges"], serde_json::json!([]));
-        assert_eq!(doc["splits"], serde_json::json!([]));
+        assert_eq!(doc["unit_ids"], json!([0, 1, 2, 3]));
+        assert_eq!(doc["merges"], json!([]));
+        assert_eq!(doc["splits"], json!([]));
         assert!(!dir.path().join("curation.json.tmp").exists());
     }
 
@@ -977,11 +1007,19 @@ mod tests {
         let (mut s, _d) = fresh_session();
         let doc = CurationImport {
             labels: vec![
-                (0, Some(PhyLabel::Good), vec!["agree".into()]),
-                (1, Some(PhyLabel::Noise), vec!["merged:consensus".into()]),
-                (2, Some(PhyLabel::Noise), vec!["merged:consensus".into()]),
+                ("0".into(), Some(PhyLabel::Good), vec!["agree".into()]),
+                (
+                    "1".into(),
+                    Some(PhyLabel::Noise),
+                    vec!["merged:consensus".into()],
+                ),
+                (
+                    "2".into(),
+                    Some(PhyLabel::Noise),
+                    vec!["merged:consensus".into()],
+                ),
             ],
-            merges: vec![vec![2, 1]],
+            merges: vec![vec!["2".into(), "1".into()]],
         };
         let current = |c: ClusterId| label_str(&s.label(c).unwrap_or_default());
         let cmds = import_commands(&s, &doc, current).unwrap();
@@ -1006,18 +1044,18 @@ mod tests {
 
         let current = |_| "unsorted";
         let unknown = CurationImport {
-            labels: vec![(9, None, vec![])],
+            labels: vec![("9".into(), None, vec![])],
             merges: vec![],
         };
         assert!(import_commands(&s, &unknown, current).is_err());
         let bad_tag = CurationImport {
-            labels: vec![(0, None, vec!["a,b".into()])],
+            labels: vec![("0".into(), None, vec!["a,b".into()])],
             merges: vec![],
         };
         assert!(import_commands(&s, &bad_tag, current).is_err());
         let twice = CurationImport {
             labels: vec![],
-            merges: vec![vec![0, 1], vec![1, 2]],
+            merges: vec![vec!["0".into(), "1".into()], vec!["1".into(), "2".into()]],
         };
         assert!(import_commands(&s, &twice, current).is_err());
     }
@@ -1030,11 +1068,11 @@ mod tests {
         let doc = CurationImport {
             labels: vec![
                 (
-                    0,
+                    "0".into(),
                     None,
                     vec!["agree".into(), "tuned".into(), "external".into()],
                 ),
-                (1, None, vec!["tuned".into()]),
+                ("1".into(), None, vec!["tuned".into()]),
             ],
             merges: vec![],
         };

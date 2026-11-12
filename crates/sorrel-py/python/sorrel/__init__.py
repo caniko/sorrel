@@ -53,8 +53,9 @@ class Session:
     Thin wrapper over the native class that decodes its JSON payloads.
     """
 
-    def __init__(self, native: Any):
+    def __init__(self, native: Any, path: str | os.PathLike | None = None):
         self._n = native
+        self.path = None if path is None else Path(path)
 
     @classmethod
     def open(
@@ -69,7 +70,8 @@ class Session:
                 str(path),
                 None if journal is None else str(journal),
                 discard_journal,
-            )
+            ),
+            path,
         )
 
     # -- read -------------------------------------------------------------
@@ -99,8 +101,10 @@ class Session:
     def suggest(self) -> dict[str, list[dict[str, Any]]]:
         return json.loads(self._n.suggest_json())
 
-    def curation(self) -> dict[str, Any]:
-        """SpikeInterface curation document for the current state."""
+    def curation(self) -> dict[str, Any] | list[dict[str, Any]]:
+        """SpikeInterface curation document for the current state: one
+        ``Curation`` dict for a labels-only history, or the list form
+        (``SequentialCuration``) once the history has a merge or split."""
         return json.loads(self._n.curation_json())
 
     # -- edit (journaled, undoable) --------------------------------------
@@ -126,6 +130,27 @@ class Session:
     def note(self, cluster: int) -> str:
         return self._n.note(cluster)
 
+    def unit_id(self, cluster: int) -> int:
+        """The backend's id for ``cluster``, as ``curation.json`` uses it
+        (phy: the cluster id; SortingAnalyzer: its ``unit_ids`` entry)."""
+        return self._n.unit_id(cluster)
+
+    def unit_name(self, cluster: int) -> str:
+        """The unit id as ``curation.json`` writes it, as text. Differs from
+        ``unit_id`` when SpikeInterface's ids are strings that are not
+        distinct integers (``"unit_a"``): ``unit_id`` then numbers units
+        densely."""
+        return self._n.unit_name(cluster)
+
+    def tags(self, cluster: int) -> list[str]:
+        return self._n.tags(cluster)
+
+    def provenance(self) -> dict[str, Any]:
+        """Who made the curation on the applied path: ``by_actor``
+        (human/agent/algo/remote), ``by_method`` (manual/algo/llm),
+        ``journal_xxh3``, node counts and whether the head is ``sealed``."""
+        return json.loads(self._n.provenance_json())
+
     def sorter(self) -> str:
         return self._n.sorter()
 
@@ -148,14 +173,33 @@ class Session:
         return self._n.export_phy(os.fspath(out_dir), copy_raw)
 
 
-def read_curation(path: str | os.PathLike) -> dict[str, Any]:
+def read_curation(path: str | os.PathLike) -> dict[str, Any] | list[dict[str, Any]]:
     """Load ``curation.json`` from a dataset directory (or the file itself),
-    ready for ``spikeinterface.curation.apply_curation``."""
+    ready for ``spikeinterface.curation.apply_curation``.
+
+    A session with merges or splits is SpikeInterface's list form
+    (``SequentialCuration``), one structural step per group of edits plus one
+    final labels-only step; it is returned as that list. A labels-only
+    session is a single ``Curation`` dict. ``apply_curation`` accepts either
+    as-is.
+
+    Raises ``ValueError`` when the file lists edits SpikeInterface has no
+    curation slot for (a rescue that added spikes): the document cannot
+    reproduce the session, and applying it would silently drop them.
+    """
     p = Path(path)
     if p.is_dir():
         p = p / "curation.json"
     with p.open() as f:
-        return json.load(f)
+        doc = json.load(f)
+    steps = doc if isinstance(doc, list) else [doc]
+    bad = [text for step in steps for text in step.get("sorrel_unrepresentable") or []]
+    if bad:
+        raise ValueError(
+            "this session's edits cannot be expressed as a SpikeInterface curation: "
+            + "; ".join(bad)
+        )
+    return doc
 
 
 def inspect_phy(path: str | os.PathLike) -> tuple[int, int, float]:

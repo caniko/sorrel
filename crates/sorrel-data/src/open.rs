@@ -179,12 +179,49 @@ fn set_aside(path: &Path) -> Result<()> {
 }
 
 /// `--discard-journal`: set the journal aside (it holds the whole action
-/// tree, so it is renamed, not deleted).
+/// tree, so it is renamed, not deleted). A SortingAnalyzer's label snapshot
+/// belongs to that journal and follows it.
 fn discard_journal(opts: &JournalOpts, path: &Path) -> Result<()> {
     if opts.discard && path.exists() {
         set_aside(path)?;
+        let labels = labels_snapshot_path(path);
+        if labels.exists() {
+            set_aside(&labels)?;
+        }
     }
     Ok(())
+}
+
+/// `<journal>.labels.json`: the label source a session started from.
+fn labels_snapshot_path(journal: &Path) -> PathBuf {
+    let mut p = journal.as_os_str().to_owned();
+    p.push(".labels.json");
+    p.into()
+}
+
+/// Copy the labels a journal starts from next to it, unless a copy exists.
+/// `curation.json` when there is one, else an empty marker (both parse as
+/// "no labels" in `read_curation_labels`). A save rewrites `curation.json`
+/// with the head's labels; without this copy, reopening would seed the
+/// journal's replay with them and an undo could not reach the pre-session
+/// label.
+fn snapshot_labels(journal: &Path, curation: &Path) -> Result<PathBuf> {
+    let dst = labels_snapshot_path(journal);
+    if dst.exists() {
+        return Ok(dst);
+    }
+    let bytes = match std::fs::read(curation) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", curation.display())),
+    };
+    let mut tmp = dst.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    sorrel_io::fsutil::replace_file(&tmp, &dst)
+        .with_context(|| format!("write {}", dst.display()))?;
+    Ok(dst)
 }
 
 /// Pull the optional per-spike arrays into the index and replay the journal.
@@ -197,12 +234,46 @@ pub fn seed_phy(session: &mut Session<KilosortProvider>) -> Result<()> {
 }
 
 /// Open a SortingAnalyzer `binary_folder`. Unseeded: call `replay_journal`.
+///
+/// `curation.json` seeds the initial labels. Sorrel's own save rewrites it
+/// with the head's labels, so the file as it was when the journal was
+/// created is kept next to the journal (`<journal>.labels.json`) and read
+/// instead while it exists: replaying a journal onto its own saved labels
+/// would make undo restore them.
 pub fn open_sorting_analyzer(
     root: &Path,
     opts: &JournalOpts,
 ) -> Result<Session<SortingAnalyzerProvider>> {
-    let provider = SortingAnalyzerProvider::open(root)?;
-    let mut session = open_identity_sealed(provider, &journal_path(opts, root, "sorrel"), opts)?;
+    let path = journal_path(opts, root, "sorrel");
+    // Held from here (before the journal or its snapshot is touched) until
+    // the session drops; `--discard-journal` sets both aside.
+    let lock = lock_journal(&path)?;
+    discard_journal(opts, &path)?;
+    let snapshot = labels_snapshot_path(&path);
+    if !path.exists() {
+        // A snapshot whose journal is gone must not seed a new one.
+        let _ = std::fs::remove_file(&snapshot);
+    }
+    let labels = snapshot.exists().then_some(snapshot.as_path());
+    // A journal from before snapshots existed: its starting labels were the
+    // `curation.json` a save has since overwritten, and the journal records
+    // only new labels, so they are gone.
+    let unsnapshotted = path.exists() && labels.is_none();
+    let provider = SortingAnalyzerProvider::open_with_labels(root, labels)?;
+    let baseline = baseline_hash(&provider.identity_bytes());
+    let journal = open_journal_locked(lock, opts, &path, baseline, provider.n_clusters())?;
+    if unsnapshotted && journal.n_records() > 0 {
+        log::warn!(
+            "{} predates label snapshots: it replays onto the labels last saved \
+             to curation.json, so undoing a relabel back past this session's \
+             start restores the saved label, not the original one",
+            path.display()
+        );
+    }
+    let mut session = Session::new(provider, journal);
+    // A new journal starts from the labels on disk now. A journal from
+    // before snapshots existed starts from them too: the best left.
+    snapshot_labels(&path, &root.join("curation.json"))?;
     session.fill_detected_sorter(detect_sorter(root, Backend::SortingAnalyzer));
     Ok(session)
 }

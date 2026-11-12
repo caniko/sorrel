@@ -10,19 +10,22 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use eframe::egui_wgpu::RenderState;
+#[cfg(feature = "hdf5")]
+use sorrel_data::baseline_hash;
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::InstanceRequest;
 use sorrel_data::{
-    apply_rules, baseline_hash, collect_qc_rows_with, diff_labels, export_qc,
-    rank_merge_candidates, rank_split_candidates, save_session as save_dir_session, save_to_phy,
-    serve, write_report, Journal, ReportFilter, RuleSet, Session, SuggestConfig,
+    apply_rules, collect_qc_rows_with, diff_labels, export_qc, rank_merge_candidates,
+    rank_split_candidates, save_session as save_dir_session, save_to_phy, serve, write_report,
+    Journal, ReportFilter, RuleSet, Session, SuggestConfig,
 };
+#[cfg(feature = "hdf5")]
+use sorrel_io::detect_sorter;
 use sorrel_io::kilosort::{read_cluster_group_tsv, KilosortOpenParams, PhyLabel};
 use sorrel_io::open_ephys::OebinMeta;
 use sorrel_io::spikeglx::SpikeGlxMeta;
 use sorrel_io::{
-    detect_sorter, DataProvider, Events, HasGeometry, HasQualityMetrics, KilosortProvider,
-    SortingAnalyzerProvider, TraceDtype,
+    DataProvider, Events, HasGeometry, HasQualityMetrics, KilosortProvider, TraceDtype,
 };
 use sorrel_ui::{OpenRequest, Opened, Opener, Shell, SorrelApp, Tab};
 use std::path::{Path, PathBuf};
@@ -557,11 +560,13 @@ fn journal_opts(open: &OpenArgs) -> sorrel_data::JournalOpts {
 }
 
 /// `--journal`, else `<dir>/<stem>.journal` (see [`sorrel_data::journal_path`]).
+#[cfg(feature = "hdf5")]
 fn journal_path(open: &OpenArgs, dir: &Path, stem: &str) -> PathBuf {
     sorrel_data::journal_path(&journal_opts(open), dir, stem)
 }
 
 /// Open the journal sealed against `baseline`, honouring `--discard-journal`.
+#[cfg(feature = "hdf5")]
 fn open_journal(open: &OpenArgs, path: &Path, baseline: u64, n_clusters: u32) -> Result<Journal> {
     sorrel_data::open_journal(&journal_opts(open), path, baseline, n_clusters)
 }
@@ -695,13 +700,12 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
         }
         Backend::SortingAnalyzer => {
             let root = open.root().to_path_buf();
-            let provider = SortingAnalyzerProvider::open(&root)?;
             // The analyzer's own sorting is reloaded on every open, so the
             // journal stays the source of truth and is never sealed.
-            let baseline = baseline_hash(&provider.identity_bytes());
-            let journal_path = journal_path(open, &root, "sorrel");
-            let journal = open_journal(open, &journal_path, baseline, provider.n_clusters())?;
-            let session = new_session(provider, journal, open, sorrel_io::Backend::SortingAnalyzer);
+            let mut session = sorrel_data::open_sorting_analyzer(&root, &journal_opts(open))?;
+            if let Some(flag) = &open.sorter {
+                session.set_sorter(flag.clone());
+            }
             let metrics = session.provider.quality_metrics().clone();
             let positions = session.provider.channel_positions().to_vec();
             let shanks = session.provider.channel_shanks().to_vec();
@@ -750,6 +754,7 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
 }
 
 /// Wrap `Session::new` and name the sorter: `--sorter`, else the saved pin, else detected from the data.
+#[cfg(feature = "hdf5")]
 fn new_session<P: DataProvider>(
     provider: P,
     journal: Journal,

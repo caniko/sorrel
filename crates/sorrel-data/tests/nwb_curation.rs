@@ -19,7 +19,10 @@ fn curation_json_uses_nwb_unit_ids() {
         target: ClusterId(2),
     })
     .unwrap();
+    // A merge makes it SpikeInterface's list form: one structural step,
+    // then the labels step on the ids that remain.
     let doc = curation_document(&s, |l| l.as_str());
-    assert_eq!(doc["unit_ids"], serde_json::json!([5, 7, 9]));
-    assert_eq!(doc["merges"][0]["unit_ids"], serde_json::json!([5, 9]));
+    assert_eq!(doc[0]["unit_ids"], serde_json::json!([5, 7, 9]));
+    assert_eq!(doc[0]["merges"][0]["unit_ids"], serde_json::json!([5, 9]));
+    assert_eq!(doc[1]["unit_ids"], serde_json::json!([7, 9]));
 }

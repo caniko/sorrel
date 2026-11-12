@@ -272,7 +272,7 @@ impl KilosortProvider {
             crate::curation_json::read_curation_labels(
                 &view.path("curation.json"),
                 n_clusters,
-                |uid| usize::try_from(uid).ok(),
+                |uid| uid.parse().ok(),
             )
             .unwrap_or_else(|| load_cluster_groups(&view.path("cluster_KSLabel.tsv"), n_clusters))
         };

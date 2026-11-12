@@ -10,7 +10,12 @@ requires-python = ">=3.8"
 dependencies = []
 
 [project.optional-dependencies]
-spikeinterface = ["spikeinterface>=0.100"]
+# 0.104 is the first release whose apply_curation accepts the list
+# (SequentialCuration) form sorrel writes for merges/splits.
+spikeinterface = ["spikeinterface>=0.104"]
+# sorrel.nwb (Units table) and sorrel.neuroconv (NeuroConv data interface)
+nwb = ["pynwb>=3.0"]
+neuroconv = ["neuroconv>=0.10.2", "pynwb>=3.0"]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
