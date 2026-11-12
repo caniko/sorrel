@@ -539,6 +539,268 @@ fn ctrl_click_row(h: &mut Harness<'static, App>, id: &str) {
     settle(h);
 }
 
+fn click_cluster_row(h: &mut Harness<'static, App>, id: u32) {
+    h.get_all_by_label(id.to_string().as_str())
+        .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+        .unwrap_or_else(|| panic!("cluster {id} row"))
+        .click();
+    settle(h);
+}
+
+/// Native Ctrl shortcuts set both flags on Windows/Linux; COMMAND alone is
+/// a synthetic macOS modifier and does not describe a Windows key event.
+fn primary_modifiers() -> egui::Modifiers {
+    egui::Modifiers {
+        ctrl: !cfg!(target_os = "macos"),
+        command: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn curation_keys_alt_g_and_alt_n_label_selected_clusters_with_one_undo_step() {
+    if no_gpu() {
+        return;
+    }
+    for (theme, name) in [(egui::Theme::Dark, "dark"), (egui::Theme::Light, "light")] {
+        let mut h = fixture(&format!("label-key-events-{name}"), 3, theme);
+        let before = {
+            let s = sorrel_ui::jobs::read(h.state().session());
+            (
+                (0..3).map(|c| s.label(ClusterId(c))).collect::<Vec<_>>(),
+                s.spike_clusters_global().to_vec(),
+            )
+        };
+        for (key, expected) in [
+            (egui::Key::G, PhyLabel::Good),
+            (egui::Key::N, PhyLabel::Noise),
+        ] {
+            click_cluster_row(&mut h, 1);
+            ctrl_click_row(&mut h, "2");
+            assert_eq!(h.state().selected_clusters(), [ClusterId(1), ClusterId(2)]);
+            // Leave a table widget focused: no click in a plot is required.
+            h.key_press_modifiers(egui::Modifiers::ALT, key);
+            settle(&mut h);
+            {
+                let s = sorrel_ui::jobs::read(h.state().session());
+                assert_eq!(s.label(ClusterId(1)), Some(expected));
+                assert_eq!(s.label(ClusterId(2)), Some(expected));
+                assert_eq!(s.label(ClusterId(0)), before.0[0]);
+                assert_eq!(s.spike_clusters_global(), before.1);
+                assert_eq!(s.history_len(), 1);
+            }
+            h.key_press_modifiers(primary_modifiers(), egui::Key::Z);
+            settle(&mut h);
+            let s = sorrel_ui::jobs::read(h.state().session());
+            assert_eq!(
+                (0..3).map(|c| s.label(ClusterId(c))).collect::<Vec<_>>(),
+                before.0
+            );
+            assert_eq!(s.spike_clusters_global(), before.1);
+        }
+    }
+}
+
+#[test]
+fn curation_keys_g_merges_membership_into_first_cluster_and_one_undo_restores_it() {
+    if no_gpu() {
+        return;
+    }
+    for (theme, name) in [(egui::Theme::Dark, "dark"), (egui::Theme::Light, "light")] {
+        let mut h = fixture(&format!("merge-key-events-{name}"), 3, theme);
+        click_cluster_row(&mut h, 2);
+        ctrl_click_row(&mut h, "0");
+        ctrl_click_row(&mut h, "1");
+        assert_eq!(
+            h.state().selected_clusters(),
+            [ClusterId(2), ClusterId(0), ClusterId(1)]
+        );
+        click_tab(&mut h, "Features");
+        lasso_points(&mut h, 4);
+        let (before, mut times) = {
+            let s = sorrel_ui::jobs::read(h.state().session());
+            (
+                s.spike_clusters_global().to_vec(),
+                (0..3)
+                    .flat_map(|c| s.spike_times(ClusterId(c)).to_vec())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        times.sort_by_key(|t| t.0);
+        h.key_press(egui::Key::G);
+        settle(&mut h);
+        {
+            let s = sorrel_ui::jobs::read(h.state().session());
+            assert_eq!(s.spike_times(ClusterId(2)), times);
+            assert!(s.spike_times(ClusterId(0)).is_empty());
+            assert!(s.spike_times(ClusterId(1)).is_empty());
+            assert_eq!(s.history_len(), 1);
+        }
+        assert_eq!(h.state().selected_clusters(), [ClusterId(2)]);
+        assert!(
+            h.state().brushes().spikes.is_none(),
+            "old lasso cannot follow renumbered buckets"
+        );
+        assert_full_feature_grid(&h);
+        // A lone selected cluster is not a merge and cannot add history.
+        h.key_press(egui::Key::G);
+        settle(&mut h);
+        assert_eq!(sorrel_ui::jobs::read(h.state().session()).history_len(), 1);
+        h.key_press_modifiers(primary_modifiers(), egui::Key::Z);
+        settle(&mut h);
+        assert_eq!(
+            sorrel_ui::jobs::read(h.state().session()).spike_clusters_global(),
+            before
+        );
+    }
+}
+
+#[test]
+fn curation_keys_feature_selection_changes_clear_old_lasso_before_new_features_arrive() {
+    if no_gpu() {
+        return;
+    }
+    let mut h = fixture("feature-selection-key-events", 3, egui::Theme::Dark);
+    select_two_and_open_features(&mut h);
+    lasso_points(&mut h, 4);
+    assert!(h.state().brushes().spikes.is_some());
+    click_cluster_row(&mut h, 2);
+    assert!(h.state().brushes().spikes.is_none());
+    assert_full_feature_grid(&h);
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    settle(&mut h);
+    assert_eq!(
+        sorrel_ui::jobs::read(h.state().session()).label(ClusterId(2)),
+        Some(PhyLabel::Good)
+    );
+    assert!(h.state().brushes().spikes.is_none());
+    assert_full_feature_grid(&h);
+}
+
+#[test]
+fn waveform_m_repeatedly_toggles_on_hover_without_plot_focus_and_respects_text_and_modals() {
+    if no_gpu() {
+        return;
+    }
+    use sorrel_ui::prefs::WaveformMode::{Mean, Waveforms};
+    for (theme, name) in [(egui::Theme::Dark, "dark"), (egui::Theme::Light, "light")] {
+        let root = dataset_channels(&format!("waveform-m-key-events-{name}"), 3, 4);
+        let mut h = harness_with(theme, move || {
+            let (session, positions) = open(&root);
+            let mut app = SorrelApp::new(session, label_str);
+            configure(&mut app, &root, positions);
+            app
+        });
+        settle(&mut h);
+        click_cluster_row(&mut h, 2);
+        ctrl_click_row(&mut h, "0");
+        ctrl_click_row(&mut h, "1");
+        h.key_press(egui::Key::G);
+        settle(&mut h);
+        let expected_spikes = sorrel_ui::jobs::read(h.state().session())
+            .spike_times(ClusterId(2))
+            .len();
+        assert!(expected_spikes > 100);
+        let loaded = h.state().waveform_all_summary();
+        assert!(loaded.ready && !loaded.loading && !loaded.incomplete);
+        assert_eq!(loaded.valid, expected_spikes);
+        assert_eq!(loaded.total, expected_spikes);
+        assert_eq!(loaded.drawn, expected_spikes);
+        assert_eq!(
+            h.state().view_params.waveform.n_spikes,
+            100,
+            "legacy preview cap does not affect all mode"
+        );
+        let at = h.get_by_label("waveform channel 0").rect().center();
+        // A real focused button must not be mistaken for text editing. No
+        // click or focus request is made on the waveform canvas itself.
+        h.get_by_label("Help").focus();
+        h.run_ok();
+        assert!(h.ctx.egui_wants_keyboard_input());
+        assert!(!h.ctx.text_edit_focused());
+        assert_eq!(h.state().view_params.waveform.mode, Waveforms);
+        for expected in [Mean, Waveforms, Mean, Waveforms, Mean, Waveforms] {
+            h.hover_at(at);
+            h.key_press(egui::Key::M);
+            settle(&mut h);
+            assert_eq!(h.state().view_params.waveform.mode, expected);
+            let summary = h.state().waveform_all_summary();
+            assert!(summary.ready && !summary.loading && !summary.incomplete);
+            assert_eq!(
+                (summary.valid, summary.total, summary.drawn),
+                (expected_spikes, expected_spikes, expected_spikes)
+            );
+            assert_eq!(
+                summary.generation, loaded.generation,
+                "M reuses the same full spike set and mean"
+            );
+            assert_eq!(
+                h.state().view_params.waveform.source,
+                sorrel_ui::prefs::WaveformSource::AllSpikes
+            );
+            match expected {
+                Mean => {
+                    h.get_by_label_contains("mean of all");
+                }
+                Waveforms => {
+                    h.get_by_label_contains("drawing all");
+                }
+                _ => unreachable!(),
+            }
+            review_image(&mut h, &format!("all-spikes-m-{expected:?}-{name}"));
+        }
+        h.hover_at(egui::pos2(10.0, 10.0));
+        h.key_press(egui::Key::M);
+        settle(&mut h);
+        assert_eq!(
+            h.state().view_params.waveform.mode,
+            Waveforms,
+            "M is pane-local"
+        );
+        click_tab(&mut h, "Probe");
+        click_tab(&mut h, "Waveforms");
+        assert_eq!(
+            h.state().waveform_all_summary().generation,
+            loaded.generation,
+            "Probe's sampled peak cache cannot replace the all-spike result"
+        );
+
+        h.get_all_by_role(Role::TextInput)
+            .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+            .expect("cluster filter")
+            .focus();
+        h.run_ok();
+        h.hover_at(at);
+        h.key_press(egui::Key::M);
+        h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+        settle(&mut h);
+        assert_eq!(
+            h.state().view_params.waveform.mode,
+            Waveforms,
+            "text owns M even while hovering a plot"
+        );
+        assert_eq!(sorrel_ui::jobs::read(h.state().session()).history_len(), 1);
+
+        sorrel_ui::settings::open(&h.ctx);
+        settle(&mut h);
+        h.hover_at(at);
+        h.key_press(egui::Key::M);
+        settle(&mut h);
+        assert_eq!(
+            h.state().view_params.waveform.mode,
+            Waveforms,
+            "Settings owns the keyboard"
+        );
+        h.key_press(egui::Key::Escape);
+        settle(&mut h);
+        ctrl_click_row(&mut h, "2");
+        assert!(h.state().selected_clusters().is_empty());
+        let cleared = h.state().waveform_all_summary();
+        assert!(!cleared.ready && !cleared.loading);
+        assert_eq!((cleared.total, cleared.valid, cleared.drawn), (0, 0, 0));
+    }
+}
+
 #[test]
 fn parity_views() {
     if no_gpu() {
@@ -1218,12 +1480,15 @@ fn lasso_points(h: &mut Harness<'static, App>, n: usize) {
                 pressed,
                 modifiers: egui::Modifiers::COMMAND,
             });
-            h.run_ok();
+            // One frame per edge: run_ok may advance past egui's long-press
+            // deadline while the pointer is held and turn a click into a drag.
+            h.step();
         }
-        h.input_mut().modifiers = egui::Modifiers::NONE;
         // Past egui's double-click window so each press is its own click.
         settle(h);
     }
+    h.input_mut().modifiers = egui::Modifiers::NONE;
+    settle(h);
 }
 
 fn select_two_and_open_features(h: &mut Harness<'static, App>) {
@@ -1244,6 +1509,29 @@ fn shape_draws_rect(shape: &egui::Shape, rect: egui::Rect) -> bool {
         egui::Shape::Vec(shapes) => shapes.iter().any(|s| shape_draws_rect(s, rect)),
         _ => false,
     }
+}
+
+/// The visible geometry of a Features grid cell (its plot, clipped to the
+/// canvas viewport by the view).
+fn feature_cell(h: &Harness<'static, App>, cell: usize) -> egui::Rect {
+    h.get_by_label(format!("feature cell {cell}").as_str())
+        .rect()
+}
+
+/// Where a painted text label sits, if it is in this frame's shapes.
+fn text_position(h: &Harness<'static, App>, text: &str) -> Option<egui::Pos2> {
+    fn walk(shape: &egui::Shape, text: &str, out: &mut Option<egui::Pos2>) {
+        match shape {
+            egui::Shape::Text(t) if t.galley.text().trim() == text => *out = Some(t.pos),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, text, out)),
+            _ => {}
+        }
+    }
+    let mut out = None;
+    for clipped in &h.output().shapes {
+        walk(&clipped.shape, text, &mut out);
+    }
+    out
 }
 
 fn assert_full_feature_grid(h: &Harness<'static, App>) {
@@ -1442,6 +1730,713 @@ fn features_grid_lasso_split() {
 }
 
 #[test]
+fn polygon_draft_with_tracking_off_does_not_publish_spikes_before_ctrl_release() {
+    if no_gpu() {
+        return;
+    }
+    let mut h = fixture("polygon-draft-no-live", 3, egui::Theme::Dark);
+    h.key_press(egui::Key::ArrowDown);
+    settle(&mut h);
+    click_tab(&mut h, "Features");
+    let preview_generation = h.state().feature_interaction_summary().preview_generation;
+    let ctrl = primary_modifiers();
+    h.input_mut().modifiers = ctrl;
+    for point in [
+        egui::vec2(0.1, 0.1),
+        egui::vec2(0.9, 0.1),
+        egui::vec2(0.9, 0.9),
+        egui::vec2(0.1, 0.9),
+    ] {
+        let pos = feature_cell(&h, 1).lerp_inside(point);
+        h.hover_at(pos);
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: ctrl,
+            });
+            h.step();
+        }
+        h.step();
+        assert!(
+            h.state().brushes().spikes.is_none(),
+            "tracking is off: adding a polygon vertex must not select spikes"
+        );
+        let summary = h.state().feature_interaction_summary();
+        assert!(summary.drafting && !summary.live_tracking);
+        assert_eq!(
+            summary.preview_generation, preview_generation,
+            "no preview vertex rebuild during the draft"
+        );
+        assert!(
+            summary.hit_generation.is_none(),
+            "no full spike hit-test during the draft"
+        );
+    }
+    h.input_mut().modifiers = egui::Modifiers::NONE;
+    h.key_press(egui::Key::K);
+    settle(&mut h);
+    assert_eq!(sorrel_ui::jobs::read(h.state().session()).history_len(), 1);
+}
+
+#[test]
+fn packet_letters_without_key_events_still_merge_and_split() {
+    if no_gpu() {
+        return;
+    }
+    // Remote-desktop clients inject letters as Windows VK_PACKET: winit
+    // reports only the text, never a key.
+    let packet = |h: &mut Harness<'static, App>, text: &str| {
+        h.event(egui::Event::Text(text.into()));
+        h.step();
+        settle(h);
+    };
+    let mut h = fixture("packet-keys", 3, egui::Theme::Dark);
+    select_two_and_open_features(&mut h);
+    settle(&mut h);
+    packet(&mut h, "g");
+    let history =
+        |h: &Harness<'static, App>| sorrel_ui::jobs::read(h.state().session()).history_len();
+    assert_eq!(history(&h), 1, "text-only g merges the selection");
+    lasso_points(&mut h, 4);
+    packet(&mut h, "k");
+    settle(&mut h);
+    assert_eq!(history(&h), 2, "text-only k splits the lasso");
+}
+
+#[test]
+fn computed_pcs_new_vertex_on_settled_lasso_keeps_the_frozen_full_set() {
+    if no_gpu() {
+        return;
+    }
+    let root = dataset("features-raw-draft-freeze", 3);
+    for f in ["pc_features.npy", "pc_feature_ind.npy"] {
+        let _ = std::fs::remove_file(root.join(f));
+    }
+    let mut h = harness_with(egui::Theme::Dark, move || {
+        let (session, positions) = open(&root);
+        let mut app = SorrelApp::new(session, label_str);
+        configure(&mut app, &root, positions);
+        app
+    });
+    settle(&mut h);
+    select_two_and_open_features(&mut h);
+    settle(&mut h);
+    lasso_points(&mut h, 4);
+    h.input_mut().modifiers = egui::Modifiers::NONE;
+    h.step();
+    settle(&mut h);
+    assert!(
+        h.state().brushes().spikes.is_some(),
+        "the settled computed lasso brushes from the full set"
+    );
+    let preview_generation = h.state().feature_interaction_summary().preview_generation;
+    // Another Ctrl-click starts a draft; tracking is off, so nothing reloads.
+    let pos = feature_cell(&h, 1).lerp_inside(egui::vec2(0.5, 0.05));
+    h.hover_at(pos);
+    h.input_mut().modifiers = egui::Modifiers::COMMAND;
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        h.step();
+    }
+    for _ in 0..4 {
+        h.step();
+    }
+    let summary = h.state().feature_interaction_summary();
+    assert!(summary.drafting && !summary.live_tracking);
+    assert!(
+        h.state().brushes().spikes.is_some(),
+        "the frozen brush survives the draft"
+    );
+    assert_eq!(
+        summary.preview_generation, preview_generation,
+        "no reload of the display sample mid-draft"
+    );
+}
+
+#[test]
+fn computed_pcs_live_tracking_brushes_a_clicked_polygon_while_ctrl_is_held() {
+    if no_gpu() {
+        return;
+    }
+    let root = dataset("features-raw-live-draft", 3);
+    for f in ["pc_features.npy", "pc_feature_ind.npy"] {
+        let _ = std::fs::remove_file(root.join(f));
+    }
+    let mut h = harness_with(egui::Theme::Dark, move || {
+        let (session, positions) = open(&root);
+        let mut app = SorrelApp::new(session, label_str);
+        configure(&mut app, &root, positions);
+        app
+    });
+    settle(&mut h);
+    select_two_and_open_features(&mut h);
+    settle(&mut h);
+    // The switch shows while a lasso is in play; turn it on, then start over.
+    lasso_points(&mut h, 4);
+    h.get_by_label("live tracking").click();
+    settle(&mut h);
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    let ctrl = egui::Modifiers::COMMAND;
+    h.input_mut().modifiers = ctrl;
+    for point in [
+        egui::vec2(0.15, 0.15),
+        egui::vec2(0.85, 0.15),
+        egui::vec2(0.85, 0.85),
+        egui::vec2(0.15, 0.85),
+    ] {
+        let pos = feature_cell(&h, 1).lerp_inside(point);
+        h.hover_at(pos);
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: ctrl,
+            });
+            h.step();
+        }
+        settle(&mut h);
+    }
+    let summary = h.state().feature_interaction_summary();
+    assert!(summary.drafting && summary.live_tracking && summary.nodes == 4);
+    assert!(
+        h.state().brushes().spikes.is_some(),
+        "live tracking previews the clicked polygon from the full set before Ctrl release"
+    );
+}
+
+#[test]
+fn polygon_ctrl_release_before_last_mouse_up_and_k_still_cuts_once() {
+    if no_gpu() {
+        return;
+    }
+    let mut h = fixture("polygon-native-release-order", 3, egui::Theme::Dark);
+    h.key_press(egui::Key::ArrowDown);
+    settle(&mut h);
+    click_tab(&mut h, "Features");
+    let before = sorrel_ui::jobs::read(h.state().session())
+        .spike_clusters_global()
+        .to_vec();
+    let ctrl = primary_modifiers();
+    h.input_mut().modifiers = ctrl;
+    for point in [egui::vec2(0.1, 0.1), egui::vec2(0.9, 0.1)] {
+        let pos = feature_cell(&h, 1).lerp_inside(point);
+        h.hover_at(pos);
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: ctrl,
+            });
+            h.step();
+        }
+    }
+    let pos = feature_cell(&h, 1).lerp_inside(egui::vec2(0.9, 0.9));
+    h.hover_at(pos);
+    h.event(egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: ctrl,
+    });
+    h.step();
+    h.input_mut().modifiers = egui::Modifiers::NONE;
+    h.input_mut().events.extend([
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::Key {
+            key: egui::Key::K,
+            physical_key: Some(egui::Key::K),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::Text("k".into()),
+    ]);
+    h.run_ok();
+    settle(&mut h);
+    assert_eq!(sorrel_ui::jobs::read(h.state().session()).history_len(), 1);
+    assert_ne!(
+        sorrel_ui::jobs::read(h.state().session()).spike_clusters_global(),
+        before
+    );
+    h.key_up(egui::Key::K);
+    h.key_press_modifiers(primary_modifiers(), egui::Key::Z);
+    settle(&mut h);
+    assert_eq!(
+        sorrel_ui::jobs::read(h.state().session()).spike_clusters_global(),
+        before
+    );
+}
+
+#[test]
+fn typing_k_then_enter_in_filter_never_commits_an_existing_polygon() {
+    if no_gpu() {
+        return;
+    }
+    let mut h = fixture("polygon-k-text-protection", 3, egui::Theme::Dark);
+    h.key_press(egui::Key::ArrowDown);
+    settle(&mut h);
+    click_tab(&mut h, "Features");
+    lasso_points(&mut h, 4);
+    h.get_all_by_role(Role::TextInput)
+        .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+        .expect("cluster filter")
+        .focus();
+    h.run_ok();
+    assert!(h.ctx.text_edit_focused());
+    h.input_mut().events.extend([
+        egui::Event::Key {
+            key: egui::Key::K,
+            physical_key: Some(egui::Key::K),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::Text("k".into()),
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ]);
+    h.run_ok();
+    settle(&mut h);
+    assert_eq!(
+        sorrel_ui::jobs::read(h.state().session()).history_len(),
+        0,
+        "ending text focus in this frame must not turn typed K into a split"
+    );
+    assert!(!h.state().feature_interaction_summary().split_pending);
+}
+
+#[test]
+fn features_last_ctrl_click_and_plain_k_in_one_frame_splits() {
+    if no_gpu() {
+        return;
+    }
+    let mut h = fixture("features-last-node-k", 3, egui::Theme::Dark);
+    select_two_and_open_features(&mut h);
+    lasso_points(&mut h, 2);
+    let cell = feature_cell(&h, 1);
+    let pos = cell.lerp_inside(egui::vec2(0.85, 0.85));
+    h.hover_at(pos);
+    h.input_mut().modifiers = egui::Modifiers::COMMAND;
+    h.event(egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::COMMAND,
+    });
+    h.step();
+    h.input_mut().modifiers = egui::Modifiers::NONE;
+    h.input_mut().events.extend([
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::COMMAND,
+        },
+        egui::Event::Key {
+            key: egui::Key::K,
+            physical_key: Some(egui::Key::K),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::Text("k".into()),
+    ]);
+    h.run_ok();
+    assert_eq!(sorrel_ui::jobs::read(h.state().session()).history_len(), 1);
+}
+
+#[test]
+fn features_freehand_release_and_k_in_one_frame_splits_and_undoes() {
+    if no_gpu() {
+        return;
+    }
+    each_theme(|theme, name| {
+        let mut h = fixture(&format!("features-fast-k-{name}"), 3, theme);
+        select_two_and_open_features(&mut h);
+        let before = sorrel_ui::jobs::read(h.state().session())
+            .spike_clusters_global()
+            .to_vec();
+        // A real workflow starts by filtering the table, then drawing in
+        // Features. A drag is not an egui click, so it must explicitly take
+        // focus back from the text editor before the user's K arrives.
+        h.get_all_by_role(Role::TextInput)
+            .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+            .expect("cluster filter")
+            .focus();
+        h.run_ok();
+        assert!(h.ctx.text_edit_focused());
+        let cell = feature_cell(&h, 1);
+        let start = cell.lerp_inside(egui::vec2(0.15, 0.15));
+        h.hover_at(start);
+        h.input_mut().modifiers = egui::Modifiers::COMMAND;
+        h.event(egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        h.run_ok();
+        for point in [
+            egui::vec2(0.85, 0.15),
+            egui::vec2(0.85, 0.85),
+            egui::vec2(0.15, 0.85),
+        ] {
+            h.hover_at(cell.lerp_inside(point));
+            h.run_ok();
+        }
+        assert!(
+            !h.ctx.text_edit_focused(),
+            "drawing takes focus from the filter"
+        );
+        // Native event queues can deliver release and the next key together.
+        // Do not settle between them: the pane has not closed the stroke yet.
+        h.input_mut().modifiers = egui::Modifiers::NONE;
+        h.input_mut().events.push(egui::Event::PointerButton {
+            pos: cell.lerp_inside(egui::vec2(0.15, 0.85)),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::K,
+            physical_key: Some(egui::Key::K),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.input_mut().events.push(egui::Event::Text("k".into()));
+        h.run_ok();
+        settle(&mut h);
+        {
+            let session = sorrel_ui::jobs::read(h.state().session());
+            assert_eq!(session.history_len(), 1, "the first K must not be lost");
+            assert_ne!(session.spike_clusters_global(), before);
+        }
+        h.key_up(egui::Key::K);
+        h.key_press_modifiers(primary_modifiers(), egui::Key::Z);
+        settle(&mut h);
+        assert_eq!(
+            sorrel_ui::jobs::read(h.state().session()).spike_clusters_global(),
+            before,
+            "one Undo restores every spike"
+        );
+        h
+    });
+}
+
+/// Opt-in real-scale regression. All mutable files are copied into a fresh
+/// directory; the original raw binary is only memory-mapped read-only.
+/// SORREL_REAL_SORT=<sort> cargo test -p sorrel-ui --test ui_states \
+///     real_sort_fast_k -- --ignored --nocapture
+#[test]
+#[ignore = "requires SORREL_REAL_SORT and several million spikes"]
+fn real_sort_fast_k_changes_membership_and_one_undo_restores_it() {
+    real_sort_keyboard_cut(false);
+}
+
+#[test]
+#[ignore = "requires SORREL_REAL_SORT and several million spikes"]
+fn real_sort_polygon_k_without_live_tracking_splits_and_undoes() {
+    real_sort_keyboard_cut(true);
+}
+
+fn real_sort_keyboard_cut(polygon: bool) {
+    use std::time::Instant;
+    assert!(!no_gpu(), "real-scale UI regression requires a GPU");
+    let original = PathBuf::from(std::env::var_os("SORREL_REAL_SORT").expect("SORREL_REAL_SORT"));
+    let original_clusters = std::fs::read(original.join("spike_clusters.npy")).unwrap();
+    let original_labels = std::fs::read(original.join("cluster_group.tsv")).unwrap();
+    let temp_root = std::env::var_os("SORREL_TEST_TEMP")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let copy = tempfile::Builder::new()
+        .prefix("sorrel-real-fast-k-")
+        .tempdir_in(temp_root)
+        .unwrap();
+    for entry in std::fs::read_dir(&original).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file()
+            && entry.file_name() != "recording.dat"
+            && matches!(
+                entry.path().extension().and_then(|s| s.to_str()),
+                Some("npy" | "tsv" | "py" | "journal" | "json")
+            )
+        {
+            std::fs::copy(entry.path(), copy.path().join(entry.file_name())).unwrap();
+        }
+    }
+    fn copy_snapshot(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_snapshot(&entry.path(), &target);
+            } else {
+                assert_ne!(entry.file_name(), "recording.dat");
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    if original.join("sorrel_original").exists() {
+        copy_snapshot(
+            &original.join("sorrel_original"),
+            &copy.path().join("sorrel_original"),
+        );
+    }
+    let opened = Instant::now();
+    let provider = KilosortProvider::open(
+        copy.path(),
+        KilosortOpenParams {
+            dat_path: Some(original.join("recording.dat")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    eprintln!("real sort: provider open {:?}", opened.elapsed());
+    let positions = provider.channel_positions().to_vec();
+    let baseline = sorrel_data::baseline_hash(
+        &std::fs::read(
+            sorrel_io::RootView::open(copy.path())
+                .unwrap()
+                .path("spike_clusters.npy"),
+        )
+        .unwrap(),
+    );
+    let journal = Journal::open_or_create(
+        &copy.path().join("sorrel.journal"),
+        baseline,
+        provider.n_clusters(),
+    )
+    .unwrap();
+    let indexed = Instant::now();
+    let mut session = Session::new(provider, journal);
+    eprintln!("real sort: session index {:?}", indexed.elapsed());
+    let seeded = Instant::now();
+    session.seed_amplitudes();
+    session.seed_templates();
+    session.seed_pc_features();
+    session.seed_template_waveforms();
+    session.replay_journal().unwrap();
+    eprintln!("real sort: seeding/replay {:?}", seeded.elapsed());
+    let before = session.spike_clusters_global().to_vec();
+    let before_labels = session.labels().to_vec();
+    let history = session.history_len();
+    let root = copy.path().to_path_buf();
+    let mut h = harness_with(egui::Theme::Dark, move || {
+        let mut app = SorrelApp::new(session, label_str);
+        configure(&mut app, &root, positions);
+        app
+    });
+    h.key_press(egui::Key::ArrowDown);
+    h.run_ok();
+    h.get_by_label("Features").click_accesskit();
+    let features = Instant::now();
+    while h.query_by_label("feature cell 1").is_none()
+        || h.state().feature_interaction_summary().preview_generation == 0
+    {
+        assert!(
+            features.elapsed() < Duration::from_secs(180),
+            "features timed out"
+        );
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    eprintln!(
+        "real sort: features ready {:?}, selected {:?}, total open {:?}",
+        features.elapsed(),
+        h.state().selected_clusters(),
+        opened.elapsed()
+    );
+    if std::env::var("SORREL_TEST_WAIT_WAVEFORMS").is_ok_and(|value| value == "1") {
+        let wait = Instant::now();
+        loop {
+            let summary = h.state().waveform_all_summary();
+            if summary.ready && !summary.loading {
+                assert!(summary.total >= 100_000, "must exercise a real large unit");
+                assert_eq!(summary.drawn, summary.valid, "no all-spike drawing cap");
+                assert_eq!(summary.raster_failed, 0);
+                eprintln!(
+                    "real sort: all waveforms ready, {} valid/{} total/{} drawn, total open {:?}",
+                    summary.valid,
+                    summary.total,
+                    summary.drawn,
+                    opened.elapsed()
+                );
+                break;
+            }
+            assert!(
+                wait.elapsed() < Duration::from_secs(180),
+                "all waveforms timed out: {summary:?}"
+            );
+            h.step();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    h.get_all_by_role(Role::TextInput)
+        .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+        .expect("real sort cluster filter")
+        .focus();
+    h.run_ok();
+    let cell = feature_cell(&h, 1);
+    let ctrl = primary_modifiers();
+    h.input_mut().modifiers = ctrl;
+    if polygon {
+        let initial_preview = h.state().feature_interaction_summary().preview_generation;
+        let mut max_frame = Duration::ZERO;
+        for (node, point) in [
+            egui::vec2(0.15, 0.15),
+            egui::vec2(0.85, 0.15),
+            egui::vec2(0.85, 0.85),
+            egui::vec2(0.15, 0.85),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let pos = feature_cell(&h, 1).lerp_inside(point);
+            h.hover_at(pos);
+            for pressed in [true, false] {
+                h.event(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: ctrl,
+                });
+                let frame = Instant::now();
+                h.step();
+                max_frame = max_frame.max(frame.elapsed());
+            }
+            h.step();
+            assert!(
+                h.state().brushes().spikes.is_none(),
+                "no selection updates during the polygon draft"
+            );
+            let summary = h.state().feature_interaction_summary();
+            assert_eq!(summary.nodes, node + 1);
+            assert!(summary.drafting && !summary.live_tracking);
+            assert!(summary.hit_generation.is_none());
+            assert_eq!(summary.preview_generation, initial_preview);
+        }
+        eprintln!("real polygon: no selection or preview rebuilds while drawing; slowest input frame {max_frame:?}");
+        assert!(
+            max_frame < Duration::from_millis(250),
+            "polygon input blocked: {max_frame:?}"
+        );
+    } else {
+        let start = cell.lerp_inside(egui::vec2(0.15, 0.15));
+        h.hover_at(start);
+        h.event(egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: ctrl,
+        });
+        h.step();
+        for point in [
+            egui::vec2(0.85, 0.15),
+            egui::vec2(0.85, 0.85),
+            egui::vec2(0.15, 0.85),
+        ] {
+            h.hover_at(cell.lerp_inside(point));
+            h.step();
+        }
+    }
+    h.input_mut().modifiers = egui::Modifiers::NONE;
+    if polygon {
+        // The user's actual sequence: release Ctrl, let that native frame
+        // finish, then press plain K while preview work may still be pending.
+        let release = Instant::now();
+        h.step();
+        eprintln!("real polygon: Ctrl-release frame {:?}", release.elapsed());
+        assert!(
+            release.elapsed() < Duration::from_millis(250),
+            "Ctrl release blocked the input frame"
+        );
+    } else {
+        h.input_mut().events.push(egui::Event::PointerButton {
+            pos: cell.lerp_inside(egui::vec2(0.15, 0.85)),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.input_mut().events.extend([
+        egui::Event::Key {
+            key: egui::Key::K,
+            physical_key: Some(egui::Key::K),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::Text("k".into()),
+    ]);
+    let cut = Instant::now();
+    h.step();
+    eprintln!("real sort: release/K input frame {:?}", cut.elapsed());
+    while cut.elapsed() < Duration::from_secs(10) {
+        if sorrel_ui::jobs::read(h.state().session()).history_len() > history {
+            break;
+        }
+        h.step();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    {
+        let session = sorrel_ui::jobs::read(h.state().session());
+        assert_eq!(session.history_len(), history + 1);
+        let moved = session
+            .spike_clusters_global()
+            .iter()
+            .zip(&before)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(moved > 0, "K must move actual spikes");
+        eprintln!("real sort: K moved {moved} spikes in {:?}", cut.elapsed());
+    }
+    h.key_up(egui::Key::K);
+    h.key_press_modifiers(primary_modifiers(), egui::Key::Z);
+    h.run_ok();
+    assert_eq!(
+        sorrel_ui::jobs::read(h.state().session()).spike_clusters_global(),
+        before,
+        "one keyboard Undo restores the entire real sort"
+    );
+    assert_eq!(
+        sorrel_ui::jobs::read(h.state().session()).labels(),
+        before_labels,
+        "one keyboard Undo also restores the original cluster labels"
+    );
+    drop(h);
+    assert_eq!(
+        std::fs::read(original.join("spike_clusters.npy")).unwrap(),
+        original_clusters
+    );
+    assert_eq!(
+        std::fs::read(original.join("cluster_group.tsv")).unwrap(),
+        original_labels
+    );
+}
+
+#[test]
 fn features_cancel_clears_the_lasso_without_changing_cluster_membership() {
     if no_gpu() {
         return;
@@ -1524,35 +2519,71 @@ fn features_navigation_keeps_layout_and_moves_projection_windows_as_a_group() {
     each_theme(|theme, name| {
         let mut h = wide_fixture(&format!("features-navigation-{name}"), theme);
         select_two_and_open_features(&mut h);
+        // The fitted default shows every projection before navigation.
+        assert_full_feature_grid(&h);
+        // The expanded alternatives strip reduces the canvas before any
+        // navigation; settle it and capture that layout as the baseline.
         h.get_by_label("ALTERNATIVES").click();
         settle(&mut h);
-        let before = [
-            h.get_by_label("feature cell 0").rect(),
-            h.get_by_label("feature cell 1").rect(),
-        ];
+        let before: Vec<_> = (0..16).map(|cell| feature_cell(&h, cell)).collect();
         let controls = h.get_by_label("k-means").rect();
         let alternative = h
             .get_all_by_label_contains("alternative ")
             .next()
             .expect("the original alternatives strip")
             .rect();
+        let caption_before = [
+            text_position(&h, "t × 0A").expect("cell 0 caption"),
+            text_position(&h, "0B × 0A").expect("cell 1 caption"),
+        ];
+        let data_before = {
+            let session = sorrel_ui::jobs::read(h.state().session());
+            (
+                session.version(),
+                session.spike_clusters_global().to_vec(),
+                session.history_len(),
+            )
+        };
         lasso_points(&mut h, 4);
         let brush = h.state().brushes().spikes.as_ref().unwrap().key();
-        wheel_zoom(&mut h, "feature cell 1");
-        for (cell, rect) in before.iter().enumerate() {
-            assert_eq!(
-                h.get_by_label(format!("feature cell {cell}").as_str())
-                    .rect(),
-                *rect,
-                "wheel zoom changes the contents, never the projection box"
-            );
-        }
-        assert_eq!(h.state().brushes().spikes.as_ref().unwrap().key(), brush);
 
-        // Start away from lasso nodes: a plain drag moves the windows, not
-        // their data-space centres or the surrounding controls.
-        let start = before[0].center();
-        let end = start + egui::vec2(15.0, 12.0);
+        // A modest pointer-anchored zoom near the top of cell 1 leaves it
+        // fully on screen while the first cell is cropped at the canvas edge.
+        let anchor = egui::pos2(
+            before[1].center().x,
+            before[1].top() + before[1].height() * 0.1,
+        );
+        wheel_at(&mut h, anchor, 100.0, egui::Modifiers::NONE);
+        let zoomed: Vec<_> = [0, 1, 2]
+            .iter()
+            .map(|&cell| feature_cell(&h, cell))
+            .collect();
+        let scale = zoomed[1].width() / before[1].width();
+        assert!(scale > 1.05, "plain wheel enlarges the projection squares");
+        assert!(
+            (zoomed[1].height() / before[1].height() - scale).abs() < 0.01,
+            "squares grow by one ratio on both axes"
+        );
+        let expected_min = anchor + (before[1].min - anchor) * scale;
+        let expected_max = anchor + (before[1].max - anchor) * scale;
+        assert!(
+            (zoomed[1].min - expected_min).length() < 0.75
+                && (zoomed[1].max - expected_max).length() < 0.75,
+            "the image point under the pointer stays put: {zoomed:?} vs anchor {anchor:?}"
+        );
+        assert!(
+            zoomed[0].width() < zoomed[1].width() - 1.0
+                && (zoomed[0].left() - before[0].left()).abs() < 0.75,
+            "a cell cropped by the canvas reports its visible geometry, not its old full rect"
+        );
+        // Exercise the GPU path with callback viewports clipped to the
+        // canvas, not just AccessKit/paint metadata.
+        h.render().expect("render the pointer-anchored canvas zoom");
+
+        // Pan inward: the enlarged first cell becomes fully visible again,
+        // and the whole matrix moves equally in screen pixels.
+        let start = zoomed[2].center();
+        let end = start + egui::vec2(80.0, 60.0);
         h.hover_at(start);
         h.event(egui::Event::PointerButton {
             pos: start,
@@ -1570,29 +2601,58 @@ fn features_navigation_keeps_layout_and_moves_projection_windows_as_a_group() {
             modifiers: egui::Modifiers::NONE,
         });
         settle(&mut h);
-        let after = [
-            h.get_by_label("feature cell 0").rect(),
-            h.get_by_label("feature cell 1").rect(),
-        ];
-        let movement = after[0].center() - before[0].center();
-        assert!(movement.length() > 1.0, "dragging must move the windows");
+        let panned: Vec<_> = [0, 1, 2, 4]
+            .iter()
+            .map(|&cell| feature_cell(&h, cell))
+            .collect();
+        let movement = panned[1].center() - zoomed[1].center();
+        assert!(movement.length() > 1.0, "dragging must move the grid");
         assert!(
-            ((after[1].center() - before[1].center()) - movement).length() < 1.0,
-            "the windows move together"
+            (panned[1].size() - zoomed[1].size()).length() < 0.5,
+            "dragging after zoom does not rescale the squares"
         );
-        assert_eq!(after[0].size(), before[0].size());
-        assert_eq!(after[1].size(), before[1].size());
-        // Check actual paint clips, not just accessibility bounds. Moving
-        // a window must expose it past its old slot instead of merely
-        // reporting a full rect while cropping its paint there.
-        for rect in after {
+        assert!(
+            (panned[0].width() - panned[1].width()).abs() < 0.75
+                && panned[0].left() > zoomed[0].left() + 1.0,
+            "panning brings the enlarged, cropped cell fully into view"
+        );
+        for rect in [panned[0], panned[1]] {
             assert!(
                 h.output().shapes.iter().any(|s| {
                     s.clip_rect.contains_rect(rect.shrink(0.5)) && shape_draws_rect(&s.shape, rect)
                 }),
-                "a translated window is painted in the shared viewport, not cropped to its old slot"
+                "a panned cell is painted in full inside the shared viewport"
             );
         }
+        h.render()
+            .expect("render the enlarged, panned canvas and its clipped cells");
+
+        // Size and both centre-to-centre pitches grow by the same ratio.
+        let scale_now = panned[1].width() / before[1].width();
+        assert!((scale_now - scale).abs() < 0.01);
+        let pitch_x_before = before[1].center().x - before[0].center().x;
+        let pitch_x_after = panned[1].center().x - panned[0].center().x;
+        assert!(
+            (pitch_x_after / pitch_x_before - scale_now).abs() < 0.01,
+            "horizontal spacing scales with the squares: {pitch_x_after} / {pitch_x_before} vs {scale_now}"
+        );
+        let pitch_y_before = before[4].center().y - before[0].center().y;
+        let pitch_y_after = panned[3].center().y - panned[0].center().y;
+        assert!(
+            (pitch_y_after / pitch_y_before - scale_now).abs() < 0.01,
+            "vertical spacing scales with the squares"
+        );
+        let caption_after = [
+            text_position(&h, "t × 0A").expect("cell 0 caption after zoom"),
+            text_position(&h, "0B × 0A").expect("cell 1 caption after zoom"),
+        ];
+        let caption_pitch_before = caption_before[1].x - caption_before[0].x;
+        let caption_pitch_after = caption_after[1].x - caption_after[0].x;
+        assert!(
+            (caption_pitch_after / caption_pitch_before - scale_now).abs() < 0.01,
+            "captions travel and scale with their squares"
+        );
+        assert_eq!(h.state().brushes().spikes.as_ref().unwrap().key(), brush);
         assert_eq!(h.get_by_label("k-means").rect(), controls);
         assert_eq!(
             h.get_all_by_label_contains("alternative ")
@@ -1601,7 +2661,53 @@ fn features_navigation_keeps_layout_and_moves_projection_windows_as_a_group() {
                 .rect(),
             alternative
         );
+
+        // Plain wheel-down shrinks the canvas again; double-click resets zoom
+        // and pan to the fitted all-16 default.
+        let zoomed_in = panned[1];
+        wheel_at(&mut h, zoomed_in.center(), -60.0, egui::Modifiers::NONE);
+        let zoomed_out = feature_cell(&h, 1);
+        assert!(
+            zoomed_out.width() < zoomed_in.width() - 0.5,
+            "wheel-down zooms the canvas out"
+        );
+        let reset_at = feature_cell(&h, 0).center();
+        double_click_at(&mut h, reset_at);
+        for (cell, rect) in before.iter().enumerate() {
+            let restored = feature_cell(&h, cell);
+            assert!(
+                (restored.min - rect.min).length() < 0.75
+                    && (restored.size() - rect.size()).length() < 0.75,
+                "double-click restores cell {cell} to the fitted layout"
+            );
+        }
+        assert_full_feature_grid(&h);
         assert_eq!(h.state().brushes().spikes.as_ref().unwrap().key(), brush);
+
+        // Ctrl-wheel and Alt-wheel keep their old meanings and never scale
+        // the canvas.
+        for modifiers in [egui::Modifiers::COMMAND, egui::Modifiers::ALT] {
+            let restored = feature_cell(&h, 1);
+            wheel_at(&mut h, restored.center(), 100.0, modifiers);
+            let after = feature_cell(&h, 1);
+            assert!(
+                (after.min - restored.min).length() < 0.75
+                    && (after.size() - restored.size()).length() < 0.75,
+                "{modifiers:?}+wheel must not zoom the projection canvas"
+            );
+        }
+        let data_after = {
+            let session = sorrel_ui::jobs::read(h.state().session());
+            (
+                session.version(),
+                session.spike_clusters_global().to_vec(),
+                session.history_len(),
+            )
+        };
+        assert_eq!(
+            data_before, data_after,
+            "navigation never changes cluster data or history"
+        );
         h
     });
 }
@@ -1763,16 +2869,43 @@ fn features_lasso_drawing_and_kmeans() {
     });
 }
 
+/// Hover `at` and scroll the wheel by `delta` points with `modifiers`.
+fn wheel_at(h: &mut Harness<'static, App>, at: egui::Pos2, delta: f32, modifiers: egui::Modifiers) {
+    h.hover_at(at);
+    h.input_mut().modifiers = modifiers;
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, delta),
+        phase: egui::TouchPhase::Move,
+        modifiers,
+    });
+    settle(h);
+    h.input_mut().modifiers = egui::Modifiers::NONE;
+}
+
 /// Hover the middle of the plot labelled `label` and scroll the wheel up.
 fn wheel_zoom(h: &mut Harness<'static, App>, label: &str) {
     let at = h.get_by_label(label).rect().center();
+    wheel_at(h, at, 300.0, egui::Modifiers::NONE);
+}
+
+/// Two quick primary clicks at `at`, close enough to count as a double-click.
+/// kittest advances 250 ms per queued event, so put both clicks in one raw
+/// frame instead of spreading them past egui's double-click window.
+fn double_click_at(h: &mut Harness<'static, App>, at: egui::Pos2) {
     h.hover_at(at);
-    h.event(egui::Event::MouseWheel {
-        unit: egui::MouseWheelUnit::Point,
-        delta: egui::vec2(0.0, 300.0),
-        phase: egui::TouchPhase::Move,
-        modifiers: egui::Modifiers::NONE,
-    });
+    h.run_ok();
+    for _ in 0..2 {
+        for pressed in [true, false] {
+            h.input_mut().events.push(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+    }
+    h.run_ok();
     settle(h);
 }
 
