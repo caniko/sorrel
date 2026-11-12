@@ -6,6 +6,7 @@
 pub mod binning;
 pub mod ccg_analysis;
 pub mod cmr;
+pub mod contaminated_gaussian;
 pub mod distribution;
 pub mod drift;
 pub mod filter;

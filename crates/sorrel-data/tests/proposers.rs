@@ -219,10 +219,91 @@ fn kmeans_split_recovers_concatenated_units_and_spares_single_unit() {
 }
 
 #[test]
+fn robust_cleanup_can_offer_a_correlated_tail_without_parent_rpv_and_uses_handles() {
+    let (mut p, _) = build(vec![]);
+    let n = 2000;
+    p.times = vec![(0..n).map(|i| SampleIndex(i as u64 * 100)).collect()];
+    p.amps = vec![vec![5.0; n]];
+    p.templates = vec![vec![0; n]];
+    p.pc_rows = vec![(0..n as u32).collect()];
+    p.pc.clear();
+    let mut seed = 7345;
+    for i in 0..n {
+        let scale = if i % 5 == 0 { 6.0 } else { 1.0 };
+        let x = scale * gaussian(&mut seed);
+        for j in 0..9 {
+            p.pc.push(if j == 0 {
+                x
+            } else if j == 1 {
+                0.8 * x + 0.2 * scale * gaussian(&mut seed)
+            } else {
+                scale * gaussian(&mut seed)
+            });
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::new(
+        p,
+        Journal::open(&dir.path().join("robust.journal")).unwrap(),
+    );
+    s.seed_amplitudes();
+    s.seed_templates();
+    s.seed_pc_features();
+    let globals = sorrel_data::proposers::cluster_globals(&s, ClusterId(0));
+    let proposal = sorrel_data::robust_cleanup::robust_cleanup(&s, ClusterId(0), &globals)
+        .expect("broad tail");
+    assert_eq!(proposal.whole_contamination, 0.0);
+    assert!(proposal.supported);
+    assert!(proposal.minor_idx.len() >= 100 && proposal.minor_idx.len() < n / 2);
+    assert!(proposal.minor_idx.iter().filter(|&&i| i % 5 == 0).count() > 300);
+    let mut handles = sorrel_data::evaluate::Handles::default();
+    let history = s.history_len();
+    let query = sorrel_data::probe::parse("split 0 by=robust").unwrap();
+    let text = sorrel_data::probe::run(&s, &mut handles, &[], None, &query).unwrap();
+    assert!(text.contains("robust-cleanup"), "{text}");
+    let handle = text.split_whitespace().next().unwrap();
+    let (parent, minor, _) = handles.resolve_split(&s, handle).unwrap();
+    assert_eq!(parent, ClusterId(0));
+    assert_eq!(minor, proposal.minor_idx);
+    assert_eq!(history, s.history_len(), "proposal is read-only");
+    assert!(sorrel_data::probe::parse("split 0 by=robust at=0.1").is_err());
+}
+
+#[test]
 fn notsplit_tag_suppresses_split() {
     let (s, _, _d) = session(vec![vec!["notsplit".into()]]);
     let splits = rank_split_candidates(&s, &SuggestConfig::default());
     assert!(splits.iter().all(|c| c.cluster != ClusterId(0)));
+}
+
+#[test]
+fn axis_probe_lists_bounded_distinct_read_only_handles() {
+    let (s, _, _d) = session(vec![]);
+    let mut handles = sorrel_data::evaluate::Handles::default();
+    let query = sorrel_data::probe::parse("split 0 by=axis").unwrap();
+    let before = s.history_len();
+    let text = sorrel_data::probe::run(&s, &mut handles, &[], None, &query).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    assert!(!lines.is_empty() && lines.len() <= 30, "{text}");
+    let mut seen = std::collections::BTreeSet::new();
+    for line in lines {
+        assert!(
+            line.contains("remaining/moved") && line.contains("not a label"),
+            "{line}"
+        );
+        let id = line.split_whitespace().next().unwrap();
+        let (parent, minor, _) = handles.resolve_split(&s, id).unwrap();
+        assert_eq!(parent, ClusterId(0));
+        assert!(minor.len() >= 100 && minor.len() <= s.spike_times(parent).len() / 2);
+        assert!(seen.insert(minor));
+    }
+    assert_eq!(before, s.history_len());
+    assert_eq!(
+        text,
+        sorrel_data::probe::run(&s, &mut handles, &[], None, &query).unwrap(),
+        "stable handles"
+    );
+    assert!(sorrel_data::probe::parse("split 0 by=axis at=0.5").is_err());
 }
 
 #[test]

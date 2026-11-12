@@ -177,8 +177,10 @@ pub fn write_blind_input(
         let mut text = std::fs::read_to_string(&params)?;
         // Point the copy at the raw by its bare name (the old line goes too: it
         // names a path in the source).
-        let loads = params_dat.unwrap_or_else(|| PathBuf::from("recording.dat"));
-        if let Some(n) = raw_name.filter(|n| Path::new(n) != loads) {
+        // Rewrite even when the resolved basename is already recording.dat:
+        // the source can omit dat_path or use a foreign singleton-list form.
+        // Leaving that source line behind leaks a path or defeats intake.
+        if let Some(n) = raw_name {
             text = text
                 .lines()
                 .filter(|l| !l.trim_start().starts_with("dat_path"))

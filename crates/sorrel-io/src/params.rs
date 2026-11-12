@@ -1,11 +1,13 @@
 //! Minimal `params.py` parser. phy's `params.py` is Python source, but the
 //! subset Kilosort emits is a flat list of `key = value` assignments. We parse
-//! only what we need; anything fancier (lists, expressions) is ignored.
+//! only what we need; expressions are ignored. A singleton list is also
+//! accepted for `dat_path`, as emitted by some Kilosort 4 exporters.
 //!
 //! Supported value forms:
 //! - integers and floats (`30000`, `30000.0`, `3e4`)
 //! - bools (`True`/`False`)
 //! - strings: `'..'`, `".."`, raw strings `r'..'` / `r".."`
+//! - `dat_path = ['..']` (one literal string, optional trailing comma)
 
 use crate::provider::TraceDtype;
 use anyhow::{bail, Context, Result};
@@ -42,7 +44,7 @@ impl PhyParams {
             let value = value.trim().trim_end_matches(';').trim();
             match key {
                 "dat_path" => {
-                    out.dat_path = parse_string(value).map(PathBuf::from);
+                    out.dat_path = parse_dat_path(value).map(PathBuf::from);
                 }
                 "n_channels_dat" => {
                     out.n_channels_dat = Some(
@@ -107,6 +109,27 @@ fn parse_string(value: &str) -> Option<String> {
         return None;
     }
     Some(v[1..v.len() - 1].to_string())
+}
+
+fn parse_dat_path(value: &str) -> Option<String> {
+    if let Some(path) = parse_string(value) {
+        return Some(path);
+    }
+    let inner = value.strip_prefix('[')?.strip_suffix(']')?.trim();
+    let inner = inner.strip_suffix(',').unwrap_or(inner).trim();
+    let path = parse_string(inner)?;
+    // Keep backslashes verbatim, but reject a second quoted list item rather
+    // than treating a multi-file list as one filename. Quoted commas are fine.
+    let literal = inner.trim_start_matches('r').trim();
+    let quote = literal.as_bytes()[0];
+    let mut escaped = false;
+    for byte in literal.as_bytes()[1..literal.len() - 1].iter().copied() {
+        if byte == quote && !escaped {
+            return None;
+        }
+        escaped = byte == b'\\' && !escaped;
+    }
+    Some(path)
 }
 
 fn parse_int(value: &str) -> Result<i64> {
@@ -244,5 +267,37 @@ dtype = 'float32'
         let src = "dat_path = r'C:\\data\\rec.bin'\n";
         let p = PhyParams::parse(src).unwrap();
         assert_eq!(p.dat_path, Some(PathBuf::from("C:\\data\\rec.bin")));
+    }
+
+    #[test]
+    fn dat_path_accepts_one_quoted_list_item() {
+        for source in [
+            "['recording.dat']",
+            "[ 'recording.dat', ]",
+            "[r'recording.dat']",
+        ] {
+            let p = PhyParams::parse(&format!("dat_path = {source}\n")).unwrap();
+            assert_eq!(p.dat_path, Some(PathBuf::from("recording.dat")));
+        }
+        let p = PhyParams::parse("dat_path = [r'C:\\data\\rec.bin']\n").unwrap();
+        assert_eq!(p.dat_path, Some(PathBuf::from("C:\\data\\rec.bin")));
+        let p = PhyParams::parse("dat_path = ['recording,part.dat']\n").unwrap();
+        assert_eq!(p.dat_path, Some(PathBuf::from("recording,part.dat")));
+    }
+
+    #[test]
+    fn dat_path_does_not_join_multiple_files_or_evaluate_expressions() {
+        for source in [
+            "[]",
+            "['one.dat', 'two.dat']",
+            "[\"one.dat\",\"two.dat\"]",
+            "[get_path()]",
+            "get_path()",
+        ] {
+            assert!(PhyParams::parse(&format!("dat_path = {source}\n"))
+                .unwrap()
+                .dat_path
+                .is_none());
+        }
     }
 }

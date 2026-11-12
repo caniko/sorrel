@@ -23,8 +23,9 @@ pub const GRAMMAR: &str = "probe grammar (ms for acg/ccg, seconds for window/spl
   acg C [win=50] [bin=1]
   ccg A B [win=50] [bin=1]
   compare A B
+  waveform C   (current-membership raw snippets, bounded; DC subtraction only)
   window C T0 T1
-  split C by=amp|time|pc|kmeans|core [at=X]   (new handle; minor part = spikes above/after X; core = clean refractory core, or cleanup = the contaminated minority dropped to leave a clean majority; the handle says which)
+  split C by=amp|time|pc|kmeans|core|robust|axis [at=X]   (axis lists up to 30 alternative PC/amplitude mixture handles; no at=; other methods give one handle)
   eval merge A B ..   |   eval s<C>.<k>   |   eval m<k>";
 
 /// Most queries in one `probe` call.
@@ -37,6 +38,8 @@ pub enum By {
     Pc,
     Kmeans,
     Core,
+    Robust,
+    Axis,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -44,6 +47,7 @@ pub enum Query {
     Acg { c: u32, win: f32, bin: f32 },
     Ccg { a: u32, b: u32, win: f32, bin: f32 },
     Compare { a: u32, b: u32 },
+    Waveform { c: u32 },
     Window { c: u32, t0: f32, t1: f32 },
     Split { c: u32, by: By, at: Option<f32> },
     Merge(Vec<u32>),
@@ -128,6 +132,10 @@ pub fn parse(q: &str) -> Result<Query, String> {
                 false => Err("need 0 <= T0 < T1".into()),
             }
         }
+        "waveform" => {
+            want(1, &[])?;
+            Ok(Query::Waveform { c: id(pos[0])? })
+        }
         "split" => {
             want(1, &["by", "at"])?;
             let by = match kv.iter().find(|(k, _)| *k == "by").map(|p| p.1) {
@@ -136,9 +144,14 @@ pub fn parse(q: &str) -> Result<Query, String> {
                 Some("pc") => By::Pc,
                 Some("kmeans") => By::Kmeans,
                 Some("core") => By::Core,
+                Some("robust") => By::Robust,
+                Some("axis") => By::Axis,
                 Some(o) => return Err(format!("unknown by={o}")),
-                None => return Err("split needs by=amp|time|pc|kmeans|core".into()),
+                None => return Err("split needs by=amp|time|pc|kmeans|core|robust|axis".into()),
             };
+            if matches!(by, By::Robust | By::Axis) && opt("at")?.is_some() {
+                return Err("by=robust/axis takes no at=".into());
+            }
             Ok(Query::Split {
                 c: id(pos[0])?,
                 by,
@@ -261,8 +274,22 @@ pub fn run<P: DataProvider>(
                 *t1,
             )
         }
+        Query::Waveform { c } => {
+            let c = cl(session, *c)?;
+            let w = crate::raw_waveform::measure(session, c)?;
+            let nan = f32::NAN;
+            Ok(format!("waveform {} raw dc_only hp_input {}: windows {}/{} channels {} peak_ch {} snr {} early_late_cos {} ttp_ms {} hw_ms {} extrema {}",
+                c.0, w.input_high_passed.map_or("unknown", |hp| if hp { "true" } else { "false" }),
+                w.used, w.sampled, w.channels, w.peak_channel, qn(w.snr), qn(w.early_late_cos),
+                qn(w.shape.map_or(nan, |s| s.trough_to_peak_ms)),
+                qn(w.shape.map_or(nan, |s| s.half_width_ms)),
+                w.shape.map_or_else(|| "-".into(), |s| s.n_extrema.to_string())))
+        }
         Query::Split { c, by, at } => {
             let c = cl(session, *c)?;
+            if *by == By::Axis {
+                return axis_handles(session, c, handles);
+            }
             let (minor, method, bic, used) = split_minor(session, c, *by, *at)?;
             let n = times(c).len();
             if minor.is_empty() || minor.len() >= n {
@@ -287,6 +314,51 @@ fn rates(counts: &[u32], n: usize, bin_ms: f32) -> String {
         .map(|&c| qn(c as f32 / k))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn axis_handles<P: DataProvider>(
+    session: &Session<P>,
+    c: ClusterId,
+    handles: &mut Handles,
+) -> Result<String, String> {
+    let globals = cluster_globals(session, c);
+    let nodes = crate::axis_split::axis_candidates(session, c, &globals);
+    let mut lines = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for pair in nodes.as_chunks::<2>().0 {
+        if !pair.iter().any(|p| p.supported) {
+            continue;
+        }
+        let (minor, remaining) = if pair[0].members.len() <= pair[1].members.len() {
+            (&pair[0], &pair[1])
+        } else {
+            (&pair[1], &pair[0])
+        };
+        if !seen.insert(minor.members.clone()) {
+            continue;
+        }
+        let id = handles.add_split(
+            session,
+            c,
+            minor.members.clone(),
+            "axis",
+            f32::NAN,
+            minor.bic_gain as f32,
+        );
+        // Listing alternatives does not compute 30 CCGs/counterfactuals. The
+        // reviewer can eval any handle it actually considers. No raw indices.
+        lines.push(format!("{id} axis {} at {} moved_above {}: remaining/moved {}/{} rpc {}/{} bic {} (alternative, not a label)",
+            minor.feature,qn(minor.at),minor.above,remaining.members.len(),minor.members.len(),
+            qm(remaining.contamination,"rp_contamination",&handles.extra),qm(minor.contamination,"rp_contamination",&handles.extra),qn(minor.bic_gain as f32)));
+        if lines.len() == 30 {
+            break;
+        }
+    }
+    if lines.is_empty() {
+        Err("no supported PC/amplitude axis-mixture boundary (BIC, size and refractory vetoes apply)".into())
+    } else {
+        Ok(lines.join("\n"))
+    }
 }
 
 /// ACG detail from the centred two-sided histogram `h`.
@@ -555,6 +627,7 @@ fn split_minor<P: DataProvider>(
             .ok_or("cluster has no amplitudes")
     };
     match by {
+        By::Axis => Err("axis alternatives must be registered as a bounded handle list".into()),
         By::Amp => {
             need_amps()?;
             match at {
@@ -597,8 +670,19 @@ fn split_minor<P: DataProvider>(
             };
             Ok((above(&secs, x), "time", f32::NAN, Some(x)))
         }
-        By::Pc | By::Kmeans | By::Core => {
+        By::Pc | By::Kmeans | By::Core | By::Robust => {
             let globals = cluster_globals(session, c);
+            if by == By::Robust {
+                let proposal = crate::robust_cleanup::robust_cleanup(session,c,&globals)
+                    .filter(|p|p.supported)
+                    .ok_or("no supported robust cleanup (needs a BIC-supported broad tail, >=100 spikes per part, majority kept, rpc <= .1 and no refractory regression)")?;
+                return Ok((
+                    proposal.minor_idx,
+                    "robust-cleanup",
+                    proposal.bic_gain as f32,
+                    None,
+                ));
+            }
             if by == By::Core {
                 let core = core_split(session, c, &globals).ok_or(
                     "no core or cleanup (needs PC features, rpc > .1, and a separated component with rpc <= .1, or a minority whose removal leaves rpc <= .1)",
@@ -629,6 +713,19 @@ fn split_minor<P: DataProvider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_waveform_query_has_a_closed_bounded_grammar() {
+        assert_eq!(parse("waveform 7").unwrap(), Query::Waveform { c: 7 });
+        for query in [
+            "waveform",
+            "waveform 1 2",
+            "waveform 1 n=1000000",
+            "waveform ../recording",
+        ] {
+            assert!(parse(query).is_err(), "accepted {query}");
+        }
+    }
     use sorrel_compute::{auto_correlogram, cross_correlogram};
 
     const SR: f32 = 30_000.0;
