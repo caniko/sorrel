@@ -32,7 +32,9 @@ in
     clippy = craneLib.cargoClippy (commonArgs
       // {
         inherit cargoArtifacts;
-        cargoClippyExtraArgs = "--workspace --all-targets -- --deny warnings";
+        # `dev` is additive (nothing is cfg(not(feature = "dev"))), so one
+        # pass with it lints the default build too.
+        cargoClippyExtraArgs = "--workspace --all-targets --features sorrel/dev -- --deny warnings";
       });
 
     hm-module = assert hmPackages true == [sorrel];
@@ -72,5 +74,18 @@ in
         HDF5_DIR = "${hdf5C}";
         # sorrel-data's other tests already run in workspace-tests.
         cargoNextestExtraArgs = "-p sorrel-io -p sorrel-data --features sorrel-io/hdf5,sorrel-data/hdf5 --no-fail-fast -E 'package(sorrel-io) | binary(nwb_curation)'";
+      });
+
+    # `sorrel dev ...` (bench, learn) and the bench results DB live behind the
+    # optional `dev` feature, which workspace-tests does not enable.
+    dev-tests = craneLib.cargoNextest (commonArgs
+      // {
+        inherit cargoArtifacts;
+        src = testSrc;
+        cargoNextestExtraArgs = "-p sorrel -p sorrel-data --features sorrel/dev --no-fail-fast";
+        preCheck = ''
+          export HOME=$(mktemp -d)
+          export XDG_RUNTIME_DIR=$HOME
+        '';
       });
   }

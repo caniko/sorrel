@@ -60,6 +60,7 @@
           "workspace-tests"
           "sorrel-hdf5"
           "hdf5-tests"
+          "dev-tests"
           "binstall-metadata"
           "binstall-metadata-sorrel-remote"
         ];
