@@ -210,6 +210,12 @@ pub fn blocked(ctx: &Context) -> bool {
     rt.open || rt.modal
 }
 
+/// egui's broad keyboard-interest flag includes focused buttons and table
+/// rows. Only a text editor should suppress curation and hovered-pane keys.
+pub fn text_input_active(ctx: &Context) -> bool {
+    ctx.text_edit_focused()
+}
+
 pub fn actions(ctx: &Context, scope: Scope) -> Vec<Action> {
     let shared = shared(ctx);
     let rt = shared.lock().unwrap();

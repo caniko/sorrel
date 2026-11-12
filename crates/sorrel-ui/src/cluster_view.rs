@@ -77,7 +77,7 @@ impl ClusterColumn {
             Self::Shank => "Shank of the peak channel",
             Self::Depth => "Probe y of the peak channel (µm)",
             Self::FiringRate => "Spikes per second",
-            Self::SpikeCount => "n_spikes: spike count",
+            Self::SpikeCount => "n_spikes: total spikes currently assigned to this cluster (not the number of waveforms drawn)",
             Self::Amplitude => {
                 "Mean spike amplitude × peak-to-peak of the primary template, as in phy \
                  (mean spike amplitude alone without templates)"
