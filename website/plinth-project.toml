@@ -174,7 +174,7 @@ html = '''
   </figure>
 </div>
 <!-- Plinth's lightbox opens the image but leaves the anchor's href to navigate; cancel it here until Plinth ships the fix. The href stays for the no-JS fallback. -->
-<script>document.addEventListener('click', event => { if (event.target.closest('a[data-lightbox-image]')) event.preventDefault(); });</script>
+<script>document.addEventListener('click', event => { const trigger = event.target.closest('a[data-lightbox-image]'); if (!trigger || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button !== 0) return; event.preventDefault(); });</script>
 '''
 
 [[pages.sections]]
