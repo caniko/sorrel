@@ -13,6 +13,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
+- **New leaf icon.** The app, crate, favicon and design-file marks use the new sorrel leaf. `assets/icon/generate.cjs` regenerates the SVG copy, PNG sizes and ICO from `logo/logo-clean.svg` in one step.
+- **Redesigned website.** The landing page leads with the native workspace and adds a linked-evidence showcase and gallery. The download page recommends the pip route with a copyable command, hides Windows package options on other platforms, and links each install route to its guide section.
 - **Citation guide.** `CITATION.cff` and a "Citing Sorrel" docs page with BibTeX, authorship and the acknowledgment of the data used in development. The release steps now update its version and date.
 - **Configurable keyboard shortcuts.** Settings provides searchable, scoped shortcut editing, key capture, alternatives, conflict checks and reset controls. One command registry drives dispatch, help and hints in tabs and pop-out windows. Global preferences, theme and recent datasets are stored in `~/.sorrel/settings.toml` (`SORREL_CONFIG_DIR` overrides the directory); per-recording workspace state stays local.
 - **Live lasso tracking.** The Features toolbar has a `live tracking` toggle, off by default. While it is off, spike counts, highlights and linked views settle when a node drag ends instead of recomputing every frame, which keeps cutting a cluster smooth.
