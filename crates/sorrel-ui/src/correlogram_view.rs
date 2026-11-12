@@ -175,27 +175,42 @@ pub(crate) fn sample_trains(
 
 /// The cap is a hard bound: a burst denser than `max` inside a chunk the
 /// budget cannot shrink any further (down to one sample) still holds more
-/// spikes than advertised. Keep an evenly spaced `max` of the survivors,
-/// spread across the trains in proportion to their size.
+/// spikes than advertised. Keep a uniformly random `max` of the survivors,
+/// spread across the trains, so spikes sharing a sample survive together as
+/// often as any other pair; a stride would drop every zero-lag partner.
+/// Seeded from the counts, so the same selection is drawn frame after frame.
 fn thin_to_cap(kept: Vec<Vec<SampleIndex>>, max: usize) -> Vec<Vec<SampleIndex>> {
     let total: usize = kept.iter().map(Vec::len).sum();
     if total <= max {
         return kept;
     }
-    let mut seen = 0usize;
+    // Selection sampling over the flattened trains: each survivor is taken
+    // with probability `need / left`, so every `max`-subset of `total` is
+    // equally likely and the trains come back in ascending order.
+    let mut state = ((total as u64) << 32) ^ max as u64;
+    let (mut left, mut need) = (total, max);
     kept.into_iter()
         .map(|train| {
             train
                 .into_iter()
                 .filter(|_| {
-                    // Bresenham selection: exactly `max` of `total`, in order.
-                    let pick = seen * max / total != (seen + 1) * max / total;
-                    seen += 1;
+                    let pick = need > 0 && next_u64(&mut state) % (left as u64) < need as u64;
+                    left -= 1;
+                    need -= usize::from(pick);
                     pick
                 })
                 .collect()
         })
         .collect()
+}
+
+/// SplitMix64 step: tiny, good enough for the cap draw.
+fn next_u64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// The budget after a pass kept `n > max` spikes: shrunk by the overshoot and
@@ -763,6 +778,28 @@ mod tests {
             "kept {} over the hard cap",
             kept[0].len()
         );
+    }
+
+    /// The cap's own thinning must stay unbiased: a stride over the sorted
+    /// train keeps one of every two duplicates, so it erases every zero-lag
+    /// pair it was meant to preserve. Uniform selection keeps a pair with
+    /// probability `p²`.
+    #[test]
+    fn an_over_cap_burst_keeps_zero_lag_pairs_at_the_uniform_rate() {
+        // 1000 timestamps, each detected twice, packed into the one-sample
+        // chunk the budget bottoms out at. The cap is scaled down from
+        // MAX_SPIKES so the burst fits that chunk.
+        let t: Vec<SampleIndex> = (0..1_000u64)
+            .flat_map(|i| [SampleIndex(4_997_500 + i), SampleIndex(4_997_500 + i)])
+            .collect();
+        let (_, kept) = sample_trains(&[&t], 10_000_000, 1_000, 150_000);
+        let kept = &kept[0];
+        assert_eq!(kept.len(), 1_000, "the cap must hold exactly");
+        let pairs = kept.windows(2).filter(|w| w[0] == w[1]).count();
+        // p = 1000/2000, so a pair survives with p² = 1/4: about 250 of 1000.
+        assert!(pairs > 1_000 / 8, "kept {pairs} of 1000 zero-lag pairs");
+        let (_, again) = sample_trains(&[&t], 10_000_000, 1_000, 150_000);
+        assert_eq!(again[0], *kept, "the draw must be reproducible");
     }
 
     #[test]
