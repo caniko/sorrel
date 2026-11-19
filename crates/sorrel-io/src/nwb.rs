@@ -481,10 +481,10 @@ mod imp {
             let specs = specs
                 .as_ref()
                 .map_err(|err| anyhow!("{}: {err:#}", unavailable()))?;
-            // Ambiguous processing groups aren't candidates unless explicitly
-            // requested, in which case a conflict must be reported.
-            let refuse_conflicts =
-                path.starts_with("/acquisition/") || requested_path.as_deref() == Some(path);
+            // Default selection ranks every discovered group (processing
+            // included), so any conflict there could change the pick; with
+            // --nwb-series only the requested group matters.
+            let refuse_conflicts = requested_path.as_deref().is_none_or(|p| p == path);
             specs.is_series(ty, refuse_conflicts)
         };
         let mut found = Vec::new();
