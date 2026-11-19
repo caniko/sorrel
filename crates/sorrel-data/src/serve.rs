@@ -1343,7 +1343,6 @@ where
                     s.replace(['\t', '\n'], " ")
                 }
             };
-            let ids = |v: Vec<u32>| v.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
             let mut out = String::from("id\tn\tlabel\ttags\torigin\tparents\tnote");
             for c in (0..session.n_clusters()).map(ClusterId) {
                 let n = session.spike_times(c).len();
@@ -1356,7 +1355,18 @@ where
                 {
                     continue;
                 }
-                let parents = ids(session.parents(c).iter().map(|p| p.0).collect());
+                let parents = session
+                    .parents(c)
+                    .iter()
+                    .map(ToString::to_string)
+                    .chain(
+                        session
+                            .missing_parent_unit_ids(c)
+                            .iter()
+                            .map(|id| format!("unit:{id}")),
+                    )
+                    .collect::<Vec<_>>()
+                    .join(",");
                 out += &format!(
                     "\n{}\t{n}\t{label}\t{}\t{}\t{}\t{}",
                     c.0,

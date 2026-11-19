@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 pub struct UnitAnnotation {
     pub origin: String,
     pub parents: Vec<ClusterId>,
+    /// External parent unit IDs without a corresponding cluster in this dataset.
+    pub missing_parent_unit_ids: Vec<i64>,
     pub note: String,
 }
 

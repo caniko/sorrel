@@ -117,3 +117,24 @@ fn offline_commands_work() {
     assert!(!none.status.success());
     assert!(String::from_utf8_lossy(&none.stderr).contains("no running sorrel host"));
 }
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn nwb_call_preserves_exported_parent_without_a_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../release/fixtures/nwb/curated_units.nwb");
+    let nwb = tmp.path().join("units.nwb");
+    std::fs::copy(src, &nwb).unwrap();
+    let out = sorrel(
+        tmp.path(),
+        &[Path::new("call"), &nwb, Path::new("list_clusters")],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("\t0,unit:77\t"), "{text}");
+}

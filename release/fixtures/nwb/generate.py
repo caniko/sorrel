@@ -23,7 +23,7 @@ container, so re-running changes object_ids but not the h5py-visible content.
 
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -152,7 +152,7 @@ def write_timestamps(irregular=False):
     nwbfile = make_file(f"sorrel-fixture-{name}")
     timestamps = 0.5 + np.arange(N_SAMPLES) / 1000.0
     if irregular:
-        timestamps[197] += 1e-4
+        timestamps[197] += 3e-4
     add_series(
         nwbfile,
         good_data(),
@@ -216,6 +216,31 @@ def write_curated_units():
                    data=[float("nan"), 0.25]),
     ])
     write(nwbfile, "curated_units.nwb")
+
+
+def write_reader_edge_cases():
+    one = make_file("one-channel")
+    one.add_acquisition(ElectricalSeries(
+        name="Raw", data=np.arange(N_SAMPLES, dtype=np.int16),
+        electrodes=one.create_electrode_table_region([0], "only channel"),
+        rate=1000.0, starting_time=0.5, conversion=1e-6,
+    ))
+    write(one, "one_channel.nwb")
+
+    exact_rate = 30000.123
+    units = make_file("precise-units", units=False, electrodes=False)
+    units.units = Units(name="units", resolution=1.0 / exact_rate)
+    # The two rates round this timestamp to different samples.
+    units.add_unit(id=0, spike_times=[0.5 + 30.49999998 / exact_rate])
+    write(units, "precise_units.nwb")
+    raw = make_file("rounded-raw", units=False)
+    add_series(raw, good_data(), rate=np.float32(exact_rate), starting_time=0.5)
+    write(raw, "rounded_raw.nwb")
+
+    shifted = make_file("shifted-raw", units=False)
+    shifted.fields["timestamps_reference_time"] = SESSION_START - timedelta(milliseconds=50)
+    add_series(shifted, good_data(), rate=1000.0, starting_time=0.5)
+    write(shifted, "shifted_raw.nwb")
 
 
 def write_foreign_quality():
@@ -286,6 +311,7 @@ def main():
     write_multiple_series()
     write_units_and_raw()
     write_curated_units()
+    write_reader_edge_cases()
     write_foreign_quality()
     write_not_electrical()
     write_subtype()

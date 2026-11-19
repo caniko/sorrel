@@ -38,7 +38,6 @@ mod imp {
     use std::sync::Mutex;
 
     const ELECTRODES: &str = "/general/extracellular_ephys/electrodes";
-    const TIMESTAMP_REL_TOL: f64 = 1e-6;
 
     #[derive(Clone, Copy, Debug, Default)]
     pub struct NwbOpenParams<'a> {
@@ -99,40 +98,62 @@ mod imp {
                         explicit,
                         "/units/spike_times resolution",
                         declared,
+                        false,
                     )?;
                 }
-                Some(checked_rate(rate.or(params.sample_rate).context(
-                    "no ElectricalSeries time base in the sorting NWB and no /units/spike_times resolution; pass --sample-rate HZ",
-                )?)?)
+                rate.or(params.sample_rate).map(checked_rate).transpose()?
             } else {
                 None
             };
 
             let mut series_identity = None;
-            let (trace, rate, t0, (channel_map, channel_positions)) =
-                if let Some((name, series, default_series)) = series {
-                    let data = series.dataset("data")?;
-                    let shape = data.shape();
-                    let (n_samples, n_channels) = (shape[0], shape[1]);
-                    let (rate, t0) = read_time_base(&series, &name, n_samples)?;
-                    if let Some(expected) = units_rate.or(params.sample_rate) {
-                        check_matching_rate("sorting sample rate", expected, &name, rate)?;
+            let (trace, rate, t0, (channel_map, channel_positions)) = if let Some((
+                name,
+                series,
+                default_series,
+            )) = series
+            {
+                let data = series.dataset("data")?;
+                let shape = data.shape();
+                let (n_samples, n_channels) = (shape[0], shape.get(1).copied().unwrap_or(1));
+                let (mut rate, t0, float32_rate) = read_time_base(&series, &name, n_samples)?;
+                if let Some(expected) = units_rate.or(params.sample_rate) {
+                    check_matching_rate(
+                        "sorting sample rate",
+                        expected,
+                        &name,
+                        rate,
+                        float32_rate,
+                    )?;
+                    if float32_rate {
+                        rate = expected;
                     }
-                    let channels = read_channels(recording, &series, &name, n_channels)?;
-                    let trace = NwbTrace::new(&series, data, &name, n_samples, n_channels)?;
-                    // Keep existing journals usable for the historical default acquisition.
-                    if raw.is_some() || !default_series {
-                        series_identity = Some(name);
-                    }
-                    (Some(trace), rate, t0, channels)
-                } else {
-                    (
+                }
+                let channels = read_channels(recording, &series, &name, n_channels)?;
+                let trace = NwbTrace::new(&series, data, &name, n_samples, n_channels)?;
+                // Keep existing journals usable for the historical default acquisition.
+                if raw.is_some() || !default_series {
+                    series_identity = Some(name);
+                }
+                (Some(trace), rate, t0, channels)
+            } else {
+                (
                         None,
-                        units_rate.expect("required without trace"),
+                        units_rate.context(
+                            "no ElectricalSeries time base in the sorting NWB and no /units/spike_times resolution; pass --sample-rate HZ",
+                        )?,
                         0.0,
                         read_units_only_channels(&f)?,
                     )
-                };
+            };
+            if let Some(raw) = &raw {
+                let units_epoch =
+                    timestamp_epoch(&f).context("sorting NWB timestamps_reference_time")?;
+                let raw_epoch =
+                    timestamp_epoch(raw).context("paired raw NWB timestamps_reference_time")?;
+                ensure!(units_epoch == raw_epoch,
+                    "NWB timestamps_reference_time mismatch: sorting NWB uses {units_epoch}, paired raw NWB uses {raw_epoch}");
+            }
             let n_samples = trace.as_ref().map_or(0, |t| t.n_samples as u64);
             let (spikes_per_cluster, unit_ids) =
                 load_units(&units, &spike_times, rate, t0).context("load /units")?;
@@ -271,12 +292,34 @@ mod imp {
         Ok(rate)
     }
 
-    fn check_matching_rate(a_name: &str, a: f64, b_name: &str, b: f64) -> Result<()> {
+    fn timestamp_epoch(file: &H5File) -> Result<jiff::Timestamp> {
+        // NWB defines time zero separately from the experiment's start time.
+        let ds = file.dataset("/timestamps_reference_time")?;
+        let value = ds
+            .read_scalar::<VarLenUnicode>()
+            .map(|s| s.to_string())
+            .or_else(|_| ds.read_scalar::<VarLenAscii>().map(|s| s.to_string()))?;
+        value
+            .parse()
+            .map_err(|err| anyhow!("invalid NWB epoch {value:?}: {err}"))
+    }
+
+    fn check_matching_rate(
+        a_name: &str,
+        a: f64,
+        b_name: &str,
+        b: f64,
+        b_float32: bool,
+    ) -> Result<()> {
         let a = checked_rate(a)?;
         // Only allow round-off from reciprocals or timestamp-derived rates,
         // not a nominally similar clock that could drift by many samples.
         ensure!(
-            (a - b).abs() <= 1e-9 * b,
+            if b_float32 {
+                a as f32 == b as f32
+            } else {
+                (a - b).abs() <= 1e-9 * b
+            },
             "NWB rate mismatch: {a_name} is {a} Hz but {b_name} is {b} Hz"
         );
         Ok(())
@@ -451,9 +494,20 @@ mod imp {
         }
         found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let has_2d_data = |g: &hdf5::Group| g.dataset("data").is_ok_and(|d| d.ndim() == 2);
+        let supported_data = |g: &hdf5::Group| {
+            g.dataset("data").is_ok_and(|d| match d.shape().as_slice() {
+                [_] => true,
+                [_, channels] => *channels > 0,
+                _ => false,
+            })
+        };
         // Keep the first 2-D acquisition as the historical default, but list
         // unsupported shapes too so a selection error can name them.
-        let default_index = found.iter().position(|(_, g)| has_2d_data(g)).unwrap_or(0);
+        let default_index = found
+            .iter()
+            .position(|(_, g)| has_2d_data(g) && supported_data(g))
+            .or_else(|| found.iter().position(|(_, g)| supported_data(g)))
+            .unwrap_or(0);
         let available = || {
             if found.is_empty() {
                 "none".to_string()
@@ -491,8 +545,8 @@ mod imp {
         };
         let (path, group) = &found[index];
         ensure!(
-            has_2d_data(group),
-            "ElectricalSeries {path} requires 2-D data (time × channels); available series: {}",
+            supported_data(group),
+            "ElectricalSeries {path} requires 1-D data (one channel) or 2-D data (time × channels); available series: {}",
             available()
         );
         if requested.is_none() && found.len() > 1 {
@@ -505,23 +559,23 @@ mod imp {
         Ok(Some((path, group, index == default_index)))
     }
 
-    /// `(rate Hz, starting_time s)`. Only a constant rate is supported.
-    fn read_time_base(g: &hdf5::Group, name: &str, n_samples: usize) -> Result<(f64, f64)> {
+    /// `(rate Hz, starting_time s, rate stored as float32)`.
+    fn read_time_base(g: &hdf5::Group, name: &str, n_samples: usize) -> Result<(f64, f64, bool)> {
         let read = || {
             if g.link_exists("timestamps") {
-                return regular_timestamps(&g.dataset("timestamps")?, n_samples);
+                let (rate, t0) = regular_timestamps(&g.dataset("timestamps")?, n_samples)?;
+                return Ok((rate, t0, false));
             }
             let st = g
                 .dataset("starting_time")
                 .context("neither starting_time nor timestamps")?;
-            let rate = checked_rate(
-                st.attr("rate")
-                    .context("starting_time has no rate")?
-                    .read_scalar()?,
-            )?;
+            let rate = st.attr("rate").context("starting_time has no rate")?;
+            let float32_rate =
+                rate.dtype()?.to_descriptor()? == TypeDescriptor::Float(FloatSize::U4);
+            let rate = checked_rate(rate.read_scalar()?)?;
             let t0: f64 = st.read_scalar()?;
             ensure!(t0.is_finite(), "invalid starting_time {t0}");
-            Ok((rate, t0))
+            Ok((rate, t0, float32_rate))
         };
         read().with_context(|| format!("ElectricalSeries {name}: invalid time base"))
     }
@@ -546,8 +600,8 @@ mod imp {
                 let sample = start + i;
                 let step = t - prev;
                 let drift = (t - t0) / period - sample as f64;
-                ensure!(step.is_finite() && (step - period).abs() <= period * TIMESTAMP_REL_TOL && drift.abs() <= 0.25,
-                    "irregular timestamps at sample {sample}: interval {step} s (expected {period} s within 1 ppm), deviation {drift} samples (limit 0.25)");
+                ensure!(step.is_finite() && step > 0.0 && drift.abs() <= 0.25,
+                    "irregular timestamps at sample {sample}: interval {step} s, deviation {drift} samples (limit 0.25)");
                 prev = t;
             }
         }
@@ -710,10 +764,20 @@ mod imp {
             // to int16). Scale in f64 before narrowing, including f64 input.
             macro_rules! read_scaled {
                 ($ty:ty) => {{
-                    let raw = self.data.read_slice_2d::<$ty, _>((start..end, ..))?;
-                    raw.iter()
+                    let raw = if self.data.ndim() == 1 {
+                        self.data
+                            .read_slice_1d::<$ty, _>(start..end)?
+                            .into_raw_vec_and_offset()
+                            .0
+                    } else {
+                        self.data
+                            .read_slice_2d::<$ty, _>((start..end, ..))?
+                            .into_raw_vec_and_offset()
+                            .0
+                    };
+                    raw.into_iter()
                         .zip(self.gain.iter().cycle())
-                        .map(|(&v, g)| (v as f64 * g + self.offset_uv) as f32)
+                        .map(|(v, g)| (v as f64 * g + self.offset_uv) as f32)
                         .collect()
                 }};
             }
@@ -897,12 +961,15 @@ mod imp {
                 .map(|(i, &id)| (i64::from(id), ClusterId(i as u32)))
                 .collect();
             for (annotation, row) in annotations.iter_mut().zip(parents) {
-                // The exporter omits emptied units. A missing parent has no
-                // ClusterId in this session; don't fabricate one.
-                annotation.parents = row
-                    .iter()
-                    .filter_map(|id| clusters.get(id).copied())
-                    .collect();
+                for id in row {
+                    if let Some(&parent) = clusters.get(&id) {
+                        annotation.parents.push(parent);
+                    } else {
+                        // The exporter omits emptied units. Keep their IDs
+                        // without confusing them with local cluster slots.
+                        annotation.missing_parent_unit_ids.push(id);
+                    }
+                }
             }
         }
         let names = string_column("unit_name").filter(|names| {
@@ -989,17 +1056,20 @@ mod imp {
     fn timestamp_validation_checks_the_interval_between_read_blocks() {
         let dir = tempfile::tempdir().unwrap();
         let file = H5File::create(dir.path().join("timestamps.h5")).unwrap();
-        let mut times: Vec<f64> = (0..65_540).map(|i| 5.0 + f64::from(i) / 30_000.0).collect();
+        let origin = 1_700_000_000.0;
+        let mut times: Vec<f64> = (0..65_540)
+            .map(|i| origin + f64::from(i) / 30_000.0)
+            .collect();
         let ds = file
             .new_dataset_builder()
             .with_data(&times)
             .create("timestamps")
             .unwrap();
         let (rate, t0) = regular_timestamps(&ds, times.len()).unwrap();
-        assert!((rate - 30_000.0).abs() < 1e-8);
-        assert_eq!(t0, 5.0);
-        // Shift the first timestamp in the second block, without changing the mean interval.
-        times[65_537] += 1e-6;
+        assert!((rate - 30_000.0).abs() < 0.01);
+        assert_eq!(t0, origin);
+        // Duplicate the first timestamp in the second block at the boundary.
+        times[65_537] = times[65_536];
         ds.write(&times).unwrap();
         let error = regular_timestamps(&ds, times.len()).unwrap_err();
         assert!(error

@@ -5928,6 +5928,7 @@ dependencies = [
  "dunce",
  "flate2",
  "hdf5-metno",
+ "jiff",
  "log",
  "memmap2",
  "serde",

@@ -1493,6 +1493,7 @@ pub fn read_annotations_tsv(path: &Path) -> Vec<UnitAnnotation> {
                 .filter_map(|p| p.trim().parse().ok().map(ClusterId))
                 .collect(),
             note: unescape_note(cols.next().unwrap_or("")),
+            ..Default::default()
         };
     }
     out

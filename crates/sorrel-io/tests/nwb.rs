@@ -285,6 +285,63 @@ fn reads_python_export_metadata_by_unit_row() {
 }
 
 #[test]
+fn paired_series_supplies_rate_without_units_resolution() {
+    let raw = fixture("raw_only.nwb");
+    let p = NwbProvider::open_with(
+        fixture("not_electrical.nwb"),
+        NwbOpenParams {
+            raw_path: Some(&raw),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(p.spike_times(ClusterId(0))[0], SampleIndex(100));
+}
+
+#[test]
+fn paired_float32_rate_uses_precise_units_rate_for_spikes() {
+    let raw = fixture("rounded_raw.nwb");
+    let p = NwbProvider::open_with(
+        fixture("precise_units.nwb"),
+        NwbOpenParams {
+            raw_path: Some(&raw),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(p.spike_times(ClusterId(0)), [SampleIndex(30)]);
+}
+
+#[test]
+fn paired_series_rejects_different_timestamp_epoch() {
+    let raw = fixture("shifted_raw.nwb");
+    let err = NwbProvider::open_with(
+        fixture("units_only.nwb"),
+        NwbOpenParams {
+            raw_path: Some(&raw),
+            ..Default::default()
+        },
+    )
+    .err()
+    .unwrap();
+    assert!(
+        err.to_string().contains("timestamps_reference_time"),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn rank_one_series_reads_scaled_single_channel_windows() {
+    let p = open("one_channel.nwb").unwrap();
+    assert_eq!(p.n_channels(), 1);
+    assert_eq!(p.channel_map(), [ChannelId(10)]);
+    assert_eq!(
+        p.trace(SampleIndex(297), 5).samples.to_f32_centred(),
+        [297.0, 298.0, 299.0]
+    );
+}
+
+#[test]
 fn accepts_recognized_foreign_labels_without_guessing_other_columns() {
     let p = NwbProvider::open_with(
         fixture("foreign_quality.nwb"),
