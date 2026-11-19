@@ -537,7 +537,7 @@ fn parse_backend(s: &str) -> std::result::Result<Backend, String> {
         #[cfg(not(feature = "hdf5"))]
         "nwb" | "ks4-rez" | "rez" => {
             return Err(format!(
-                "backend {s} requires building with --features hdf5"
+                "backend {s} is unavailable in this build; rebuild with default features"
             ));
         }
         other => return Err(format!("unknown backend {other}")),
@@ -594,7 +594,10 @@ fn detect_backend(root: &Path) -> Result<Backend> {
         #[cfg(not(feature = "hdf5"))]
         {
             if ext == "nwb" || name == "rez.mat" || name == "rez2.mat" {
-                bail!("{} requires building with --features hdf5", root.display());
+                bail!(
+                    "{} is unsupported in this build; rebuild with default features",
+                    root.display()
+                );
             }
         }
         bail!("unrecognised file {}; expected a directory", root.display());

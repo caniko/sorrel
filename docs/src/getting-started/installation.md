@@ -1,8 +1,8 @@
 # Installation
 
-Sorrel is a Rust workspace and a Nix flake. The default build is pure Rust;
-the NWB and Kilosort 4 `rez.mat` backends are gated behind an `hdf5`
-feature that links against `libhdf5`.
+Sorrel includes the NWB and Kilosort 4 `rez.mat` readers by default.
+Prebuilt binaries and the default Nix package bundle HDF5; you don't need
+to install HDF5 or CMake to use them.
 
 Prebuilt binaries are on the
 [GitHub releases page](https://github.com/caniko/sorrel/releases), and are
@@ -19,10 +19,8 @@ The binary is written to `target/release/sorrel`. A second binary,
 `sorrelw`, is the console-free launcher for Windows (see [Windows](#windows)). Shell completions come from
 `sorrel completions <shell>`; see the [CLI reference](cli.md#completions).
 
-NWB and Kilosort 4 `rez.mat` readers are included by default, including in
-release binaries and the `sorrel` executable shipped in the Python wheel.
-Building from source requires a C compiler and CMake 3.26 or newer to build
-the bundled HDF5 library; no system HDF5 installation is needed.
+When building from source with Cargo (including `cargo install`), you need
+a C compiler and CMake 3.26 or newer to build the bundled HDF5 library.
 
 Full phy export (`sorrel export-phy`, the `export_phy` MCP tool, the
 **Export phy** button and `Session.export_phy` in `sorrel-py`) is the

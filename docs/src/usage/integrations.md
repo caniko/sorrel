@@ -284,8 +284,8 @@ Reads `rez/st3` for sample/template tuples, `rez/ops/fs` and
 positions, and `rez/ops/fbinary`/`fproc` for the dat path (overridable
 with `--dat`).
 
-If you build without the `hdf5` feature, KS4 writes a phy export
-under `<output>/phy/` automatically — open that directory instead.
+The `rez.mat` reader is included by default. If you build without it,
+open the phy export that KS4 writes under `<output>/phy/` instead.
 
 ## Python (Jupyter)
 
