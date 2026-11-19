@@ -20,6 +20,7 @@ mod zarr;
 pub(crate) use zarr::ZarrStore;
 
 const BASE: &str = "https://api.dandiarchive.org/api/";
+const LOCATOR_PREFIX: &str = "dandi://dandi/";
 
 /// Whether this dataset argument names a remote NWB source, not a local path.
 pub fn is_remote(path: &Path) -> bool {
@@ -41,6 +42,23 @@ pub(crate) struct Resolved {
 
 pub(crate) fn resolve(input: &str) -> Result<Resolved> {
     Api::production().resolve(input)
+}
+
+/// Pin a DANDI locator to an explicit version for both session lookup and open.
+/// Non-DANDI paths and HTTPS URLs have no Dandiset version to pin.
+pub fn pin_version(input: &str) -> Result<Option<String>> {
+    if !input.starts_with(LOCATOR_PREFIX) {
+        return Ok(None);
+    }
+    Ok(Api::production().dandiset_locator(input)?.map(|locator| {
+        let Locator {
+            id,
+            version,
+            encoded_path,
+            ..
+        } = locator;
+        format!("{LOCATOR_PREFIX}{id}@{version}/{encoded_path}")
+    }))
 }
 
 /// Find the local state subdirectory without opening or listing the asset.
@@ -119,6 +137,7 @@ struct Locator<'a> {
     id: &'a str,
     version: String,
     path: std::borrow::Cow<'a, str>,
+    encoded_path: &'a str,
 }
 
 impl Locator<'_> {
@@ -155,10 +174,10 @@ impl Api {
     }
 
     fn dandiset_locator<'a>(&self, input: &'a str) -> Result<Option<Locator<'a>>> {
-        let Some(rest) = input.strip_prefix("dandi://dandi/") else {
+        let Some(rest) = input.strip_prefix(LOCATOR_PREFIX) else {
             return Ok(None);
         };
-        let (dataset, path) = rest.split_once('/').context("missing DANDI asset path")?;
+        let (dataset, encoded_path) = rest.split_once('/').context("missing DANDI asset path")?;
         let (id, version) = dataset
             .split_once('@')
             .map_or((dataset, None), |(id, v)| (id, Some(v)));
@@ -166,7 +185,7 @@ impl Api {
             id.len() == 6 && id.bytes().all(|b| b.is_ascii_digit()),
             "expected a six-digit Dandiset ID"
         );
-        let path = percent_decode_str(path)
+        let path = percent_decode_str(encoded_path)
             .decode_utf8()
             .context("asset path is not UTF-8")?;
         ensure!(
@@ -185,12 +204,19 @@ impl Api {
             }
         };
         component(&version)?;
-        Ok(Some(Locator { id, version, path }))
+        Ok(Some(Locator {
+            id,
+            version,
+            path,
+            encoded_path,
+        }))
     }
 
     fn resolve(&self, input: &str) -> Result<Resolved> {
         if let Some(locator) = self.dandiset_locator(input)? {
-            let Locator { id, version, path } = &locator;
+            let Locator {
+                id, version, path, ..
+            } = &locator;
             let mut list = self.endpoint(&format!("dandisets/{id}/versions/{version}/assets/"));
             list.query_pairs_mut()
                 .append_pair("path", path)

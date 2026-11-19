@@ -504,6 +504,19 @@ impl OpenArgs {
         self.root.as_deref().expect("clap marks DATA_DIR required")
     }
 
+    fn pin_remote_version(
+        &mut self,
+        pin: impl FnOnce(&str) -> Result<Option<String>>,
+    ) -> Result<()> {
+        let Some(input) = self.root().to_str() else {
+            return Ok(());
+        };
+        if let Some(pinned) = pin(input)? {
+            self.root = Some(pinned.into());
+        }
+        Ok(())
+    }
+
     /// Make the path fields absolute against `cwd`: the args came from a
     /// `sorrel open` run somewhere else.
     fn rebase(&mut self, cwd: &Path) {
@@ -1603,6 +1616,16 @@ fn is_remote(path: &Path) -> bool {
         .is_some_and(|s| s.starts_with("dandi://") || s.starts_with("https://"))
 }
 
+fn pin_dandi_version(input: &str) -> Result<Option<String>> {
+    #[cfg(feature = "dandi")]
+    return sorrel_io::dandi::pin_version(input);
+    #[cfg(not(feature = "dandi"))]
+    {
+        let _ = input;
+        Ok(None)
+    }
+}
+
 #[cfg(feature = "dandi")]
 fn dandi_data_dir() -> Result<PathBuf> {
     let var = |key| {
@@ -2020,6 +2043,35 @@ fn load_events(
     Ok(events)
 }
 
+fn tab_target<'a>(
+    open: &mut OpenArgs,
+    tabs: impl Iterator<Item = (&'a Path, Option<&'a str>)>,
+    pin: impl FnOnce(&str) -> Result<Option<String>>,
+) -> Result<(String, Option<usize>)> {
+    // Resolve moving DANDI locators before lookup and keep the same version for open.
+    open.pin_remote_version(pin)?;
+    let key = session_key(open)?;
+    let remote = is_remote(open.root());
+    let dir = (!remote).then(|| session_path(&host_dir(open)));
+    for (i, (dataset, tab_key)) in tabs.enumerate() {
+        let matches = if remote {
+            tab_key == Some(key.as_str())
+        } else {
+            dir.as_ref().is_some_and(|d| session_path(dataset) == *d)
+        };
+        if matches {
+            sorrel_data::serve::check_session_reuse(
+                "open tab",
+                tab_key,
+                &key,
+                open.discard_journal,
+            )?;
+            return Ok((key, Some(i)));
+        }
+    }
+    Ok((key, None))
+}
+
 /// The shell's opener: a forwarded `sorrel open`'s args become a tab, or the
 /// index of the tab that already shows the dataset.
 fn tab_opener() -> Opener {
@@ -2027,23 +2079,17 @@ fn tab_opener() -> Opener {
         let args = std::iter::once("sorrel").chain(req.args.iter().map(String::as_str));
         let mut open = TabCli::try_parse_from(args)?.open;
         open.rebase(&req.cwd);
-        let key = session_key(&open)?;
-        let remote = is_remote(open.root());
-        let dir = (!remote).then(|| session_path(&host_dir(&open)));
-        if let Some((i, tab)) = open_tabs.iter().enumerate().find(|(_, tab)| {
-            if remote {
-                tab.session_key() == Some(key.as_str())
-            } else {
-                dir.as_ref()
-                    .is_some_and(|d| session_path(tab.dataset()) == *d)
-            }
-        }) {
-            sorrel_data::serve::check_session_reuse(
-                "open tab",
-                tab.session_key(),
-                &key,
-                open.discard_journal,
-            )?;
+        // Recents keep the user's locator, not the pinned version or a signed query.
+        let display = if is_remote(open.root()) {
+            PathBuf::from(open.root().to_str().unwrap().split('?').next().unwrap())
+        } else {
+            open.root().to_path_buf()
+        };
+        let tabs = open_tabs
+            .iter()
+            .map(|tab| (tab.dataset(), tab.session_key()));
+        let (key, existing) = tab_target(&mut open, tabs, pin_dandi_version)?;
+        if let Some(i) = existing {
             return Ok(Opened::Existing(i));
         }
         let mut tab = None;
@@ -2058,11 +2104,6 @@ fn tab_opener() -> Opener {
             },
         )?;
         let tab = tab.context("backend produced no tab")?;
-        let display = if remote {
-            PathBuf::from(open.root().to_str().unwrap().split('?').next().unwrap())
-        } else {
-            open.root().to_path_buf()
-        };
         Ok(Opened::Tab(tab, display))
     })
 }
@@ -2624,20 +2665,26 @@ fn main() -> Result<()> {
         None => run_bare(),
         Some(Cmd::Open(open)) => run_open(&open),
         Some(Cmd::Run {
-            open,
+            mut open,
             standalone,
             headless,
         }) => match headless {
-            true => with_session(&open, Headless(&open)),
+            true => {
+                open.pin_remote_version(pin_dandi_version)?;
+                with_session(&open, Headless(&open))
+            }
             false => run_gui(&open, standalone),
         },
         Some(Cmd::Status { dir, json }) => run_status(dir.as_deref(), json),
         Some(Cmd::Call {
-            open,
+            mut open,
             tool,
             args,
             raw,
-        }) => run_call(&open, &tool, args.as_deref(), raw),
+        }) => {
+            open.pin_remote_version(pin_dandi_version)?;
+            run_call(&open, &tool, args.as_deref(), raw)
+        }
         Some(Cmd::AgentGuide { prompt }) => {
             match prompt {
                 Some(_) => print!("{}", serve::review_prompt()?),
@@ -2809,10 +2856,13 @@ fn main() -> Result<()> {
                 truth,
             },
         ),
-        Some(Cmd::Mcp { open, sub }) => match (sub, open.root.is_some()) {
+        Some(Cmd::Mcp { mut open, sub }) => match (sub, open.root.is_some()) {
             (Some(McpCmd::Tools { json }), _) => mcp_tools(json),
             (Some(McpCmd::Config { client, dir }), _) => mcp_config(client, dir),
-            (None, true) => run_mcp(&open),
+            (None, true) => {
+                open.pin_remote_version(pin_dandi_version)?;
+                run_mcp(&open)
+            }
             (None, false) => run_mcp_active(),
         },
         Some(Cmd::Describe { open, json }) => with_session(&open, Describe { json }),
@@ -3146,6 +3196,58 @@ mod tests {
             session_host_dir(&open)?,
             dandi_data_dir()?.join("000123/draft").join(hash.as_str())
         );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "dandi")]
+    fn versionless_dandi_reopen_reuses_only_the_resolved_version() -> Result<()> {
+        let locator = "dandi://dandi/000123/test/a%2520.nwb";
+        let open = || OpenArgs {
+            root: Some(locator.into()),
+            ..Default::default()
+        };
+        // Mock the DANDI version lookup at the resolver boundary.
+        let pin = |version| {
+            move |input: &str| {
+                assert_eq!(input, locator);
+                Ok(Some(format!(
+                    "dandi://dandi/000123@{version}/test/a%2520.nwb"
+                )))
+            }
+        };
+
+        let mut first = open();
+        let (first_key, existing) = tab_target(&mut first, std::iter::empty(), pin("0.42.1"))?;
+        assert_eq!(existing, None);
+        let first_dir = session_host_dir(&first)?;
+
+        let mut second = open();
+        let (second_key, existing) = tab_target(
+            &mut second,
+            [(first_dir.as_path(), Some(first_key.as_str()))].into_iter(),
+            pin("0.42.2"),
+        )?;
+        assert_eq!(existing, None);
+        assert_eq!(
+            second.root(),
+            Path::new("dandi://dandi/000123@0.42.2/test/a%2520.nwb")
+        );
+        let second_dir = session_host_dir(&second)?;
+        assert_ne!(first_dir, second_dir);
+
+        let mut third = open();
+        let (_, existing) = tab_target(
+            &mut third,
+            [
+                (first_dir.as_path(), Some(first_key.as_str())),
+                (second_dir.as_path(), Some(second_key.as_str())),
+            ]
+            .into_iter(),
+            pin("0.42.2"),
+        )?;
+        assert_eq!(existing, Some(1));
+        assert_eq!(session_host_dir(&third)?, second_dir);
         Ok(())
     }
 
