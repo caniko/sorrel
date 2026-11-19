@@ -295,6 +295,16 @@ mod imp {
         H5File::open(path).with_context(|| format!("open NWB {}", path.display()))
     }
 
+    /// Clock values are read as f64; only float32/float64 storage converts
+    /// exactly. HDF5 would silently round a long double (or other float).
+    fn exact_float(dtype: hdf5::Result<hdf5::Datatype>, what: &str) -> Result<()> {
+        match dtype?.to_descriptor() {
+            Ok(TypeDescriptor::Float(FloatSize::U4 | FloatSize::U8)) => Ok(()),
+            Ok(other) => anyhow::bail!("{what} must be float32 or float64, found {other}"),
+            Err(e) => anyhow::bail!("{what} must be float32 or float64, found {e}"),
+        }
+    }
+
     fn checked_rate(rate: f64) -> Result<f64> {
         ensure!(
             (rate as f32).is_finite() && (rate as f32) > 0.0,
@@ -307,6 +317,7 @@ mod imp {
         let Ok(attr) = spike_times.attr("resolution") else {
             return Ok(None);
         };
+        exact_float(attr.dtype(), "/units/spike_times resolution")?;
         match attr.read_scalar::<f64>()? {
             -1.0 => Ok(None), // Unspecified in the NWB schema.
             resolution => checked_rate(resolution.recip())
@@ -740,6 +751,7 @@ mod imp {
         let read = || {
             if g.link_exists("timestamps") {
                 let ds = stored_dataset(file, &format!("{name}/timestamps"))?;
+                exact_float(ds.dtype(), "timestamps")?;
                 let (rate, t0) = regular_timestamps(&ds, n_samples)?;
                 return Ok((rate, t0, Some(ds)));
             }
@@ -749,6 +761,8 @@ mod imp {
             );
             let st = stored_dataset(file, &format!("{name}/starting_time"))?;
             let rate = st.attr("rate").context("starting_time has no rate")?;
+            exact_float(rate.dtype(), "starting_time rate")?;
+            exact_float(st.dtype(), "starting_time")?;
             // Reading as f64 widens a float32 attribute exactly.
             let rate = checked_rate(rate.read_scalar()?)?;
             let t0: f64 = st.read_scalar()?;
@@ -1052,6 +1066,7 @@ mod imp {
         mut comparison: Option<(f64, bool)>,
     ) -> Result<(Vec<Vec<SampleIndex>>, Vec<u32>, bool)> {
         let ids: Vec<i64> = ids.read_raw()?;
+        exact_float(spike_times.dtype(), "/units/spike_times")?;
         let mut all: Vec<f64> = spike_times.read_raw()?;
         let ends: Vec<i64> = spike_times_index.read_raw()?;
         ensure!(

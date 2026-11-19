@@ -657,6 +657,30 @@ fn reviewer_short_files_require_exact_clock_values() {
 }
 
 #[test]
+fn clock_values_must_be_stored_as_float32_or_float64() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("int-rate.nwb");
+    std::fs::copy(fixture("close_f64_rate_short.nwb"), &path).unwrap();
+    {
+        let f = hdf5_metno::File::open_rw(&path).unwrap();
+        let st = f
+            .dataset("/acquisition/ElectricalSeriesRaw/starting_time")
+            .unwrap();
+        st.delete_attr("rate").unwrap();
+        st.new_attr::<i32>()
+            .create("rate")
+            .unwrap()
+            .write_scalar(&30000)
+            .unwrap();
+    }
+    let err = format!("{:#}", NwbProvider::open(&path).err().expect("refused"));
+    assert!(
+        err.contains("starting_time rate must be float32 or float64"),
+        "{err}"
+    );
+}
+
+#[test]
 fn coarse_units_resolution_is_ignored_only_in_a_single_file() {
     let dir = tempfile::tempdir().unwrap();
     let sorting = dir.path().join("coarse.nwb");
