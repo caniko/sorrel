@@ -213,7 +213,11 @@ DANDI/HTTP streaming are not supported.
 - The selected clock (`starting_time` with its `rate`, or `timestamps`) and `/units/id`, `/units/spike_times`, and `/units/spike_times_index` must be stored in their respective opened files or stores. For HDF5, every path component must be a hard link; virtual datasets and external raw storage are refused. Open the file holding the data directly, or pass the recording file via `--dat`.
 
 **Zarr.** `sorrel open session.nwb.zarr` reads local NWB-Zarr v2 directories
-written by `NWBZarrIO`, including Blosc (default LZ4), zlib and gzip chunks. The
+written by `NWBZarrIO`. Arrays must use C order and a defined fill value. Supported
+compressors are Blosc (default LZ4), zlib and gzip; uncompressed chunks are also
+supported. Sorrel refuses filters other than variable-length string encodings
+and the JSON encoding used for cached NWB specifications. If `.zmetadata` is
+present, it must match the individual metadata files. The
 `zarr` feature is on by default in `sorrel`. `--dat` can pair an HDF5 file with
 a Zarr store in either direction when both features are built. Rates in Zarr
 attributes are JSON numbers without a stored float width, so the float32 rate

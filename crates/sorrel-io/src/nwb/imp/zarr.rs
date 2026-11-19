@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::{fs, ops::Range, path::Path, sync::Arc};
 use zarrs::array::{Array, Element, ElementOwned};
 use zarrs::array_subset::ArraySubset;
+use zarrs::config::MetadataRetrieveVersion;
 use zarrs::filesystem::FilesystemStore;
 use zarrs::group::Group as ZarrGroup;
 use zarrs::metadata::{v2::DataTypeMetadataV2, ArrayMetadata};
@@ -29,15 +30,78 @@ pub(super) fn exact_number(value: &Value, what: &str) -> Result<f64> {
 }
 
 pub(super) fn open(path: &Path) -> Result<Group> {
+    verify_consolidated_metadata(path)?;
     let store: ReadableListableStorage = Arc::new(FilesystemStore::new(path)?);
     Group::open(store, path.into(), "/")
+}
+
+fn verify_consolidated_metadata(root: &Path) -> Result<()> {
+    let path = root.join(".zmetadata");
+    match fs::symlink_metadata(&path) {
+        Ok(meta) => ensure!(meta.is_file(), ".zmetadata is not a regular file"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).context("inspect .zmetadata"),
+    }
+    let mut consolidated: Value =
+        serde_json::from_slice(&fs::read(path).context("read .zmetadata")?)
+            .context("parse .zmetadata")?;
+    ensure!(
+        consolidated["zarr_consolidated_format"] == 1,
+        "unsupported .zmetadata zarr_consolidated_format"
+    );
+    let metadata = consolidated["metadata"]
+        .as_object_mut()
+        .context("expected a metadata object in .zmetadata")?;
+
+    // Walk lexical paths rather than resolving keys supplied by .zmetadata.
+    // Compare only metadata contents, never read data chunks here.
+    fn walk(root: &Path, dir: &Path, metadata: &mut serde_json::Map<String, Value>) -> Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if matches!(
+                entry.file_name().to_str(),
+                Some(".zattrs" | ".zarray" | ".zgroup")
+            ) {
+                let key = path
+                    .strip_prefix(root)?
+                    .to_str()
+                    .context("non-UTF-8 Zarr metadata key")?
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                ensure!(kind.is_file(), "Zarr metadata {key} is not a regular file");
+                let expected = metadata.remove(&key).with_context(|| {
+                    format!("Zarr metadata key {key} is missing from .zmetadata")
+                })?;
+                let actual: Value = serde_json::from_slice(
+                    &fs::read(&path).with_context(|| format!("read Zarr metadata {key}"))?,
+                )
+                .with_context(|| format!("parse Zarr metadata {key}"))?;
+                ensure!(
+                    actual == expected,
+                    "Zarr metadata key {key} disagrees with .zmetadata"
+                );
+            } else if kind.is_dir() {
+                walk(root, &path, metadata)?;
+            }
+        }
+        Ok(())
+    }
+    walk(root, root, metadata).context("verify .zmetadata")?;
+    if let Some(key) = metadata.keys().next() {
+        bail!("Zarr metadata key {key} in .zmetadata has no matching per-node metadata file");
+    }
+    Ok(())
 }
 
 pub(in crate::nwb::imp) struct Group(ZarrGroup<Store>, Arc<Path>);
 
 impl Group {
     fn open(store: ReadableListableStorage, root: Arc<Path>, path: &str) -> Result<Self> {
-        Ok(Self(ZarrGroup::open(store, path)?, root))
+        Ok(Self(
+            ZarrGroup::open_opt(store, path, &MetadataRetrieveVersion::V2)?,
+            root,
+        ))
     }
 
     pub fn optional_attr(&self, name: &str) -> Option<&Value> {
@@ -143,11 +207,7 @@ impl Group {
         let store = self.0.storage();
         let key = |name| StoreKey::new(format!("{}/{name}", &path[1..]));
         // Classify arrays from metadata without requiring a supported codec.
-        if let Some(meta) = store.get(&key("zarr.json")?)? {
-            if serde_json::from_slice::<Value>(&meta)?["node_type"] == "array" {
-                return Ok(None);
-            }
-        } else if let Some(meta) = store.get(&key(".zarray")?)? {
+        if let Some(meta) = store.get(&key(".zarray")?)? {
             ensure!(
                 store.get(&key(".zgroup")?)?.is_none(),
                 "ambiguous Zarr node {path}: both .zarray and .zgroup"
@@ -163,31 +223,74 @@ impl Group {
 
     pub fn open_dataset(&self, path: &str) -> Result<Dataset> {
         let store = self.0.storage();
-        let data = match Array::open(store.clone(), path) {
-            Ok(array) => Data::Array(Box::new(array)),
-            Err(error) => {
-                // hdmf-zarr writes cached specs as a single uncompressed
-                // object chunk using numcodecs JSON. Never deserialize pickle.
-                let Some(meta) = store.get(&StoreKey::new(format!("{}/.zarray", &path[1..]))?)?
-                else {
-                    return Err(error.into());
-                };
-                let meta: Value = serde_json::from_slice(&meta)?;
-                if !(meta["dtype"] == "|O"
-                    && meta["shape"] == serde_json::json!([1])
-                    && meta["chunks"] == serde_json::json!([1])
-                    && meta["compressor"].is_null()
-                    && meta["filters"]
-                        .as_array()
-                        .is_some_and(|f| f.len() == 1 && f[0]["id"] == "json2"))
-                {
-                    return Err(error.into());
-                }
-                Data::JsonString {
-                    store,
-                    key: StoreKey::new(format!("{}/0", &path[1..]))?,
-                }
+        let key = |name| StoreKey::new(format!("{}/{name}", &path[1..]));
+        let meta = store
+            .get(&key(".zarray")?)?
+            .with_context(|| format!("missing Zarr v2 array metadata for {path}"))?;
+        let meta: Value =
+            serde_json::from_slice(&meta).with_context(|| format!("parse .zarray for {path}"))?;
+        ensure!(meta["zarr_format"] == 2, "expected Zarr v2 array at {path}");
+        ensure!(
+            meta["order"] == "C",
+            "unsupported Zarr order {} for array {path}; expected C",
+            meta["order"]
+        );
+        if let Some(separator) = meta.get("dimension_separator") {
+            ensure!(
+                matches!(separator.as_str(), Some("." | "/")),
+                "unsupported Zarr dimension_separator {separator} for array {path}"
+            );
+        }
+        // zarrs would invent a default for an undefined v2 fill value.
+        ensure!(
+            !meta["fill_value"].is_null(),
+            "undefined Zarr fill_value for array {path}"
+        );
+        let compressor = &meta["compressor"];
+        if !compressor.is_null() {
+            ensure!(
+                matches!(compressor["id"].as_str(), Some("blosc" | "zlib" | "gzip")),
+                "unsupported Zarr compressor {} for array {path}",
+                compressor["id"]
+            );
+        }
+        let filters = match &meta["filters"] {
+            Value::Null => &[][..],
+            Value::Array(filters) => filters.as_slice(),
+            filters => bail!("invalid Zarr filters {filters} for array {path}"),
+        };
+        // hdmf-zarr writes cached specs as a single uncompressed object
+        // chunk using numcodecs JSON. Decode that specific layout ourselves.
+        let json_spec = matches!(filters, [filter] if filter["id"] == "json2"
+                && filter.get("encoding").is_none_or(|v| v == "utf-8"))
+            && path.starts_with("/specifications/")
+            && meta["dtype"] == "|O"
+            && meta["shape"] == serde_json::json!([1])
+            && meta["chunks"] == serde_json::json!([1])
+            && compressor.is_null();
+        let data = if json_spec {
+            Data::JsonString {
+                store,
+                key: key("0")?,
             }
+        } else {
+            // These object encodings are needed for strings (e.g. the NWB
+            // epoch), not numeric filters. Never deserialize pickle.
+            if let [filter, ..] = filters {
+                ensure!(
+                    filters.len() == 1
+                        && meta["dtype"] == "|O"
+                        && (filter == &serde_json::json!({"id":"vlen-utf8"})
+                            || filter == &serde_json::json!({"id":"vlen-bytes"})),
+                    "unsupported Zarr filters {} for array {path}",
+                    meta["filters"]
+                );
+            }
+            Data::Array(Box::new(Array::open_opt(
+                store,
+                path,
+                &MetadataRetrieveVersion::V2,
+            )?))
         };
         let shape = match &data {
             Data::Array(array) => array
@@ -430,4 +533,86 @@ pub(super) fn identity(root: &Path) -> Result<Vec<u8>> {
     hash.update(b"\0");
     walk(root, root, &mut hash).context("seal NWB-Zarr directory store")?;
     Ok(hash.finalize().as_bytes().to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn consolidated_metadata_must_match_in_both_directions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let group = json!({"zarr_format": 2});
+        let key = "acquisition/Raw/starting_time/.zattrs";
+        let attrs = root.join(key);
+        fs::create_dir_all(attrs.parent().unwrap()).unwrap();
+        fs::write(root.join(".zgroup"), group.to_string()).unwrap();
+        fs::write(&attrs, r#"{"rate":1000.0}"#).unwrap();
+        let consolidate = |metadata| {
+            fs::write(
+                root.join(".zmetadata"),
+                json!({"zarr_consolidated_format": 1, "metadata": metadata}).to_string(),
+            )
+            .unwrap();
+        };
+        let refuses_key = || {
+            let err = open(root).err().expect("opened inconsistent metadata");
+            assert!(format!("{err:#}").contains(key), "{err:#}");
+        };
+
+        assert!(open(root).is_ok());
+        consolidate(json!({".zgroup": group, key: {"rate": 1000.0}}));
+        assert!(open(root).is_ok());
+        fs::write(&attrs, r#"{"rate":2000.0}"#).unwrap();
+        refuses_key();
+        fs::remove_file(&attrs).unwrap();
+        refuses_key();
+        fs::write(&attrs, r#"{"rate":1000.0}"#).unwrap();
+        consolidate(json!({".zgroup": group}));
+        refuses_key();
+    }
+
+    #[test]
+    fn rejects_fixedscaleoffset_but_keeps_verified_string_encodings() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join(".zgroup"), r#"{"zarr_format":2}"#).unwrap();
+        let path = "/acquisition/Raw/data";
+        let data = root.join(&path[1..]);
+        fs::create_dir_all(&data).unwrap();
+        let meta = json!({
+            "zarr_format": 2, "shape": [256, 1], "chunks": [256, 1], "dtype": "<i2",
+            "compressor": null, "fill_value": 0, "order": "C",
+            "filters": [{"id": "fixedscaleoffset", "offset": 0, "scale": 1024.0,
+                         "dtype": "<i2", "astype": "<i4"}]
+        });
+        fs::write(data.join(".zarray"), meta.to_string()).unwrap();
+        let err = open(root)
+            .unwrap()
+            .open_dataset(path)
+            .err()
+            .expect("opened an array with fixedscaleoffset");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(path) && message.contains("fixedscaleoffset"),
+            "{message}"
+        );
+
+        // Reference values decoded with numcodecs 0.15.1 from the hdmf-zarr
+        // fixture: VLenBytes for the epoch and VLenUTF8 for locations.
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../release/fixtures/nwb/good.nwb.zarr");
+        let group = open(&fixture).unwrap();
+        let read = |path| group.open_dataset(path).unwrap().strings().unwrap();
+        assert_eq!(
+            read("/timestamps_reference_time"),
+            ["2026-01-01T00:00:00+00:00"]
+        );
+        assert_eq!(
+            read("/general/extracellular_ephys/electrodes/location"),
+            ["CA1"; 6]
+        );
+    }
 }

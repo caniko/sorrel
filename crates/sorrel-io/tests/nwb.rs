@@ -566,6 +566,8 @@ fn replace_member_with_link(
         Format::Zarr => {
             use std::fs;
             zarr_tests::copy_store(&fixture, &path);
+            // This test edits per-node metadata to exercise link handling.
+            fs::remove_file(path.join(".zmetadata")).unwrap();
             fs::remove_dir_all(path.join(&member[1..])).unwrap();
             let attrs = path.join(&parent[1..]).join(".zattrs");
             let mut json = if attrs.exists() {
@@ -633,6 +635,7 @@ mod zarr_tests {
         let temp = tempfile::tempdir().unwrap();
         let store = temp.path().join("region.nwb.zarr");
         copy_store(&Format::Zarr.fixture("good.nwb"), &store);
+        fs::remove_file(store.join(".zmetadata")).unwrap();
         fs::rename(
             store.join("general/extracellular_ephys/electrodes"),
             store.join("alternate_table"),
