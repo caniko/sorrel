@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use egui::{Sense, Shape, Stroke, Ui};
-use sorrel_compute::{isi_histogram_range, isi_violations};
+use sorrel_compute::{isi_histogram_range, isi_violations, refractory_evidence};
 use sorrel_data::{preview_split, Session, SplitPreview};
 use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 
@@ -104,6 +104,61 @@ fn refractory_pct(times: &[SampleIndex], refractory: u64) -> f32 {
     } else {
         isi_violations(times, refractory) as f32 / times.len() as f32 * 100.0
     }
+}
+
+fn refractory_tooltip<P: DataProvider>(ui: &Ui, session: &Session<P>, c: ClusterId) -> String {
+    type Tooltip = ((ClusterId, u64), String);
+    let key = (c, session.metrics_version());
+    let id = egui::Id::new("isi_refractory_tooltip");
+    if let Some((_, text)) = ui
+        .data(|d| d.get_temp::<Tooltip>(id))
+        .filter(|(k, _)| *k == key)
+    {
+        return text;
+    }
+    let (srp, post) = refractory_evidence(
+        session.spike_times(c),
+        session.provider.n_samples().0,
+        session.provider.sample_rate(),
+        session.refractory(),
+    );
+    // Two significant digits, so a tiny but non-zero bound does not print as 0.
+    let pct = |f: f32| {
+        let p = 100.0 * f;
+        let decimals = match p > 0.0 && p < 1.0 {
+            true => (1 - p.log10().floor() as i32) as usize,
+            false => 1,
+        };
+        format!("{p:.decimals$}%")
+    };
+    let srp = match (srp.min_contamination.is_nan(), srp.tested) {
+        (true, false) => "SRP n/a".to_owned(),
+        // Tested but nothing passed: too few spikes or heavy contamination.
+        (true, true) => "SRP unconfirmed ≤35%".to_owned(),
+        (false, _) => format!(
+            "SRP ≤{} (90%) @ {:.2} ms",
+            pct(srp.min_contamination),
+            srp.rp_ms
+        ),
+    };
+    // The posterior uses the fixed window, not the SRP one; disagreement can
+    // mean the fixed window is longer than this unit's refractory period.
+    // Shown as the sample edge actually used, like the SRP window.
+    let sr = session.provider.sample_rate();
+    let fixed = session.refractory().fixed_samples(sr) as f32 * 1000.0 / sr;
+    let text = if post.mean.is_nan() {
+        // No window: it may not exist (e.g. a zero sample rate gives NaN ms).
+        format!("{srp} · posterior n/a")
+    } else {
+        format!(
+            "{srp} · {fixed:.2} ms posterior {} (95% CrI {}–{})",
+            pct(post.mean),
+            pct(post.lo95),
+            pct(post.hi95)
+        )
+    };
+    ui.data_mut(|d| d.insert_temp(id, (key, text.clone())));
+    text
 }
 
 /// phy status text: `[x_min ms, x_max ms]`.
@@ -254,7 +309,10 @@ pub fn isi_view<P: DataProvider>(
                 )
             });
             if resp
-                .on_hover_text("Click to brush this cluster's violating spikes")
+                .on_hover_ui(|ui| {
+                    ui.label("Click to brush this cluster's violating spikes");
+                    ui.label(refractory_tooltip(ui, session, c));
+                })
                 .clicked()
             {
                 clicked.push(c);

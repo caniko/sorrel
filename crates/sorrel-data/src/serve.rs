@@ -256,7 +256,7 @@ fn read_tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
                 "fixed_ms": {"type": "number"}, "sweep_min_ms": {"type": "number", "description": "Exclusive lower bound"},
                 "sweep_max_ms": {"type": "number", "description": "Inclusive upper bound"}, "sweep_step_ms": {"type": "number"}}}}),
-        json!({"name": "metrics", "description": "Quality metrics of one cluster as JSON (same columns as cluster_qc.tsv, plus refractory settings). brief level 2 gives the same numbers for many units at once, quantised",
+        json!({"name": "metrics", "description": "Quality metrics of one cluster as JSON (same columns as cluster_qc.tsv, plus refractory settings). srp_contamination is a nominal 90% upper limit on contamination from the sliding-RP test; null means not confirmed at or below 35% (too few spikes or heavier contamination), so never treat null as clean. rpv_post_* is a contamination posterior at the fixed window (flat prior): read [lo95, hi95], not the mean alone; lo95 > x is evidence of contamination if contaminating spikes are diffuse (Poisson) and the fixed window is no longer than the unit's refractory period; a wide interval from near 0 is too little data. brief level 2 gives the same numbers for many units at once, quantised",
          "inputSchema": cluster}),
         json!({"name": "suggest", "description": "Merge components and split candidates for the current curation, each with a handle (m<k>, s<cluster>.<k>) and a one-line counterfactual; pass the handle as candidate to split/propose/eval",
          "inputSchema": {"type": "object", "properties": {}}}),
@@ -2333,12 +2333,55 @@ mod tests {
         assert_eq!(after["refractory"], new["current"]);
         assert_eq!(before["isi_violations"].as_f64(), Some(0.0));
         assert_eq!(after["isi_violations"].as_f64(), Some(1.0));
+        assert!(
+            after["rpv_post_mean"].as_f64().unwrap() > before["rpv_post_mean"].as_f64().unwrap()
+        );
         let invalid = run(
             "refractory",
             json!({"sweep_step_ms": 0.0, "fixed_ms": 50.0}),
         );
         assert_eq!(invalid["result"]["isError"], true);
         assert_eq!(payload(&run("refractory", json!({}))), new);
+    }
+
+    #[test]
+    fn refractory_evidence_in_metrics_json_and_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SessionHost::new(mock_session(dir.path()));
+        let mut env = Env::new(dir.path(), false, label);
+        let r = handle_line(&h, &mut env, &call(1, "metrics", json!({"cluster": 0}))).unwrap();
+        let row = payload(&r);
+        for name in ["srp_contamination", "srp_rp_ms"] {
+            assert!(
+                row.get(name).unwrap().is_null(),
+                "not enough spikes to confirm {name}"
+            );
+        }
+        let lo = row["rpv_post_lo95"].as_f64().unwrap();
+        let mean = row["rpv_post_mean"].as_f64().unwrap();
+        let hi = row["rpv_post_hi95"].as_f64().unwrap();
+        assert!(lo < mean && mean < hi && hi > 0.1);
+
+        let rules = r#"
+            [[rule]]
+            name = "review refractory evidence"
+            metric = "rpv_post_hi95"
+            op = ">"
+            value = 0.1
+            label = "mua"
+        "#;
+        let r = handle_line(
+            &h,
+            &mut env,
+            &call(2, "rules_eval", json!({"rules": rules})),
+        )
+        .unwrap();
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let t = texts(&r);
+        assert!(
+            t.contains("review refractory evidence: rpv_post_hi95>0.1 -> mua: 2"),
+            "{t}"
+        );
     }
 
     fn ui() -> (Arc<Ui>, std::sync::mpsc::Receiver<Vec<ClusterId>>) {

@@ -19,6 +19,7 @@ pub mod lttb;
 pub mod metrics;
 pub mod metrics_iso;
 pub mod quality;
+pub mod refractory;
 pub mod rescue;
 pub mod shape;
 pub mod snippets;
@@ -51,6 +52,9 @@ pub use metrics_iso::{
     MIN_CLUSTER_SPIKES,
 };
 pub use quality::{quality_breakdown, QualityBreakdown};
+pub use refractory::{
+    contamination_posterior, refractory_evidence, sliding_rp, ContaminationPosterior, SlidingRp,
+};
 pub use shape::{
     burst_index, footprint, log_bins, peak_channel, sax, waveform_landmarks, Footprint,
     WaveformLandmarks,
