@@ -326,7 +326,10 @@
         # SpikeInterface sidecar `sorrel auto` embeds with include_str!.
         || pkgs.lib.hasSuffix "crates/sorrel/src/sorrel_auto.py" path
         # `sorrel agent-guide`'s primer, also embedded with include_str!.
-        || pkgs.lib.hasSuffix "crates/sorrel/src/agent_guide.md" path;
+        || pkgs.lib.hasSuffix "crates/sorrel/src/agent_guide.md" path
+        # NWB export's embedded metric definitions and cached schemas.
+        || pkgs.lib.hasSuffix "crates/sorrel-data/src/nwb_metrics.tsv" path
+        || pkgs.lib.hasInfix "/crates/sorrel-io/src/nwb_schema/" path;
       src = pkgs.lib.cleanSourceWith {
         src = ./.;
         filter = srcFilter;
@@ -540,6 +543,11 @@
         })
         // {
           formatting = treefmtEval.config.build.check self;
+          nwb-export-assets = pkgs.runCommand "nwb-export-assets" {} ''
+            test -f ${src}/crates/sorrel-data/src/nwb_metrics.tsv
+            test -f ${src}/crates/sorrel-io/src/nwb_schema/core/2.11.0/namespace.json
+            touch "$out"
+          '';
         }
         // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           # The crate's [package.metadata.binstall] must match the release
