@@ -137,6 +137,143 @@ fn timestamps_supply_the_same_time_base_as_starting_time() {
 }
 
 #[test]
+fn refuses_spikes_that_disagree_with_recorded_timestamps() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("midpoint.nwb");
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    let origin = 1_700_000_000.0_f64;
+    let ulp = origin.next_up() - origin;
+    let period = 128.0 * ulp;
+    // The grid assigns the spike to the first sample of a new read block.
+    let assigned = 65_536;
+    let last = assigned + 3;
+    let mut times: Vec<_> = (0..=last).map(|i| origin + i as f64 * period).collect();
+    let midpoint = times[assigned - 1] + period / 2.0;
+    let spike = midpoint + ulp;
+    let (timestamps, spikes) = {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        let series = file.group("/acquisition/ElectricalSeriesRaw").unwrap();
+        series.unlink("starting_time").unwrap();
+        series.unlink("data").unwrap();
+        series
+            .new_dataset::<i16>()
+            .shape((times.len(), 4))
+            .create("data")
+            .unwrap();
+        let timestamps = series
+            .new_dataset_builder()
+            .with_data(&times)
+            .create("timestamps")
+            .unwrap();
+        (timestamps, file.dataset("/units/spike_times").unwrap())
+    };
+    let write_spikes = |t| {
+        spikes
+            .write(&[times[0], t, times[last], times[0], times[last]])
+            .unwrap()
+    };
+    for t in [midpoint, spike] {
+        write_spikes(t);
+        let p = NwbProvider::open(&path).unwrap();
+        assert_eq!(
+            p.spike_times(ClusterId(0)),
+            [
+                SampleIndex(0),
+                SampleIndex(assigned as u64),
+                SampleIndex(last as u64)
+            ]
+        );
+    }
+    // Still a valid inferred grid, but the closest recorded sample is before the block boundary.
+    write_spikes(spike);
+    times[assigned - 1] += 3.0 * ulp;
+    timestamps.write(&times).unwrap();
+    let err = NwbProvider::open(&path).err().expect("mismapped midpoint");
+    let err = format!("{err:#}");
+    for text in [
+        format!("unit 5: spike at {spike} s"),
+        format!("assigned sample {assigned}"),
+        format!("nearest recorded sample is {}", assigned - 1),
+    ] {
+        assert!(err.contains(&text), "{err}");
+    }
+
+    for t in [origin - period, times[last] + period] {
+        spikes.write(&[t, t, t, t, t]).unwrap();
+        let err = NwbProvider::open(&path).err().expect("out-of-range spike");
+        assert!(
+            format!("{err:#}").contains("outside the sample index range"),
+            "{err:#}"
+        );
+    }
+}
+
+#[test]
+fn spike_mapping_datasets_must_be_stored_in_the_opened_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recording.nwb");
+    let clock = "/acquisition/ElectricalSeriesRaw/starting_time";
+    for (kind, component) in [
+        ("soft link", clock),
+        ("soft link", "/acquisition"),
+        ("external raw storage", clock),
+    ] {
+        std::fs::copy(fixture("good.nwb"), &path).unwrap();
+        {
+            let file = hdf5_metno::File::open_rw(&path).unwrap();
+            if kind == "soft link" {
+                file.relink(component, "/local_target").unwrap();
+                file.link_soft("/local_target", component).unwrap();
+            } else {
+                let external = dir.path().join("clock.bin");
+                file.unlink(clock).unwrap();
+                let st = file
+                    .new_dataset::<f64>()
+                    .external(external.to_str().unwrap(), 0, 8)
+                    .shape(())
+                    .create(clock)
+                    .unwrap();
+                assert_eq!(st.dcpl().unwrap().get_external().unwrap().len(), 1);
+                st.write_scalar(&0.5).unwrap();
+                st.new_attr::<f64>()
+                    .create("rate")
+                    .unwrap()
+                    .write_scalar(&1000.0)
+                    .unwrap();
+            }
+        }
+        // Exercise the same check for the units file and the --dat file.
+        for paired in [false, true] {
+            let (units, raw_path) = if paired {
+                (fixture("units_only.nwb"), Some(path.as_path()))
+            } else {
+                (path.clone(), None)
+            };
+            let err = NwbProvider::open_with(
+                units,
+                NwbOpenParams {
+                    raw_path,
+                    ..Default::default()
+                },
+            )
+            .err()
+            .unwrap_or_else(|| panic!("must reject {kind} at {component} (paired: {paired})"));
+            let err = format!("{err:#}");
+            assert!(
+                err.contains(clock) && err.contains(kind) && err.contains("--dat"),
+                "{err}"
+            );
+            if kind == "soft link" {
+                assert!(
+                    err.contains(&format!("{component} is an HDF5 soft link")),
+                    "{err}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn series_selection_prefers_acquisition_and_lists_available_paths() {
     let path = fixture("multiple_series.nwb");
     let default = NwbProvider::open(&path).unwrap();
