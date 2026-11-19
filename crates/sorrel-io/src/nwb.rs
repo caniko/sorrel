@@ -210,7 +210,7 @@ mod imp {
                 let units_clock = if let Some(declared) = units_rate {
                     // The one-ppm gate decides whether resolution declares a clock,
                     // not whether an explicit value matches that clock.
-                    let close = (declared - stored_rate).abs() <= 1e-6 * stored_rate;
+                    let close = is_units_clock(declared, stored_rate);
                     ensure!(close || raw.is_none(),
                         "NWB rate mismatch: sorting sample rate is {declared} Hz but {name} is {stored_rate} Hz");
                     close.then_some(declared)
@@ -442,6 +442,25 @@ mod imp {
             t.abs() < CLOCK_LIMIT,
             "invalid {what} {t} s (must be finite and have magnitude below 2^53 s)"
         );
+        Ok(())
+    }
+
+    fn is_units_clock(units_rate: f64, series_rate: f64) -> bool {
+        (units_rate - series_rate).abs() <= 1e-6 * series_rate
+    }
+
+    #[cfg(feature = "hdf5")]
+    pub(crate) fn check_append_rate(file: &hdf5_metno::File, units_rate: f64) -> Result<()> {
+        let units_rate = checked_rate(units_rate)?;
+        let file = Group::Hdf5(file.group("/")?);
+        if let Some((name, series)) = find_electrical_series(&file, None, false)? {
+            let samples = series.dataset("data")?.shape()[0];
+            let (series_rate, _, _) = read_time_base(&file, &name, samples)?;
+            // A single-file open ignores out-of-gate resolutions. Refuse to
+            // append here so reopening cannot silently use the wrong clock.
+            ensure!(is_units_clock(units_rate, series_rate),
+                "NWB rate mismatch: exported Units clock is {units_rate} Hz but destination {name} is {series_rate} Hz; use --out for a separate Units file");
+        }
         Ok(())
     }
 
@@ -1498,6 +1517,8 @@ mod imp {
     }
 }
 
+#[cfg(feature = "hdf5")]
+pub(crate) use imp::check_append_rate;
 #[cfg(feature = "hdf5")]
 pub(crate) use imp::storage::{read_str, strings};
 #[cfg(any(feature = "hdf5", feature = "zarr"))]

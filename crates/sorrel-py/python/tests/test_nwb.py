@@ -317,6 +317,45 @@ def test_native_export_units_only_with_explicit_rate(tmp_path: Path, native_cli)
         assert nwb.units["spike_times"][0][0] == round(0.55 * rate) / rate
 
 
+@pytest.mark.parametrize("compatible", [True, False], ids=["float32", "mismatch"])
+def test_native_append_preserves_declared_clock(tmp_path: Path, native_cli, compatible):
+    source = tmp_path / "input.nwb"
+    dest = tmp_path / "recording.nwb"
+    shutil.copyfile(FIXTURE.parent / "nwb" / "precise_rate_long.nwb", source)
+    shutil.copyfile(source, dest)
+    with h5py.File(source, "r") as f:
+        rate = 1 / float(f["units/spike_times"].attrs["resolution"])
+    with h5py.File(dest, "r+") as f:
+        del f["units"]
+        start = f["acquisition/ElectricalSeriesRaw/starting_time"]
+        assert start.attrs["rate"].dtype == np.dtype("float32")
+        if not compatible:
+            start.attrs.modify("rate", np.float32(30001))
+    before = dest.read_bytes()
+    result = subprocess.run([native_cli, "export-nwb", source, "--into", dest,
+                             "--sample-rate", str(rate)], text=True, capture_output=True)
+    if not compatible:
+        assert result.returncode != 0 and "NWB rate mismatch" in result.stderr
+        assert dest.read_bytes() == before
+        return
+
+    assert result.returncode == 0, result.stderr
+    assert not validate(path=dest)
+    with h5py.File(dest, "r") as f:
+        spikes = f["units/spike_times"]
+        assert spikes.dtype == spikes.attrs["resolution"].dtype == np.dtype("float64")
+        assert spikes[0] == 330_000_000 / rate
+        declared = 1 / float(spikes.attrs["resolution"])
+    reopened = tmp_path / "reopened.nwb"
+    cmd = [native_cli, "export-nwb", dest, "--out", reopened]
+    result = subprocess.run(cmd, text=True, capture_output=True)
+    assert result.returncode != 0 and "Ambiguous NWB sample rate" in result.stderr
+    subprocess.run([*cmd, "--sample-rate", str(declared)], check=True)
+    assert not validate(path=reopened)
+    with h5py.File(reopened, "r") as f:
+        assert f["units/spike_times"][0] == 330_000_000 / rate
+
+
 def test_native_export_destinations(native_cli):
     help_text = subprocess.check_output([native_cli, "export-nwb", "--help"], text=True)
     assert "--out" in help_text and "--into" in help_text
