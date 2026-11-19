@@ -1,55 +1,38 @@
 //! Decode c-Blosc 1 chunks (header format version 2):
 //! https://github.com/Blosc/c-blosc/blob/v1.21.6/README_CHUNK_FORMAT.rst
 
-use std::{
-    borrow::Cow,
-    io::Read,
-    sync::{Arc, Once},
-};
+use std::{borrow::Cow, io::Read, sync::Arc};
 
-use zarrs::array::codec::api::{
-    register_codec_v2, ArrayBytesRaw, BytesRepresentation, BytesToBytesCodecTraits, Codec,
-    CodecError, CodecMetadataOptions, CodecOptions, CodecRuntimePluginV2, CodecTraits,
-    PartialDecoderCapability, PartialEncoderCapability, RecommendedConcurrency,
+use zarrs::array::{
+    codec::{
+        BytesToBytesCodecTraits, Codec, CodecError, CodecMetadataOptions, CodecOptions,
+        CodecPlugin, CodecTraits, PartialDecoderCapability, PartialEncoderCapability,
+    },
+    BytesRepresentation, RawBytes, RecommendedConcurrency,
 };
-use zarrs::metadata::Configuration;
-use zarrs::plugin::{ExtensionName, ZarrVersion};
+use zarrs::metadata::{v3::MetadataV3, Configuration};
+use zarrs::plugin::PluginCreateError;
 
-pub(super) fn register() {
-    static REGISTER: Once = Once::new();
-    REGISTER.call_once(|| {
-        // Array::open uses the V2 plugin directly, without a V3 metadata conversion.
-        register_codec_v2(CodecRuntimePluginV2::new(
-            |name| name == "blosc",
-            |metadata| {
-                Ok(Codec::BytesToBytes(Arc::new(Blosc(
-                    metadata.configuration().clone(),
-                ))))
-            },
-        ));
-    });
+inventory::submit! {
+    CodecPlugin::new("blosc", |name| name == "blosc", create)
+}
+
+fn create(metadata: &MetadataV3) -> Result<Codec, PluginCreateError> {
+    Ok(Codec::BytesToBytes(Arc::new(Blosc(
+        metadata.configuration().cloned(),
+    ))))
 }
 
 #[derive(Debug)]
-struct Blosc(Configuration);
-
-impl ExtensionName for Blosc {
-    fn name(&self, version: ZarrVersion) -> Option<Cow<'static, str>> {
-        (version == ZarrVersion::V2).then_some(Cow::Borrowed("blosc"))
-    }
-}
+struct Blosc(Option<Configuration>);
 
 impl CodecTraits for Blosc {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn identifier(&self) -> &str {
+        "blosc"
     }
 
-    fn configuration(
-        &self,
-        version: ZarrVersion,
-        _: &CodecMetadataOptions,
-    ) -> Option<Configuration> {
-        (version == ZarrVersion::V2).then(|| self.0.clone())
+    fn configuration_opt(&self, _: &str, _: &CodecMetadataOptions) -> Option<Configuration> {
+        self.0.clone()
     }
 
     fn partial_decoder_capability(&self) -> PartialDecoderCapability {
@@ -78,20 +61,16 @@ impl BytesToBytesCodecTraits for Blosc {
         Ok(RecommendedConcurrency::new_maximum(1))
     }
 
-    fn encode<'a>(
-        &self,
-        _: ArrayBytesRaw<'a>,
-        _: &CodecOptions,
-    ) -> Result<ArrayBytesRaw<'a>, CodecError> {
+    fn encode<'a>(&self, _: RawBytes<'a>, _: &CodecOptions) -> Result<RawBytes<'a>, CodecError> {
         Err(CodecError::from("Sorrel's Blosc codec is decode-only"))
     }
 
     fn decode<'a>(
         &self,
-        encoded: ArrayBytesRaw<'a>,
+        encoded: RawBytes<'a>,
         decoded: &BytesRepresentation,
         _: &CodecOptions,
-    ) -> Result<ArrayBytesRaw<'a>, CodecError> {
+    ) -> Result<RawBytes<'a>, CodecError> {
         decode_frame(&encoded, *decoded).map(Cow::Owned)
     }
 

@@ -2,7 +2,8 @@ use super::SampleType;
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::Value;
 use std::{fs, ops::Range, path::Path, sync::Arc};
-use zarrs::array::{Array, ArraySubset, Element, ElementOwned};
+use zarrs::array::{Array, Element, ElementOwned};
+use zarrs::array_subset::ArraySubset;
 use zarrs::filesystem::FilesystemStore;
 use zarrs::group::Group as ZarrGroup;
 use zarrs::metadata::{v2::DataTypeMetadataV2, ArrayMetadata};
@@ -28,7 +29,6 @@ pub(super) fn exact_number(value: &Value, what: &str) -> Result<f64> {
 }
 
 pub(super) fn open(path: &Path) -> Result<Group> {
-    blosc::register();
     let store: ReadableListableStorage = Arc::new(FilesystemStore::new(path)?);
     Group::open(store, "/")
 }
@@ -294,11 +294,11 @@ impl Dataset {
     fn read<T: Number>(&self, subset: &ArraySubset) -> Result<Vec<T>> {
         let a = self.array()?;
         if T::validate_data_type(a.data_type()).is_ok() {
-            return Ok(a.retrieve_array_subset::<Vec<T>>(subset)?);
+            return Ok(a.retrieve_array_subset_elements::<T>(subset)?);
         }
         macro_rules! convert {
             ($($kind:ident: $ty:ty),*) => { match self.sample_type()? { $(
-                SampleType::$kind => a.retrieve_array_subset::<Vec<$ty>>(subset)?
+                SampleType::$kind => a.retrieve_array_subset_elements::<$ty>(subset)?
                     .into_iter().map(|n| T::from(n).context("Zarr numeric conversion out of range")).collect(),
             )* } };
         }
@@ -342,11 +342,11 @@ impl Dataset {
     pub fn strings(&self) -> Result<Vec<String>> {
         match &self.data {
             Data::Array(a) if Vec::<u8>::validate_data_type(a.data_type()).is_ok() => a
-                .retrieve_array_subset::<Vec<Vec<u8>>>(&a.subset_all())?
+                .retrieve_array_subset_elements::<Vec<u8>>(&a.subset_all())?
                 .into_iter()
                 .map(|s| Ok(String::from_utf8(s)?))
                 .collect(),
-            Data::Array(a) => Ok(a.retrieve_array_subset::<Vec<String>>(&a.subset_all())?),
+            Data::Array(a) => Ok(a.retrieve_array_subset_elements::<String>(&a.subset_all())?),
             Data::JsonString { store, key } => {
                 let bytes = store.get(key)?.context("missing Zarr JSON chunk")?;
                 // Numcodecs appends dtype and shape to the flattened values.

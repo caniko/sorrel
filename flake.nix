@@ -325,8 +325,6 @@
         || pkgs.lib.hasSuffix "sorrel-remote/wordlist.txt" path
         # SpikeInterface sidecar `sorrel auto` embeds with include_str!.
         || pkgs.lib.hasSuffix "crates/sorrel/src/sorrel_auto.py" path
-        # The patched zarrs crate includes its status docs at compile time.
-        || pkgs.lib.hasInfix "/vendor/zarrs/doc/" path
         # `sorrel agent-guide`'s primer, also embedded with include_str!.
         || pkgs.lib.hasSuffix "crates/sorrel/src/agent_guide.md" path;
       src = pkgs.lib.cleanSourceWith {

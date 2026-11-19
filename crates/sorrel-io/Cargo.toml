@@ -31,8 +31,9 @@ lz4_flex = { version = "0.12.3", optional = true, default-features = false, feat
 ] }
 ruzstd = { version = "0.9.1", optional = true }
 snap = { version = "1.1", optional = true }
-# ponytail: drop the local path when the upstream libz-sys fix ships on crates.io.
-zarrs = { version = "0.23.14", path = "../../vendor/zarrs", optional = true, default-features = false, features = [
+inventory = { version = "0.3", optional = true }
+# zarrs 0.23 adds an unconditional libz-sys build dependency, even without codecs.
+zarrs = { version = "0.22.10", optional = true, default-features = false, features = [
   "filesystem",
   "gzip",
   "transpose",
@@ -44,6 +45,7 @@ jiff = { version = "0.2", default-features = false, optional = true }
 default = []
 hdf5 = ["dep:hdf5-metno", "dep:hdf5-metno-sys", "dep:jiff"]
 zarr = [
+  "dep:inventory",
   "dep:zarrs",
   "dep:num-traits",
   "dep:jiff",

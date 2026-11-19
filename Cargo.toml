@@ -14,7 +14,7 @@ members = [
 # `crates/sorrel-py` is intentionally excluded — it requires PyO3/maturin
 # at build time and ships its own (single-member) workspace declaration so
 # `cargo check` from the root never recurses into it.
-exclude = ["crates/sorrel-py", "vendor/zarrs"]
+exclude = ["crates/sorrel-py"]
 
 [workspace.package]
 version = "0.4.0"
