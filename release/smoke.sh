@@ -59,10 +59,12 @@ test -x "sorrel-${VERSION}-x86_64.AppImage"
 # opens the dataset and reads its units without starting a GUI or GPU.
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-cp "$NWB_FIXTURE" "$tmp/good.nwb"
 describe_nwb() {
-  "$@" describe "$tmp/good.nwb" --json > "$tmp/describe.json"
-  grep -F '"# spikes": "5"' "$tmp/describe.json"
+  local data
+  data=$(mktemp -d "$tmp/nwb.XXXXXX")
+  cp "$NWB_FIXTURE" "$data/good.nwb"
+  "$@" describe "$data/good.nwb" --json > "$data/describe.json"
+  grep -F '"# spikes": "5"' "$data/describe.json"
 }
 for arch in x86_64 aarch64; do
   tar -xOzf "sorrel-${VERSION}-${arch}-linux.tar.gz" ./sorrel > "$tmp/sorrel-$arch"
