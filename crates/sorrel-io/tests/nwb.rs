@@ -364,6 +364,43 @@ fn paired_series_rejects_different_timestamp_epoch() {
 }
 
 #[test]
+fn paired_series_reads_fixed_and_variable_length_epochs() {
+    use hdf5_metno::types::{FixedAscii, FixedUnicode, VarLenAscii, VarLenUnicode};
+
+    fn write_epoch<T: hdf5_metno::H5Type>(f: &hdf5_metno::File, epoch: &T) {
+        f.unlink("timestamps_reference_time").unwrap();
+        f.new_dataset::<T>()
+            .shape(())
+            .create("timestamps_reference_time")
+            .unwrap()
+            .write_scalar(epoch)
+            .unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let raw = dir.path().join("raw.nwb");
+    const EPOCH: &str = "2026-01-01T00:00:00+00:00";
+    for write in [
+        (|f| write_epoch(f, &FixedAscii::<25>::from_ascii(EPOCH).unwrap()))
+            as fn(&hdf5_metno::File),
+        |f| write_epoch(f, &EPOCH.parse::<FixedUnicode<64>>().unwrap()),
+        |f| write_epoch(f, &VarLenAscii::from_ascii(EPOCH).unwrap()),
+        |f| write_epoch(f, &EPOCH.parse::<VarLenUnicode>().unwrap()),
+    ] {
+        std::fs::copy(fixture("raw_only.nwb"), &raw).unwrap();
+        write(&hdf5_metno::File::open_rw(&raw).unwrap());
+        NwbProvider::open_with(
+            fixture("units_only.nwb"),
+            NwbOpenParams {
+                raw_path: Some(&raw),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+}
+
+#[test]
 fn rank_one_series_reads_scaled_single_channel_windows() {
     let p = open("one_channel.nwb").unwrap();
     assert_eq!(p.n_channels(), 1);

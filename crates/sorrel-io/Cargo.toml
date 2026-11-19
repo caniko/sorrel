@@ -23,11 +23,12 @@ dunce = "1"
 # `--features hdf5`. We use the actively-maintained `hdf5-metno` fork
 # (vs. the upstream-stale `hdf5` crate), which supports libhdf5 ≥ 1.14.
 hdf5-metno = { version = "0.12.4", optional = true }
+hdf5-metno-sys = { version = "0.11.3", optional = true }
 jiff = { version = "0.2", default-features = false, optional = true }
 
 [features]
 default = []
-hdf5 = ["dep:hdf5-metno", "dep:jiff"]
+hdf5 = ["dep:hdf5-metno", "dep:hdf5-metno-sys", "dep:jiff"]
 
 [dev-dependencies]
 tempfile.workspace = true

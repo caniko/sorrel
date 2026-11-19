@@ -300,10 +300,7 @@ mod imp {
     fn timestamp_epoch(file: &H5File) -> Result<jiff::Timestamp> {
         // NWB defines time zero separately from the experiment's start time.
         let ds = file.dataset("/timestamps_reference_time")?;
-        let value = ds
-            .read_scalar::<VarLenUnicode>()
-            .map(|s| s.to_string())
-            .or_else(|_| ds.read_scalar::<VarLenAscii>().map(|s| s.to_string()))?;
+        let value = read_str(&ds)?;
         value
             .parse()
             .map_err(|err| anyhow!("invalid NWB epoch {value:?}: {err}"))
@@ -366,25 +363,95 @@ mod imp {
         hasher.finalize().as_bytes().to_vec()
     }
 
-    fn read_str(attr: hdf5::Attribute) -> Option<String> {
-        attr.read_scalar::<VarLenUnicode>()
-            .map(|s| s.to_string())
-            .or_else(|_| attr.read_scalar::<VarLenAscii>().map(|s| s.to_string()))
-            .ok()
+    fn read_str(data: &hdf5::Container) -> Result<String> {
+        ensure!(data.is_scalar(), "expected a scalar HDF5 string");
+        strings(data)?.pop().context("missing HDF5 string")
     }
 
-    fn strings(ds: &hdf5::Dataset) -> Option<Vec<String>> {
-        match ds.dtype().ok()?.to_descriptor().ok()? {
-            TypeDescriptor::VarLenUnicode => ds
-                .read_raw::<VarLenUnicode>()
-                .ok()
-                .map(|v| v.iter().map(ToString::to_string).collect()),
-            TypeDescriptor::VarLenAscii => ds
-                .read_raw::<VarLenAscii>()
-                .ok()
-                .map(|v| v.iter().map(ToString::to_string).collect()),
-            _ => None,
+    fn strings(data: &hdf5::Container) -> Result<Vec<String>> {
+        let dtype = data.dtype()?;
+        match dtype.to_descriptor()? {
+            TypeDescriptor::VarLenUnicode => Ok(data
+                .read_raw::<VarLenUnicode>()?
+                .iter()
+                .map(ToString::to_string)
+                .collect()),
+            TypeDescriptor::VarLenAscii => Ok(data
+                .read_raw::<VarLenAscii>()?
+                .iter()
+                .map(ToString::to_string)
+                .collect()),
+            TypeDescriptor::FixedAscii(width) | TypeDescriptor::FixedUnicode(width) => {
+                fixed_strings(data, &dtype, width)
+            }
+            _ => Err(anyhow!("expected an HDF5 string datatype")),
         }
+    }
+
+    fn fixed_strings(
+        data: &hdf5::Container,
+        dtype: &hdf5::Datatype,
+        width: usize,
+    ) -> Result<Vec<String>> {
+        use hdf5_metno_sys::{
+            h5a::H5Aread,
+            h5d::H5Dread,
+            h5i::{H5Iget_type, H5I_ATTR},
+            h5p::H5P_DEFAULT,
+            h5s::H5Sget_simple_extent_npoints,
+            h5t::{H5T_str_t::H5T_STR_SPACEPAD, H5Tget_strpad},
+        };
+
+        // hdf5-metno's fixed strings require a compile-time width. Read with
+        // the file datatype as the memory datatype instead (no conversion).
+        let space = data.space()?;
+        // SAFETY: space is a live HDF5 dataspace, accessed under the HDF5 lock.
+        let count = hdf5::sync::sync(|| unsafe {
+            hdf5::h5check(H5Sget_simple_extent_npoints(space.id()))
+        })?;
+        let count = usize::try_from(count)?;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let len = count
+            .checked_mul(width)
+            .filter(|&n| n != 0)
+            .context("invalid HDF5 string size")?;
+        let mut bytes = Vec::<u8>::new();
+        bytes.try_reserve_exact(len)?;
+        bytes.resize(len, 0);
+        let space_pad = hdf5::sync::sync(|| {
+            // SAFETY: data and dtype are live; bytes holds count * width bytes
+            // for the whole dataspace, and the HDF5 lock serializes the calls.
+            unsafe {
+                let buf = bytes.as_mut_ptr().cast();
+                hdf5::h5check(if H5Iget_type(data.id()) == H5I_ATTR {
+                    H5Aread(data.id(), dtype.id(), buf)
+                } else {
+                    H5Dread(
+                        data.id(),
+                        dtype.id(),
+                        space.id(),
+                        space.id(),
+                        H5P_DEFAULT,
+                        buf,
+                    )
+                })?;
+                Ok::<_, hdf5::Error>(H5Tget_strpad(dtype.id()) == H5T_STR_SPACEPAD)
+            }
+        })?;
+        bytes
+            .chunks_exact(width)
+            .map(|s| {
+                let s = std::str::from_utf8(s.split(|&b| b == 0).next().unwrap_or_default())?;
+                Ok(if space_pad {
+                    s.trim_end_matches(' ')
+                } else {
+                    s
+                }
+                .to_owned())
+            })
+            .collect()
     }
 
     pub(crate) fn read_trials(path: &Path) -> Result<crate::Events> {
@@ -396,7 +463,11 @@ mod imp {
         let names = ["trial_type", "stimulus", "condition"]
             .into_iter()
             .filter_map(|c| g.dataset(c).ok())
-            .find_map(|ds| strings(&ds).filter(|names| names.len() == starts.len()));
+            .find_map(|ds| {
+                strings(&ds)
+                    .ok()
+                    .filter(|names| names.len() == starts.len())
+            });
         let mut events = crate::Events::default();
         for (i, t) in starts.into_iter().enumerate() {
             events.push(t, names.as_ref().map_or("trial", |n| n[i].as_str()));
@@ -431,10 +502,7 @@ mod imp {
             .flatten()
         {
             for ds in version.datasets().into_iter().flatten() {
-                let text = ds
-                    .read_scalar::<VarLenUnicode>()
-                    .map(|s| s.to_string())
-                    .or_else(|_| ds.read_scalar::<VarLenAscii>().map(|s| s.to_string()));
+                let text = read_str(&ds);
                 if let Some(v) = text.ok().and_then(|t| serde_json::from_str(&t).ok()) {
                     collect(&v, &mut out);
                 }
@@ -464,7 +532,7 @@ mod imp {
                 if child
                     .attr("neurodata_type")
                     .ok()
-                    .and_then(read_str)
+                    .and_then(|a| read_str(&a).ok())
                     .is_some_and(|t| is_series(&t))
                 {
                     found.push((path, child));
@@ -808,7 +876,7 @@ mod imp {
         name: &str,
         n_channels: usize,
     ) -> Result<(Vec<f64>, f64)> {
-        if let Some(unit) = data.attr("unit").ok().and_then(read_str) {
+        if let Some(unit) = data.attr("unit").ok().and_then(|a| read_str(&a).ok()) {
             ensure!(
                 unit.eq_ignore_ascii_case("volts"),
                 "ElectricalSeries {name}: data unit is {unit:?}, expected volts"
@@ -905,7 +973,7 @@ mod imp {
         let n = ids.len();
         let string_column = |name| {
             let ds = units.dataset(name).ok()?;
-            (ds.shape() == [n]).then(|| strings(&ds)).flatten()
+            (ds.shape() == [n]).then(|| strings(&ds).ok()).flatten()
         };
         let label_columns: Vec<_> = ["label", "quality", "KSLabel"]
             .into_iter()
@@ -940,7 +1008,7 @@ mod imp {
         let tags = (|| {
             let ends = index("tags")?;
             let ds = units.dataset("tags").ok()?;
-            let values = strings(&ds)?;
+            let values = strings(&ds).ok()?;
             let mut rows = ragged_rows(&values, &ends)?;
             for row in &mut rows {
                 row.retain(|tag| valid_tag(tag));
@@ -995,7 +1063,7 @@ mod imp {
                 && ds
                     .attr("description")
                     .ok()
-                    .and_then(read_str)
+                    .and_then(|a| read_str(&a).ok())
                     .is_some_and(|d| d.starts_with("Sorrel QC metric. "))
             {
                 if let Ok(values) = ds.read_raw::<f32>() {
