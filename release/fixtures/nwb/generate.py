@@ -258,14 +258,19 @@ def write_reader_edge_cases():
 
 def write_single_file_precise_rates():
     rate = 30000.123
-    for length, sample in [("short", 100), ("long", 330_000_000)]:
-        name = f"precise_rate_{length}"
+    for name, stored_rate, start, sample in [
+        ("precise_rate_short", np.float32(rate), 0.0, 100),
+        ("precise_rate_long", np.float32(rate), 0.0, 330_000_000),
+        # Reproduce the append-clock mismatch with a float64 rate ~0.9 ppb away.
+        ("close_f64_rate_short", rate + 0.000027, 0.5, 100),
+        ("close_f64_rate_long", rate + 0.000027, 0.5, 660_000_000),
+    ]:
         nwbfile = make_file(name, units=False)
         nwbfile.units = Units(name="units", resolution=1 / rate)
-        nwbfile.add_unit(id=0, spike_times=[sample / rate])
+        nwbfile.add_unit(id=0, spike_times=[start + sample / rate])
         # Chunked data with no allocated samples, even for the long recording.
         data = H5DataIO(shape=(sample + 2, N_CHANNELS), dtype=np.int16, chunks=(64, N_CHANNELS))
-        add_series(nwbfile, data, rate=np.float32(rate), starting_time=0.0)
+        add_series(nwbfile, data, rate=stored_rate, starting_time=start)
         write(nwbfile, name + ".nwb")
 
 

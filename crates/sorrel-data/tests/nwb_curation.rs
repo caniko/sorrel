@@ -110,13 +110,18 @@ fn nwb_trunk_journal_replays_only_with_the_trunk_series() {
 
 #[test]
 fn nwb_trunk_journal_replays_when_precise_rate_leaves_samples_unchanged() {
-    let path = fixture("precise_rate_short.nwb");
+    for name in ["precise_rate_short.nwb", "close_f64_rate_short.nwb"] {
+        assert_unchanged_mapping_replays_trunk_journal(&fixture(name));
+    }
+}
+
+fn assert_unchanged_mapping_replays_trunk_journal(path: &Path) {
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("trunk.journal");
     {
-        let provider = NwbProvider::open(&path).unwrap();
+        let provider = NwbProvider::open(path).unwrap();
         assert_eq!(provider.spike_times(ClusterId(0)), [SampleIndex(100)]);
-        let j = trunk_journal(&path, &journal, provider.n_clusters());
+        let j = trunk_journal(path, &journal, provider.n_clusters());
         let mut session = Session::new(provider, j);
         session
             .dispatch(CurationCommand::Relabel {
@@ -129,7 +134,7 @@ fn nwb_trunk_journal_replays_when_precise_rate_leaves_samples_unchanged() {
     // An explicit choice with the same sample mapping also preserves the seal.
     for sample_rate in [None, Some(30000.123)] {
         let provider = NwbProvider::open_with(
-            &path,
+            path,
             NwbOpenParams {
                 sample_rate,
                 ..Default::default()

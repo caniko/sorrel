@@ -47,8 +47,7 @@ mod imp {
         pub series: Option<&'a str>,
         /// Read the ElectricalSeries from this file instead of the units file.
         pub raw_path: Option<&'a Path>,
-        /// Sampling rate (Hz) for units without a time base, or to choose a
-        /// rate matching a series' stored float32 rate at float32 precision.
+        /// Sampling rate (Hz) for units without a time base or with ambiguous clocks.
         pub sample_rate: Option<f64>,
     }
 
@@ -107,42 +106,58 @@ mod imp {
                 let (n_samples, n_channels) = (shape[0], shape.get(1).copied().unwrap_or(1));
                 let (stored_rate, t0, float32_rate, timestamps) =
                     read_time_base(recording, series, name, n_samples)?;
-                if let Some(declared) = units_rate {
-                    check_matching_rate(
-                        "sorting sample rate",
-                        declared,
-                        name,
-                        stored_rate,
-                        float32_rate,
-                    )?;
-                }
-                if let Some(declared) = units_rate.filter(|_| !float32_rate) {
+                let units_clock = if timestamps.is_some() {
+                    if let Some(declared) = units_rate {
+                        check_matching_rate(
+                            "sorting sample rate",
+                            declared,
+                            name,
+                            stored_rate,
+                            false,
+                        )?;
+                    }
+                    None
+                } else {
+                    let declared = if raw.is_some() {
+                        units_rate
+                    } else {
+                        read_units_rate(&spike_times).ok().flatten()
+                    };
+                    if let Some(declared) = declared {
+                        // One ppm covers float32 rounding (~6e-8) and ppb-level float64 differences.
+                        let close = (declared - stored_rate).abs() <= 1e-6 * stored_rate;
+                        ensure!(close || raw.is_none(),
+                            "NWB rate mismatch: sorting sample rate is {declared} Hz but {name} is {stored_rate} Hz");
+                        (close && declared != stored_rate).then_some(declared)
+                    } else {
+                        None
+                    }
+                };
+                let explicit_units_clock = units_clock.filter(|&declared| {
+                    params
+                        .sample_rate
+                        .is_some_and(|explicit| rates_match(explicit, declared, false))
+                });
+                if let Some(declared) =
+                    explicit_units_clock.or(units_rate.filter(|_| timestamps.is_some()))
+                {
                     check_explicit("/units/spike_times resolution", declared, false)?;
                 } else {
                     check_explicit(name, stored_rate, float32_rate)?;
                 }
                 legacy_identity =
                     raw.is_none() && timestamps.is_none() && is_trunk_series(&f, name);
-                let rate = if float32_rate {
-                    if let Some(explicit) = params.sample_rate {
+                let rate = match params.sample_rate {
+                    Some(explicit) if float32_rate || units_clock.is_some() => {
                         comparison_rate =
                             (legacy_identity && explicit != stored_rate).then_some(stored_rate);
                         explicit
-                    } else {
-                        // Units resolution may describe a different clock. A
-                        // matching float32 rate only helps if the samples agree.
-                        let declared = if raw.is_some() {
-                            units_rate
-                        } else {
-                            read_units_rate(&spike_times).ok().flatten()
-                        };
-                        comparison_rate = declared.filter(|&rate| {
-                            rate != stored_rate && rate as f32 == stored_rate as f32
-                        });
+                    }
+                    None => {
+                        comparison_rate = units_clock;
                         stored_rate
                     }
-                } else {
-                    stored_rate
+                    Some(_) => stored_rate,
                 };
                 let channels = read_channels(recording, series, name, n_channels)?;
                 let trace = NwbTrace::new(series, data, name, n_samples, n_channels)?;
@@ -338,6 +353,14 @@ mod imp {
             .map_err(|err| anyhow!("invalid NWB epoch {value:?}: {err}"))
     }
 
+    fn rates_match(a: f64, b: f64, b_float32: bool) -> bool {
+        if b_float32 {
+            a as f32 == b as f32
+        } else {
+            (a - b).abs() <= 1e-9 * b
+        }
+    }
+
     fn check_matching_rate(
         a_name: &str,
         a: f64,
@@ -349,11 +372,7 @@ mod imp {
         // Only allow round-off from reciprocals or timestamp-derived rates,
         // not a nominally similar clock that could drift by many samples.
         ensure!(
-            if b_float32 {
-                a as f32 == b as f32
-            } else {
-                (a - b).abs() <= 1e-9 * b
-            },
+            rates_match(a, b, b_float32),
             "NWB rate mismatch: {a_name} is {a} Hz but {b_name} is {b} Hz"
         );
         Ok(())

@@ -486,6 +486,88 @@ fn single_file_float32_rate_does_not_assume_resampled_units_use_acquisition_cloc
 }
 
 #[test]
+fn single_file_float64_rate_requires_clock_choice_for_long_recording() {
+    let name = "close_f64_rate_long.nwb";
+    let err = open_err(name);
+    assert!(err.contains("660000001 vs 660000000"), "{err}");
+    assert!(err.contains("--sample-rate <Hz>"), "{err}");
+
+    for (rate, sample) in [(30000.123, 660_000_000), (30000.123027, 660_000_001)] {
+        let p = NwbProvider::open_with(
+            fixture(name),
+            NwbOpenParams {
+                sample_rate: Some(rate),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(p.spike_times(ClusterId(0)), [SampleIndex(sample)]);
+    }
+}
+
+#[test]
+fn coarse_units_resolution_is_ignored_only_in_a_single_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let sorting = dir.path().join("coarse.nwb");
+    let raw = fixture("close_f64_rate_short.nwb");
+    std::fs::copy(&raw, &sorting).unwrap();
+    hdf5_metno::File::open_rw(&sorting)
+        .unwrap()
+        .dataset("/units/spike_times")
+        .unwrap()
+        .attr("resolution")
+        .unwrap()
+        .write_scalar(&1e-4_f64)
+        .unwrap();
+
+    let p = NwbProvider::open(&sorting).unwrap();
+    assert_eq!(p.sample_rate(), 30000.123_f32);
+    assert_eq!(p.spike_times(ClusterId(0)), [SampleIndex(100)]);
+
+    let err = NwbProvider::open_with(
+        &sorting,
+        NwbOpenParams {
+            raw_path: Some(&raw),
+            ..Default::default()
+        },
+    )
+    .err()
+    .expect("a paired sorting with an incompatible rate must be refused");
+    assert!(err.to_string().contains("NWB rate mismatch"), "{err:#}");
+}
+
+#[test]
+fn paired_rate_within_one_ppm_requires_mapping_agreement() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = dir.path().join("raw.nwb");
+    let sorting = fixture("close_f64_rate_long.nwb");
+    std::fs::copy(&sorting, &raw).unwrap();
+    hdf5_metno::File::open_rw(&raw)
+        .unwrap()
+        .dataset("/acquisition/ElectricalSeriesRaw/starting_time")
+        .unwrap()
+        .attr("rate")
+        .unwrap()
+        .write_scalar(&30000.125_f64) // ~0.067 ppm away, beyond f32 equality and the old f64 check.
+        .unwrap();
+
+    let open = |sample_rate| {
+        NwbProvider::open_with(
+            &sorting,
+            NwbOpenParams {
+                raw_path: Some(&raw),
+                sample_rate,
+                ..Default::default()
+            },
+        )
+    };
+    let err = open(None).err().expect("ambiguous clocks must be refused");
+    assert!(format!("{err:#}").contains("--sample-rate <Hz>"), "{err:#}");
+    let p = open(Some(30000.123)).unwrap();
+    assert_eq!(p.spike_times(ClusterId(0)), [SampleIndex(660_000_000)]);
+}
+
+#[test]
 fn paired_float32_rate_requires_clock_choice_and_seals_that_rate() {
     let raw = fixture("rounded_raw.nwb");
     let open = |sample_rate| {
