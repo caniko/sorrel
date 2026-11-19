@@ -202,16 +202,28 @@ Spike indices must fit
 inside the raw series. The files must have the same `timestamps_reference_time`;
 Sorrel does not infer an offset between files.
 
-The reader requires HDF5 support (`cargo build --features hdf5`) and a local
-HDF5 file with `/units`. One series is read per session; multi-segment stitching,
-NWB-Zarr and DANDI/HTTP streaming are not supported.
+The reader needs a local NWB with `/units`. HDF5 files require `cargo build
+--features hdf5`. One series is read per session; multi-segment stitching and
+DANDI/HTTP streaming are not supported.
 
 - Timestamps with float64 spacing greater than 0.01 samples are refused; if sampling was regular, rewrite the series with `starting_time` and `rate`.
 - With per-sample `timestamps`, each spike must map to a sample inside the series whose recorded timestamp is nearest to the spike time (ties are allowed). Sorrel refuses the file if the inferred grid disagrees.
-- The selected clock (`starting_time` with its `rate`, or `timestamps`) and `/units/id`, `/units/spike_times`, and `/units/spike_times_index` must be stored in their respective opened files. Every path component must be an HDF5 hard link; virtual datasets and external raw storage are refused. Open the file holding the data directly, or pass the recording file via `--dat`.
+- The selected clock (`starting_time` with its `rate`, or `timestamps`) and `/units/id`, `/units/spike_times`, and `/units/spike_times_index` must be stored in their respective opened files or stores. For HDF5, every path component must be a hard link; virtual datasets and external raw storage are refused. Open the file holding the data directly, or pass the recording file via `--dat`.
 
-The test fixtures in `release/fixtures/nwb/` are written by PyNWB
-(`generate.py` pins the version).
+**Zarr.** `sorrel open session.nwb.zarr` reads local NWB-Zarr v2 directories
+written by `NWBZarrIO`, including Blosc (default LZ4), zlib and gzip chunks. The
+`zarr` feature is on by default in `sorrel`. `--dat` can pair an HDF5 file with
+a Zarr store in either direction when both features are built. Rates in Zarr
+attributes are JSON numbers without a stored float width, so the float32 rate
+exception applies only to HDF5. External links and references are not followed;
+even same-store `zarr_link` aliases are refused for the clock and spike-mapping
+columns, like HDF5 soft links. Pickled columns are not decoded. Journals live
+next to the store. Its seal hashes metadata contents and the paths, sizes and
+modification times of chunk files, without reading trace chunks at open.
+An edit that deliberately preserves chunk size and mtime is not detected.
+
+The test fixtures in `release/fixtures/nwb/` are written by PyNWB and hdmf-zarr
+(`generate.py` pins both versions).
 
 ### Writing curated units to NWB
 

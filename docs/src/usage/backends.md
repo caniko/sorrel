@@ -11,6 +11,7 @@ Sorrel reads several sorting and recording formats. The general rule:
 | Sorting   | phy / Kilosort directory                                 | First-class. Reads phy artefacts as-is.                                                                                                                                                                       |
 | Sorting   | SpikeInterface `SortingAnalyzer` (binary folder)         | Reads `recording.json` (binary, or a channel- and sample-preserving preprocessing chain over binary), the flat sorting under `sorting/`, optional `probe.json`, and `extensions/quality_metrics/metrics.csv`. |
 | Sorting   | NWB (local HDF5)                                         | Requires `--features hdf5`. Reads `/units`, with or without a trace. `--nwb-series` selects an acquisition or processed series; `--dat` pairs a separate raw NWB. See [NWB](integrations.md#nwb).             |
+| Sorting   | NWB-Zarr (local Zarr v2 directory)                       | Default `zarr` feature. Same units and lazy trace reader as HDF5 NWB; `--dat` can mix storage formats. See [NWB](integrations.md#nwb).                                                                        |
 | Sorting   | Kilosort 4 `rez.mat`                                     | Requires `--features hdf5`. Reads `rez/st3`, `rez/ops/*`, `rez/xc`, `rez/yc`.                                                                                                                                 |
 | Recording | SpikeGLX (`*.bin` + `*.meta`)                            | Use as `--dat`; pass `--spikeglx-meta` for sample rate / channels / dtype.                                                                                                                                    |
 | Recording | Open Ephys binary (`continuous.dat` + `structure.oebin`) | Use as `--dat`; pass `--oebin` to inherit metadata.                                                                                                                                                           |
@@ -24,7 +25,8 @@ When `--backend` is not specified, the detector is run on the input path:
 2. File path `rez.mat` / `rez2.mat` → KS4 rez (HDF5).
 3. Directory containing `spike_times.npy` + `spike_clusters.npy` →
    phy / Kilosort.
-4. Directory containing `recording.json` (or `binary.json`) and a
+4. Directory ending in `.nwb.zarr` or with `nwb_version` in root `.zattrs` → NWB (Zarr).
+5. Directory containing `recording.json` (or `binary.json`) and a
    `sorting/` folder → SortingAnalyzer.
 
 If none match, Sorrel exits with a message listing what it looked for.
