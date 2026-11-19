@@ -1722,6 +1722,17 @@ fn remote_session_path(state: &Path, fingerprint: &[u8]) -> PathBuf {
 fn session_key(open: &OpenArgs, [root, dat]: [Option<PathBuf>; 2]) -> Result<String> {
     let mut args = open.clone();
     args.rebase(&std::env::current_dir()?);
+    #[cfg(feature = "dandi")]
+    let local_revision = match (is_remote(args.root()), args.dat.as_deref()) {
+        (true, Some(path)) if !is_remote(path) => Some(path),
+        (false, Some(path)) if is_remote(path) => Some(args.root()),
+        _ => None,
+    }
+    .map(|path| {
+        sorrel_io::NwbProvider::local_identity(path)
+            .with_context(|| format!("verify local NWB revision for {}", path.display()))
+    })
+    .transpose()?;
     // Discard is a one-shot action, not a property of the live session.
     args.discard_journal = false;
     // A file's name matters even through a symlink: it names its journal.
@@ -1759,6 +1770,13 @@ fn session_key(open: &OpenArgs, [root, dat]: [Option<PathBuf>; 2]) -> Result<Str
         *name = format!("/acquisition/{name}");
     }
     // ponytail: compare normalized flags without opening a provider to resolve implicit defaults.
+    #[cfg(feature = "dandi")]
+    if let Some(revision) = local_revision {
+        return Ok(format!(
+            "open-args-v1:{args:?}:local-nwb:{}",
+            blake3::hash(&revision)
+        ));
+    }
     Ok(format!("open-args-v1:{args:?}"))
 }
 
@@ -3263,7 +3281,8 @@ mod tests {
         }
         // A local units file still owns the same journal; a changed remote --dat is a conflict.
         let local = tempfile::tempdir()?;
-        open.root = Some(local.path().join("units.nwb"));
+        open.root = Some(local.path().join("units.nwb.zarr"));
+        std::fs::create_dir(open.root())?;
         let first = session_key(&open, [None, dat(b"one")])?;
         let tabs = || [(local.path(), Some(first.as_str()))].into_iter();
         let newer = Some(remote_session_path(
@@ -3273,6 +3292,48 @@ mod tests {
         let changed = session_key(&open, [None, newer])?;
         assert!(tab_target(&open, &changed, tabs()).is_err());
         assert_eq!(tab_target(&open, &first, tabs())?, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(all(feature = "dandi", feature = "hdf5"))]
+    fn mixed_session_reuse_checks_local_revision() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let local = dir.path().join("local.nwb");
+        let remote = PathBuf::from("dandi://dandi/000123/test/remote.nwb");
+        for (open, keys) in [
+            (
+                OpenArgs {
+                    root: Some(remote.clone()),
+                    dat: Some(local.clone()),
+                    ..Default::default()
+                },
+                [Some(PathBuf::from("pinned")), None],
+            ),
+            (
+                OpenArgs {
+                    root: Some(local.clone()),
+                    dat: Some(remote),
+                    ..Default::default()
+                },
+                [None, Some(PathBuf::from("pinned"))],
+            ),
+        ] {
+            std::fs::write(&local, b"old")?;
+            let before = session_key(&open, keys.clone())?;
+            assert_eq!(session_key(&open, keys.clone())?, before);
+
+            let replacement = dir.path().join("replacement.nwb");
+            std::fs::write(&replacement, b"new recording")?;
+            std::fs::rename(replacement, &local)?;
+            let after = session_key(&open, keys.clone())?;
+            let tabs = [(dir.path(), Some(before.as_str()))].into_iter();
+            assert!(!matches!(tab_target(&open, &after, tabs), Ok(Some(_))));
+            assert!(serve::check_session_reuse("host", Some(&before), &after, false).is_err());
+
+            std::fs::remove_file(&local)?;
+            assert!(session_key(&open, keys).is_err());
+        }
         Ok(())
     }
 

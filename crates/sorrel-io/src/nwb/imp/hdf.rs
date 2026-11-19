@@ -40,25 +40,19 @@ pub(super) fn sample_type(data: &hdf5::Dataset) -> Result<SampleType> {
     })
 }
 
-pub(super) fn identity(path: &Path) -> Vec<u8> {
+pub(super) fn identity(path: &Path, meta: &std::fs::Metadata) -> Result<Vec<u8>> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("missing UTF-8 NWB filename")?;
+    let modified = meta.modified()?.duration_since(std::time::UNIX_EPOCH)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"sorrel-provider-identity-v1/nwb");
-    hasher.update(
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("")
-            .as_bytes(),
-    );
-    if let Ok(meta) = std::fs::metadata(path) {
-        hasher.update(&meta.len().to_le_bytes());
-        if let Ok(modified) = meta.modified() {
-            if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
-                hasher.update(&duration.as_secs().to_le_bytes());
-                hasher.update(&duration.subsec_nanos().to_le_bytes());
-            }
-        }
-    }
-    hasher.finalize().as_bytes().to_vec()
+    hasher.update(name.as_bytes());
+    hasher.update(&meta.len().to_le_bytes());
+    hasher.update(&modified.as_secs().to_le_bytes());
+    hasher.update(&modified.subsec_nanos().to_le_bytes());
+    Ok(hasher.finalize().as_bytes().to_vec())
 }
 
 pub(super) fn read_str(data: &hdf5::Container) -> Result<String> {

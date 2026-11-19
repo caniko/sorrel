@@ -87,6 +87,12 @@ mod imp {
     }
 
     impl NwbProvider {
+        /// Compute the local storage revision used in the journal seal, without opening NWB data.
+        #[cfg(feature = "dandi")]
+        pub fn local_identity(path: &Path) -> Result<Vec<u8>> {
+            storage::local_identity(path)
+        }
+
         pub fn open(path: impl AsRef<Path>) -> Result<Self> {
             Self::open_with(path, NwbOpenParams::default())
         }
@@ -284,7 +290,7 @@ mod imp {
             let remote = remote_identity.is_some();
             let mut identity_bytes = match remote_identity {
                 Some(identity) => identity,
-                None => f.identity(path)?,
+                None => storage::local_identity(path)?,
             };
             if !(legacy_identity && same_mapping) {
                 if let Some((name, _)) = &series {
@@ -292,10 +298,10 @@ mod imp {
                 }
                 identity_bytes.push(0); // Terminate the path (empty for units-only).
                 identity_bytes.extend(rate.to_le_bytes());
-                if let Some(((raw, raw_identity), raw_path)) = raw.zip(params.raw_path) {
+                if let Some(((_, raw_identity), raw_path)) = raw.zip(params.raw_path) {
                     identity_bytes.extend(match raw_identity {
                         Some(identity) => identity,
-                        None => raw.identity(raw_path)?,
+                        None => storage::local_identity(raw_path)?,
                     });
                 }
             }
