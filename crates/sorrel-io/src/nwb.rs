@@ -45,7 +45,7 @@ mod imp {
         TraceSlice, UnitAnnotation,
     };
     use anyhow::{anyhow, ensure, Context, Result};
-    use specs::{core_series, legacy_is_series, legacy_type_parents, TypeSpecs};
+    use specs::{legacy_is_series, legacy_type_parents, TypeSpecs};
     use std::cmp::Reverse;
     use std::collections::{BinaryHeap, HashMap, VecDeque};
     use std::ops::Range;
@@ -438,7 +438,7 @@ mod imp {
             group: &Group,
             path: &str,
             depth: usize,
-            is_series: &impl Fn(Option<&str>, &str, &str) -> Result<bool>,
+            is_series: &impl Fn(&str, &str) -> Result<bool>,
             found: &mut Vec<(String, Group)>,
         ) -> Result<()> {
             for name in group.member_names()? {
@@ -451,12 +451,7 @@ mod imp {
                     .map(|a| a.string())
                     .transpose()?;
                 let is_series_node = if let Some(ty) = ty {
-                    let ns = child
-                        .optional_attr("namespace")?
-                        .map(|a| a.string())
-                        .transpose()
-                        .with_context(|| format!("invalid namespace on {path}"))?;
-                    is_series(ns.as_deref(), &ty, &path)?
+                    is_series(&ty, &path)?
                 } else {
                     false
                 };
@@ -470,19 +465,27 @@ mod imp {
             Ok(())
         }
 
-        let specs = std::cell::OnceCell::new();
-        let is_series = |ns: Option<&str>, ty: &str, path: &str| {
-            if let Some(answer) = ns.and_then(|ns| core_series(ns, ty)) {
-                return Ok(answer);
+        let requested_path = requested.map(|path| {
+            if path.starts_with('/') {
+                path.to_owned()
+            } else {
+                format!("/acquisition/{path}")
             }
+        });
+        let specs = std::cell::OnceCell::new();
+        let is_series = |ty: &str, path: &str| {
             let unavailable = || {
-                format!("cannot determine ElectricalSeries ancestry of {path} ({ns:?}, {ty:?}); readable same-file cached NWB specifications are required")
+                format!("cannot determine ElectricalSeries ancestry of {path} ({ty:?}); readable same-file cached NWB specifications are required")
             };
             let specs = specs.get_or_init(|| TypeSpecs::read(f));
             let specs = specs
                 .as_ref()
                 .map_err(|err| anyhow!("{}: {err:#}", unavailable()))?;
-            specs.is_series(ns, ty).with_context(unavailable)
+            // Ambiguous processing groups aren't candidates unless explicitly
+            // requested, in which case a conflict must be reported.
+            let refuse_conflicts =
+                path.starts_with("/acquisition/") || requested_path.as_deref() == Some(path);
+            specs.is_series(ty, refuse_conflicts)
         };
         let mut found = Vec::new();
         for (root, depth) in [("/acquisition", 0), ("/processing", 32)] {
@@ -511,17 +514,17 @@ mod imp {
                     .join(", ")
             }
         };
-        let index = if let Some(requested) = requested {
-            let path = if requested.starts_with('/') {
-                requested.to_owned()
-            } else {
-                format!("/acquisition/{requested}")
-            };
-            if let Some(index) = found.iter().position(|(name, _)| *name == path) {
+        let index = if let Some(path) = &requested_path {
+            if let Some(index) = found.iter().position(|(name, _)| name == path) {
                 index
             } else {
                 // A selected path outside the discovery walk can still contain a link.
-                f.optional_group(&path)?;
+                if let Some(group) = f.optional_group(path)? {
+                    if let Some(ty) = group.optional_attr("neurodata_type")? {
+                        is_series(&ty.string()?, path)?;
+                    }
+                }
+                let requested = requested.unwrap_or(path);
                 anyhow::bail!(
                     "no ElectricalSeries matching {requested:?}; available series: {}",
                     available()

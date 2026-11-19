@@ -152,14 +152,9 @@ fn electrical_series_subtypes_are_accepted() {
     }
 }
 
-#[test]
-fn extension_lfp_uses_the_recording_clock() {
+fn check_custom_extension_spec(ty: &str, spec: &str, check: impl Fn(anyhow::Result<NwbProvider>)) {
     const SERIES: &str = "acquisition/TestSeriesRaw";
     const CACHE: &str = "specifications/ndx-sorrel-test/0.1.0/ndx-sorrel-test.extensions";
-    const SPEC: &str =
-        r#"{"groups":[{"neurodata_type_def":"LFP","neurodata_type_inc":"ElectricalSeries"}]}"#;
-    // Rename the fixture's extension type to LFP. The core cache still
-    // defines its own LFP, which is not an ElectricalSeries.
     for format in FORMATS {
         let dir = tempfile::tempdir().unwrap();
         let src = format.fixture("subtype.nwb");
@@ -174,11 +169,11 @@ fn extension_lfp_uses_the_recording_clock() {
                     .unwrap()
                     .attr("neurodata_type")
                     .unwrap()
-                    .write_scalar(&"LFP".parse::<VarLenUnicode>().unwrap())
+                    .write_scalar(&ty.parse::<VarLenUnicode>().unwrap())
                     .unwrap();
                 f.dataset(CACHE)
                     .unwrap()
-                    .write_scalar(&SPEC.parse::<VarLenUnicode>().unwrap())
+                    .write_scalar(&spec.parse::<VarLenUnicode>().unwrap())
                     .unwrap();
             }
             #[cfg(feature = "zarr")]
@@ -187,22 +182,67 @@ fn extension_lfp_uses_the_recording_clock() {
                 let attrs = path.join(SERIES).join(".zattrs");
                 let mut tags: serde_json::Value =
                     serde_json::from_slice(&std::fs::read(&attrs).unwrap()).unwrap();
-                tags["neurodata_type"] = "LFP".into();
+                tags["neurodata_type"] = ty.into();
                 std::fs::write(attrs, tags.to_string()).unwrap();
-                let chunk = serde_json::json!([SPEC, "|O", [1]]);
+                let chunk = serde_json::json!([spec, "|O", [1]]);
                 std::fs::write(path.join(CACHE).join("0"), chunk.to_string()).unwrap();
             }
         }
-        let p = NwbProvider::open_with(
+        check(NwbProvider::open_with(
             &path,
             NwbOpenParams {
                 sample_rate: Some(1000.0), // The units-only fallback would also succeed.
                 ..Default::default()
             },
-        )
-        .unwrap();
-        assert_eq!(p.spike_times(ClusterId(2))[0], SampleIndex(50));
+        ));
     }
+}
+
+#[test]
+fn conflicting_cached_parents_refuse_to_choose_a_clock() {
+    for (ty, spec, conflict) in [
+        // A local LFP extends ElectricalSeries, but core's LFP does not.
+        (
+            "LFP",
+            r#"{"groups":[{"neurodata_type_def":"LFP","neurodata_type_inc":"ElectricalSeries"}]}"#,
+            "LFP is defined with conflicting parents ElectricalSeries, NWBDataInterface",
+        ),
+        // A conflicting parent can occur further up the walk.
+        (
+            "RawDerived",
+            r#"{"groups":[{"neurodata_type_def":"RawDerived","neurodata_type_inc":"ElectricalSeries"},{"neurodata_type_def":"ElectricalSeries","neurodata_type_inc":"NWBDataInterface"}]}"#,
+            "ElectricalSeries is defined with conflicting parents NWBDataInterface, TimeSeries",
+        ),
+        // Even the built-in series name itself must check for conflicts.
+        (
+            "ElectricalSeries",
+            r#"{"groups":[{"neurodata_type_def":"ElectricalSeries","neurodata_type_inc":"NWBDataInterface"}]}"#,
+            "ElectricalSeries is defined with conflicting parents NWBDataInterface, TimeSeries",
+        ),
+    ] {
+        check_custom_extension_spec(ty, spec, |result| {
+            let err = result.err().expect("ambiguous ancestry must be refused");
+            assert_eq!(
+                err.to_string(),
+                format!("NWB type {conflict} in the cached specifications; Sorrel cannot tell which applies")
+            );
+        });
+    }
+}
+
+#[test]
+fn duplicate_parents_and_unused_conflicts_do_not_change_the_clock() {
+    let spec = r#"{"groups":[
+        {"neurodata_type_def":"ElectricalSeries","neurodata_type_inc":"TimeSeries"},
+        {"neurodata_type_def":"RawDerived","neurodata_type_inc":"ElectricalSeries"},
+        {"neurodata_type_def":"LFP","neurodata_type_inc":"ElectricalSeries"}
+    ]}"#;
+    check_custom_extension_spec("RawDerived", spec, |result| {
+        assert_eq!(
+            result.unwrap().spike_times(ClusterId(2))[0],
+            SampleIndex(50)
+        );
+    });
 }
 
 #[test]
