@@ -164,8 +164,10 @@ What Sorrel reads:
 - **Time base.** Spike times on the NWB session clock become sample indices as
   `round((t - starting_time) × rate)`. With per-sample `timestamps`, the first
   timestamp gives the start and the end-to-end mean interval gives the rate.
-  Timestamps must strictly increase and stay within 0.25 samples of the
-  inferred grid. Irregular timestamps are refused.
+  Timestamps must strictly increase and stay within 0.001 samples of the
+  inferred grid, plus four floating-point steps at the largest absolute
+  timestamp (converted to samples) to allow for rounding at large clock origins.
+  Irregular timestamps are refused.
   NWB trials used as events are shifted by the same start time; CSV/NPY event
   times are already relative to the recording.
 - **Sample types.** int8, uint8, int16, uint16, int32, uint32, int64, float32

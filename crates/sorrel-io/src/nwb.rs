@@ -666,18 +666,33 @@ mod imp {
         let period = (last - t0) / (n - 1) as f64;
         let rate =
             checked_rate(period.recip()).context("irregular timestamps: invalid mean interval")?;
+        let scale = t0.abs().max(last.abs());
+        let ulp = if scale == f64::MAX {
+            scale - scale.next_down()
+        } else {
+            scale.next_up() - scale
+        };
+        // The grid interpolates two rounded endpoints. Allow a few ulps
+        // for their error, each rounded timestamp, and the arithmetic.
+        let limit = 1e-3 + 4.0 * ulp * rate;
+        let (mut max_drift, mut worst_sample) = (0.0, 0);
         let mut prev = t0;
         for start in (1..n).step_by(BLOCK) {
             let times = ds.read_slice_1d::<f64, _>(start..start.saturating_add(BLOCK).min(n))?;
             for (i, &t) in times.iter().enumerate() {
                 let sample = start + i;
                 let step = t - prev;
-                let drift = (t - t0) / period - sample as f64;
-                ensure!(step.is_finite() && step > 0.0 && drift.abs() <= 0.25,
-                    "irregular timestamps at sample {sample}: interval {step} s, deviation {drift} samples (limit 0.25)");
+                ensure!(step.is_finite() && step > 0.0,
+                    "irregular timestamps at sample {sample}: interval {step} s; timestamps must strictly increase");
+                let drift = ((t - t0) / period - sample as f64).abs();
+                if drift > max_drift {
+                    (max_drift, worst_sample) = (drift, sample);
+                }
                 prev = t;
             }
         }
+        ensure!(max_drift <= limit,
+            "irregular timestamps at sample {worst_sample}: max deviation {max_drift:.6} samples from the inferred grid (limit {limit:.6})");
         Ok((rate, t0))
     }
 
@@ -1122,6 +1137,22 @@ mod imp {
             eager[290 * 4..]
         );
         assert!(p.trace(SampleIndex(u64::MAX), 1).samples.is_empty());
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn timestamp_validation_rejects_subsample_jitter() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = H5File::create(dir.path().join("timestamps.h5")).unwrap();
+        // Alternating 0.8/1.2 ms intervals on a nominal 1 kHz grid.
+        let times = [0.5, 0.5008, 0.502, 0.5028, 0.504];
+        let ds = file
+            .new_dataset_builder()
+            .with_data(&times)
+            .create("timestamps")
+            .unwrap();
+        let err = regular_timestamps(&ds, times.len()).unwrap_err();
+        assert!(err.to_string().contains("max deviation 0.200000 samples"));
     }
 
     #[cfg(test)]
