@@ -33,6 +33,11 @@ The ARM64 Target smoke runs `release/smoke-windows.ps1 -SkipWheel`. It covers
 DX12 but not Vulkan, because the pinned lavapipe is x64-only; the x64 run
 covers both.
 
+The CLI in every archive, installer and wheel bundles static HDF5 with
+gzip/deflate and LZF. It does not need a system HDF5 library. See the
+[bundled library notices](crates/sorrel/THIRD-PARTY-HDF5.txt). The wheel's
+Python `Session.open()` still supports phy and SortingAnalyzer only.
+
 Regenerate these workflows with simit, never by hand:
 
 ```sh

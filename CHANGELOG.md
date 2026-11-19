@@ -35,6 +35,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **Python tests in CI.** A `python` target smoke installs the Linux release wheel with the new extras and runs `crates/sorrel-py/python/tests`. That covers the NWB export, the NeuroConv interface and the SpikeInterface `apply_curation` round trip.
 - **Native Windows on ARM release.** Each release now includes `sorrel-<VERSION>-aarch64-windows.zip` (plus standalone `.exe` and `-gui.exe` assets), built for `aarch64-pc-windows-gnullvm`, and winget serves it to ARM64 machines. Smoke-tested on a `windows-11-arm` runner (DX12; Vulkan on ARM64 is untested because the pinned lavapipe is x64-only) without the wheel step; Chocolatey and the Python wheel stay x64.
 
+- **NWB and Kilosort 4 `rez.mat` support ships by default.** Release binaries (including the CLI in the Python wheel), Cargo installs, and the default Nix package bundle HDF5 with gzip/deflate and LZF. The separate `sorrelHdf5` package is no longer needed.
+
 ### Fixed
 
 - **SortingAnalyzer unit ids.** SpikeInterface 0.101+ binary folders keep the unit ids in `sorting/numpysorting_info.json`, often as strings. Sorrel used to number those units densely and write integers, so `apply_curation` refused the `curation.json` whenever the ids were not `0..n-1` integers. Sorrel now reads the real ids and writes them back verbatim, including strings that are not integers (`"007"`, `"unit_a"`). New ids skip every id that reads as a number, and the NWB Units table keeps non-integer ids in a `unit_name` column.
@@ -43,7 +45,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **SortingAnalyzers on a SpikeInterface binary folder open.** An analyzer whose recording came from `rec.save(folder=...)` (a `BinaryFolderRecording`) failed with "missing sampling_frequency". Sorrel now follows `folder_path` to that folder's `binary.json`, and through preprocessing chains that keep every channel and sample (filters, common reference, whitening, phase shift, scaling) to their binary source, without re-applying the chain. Slicing, resampling and other classes fail with an error that names the class; Zarr analyzers and recordings fail with the SpikeInterface call that converts them.
 - **NWB export keeps a caller's `was_generated_by`** when it was passed as a tuple.
 - **`saving.md` round-trip example** passed a path to `apply_curation`, which only takes a dict; it now uses `sorrel.read_curation`.
-- **NWB reader keeps NWB's identities and units** (`--features hdf5`). Tested against PyNWB-written fixtures in `release/fixtures/nwb/`, and now built and tested in CI (`checks.sorrel-hdf5`, `checks.hdf5-tests`).
+- **NWB reader keeps NWB's identities and units.** Tested against PyNWB-written fixtures in `release/fixtures/nwb/` (`checks.hdf5-tests`).
   - Unit ids come from `/units/id`; a table with ids `5, 7, 9` was reported to `curation.json` and MCP evidence as `0, 1, 2`.
   - Spike times are taken relative to the series' `starting_time`; they were offset by it.
   - Data columns map to electrodes through the series' `electrodes` region, giving channel ids and `rel_x`/`rel_y` positions. The first N table rows were paired with the N columns, and brain `x`/`y` stood in for probe geometry.

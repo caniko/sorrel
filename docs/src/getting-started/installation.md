@@ -19,15 +19,15 @@ The binary is written to `target/release/sorrel`. A second binary,
 `sorrelw`, is the console-free launcher for Windows (see [Windows](#windows)). Shell completions come from
 `sorrel completions <shell>`; see the [CLI reference](cli.md#completions).
 
-To enable the HDF5-backed readers (NWB, KS4 `rez.mat`):
-
-```bash
-cargo build --release -p sorrel --features hdf5
-```
+NWB and Kilosort 4 `rez.mat` readers are included by default, including in
+release binaries and the `sorrel` executable shipped in the Python wheel.
+Building from source requires a C compiler and CMake 3.26 or newer to build
+the bundled HDF5 library; no system HDF5 installation is needed.
 
 Full phy export (`sorrel export-phy`, the `export_phy` MCP tool, the
 **Export phy** button and `Session.export_phy` in `sorrel-py`) is the
-`phy-export` feature, on by default. Leave it out with:
+`phy-export` feature, on by default. To build the CLI without both HDF5 and
+phy export, use:
 
 ```bash
 cargo build --release -p sorrel --no-default-features
@@ -158,8 +158,7 @@ Vulkan on ARM64 is untested.
 ## With Nix
 
 ```bash
-nix build .#sorrel        # default build, no HDF5
-nix build .#sorrelHdf5    # with HDF5 features
+nix build .#sorrel        # includes HDF5
 ```
 
 `nix build` builds the default `sorrel` package. The flake also exposes:
@@ -183,8 +182,6 @@ Add the flake as an input and enable the module:
   # in your Home Manager configuration:
   imports = [inputs.sorrel.homeManagerModules.default];
   programs.sorrel.enable = true;
-  # NWB/HDF5 support:
-  # programs.sorrel.package = inputs.sorrel.packages.${system}.sorrelHdf5;
 }
 ```
 
