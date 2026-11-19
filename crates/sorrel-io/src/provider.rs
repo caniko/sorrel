@@ -436,6 +436,10 @@ pub trait DataProvider: Send + Sync + 'static {
     type Label: Copy + Debug + Default + Send + Sync + 'static;
 
     fn sample_rate(&self) -> f32;
+    /// The recording's sample rate before rounding to the internal f32 time base.
+    fn exact_sample_rate(&self) -> anyhow::Result<f64> {
+        Ok(f64::from(self.sample_rate()))
+    }
     fn n_channels(&self) -> u32;
     fn n_samples(&self) -> SampleIndex;
     fn n_clusters(&self) -> u32;

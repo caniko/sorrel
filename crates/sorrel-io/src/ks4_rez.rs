@@ -54,7 +54,7 @@ mod imp {
     use std::path::{Path, PathBuf};
 
     pub struct Ks4RezProvider {
-        sample_rate: f32,
+        sample_rate: f64,
         n_channels: u32,
         n_samples: SampleIndex,
         spikes_per_cluster: Vec<Vec<SampleIndex>>,
@@ -87,8 +87,8 @@ mod imp {
             let rez = f.group("rez").context("missing /rez group")?;
             let ops = rez.group("ops").context("missing /rez/ops")?;
 
-            let sample_rate: f32 = read_scalar_f32(&ops, "fs")?;
-            let n_channels: u32 = read_scalar_f32(&ops, "Nchan")? as u32;
+            let sample_rate = read_number(&ops, "fs")?;
+            let n_channels = read_number(&ops, "Nchan")? as u32;
 
             // st3: shape stored as (cols, rows) by MATLAB. We want a contiguous
             // (n_spikes, n_cols) flat array.
@@ -219,7 +219,10 @@ mod imp {
         type Label = PhyLabel;
 
         fn sample_rate(&self) -> f32 {
-            self.sample_rate
+            self.sample_rate as f32
+        }
+        fn exact_sample_rate(&self) -> Result<f64> {
+            Ok(self.sample_rate)
         }
         fn n_channels(&self) -> u32 {
             self.n_channels
@@ -281,23 +284,15 @@ mod imp {
         }
     }
 
-    fn read_scalar_f32(g: &hdf5::Group, name: &str) -> Result<f32> {
+    fn read_number(g: &hdf5::Group, name: &str) -> Result<f64> {
         let ds = g
             .dataset(name)
             .with_context(|| format!("missing /rez/ops/{name}"))?;
-        if let Ok(v) = ds.read_scalar::<f32>() {
-            return Ok(v);
-        }
         if let Ok(v) = ds.read_scalar::<f64>() {
-            return Ok(v as f32);
+            return Ok(v);
         }
         // KS4 stores most numeric scalars as 1-element arrays.
         if let Ok(v) = ds.read_raw::<f64>() {
-            if let Some(x) = v.first() {
-                return Ok(*x as f32);
-            }
-        }
-        if let Ok(v) = ds.read_raw::<f32>() {
             if let Some(x) = v.first() {
                 return Ok(*x);
             }

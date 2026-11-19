@@ -43,6 +43,8 @@ zarrs = { version = "0.22.10", optional = true, default-features = false, featur
   "zlib",
 ] }
 jiff = { version = "0.2", default-features = false, optional = true }
+tempfile = { workspace = true, optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
 ureq = { version = "3.3", default-features = false, features = [
   "rustls",
 ], optional = true }
@@ -56,7 +58,14 @@ cc = { version = "1", optional = true }
 
 [features]
 default = []
-hdf5 = ["dep:hdf5-metno", "dep:hdf5-metno-sys", "dep:jiff"]
+hdf5 = [
+  "dep:hdf5-metno",
+  "dep:hdf5-metno-sys",
+  "dep:jiff",
+  "jiff/std",
+  "dep:tempfile",
+  "dep:uuid",
+]
 dandi = [
   "zarr",
   "dep:cc",

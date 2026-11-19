@@ -3,7 +3,9 @@
 Expected values come from the fixture's .npy files and the edits below,
 never from sorrel. Run with the test dependencies (see crates/sorrel-py/README.md).
 """
+import os
 import shutil
+import subprocess
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -206,3 +208,89 @@ def test_keeps_callers_was_generated_by(curated: Path) -> None:
     add_units_to_nwbfile(curated, nwb)
     assert [tuple(e) for e in nwb.was_generated_by] == [("acq", "1.0"),
                                                         ("sorrel-ephys", sorrel.__version__)]
+
+
+@pytest.fixture
+def native_cli():
+    binary = os.environ.get("SORREL_NWB_BIN")
+    if binary is None:
+        pytest.skip("set SORREL_NWB_BIN to the sorrel binary built with --features hdf5")
+    return binary
+
+
+@pytest.mark.parametrize("append", [False, True], ids=["new", "append"])
+def test_native_units_match_python(curated: Path, tmp_path: Path, native_cli, append: bool):
+    native = tmp_path / "native.nwb"
+    python = tmp_path / "python.nwb"
+    write_direct(curated, python)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    if append:
+        nwb = NWBFile("existing", "existing", start, subject=Subject(**SUBJECT),
+                      was_generated_by=[["acquisition", "1.0"]])
+        with NWBHDF5IO(native, "w") as io:
+            io.write(nwb)
+        args = ["--into", native]
+    else:
+        args = ["--out", native, "--session-start-time", start.isoformat(),
+                "--identifier", "native", "--session-description", "tiny"]
+    cmd = [native_cli, "export-nwb", curated, *args, "--starting-time", str(START)]
+    subprocess.run(cmd, check=True)
+    assert not validate(path=native)
+    with NWBHDF5IO(native, "r") as actual, NWBHDF5IO(python, "r") as expected:
+        dest, src = actual.read(), expected.read()
+        got, want = dest.units, src.units
+        assert got.colnames == want.colnames
+        assert got.resolution == want.resolution == 1 / RATE
+        assert got.description == want.description
+        np.testing.assert_array_equal(got.id[:], want.id[:])
+        for name in want.colnames:
+            for row in range(len(want)):
+                np.testing.assert_array_equal(got[name][row], want[name][row])
+        assert [tuple(x) for x in dest.was_generated_by] == (
+            ([("acquisition", "1.0")] if append else []) + [tuple(x) for x in src.was_generated_by]
+        )
+        if not append:
+            assert dest.identifier == "native"
+            assert dest.session_start_time == start
+            assert len(dest.electrodes) == 4
+            assert all(g.device.name == "probe" for g in dest.electrodes["group"][:])
+            assert not dest.acquisition
+
+    messages = list(inspect_nwbfile(nwbfile_path=native, config=load_config("dandi")))
+    for m in messages:
+        print(m.importance.name, m.check_function_name, m.location, m.message)
+    # Standalone sort exports deliberately don't invent subject metadata.
+    assert not [m for m in messages if m.importance in (Importance.CRITICAL,
+                                                       Importance.BEST_PRACTICE_VIOLATION)
+                and (append or m.check_function_name != "check_subject_exists")]
+    before = native.read_bytes()
+    result = subprocess.run(cmd, text=True, capture_output=True)
+    assert result.returncode != 0
+    assert ("already has /units" if append else "already exists") in result.stderr
+    assert native.read_bytes() == before
+
+
+def test_native_export_from_nwb(tmp_path: Path, native_cli):
+    source = tmp_path / "input.nwb"
+    shutil.copyfile(FIXTURE.parent / "nwb" / "good.nwb", source)
+    before = source.read_bytes()
+    refused = subprocess.run([native_cli, "export-nwb", source, "--in-place"],
+                             text=True, capture_output=True)
+    assert refused.returncode != 0
+    assert "already has /units" in refused.stderr
+
+    out = tmp_path / "sort.nwb"
+    subprocess.run([native_cli, "export-nwb", source, "--out", out], check=True)
+    assert source.read_bytes() == before
+    assert not validate(path=out)
+    with NWBHDF5IO(source, "r") as original, NWBHDF5IO(out, "r") as exported:
+        src, dest = original.read(), exported.read()
+        assert dest.identifier == src.identifier
+        assert dest.session_description == src.session_description
+        assert dest.session_start_time == src.session_start_time
+        assert dest.timestamps_reference_time == src.timestamps_reference_time
+        assert dest.units.resolution == 0.001
+        np.testing.assert_array_equal(dest.units.id[:], [5, 9])
+        np.testing.assert_allclose(dest.units["spike_times"][0], src.units["spike_times"][0])
+        np.testing.assert_allclose(dest.units["spike_times"][1], src.units["spike_times"][2])
+        np.testing.assert_array_equal(dest.electrodes.id[:], [13, 10, 15, 11])
