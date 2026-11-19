@@ -7,6 +7,22 @@ use sorrel_io::{ClusterId, NwbProvider};
 use std::path::PathBuf;
 
 #[test]
+#[cfg(feature = "phy-export")]
+fn nwb_phy_export_refuses_zero_channels_before_writing() {
+    let p = NwbProvider::open(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../release/fixtures/nwb/curated_units.nwb"),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let s = Session::new(p, Journal::open(&dir.path().join("j.sqlite")).unwrap());
+    let out = dir.path().join("phy");
+    let err = sorrel_data::export_phy(&s, &out, false, |l| l.as_str()).unwrap_err();
+    assert!(err.to_string().contains("--dat"), "{err:#}");
+    assert!(!out.exists());
+}
+
+#[test]
 fn curation_json_uses_nwb_unit_ids() {
     let p = NwbProvider::open(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../release/fixtures/nwb/good.nwb"),

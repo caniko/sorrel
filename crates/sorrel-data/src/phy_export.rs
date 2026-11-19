@@ -59,6 +59,10 @@ where
     F: Fn(&P::Label) -> &'static str,
 {
     let provider = &session.provider;
+    ensure!(
+        provider.n_channels() > 0,
+        "cannot export phy without channels; for a units-only NWB, pair a raw NWB with --dat"
+    );
     std::fs::create_dir_all(out).with_context(|| format!("create {}", out.display()))?;
     let raw = provider.raw_file();
     let stream = provider.n_samples().0 > 0 && (copy_raw || raw.is_none());
