@@ -47,7 +47,8 @@ mod imp {
         pub series: Option<&'a str>,
         /// Read the ElectricalSeries from this file instead of the units file.
         pub raw_path: Option<&'a Path>,
-        /// Sampling rate (Hz) when the units file lacks its own time base.
+        /// Sampling rate (Hz) for units without a time base, or to choose a
+        /// rate matching a series' stored float32 rate at float32 precision.
         pub sample_rate: Option<f64>,
     }
 
@@ -83,22 +84,19 @@ mod imp {
             let recording = raw.as_ref().unwrap_or(&f);
             let series = find_electrical_series(recording, params.series, raw.is_some())?;
             let units_rate = if raw.is_some() || series.is_none() {
-                let rate = read_units_rate(&spike_times)?;
-                if let (Some(declared), Some(explicit)) = (rate, params.sample_rate) {
-                    check_matching_rate(
-                        "--sample-rate",
-                        explicit,
-                        "/units/spike_times resolution",
-                        declared,
-                        false,
-                    )?;
-                }
-                rate.or(params.sample_rate).map(checked_rate).transpose()?
+                read_units_rate(&spike_times)?
             } else {
                 None
             };
+            let check_explicit = |name: &str, rate, float32| -> Result<()> {
+                if let Some(explicit) = params.sample_rate {
+                    check_matching_rate("--sample-rate", explicit, name, rate, float32)?;
+                }
+                Ok(())
+            };
 
-            let mut legacy_rate = None;
+            let mut legacy_identity = false;
+            let mut comparison_rate = None;
             let (trace, rate, t0, (channel_map, channel_positions), timestamps) = if let Some((
                 name,
                 series,
@@ -109,40 +107,53 @@ mod imp {
                 let (n_samples, n_channels) = (shape[0], shape.get(1).copied().unwrap_or(1));
                 let (stored_rate, t0, float32_rate, timestamps) =
                     read_time_base(recording, series, name, n_samples)?;
-                let required_rate = units_rate.or(params.sample_rate);
-                // With a same-file clock, resolution is a precision hint, not
-                // necessarily a declaration of the recording's sample period.
-                let expected = required_rate.or_else(|| {
-                    if raw.is_none() && float32_rate {
-                        read_units_rate(&spike_times).ok().flatten()
-                    } else {
-                        None
-                    }
-                });
-                let rate = if let Some(expected) = expected {
-                    match check_matching_rate(
+                if let Some(declared) = units_rate {
+                    check_matching_rate(
                         "sorting sample rate",
-                        expected,
+                        declared,
                         name,
                         stored_rate,
                         float32_rate,
-                    ) {
-                        Ok(()) if float32_rate => expected,
-                        Err(err) if required_rate.is_some() => return Err(err),
-                        _ => stored_rate,
+                    )?;
+                }
+                if let Some(declared) = units_rate.filter(|_| !float32_rate) {
+                    check_explicit("/units/spike_times resolution", declared, false)?;
+                } else {
+                    check_explicit(name, stored_rate, float32_rate)?;
+                }
+                legacy_identity =
+                    raw.is_none() && timestamps.is_none() && is_trunk_series(&f, name);
+                let rate = if float32_rate {
+                    if let Some(explicit) = params.sample_rate {
+                        comparison_rate =
+                            (legacy_identity && explicit != stored_rate).then_some(stored_rate);
+                        explicit
+                    } else {
+                        // Units resolution may describe a different clock. A
+                        // matching float32 rate only helps if the samples agree.
+                        let declared = if raw.is_some() {
+                            units_rate
+                        } else {
+                            read_units_rate(&spike_times).ok().flatten()
+                        };
+                        comparison_rate = declared.filter(|&rate| {
+                            rate != stored_rate && rate as f32 == stored_rate as f32
+                        });
+                        stored_rate
                     }
                 } else {
                     stored_rate
                 };
                 let channels = read_channels(recording, series, name, n_channels)?;
                 let trace = NwbTrace::new(series, data, name, n_samples, n_channels)?;
-                legacy_rate = (raw.is_none() && timestamps.is_none() && is_trunk_series(&f, name))
-                    .then_some(stored_rate);
                 (Some(trace), rate, t0, channels, timestamps)
             } else {
+                if let Some(declared) = units_rate {
+                    check_explicit("/units/spike_times resolution", declared, false)?;
+                }
                 (
                         None,
-                        units_rate.context(
+                        units_rate.or(params.sample_rate).map(checked_rate).transpose()?.context(
                             "no ElectricalSeries time base in the sorting NWB and no /units/spike_times resolution; pass --sample-rate HZ",
                         )?,
                         0.0,
@@ -159,14 +170,15 @@ mod imp {
                     "NWB timestamps_reference_time mismatch: sorting NWB uses {units_epoch}, paired raw NWB uses {raw_epoch}");
             }
             let n_samples = trace.as_ref().map_or(0, |t| t.n_samples);
-            let (spikes_per_cluster, unit_ids, legacy_identity) = load_units(
+            let require_agreement = params.sample_rate.is_none();
+            let (spikes_per_cluster, unit_ids, same_mapping) = load_units(
                 &ids,
                 &spike_times,
                 &spike_times_index,
                 rate,
                 t0,
                 timestamps.as_ref().map(|ds| (ds, n_samples)),
-                legacy_rate,
+                comparison_rate.map(|other_rate| (other_rate, require_agreement)),
             )
             .context("load /units")?;
             if raw.is_some() {
@@ -174,7 +186,7 @@ mod imp {
                     "spike times extend past the paired ElectricalSeries (starting time {t0} s, {n_samples} samples at {rate} Hz)");
             }
             let mut identity_bytes = provider_identity_bytes(path);
-            if !legacy_identity {
+            if !(legacy_identity && same_mapping) {
                 if let Some((name, _)) = &series {
                     identity_bytes.extend_from_slice(name.as_bytes());
                 }
@@ -1064,7 +1076,8 @@ mod imp {
     }
 
     /// Spike sample indices per unit (relative to `t0`), unit ids, and
-    /// whether the spike mapping still qualifies for the legacy seal.
+    /// whether the mapping agrees with the optional comparison rate. Any
+    /// disagreement is an error when there is no explicit clock choice.
     fn load_units(
         ids: &hdf5::Dataset,
         spike_times: &hdf5::Dataset,
@@ -1072,7 +1085,7 @@ mod imp {
         rate: f64,
         t0: f64,
         timestamps: Option<(&hdf5::Dataset, usize)>,
-        mut legacy_rate: Option<f64>,
+        mut comparison: Option<(f64, bool)>,
     ) -> Result<(Vec<Vec<SampleIndex>>, Vec<u32>, bool)> {
         let ids: Vec<i64> = ids.read_raw()?;
         let mut all: Vec<f64> = spike_times.read_raw()?;
@@ -1094,6 +1107,8 @@ mod imp {
 
         let mut out = Vec::with_capacity(ends.len());
         let mut start = 0usize;
+        let mut n_differing = 0;
+        let mut first_difference = None;
         for (&end, &id) in ends.iter().zip(&unit_ids) {
             let end = usize::try_from(end)
                 .ok()
@@ -1105,14 +1120,24 @@ mod imp {
             }
             let mut bucket = times
                 .iter()
-                .map(|&t| {
+                .enumerate()
+                .map(|(spike, &t)| {
                     let relative = t - t0;
                     let s = (relative * rate).round();
                     ensure!(s.is_finite() && (0.0..u64::MAX as f64).contains(&s)
                         && timestamps.is_none_or(|(_, n_samples)| (s as u64) < n_samples as u64),
                         "unit {id}: spike at {t} s is outside the sample index range (starting time {t0} s, {rate} Hz)");
-                    if legacy_rate.is_some_and(|stored| stored != rate && (relative * stored).round() != s) {
-                        legacy_rate = None;
+                    if let Some((other_rate, require_agreement)) = comparison {
+                        let other = (relative * other_rate).round();
+                        if other != s {
+                            n_differing += 1;
+                            if require_agreement {
+                                first_difference.get_or_insert((other_rate, id, spike, t, s, other));
+                            } else {
+                                // One changed sample already rules out the legacy seal.
+                                comparison = None;
+                            }
+                        }
                     }
                     Ok(SampleIndex::new(s as u64))
                 })
@@ -1126,7 +1151,13 @@ mod imp {
         if let Some((ds, n_samples)) = timestamps {
             check_timestamp_spikes(ds, n_samples, &all, &unit_ids, &out)?;
         }
-        Ok((out, unit_ids, legacy_rate.is_some()))
+        if let Some((units_rate, id, spike, t, stored, precise)) = first_difference {
+            let noun = if n_differing == 1 { "spike" } else { "spikes" };
+            anyhow::bail!(
+                "Ambiguous NWB sample rate: stored series rate {rate} Hz and Units resolution rate {units_rate} Hz map {n_differing} {noun} to different samples (first: unit {id} spike {spike} at {t} s, sample indices {stored} vs {precise}, respectively); pass --sample-rate <Hz> to choose which clock applies"
+            );
+        }
+        Ok((out, unit_ids, n_differing == 0))
     }
 
     fn check_timestamp_spikes(

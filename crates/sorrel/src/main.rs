@@ -458,7 +458,7 @@ struct OpenArgs {
     /// Raw recording (overrides params.py:dat_path, or pairs NWB units with a raw NWB)
     #[arg(long, value_name = "PATH")]
     dat: Option<PathBuf>,
-    /// Overrides params.py:sample_rate, or provides the rate for NWB units without resolution
+    /// Overrides params.py:sample_rate, or supplies the rate for NWB units without a clock or with ambiguous clocks
     #[arg(long, value_name = "Hz")]
     sample_rate: Option<f64>,
     /// NWB ElectricalSeries name under /acquisition or absolute HDF5 path

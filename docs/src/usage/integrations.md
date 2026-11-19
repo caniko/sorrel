@@ -163,10 +163,12 @@ What Sorrel reads:
   conflicting options are refused rather than silently ignored.
 - **Time base.** Spike times on the NWB session clock become sample indices as
   `round((t - starting_time) × rate)`. If `starting_time.rate` is stored as
-  float32, Sorrel uses the more precise `1 / spike_times.resolution` when it
-  rounds to the same float32 rate, whether the Units table and series are in
-  one file or two. In a single file, an explicit `--sample-rate` takes
-  precedence and must also match the series rate. With per-sample `timestamps`, the first
+  float32 and `1 / spike_times.resolution` rounds to that same rate, Sorrel
+  compares spike indices under both rates, whether the Units table and series
+  are in one file or two. If the indices agree for every spike, Sorrel uses
+  the stored rate. If any differ, pass `--sample-rate <Hz>` to choose the
+  clock that applies. For a float32 series the supplied rate must round to
+  the stored rate. With per-sample `timestamps`, the first
   timestamp gives the start and the end-to-end mean interval gives the rate.
   Timestamps must strictly increase and stay within 0.001 samples of the
   inferred grid, plus four floating-point steps at the largest absolute
@@ -192,8 +194,9 @@ The electrodes table supplies channels if present, but there is no raw trace
 or waveform extraction. With `--dat recording.nwb`, the raw file supplies
 the trace, channels and time base; `--nwb-series` selects from that file.
 If a units rate is declared or supplied, it must match the series rate
-within 1 part per billion, or at float32 precision if stored as float32
-(in which case the higher-precision rate is used). Spike indices must fit
+within 1 part per billion, or at float32 precision if stored as float32.
+Float32 agreement alone does not choose the clock: the spike-index check
+above still applies unless you pass `--sample-rate`. Spike indices must fit
 inside the raw series. The files must have the same `timestamps_reference_time`;
 Sorrel does not infer an offset between files.
 

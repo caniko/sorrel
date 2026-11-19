@@ -6,7 +6,7 @@ use sorrel_data::{
     baseline_hash, open_identity_sealed, CurationCommand, Journal, JournalOpts, PhyLabelOp, Session,
 };
 use sorrel_io::kilosort::PhyLabel;
-use sorrel_io::{ClusterId, DataProvider, NwbOpenParams, NwbProvider};
+use sorrel_io::{ClusterId, DataProvider, NwbOpenParams, NwbProvider, SampleIndex};
 use std::path::{Path, PathBuf};
 
 fn fixture(name: &str) -> PathBuf {
@@ -115,6 +115,7 @@ fn nwb_trunk_journal_replays_when_precise_rate_leaves_samples_unchanged() {
     let journal = dir.path().join("trunk.journal");
     {
         let provider = NwbProvider::open(&path).unwrap();
+        assert_eq!(provider.spike_times(ClusterId(0)), [SampleIndex(100)]);
         let j = trunk_journal(&path, &journal, provider.n_clusters());
         let mut session = Session::new(provider, j);
         session
@@ -125,8 +126,7 @@ fn nwb_trunk_journal_replays_when_precise_rate_leaves_samples_unchanged() {
             .unwrap();
     }
 
-    // Also force the exact rate explicitly: this exercises seal compatibility
-    // even on a reader that does not yet consult same-file Units resolution.
+    // An explicit choice with the same sample mapping also preserves the seal.
     for sample_rate in [None, Some(30000.123)] {
         let provider = NwbProvider::open_with(
             &path,
@@ -144,15 +144,29 @@ fn nwb_trunk_journal_replays_when_precise_rate_leaves_samples_unchanged() {
 }
 
 #[test]
-fn nwb_trunk_journal_is_refused_when_precise_rate_moves_spikes() {
+fn nwb_trunk_journal_replays_only_with_stored_clock_when_mappings_differ() {
     let path = fixture("precise_rate_long.nwb");
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("trunk.journal");
-    let provider = NwbProvider::open(&path).unwrap();
-    drop(trunk_journal(&path, &journal, provider.n_clusters()));
+    let open = |sample_rate| {
+        NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                sample_rate,
+                ..Default::default()
+            },
+        )
+    };
+    assert!(open(None).is_err());
+    let stored = open(Some(f64::from(30000.123_f32))).unwrap();
+    assert_eq!(stored.spike_times(ClusterId(0)), [SampleIndex(330_000_001)]);
+    drop(trunk_journal(&path, &journal, stored.n_clusters()));
+    let opts = JournalOpts::default();
+    open_identity_sealed(stored, &journal, &opts).unwrap();
 
-    let Err(err) = open_identity_sealed(provider, &journal, &JournalOpts::default()) else {
-        panic!("trunk journal accepted after correcting the spike indices");
+    let precise = open(Some(30000.123)).unwrap();
+    let Err(err) = open_identity_sealed(precise, &journal, &opts) else {
+        panic!("trunk journal accepted for a different spike mapping");
     };
     assert!(
         err.to_string().contains("sealed against different data"),

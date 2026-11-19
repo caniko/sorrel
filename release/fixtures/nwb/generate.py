@@ -269,6 +269,26 @@ def write_single_file_precise_rates():
         write(nwbfile, name + ".nwb")
 
 
+def write_resampled_units_clock():
+    raw_rate = 30000.0
+    sort_rate = 29999.9991
+    sort_t0 = 0.5 / raw_rate
+    nwbfile = make_file("resampled-units-clock", units=False)
+    nwbfile.units = Units(name="units", resolution=1 / sort_rate)
+    # This spike on the resampled clock rounds to 101 on the acquisition clock.
+    nwbfile.add_unit(id=0, spike_times=[sort_t0 + 100 / sort_rate])
+    traces = np.zeros((250, N_CHANNELS), dtype=np.int16)
+    traces[101, 0] = 42
+    add_series(nwbfile, traces, rate=np.float32(raw_rate), starting_time=0.0)
+    sorted_signal = make_series(
+        nwbfile, traces, name="ResampledForSorting", rate=sort_rate, starting_time=sort_t0
+    )
+    nwbfile.create_processing_module("ecephys", "Resampled for sorting").add(
+        FilteredEphys(electrical_series=sorted_signal)
+    )
+    write(nwbfile, "resampled_units_clock.nwb")
+
+
 def write_foreign_quality():
     nwbfile = make_file("sorrel-fixture-quality", units=False, electrodes=False)
     for name in ["quality", "KSLabel", "unrelated_number"]:
@@ -340,6 +360,7 @@ def main():
     write_curated_units()
     write_reader_edge_cases()
     write_single_file_precise_rates()
+    write_resampled_units_clock()
     write_foreign_quality()
     write_not_electrical()
     write_subtype()

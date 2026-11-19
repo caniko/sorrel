@@ -436,53 +436,78 @@ fn paired_series_supplies_rate_without_units_resolution() {
 }
 
 #[test]
-fn single_file_float32_rate_uses_precise_units_rate_for_spikes() {
-    let p = open("precise_rate_long.nwb").unwrap();
+fn single_file_float32_rate_requires_clock_choice_for_long_recording() {
+    let err = open_err("precise_rate_long.nwb");
+    for part in [
+        "30000.123046875 Hz",
+        "30000.123 Hz",
+        "1 spike",
+        "unit 0 spike 0",
+        "330000001 vs 330000000",
+        "--sample-rate <Hz>",
+    ] {
+        assert!(err.contains(part), "{err}");
+    }
+    let p = NwbProvider::open_with(
+        fixture("precise_rate_long.nwb"),
+        NwbOpenParams {
+            sample_rate: Some(30000.123),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(p.n_samples(), SampleIndex(330_000_002));
     assert_eq!(p.spike_times(ClusterId(0)), [SampleIndex(330_000_000)]);
 }
 
 #[test]
-fn paired_float32_rate_uses_precise_units_rate_for_spikes() {
-    let raw = fixture("rounded_raw.nwb");
-    let p = NwbProvider::open_with(
-        fixture("precise_units.nwb"),
-        NwbOpenParams {
-            raw_path: Some(&raw),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(p.spike_times(ClusterId(0)), [SampleIndex(30)]);
-}
-
-#[test]
-fn paired_float32_rate_seals_the_effective_rate() {
-    let dir = tempfile::tempdir().unwrap();
-    let units = dir.path().join("units.nwb");
-    std::fs::copy(fixture("precise_units.nwb"), &units).unwrap();
-    hdf5_metno::File::open_rw(&units)
-        .unwrap()
-        .dataset("/units/spike_times")
-        .unwrap()
-        .attr("resolution")
-        .unwrap()
-        .write_scalar(&-1.0_f64)
-        .unwrap();
-    let raw = fixture("rounded_raw.nwb");
-    let open = |rate| {
+fn single_file_float32_rate_does_not_assume_resampled_units_use_acquisition_clock() {
+    let path = fixture("resampled_units_clock.nwb");
+    let open = |sample_rate| {
         NwbProvider::open_with(
-            &units,
+            &path,
             NwbOpenParams {
-                raw_path: Some(&raw),
-                sample_rate: Some(rate),
+                series: Some("ElectricalSeriesRaw"),
+                sample_rate,
                 ..Default::default()
             },
         )
-        .unwrap()
     };
-    let precise = open(30000.123);
-    let rounded = open(f64::from(30000.123_f32));
+    let err = format!(
+        "{:#}",
+        open(None).err().expect("ambiguous clocks must be refused")
+    );
+    // Taking the reciprocal of the stored resolution can move the last bit.
+    for part in ["30000 Hz", "29999.99909", "101 vs 100"] {
+        assert!(err.contains(part), "{err}");
+    }
+    let p = open(Some(30000.0)).unwrap();
+    assert_eq!(p.spike_times(ClusterId(0)), [SampleIndex(101)]);
+}
+
+#[test]
+fn paired_float32_rate_requires_clock_choice_and_seals_that_rate() {
+    let raw = fixture("rounded_raw.nwb");
+    let open = |sample_rate| {
+        NwbProvider::open_with(
+            fixture("precise_units.nwb"),
+            NwbOpenParams {
+                raw_path: Some(&raw),
+                sample_rate,
+                ..Default::default()
+            },
+        )
+    };
+    let err = format!(
+        "{:#}",
+        open(None).err().expect("ambiguous clocks must be refused")
+    );
+    assert!(
+        err.contains("31 vs 30") && err.contains("--sample-rate <Hz>"),
+        "{err}"
+    );
+    let precise = open(Some(30000.123)).unwrap();
+    let rounded = open(Some(f64::from(30000.123_f32))).unwrap();
     assert_eq!(precise.sample_rate(), rounded.sample_rate());
     assert_eq!(precise.spike_times(ClusterId(0)), [SampleIndex(30)]);
     assert_eq!(rounded.spike_times(ClusterId(0)), [SampleIndex(31)]);
