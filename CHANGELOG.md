@@ -49,6 +49,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **NWB reader keeps NWB's identities and units** (`--features hdf5`). Tested against PyNWB-written fixtures in `release/fixtures/nwb/`, and now built and tested in CI (`checks.sorrel-hdf5`, `checks.hdf5-tests`).
   - Unit ids come from `/units/id`; a table with ids `5, 7, 9` was reported to `curation.json` and MCP evidence as `0, 1, 2`.
   - Spike times are taken relative to the series' `starting_time`; they were offset by it.
+  - With per-sample timestamps, the inferred grid must assign each spike to a nearest recorded sample. The selected clock and spike-mapping Units columns must be stored in their respective opened files, without soft or external links, virtual datasets, or external raw storage.
   - Data columns map to electrodes through the series' `electrodes` region, giving channel ids and `rel_x`/`rel_y` positions. The first N table rows were paired with the N columns, and brain `x`/`y` stood in for probe geometry.
   - Samples are read in their stored dtype and scaled to µV with `conversion`, `channel_conversion` and `offset`. uint16 data was clipped at 32767, and the scale fields were ignored.
   - Only an `ElectricalSeries` (or a subtype declared in the file's cached spec) is read as the trace; previously any 2-D acquisition with a rate was accepted.

@@ -198,7 +198,8 @@ HDF5 file with `/units`. One series is read per session; multi-segment stitching
 NWB-Zarr and DANDI/HTTP streaming are not supported.
 
 - Timestamps with float64 spacing greater than 0.01 samples are refused; if sampling was regular, rewrite the series with `starting_time` and `rate`.
-- HDF5 external links to `starting_time` (including its `rate`), `timestamps`, or `/units`' `spike_times`, `spike_times_index`, or `id` are refused. Open the file holding the data directly, or pass the recording file via `--dat`.
+- With per-sample `timestamps`, each spike must map to a sample inside the series whose recorded timestamp is nearest to the spike time (ties are allowed). Sorrel refuses the file if the inferred grid disagrees.
+- The selected clock (`starting_time` with its `rate`, or `timestamps`) and `/units/id`, `/units/spike_times`, and `/units/spike_times_index` must be stored in their respective opened files. Every path component must be an HDF5 hard link; virtual datasets and external raw storage are refused. Open the file holding the data directly, or pass the recording file via `--dat`.
 
 The test fixtures in `release/fixtures/nwb/` are written by PyNWB
 (`generate.py` pins the version).
