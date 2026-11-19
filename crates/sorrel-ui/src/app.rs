@@ -531,7 +531,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         self.session_key = Some(key);
     }
 
-    /// Serve this window's session to MCP clients (`sorrel mcp <dir>`
+    /// Serve this window's session to MCP clients (`sorrel mcp` with matching open arguments
     /// attaches): a loopback listener next to the save directory, whose
     /// `select` moves this selection. Needs `set_save_dir` first.
     pub fn serve_mcp(&mut self) -> anyhow::Result<()>
@@ -627,7 +627,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         ui.label(who).on_hover_text(if active {
             "An agent just edited; the touched clusters are highlighted"
         } else {
-            "MCP clients connected with `sorrel mcp <DATA_DIR>`"
+            "Connect with `sorrel mcp` and the same dataset path and open options"
         });
         let pending = self.host.proposals().len();
         if pending > 0

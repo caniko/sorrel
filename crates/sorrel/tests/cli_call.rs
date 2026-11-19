@@ -140,18 +140,88 @@ fn nwb_call_preserves_exported_parent_without_a_row() {
 }
 
 #[cfg(feature = "hdf5")]
+struct Host(std::process::Child);
+
+#[cfg(feature = "hdf5")]
+impl Drop for Host {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(all(feature = "hdf5", unix))]
+#[test]
+fn nwb_headless_connect_hint_attaches_to_matching_host() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../release/fixtures/nwb");
+    std::fs::copy(
+        fixtures.join("units_only.nwb"),
+        tmp.path().join("units.nwb"),
+    )
+    .unwrap();
+    std::fs::copy(
+        fixtures.join("raw_only.nwb"),
+        tmp.path().join("raw's trace.nwb"),
+    )
+    .unwrap();
+    let mut host = Host(
+        Command::new(env!("CARGO_BIN_EXE_sorrel"))
+            .current_dir(tmp.path())
+            .env("SORREL_USER_DIR", tmp.path())
+            .args(["run", "--headless"])
+            .arg(tmp.path().join("units.nwb"))
+            .args([
+                "--dat",
+                "raw's trace.nwb",
+                "--nwb-series",
+                "ElectricalSeriesRaw",
+                "--journal",
+                "my journal",
+                "--sample-rate",
+                "1000",
+                "--sorter=-manual",
+                "--discard-journal",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let line = BufReader::new(host.0.stdout.take().unwrap())
+        .lines()
+        .next()
+        .unwrap()
+        .unwrap();
+    let (_, hint) = line.split_once("; connect an agent with `sorrel ").unwrap();
+    let args = hint.strip_suffix("`; Ctrl-C stops").unwrap();
+    assert!(!args.contains("--discard-journal"));
+    // Use the printed shell arguments verbatim from a different directory.
+    let out = Command::new("sh")
+        .args([
+            "-c",
+            &format!("exec \"$1\" {args}"),
+            "sh",
+            env!("CARGO_BIN_EXE_sorrel"),
+        ])
+        .env("SORREL_USER_DIR", tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{line}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(args.contains("units.nwb"), "{line}");
+}
+
+#[cfg(feature = "hdf5")]
 #[test]
 fn nwb_call_only_reuses_matching_running_session() {
     use std::io::{BufRead, BufReader};
-    use std::process::{Child, Stdio};
-
-    struct Host(Child);
-    impl Drop for Host {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
+    use std::process::Stdio;
 
     let tmp = tempfile::tempdir().unwrap();
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))

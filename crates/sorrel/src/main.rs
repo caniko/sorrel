@@ -77,7 +77,7 @@ enum Cmd {
         #[arg(long)]
         standalone: bool,
         /// Run the session host without a window: MCP clients connect with
-        /// `sorrel mcp <DATA_DIR>`. Stops on Ctrl-C
+        /// `sorrel mcp` and the same dataset path and open options. Stops on Ctrl-C
         #[arg(long, requires = "root", conflicts_with = "standalone")]
         headless: bool,
     },
@@ -1525,6 +1525,8 @@ fn session_path(path: &Path) -> PathBuf {
 fn session_key(open: &OpenArgs) -> Result<String> {
     let mut args = open.clone();
     args.rebase(&std::env::current_dir()?);
+    // Discard is a one-shot action, not a property of the live session.
+    args.discard_journal = false;
     // A file's name matters even through a symlink: it names its journal.
     args.root = Some(if args.root().is_dir() {
         session_path(args.root())
@@ -1584,12 +1586,14 @@ fn busy_hint(e: anyhow::Error) -> anyhow::Error {
 }
 
 /// `sorrel run --headless`: the host and its MCP listener, no window.
-struct Headless(String);
-impl SessionVisitor for Headless {
+struct Headless<'a>(&'a OpenArgs);
+impl SessionVisitor for Headless<'_> {
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
+        let key = session_key(self.0)?;
+        let args = mcp_open_args(self.0)?;
         let host = std::sync::Arc::new(sorrel_data::SessionHost::new(seeded(session, seed)?));
         let listener = sorrel_data::serve::spawn_listener_for_session(
             host,
@@ -1597,18 +1601,64 @@ impl SessionVisitor for Headless {
             ctx.reseal_on_save,
             phy_label_str,
             None,
-            Some(&self.0),
+            Some(&key),
         )?;
         println!(
             "sorrel host on 127.0.0.1:{}; connect an agent with `sorrel mcp {}`; Ctrl-C stops",
             listener.port(),
-            sorrel_io::fsutil::display_path(&ctx.save_dir)
+            args
         );
         // Ctrl-C returns, dropping the listener so it removes its registry file.
         sorrel_remote::wait_for_ctrl_c();
         drop(listener);
         Ok(())
     }
+}
+
+fn mcp_open_args(open: &OpenArgs) -> Result<String> {
+    let mut open = open.clone();
+    open.rebase(&std::env::current_dir()?);
+    let mut args = shell_quote(&sorrel_io::fsutil::display_path(open.root()).to_string());
+    let mut flag = |name, value: Option<String>| {
+        if let Some(value) = value {
+            let sep = if value.starts_with('-') { "=" } else { " " };
+            args.push_str(&format!(" --{name}{sep}{}", shell_quote(&value)));
+        }
+    };
+    for (name, path) in [
+        ("dat", open.dat),
+        ("journal", open.journal),
+        ("spikeglx-meta", open.spikeglx_meta),
+        ("oebin", open.oebin),
+        ("events", open.events),
+    ] {
+        flag(
+            name,
+            path.map(|p| sorrel_io::fsutil::display_path(&p).to_string()),
+        );
+    }
+    #[cfg(feature = "hdf5")]
+    flag("nwb-series", open.nwb_series);
+    flag("sample-rate", open.sample_rate.map(|r| r.to_string()));
+    flag("channels", open.n_channels.map(|n| n.to_string()));
+    flag("dtype", open.dtype.map(|d| d.phy_name().into()));
+    flag("offset", open.offset.map(|n| n.to_string()));
+    flag("sorter", open.sorter);
+    flag(
+        "backend",
+        open.backend.map(|b| {
+            match b {
+                Backend::Kilosort => "kilosort",
+                Backend::SortingAnalyzer => "sorting-analyzer",
+                #[cfg(feature = "hdf5")]
+                Backend::Nwb => "nwb",
+                #[cfg(feature = "hdf5")]
+                Backend::Ks4Rez => "ks4-rez",
+            }
+            .into()
+        }),
+    );
+    Ok(args)
 }
 
 struct Serve;
@@ -2038,7 +2088,8 @@ fn mcp_target() -> Result<PathBuf> {
         0 => bail!("no running sorrel host; pass DATA_DIR"),
         1 => Ok(alive.remove(0).dataset),
         _ => bail!(
-            "several sorrel hosts are running; pass DATA_DIR:\n{}",
+            "several sorrel hosts are running; pass the dataset path and its open options. \
+             Host save directories:\n{}",
             alive
                 .iter()
                 .map(|h| format!("  {} ({}, pid {})", h.dataset.display(), h.kind, h.pid))
@@ -2081,6 +2132,17 @@ fn mcp_tools(json: bool) -> Result<()> {
     Ok(())
 }
 
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || "/._-+:@".contains(c))
+    {
+        s.to_owned()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 /// `sorrel mcp config`: how to register this binary with an agent client.
 fn mcp_config(client: Client, dir: Option<PathBuf>) -> Result<()> {
     let exe = std::env::current_exe()?.display().to_string();
@@ -2088,21 +2150,15 @@ fn mcp_config(client: Client, dir: Option<PathBuf>) -> Result<()> {
     if let Some(d) = dir {
         args.push(std::path::absolute(d)?.display().to_string());
     }
-    let sh = |s: &str| {
-        if s.chars()
-            .all(|c| c.is_alphanumeric() || "/._-+:@".contains(c))
-        {
-            s.to_owned()
-        } else {
-            format!("'{}'", s.replace('\'', r"'\''"))
-        }
-    };
     let json = |s: &[String]| serde_json::to_string(s).expect("strings serialise");
     match client {
         Client::Claude => println!(
             "claude mcp add sorrel -- {} {}",
-            sh(&exe),
-            args.iter().map(|a| sh(a)).collect::<Vec<_>>().join(" ")
+            shell_quote(&exe),
+            args.iter()
+                .map(|a| shell_quote(a))
+                .collect::<Vec<_>>()
+                .join(" ")
         ),
         // JSON string escapes are valid TOML basic strings.
         Client::Codex => println!(
@@ -2360,7 +2416,7 @@ fn main() -> Result<()> {
             standalone,
             headless,
         }) => match headless {
-            true => with_session(&open, Headless(session_key(&open)?)),
+            true => with_session(&open, Headless(&open)),
             false => run_gui(&open, standalone),
         },
         Some(Cmd::Status { dir, json }) => run_status(dir.as_deref(), json),
