@@ -102,6 +102,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Changed
 
+- **Redesigned `sorrel report`.** The page is now an askama template compiled into the binary. It opens with an overview table linking every cluster, and each card shows eight headline metrics as tiles, the template on its four strongest channels with waveform landmarks, ISI on linear and log axes, a mirrored ACG, amplitude over time and the full metric list. It follows the system dark mode on screen and prints to A4 PDF without splitting cards.
 - The landing page moves from Zola to Plinth's `plinth-project`: a
   full-width animated hero (a still for reduced motion, a Waveforms crop on
   phones), six focused gallery crops with a lightbox, a self-hosted Inter
