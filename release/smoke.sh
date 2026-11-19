@@ -84,9 +84,7 @@ tar -xOzf "sorrel-${VERSION}-aarch64-darwin.tar.gz" ./sorrel > "$tmp/sorrel-darw
 unzip -p "sorrel_ephys-${VERSION}-cp38-abi3-macosx_11_0_arm64.whl" \
   "sorrel_ephys-${VERSION}.data/scripts/sorrel" | cmp - "$tmp/sorrel-darwin"
 if [[ $(uname -m) == x86_64 ]]; then
-  appimage=$(realpath "sorrel-${VERSION}-x86_64.AppImage")
-  (cd "$tmp"; "$appimage" --appimage-extract AppRun)
-  cmp "$tmp/squashfs-root/AppRun" "$tmp/sorrel-x86_64"
+  APPIMAGE_EXTRACT_AND_RUN=1 describe_nwb "./sorrel-${VERSION}-x86_64.AppImage"
 fi
 
 printf 'release smoke checks passed for Sorrel %s\n' "$VERSION"

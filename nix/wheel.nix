@@ -59,7 +59,7 @@
       ${lib.optionalString (t.elf or false) "patchelf --remove-rpath $root/sorrel/_native${t.ext}"}
       install -m755 ${t.binary} $root/${root}.data/scripts/${t.exe}
       install -m644 ${metadata} $root/${root}.dist-info/METADATA
-      install -m644 ${../crates/sorrel/THIRD-PARTY-HDF5.txt} $root/${root}.dist-info/
+      install -m644 ${../crates/sorrel/THIRD-PARTY-HDF5.txt} $root/${root}.dist-info/THIRD-PARTY-HDF5.txt
       printf 'Wheel-Version: 1.0\nGenerator: sorrel-nix\nRoot-Is-Purelib: false\nTag: ${tag}\n' \
         > $root/${root}.dist-info/WHEEL
       mkdir -p $out
