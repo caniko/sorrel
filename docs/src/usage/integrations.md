@@ -258,8 +258,9 @@ The default journal and save directory is local, under the Sorrel user data
 directory (`$XDG_DATA_HOME/sorrel` or `~/.local/share/sorrel` on Linux), in
 `dandi/<dandiset>/<version>/<path hash>/`. Direct HTTPS URLs are stored under
 `dandi/https/<URL hash>/`, without the signed query. Use `--journal` or the
-command's `--out` to choose a different location. An asset whose ETags or sizes
-have changed does not match the old journal seal.
+command's `--out` to choose a different location. `export-phy`, `qc`, and
+`report` default to this directory for remote sessions. An asset whose ETags
+or sizes have changed does not match the old journal seal.
 
 ### Writing curated units to NWB
 

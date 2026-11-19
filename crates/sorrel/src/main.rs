@@ -121,9 +121,9 @@ enum Cmd {
     Qc {
         #[command(flatten)]
         open: OpenArgs,
-        /// Output directory (created if missing)
+        /// Output directory (required for local datasets)
         #[arg(long, value_name = "DIR")]
-        out: PathBuf,
+        out: Option<PathBuf>,
     },
     /// Headless: rank merge and split suggestions for the current curation
     Suggest {
@@ -210,8 +210,8 @@ enum Cmd {
         #[command(flatten)]
         open: OpenArgs,
         /// Output file
-        #[arg(long, value_name = "FILE", default_value = "sorrel_report.html")]
-        out: PathBuf,
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
         /// Only these cluster ids (comma-separated)
         #[arg(long, value_name = "IDS", value_delimiter = ',')]
         clusters: Option<Vec<u32>>,
@@ -347,9 +347,9 @@ enum Cmd {
     ExportPhy {
         #[command(flatten)]
         open: OpenArgs,
-        /// Output directory (created if missing; must not be the source)
+        /// Output directory (required for local datasets; must not be the source)
         #[arg(long, value_name = "DIR")]
-        out: PathBuf,
+        out: Option<PathBuf>,
         /// Copy the raw recording into DIR/recording.dat instead of pointing
         /// params.py at the original
         #[arg(long)]
@@ -648,6 +648,8 @@ fn apply_recording_overrides(open: &OpenArgs, p: &mut KilosortOpenParams) -> Res
 struct OpenCtx<P: DataProvider> {
     /// Directory `save_to_phy` writes into.
     save_dir: PathBuf,
+    /// Remote source: default exports stay inside the local state directory.
+    remote: bool,
     /// True only for backends that read the saved `spike_clusters.npy`
     /// back on open (phy/Kilosort); see `SorrelApp::set_save_dir`.
     reseal_on_save: bool,
@@ -725,6 +727,7 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
                 session,
                 Box::new(|s| s.replay_journal()),
                 OpenCtx {
+                    remote: false,
                     save_dir: root,
                     reseal_on_save: false,
                     positions,
@@ -766,6 +769,7 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
             let (session, mut ctx) =
                 open_file_backed(open, provider, &path, "nwb", sorrel_io::Backend::Nwb)?;
             ctx.nwb_start_time = starting_time;
+            ctx.remote = is_remote(open.root());
             ctx.metrics = metrics;
             v.visit(session, Box::new(|s| s.replay_journal()), ctx)
         }
@@ -827,6 +831,7 @@ fn open_kilosort(
     Ok((
         session,
         OpenCtx {
+            remote: false,
             save_dir: root,
             reseal_on_save: true,
             positions,
@@ -916,6 +921,7 @@ fn run_join(
     // refused as diverged. Saving still writes the phy files locally.
     let root = std::path::absolute(&joined.root)?;
     let ctx = OpenCtx {
+        remote: false,
         save_dir: joined.root.clone(),
         reseal_on_save: false,
         positions: joined.positions.clone(),
@@ -975,6 +981,7 @@ where
     Ok((
         session,
         OpenCtx {
+            remote: false,
             save_dir: parent,
             reseal_on_save: false,
             positions,
@@ -1014,14 +1021,15 @@ impl SessionVisitor for TabBuilder<'_> {
     }
 }
 
-struct Qc(PathBuf);
+struct Qc(Option<PathBuf>);
 impl SessionVisitor for Qc {
-    fn visit<P>(self, session: Session<P>, seed: Seed<P>, _: OpenCtx<P>) -> Result<()>
+    fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
+        let out = dataset_output(&ctx, self.0, "qc", None)?;
         let session = seeded(session, seed)?;
-        let out_dir = &self.0;
+        let out_dir = &out;
         let n = export_qc(
             &session,
             out_dir,
@@ -1140,22 +1148,23 @@ impl SessionVisitor for Blind {
 
 #[cfg(feature = "phy-export")]
 struct ExportPhy {
-    out: PathBuf,
+    out: Option<PathBuf>,
     copy_raw: bool,
 }
 #[cfg(feature = "phy-export")]
 impl SessionVisitor for ExportPhy {
-    fn visit<P>(self, session: Session<P>, seed: Seed<P>, _: OpenCtx<P>) -> Result<()>
+    fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
+        let out = dataset_output(&ctx, self.out, "phy", None)?;
         let session = seeded(session, seed)?;
-        sorrel_data::export_phy(&session, &self.out, self.copy_raw, phy_label_str)
-            .with_context(|| format!("exporting phy to {}", self.out.display()))?;
+        sorrel_data::export_phy(&session, &out, self.copy_raw, phy_label_str)
+            .with_context(|| format!("exporting phy to {}", out.display()))?;
         println!(
             "exported {} clusters as phy into {}",
             session.n_clusters(),
-            self.out.display()
+            out.display()
         );
         Ok(())
     }
@@ -1400,17 +1409,18 @@ fn run_auto_sidecar(open: &OpenArgs, out: &Path, flags: &[String]) -> Result<()>
 }
 
 struct Report {
-    out: PathBuf,
+    out: Option<PathBuf>,
     filter: ReportFilter,
 }
 impl SessionVisitor for Report {
-    fn visit<P>(self, session: Session<P>, seed: Seed<P>, _: OpenCtx<P>) -> Result<()>
+    fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
+        let out = dataset_output(&ctx, self.out, "sorrel_report.html", Some("sorrel_report.html"))?;
         let session = seeded(session, seed)?;
-        let n = write_report(&session, &self.out, phy_label_str, &self.filter)?;
-        println!("wrote {n} cluster cards → {}", self.out.display());
+        let n = write_report(&session, &out, phy_label_str, &self.filter)?;
+        println!("wrote {n} cluster cards → {}", out.display());
         Ok(())
     }
 }
@@ -1543,6 +1553,21 @@ fn session_host_dir(open: &OpenArgs) -> Result<PathBuf> {
         bail!("remote NWB datasets require building with --features dandi");
     }
     Ok(host_dir(open))
+}
+
+fn dataset_output<P: DataProvider>(
+    ctx: &OpenCtx<P>,
+    out: Option<PathBuf>,
+    remote_name: &str,
+    local_default: Option<&str>,
+) -> Result<PathBuf> {
+    if let Some(out) = out {
+        Ok(out)
+    } else if ctx.remote {
+        Ok(ctx.save_dir.join(remote_name))
+    } else {
+        Ok(PathBuf::from(local_default.context("--out is required for local datasets")?))
+    }
 }
 
 fn is_dataset_directory(path: &Path) -> bool {
@@ -1882,7 +1907,11 @@ where
         let name = dir
             .file_name()
             .map_or("sorrel".into(), |n| n.to_string_lossy());
-        let out = dir.with_file_name(format!("{name}_phy"));
+        let out = if ctx.remote {
+            dir.join("phy")
+        } else {
+            dir.with_file_name(format!("{name}_phy"))
+        };
         app.set_phy_export(std::sync::Arc::new(move |s: &Session<P>| {
             sorrel_data::export_phy(s, &out, false, phy_label_str)?;
             Ok(out.clone())
@@ -2390,11 +2419,11 @@ fn run_status(dir: Option<&Path>, json: bool) -> Result<()> {
     });
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let want = dir.map(|d| {
-        canon(&host_dir(&OpenArgs {
+        session_host_dir(&OpenArgs {
             root: Some(d.into()),
             ..Default::default()
-        }))
-    });
+        }).map(|dir| canon(&dir))
+    }).transpose()?;
     // `list_hosts` paths carry no `\\?\` prefix, so compare without it.
     let canon = |p: &Path| sorrel_io::fsutil::simplified(&canon(p)).to_path_buf();
     let hosts: Vec<_> = sorrel_data::list_hosts()
@@ -2606,7 +2635,12 @@ fn main() -> Result<()> {
             dry_run,
             save,
         }) => {
-            let out = open.root().join("sorrel_auto");
+            let out = if is_remote(open.root()) {
+                anyhow::ensure!(reuse, "sorrel auto supports Kilosort/phy directories unless --reuse is used");
+                session_host_dir(&open)?.join("sorrel_auto")
+            } else {
+                open.root().join("sorrel_auto")
+            };
             if !reuse {
                 auto_llm_journal_ok(llm.is_some(), open.discard_journal)?;
                 let mut flags = vec![];
@@ -2988,7 +3022,7 @@ mod tests {
             .cmd
         {
             Some(Cmd::Qc { open, out }) => {
-                assert_eq!(out, PathBuf::from("o"));
+                assert_eq!(out, Some(PathBuf::from("o")));
                 assert_eq!(open.backend, Some(Backend::SortingAnalyzer));
             }
             other => panic!("unexpected {other:?}"),
@@ -3030,6 +3064,29 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(host_dir(&open), PathBuf::from("/"));
+    }
+
+    #[test]
+    #[cfg(feature = "dandi")]
+    fn remote_session_paths_survive_rebasing_and_redact_query() -> Result<()> {
+        let locator = "dandi://dandi/000123@draft/test.nwb";
+        let url = "https://example.org/raw.nwb?signature=not-for-the-registry";
+        let mut open = OpenArgs {
+            root: Some(locator.into()),
+            dat: Some(url.into()),
+            journal: Some("override.journal".into()),
+            ..Default::default()
+        };
+        let cwd = std::env::current_dir()?;
+        open.rebase(&cwd);
+        assert_eq!(open.root(), Path::new(locator));
+        assert_eq!(open.dat.as_deref(), Some(Path::new(url)));
+        assert_eq!(open.journal, Some(cwd.join("override.journal")));
+        assert!(!session_key(&open)?.contains("signature="));
+        assert!(!mcp_open_args(&open)?.contains("signature="));
+        let hash = blake3::hash(b"test.nwb").to_hex();
+        assert_eq!(session_host_dir(&open)?, dandi_data_dir()?.join("000123/draft").join(hash.as_str()));
+        Ok(())
     }
 
     #[test]
