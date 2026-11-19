@@ -147,23 +147,25 @@ What Sorrel reads:
   ID; a unique `unit_name` string column preserves the upstream names in
   `curation.json`. Sorrel reads `good`, `mua`, `noise` and `unsorted` from
   `label`, `quality` or `KSLabel`, in that order. Sorrel's Python-exported
-  origin, tags and parent IDs are restored when possible (parents without a
-  table row are skipped). Columns marked `Sorrel QC metric.` populate the
+  origin, tags and parent IDs are restored. Parents without a table row are
+  displayed as `unit:<id>` instead of local cluster IDs. Columns marked `Sorrel QC metric.` populate the
   cluster table, just like sidecar metrics. Unrecognized columns are ignored.
 - **Trace.** Sorrel reads single windows on demand and caches recent blocks
   instead of loading the entire trace. It looks for `ElectricalSeries` (or an
   extension subtype declared in `/specifications`) under `/acquisition` and
-  `/processing`, with 2-D `data` (time × channels). By default it takes the
-  first such acquisition by name, or the first processed series by path if
-  there is no such acquisition, and logs the available paths when there is
+  `/processing`, with 2-D `data` (time × channels) or 1-D `data` (one channel).
+  By default it prefers 2-D series, then takes the first series by path
+  (acquisitions before processed series), and logs the available paths when there is
   more than one. `--nwb-series` takes an acquisition name or an absolute path
   in the NWB file, not a filesystem path. Use a separate `--journal` when
-  curating against another series or a different paired recording.
+  curating against another series or a different paired recording. To reuse
+  an open tab or attach `call` or `mcp` to its host, pass the same open options;
+  conflicting options are refused rather than silently ignored.
 - **Time base.** Spike times on the NWB session clock become sample indices as
   `round((t - starting_time) × rate)`. With per-sample `timestamps`, the first
   timestamp gives the start and the end-to-end mean interval gives the rate.
-  Every interval must be within 1 ppm of the mean and every timestamp within
-  0.25 samples of the inferred grid. Irregular timestamps are refused.
+  Timestamps must strictly increase and stay within 0.25 samples of the
+  inferred grid. Irregular timestamps are refused.
   NWB trials used as events are shifted by the same start time; CSV/NPY event
   times are already relative to the recording.
 - **Sample types.** int8, uint8, int16, uint16, int32, uint32, int64, float32
@@ -178,13 +180,16 @@ What Sorrel reads:
 
 **Units without a trace.** Without an ElectricalSeries, Sorrel takes the
 rate from `1 / spike_times.resolution`, or requires `--sample-rate HZ`
-when unspecified. Spike times are relative to zero (the NWB session start).
+when unspecified and no raw NWB is paired. Spike times are relative to zero
+(`timestamps_reference_time`).
 The electrodes table supplies channels if present, but there is no raw trace
 or waveform extraction. With `--dat recording.nwb`, the raw file supplies
-the trace, channels and start time; `--nwb-series` selects from that file.
-Its rate must match the units' declared or supplied rate within 1 part per
-billion, and spike indices must fit inside the raw series. The files must use
-the same session clock; Sorrel does not infer an offset between files.
+the trace, channels and time base; `--nwb-series` selects from that file.
+If a units rate is declared or supplied, it must match the series rate
+within 1 part per billion, or at float32 precision if stored as float32
+(in which case the higher-precision rate is used). Spike indices must fit
+inside the raw series. The files must have the same `timestamps_reference_time`;
+Sorrel does not infer an offset between files.
 
 The reader requires HDF5 support (`cargo build --features hdf5`) and a local
 HDF5 file with `/units`. One series is read per session; multi-segment stitching,

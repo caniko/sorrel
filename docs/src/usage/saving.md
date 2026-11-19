@@ -148,7 +148,8 @@ What goes into the directory depends on the source:
   `channel_shanks.npy` when known) and `cluster_group.tsv`. Templates are
   mean waveforms of up to 500 spikes per cluster, 1 ms before to 2 ms after
   each spike, from the raw trace with the per-channel mean removed (no
-  high-pass filter). Units-only NWB has no raw waveforms to average. There
+  high-pass filter). Units-only NWB has no raw waveforms to average; if it
+  also has no channels, export requires pairing a raw NWB with `--dat`. There
   are no amplitudes, PC features or similarity matrix, so phy falls back to
   its defaults for those views.
 
