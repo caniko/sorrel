@@ -19,7 +19,14 @@
     mkReleaseArchive {
       inherit pkgs pname version package system rustTarget format;
       name = "sorrel-${version}-${system}.${format}";
-      entries = pkgs.lib.genAttrs binaries (b: "bin/${b}");
+      entries =
+        pkgs.lib.genAttrs binaries (b: "bin/${b}")
+        // {
+          "THIRD-PARTY-HDF5.txt" = {
+            source = "${../crates/sorrel/THIRD-PARTY-HDF5.txt}";
+            mode = "0644";
+          };
+        };
     };
 
   # `pip install sorrel-ephys` wheels: the `_native` extension plus the GUI binary.

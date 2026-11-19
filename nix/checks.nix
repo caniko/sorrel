@@ -4,9 +4,7 @@
   commonArgs,
   cargoArtifacts,
   runtimeLibs,
-  hdf5C,
   sorrel,
-  sorrelHdf5,
   testSrc,
   hmModule,
 }: let
@@ -62,16 +60,11 @@ in
         '';
       });
 
-    # The NWB and rez.mat readers live behind the optional `hdf5` feature:
-    # build the binary with it, and run the readers' tests against the
-    # committed PyNWB fixtures (release/fixtures/nwb).
-    sorrel-hdf5 = sorrelHdf5;
+    # Explicitly enable the readers when testing the library crates on their own.
     hdf5-tests = craneLib.cargoNextest (commonArgs
       // {
         inherit cargoArtifacts;
         src = testSrc;
-        buildInputs = commonArgs.buildInputs ++ [hdf5C];
-        HDF5_DIR = "${hdf5C}";
         # sorrel-data's other tests already run in workspace-tests.
         cargoNextestExtraArgs = "-p sorrel-io -p sorrel-data --features sorrel-io/hdf5,sorrel-data/hdf5 --no-fail-fast -E 'package(sorrel-io) | binary(nwb_curation)'";
       });

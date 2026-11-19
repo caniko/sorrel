@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - "trunk"
+      - "simit/update/**"
   pull_request:
   workflow_dispatch:
 
@@ -19,6 +20,8 @@ jobs:
   build:
     name: build (${{ matrix.group }})
     runs-on: ubuntu-24.04
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -26,7 +29,7 @@ jobs:
       matrix:
         include:
           - group: "checks"
-            installables: '[".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.default",".#checks.x86_64-linux.formatting",".#checks.x86_64-linux.hm-module",".#checks.x86_64-linux.workspace-tests",".#checks.x86_64-linux.sorrel-hdf5",".#checks.x86_64-linux.hdf5-tests",".#checks.x86_64-linux.dev-tests",".#checks.x86_64-linux.binstall-metadata",".#checks.x86_64-linux.binstall-metadata-sorrel-remote"]'
+            installables: '[".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.default",".#checks.x86_64-linux.formatting",".#checks.x86_64-linux.hm-module",".#checks.x86_64-linux.workspace-tests",".#checks.x86_64-linux.hdf5-tests",".#checks.x86_64-linux.dev-tests",".#checks.x86_64-linux.binstall-metadata",".#checks.x86_64-linux.binstall-metadata-sorrel-remote"]'
     env:
       NIX_CONFIG: "experimental-features = nix-command flakes"
     steps:
@@ -58,15 +61,14 @@ jobs:
 
       - name: Restore grouped-build engine
         id: simit-engine-cache
-        if: ${{ (vars.SIMIT_CI_ENGINE_REVISION || 'bb75df673d9397e31e1fe8eb9108934364458ae1') != '' }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/simit-engine-cache
           key: simit-engine-v1-${{ (vars.SIMIT_CI_ENGINE_REVISION || 'bb75df673d9397e31e1fe8eb9108934364458ae1') }}-${{ runner.os }}-${{ runner.arch }}
       - name: Import grouped-build engine
-        if: ${{ steps.simit-engine-cache.outputs.cache-hit == 'true' }}
         shell: bash
         env:
+          SIMIT_ENGINE_CACHE_HIT: ${{ steps.simit-engine-cache.outputs.cache-hit }}
           BASH_ENV: ''
           ENV: ''
           NIX_CONFIG: 'experimental-features = nix-command flakes'
@@ -74,6 +76,7 @@ jobs:
           NIX_PATH: ''
         run: |
           set -euo pipefail
+          [ "$SIMIT_ENGINE_CACHE_HIT" = true ] || exit 0
           cache_root="$RUNNER_TEMP/simit-engine-cache"
           env -u GH_TOKEN -u GITHUB_TOKEN -u GITHUB_OAUTH_TOKEN -u ATTIC_TOKEN -u CACHIX_AUTH_TOKEN -u CACHIX_SIGNING_KEY nix copy --no-check-sigs --all --from "file://$cache_root" || echo '::warning::Cached grouped-build engine failed to import; building it normally'
           rm -rf "$cache_root"
@@ -102,9 +105,9 @@ jobs:
           printf '%s\n' "SIMIT_CI_ENGINE=$engine_path/bin/simit" >> "$GITHUB_ENV"
       - name: Export grouped-build engine
         id: simit-engine-cache-save
-        if: ${{ (vars.SIMIT_CI_ENGINE_REVISION || 'bb75df673d9397e31e1fe8eb9108934364458ae1') != '' && steps.simit-engine-cache.outputs.cache-hit != 'true' }}
         shell: bash
         env:
+          SIMIT_ENGINE_CACHE_HIT: ${{ steps.simit-engine-cache.outputs.cache-hit }}
           BASH_ENV: ''
           ENV: ''
           NIX_CONFIG: 'experimental-features = nix-command flakes'
@@ -112,6 +115,7 @@ jobs:
           NIX_PATH: ''
         run: |
           set -euo pipefail
+          [ "$SIMIT_ENGINE_CACHE_HIT" != true ] || exit 0
           cache_root="$RUNNER_TEMP/simit-engine-cache"
           rm -rf "$cache_root"
           if nix copy --to "file://$cache_root?compression=zstd" "${SIMIT_CI_ENGINE%/bin/simit}"; then
@@ -132,7 +136,7 @@ jobs:
         run: |
           case "$SIMIT_NIX_GROUP" in
             checks)
-              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.default",".#checks.x86_64-linux.formatting",".#checks.x86_64-linux.hm-module",".#checks.x86_64-linux.workspace-tests",".#checks.x86_64-linux.sorrel-hdf5",".#checks.x86_64-linux.hdf5-tests",".#checks.x86_64-linux.dev-tests",".#checks.x86_64-linux.binstall-metadata",".#checks.x86_64-linux.binstall-metadata-sorrel-remote"],"plan":[".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.default",".#checks.x86_64-linux.formatting",".#checks.x86_64-linux.hm-module",".#checks.x86_64-linux.workspace-tests",".#checks.x86_64-linux.sorrel-hdf5",".#checks.x86_64-linux.hdf5-tests",".#checks.x86_64-linux.dev-tests",".#checks.x86_64-linux.binstall-metadata",".#checks.x86_64-linux.binstall-metadata-sorrel-remote"],"check_systems":["x86_64-linux"],"limits":[],"post_build":[],"post_build_always":[],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
+              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.default",".#checks.x86_64-linux.formatting",".#checks.x86_64-linux.hm-module",".#checks.x86_64-linux.workspace-tests",".#checks.x86_64-linux.hdf5-tests",".#checks.x86_64-linux.dev-tests",".#checks.x86_64-linux.binstall-metadata",".#checks.x86_64-linux.binstall-metadata-sorrel-remote"],"plan":[".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.default",".#checks.x86_64-linux.formatting",".#checks.x86_64-linux.hm-module",".#checks.x86_64-linux.workspace-tests",".#checks.x86_64-linux.hdf5-tests",".#checks.x86_64-linux.dev-tests",".#checks.x86_64-linux.binstall-metadata",".#checks.x86_64-linux.binstall-metadata-sorrel-remote"],"check_systems":["x86_64-linux"],"limits":[],"post_build":[],"post_build_always":[],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
               ;;
             *) echo 'Unknown Nix execution group' >&2; exit 1 ;;
           esac
@@ -147,3 +151,57 @@ jobs:
           if-no-files-found: error
           path: |
             ${{ runner.temp }}/simit-nix-build-${{ strategy.job-index }}
+
+  changes:
+    name: Classify changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify changed paths
+        id: classify
+        shell: bash
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          # Root Markdown nobody builds is documentation.
+          classify() {
+            case "$1" in
+              */*) return 1 ;;
+              README.md) return 1 ;;
+              *.md) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          code=true
+          base=
+          # A branch push compares with its fork point, not its previous push, which
+          # may never have passed. Default-branch pushes qualify and publish every
+          # revision, so they always run.
+          if [ "$EVENT_NAME" = pull_request ]; then
+            base=$PR_BASE
+          elif [ "$EVENT_NAME" = push ]; then
+            case "$GITHUB_REF" in
+              "refs/heads/$DEFAULT_BRANCH") ;;
+              refs/heads/*) base=$(git merge-base "origin/$DEFAULT_BRANCH" HEAD 2>/dev/null) || base= ;;
+            esac
+          fi
+          # A missing or unreachable base, or an empty diff, has nothing to classify.
+          if [ -n "$base" ] && git cat-file -e "$base^{commit}" 2>/dev/null && changed=$(git diff --no-renames --name-only "$base" HEAD --) && [ -n "$changed" ]; then
+            code=false
+            while IFS= read -r path; do
+              classify "$path" || { code=true; break; }
+            done <<< "$changed"
+          fi
+          printf 'code=%s\n' "$code" >> "$GITHUB_OUTPUT"

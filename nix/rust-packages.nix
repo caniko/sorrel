@@ -4,11 +4,12 @@
   src,
   deps,
 }: let
-  inherit (deps) buildInputs nativeBuildInputs runtimeLibs hdf5C;
+  inherit (deps) buildInputs nativeBuildInputs runtimeLibs;
 
   commonArgs = {
     inherit src buildInputs nativeBuildInputs;
     strictDeps = true;
+    dontUseCmakeConfigure = true;
     pname = "sorrel";
     # One version source: simit release bumps the workspace manifest.
     version = (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package.version;
@@ -35,27 +36,16 @@
       "$out/share/icons/hicolor/256x256/apps/sorrel.png"
   '';
 
-  sorrelHdf5 =
-    if pkgs.stdenv.hostPlatform.isLinux
-    then
-      craneLib.buildPackage (commonArgs
-        // {
-          inherit cargoArtifacts;
-          buildInputs = buildInputs ++ [hdf5C];
-          HDF5_DIR = "${hdf5C}";
-          cargoExtraArgs = "-p sorrel --locked --features hdf5";
-          nativeBuildInputs = nativeBuildInputs ++ [pkgs.installShellFiles];
-          postInstall = completions;
-          postFixup = rpathFixup;
-        })
-    else null;
-
   sorrel = craneLib.buildPackage (commonArgs
     // {
       inherit cargoArtifacts;
       cargoExtraArgs = "-p sorrel --locked";
       nativeBuildInputs = nativeBuildInputs ++ [pkgs.installShellFiles];
-      postInstall = completions;
+      postInstall =
+        completions
+        + ''
+          install -Dm644 ${../crates/sorrel/THIRD-PARTY-HDF5.txt} "$out/share/licenses/sorrel/THIRD-PARTY-HDF5.txt"
+        '';
       # Add an rpath so the binary finds vulkan/wayland/etc. without
       # leaking the dev shell's LD_LIBRARY_PATH.
       postFixup = rpathFixup;
@@ -83,5 +73,5 @@
       };
     });
 in {
-  inherit sorrel sorrelHdf5 sorrelRelay commonArgs cargoArtifacts;
+  inherit sorrel sorrelRelay commonArgs cargoArtifacts;
 }

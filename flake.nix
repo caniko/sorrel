@@ -58,7 +58,6 @@
           "formatting"
           "hm-module"
           "workspace-tests"
-          "sorrel-hdf5"
           "hdf5-tests"
           "dev-tests"
           "binstall-metadata"
@@ -355,7 +354,6 @@
         inherit pkgs craneLib src deps;
       };
       inherit (rustPackages) sorrel sorrelRelay commonArgs cargoArtifacts;
-      sorrelHdf5 = rustPackages.sorrelHdf5 or null;
 
       sorrelVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
       crossSorrelPackages = harbor-rs.lib.mkCrossPackages {
@@ -366,6 +364,7 @@
           inherit src;
           version = sorrelVersion;
           strictDeps = true;
+          dontUseCmakeConfigure = true;
           inherit (deps) nativeBuildInputs;
           # sorrel-relay rides along in every archive (cargo binstall
           # sorrel-remote); crane installs every executable in the build log.
@@ -464,7 +463,17 @@
 
       releaseSmoke = pkgs.writeShellApplication {
         name = "sorrel-release-smoke";
-        runtimeInputs = with pkgs; [coreutils diffutils file findutils gnugrep gzip gnutar unzip];
+        runtimeInputs = with pkgs;
+          [coreutils diffutils file findutils gnugrep gzip gnutar unzip]
+          ++ lib.optional (system == "x86_64-linux") qemu-user;
+        runtimeEnv =
+          {SORREL_NWB_FIXTURE = "${./release/fixtures/nwb/good.nwb}";}
+          // pkgs.lib.optionalAttrs (system == "x86_64-linux") (let
+            arm = pkgs.pkgsCross.aarch64-multiplatform;
+          in {
+            SORREL_ARM_LD = "${arm.glibc}/lib/ld-linux-aarch64.so.1";
+            SORREL_ARM_LIBS = pkgs.lib.makeLibraryPath [arm.glibc arm.stdenv.cc.cc.lib];
+          });
         text = ''
           exec bash ${./release/smoke.sh} "$@"
         '';
@@ -498,7 +507,6 @@
         }
         // crossSorrelPackages
         // crossSorrelPyPackages
-        // pkgs.lib.optionalAttrs (sorrelHdf5 != null) {inherit sorrelHdf5;}
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux portable
         // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           release-bundle = import ./nix/release.nix {
@@ -534,8 +542,8 @@
 
       checks =
         (import ./nix/checks.nix {
-          inherit pkgs craneLib commonArgs cargoArtifacts sorrel sorrelHdf5 testSrc;
-          inherit (deps) runtimeLibs hdf5C;
+          inherit pkgs craneLib commonArgs cargoArtifacts sorrel testSrc;
+          inherit (deps) runtimeLibs;
           hmModule = self.homeManagerModules.default;
         })
         // {

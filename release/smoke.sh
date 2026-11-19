@@ -4,6 +4,7 @@ trap 'echo "release smoke check failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 VERSION="${1:?usage: smoke.sh VERSION RELEASE_DIR}"
 RELEASE_DIR="${2:?usage: smoke.sh VERSION RELEASE_DIR}"
+NWB_FIXTURE=${SORREL_NWB_FIXTURE:-$(realpath "$(dirname "${BASH_SOURCE[0]}")/fixtures/nwb/good.nwb")}
 
 cd "$RELEASE_DIR"
 
@@ -53,5 +54,37 @@ done
 
 file "sorrel-${VERSION}-x86_64.AppImage" | grep -Eiq 'executable|appimage|squashfs'
 test -x "sorrel-${VERSION}-x86_64.AppImage"
+
+# Exercise the archived executable, not a local Cargo build. `describe`
+# opens the dataset and reads its units without starting a GUI or GPU.
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+cp "$NWB_FIXTURE" "$tmp/good.nwb"
+describe_nwb() {
+  "$@" describe "$tmp/good.nwb" --json > "$tmp/describe.json"
+  grep -F '"# spikes": "5"' "$tmp/describe.json"
+}
+for arch in x86_64 aarch64; do
+  tar -xOzf "sorrel-${VERSION}-${arch}-linux.tar.gz" ./sorrel > "$tmp/sorrel-$arch"
+  unzip -p "sorrel_ephys-${VERSION}-cp38-abi3-manylinux_2_34_${arch}.whl" \
+    "sorrel_ephys-${VERSION}.data/scripts/sorrel" | cmp - "$tmp/sorrel-$arch"
+  chmod +x "$tmp/sorrel-$arch"
+  if [[ $(uname -m) == "$arch" ]]; then
+    describe_nwb "$tmp/sorrel-$arch"
+  elif [[ $arch == aarch64 ]]; then
+    describe_nwb qemu-aarch64 "${SORREL_ARM_LD:?use nix run .#release-smoke}" \
+      --library-path "$SORREL_ARM_LIBS" "$tmp/sorrel-$arch"
+  fi
+done
+unzip -p "sorrel_ephys-${VERSION}-cp38-abi3-win_amd64.whl" \
+  "sorrel_ephys-${VERSION}.data/scripts/sorrel.exe" | cmp - "sorrel-${VERSION}-x86_64-windows.exe"
+tar -xOzf "sorrel-${VERSION}-aarch64-darwin.tar.gz" ./sorrel > "$tmp/sorrel-darwin"
+unzip -p "sorrel_ephys-${VERSION}-cp38-abi3-macosx_11_0_arm64.whl" \
+  "sorrel_ephys-${VERSION}.data/scripts/sorrel" | cmp - "$tmp/sorrel-darwin"
+if [[ $(uname -m) == x86_64 ]]; then
+  appimage=$(realpath "sorrel-${VERSION}-x86_64.AppImage")
+  (cd "$tmp"; "$appimage" --appimage-extract AppRun)
+  cmp "$tmp/squashfs-root/AppRun" "$tmp/sorrel-x86_64"
+fi
 
 printf 'release smoke checks passed for Sorrel %s\n' "$VERSION"

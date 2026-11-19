@@ -25,7 +25,7 @@
       nativeBuildInputs = [pkgs.cargo-zigbuild pkgs.zig pkgs.cmake];
       # aws-lc-sys (via libp2p-quic) links s2n-bignum's assembly with
       # unresolvable symbols under its cc builder + zig; its CMake builder
-      # links cleanly. cmake is only for that, not for configurePhase.
+      # links cleanly. Cargo uses CMake for aws-lc and HDF5.
       AWS_LC_SYS_CMAKE_BUILDER = "1";
       dontUseCmakeConfigure = true;
       cargoBuildCommand = "cargo zigbuild --profile release --target ${rustTarget}.${glibc}";
@@ -53,6 +53,7 @@
   appimage = pkgs.runCommand "sorrel-${version}.AppImage" {nativeBuildInputs = [pkgs.squashfsTools];} ''
     mkdir -p AppDir
     install -m755 ${x86_64}/bin/sorrel AppDir/AppRun
+    install -m644 ${../crates/sorrel/THIRD-PARTY-HDF5.txt} AppDir/THIRD-PARTY-HDF5.txt
     install -m644 ${desktop} AppDir/sorrel.desktop
     install -m644 ${../assets/icon/sorrel-256.png} AppDir/sorrel.png
     ln -s sorrel.png AppDir/.DirIcon

@@ -73,6 +73,18 @@ Assert-Ok 'version' (Invoke-Native 'version' $exe @('--version'))
 $got = (Get-Content (Join-Path $OutDir 'version.out.txt') -Raw).Trim()
 if ($got -ne "sorrel $version") { throw "sorrel.exe --version is '$got', expected 'sorrel $version'" }
 
+# The NWB fixture has five spikes. Copy it because opening creates a sidecar.
+$nwbDir = Join-Path ([IO.Path]::GetTempPath()) "sorrel-nwb-$PID"
+New-Item -ItemType Directory $nwbDir | Out-Null
+$nwb = Join-Path $nwbDir 'good.nwb'
+Copy-Item (Join-Path $repo 'release\fixtures\nwb\good.nwb') $nwb
+try {
+    Assert-Ok 'describe-nwb' (Invoke-Native 'describe-nwb' $exe @('describe', $nwb, '--json'))
+    $nwbInfo = Get-Content (Join-Path $OutDir 'describe-nwb.out.txt') -Raw | ConvertFrom-Json
+    if ($nwbInfo.'# spikes' -ne '5') { throw 'NWB fixture should have five spikes' }
+}
+finally { Remove-Item -Recurse -Force $nwbDir }
+
 # 2. gpu-check: real FXC/DX12 (WARP on a runner without a GPU) must build the
 #    compute kernels and match the CPU. Exit 0 is the contract.
 Assert-Ok 'gpu-check' (Invoke-Native 'gpu-check' $exe @('gpu-check'))
