@@ -454,6 +454,62 @@ fn units_only_have_no_trace_and_use_resolution_or_sample_rate() {
     }
 }
 
+#[cfg(feature = "hdf5")]
+#[test]
+fn later_series_never_inherits_a_linked_earlier_series_legacy_seal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy-linked.nwb");
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    const SELECTED: &str = "/acquisition/ElectricalSeriesRaw";
+    let open = || {
+        NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                series: Some(SELECTED),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(open().identity_bytes().len(), 32);
+
+    let file = hdf5_metno::File::open_rw(&path).unwrap();
+    let earlier = file.create_group("/acquisition/AClock").unwrap();
+    let ty = file
+        .group(SELECTED)
+        .unwrap()
+        .attr("neurodata_type")
+        .unwrap()
+        .read_scalar::<hdf5_metno::types::VarLenUnicode>()
+        .unwrap();
+    earlier
+        .new_attr::<hdf5_metno::types::VarLenUnicode>()
+        .create("neurodata_type")
+        .unwrap()
+        .write_scalar(&ty)
+        .unwrap();
+    let start = earlier
+        .new_dataset::<f64>()
+        .create("starting_time")
+        .unwrap();
+    start.write_scalar(&0.5).unwrap();
+    start
+        .new_attr::<f64>()
+        .create("rate")
+        .unwrap()
+        .write_scalar(&2000.0)
+        .unwrap();
+    for target in ["/acquisition/ElectricalSeriesRaw/data", "/missing"] {
+        earlier.link_soft(target, "data").unwrap();
+        file.flush().unwrap();
+        let p = open();
+        assert_eq!(p.sample_rate(), 1000.0);
+        let seal = p.identity_bytes();
+        assert_eq!(seal.get(32..32 + SELECTED.len()), Some(SELECTED.as_bytes()));
+        earlier.unlink("data").unwrap();
+    }
+}
+
 #[test]
 fn paired_raw_uses_its_series_channels_and_time_base() {
     for format in FORMATS {
@@ -597,6 +653,60 @@ mod zarr_tests {
             } else {
                 fs::copy(entry.path(), target).unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn zarr_clock_choice_is_exact_and_clock_arrays_require_little_endian_floats() {
+        use serde_json::{json, Value};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("clocks.nwb.zarr");
+        copy_store(&Format::Zarr.fixture("good.nwb"), &store);
+        fs::remove_file(store.join(".zmetadata")).unwrap();
+        let spikes = store.join("units/spike_times");
+        let resolution = 1000.0005_f64.recip();
+        let attrs = spikes.join(".zattrs");
+        let mut json: Value = serde_json::from_slice(&fs::read(&attrs).unwrap()).unwrap();
+        json["resolution"] = json!(resolution);
+        fs::write(attrs, json.to_string()).unwrap();
+        let array = spikes.join(".zarray");
+        let mut meta: Value = serde_json::from_slice(&fs::read(&array).unwrap()).unwrap();
+        meta["compressor"] = Value::Null;
+        fs::write(&array, meta.to_string()).unwrap();
+        fs::write(
+            spikes.join("0"),
+            [0.600499975_f64, 0.7, 0.75, 0.55, 0.79]
+                .map(f64::to_le_bytes)
+                .concat(),
+        )
+        .unwrap();
+        let open = |sample_rate| {
+            NwbProvider::open_with(
+                &store,
+                NwbOpenParams {
+                    sample_rate,
+                    ..Default::default()
+                },
+            )
+        };
+        let err = open(None).err().expect("ambiguous clocks");
+        assert!(format!("{err:#}").contains("100 vs 101"), "{err:#}");
+        let series = open(Some(1000.0)).unwrap();
+        let units = open(Some(resolution.recip())).unwrap();
+        assert_eq!(series.spike_times(ClusterId(0))[0], SampleIndex(100));
+        assert_eq!(units.spike_times(ClusterId(0))[0], SampleIndex(101));
+        assert_ne!(series.identity_bytes(), units.identity_bytes());
+        let err = open(Some(1000.0_f64.next_up()))
+            .err()
+            .expect("undeclared rate");
+        assert!(err.to_string().contains("is not a clock this NWB declares"));
+
+        for dtype in [">f8", "<i8"] {
+            meta["dtype"] = json!(dtype);
+            fs::write(&array, meta.to_string()).unwrap();
+            let err = open(Some(1000.0)).err().expect(dtype);
+            assert!(format!("{err:#}").contains("/units/spike_times must be stored as Zarr v2 little-endian IEEE float32 or float64"), "{err:#}");
         }
     }
 

@@ -219,9 +219,9 @@ supported. Sorrel refuses filters other than variable-length string encodings
 and the JSON encoding used for cached NWB specifications. If `.zmetadata` is
 present, it must match the individual metadata files. The
 `zarr` feature is on by default in `sorrel`. `--dat` can pair an HDF5 file with
-a Zarr store in either direction when both features are built. Rates in Zarr
-attributes are JSON numbers without a stored float width, so the float32 rate
-exception applies only to HDF5. External links and references are not followed;
+a Zarr store in either direction when both features are built. The same exact
+clock rules apply: Zarr clock attributes are finite JSON numbers read as
+float64, and clock arrays must use little-endian `<f4` or `<f8`. External links and references are not followed;
 even same-store `zarr_link` aliases are refused for the clock and spike-mapping
 columns, like HDF5 soft links. Pickled columns are not decoded. Journals live
 next to the store. Its seal hashes metadata contents and the paths, sizes and

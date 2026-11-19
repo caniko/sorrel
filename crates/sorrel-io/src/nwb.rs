@@ -114,8 +114,7 @@ mod imp {
                 let data = series.dataset("data")?;
                 let shape = data.shape();
                 let (n_samples, n_channels) = (shape[0], shape.get(1).copied().unwrap_or(1));
-                let (stored_rate, t0, timestamps) =
-                    read_time_base(recording, name, n_samples)?;
+                let (stored_rate, t0, timestamps) = read_time_base(recording, name, n_samples)?;
                 let units_clock = if let Some(declared) = units_rate {
                     // The one-ppm gate decides whether resolution declares a clock,
                     // not whether an explicit value matches that clock.
@@ -397,7 +396,12 @@ mod imp {
             }
         }
         let mut out = HashMap::new();
-        let specs = f.group("/specifications").and_then(|g| g.groups());
+        let specs = if legacy {
+            f.legacy_group("/specifications")
+        } else {
+            f.optional_group("/specifications")
+        }
+        .and_then(|g| g.context("missing specifications")?.groups());
         for version in specs
             .into_iter()
             .flatten()
@@ -435,24 +439,32 @@ mod imp {
         let Some(name) = selected.strip_prefix("/acquisition/") else {
             return false;
         };
-        let Ok(acq) = f.group("/acquisition") else {
+        let Ok(Some(acq)) = f.legacy_group("/acquisition") else {
             return false;
         };
         let Ok(names) = acq.member_names() else {
             return false;
         };
         let parents = type_parents(f, true);
-        names
-            .into_iter()
-            .find(|name| {
-                let Ok(g) = acq.group(name) else { return false };
-                g.attr("neurodata_type")
-                    .ok()
-                    .and_then(|a| a.legacy_string().ok())
-                    .is_some_and(|t| is_electrical_series(&t, &parents))
-                    && g.dataset("data").is_ok_and(|d| d.ndim() == 2)
-            })
-            .is_some_and(|first| first == name)
+        for candidate in names {
+            let g = match acq.legacy_group(&candidate) {
+                Ok(Some(g)) => g,
+                Ok(None) => continue,
+                Err(_) => return false, // Can't rule out an earlier group.
+            };
+            let ty = match g.optional_attr("neurodata_type") {
+                Ok(attr) => attr.and_then(|a| a.legacy_string().ok()),
+                Err(_) => return false,
+            };
+            if ty.is_some_and(|t| is_electrical_series(&t, &parents)) {
+                match g.legacy_dataset_rank("data") {
+                    Ok(Some(2)) => return candidate == name,
+                    Ok(_) => (),
+                    Err(_) => return false, // Might have been trunk's series.
+                }
+            }
+        }
+        false
     }
 
     fn find_electrical_series(

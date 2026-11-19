@@ -140,6 +140,25 @@ impl Group {
         dispatch!(self, Self, _g => true, false)
     }
 
+    // Historical lookups only: never use these to choose or load current data.
+    pub fn legacy_group(&self, name: &str) -> Result<Option<Self>> {
+        dispatch!(self, Self, g => {
+            if !g.link_exists(name) || g.loc_type_by_name(name)? != h5::LocationType::Group {
+                return Ok(None);
+            }
+            Ok(Some(Self::Hdf5(g.group(name)?)))
+        }, { let _ = name; Ok(None) })
+    }
+
+    pub fn legacy_dataset_rank(&self, name: &str) -> Result<Option<usize>> {
+        dispatch!(self, Self, g => {
+            if !g.link_exists(name) || g.loc_type_by_name(name)? != h5::LocationType::Dataset {
+                return Ok(None);
+            }
+            Ok(Some(g.dataset(name)?.ndim()))
+        }, { let _ = name; Ok(None) })
+    }
+
     pub fn identity(&self, path: &Path) -> Result<Vec<u8>> {
         dispatch!(self, Self, _g => Ok(hdf::identity(path)), zarr::identity(path))
     }
