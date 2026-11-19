@@ -61,6 +61,7 @@
           "sorrel-hdf5"
           "hdf5-tests"
           "dev-tests"
+          "nwb-export-assets"
           "binstall-metadata"
           "binstall-metadata-sorrel-remote"
         ];
