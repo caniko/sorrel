@@ -624,9 +624,17 @@ fn detect_backend(root: &Path) -> Result<Backend> {
     );
 }
 
-/// Apply SpikeGLX/Open Ephys metadata overrides to a `KilosortOpenParams`,
-/// preserving any explicit CLI overrides the user supplied.
-fn apply_recording_overrides(open: &OpenArgs, p: &mut KilosortOpenParams) -> Result<()> {
+/// Merge explicit CLI overrides with SpikeGLX/Open Ephys recording metadata.
+/// The provider fills any remaining defaults from `params.py`.
+fn kilosort_open_params(open: &OpenArgs) -> Result<KilosortOpenParams> {
+    let mut p = KilosortOpenParams {
+        sample_rate: open.sample_rate,
+        n_channels: open.n_channels,
+        dtype: open.dtype,
+        offset: open.offset,
+        dat_path: open.dat.clone(),
+        ..Default::default()
+    };
     if let Some(meta_path) = &open.spikeglx_meta {
         let meta = SpikeGlxMeta::read(meta_path)
             .with_context(|| format!("read spikeglx meta {}", meta_path.display()))?;
@@ -647,7 +655,7 @@ fn apply_recording_overrides(open: &OpenArgs, p: &mut KilosortOpenParams) -> Res
             p.dat_path = Some(stream.dat_path(oebin_path.parent().unwrap_or(Path::new("."))));
         }
     }
-    Ok(())
+    Ok(p)
 }
 
 /// Where a session's artifacts go, how its journal is treated on save, and
@@ -697,16 +705,7 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
     };
     match backend {
         Backend::Kilosort => {
-            let mut params = KilosortOpenParams {
-                sample_rate: open.sample_rate.map(|r| r as f32),
-                n_channels: open.n_channels,
-                dtype: open.dtype,
-                offset: open.offset,
-                dat_path: open.dat.clone(),
-                ..Default::default()
-            };
-            apply_recording_overrides(open, &mut params)?;
-            let (session, ctx) = open_kilosort(open, params)?;
+            let (session, ctx) = open_kilosort(open, kilosort_open_params(open)?)?;
             v.visit(session, Box::new(seed_kilosort), ctx)
         }
         Backend::SortingAnalyzer => {
@@ -842,16 +841,7 @@ fn run_share(open: &OpenArgs, port: u16, relay: Option<sorrel_remote::Multiaddr>
         // into RAM); add them when someone needs to share one.
         bail!("remote share supports kilosort/phy datasets");
     }
-    let mut params = KilosortOpenParams {
-        sample_rate: open.sample_rate.map(|r| r as f32),
-        n_channels: open.n_channels,
-        dtype: open.dtype,
-        offset: open.offset,
-        dat_path: open.dat.clone(),
-        ..Default::default()
-    };
-    apply_recording_overrides(open, &mut params)?;
-    let (mut session, ctx) = open_kilosort(open, params)?;
+    let (mut session, ctx) = open_kilosort(open, kilosort_open_params(open)?)?;
     seed_kilosort(&mut session)?;
     let p = &session.provider;
     let dat = sorrel_remote::DatSource {

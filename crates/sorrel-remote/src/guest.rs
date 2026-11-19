@@ -131,7 +131,7 @@ pub fn join(code: &PairingCode, mode: &Mode, into: &Path) -> Result<Joined> {
         let provider = KilosortProvider::open(
             into,
             KilosortOpenParams {
-                sample_rate: Some(info.dat.sample_rate),
+                sample_rate: Some(f64::from(info.dat.sample_rate)),
                 n_channels: Some(info.dat.n_channels),
                 dtype: Some(dtype),
                 offset: Some(0),

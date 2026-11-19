@@ -19,7 +19,7 @@ use std::path::Path;
 #[derive(Debug, Clone)]
 pub struct SpikeGlxMeta {
     /// Saved sample rate (Hz). `imSampRate` for IMEC, `niSampRate` for NI-DAQ.
-    pub sample_rate: f32,
+    pub sample_rate: f64,
     /// Total channels saved per timepoint (the `nSavedChans` field).
     pub n_channels: u32,
     /// Always int16 in SpikeGLX, kept for parity with [`TraceDtype`].
@@ -51,7 +51,7 @@ impl SpikeGlxMeta {
         let sample_rate = raw
             .get("imSampRate")
             .or_else(|| raw.get("niSampRate"))
-            .and_then(|s| s.parse::<f32>().ok())
+            .and_then(|s| s.parse().ok())
             .or_else(|| raw.get("sRateHz").and_then(|s| s.parse().ok()))
             .ok_or_else(|| anyhow::anyhow!("spikeglx meta: no imSampRate/niSampRate field"))?;
 
