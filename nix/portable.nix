@@ -31,7 +31,14 @@
       cargoBuildCommand = "cargo zigbuild --profile release --target ${rustTarget}.${glibc}";
       # sorrel-relay ships in the same tarball: `cargo binstall sorrel-remote`
       # needs it next to sorrel's binaries.
-      cargoExtraArgs = "-p sorrel -p sorrel-remote --locked";
+      # Zig 0.16 emits unresolved relocations in the optimized C/C++
+      # archives linked by blosc-src. Keep the workaround local to these
+      # packages; Sorrel and the rest of the build still use release flags.
+      cargoExtraArgs =
+        "-p sorrel -p sorrel-remote --locked"
+        + pkgs.lib.concatMapStrings
+        (name: " --config profile.release.package.${name}.opt-level=0")
+        ["libz-sys" "lz4-sys" "snappy_src" "zstd-sys"];
       doCheck = false;
       preBuild = ''
         export HOME=$TMPDIR ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local
