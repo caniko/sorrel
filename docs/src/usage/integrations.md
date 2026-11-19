@@ -156,8 +156,10 @@ What Sorrel reads:
   `/processing`, with 2-D `data` (time × channels) or 1-D `data` (one channel).
   By default it prefers 2-D series, then takes the first series by path
   (acquisitions before processed series), and logs the available paths when there is
-  more than one. `--nwb-series` takes an acquisition name or an absolute path
-  in the NWB file, not a filesystem path. Use a separate `--journal` when
+  more than one. Linked series and linked datasets used by the reader are
+  refused; open the file or store that holds the data directly. `--nwb-series`
+  takes an acquisition name or an absolute path in the NWB file, not a
+  filesystem path. Use a separate `--journal` when
   curating against another series or a different paired recording. To reuse
   an open tab or attach `call` or `mcp` to its host, pass the same open options;
   conflicting options are refused rather than silently ignored.
