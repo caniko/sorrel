@@ -1,7 +1,10 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "spikeinterface[full]>=0.105",
+#   "spikeinterface[full]>=0.105; sys_platform != 'win32' or platform_machine != 'ARM64'",
+#   # ponytail: SI 0.106 needs zarr 3 -> numcodecs >=0.16.6, which has no win_arm64
+#   # wheel and fails to build from source there; drop once numcodecs ships one.
+#   "spikeinterface[full]>=0.105,<0.106; sys_platform == 'win32' and platform_machine == 'ARM64'",
 #   "skops",
 #   "huggingface_hub",
 #   "anthropic",
