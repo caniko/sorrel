@@ -1,4 +1,12 @@
 //! Stable firing-rate and amplitude epochs.
+//!
+//! Exact optimal partitioning of 100 recording bins with a bounded
+//! (biweight) loss, after Fearnhead & Rigaill (2019), "Changepoint detection
+//! in the presence of outliers", JASA 114(525):169–183,
+//! doi:10.1080/01621459.2017.1385466. Each series is standardized by a noise
+//! scale taken from the median absolute first difference between bins, so
+//! overdispersion from bursts, quantized amplitudes and correlated spikes is
+//! measured from the data rather than assumed away.
 
 use sorrel_io::SampleIndex;
 
@@ -18,191 +26,158 @@ pub struct Epoch {
 const BINS: usize = 100;
 const MIN_BINS: usize = 5;
 const MIN_SPIKES: usize = 2 * MIN_BINS;
-// Twenty residual degrees of freedom give a noise estimate with ~32% relative
-// standard error under Gaussian noise, rather than relying on a few pairs.
-const MIN_AMP_DF: u32 = 20;
+/// Consecutive nonempty bin pairs needed to estimate the amplitude noise.
+const MIN_AMP_PAIRS: usize = 20;
+/// Squared biweight threshold, K = 3 noise standard deviations as in
+/// Fearnhead & Rigaill's simulations.
+const K2: f64 = 9.0;
+/// Standard deviation per median absolute value of a centred Gaussian.
+const MAD_TO_SD: f64 = 1.482_602_218_505_602;
 
-#[derive(Default, Clone, Copy)]
-struct Stats {
-    n: u32,
-    mean: f64,
-    ss: f64,
+/// One standardized bin: its loss is `min(w (y - θ)², K²)`.
+#[derive(Clone, Copy)]
+struct Point {
+    y: f64,
+    w: f64,
 }
 
-impl Stats {
-    // Weighted Welford update, used for individual amplitudes (n=1) and for
-    // bin means (weighted by spike count). Avoids subtracting large squares.
-    fn add(&mut self, mean: f64, n: u32) {
-        if n > 0 {
-            let delta = mean - self.mean;
-            let weight = f64::from(n) / f64::from(self.n + n);
-            self.ss += delta * delta * weight * f64::from(self.n);
-            self.mean += delta * weight;
-            self.n += n;
-        }
+/// Where a point enters (`w > 0`) or leaves (`w < 0`) the inlier set as θ increases.
+#[derive(Clone, Copy)]
+struct Event {
+    at: f64,
+    y: f64,
+    w: f64,
+}
+
+/// Add a point's two events to a list kept sorted by position.
+fn insert(events: &mut Vec<Event>, p: Point) {
+    let h = (K2 / p.w).sqrt();
+    for e in [
+        Event {
+            at: p.y - h,
+            y: p.y,
+            w: p.w,
+        },
+        Event {
+            at: p.y + h,
+            y: p.y,
+            w: -p.w,
+        },
+    ] {
+        let i = events.partition_point(|x| x.at <= e.at);
+        events.insert(i, e);
     }
 }
 
-fn poisson_cap(mean: u32) -> u32 {
-    // Sum mass relative to the mode so a large mean cannot underflow the seed.
-    let mode = mean;
-    let mean = f64::from(mean);
-    let mut cdf = 1.0;
-    let mut mass = 1.0;
-    for k in (1..=mode).rev() {
-        mass *= f64::from(k) / mean;
-        cdf += mass;
-        if mass <= f64::EPSILON * cdf {
-            break;
+/// Exact `min over θ of Σ min(w (y - θ)², K²)` for the points behind `events`.
+/// Between consecutive events the inlier set is fixed, so the loss is a
+/// quadratic minimized at the inlier weighted mean clamped to the interval;
+/// every other point costs K². The loss is continuous in θ, so ties between
+/// events need no particular order. Inlier sums are kept relative to the
+/// current event, where every inlier lies within 2K/√w, to avoid cancellation.
+fn biweight_min(events: &[Event], points: usize) -> f64 {
+    let mut best = K2 * points as f64;
+    let (mut a, mut b, mut c, mut inliers) = (0.0, 0.0, 0.0, 0_usize);
+    let mut at = 0.0;
+    for (k, e) in events.iter().enumerate() {
+        if inliers > 0 {
+            let d = e.at - at;
+            c += d * (a * d - 2.0 * b);
+            b -= a * d;
         }
-    }
-    let mut total = cdf;
-    mass = 1.0;
-    for k in mode + 1.. {
-        mass *= mean / f64::from(k);
-        total += mass;
-        if mass <= f64::EPSILON * total {
-            break;
-        }
-    }
-    let mut k = mode;
-    mass = 1.0;
-    while cdf < 0.999 * total {
-        k += 1;
-        mass *= mean / f64::from(k);
-        cdf += mass;
-    }
-    k.max(3) // Allow a few spikes even if the local median is zero.
-}
-
-/// Estimate each bin's baseline from the median (rounded down) of six nearby
-/// bins, three on each side outside the bin and its immediate neighbours.
-/// Take more from the other side near recording ends. A run of at least three
-/// bins above their individual Poisson caps is left alone. Otherwise apply the
-/// individual cap and, for adjacent bins both above baseline, cap their sum
-/// using the sum of their baselines as the Poisson mean. Share that budget in
-/// proportion to each bin's excess, rounding down and taking the tighter cap
-/// if pairs overlap. All caps use the 99.9th percentile with a floor of three.
-fn capped_counts(bins: &[Stats; BINS]) -> [u32; BINS] {
-    const FLANKS: usize = 6;
-    let raw = bins.map(|bin| bin.n);
-    let baseline: [_; BINS] = std::array::from_fn(|b| {
-        let gap_start = b.saturating_sub(1);
-        let gap_len = (b + 2).min(BINS) - gap_start;
-        // Center and clamp the window in the index space with the gap removed.
-        let start = gap_start
-            .saturating_sub(FLANKS / 2)
-            .min(BINS - gap_len - FLANKS);
-        let mut window: [_; FLANKS] = std::array::from_fn(|i| {
-            let i = start + i;
-            raw[if i < gap_start { i } else { i + gap_len }]
-        });
-        window.sort_unstable();
-        window[FLANKS / 2 - 1].midpoint(window[FLANKS / 2])
-    });
-    let caps = baseline.map(poisson_cap);
-    let outliers: [_; BINS] = std::array::from_fn(|b| raw[b] > caps[b]);
-    let mut sustained = [false; BINS];
-    for (b, triple) in outliers.windows(3).enumerate() {
-        if triple.iter().all(|&outlier| outlier) {
-            sustained[b..b + 3].fill(true);
-        }
-    }
-
-    let mut counts = std::array::from_fn(|b| {
-        if sustained[b] {
-            raw[b]
+        at = e.at;
+        let r = e.y - at;
+        a += e.w;
+        b += e.w * r;
+        c += e.w * r * r;
+        if e.w > 0.0 {
+            inliers += 1;
         } else {
-            raw[b].min(caps[b])
-        }
-    });
-    for a in 0..BINS - 1 {
-        let b = a + 1;
-        if sustained[a] || sustained[b] || raw[a] <= baseline[a] || raw[b] <= baseline[b] {
-            continue;
-        }
-        let mean = baseline[a] + baseline[b];
-        let cap = poisson_cap(mean);
-        let sum = raw[a] + raw[b];
-        if sum > cap {
-            for i in [a, b] {
-                let share =
-                    u64::from(raw[i] - baseline[i]) * u64::from(cap - mean) / u64::from(sum - mean);
-                counts[i] = counts[i].min(baseline[i] + share as u32);
+            inliers -= 1;
+            if inliers == 0 {
+                (a, b, c) = (0.0, 0.0, 0.0);
             }
         }
+        if inliers > 0 {
+            let len = events.get(k + 1).map_or(0.0, |next| next.at - at);
+            let t = (b / a).clamp(0.0, len);
+            let q = (c - t * (2.0 * b - t * a)).max(0.0);
+            best = best.min(q + K2 * (points - inliers) as f64);
+        }
     }
-    counts
+    best
 }
 
-fn dispersion(counts: &[u32; BINS]) -> f64 {
-    // Pool squared differences at lags 1..=5 bins to capture short runs of
-    // elevated firing, not just isolated bursts. Winsorize at the 90th
-    // percentile: a single abrupt step crosses at most 15 pairs, less than
-    // the top decile. For stationary Poisson counts, E[Δ²] = 2 × mean count;
-    // winsorizing chi-square(1) at its 90th percentile retains ~0.831 of that.
-    let mut differences = Vec::new();
-    for lag in 1..=MIN_BINS {
-        differences.extend(
-            counts
-                .iter()
-                .zip(&counts[lag..])
-                .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2)),
-        );
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_unstable_by(f64::total_cmp);
+    let m = v.len() / 2;
+    if v.len() % 2 == 1 {
+        v[m]
+    } else {
+        v[m - 1].midpoint(v[m])
     }
-    differences.sort_unstable_by(f64::total_cmp);
-    let cap = differences[9 * (differences.len() - 1) / 10];
-    let mean_diff = differences.iter().map(|&d| d.min(cap)).sum::<f64>() / differences.len() as f64;
-    let mean_count = counts.iter().map(|&n| f64::from(n)).sum::<f64>() / BINS as f64;
-    (mean_diff / (0.831 * 2.0 * mean_count)).max(1.0)
 }
 
-fn amp_variance(bins: &[Stats]) -> Option<f64> {
-    // Pool spike-level within-bin sample variances by degrees of freedom,
-    // winsorizing at their 90th percentile so isolated noisy bins don't set
-    // the scale. Singleton and empty bins cannot estimate within-bin noise.
-    let mut variances: Vec<_> = bins
-        .iter()
-        .filter(|b| b.n > 1)
-        .map(|b| (b.ss / f64::from(b.n - 1), f64::from(b.n - 1)))
-        .collect();
-    if variances.iter().map(|&(_, df)| df).sum::<f64>() < f64::from(MIN_AMP_DF) {
-        return None;
-    }
-    variances.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-    let cap = variances[(9 * (variances.len() - 1)).div_ceil(10)].0;
-    let (ss, df) = variances.iter().fold((0.0, 0.0), |(ss, df), &(v, w)| {
-        (ss + v.min(cap) * w, df + w)
-    });
-    // A digitized signal can have zero within-bin noise. Use one f32 epsilon
-    // at the mean-amplitude scale as a floor rather than dividing by zero.
-    let scale = bins
-        .iter()
-        .map(|b| b.mean.abs())
-        .fold(f64::from(f32::MIN_POSITIVE), f64::max);
-    Some((ss / df).max((scale * f64::from(f32::EPSILON)).powi(2)))
-}
-
-/// Fit constant rate and (if available) amplitude over 100 equal recording
-/// bins, with at least five bins per segment. Each fitted level costs
-/// ln(spikes) (one rate per segment, one amplitude per nonempty segment if
-/// enabled). Searching over boundary locations also incurs a penalty: charge
-/// 2 ln(91) per boundary, the cost of coding a location uniformly among the
-/// 91 possible interior edges on the deviance scale. This avoids treating the
-/// best of many candidate edges as a prespecified edge and is additive for DP.
+/// Robust noise scale of a series of `(value, weight)` points. Each
+/// difference scaled by `sqrt(w_i w_j / (w_i + w_j))` has the unit-weight
+/// scale σ for independent points. `v(k)` is the robust variance of those
+/// differences at lag k: the squared Gaussian-consistent MAD of the absolute
+/// differences (not centred, so periodic or quantized series do not give
+/// zero), or of their mean absolute value if the median is zero. Isolated
+/// outliers and a few steps barely move either.
 ///
-/// For rate fitting only, cap isolated high counts and jointly cap adjacent
-/// elevated bins using Poisson limits from the surrounding counts (see
-/// `capped_counts`). This limits brief bursts without flattening sustained
-/// rate changes. Scale the rate deviance by the winsorized short-lag
-/// dispersion of the capped counts (at least one). Report raw counts and rates;
-/// neither the amplitude fit nor its reported means use capped counts.
+/// For independent bins v(1) = σ². With `long_run`, allow for a lag-one
+/// correlation r between bins (spike amplitudes correlated across a bin
+/// edge), which shrinks v(1) to σ²(1 − r) while v(3) ≈ σ² once the
+/// correlation has died out: return the larger of v(1) and the lag-one
+/// long-run variance σ²(1 + 2r) = 3 v(3) − 2 v(1), the spread that segment
+/// means actually have.
+fn noise_scale(points: &[(f64, f64)], long_run: bool) -> f64 {
+    let v = |lag: usize| {
+        let d: Vec<f64> = points
+            .iter()
+            .zip(&points[lag..])
+            .map(|(p, q)| (q.0 - p.0).abs() * (p.1 * q.1 / (p.1 + q.1)).sqrt())
+            .collect();
+        let mean_abs = d.iter().sum::<f64>() / d.len() as f64;
+        let mad = MAD_TO_SD * median(d);
+        let s = if mad > 0.0 {
+            mad
+        } else {
+            (std::f64::consts::PI / 2.0).sqrt() * mean_abs
+        };
+        s * s
+    };
+    let v1 = v(1);
+    if long_run {
+        v1.max(3.0 * v(3) - 2.0 * v1).sqrt()
+    } else {
+        v1.sqrt()
+    }
+}
+
+/// Fit a constant firing rate and (if available) amplitude level over 100
+/// equal recording bins, with at least five bins per segment.
+///
+/// Rate: the counts are variance-stabilized as `2 sqrt(c + 3/8)` (Anscombe)
+/// and divided by their first-difference noise scale (at least one).
+/// Amplitude: the bin mean amplitudes of nonempty bins, weighted by spike
+/// count and divided by the per-spike noise scale from first differences,
+/// widened to the long-run scale when neighbouring bins are correlated (see
+/// `noise_scale`). Each series costs `min(w (y - θ)², 9)` per bin at its
+/// best level θ, so a bin more than three noise units from its segment's
+/// level (a burst, a stray bin) costs a bounded amount instead of buying a
+/// boundary.
+///
+/// Each fitted level costs ln(100) (one rate per segment, one amplitude per
+/// nonempty segment when fitted), and each boundary costs 2 ln(91) for the
+/// search over the 91 possible interior edges. The optimum is exact.
 ///
 /// Returns empty with fewer than ten spikes (twice the minimum bin count),
 /// invalid duration/sample rate, or times outside `[0, total_samples)`.
-/// Missing/invalid amplitudes or fewer than 20 pooled within-bin degrees of
-/// freedom reduce the fit to rates only. Observed amplitude means are still
-/// reported if the amplitude data are valid.
+/// Missing/invalid amplitudes, or fewer than 20 consecutive pairs of
+/// nonempty bins, reduce the fit to rates only. Observed amplitude means are
+/// still reported if the amplitude data are valid.
 pub fn stable_epochs(
     times: &[SampleIndex],
     amps: &[f32],
@@ -220,28 +195,59 @@ pub fn stable_epochs(
         return Vec::new();
     }
     let has_amp = amps.len() == times.len() && amps.iter().all(|a| a.is_finite());
-    let mut bins = [Stats::default(); BINS];
+    let mut counts = [0_u32; BINS];
+    let mut sums = [0.0_f64; BINS];
     for (i, &t) in times.iter().enumerate() {
         if t.0 >= total_samples {
             return Vec::new();
         }
         // Exact edges, including for recordings not divisible by 100 samples.
-        let b = &mut bins[(u128::from(t.0) * BINS as u128 / u128::from(total_samples)) as usize];
+        let b = (u128::from(t.0) * BINS as u128 / u128::from(total_samples)) as usize;
+        counts[b] += 1;
         if has_amp {
-            b.add(f64::from(amps[i]), 1);
-        } else {
-            b.n += 1;
+            sums[b] += f64::from(amps[i]);
         }
     }
 
-    let rate_counts = capped_counts(&bins);
-    let phi = dispersion(&rate_counts);
-    let sigma2 = if has_amp { amp_variance(&bins) } else { None };
-    let level_penalty = (times.len() as f64).ln();
+    let anscombe = counts.map(|c| 2.0 * (f64::from(c) + 0.375).sqrt());
+    // Poisson counts have unit variance on this scale, and discrete low
+    // counts often have a zero median difference. Bursts last milliseconds,
+    // so they do not correlate counts across bins.
+    let sigma_rate = noise_scale(&anscombe.map(|y| (y, 1.0)), false).max(1.0);
+    let rate = anscombe.map(|y| Point {
+        y: y / sigma_rate,
+        w: 1.0,
+    });
+    let nonempty: Vec<_> = (0..BINS)
+        .filter(|&b| counts[b] > 0)
+        .map(|b| (sums[b] / f64::from(counts[b]), f64::from(counts[b])))
+        .collect();
+    // Never below one f32 epsilon at the amplitude scale (identical bins).
+    let floor = f64::from(f32::EPSILON)
+        * nonempty
+            .iter()
+            .map(|&(m, _)| m.abs())
+            .fold(f64::from(f32::MIN_POSITIVE), f64::max);
+    let sigma_amp = (has_amp && nonempty.len() > MIN_AMP_PAIRS)
+        .then(|| noise_scale(&nonempty, true).max(floor));
+    let amp: [Option<Point>; BINS] = match sigma_amp {
+        Some(sigma) => {
+            // Centre before scaling so a tiny noise scale keeps precision.
+            let centre = median(nonempty.iter().map(|&(m, _)| m).collect());
+            std::array::from_fn(|b| {
+                (counts[b] > 0).then(|| Point {
+                    y: (sums[b] / f64::from(counts[b]) - centre) / sigma,
+                    w: f64::from(counts[b]),
+                })
+            })
+        }
+        None => [None; BINS],
+    };
+
+    let level_penalty = (BINS as f64).ln();
     let boundary_penalty = 2.0 * ((BINS - 2 * MIN_BINS + 1) as f64).ln();
     let mut best = [f64::INFINITY; BINS + 1];
     let mut previous = [0; BINS + 1];
-    let mut fits = [Stats::default(); BINS + 1];
     best[0] = 0.0;
     // Exact optimal partitioning. ponytail: use PELT pruning if B grows;
     // a quadratic search over 100 bins is small and has no pruning assumptions.
@@ -250,61 +256,52 @@ pub fn stable_epochs(
             continue;
         }
         let base = best[start] + level_penalty + if start == 0 { 0.0 } else { boundary_penalty };
-        let mut segment = Stats::default();
-        let mut rate_n = 0;
-        for (i, (bin, &count)) in bins[start..].iter().zip(&rate_counts[start..]).enumerate() {
-            segment.add(bin.mean, bin.n);
-            rate_n += count;
-            let width = i + 1;
-            if width < MIN_BINS {
+        let (mut rate_events, mut amp_events) = (Vec::new(), Vec::new());
+        let mut amp_bins = 0;
+        for end in start + 1..=BINS {
+            insert(&mut rate_events, rate[end - 1]);
+            if let Some(p) = amp[end - 1] {
+                insert(&mut amp_events, p);
+                amp_bins += 1;
+            }
+            if end - start < MIN_BINS {
                 continue;
             }
-            // Profiled Poisson deviance / phi, dropping terms that sum to a
-            // constant across partitions; the n=0 limit is zero.
-            let n = f64::from(rate_n);
-            let rate = if n > 0.0 {
-                -2.0 * n * (n / width as f64).ln() / phi
-            } else {
-                0.0
-            };
-            let amp = sigma2
-                .filter(|_| segment.n > 0)
-                .map_or(0.0, |v| segment.ss / v + level_penalty);
-            let cost = base + rate + amp;
-            let end = start + width;
+            let mut cost = base + biweight_min(&rate_events, end - start);
+            if amp_bins > 0 {
+                cost += biweight_min(&amp_events, amp_bins) + level_penalty;
+            }
             if cost < best[end] {
                 best[end] = cost;
                 previous[end] = start;
-                fits[end] = segment;
             }
         }
     }
 
+    // The first sample of bin b, so a time split at a boundary reproduces
+    // the exact half-open integer partition.
+    let edge = |b: usize| (u128::from(total_samples) * b as u128).div_ceil(BINS as u128) as u64;
     let mut epochs = Vec::new();
     let mut end = BINS;
     while end > 0 {
         let start = previous[end];
-        let fit = fits[end];
-        // Report the first sample on the right, so a time split at this
-        // boundary can reproduce the exact half-open integer partition.
-        let edge_s = |b| {
-            (u128::from(total_samples) * b as u128).div_ceil(BINS as u128) as f64 / f64::from(sr)
-        };
-        let rate_hz = (f64::from(fit.n) / (duration * (end - start) as f64 / BINS as f64)) as f32;
+        let n: u32 = counts[start..end].iter().sum();
+        let exposure = (edge(end) - edge(start)) as f64 / f64::from(sr);
+        let rate_hz = (f64::from(n) / exposure) as f32;
         if !rate_hz.is_finite() {
             return Vec::new();
         }
         epochs.push(Epoch {
-            start_s: edge_s(start),
-            end_s: edge_s(end),
-            n: fit.n,
+            start_s: edge(start) as f64 / f64::from(sr),
+            end_s: edge(end) as f64 / f64::from(sr),
+            n,
             rate_hz,
-            amp_mean: if has_amp && fit.n > 0 {
-                fit.mean as f32
+            amp_mean: if has_amp && n > 0 {
+                (sums[start..end].iter().sum::<f64>() / f64::from(n)) as f32
             } else {
                 f32::NAN
             },
-            amp_fitted: sigma2.is_some() && fit.n > 0,
+            amp_fitted: sigma_amp.is_some() && n > 0,
         });
         end = start;
     }
@@ -319,16 +316,20 @@ mod tests {
     const SR: f32 = 1_000.0;
     const TOTAL: u64 = BINS as u64 * 1_000;
 
+    fn rng(seed: u64) -> impl FnMut() -> f64 {
+        let mut state = seed;
+        move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (1 + (state >> 33)) as f64 / ((1_u64 << 31) + 1) as f64
+        }
+    }
+
     fn train(
         seed: u64,
         rate: impl Fn(usize) -> f64,
         amp: impl Fn(usize) -> f32,
     ) -> (Vec<SampleIndex>, Vec<f32>) {
-        let mut state = seed;
-        let mut uniform = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            (1 + (state >> 33)) as f64 / ((1_u64 << 31) + 1) as f64
-        };
+        let mut uniform = rng(seed);
         let mut times = Vec::new();
         let mut amps = Vec::new();
         for bin in 0..BINS {
@@ -345,6 +346,35 @@ mod tests {
             }
         }
         (times, amps)
+    }
+
+    #[test]
+    fn biweight_minimum_matches_a_grid() {
+        let mut uniform = rng(7);
+        for _ in 0..20 {
+            let points: Vec<_> = (0..12)
+                .map(|i| Point {
+                    y: 10.0 * uniform() + if i % 4 == 0 { 20.0 } else { 0.0 },
+                    w: 1.0 + 4.0 * uniform(),
+                })
+                .collect();
+            let mut events = Vec::new();
+            points.iter().for_each(|&p| insert(&mut events, p));
+            let loss = |theta: f64| -> f64 {
+                points
+                    .iter()
+                    .map(|p| (p.w * (p.y - theta).powi(2)).min(K2))
+                    .sum()
+            };
+            let grid = (0..=400_000)
+                .map(|i| loss(-5.0 + i as f64 * 1e-4))
+                .fold(f64::INFINITY, f64::min);
+            let exact = biweight_min(&events, points.len());
+            assert!(
+                exact <= grid + 1e-9 && grid - exact < 1e-6,
+                "{exact} {grid}"
+            );
+        }
     }
 
     #[test]
@@ -367,12 +397,53 @@ mod tests {
             let (times, _) = train(seed, |_| 1.0, |_| 100.0);
             assert_eq!(stable_epochs(&times, &[], TOTAL, SR).len(), 1);
             // Three isolated one-bin bursts, none sustained for five bins.
-            let (times, _) = train(
+            let (times, amps) = train(
                 seed,
                 |b| if [20, 36, 70].contains(&b) { 75.0 } else { 5.0 },
                 |_| 100.0,
             );
             assert_eq!(stable_epochs(&times, &[], TOTAL, SR).len(), 1);
+            assert_eq!(stable_epochs(&times, &amps, TOTAL, SR).len(), 1);
+        }
+    }
+
+    #[test]
+    fn recurrent_bursts_rounded_and_correlated_amplitudes_do_not_split() {
+        for seed in 0..5 {
+            let mut uniform = rng(seed);
+            let mut gauss =
+                move || (-2.0 * uniform().ln()).sqrt() * (std::f64::consts::TAU * uniform()).cos();
+            let (times, _) = train(seed + 100, |_| 5.0, |_| 0.0);
+            // Integer-rounded amplitudes with SD 0.2 leave almost every bin identical.
+            let rounded: Vec<_> = times
+                .iter()
+                .map(|_| (100.0 + 0.2 * gauss()).round() as f32)
+                .collect();
+            assert_eq!(stable_epochs(&times, &rounded, TOTAL, SR).len(), 1);
+            // AR(1) amplitudes, correlation 0.75 between consecutive spikes.
+            let mut x = 0.0;
+            let correlated: Vec<_> = times
+                .iter()
+                .map(|_| {
+                    x = 0.75 * x + (1.0 - 0.75_f64.powi(2)).sqrt() * gauss();
+                    (100.0 + 10.0 * x) as f32
+                })
+                .collect();
+            assert_eq!(stable_epochs(&times, &correlated, TOTAL, SR).len(), 1);
+            // Eight-spike bursts, 4 ms apart, starting as a 0.2 Hz Poisson process.
+            let mut bursty = times.clone();
+            let mut onset = rng(seed + 200);
+            let mut t = 0.0;
+            loop {
+                t -= onset().ln() / 0.2;
+                if t >= 99.9 {
+                    break;
+                }
+                bursty
+                    .extend((0..8).map(|i| SampleIndex(((t + 0.004 * i as f64) * 1000.0) as u64)));
+            }
+            bursty.sort_unstable_by_key(|s| s.0);
+            assert_eq!(stable_epochs(&bursty, &[], TOTAL, SR).len(), 1);
         }
     }
 
@@ -414,40 +485,30 @@ mod tests {
     }
 
     #[test]
-    fn rate_cap_preserves_three_bin_changes() {
-        let mut bins = [Stats {
-            n: 5,
-            ..Stats::default()
-        }; BINS];
-        for b in [0, 1, 30, 31, 32, 98, 99] {
-            bins[b].n = 75;
-        }
-        // Include all six flanking bins in the silent interval.
-        bins[58..67].fill(Stats::default());
-        bins[62].n = 75;
-        let counts = capped_counts(&bins);
-        let share = poisson_cap(10) / 2;
-        assert_eq!(counts[..2], [share; 2]);
-        assert_eq!(counts[98..], [share; 2]);
-        assert_eq!(counts[30..33], [75; 3]);
-        assert_eq!(counts[62], 3);
+    fn rates_use_integer_edge_exposure() {
+        // 1003 samples: bins hold 10 or 11 samples, so nominal widths would be wrong.
+        let times: Vec<_> = (0..1003).step_by(3).map(SampleIndex).collect();
+        let e = stable_epochs(&times, &[], 1003, SR);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert_eq!(e[0].rate_hz, (times.len() as f64 / 1.003) as f32);
     }
 
     #[test]
     fn one_matching_pair_cannot_set_the_amplitude_noise() {
         let mut times: Vec<_> = (0..100).map(|b| SampleIndex(b * 1000)).collect();
-        let mut amps: Vec<_> = (0..100).map(|b| 95.0 + (b % 11) as f32).collect();
+        let mut amps: Vec<_> = (0..100).map(|b| 95.0 + (b * 7 % 11) as f32).collect();
         times.insert(1, SampleIndex(1));
         amps.insert(1, amps[0]);
         let e = stable_epochs(&times, &amps, TOTAL, SR);
         assert_eq!(e.len(), 1, "{e:?}");
-        assert!(e[0].amp_mean.is_finite());
+        assert!(e[0].amp_fitted && e[0].amp_mean.is_finite());
     }
 
     #[test]
     fn silence_has_no_amplitude_parameter() {
-        // The rate gain (~17.5) pays for a boundary and rate (~14.2), but
-        // not a spurious amplitude parameter for the five silent bins (~19.3).
+        // Splitting off the five silent bins gains ~15.5 in the rate cost,
+        // which pays for a boundary and a rate (~13.6) but would not also pay
+        // for an amplitude level (~4.6) on the silent segment.
         let times: Vec<_> = (5..100)
             .flat_map(|b| {
                 (0..if b % 5 == 0 { 1 } else { 2 }).map(move |i| SampleIndex(b * 1000 + i * 500))
@@ -456,7 +517,7 @@ mod tests {
         for amps in [&[][..], &vec![100.0; times.len()]] {
             let e = stable_epochs(&times, amps, TOTAL, SR);
             assert_eq!(e.len(), 2, "{e:?}");
-            assert_eq!((e[0].end_s, e[0].n), (5.0, 0));
+            assert_eq!((e[0].end_s, e[0].n, e[0].amp_fitted), (5.0, 0, false));
         }
     }
 

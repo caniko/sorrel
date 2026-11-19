@@ -328,16 +328,28 @@ pub fn run<P: DataProvider>(
                 .iter()
                 .map(|e| {
                     format!(
-                        "{}-{} s n={} rate={}Hz amp={}",
+                        "{}-{} s n={} rate={}Hz amp={} fit={}",
                         e.start_s,
                         e.end_s,
                         e.n,
                         qn(e.rate_hz),
-                        qn(e.amp_mean)
+                        qn(e.amp_mean),
+                        if e.amp_fitted { "rate+amp" } else { "rate" }
                     )
                 })
                 .collect::<Vec<_>>();
-            if epochs.len() > 1 {
+            // A time split only separates spikes if some boundary has spikes
+            // on both sides, not one that just cuts off leading silence.
+            let total: u32 = epochs.iter().map(|e| e.n).sum();
+            let splittable = epochs
+                .iter()
+                .scan(0, |before, e| {
+                    *before += e.n;
+                    Some(*before)
+                })
+                .take(epochs.len() - 1)
+                .any(|before| before > 0 && before < total);
+            if splittable {
                 lines.push(format!("Review a boundary with `split {} by=time at=T`; applying the handle is journaled and undoable.", c.0));
             }
             Ok(lines.join("\n"))

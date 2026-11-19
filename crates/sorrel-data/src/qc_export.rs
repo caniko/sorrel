@@ -79,7 +79,8 @@ pub struct QcRow {
     pub rpv_post_hi95: f32,
     /// Number of fitted stable epochs; `NaN` if not computed.
     pub n_epochs: f32,
-    /// Lowest / highest fitted amplitude; `NaN` if an epoch lacks amplitudes.
+    /// Lowest / highest magnitude of the epoch mean amplitudes; `NaN` unless
+    /// every epoch has a fitted amplitude.
     pub epoch_amp_ratio: f32,
     /// Lowest / highest fitted firing rate.
     pub epoch_rate_ratio: f32,
