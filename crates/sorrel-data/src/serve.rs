@@ -2483,6 +2483,9 @@ mod tests {
         assert_eq!(after["refractory"], new["current"]);
         assert_eq!(before["isi_violations"].as_f64(), Some(0.0));
         assert_eq!(after["isi_violations"].as_f64(), Some(1.0));
+        assert!(
+            after["rpv_post_mean"].as_f64().unwrap() > before["rpv_post_mean"].as_f64().unwrap()
+        );
         let invalid = run(
             "refractory",
             json!({"sweep_step_ms": 0.0, "fixed_ms": 50.0}),
@@ -2570,6 +2573,46 @@ mod tests {
                 .unwrap()
                 .contains("rp 8.0ms"),
             "{acg}"
+        );
+    }
+
+    #[test]
+    fn refractory_evidence_in_metrics_json_and_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SessionHost::new(mock_session(dir.path()));
+        let mut env = Env::new(dir.path(), false, label);
+        let r = handle_line(&h, &mut env, &call(1, "metrics", json!({"cluster": 0}))).unwrap();
+        let row = payload(&r);
+        for name in ["srp_contamination", "srp_rp_ms"] {
+            assert!(
+                row.get(name).unwrap().is_null(),
+                "not enough spikes to confirm {name}"
+            );
+        }
+        let lo = row["rpv_post_lo95"].as_f64().unwrap();
+        let mean = row["rpv_post_mean"].as_f64().unwrap();
+        let hi = row["rpv_post_hi95"].as_f64().unwrap();
+        assert!(lo < mean && mean < hi && hi > 0.1);
+
+        let rules = r#"
+            [[rule]]
+            name = "review refractory evidence"
+            metric = "rpv_post_hi95"
+            op = ">"
+            value = 0.1
+            label = "mua"
+        "#;
+        let r = handle_line(
+            &h,
+            &mut env,
+            &call(2, "rules_eval", json!({"rules": rules})),
+        )
+        .unwrap();
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let t = texts(&r);
+        assert!(
+            t.contains("review refractory evidence: rpv_post_hi95>0.1 -> mua: 2"),
+            "{t}"
         );
     }
 

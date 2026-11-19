@@ -68,6 +68,14 @@ pub struct QcRow {
     pub amplitude_dip: f32,
     /// Amplitude change per second (least squares).
     pub drift_slope: f32,
+    /// Minimum contamination fraction confirmed by sliding-RP, or `NaN`.
+    pub srp_contamination: f32,
+    /// First passing window at that fraction (ms), or `NaN`.
+    pub srp_rp_ms: f32,
+    /// Fixed-window contamination posterior mean and 95% equal-tailed bounds.
+    pub rpv_post_mean: f32,
+    pub rpv_post_lo95: f32,
+    pub rpv_post_hi95: f32,
 }
 
 impl Default for QcRow {
@@ -108,6 +116,11 @@ impl Default for QcRow {
             rp_contamination: n,
             amplitude_dip: n,
             drift_slope: n,
+            srp_contamination: n,
+            srp_rp_ms: n,
+            rpv_post_mean: n,
+            rpv_post_lo95: n,
+            rpv_post_hi95: n,
         }
     }
 }
@@ -119,7 +132,7 @@ impl QcRow {
 
     /// Every metric column name, in TSV order. The single source of truth
     /// for names used by `get`, the rule engine, and the exports.
-    pub const METRICS: [&'static str; 32] = [
+    pub const METRICS: [&'static str; 37] = [
         "n_spikes",
         "firing_rate",
         "mean_amplitude",
@@ -152,6 +165,11 @@ impl QcRow {
         "rp_contamination",
         "amplitude_dip",
         "drift_slope",
+        "srp_contamination",
+        "srp_rp_ms",
+        "rpv_post_mean",
+        "rpv_post_lo95",
+        "rpv_post_hi95",
     ];
 
     /// `{"cluster_id": .., "<metric>": number | null, ...}` — NaN becomes
@@ -208,6 +226,11 @@ impl QcRow {
             "rp_contamination" => self.rp_contamination,
             "amplitude_dip" => self.amplitude_dip,
             "drift_slope" => self.drift_slope,
+            "srp_contamination" => self.srp_contamination,
+            "srp_rp_ms" => self.srp_rp_ms,
+            "rpv_post_mean" => self.rpv_post_mean,
+            "rpv_post_lo95" => self.rpv_post_lo95,
+            "rpv_post_hi95" => self.rpv_post_hi95,
             _ => return None,
         })
     }
@@ -330,9 +353,10 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
 ) -> Vec<QcRow> {
     use sorrel_compute::{
         amplitude_drift_slope, burst_index, footprint, hartigan_dip, isi_violation_rate,
-        isi_violations, mean_amplitude, peak_channel, waveform_landmarks,
+        isi_violations, mean_amplitude, peak_channel, refractory_evidence, waveform_landmarks,
     };
-    let sr = session.provider.sample_rate().max(1.0);
+    let sample_rate = session.provider.sample_rate();
+    let sr = sample_rate.max(1.0);
     let total_samples = session.provider.n_samples();
     let total_seconds = total_samples.as_f32() / sr;
     let refractory_samples = windows.fixed_samples(sr);
@@ -387,6 +411,22 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
         let nan = f32::NAN;
         // (0, 0) means there is no estimate.
         let (rp_contam, rp) = windows.sweep(times, total_samples.0, sr);
+        let (srp_contamination, srp_rp_ms, rpv_post_mean, rpv_post_lo95, rpv_post_hi95) =
+            match windows {
+                RefractoryWindows::Session(params) => {
+                    let (srp, post) =
+                        refractory_evidence(times, total_samples.0, sample_rate, params);
+                    (
+                        srp.min_contamination,
+                        srp.rp_ms,
+                        post.mean,
+                        post.lo95,
+                        post.hi95,
+                    )
+                }
+                // These are public QC metrics, not versioned model features.
+                RefractoryWindows::Learn => (nan, nan, nan, nan, nan),
+            };
         let acg = acg_or_compute(session, c, acg_bin, acg_window);
         // ponytail: evenly strided to <= 5000 points to bound the O(n log n)
         // sort per cluster; a rare second mode in a huge cluster can thin out.
@@ -437,6 +477,11 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
             } else {
                 nan
             },
+            srp_contamination,
+            srp_rp_ms,
+            rpv_post_mean,
+            rpv_post_lo95,
+            rpv_post_hi95,
         });
     }
     rows
@@ -685,8 +730,9 @@ pub(crate) mod tests {
                 vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
                 vec![SampleIndex(20), SampleIndex(200)],
                 vec![SampleIndex(100)],
+                vec![],
             ],
-            amps: vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0], vec![6.0]],
+            amps: vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0], vec![6.0], vec![]],
             n_samples: SampleIndex(1000),
         };
         let dir = tempfile::tempdir().unwrap();
@@ -696,12 +742,12 @@ pub(crate) mod tests {
 
         let outdir = dir.path().join("export");
         let n = export_qc(&s, &outdir, None).unwrap();
-        assert_eq!(n, 3);
+        assert_eq!(n, 4);
 
         let tsv = std::fs::read_to_string(outdir.join("cluster_qc.tsv")).unwrap();
         let lines: Vec<&str> = tsv.lines().collect();
-        // 1 header + 3 rows.
-        assert_eq!(lines.len(), 4);
+        // 1 header + 4 rows.
+        assert_eq!(lines.len(), 5);
         assert!(lines[0].starts_with("cluster_id\t"));
         assert!(lines[1].starts_with("0\t"));
 
@@ -721,6 +767,21 @@ pub(crate) mod tests {
             .unwrap();
         let json_keys: Vec<&str> = first_row.split('"').skip(1).step_by(2).collect();
         assert_eq!(tsv_keys, json_keys);
+        let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for name in [
+            "srp_contamination",
+            "srp_rp_ms",
+            "rpv_post_mean",
+            "rpv_post_lo95",
+            "rpv_post_hi95",
+        ] {
+            let i = tsv_keys.iter().position(|&k| k == name).unwrap();
+            for row in [2, 3] {
+                assert!(rows[row].get(name).unwrap().is_null(), "{name}");
+                assert_eq!(lines[row + 1].split('\t').nth(i), Some(""), "{name}");
+            }
+        }
+        assert!(rows[0]["rpv_post_hi95"].as_f64().unwrap() > 0.1);
     }
 
     #[test]
