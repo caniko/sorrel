@@ -58,6 +58,11 @@ METRIC_DESCRIPTIONS = {
     "rp_contamination": "Hill false-positive fraction (0-1) at rp_estimate_ms, the estimated share of spikes that belong to other units; NaN when no refractory window could be estimated.",
     "amplitude_dip": "Hartigan dip statistic (0-0.25) of up to 5000 evenly strided per-spike amplitudes; larger values indicate a second amplitude mode; NaN with fewer than 4 amplitudes.",
     "drift_slope": "Least-squares slope of per-spike amplitude versus time in seconds, in amplitude units per second; NaN with fewer than 2 spikes or when spike and amplitude counts differ.",
+    "srp_contamination": "Smallest contamination fraction (0-1) that the sliding-RP test confirms at nominal confidence above 90%; NaN if none of the 0.5%-35% grid passes.",
+    "srp_rp_ms": "First tested refractory window (ms) passing at srp_contamination; NaN when no tested combination passes.",
+    "rpv_post_mean": "Mean contamination fraction (0-1) under a fixed refractory window, Poisson likelihood and uniform Beta(1,1) prior.",
+    "rpv_post_lo95": "Lower endpoint of the fixed-window contamination posterior's 95% equal-tailed credible interval (fraction, 0-1).",
+    "rpv_post_hi95": "Upper endpoint of the fixed-window contamination posterior's 95% equal-tailed credible interval (fraction, 0-1).",
 }
 _INT_METRICS = {"n_spikes", "isi_violations"}
 

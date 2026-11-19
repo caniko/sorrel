@@ -308,7 +308,7 @@ impl RefractoryParams {
         f64::from(self.sweep_min_ms) + k as f64 * f64::from(self.sweep_step_ms)
     }
 
-    fn windows(&self, sr: f32) -> impl Iterator<Item = u64> + '_ {
+    pub(crate) fn windows(&self, sr: f32) -> impl Iterator<Item = u64> + '_ {
         (1..=self.window_count()).map(move |k| {
             let ms = self.window_ms(k).min(f64::from(self.sweep_max_ms));
             (ms * f64::from(sr) / 1000.0).round() as u64

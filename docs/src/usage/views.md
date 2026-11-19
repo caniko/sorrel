@@ -91,9 +91,36 @@ Set the windows in **Settings → Refractory-period settings**, or pass these fl
 | Sweep maximum (`sweep_max_ms`, inclusive) | `--rp-max-ms`     | 10 ms   | SpikeInterface `max_ref_period_ms`; IBL slidingRP upper limit           |
 | Sweep step (`sweep_step_ms`)              | `--rp-step-ms`    | 0.25 ms | SpikeInterface `bin_size_ms`                                            |
 
-The first tested window is minimum + step: the default grid runs from 0.75 to 10 ms in 38 windows. For Bombcell's 1 ms first window, set the exclusive minimum to 0.75 ms and keep the default step. These are defaults, not upstream statistical tests: Sorrel takes the minimum of a linearised Hill estimate, which can be biased low when short windows have no violations.
+The first tested window is minimum + step: the default grid runs from 0.75 to 10 ms in 38 windows. For Bombcell's 1 ms first window, set the exclusive minimum to 0.75 ms and keep the default step. The legacy `rp_contamination` and `rp_estimate_ms` columns still report the minimum of a linearised Hill estimate and its window. That estimate can be biased low when short windows have no violations.
 
 The MCP tool `refractory` returns the current and default parameters without arguments. Supply any of the four fields to update the live session, including its attached GUI, without changing the saved GUI defaults. `metrics` includes the settings it used under `refractory`.
+
+### Refractory evidence in QC
+
+`sorrel qc`, MCP `metrics`, and rules expose these columns. In the GUI, hover over a cluster's coloured badge in the ISI view to see both results.
+
+| Column              | Meaning                                                                                                                          |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `srp_contamination` | Smallest contamination fraction confirmed by the sliding-RP test at nominal confidence strictly above 90%.                       |
+| `srp_rp_ms`         | First tested window (ms) that reaches that confidence at the reported fraction. This is not the neuron's true refractory period. |
+| `rpv_post_mean`     | Posterior mean contamination fraction at the session's fixed window.                                                             |
+| `rpv_post_lo95`     | Lower bound of the 95% equal-tailed credible interval.                                                                           |
+| `rpv_post_hi95`     | Upper bound of the 95% equal-tailed credible interval.                                                                           |
+
+Both metrics count all spike pairs with a positive lag strictly inside the window, not just consecutive ISIs. Windows are rounded to sample edges. The sliding-RP test ([Roth et al., 2026](https://doi.org/10.64898/2026.03.06.710130)) uses a fixed 0.5–35% contamination grid in 0.5 percentage-point steps, with no correction for testing multiple windows. Sorrel uses the configured sweep above, rather than IBL's every sample bin above 0.5 ms. The SRP columns are unavailable if no tested fraction reaches confidence; this does not distinguish high contamination from too few spikes to tell.
+
+The posterior uses a uniform Beta(1,1) prior on the contamination fraction and a Poisson likelihood with the same expected-violation model as the sliding test ([Llobet et al., 2022](https://doi.org/10.1101/2022.02.08.479192)). It assumes stationary spike rates and a fixed window no longer than the neuron's true refractory period. A wide interval means too little data to tell, even with zero observed violations. With fewer than two spikes or invalid recording duration or sample rate, both results are unavailable (`NaN` in Rust, `null` in JSON and blank in TSV).
+
+For example, this `rules.toml` policy labels a unit `mua` for review when the posterior's upper bound exceeds 10%. This is a review trigger, not evidence that contamination exceeds 10%.
+
+```toml
+[[rule]]
+name = "review refractory evidence"
+metric = "rpv_post_hi95"
+op = ">"
+value = 0.1
+label = "mua"
+```
 
 **Cross-talk** (Sorrel extra). The views share four kinds of state, so a pick in one shows in all the others:
 

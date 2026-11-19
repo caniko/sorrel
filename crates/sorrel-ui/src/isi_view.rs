@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use egui::{Sense, Shape, Stroke, Ui};
-use sorrel_compute::{isi_histogram_range, isi_violations};
+use sorrel_compute::{isi_histogram_range, isi_violations, refractory_evidence};
 use sorrel_data::{preview_split, Session, SplitPreview};
 use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 
@@ -104,6 +104,45 @@ fn refractory_pct(times: &[SampleIndex], refractory: u64) -> f32 {
     } else {
         isi_violations(times, refractory) as f32 / times.len() as f32 * 100.0
     }
+}
+
+fn refractory_tooltip<P: DataProvider>(ui: &Ui, session: &Session<P>, c: ClusterId) -> String {
+    type Tooltip = ((ClusterId, u64), String);
+    let key = (c, session.metrics_version());
+    let id = egui::Id::new("isi_refractory_tooltip");
+    if let Some((_, text)) = ui
+        .data(|d| d.get_temp::<Tooltip>(id))
+        .filter(|(k, _)| *k == key)
+    {
+        return text;
+    }
+    let (srp, post) = refractory_evidence(
+        session.spike_times(c),
+        session.provider.n_samples().0,
+        session.provider.sample_rate(),
+        session.refractory(),
+    );
+    let srp = if srp.min_contamination.is_nan() {
+        "SRP n/a".to_owned()
+    } else {
+        format!(
+            "SRP ≤{:.1}% @ {:.2} ms",
+            100.0 * srp.min_contamination,
+            srp.rp_ms
+        )
+    };
+    let text = if post.mean.is_nan() {
+        format!("{srp} · post n/a")
+    } else {
+        format!(
+            "{srp} · post {:.1}% [{:.1}–{:.1}%]",
+            100.0 * post.mean,
+            100.0 * post.lo95,
+            100.0 * post.hi95
+        )
+    };
+    ui.data_mut(|d| d.insert_temp(id, (key, text.clone())));
+    text
 }
 
 /// phy status text: `[x_min ms, x_max ms]`.
@@ -254,7 +293,10 @@ pub fn isi_view<P: DataProvider>(
                 )
             });
             if resp
-                .on_hover_text("Click to brush this cluster's violating spikes")
+                .on_hover_ui(|ui| {
+                    ui.label("Click to brush this cluster's violating spikes");
+                    ui.label(refractory_tooltip(ui, session, c));
+                })
                 .clicked()
             {
                 clicked.push(c);
