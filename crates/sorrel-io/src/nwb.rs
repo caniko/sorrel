@@ -379,58 +379,99 @@ mod imp {
 
     /// `neurodata_type_def → neurodata_type_inc` for every type in the
     /// file's cached specifications (core and extensions).
-    fn type_parents(f: &Group, legacy: bool) -> HashMap<String, String> {
-        fn collect(v: &serde_json::Value, out: &mut HashMap<String, String>) {
+    fn type_parents(f: &Group, legacy: bool) -> Result<HashMap<String, Option<String>>> {
+        fn collect(
+            v: &serde_json::Value,
+            out: &mut HashMap<String, Option<String>>,
+            legacy: bool,
+        ) -> Result<()> {
             match v {
                 serde_json::Value::Object(m) => {
-                    if let (Some(def), Some(inc)) = (
-                        m.get("neurodata_type_def").and_then(|v| v.as_str()),
-                        m.get("neurodata_type_inc").and_then(|v| v.as_str()),
-                    ) {
-                        out.insert(def.to_owned(), inc.to_owned());
+                    if let Some(def) = m.get("neurodata_type_def").and_then(|v| v.as_str()) {
+                        let parent = m
+                            .get("neurodata_type_inc")
+                            .map(|v| {
+                                v.as_str()
+                                    .map(str::to_owned)
+                                    .context("invalid neurodata_type_inc")
+                            })
+                            .transpose();
+                        if legacy {
+                            if let Ok(Some(parent)) = parent {
+                                out.insert(def.to_owned(), Some(parent));
+                            }
+                        } else {
+                            let parent = parent?;
+                            ensure!(
+                                out.get(def).is_none_or(|old| *old == parent),
+                                "conflicting cached definitions of {def:?}"
+                            );
+                            out.insert(def.to_owned(), parent);
+                        }
                     }
-                    m.values().for_each(|v| collect(v, out));
+                    for child in m.values() {
+                        collect(child, out, legacy)?;
+                    }
                 }
-                serde_json::Value::Array(a) => a.iter().for_each(|v| collect(v, out)),
+                serde_json::Value::Array(a) => {
+                    for child in a {
+                        collect(child, out, legacy)?;
+                    }
+                }
                 _ => {}
             }
+            Ok(())
         }
         let mut out = HashMap::new();
-        let specs = if legacy {
-            f.legacy_group("/specifications")
-        } else {
-            f.optional_group("/specifications")
-        }
-        .and_then(|g| g.context("missing specifications")?.groups());
-        for version in specs
-            .into_iter()
-            .flatten()
-            .flat_map(|ns| ns.groups())
-            .flatten()
-        {
-            for ds in version.datasets().into_iter().flatten() {
-                let text = ds.spec_text(legacy);
-                if let Some(v) = text.ok().and_then(|t| serde_json::from_str(&t).ok()) {
-                    collect(&v, &mut out);
+        for ns in f.spec_group(legacy)?.spec_groups()? {
+            for version in ns.spec_groups()? {
+                for ds in version.spec_datasets()? {
+                    let spec = ds
+                        .spec_text(legacy)
+                        .and_then(|t| Ok(serde_json::from_str(&t)?));
+                    match spec {
+                        Ok(v) => collect(&v, &mut out, legacy)?,
+                        Err(_) if legacy => continue,
+                        Err(err) => return Err(err).context("unreadable cached NWB specification"),
+                    }
                 }
             }
         }
-        out
+        Ok(out)
     }
 
-    fn is_electrical_series(ty: &str, parents: &HashMap<String, String>) -> bool {
+    fn is_electrical_series(
+        ty: &str,
+        parents: Option<&HashMap<String, Option<String>>>,
+        legacy: bool,
+    ) -> Option<bool> {
         let mut ty = ty;
         // Bounded walk: a malformed spec could loop.
         for _ in 0..32 {
             if ty == "ElectricalSeries" {
-                return true;
+                return Some(true);
             }
-            match parents.get(ty) {
+            // Core types with known non-ElectricalSeries ancestry, including
+            // common processing wrappers that can contain a series.
+            if !legacy
+                && matches!(
+                    ty,
+                    "TimeSeries"
+                        | "ProcessingModule"
+                        | "LFP"
+                        | "FilteredEphys"
+                        | "NWBDataInterface"
+                        | "NWBContainer"
+                )
+            {
+                return Some(false);
+            }
+            match parents?.get(ty)? {
                 Some(parent) => ty = parent,
-                None => return false,
+                None => return Some(false),
             }
         }
-        false
+        None
     }
 
     /// Mirror trunk's discovery for the journal seal, including the old
@@ -445,7 +486,7 @@ mod imp {
         let Ok(names) = acq.member_names() else {
             return false;
         };
-        let parents = type_parents(f, true);
+        let parents = type_parents(f, true).ok();
         for candidate in names {
             let g = match acq.legacy_group(&candidate) {
                 Ok(Some(g)) => g,
@@ -456,7 +497,7 @@ mod imp {
                 Ok(attr) => attr.and_then(|a| a.legacy_string().ok()),
                 Err(_) => return false,
             };
-            if ty.is_some_and(|t| is_electrical_series(&t, &parents)) {
+            if ty.is_some_and(|t| is_electrical_series(&t, parents.as_ref(), true) == Some(true)) {
                 match g.legacy_dataset_rank("data") {
                     Ok(Some(2)) => return candidate == name,
                     Ok(_) => (),
@@ -476,7 +517,7 @@ mod imp {
             group: &Group,
             path: &str,
             depth: usize,
-            is_series: &impl Fn(&str) -> bool,
+            is_series: &impl Fn(&str, &str) -> Result<bool>,
             found: &mut Vec<(String, Group)>,
         ) -> Result<()> {
             for name in group.member_names()? {
@@ -484,11 +525,15 @@ mod imp {
                     continue;
                 };
                 let path = format!("{path}/{name}");
-                if child
+                let ty = child
                     .optional_attr("neurodata_type")?
                     .map(|a| a.string())
+                    .transpose()?;
+                if ty
+                    .as_deref()
+                    .map(|t| is_series(t, &path))
                     .transpose()?
-                    .is_some_and(|t| is_series(&t))
+                    .unwrap_or(false)
                 {
                     found.push((path, child));
                 } else if depth > 0 {
@@ -499,8 +544,20 @@ mod imp {
             Ok(())
         }
 
-        let parents = type_parents(f, false);
-        let is_series = |t: &str| is_electrical_series(t, &parents);
+        let parents = std::cell::OnceCell::new();
+        let is_series = |ty: &str, path: &str| {
+            if let Some(answer) = is_electrical_series(ty, None, false) {
+                return Ok(answer);
+            }
+            let unavailable = || {
+                format!("cannot determine ElectricalSeries ancestry of {path} ({ty:?}); readable same-file cached NWB specifications are required")
+            };
+            let parents = parents.get_or_init(|| type_parents(f, false));
+            let parents = parents
+                .as_ref()
+                .map_err(|err| anyhow!("{}: {err:#}", unavailable()))?;
+            is_electrical_series(ty, Some(parents), false).with_context(unavailable)
+        };
         let mut found = Vec::new();
         for (root, depth) in [("/acquisition", 0), ("/processing", 32)] {
             if let Some(group) = f.optional_group(root)? {

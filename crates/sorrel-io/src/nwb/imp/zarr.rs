@@ -221,7 +221,7 @@ impl Group {
         self.open_group(&path).map(Some)
     }
 
-    pub fn open_dataset(&self, path: &str) -> Result<Dataset> {
+    pub fn open_dataset(&self, path: &str, spec: bool) -> Result<Dataset> {
         let store = self.0.storage();
         let key = |name| StoreKey::new(format!("{}/{name}", &path[1..]));
         let meta = store
@@ -261,9 +261,9 @@ impl Group {
         };
         // hdmf-zarr writes cached specs as a single uncompressed object
         // chunk using numcodecs JSON. Decode that specific layout ourselves.
-        let json_spec = matches!(filters, [filter] if filter["id"] == "json2"
+        let json_spec = spec
+            && matches!(filters, [filter] if filter["id"] == "json2"
                 && filter.get("encoding").is_none_or(|v| v == "utf-8"))
-            && path.starts_with("/specifications/")
             && meta["dtype"] == "|O"
             && meta["shape"] == serde_json::json!([1])
             && meta["chunks"] == serde_json::json!([1])
@@ -601,7 +601,7 @@ mod tests {
         fs::write(data.join(".zarray"), meta.to_string()).unwrap();
         let err = open(root)
             .unwrap()
-            .open_dataset(path)
+            .open_dataset(path, false)
             .err()
             .expect("opened an array with fixedscaleoffset");
         let message = format!("{err:#}");
@@ -615,7 +615,7 @@ mod tests {
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../release/fixtures/nwb/good.nwb.zarr");
         let group = open(&fixture).unwrap();
-        let read = |path| group.open_dataset(path).unwrap().strings().unwrap();
+        let read = |path| group.open_dataset(path, false).unwrap().strings().unwrap();
         assert_eq!(
             read("/timestamps_reference_time"),
             ["2026-01-01T00:00:00+00:00"]

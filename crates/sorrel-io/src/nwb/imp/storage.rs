@@ -84,14 +84,49 @@ impl Group {
         }, Ok(g.child_group(name)?.map(Self::Zarr)))
     }
 
-    pub fn groups(&self) -> Result<Vec<Self>> {
-        dispatch!(self, Self, g => Ok(g.groups()?.into_iter().map(Self::Hdf5).collect()),
-            g.member_names()?.iter().filter_map(|name| self.child_group(name).transpose()).collect())
+    pub fn spec_group(&self, legacy: bool) -> Result<Self> {
+        dispatch!(self, Self, g => {
+            if let Some(Attr::Hdf5(attr)) = if legacy { None } else { hdf_attr(g, ".specloc")? } {
+                return Ok(Self::Hdf5(hdf::spec_reference(g, &attr)?));
+            }
+            Ok(Self::Hdf5(hdf::spec_object(g, "/specifications")?.as_group()?))
+        }, {
+            let _ = legacy;
+            let path = match g.optional_attr(".specloc") {
+                Some(attr) => attr.as_str().filter(|s| !s.is_empty() && *s != "/")
+                    .context("Zarr .specloc must be a same-store group path")?,
+                None => "/specifications",
+            };
+            g.child_group(path)?.map(Self::Zarr).context("missing Zarr specifications group")
+        })
     }
 
-    pub fn datasets(&self) -> Result<Vec<Dataset>> {
-        dispatch!(self, Self, g => Ok(g.datasets()?.into_iter().map(Dataset::Hdf5).collect()),
-            Ok(g.member_names()?.iter().filter_map(|name| self.dataset(name).ok()).collect()))
+    pub fn spec_groups(&self) -> Result<Vec<Self>> {
+        self.member_names()?
+            .into_iter()
+            .filter_map(|name| {
+                dispatch!(self, Self, g => match hdf::spec_object(g, &name) {
+                Ok(obj) => obj.as_group().ok().map(|group| Ok(Self::Hdf5(group))),
+                Err(err) => Some(Err(err)),
+            }, g.child_group(&name).map(|group| group.map(Self::Zarr)).transpose())
+            })
+            .collect()
+    }
+
+    pub fn spec_datasets(&self) -> Result<Vec<Dataset>> {
+        self.member_names()?
+            .into_iter()
+            .map(|name| {
+                dispatch!(self, Self, g => {
+                    let ds = hdf::spec_object(g, &name)?.as_dataset()?;
+                    hdf::check_dataset_storage(&ds)?;
+                    Ok(Dataset::Hdf5(ds))
+                }, {
+                    let path = g.local_path(&name)?.context("missing Zarr spec array")?;
+                    g.open_dataset(&path, true).map(|d| Dataset::Zarr(Box::new(d)))
+                })
+            })
+            .collect()
     }
 
     pub fn member_names(&self) -> Result<Vec<String>> {
@@ -112,7 +147,7 @@ impl Group {
         dispatch!(self, Self, g => {
             if !hdf::hard_link_exists(g, path)? { return Ok(None); }
             hdf::local_dataset(g, path).map(Dataset::Hdf5).map(Some)
-        }, g.local_path(path)?.map(|path| g.open_dataset(&path).map(|d| Dataset::Zarr(Box::new(d)))
+        }, g.local_path(path)?.map(|path| g.open_dataset(&path, false).map(|d| Dataset::Zarr(Box::new(d)))
             .with_context(|| format!("open Zarr dataset {path}"))).transpose())
     }
 

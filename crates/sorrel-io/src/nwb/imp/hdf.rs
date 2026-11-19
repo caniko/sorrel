@@ -208,12 +208,17 @@ pub(super) fn hard_link_exists(group: &hdf5::Group, path: &str) -> Result<bool> 
 }
 
 pub(super) fn local_dataset(file: &hdf5::Group, path: &str) -> Result<hdf5::Dataset> {
-    use hdf5::plist::dataset_create::Layout;
-    use hdf5_metno_sys::h5p::H5Pget_external_count;
-
     let ds = file
         .dataset(path)
         .with_context(|| format!("cannot open HDF5 dataset {path}"))?;
+    check_dataset_storage(&ds)?;
+    Ok(ds)
+}
+
+pub(super) fn check_dataset_storage(ds: &hdf5::Dataset) -> Result<()> {
+    use hdf5::plist::dataset_create::Layout;
+    use hdf5_metno_sys::h5p::H5Pget_external_count;
+
     let dcpl = ds
         .dcpl()
         .context("cannot inspect dataset creation properties")?;
@@ -229,5 +234,78 @@ pub(super) fn local_dataset(file: &hdf5::Group, path: &str) -> Result<hdf5::Data
     let external = hdf5::sync::sync(|| unsafe { hdf5::h5check(H5Pget_external_count(dcpl.id())) })
         .context("cannot inspect HDF5 external raw storage")?;
     ensure!(external == 0, "HDF5 external raw storage");
-    Ok(ds)
+    Ok(())
+}
+
+/// Cached specs may use same-file soft links. Block external links even
+/// when they are reached indirectly through a soft link.
+pub(super) fn spec_object(group: &hdf5::Group, path: &str) -> Result<hdf5::Location> {
+    use hdf5_metno_sys::{
+        h5::herr_t,
+        h5i::hid_t,
+        h5o::H5Oopen,
+        h5p::{H5Pcreate, H5Pset_elink_cb, H5P_CLS_LINK_ACCESS},
+    };
+    use std::ffi::{c_char, c_uint, c_void, CString};
+
+    extern "C" fn deny_external(
+        _: *const c_char,
+        _: *const c_char,
+        _: *const c_char,
+        _: *const c_char,
+        _: *mut c_uint,
+        _: hid_t,
+        _: *mut c_void,
+    ) -> herr_t {
+        -1
+    }
+    let name = CString::new(path)?;
+    hdf5::sync::sync(|| {
+        // SAFETY: IDs and the C string are live under the HDF5 lock. The
+        // callback ignores its arguments; owned IDs are wrapped immediately.
+        unsafe {
+            let lapl: hdf5::PropertyList = hdf5::from_id(H5Pcreate(*H5P_CLS_LINK_ACCESS))?;
+            hdf5::h5check(H5Pset_elink_cb(
+                lapl.id(),
+                Some(deny_external),
+                std::ptr::null_mut(),
+            ))?;
+            hdf5::from_id(H5Oopen(group.id(), name.as_ptr(), lapl.id()))
+        }
+    })
+    .with_context(|| format!("cannot open same-file HDF5 spec object {path:?}"))
+}
+
+pub(super) fn spec_reference(root: &hdf5::Group, attr: &hdf5::Attribute) -> Result<hdf5::Group> {
+    use hdf5_metno_sys::{
+        h5a::H5Aread,
+        h5p::H5P_DEFAULT,
+        h5r::{hobj_ref_t, H5R_type_t::H5R_OBJECT1, H5Rdereference2},
+        h5t::{H5Tequal, H5T_STD_REF_OBJ},
+    };
+
+    ensure!(attr.ndim() == 0, "HDF5 .specloc must be scalar");
+    let dtype = attr.dtype()?;
+    hdf5::sync::sync(|| {
+        // SAFETY: the scalar old-style object reference has exactly the
+        // hobj_ref_t layout. It can only reference objects in the same file.
+        unsafe {
+            ensure!(
+                H5Tequal(dtype.id(), *H5T_STD_REF_OBJ) > 0,
+                "HDF5 .specloc must be an object reference"
+            );
+            let mut reference: hobj_ref_t = 0;
+            hdf5::h5check(H5Aread(
+                attr.id(),
+                *H5T_STD_REF_OBJ,
+                (&mut reference as *mut hobj_ref_t).cast(),
+            ))?;
+            Ok(hdf5::from_id(H5Rdereference2(
+                root.id(),
+                H5P_DEFAULT,
+                H5R_OBJECT1,
+                (&reference as *const hobj_ref_t).cast(),
+            ))?)
+        }
+    })
 }

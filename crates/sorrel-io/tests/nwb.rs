@@ -153,6 +153,58 @@ fn electrical_series_subtypes_are_accepted() {
 }
 
 #[test]
+fn subtype_discovery_uses_local_cached_specs_or_refuses_to_choose_a_clock() {
+    for format in FORMATS {
+        let dir = tempfile::tempdir().unwrap();
+        let src = format.fixture("subtype.nwb");
+        let path = dir.path().join(src.file_name().unwrap());
+        let open = || {
+            NwbProvider::open_with(
+                &path,
+                NwbOpenParams {
+                    sample_rate: Some(1000.0), // A units-only fallback could otherwise succeed.
+                    ..Default::default()
+                },
+            )
+        };
+        let check_clock = || {
+            let p = open().unwrap();
+            assert_eq!(p.spike_times(ClusterId(2))[0], SampleIndex(50));
+        };
+        match format {
+            #[cfg(feature = "hdf5")]
+            Format::Hdf5 => {
+                std::fs::copy(src, &path).unwrap();
+                let f = hdf5_metno::File::open_rw(&path).unwrap();
+                f.relink("/specifications", "/cache").unwrap();
+                drop(f);
+                check_clock(); // PyNWB's existing .specloc object reference still points here.
+                let f = hdf5_metno::File::open_rw(&path).unwrap();
+                f.delete_attr(".specloc").unwrap();
+                f.link_soft("/cache", "/specifications").unwrap();
+                drop(f);
+                check_clock();
+                let f = hdf5_metno::File::open_rw(&path).unwrap();
+                f.unlink("/cache").unwrap();
+            }
+            #[cfg(feature = "zarr")]
+            Format::Zarr => {
+                zarr_tests::copy_store(&src, &path);
+                std::fs::rename(path.join("specifications"), path.join("cache")).unwrap();
+                std::fs::write(path.join(".zattrs"), r#"{".specloc":"cache"}"#).unwrap();
+                check_clock();
+                std::fs::write(path.join(".zattrs"), r#"{".specloc":"../cache"}"#).unwrap();
+            }
+        }
+        let err = open().err().expect("unverifiable ancestry");
+        assert!(
+            format!("{err:#}").contains("cannot determine ElectricalSeries ancestry"),
+            "{err:#}"
+        );
+    }
+}
+
+#[test]
 fn rejects_what_it_cannot_read_faithfully() {
     for format in FORMATS {
         let e = format.open_err("not_electrical.nwb");
