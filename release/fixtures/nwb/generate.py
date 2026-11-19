@@ -26,6 +26,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import h5py
 import numpy as np
 from hdmf.backends.hdf5.h5_utils import H5DataIO
 from hdmf.common import VectorData, VectorIndex
@@ -180,6 +181,18 @@ def write_multiple_series():
     write(nwbfile, "multiple_series.nwb")
 
 
+def write_legacy_series():
+    nwbfile = make_file("sorrel-fixture-legacy-series")
+    add_series(nwbfile, good_data(), name="A_first", rate=1000.0, starting_time=0.52)
+    add_series(nwbfile, good_data(), name="Z_second", rate=np.float32(1000), starting_time=0.5)
+    name = "legacy_series.nwb"
+    write(nwbfile, name)
+    with h5py.File(OUT / name, "r+") as f:
+        attrs = f["acquisition/A_first"].attrs
+        del attrs["neurodata_type"]
+        attrs["neurodata_type"] = np.bytes_("ElectricalSeries")
+
+
 def write_units_and_raw():
     units = make_file("sorrel-fixture-units-only", resolution=0.001)
     units.add_trial(start_time=0.6, stop_time=0.7)
@@ -309,6 +322,7 @@ def main():
     write_timestamps()
     write_timestamps(irregular=True)
     write_multiple_series()
+    write_legacy_series()
     write_units_and_raw()
     write_curated_units()
     write_reader_edge_cases()

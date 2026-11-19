@@ -106,42 +106,29 @@ mod imp {
                 None
             };
 
-            let mut series_identity = None;
-            let seal_rate;
-            let (trace, rate, t0, (channel_map, channel_positions)) = if let Some((
-                name,
-                series,
-                default_series,
-            )) = series
+            let mut legacy_identity = false;
+            let (trace, rate, t0, (channel_map, channel_positions)) = if let Some((name, series)) =
+                &series
             {
                 let data = series.dataset("data")?;
                 let shape = data.shape();
                 let (n_samples, n_channels) = (shape[0], shape.get(1).copied().unwrap_or(1));
-                let (mut rate, t0, float32_rate) = read_time_base(&series, &name, n_samples)?;
-                // Files alone don't pin the effective rate when a float32 clock
-                // can be refined by the sorting rate or --sample-rate.
-                seal_rate = float32_rate;
+                let (stored_rate, t0, float32_rate) = read_time_base(series, name, n_samples)?;
+                let mut rate = stored_rate;
                 if let Some(expected) = units_rate.or(params.sample_rate) {
-                    check_matching_rate(
-                        "sorting sample rate",
-                        expected,
-                        &name,
-                        rate,
-                        float32_rate,
-                    )?;
+                    check_matching_rate("sorting sample rate", expected, name, rate, float32_rate)?;
                     if float32_rate {
                         rate = expected;
                     }
                 }
-                let channels = read_channels(recording, &series, &name, n_channels)?;
-                let trace = NwbTrace::new(&series, data, &name, n_samples, n_channels)?;
-                // Don't add a series path to the historical default acquisition's seal.
-                if raw.is_some() || !default_series {
-                    series_identity = Some(name);
-                }
+                let channels = read_channels(recording, series, name, n_channels)?;
+                let trace = NwbTrace::new(series, data, name, n_samples, n_channels)?;
+                legacy_identity = raw.is_none()
+                    && rate == stored_rate
+                    && !series.link_exists("timestamps")
+                    && is_trunk_series(&f, name);
                 (Some(trace), rate, t0, channels)
             } else {
-                seal_rate = true;
                 (
                         None,
                         units_rate.context(
@@ -167,14 +154,15 @@ mod imp {
                     "spike times extend past the paired ElectricalSeries (starting time {t0} s, {n_samples} samples at {rate} Hz)");
             }
             let mut identity_bytes = provider_identity_bytes(path);
-            if let Some(raw_path) = params.raw_path {
-                identity_bytes.extend(provider_identity_bytes(raw_path));
-            }
-            if let Some(series) = series_identity {
-                identity_bytes.extend(series.into_bytes());
-            }
-            if seal_rate {
+            if !legacy_identity {
+                if let Some((name, _)) = &series {
+                    identity_bytes.extend_from_slice(name.as_bytes());
+                }
+                identity_bytes.push(0); // Terminate the path (empty for units-only).
                 identity_bytes.extend(rate.to_le_bytes());
+                if let Some(raw_path) = params.raw_path {
+                    identity_bytes.extend(provider_identity_bytes(raw_path));
+                }
             }
             let metadata = read_unit_metadata(&units, &unit_ids)?;
             Ok(Self {
@@ -477,7 +465,10 @@ mod imp {
 
     /// `neurodata_type_def → neurodata_type_inc` for every type in the
     /// file's cached specifications (core and extensions).
-    fn type_parents(f: &H5File) -> HashMap<String, String> {
+    fn type_parents(
+        f: &H5File,
+        read: impl Fn(&hdf5::Container) -> Result<String>,
+    ) -> HashMap<String, String> {
         fn collect(v: &serde_json::Value, out: &mut HashMap<String, String>) {
             match v {
                 serde_json::Value::Object(m) => {
@@ -502,7 +493,7 @@ mod imp {
             .flatten()
         {
             for ds in version.datasets().into_iter().flatten() {
-                let text = read_str(&ds);
+                let text = read(&ds);
                 if let Some(v) = text.ok().and_then(|t| serde_json::from_str(&t).ok()) {
                     collect(&v, &mut out);
                 }
@@ -511,11 +502,58 @@ mod imp {
         out
     }
 
+    fn is_electrical_series(ty: &str, parents: &HashMap<String, String>) -> bool {
+        let mut ty = ty;
+        // Bounded walk: a malformed spec could loop.
+        for _ in 0..32 {
+            if ty == "ElectricalSeries" {
+                return true;
+            }
+            match parents.get(ty) {
+                Some(parent) => ty = parent,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Mirror trunk's discovery for the journal seal, including the old
+    /// variable-length-only decoder for both type tags and cached specs.
+    fn is_trunk_series(f: &H5File, selected: &str) -> bool {
+        fn read_legacy_str(data: &hdf5::Container) -> Result<String> {
+            Ok(data
+                .read_scalar::<VarLenUnicode>()
+                .map(|s| s.to_string())
+                .or_else(|_| data.read_scalar::<VarLenAscii>().map(|s| s.to_string()))?)
+        }
+        let Some(name) = selected.strip_prefix("/acquisition/") else {
+            return false;
+        };
+        let Ok(acq) = f.group("/acquisition") else {
+            return false;
+        };
+        let Ok(names) = acq.member_names() else {
+            return false;
+        };
+        let parents = type_parents(f, read_legacy_str);
+        names
+            .into_iter()
+            .find(|name| {
+                let Ok(g) = acq.group(name) else { return false };
+                g.attr("neurodata_type")
+                    .ok()
+                    .and_then(|a| read_legacy_str(&a).ok())
+                    .is_some_and(|t| is_electrical_series(&t, &parents))
+                    && g.dataset("data").is_ok_and(|d| d.ndim() == 2)
+            })
+            .is_some_and(|first| first == name)
+    }
+
     fn find_electrical_series(
         f: &H5File,
         requested: Option<&str>,
         required: bool,
-    ) -> Result<Option<(String, hdf5::Group, bool)>> {
+    ) -> Result<Option<(String, hdf5::Group)>> {
         fn collect(
             group: &hdf5::Group,
             path: &str,
@@ -544,21 +582,8 @@ mod imp {
             Ok(())
         }
 
-        let parents = type_parents(f);
-        let is_series = |t: &str| {
-            let mut t = t;
-            // Bounded walk: a malformed spec could loop.
-            for _ in 0..32 {
-                if t == "ElectricalSeries" {
-                    return true;
-                }
-                match parents.get(t) {
-                    Some(p) => t = p,
-                    None => return false,
-                }
-            }
-            false
-        };
+        let parents = type_parents(f, read_str);
+        let is_series = |t: &str| is_electrical_series(t, &parents);
         let mut found = Vec::new();
         for (root, depth) in [("/acquisition", 0), ("/processing", 32)] {
             if f.link_exists(root) {
@@ -628,8 +653,7 @@ mod imp {
                 available()
             );
         }
-        let (path, group) = found.swap_remove(index);
-        Ok(Some((path, group, index == default_index)))
+        Ok(Some(found.swap_remove(index)))
     }
 
     /// `(rate Hz, starting_time s, rate stored as float32)`.
