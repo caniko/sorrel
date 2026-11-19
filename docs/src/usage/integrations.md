@@ -245,7 +245,9 @@ version, Sorrel selects the latest published version, or `draft` if there is
 none. Prefer an explicit version for reproducibility. For embargoed data, set
 `DANDI_API_KEY` in the Sorrel process that opens the session (including an
 already-running GUI if it receives `sorrel open`). The key is used only for
-requests to the DANDI API, not to storage.
+requests to the DANDI API, not to storage. Library consumers should cap
+`ureq`, `ureq_proto`, and `rustls` logging at `warn` or turn it off to keep
+signed URLs out of logs.
 
 Streaming is read-only. Sorrel loads metadata and sorting data, then fetches
 trace windows on demand. Direct HTTPS HDF5 URLs must support range GETs and

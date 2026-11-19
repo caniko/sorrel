@@ -2591,7 +2591,23 @@ fn install_shortcut(remove: bool) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let mut logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    // Signed URLs are credentials. A more specific RUST_LOG target would
+    // override a crate-level filter, so disable those directives too.
+    let transport = ["ureq", "ureq_proto", "rustls"];
+    let filter = std::env::var("RUST_LOG").unwrap_or_default();
+    let targets = filter
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().split('=').next().unwrap_or_default())
+        .filter(|target| transport.iter().any(|prefix| target.starts_with(prefix)));
+    for target in transport.into_iter().chain(targets) {
+        logger.filter_module(target, log::LevelFilter::Off);
+    }
+    logger.init();
     let cli = Cli::parse();
     match cli.cmd {
         None => run_bare(),

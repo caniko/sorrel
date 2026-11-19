@@ -13,7 +13,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
-- **DANDI streaming.** Open HDF5 NWB and NWB-Zarr assets by `dandi://` or HTTPS. Sorrel reads trace ranges on demand and keeps curation journals locally. HDF5 assets still require an HDF5-enabled build.
+- **DANDI streaming.** Open HDF5 NWB and NWB-Zarr assets by `dandi://` or HTTPS. Sorrel verifies DANDI Zarr listings and pins storage objects before reusing cached ranges. Remote NWB GUI sessions show trial events, and waveform probes report failed reads. Journals stay local; HDF5 assets still require an HDF5-enabled build.
 - **NWB-Zarr reads without native compression libraries.** The reader decodes Blosc 1 chunks with LZ4, LZ4HC, Zstd, zlib, BloscLZ, or Snappy on the same release targets as Sorrel.
 - **New leaf icon.** The app, crate, favicon and design-file marks use the new sorrel leaf. `assets/icon/generate.cjs` regenerates the SVG copy, PNG sizes and ICO from `logo/logo-clean.svg` in one step.
 - **Redesigned website.** The landing page leads with the native workspace and adds a linked-evidence showcase and gallery. The download page recommends the pip route with a copyable command, hides Windows package options on other platforms, and links each install route to its guide section.
