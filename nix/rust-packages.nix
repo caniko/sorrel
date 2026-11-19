@@ -57,6 +57,9 @@
     // {
       inherit cargoArtifacts;
       cargoExtraArgs = "-p sorrel --locked";
+      # Its NWB tests read release/fixtures, which this source omits; they
+      # run in checks.workspace-tests and checks.hdf5-tests.
+      doCheck = false;
       nativeBuildInputs = nativeBuildInputs ++ [pkgs.installShellFiles];
       postInstall = completions;
       # Add an rpath so the binary finds vulkan/wayland/etc. without
