@@ -102,7 +102,7 @@ until margin units and disagreements with the auto classifiers are few.
 brief {clusters:[..]} for cards, brief level 3 for relations (merge components \
 m<k>, split candidates s<cluster>.<k>), eval for a counterfactual of a merge or a \
 split. When the precomputed evidence does not settle a hypothesis, test it with \
-probe (acg, ccg, compare, window, split by=amp|time|pc|kmeans|core|robust|axis, eval): one short \
+probe (acg, ccg, compare, window, epochs, split by=amp|time|pc|kmeans|core|robust|axis, eval): one short \
 answer per query, and probe split gives a new s handle you can decide on. \
 select moves the human's selection so they see what you discuss.
 4. Call rules_apply, then decide for the exceptions, the merges (by m handle, or \
@@ -272,7 +272,7 @@ fn read_tools() -> Vec<Value> {
          "inputSchema": cluster}),
         json!({"name": "merge_candidates", "description": "Merge candidates involving a cluster with their evidence (CCG dip, amplitude KS); brief level 3 shows all of them as components (m<k>)",
          "inputSchema": cluster}),
-        json!({"name": "probe", "description": "Closed-grammar computations for hypotheses the brief did not anticipate, one compact answer per query. q = one string or a list. acg C [win=50] [bin=1] (refractory estimate, contamination, burst, SAX of log lags, first bin rates); ccg A B [win=50] [bin=1] (dip_z, sync_z, +/- lag asymmetry, SAX); compare A B (template cosine on shared channels, peak-channel distance um, trough-to-peak/half-width deltas, amplitude ratio); waveform C (up to 128 current-membership raw snippets on up to 8 channels, SNR, early/late waveform cosine and landmarks; unlike template metrics it changes after splits; DC subtraction only, so do not apply filtered-template shape cutoffs to hp_input=false/unknown raw); window C T0 T1 (seconds: n, rate, rpc, amplitude, presence of the slice vs the whole unit); split C by=amp|time|pc|kmeans|core|robust|axis [at=X] (core = small clean refractory core of a contaminated unit, minor part, or cleanup = the contaminated minority whose removal leaves a clean majority, minor part; robust = covariance-aware majority cleanup whose refractory checks only veto the offer; axis lists up to 30 alternative PC/amplitude mixture handles, no at=; the handle line says which part is the minor one; creates a NEW split handle s<C>.<k> with its counterfactual line: minor part = spikes above/after X, default the GMM boundary / the biggest amplitude jump / PC1 sign; act on it with split {candidate}, decide or eval); eval merge A B .. | eval s12.1 | eval m3. Read-only except that split registers a handle",
+        json!({"name": "probe", "description": "Closed-grammar computations for hypotheses the brief did not anticipate, one compact answer per query. q = one string or a list. acg C [win=50] [bin=1] (refractory estimate, contamination, burst, SAX of log lags, first bin rates); ccg A B [win=50] [bin=1] (dip_z, sync_z, +/- lag asymmetry, SAX); compare A B (template cosine on shared channels, peak-channel distance um, trough-to-peak/half-width deltas, amplitude ratio); waveform C (up to 128 current-membership raw snippets on up to 8 channels, SNR, early/late waveform cosine and landmarks; unlike template metrics it changes after splits; DC subtraction only, so do not apply filtered-template shape cutoffs to hp_input=false/unknown raw); window C T0 T1 (seconds: n, rate, rpc, amplitude, presence of the slice vs the whole unit); epochs C (one line per fitted epoch: start/end seconds, spike count, rate in Hz, mean stored amplitude; a rate-only change is not evidence of dropout by itself; use a boundary in split C by=time at=T to propose a split); split C by=amp|time|pc|kmeans|core|robust|axis [at=X] (core = small clean refractory core of a contaminated unit, minor part, or cleanup = the contaminated minority whose removal leaves a clean majority, minor part; robust = covariance-aware majority cleanup whose refractory checks only veto the offer; axis lists up to 30 alternative PC/amplitude mixture handles, no at=; the handle line says which part is the minor one; creates a NEW split handle s<C>.<k> with its counterfactual line: minor part = spikes above/after X, default the GMM boundary / the biggest amplitude jump / PC1 sign; act on it with split {candidate}, decide or eval); eval merge A B .. | eval s12.1 | eval m3. Read-only except that split registers a handle",
          "inputSchema": {"type": "object", "properties": {"q": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]}}, "required": ["q"]}}),
         json!({"name": "eval", "description": "Counterfactual of a merge or split without applying it: per-part and merged contamination, presence and cutoff, plus per-pair CCG dip/synchrony z and amplitude KS. {merge:[ids]} tests any merge; {candidate:\"s12.1\"|\"m3\"} a handle from brief level 3 or suggest",
          "inputSchema": {"type": "object", "properties": {"merge": {"type": "array", "items": {"type": "integer"}}, "candidate": {"type": "string"}}}}),
@@ -2382,6 +2382,99 @@ mod tests {
             t.contains("review refractory evidence: rpv_post_hi95>0.1 -> mua: 2"),
             "{t}"
         );
+    }
+
+    #[test]
+    fn stable_epochs_in_metrics_rules_and_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let times: Vec<_> = (0..1000).map(|i| SampleIndex(i * 100)).collect();
+        let singletons: Vec<_> = (0..100).map(|i| SampleIndex(i * 1000)).collect();
+        let amps = (0..1000)
+            .map(|i| if i < 600 { -100.0 } else { -50.0 })
+            .collect();
+        let mut session = Session::new(
+            MockProvider {
+                spikes: vec![
+                    times.clone(),
+                    times.clone(),
+                    vec![SampleIndex(5)],
+                    singletons,
+                    times,
+                ],
+                amps: vec![
+                    amps,
+                    vec![],
+                    vec![1.0],
+                    [vec![100.0; 50], vec![50.0; 50]].concat(),
+                    vec![0.0; 1000],
+                ],
+                n_samples: SampleIndex(100_000),
+            },
+            Journal::open(&dir.path().join("j.journal")).unwrap(),
+        );
+        session.seed_amplitudes();
+        let h = SessionHost::new(session);
+        let mut env = Env::new(dir.path(), false, label);
+        let mut run = |tool, args| handle_line(&h, &mut env, &call(1, tool, args)).unwrap();
+
+        let step = payload(&run("metrics", json!({"cluster": 0})));
+        assert_eq!(step["n_epochs"], 2.0);
+        assert_eq!(step["epoch_amp_ratio"], 0.5);
+        assert_eq!(step["epoch_rate_ratio"], 1.0);
+        let no_amp = payload(&run("metrics", json!({"cluster": 1})));
+        assert_eq!(no_amp["n_epochs"], 1.0);
+        assert!(no_amp.get("epoch_amp_ratio").unwrap().is_null());
+        assert_eq!(no_amp["epoch_rate_ratio"], 1.0);
+        let sparse = payload(&run("metrics", json!({"cluster": 2})));
+        for name in ["n_epochs", "epoch_amp_ratio", "epoch_rate_ratio"] {
+            assert!(sparse.get(name).unwrap().is_null(), "{sparse}");
+        }
+        for cluster in [3, 4] {
+            let unavailable = payload(&run("metrics", json!({"cluster": cluster})));
+            assert_eq!(unavailable["n_epochs"], 1.0);
+            assert!(unavailable.get("epoch_amp_ratio").unwrap().is_null());
+        }
+
+        let rules = r#"
+            [[rule]]
+            name = "review amplitude step"
+            metric = "epoch_amp_ratio"
+            op = "<"
+            value = 0.6
+            label = "mua"
+            all = [{metric = "n_epochs", op = ">", value = 1}, {metric = "epoch_rate_ratio", op = ">", value = 0.9}]
+        "#;
+        let out = run("rules_eval", json!({"rules": rules}));
+        assert_eq!(out["result"]["isError"], false, "{out}");
+        let text = texts(&out);
+        assert!(text.contains("-> mua: 1"), "{text}");
+
+        let text = texts(&run(
+            "probe",
+            json!({"q": ["epochs 0", "epochs 1", "epochs 2", "epochs 3", "epochs 0 extra=1", "split 0 by=time at=60"]}),
+        ));
+        assert!(
+            text.contains(
+                "> epochs 0\n0-60 s n=600 rate=10Hz amp=-100\n60-100 s n=400 rate=10Hz amp=-50\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("`split 0 by=time at=T`"), "{text}");
+        assert!(
+            text.contains("> epochs 1\n0-100 s n=1000 rate=10Hz amp=-"),
+            "{text}"
+        );
+        assert!(text.contains("> epochs 2\nepochs unavailable"), "{text}");
+        assert!(
+            text.contains("> epochs 3\n0-100 s n=100 rate=1Hz amp=75"),
+            "{text}"
+        );
+        assert!(
+            text.contains("unknown option \"extra\" for epochs"),
+            "{text}"
+        );
+        assert!(text.contains("s0.1 time sc -: parts 600/400"), "{text}");
+        assert_eq!(h.read().spike_times(ClusterId(0)).len(), 1000);
     }
 
     fn ui() -> (Arc<Ui>, std::sync::mpsc::Receiver<Vec<ClusterId>>) {

@@ -127,6 +127,24 @@ value = 0.1
 label = "mua"
 ```
 
+### Stable epochs
+
+Thin lines in the **Amplitudes** view mark fitted changes for the selected units, using their stored sorter amplitudes regardless of the displayed amplitude type. The lines are hidden when Ctrl+R reorders spike times. `probe epochs C` lists each interval in seconds with its spike count, firing rate (Hz), and signed mean amplitude. QC exports, MCP `metrics`, and rules expose these summaries:
+
+| Column             | Meaning                                                                |
+| ------------------ | ---------------------------------------------------------------------- |
+| `n_epochs`         | Number of fitted segments, including 1 if no change was found.         |
+| `epoch_amp_ratio`  | Smallest divided by largest magnitude of the segment mean amplitudes.  |
+| `epoch_rate_ratio` | Lowest divided by highest segment firing rate; 1 for a single segment. |
+
+The fit uses 100 equal recording bins and segments at least 5 bins long. For rate fitting, each bin's baseline is the median of six nearby bins, excluding the bin itself and its immediate neighbors. Near recording ends, more bins are taken from the available side. Single bins are capped against their baseline; two adjacent bins above baseline also share a cap based on the sum of their baselines, so a short burst gets much the same cap whether or not it crosses a bin edge. Caps use the 99.9th Poisson percentile, with a minimum of three spikes. Runs of three or more bins above their individual caps are left unchanged as a sustained change, so a two-bin burst next to an already high bin, or a burst longer than about two bins, can still start a segment. The Poisson count deviance is scaled by a winsorized short-lag dispersion estimate on the capped counts, floored at 1. Reported spike counts and firing rates still use all spikes, as does the amplitude fit.
+
+When amplitudes are fitted, the Gaussian cost weights bin means by spike count and uses a pooled, outlier-capped within-bin variance. The fit charges `ln(spike count)` per fitted level (one rate per segment and one amplitude per nonempty segment when enabled), plus `2 ln(91)` per boundary for searching over 91 possible locations.
+
+Missing or invalid amplitudes, or fewer than 20 pooled within-bin degrees of freedom, give a rate-only fit. The amplitude ratio is unavailable if amplitudes were not fitted, any segment is silent, or the largest mean magnitude is zero. A single segment with a fitted nonzero mean has ratio 1. Probe still shows descriptive means when amplitudes are valid but not fitted. All three summaries are unavailable with fewer than 10 spikes or invalid recording timing (`NaN` in Rust, `null` in JSON, blank in TSV).
+
+A rate-only change is not by itself evidence of dropout: behaviour can change firing rates. For example, try `epoch_amp_ratio < 0.6` as a review rule in `rules_eval`, then inspect where the change occurred. To split at a boundary, copy the reported time into `split C by=time at=T` in `probe`. The handle moves spikes at or after the boundary, matching the fit's half-open intervals. Applying it is journaled and undoable; the fit itself makes no edits.
+
 **Cross-talk** (Sorrel extra). The views share four kinds of state, so a pick in one shows in all the others:
 
 - **Spike brush.** One set of spikes at a time, and the last writer wins. It comes from a Features lasso or k-means part, an Amplitudes lasso or threshold, a Spike data or Tmpl features lasso, or the ISI refractory band. Every spike view draws the brushed spikes in brush ink: white in dark, near-black in light. With a lasso or k-means brush, ISI, Waveforms and Quality also preview the split: the inside part dashed, the outside part dotted, and "if split" rows with the change in composite score.
