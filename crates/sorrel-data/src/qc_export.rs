@@ -72,7 +72,7 @@ pub struct QcRow {
     pub srp_contamination: f32,
     /// First passing window at that fraction (ms), or `NaN`.
     pub srp_rp_ms: f32,
-    /// Fixed-window contamination posterior mean and 95% equal-tailed bounds.
+    /// Fixed-window contamination posterior mean and 95% highest-density bounds.
     pub rpv_post_mean: f32,
     pub rpv_post_lo95: f32,
     pub rpv_post_hi95: f32,
@@ -311,9 +311,18 @@ impl QcRow {
     }
 }
 
+/// Six decimals, except tiny non-zero values (posterior bounds of long clean
+/// units) print in full so they do not round to 0.
+fn num(v: f32) -> String {
+    match v != 0.0 && v.abs() < 1e-3 {
+        true => format!("{v}"),
+        false => format!("{v:.6}"),
+    }
+}
+
 fn fmt_or_empty(v: f32) -> String {
     if v.is_finite() {
-        format!("{v:.6}")
+        num(v)
     } else {
         String::new()
     }
@@ -321,7 +330,7 @@ fn fmt_or_empty(v: f32) -> String {
 
 fn json_num(v: f32) -> String {
     if v.is_finite() {
-        format!("{v:.6}")
+        num(v)
     } else {
         "null".to_string()
     }

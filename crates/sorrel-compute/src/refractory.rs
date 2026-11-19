@@ -36,10 +36,12 @@ const NO_POSTERIOR: ContaminationPosterior = ContaminationPosterior {
 /// Tests 0.5% through 35% in 0.5% steps, requiring nominal Poisson confidence
 /// strictly above 90% (no multiple-comparisons correction). Unlike IBL, which
 /// tests every sample bin above 0.5 ms, this uses the session sweep (by default
-/// 0.75–10 ms by 0.25 ms), rounded to sample edges. The first passing edge at
-/// the smallest passing fraction wins. Neither output is an estimate of the
-/// neuron's true refractory period. Both are `NaN` if nothing passes, there
-/// are fewer than two spikes, or the recording duration or rate is invalid.
+/// 0.75–10 ms by 0.25 ms), rounded to sample edges, and charges a window of
+/// `e` samples `e - 1` samples of exposure. At the smallest passing fraction
+/// it reports the window of highest confidence, IBL's refractory-period
+/// estimate. Assumes diffuse (Poisson) contamination. Both are `NaN` if
+/// nothing passes (too few spikes, or contamination above 35%), there are
+/// fewer than two spikes, or the recording duration or rate is invalid.
 /// `times` must be sorted in ascending sample order.
 pub fn sliding_rp(
     times: &[SampleIndex],
@@ -51,10 +53,12 @@ pub fn sliding_rp(
 }
 
 /// Fixed-window contamination posterior with a uniform Beta(1,1) prior on
-/// [0, 1], a Poisson likelihood, and a 95% equal-tailed credible interval.
+/// [0, 1], a Poisson likelihood, and a 95% highest-density credible interval.
 /// Assumes the tested window is no longer than the neuron's true refractory
-/// period and spike rates are stationary. A wide interval means too little
-/// data to tell. Fractions are `NaN` with fewer than two spikes or invalid
+/// period, stationary rates and diffuse (Poisson) contamination. An interval
+/// from near 0 to high values means too little data to tell; one bounded well
+/// above 0 is wide because Ve flattens as C nears 1. Fractions are `NaN` with
+/// fewer than two spikes or invalid
 /// recording duration, rate, or fixed window. `times` must be sorted.
 pub fn contamination_posterior(
     times: &[SampleIndex],
@@ -113,24 +117,44 @@ fn compute_evidence(
         return (NO_SRP, NO_POSTERIOR);
     }
     let n = times.len() as f64;
-    // tau / duration, both originally in seconds: the sample rate cancels.
-    let ratio = |edge: u64| edge as f64 / total_samples as f64;
+    // A window as long as the recording holds every pair, so more width
+    // cannot add counts while Ve keeps growing: such windows are no evidence.
+    // Ve's 2·τ/D pair probability also exceeds 1 past half the recording.
+    let fits = |e: u64| e.saturating_mul(2) < total_samples;
+    let edges: Vec<u64> = edges.into_iter().filter(|&e| fits(e)).collect();
+    let fixed = if fits(fixed) { fixed } else { 0 };
+    // Exposure / duration. Integer lags 1..edge-1 see edge - 1 samples of
+    // continuous lag (uniform sub-sample phase), not edge: charging the full
+    // edge, as IBL does, understates contamination on coarse timestamps.
+    // The sample rate cancels.
+    let ratio = |edge: u64| (edge - 1) as f64 / total_samples as f64;
     let (counts, fixed_count) = violation_counts(times, &edges, fixed);
     let srp = if edges.is_empty() {
         NO_SRP
     } else {
         let grid: [f64; 70] = std::array::from_fn(|i| (i + 1) as f64 / 200.0);
-        let first_passing_edge = |c| {
-            edges.iter().copied().zip(&counts).find_map(|(edge, &v)| {
-                (poisson_confidence(v, expected_violations(n, ratio(edge), c)) > 0.9)
-                    .then_some(edge)
-            })
+        // Among windows passing at `c`, the one of highest confidence, as in
+        // IBL `pass_slidingRP_confmat` (argmax, first on ties). Compare log
+        // P(X <= V) so confidences that round to 1.0 still order.
+        let best_edge = |c| {
+            edges
+                .iter()
+                .zip(&counts)
+                .map(|(&edge, &v)| {
+                    (
+                        edge,
+                        poisson_log_cdf(v, expected_violations(n, ratio(edge), c)),
+                    )
+                })
+                .filter(|&(_, log_cdf)| -log_cdf.exp_m1() > 0.9)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(edge, _)| edge)
         };
         // Expected violations increase with C throughout the tested grid.
-        let i = grid.partition_point(|&c| first_passing_edge(c).is_none());
+        let i = grid.partition_point(|&c| best_edge(c).is_none());
         grid.get(i)
             .and_then(|&c| {
-                first_passing_edge(c).map(|edge| SlidingRp {
+                best_edge(c).map(|edge| SlidingRp {
                     min_contamination: c as f32,
                     rp_ms: (edge as f64 * 1000.0 / f64::from(sr)) as f32,
                 })
@@ -205,11 +229,17 @@ fn poisson_log_pmf(k: f64, mean: f64) -> f64 {
     }
 }
 
-/// P(X > v). Sum the shorter tail relative to its largest mass, then
-/// restore scale in log space; no exp(-mean) seed that could underflow.
+/// P(X > v).
+#[cfg(test)]
 fn poisson_confidence(v: u64, mean: f64) -> f64 {
+    -poisson_log_cdf(v, mean).exp_m1()
+}
+
+/// ln P(X <= v). Sum the shorter tail relative to its largest mass, then
+/// restore scale in log space; no exp(-mean) seed that could underflow.
+fn poisson_log_cdf(v: u64, mean: f64) -> f64 {
     if v == 0 {
-        return -(-mean).exp_m1();
+        return -mean;
     }
     let mut term = 1.0;
     let mut sum = 1.0;
@@ -222,7 +252,7 @@ fn poisson_confidence(v: u64, mean: f64) -> f64 {
                 break;
             }
         }
-        -(poisson_log_pmf(k, mean) + sum.ln()).min(0.0).exp_m1()
+        (poisson_log_pmf(k, mean) + sum.ln()).min(0.0)
     } else {
         for j in v + 2.. {
             term *= mean / j as f64;
@@ -231,7 +261,7 @@ fn poisson_confidence(v: u64, mean: f64) -> f64 {
                 break;
             }
         }
-        (poisson_log_pmf(k + 1.0, mean) + sum.ln()).min(0.0).exp()
+        (-(poisson_log_pmf(k + 1.0, mean) + sum.ln()).min(0.0).exp()).ln_1p()
     }
 }
 
@@ -268,7 +298,8 @@ fn posterior_from_count(violations: u64, n: f64, tau_over_duration: f64) -> Cont
     // (Ve(C) = k), so a narrow peak near 0 on a long recording is resolved.
     let c_peak = match k == 0.0 {
         true => 0.0,
-        false => bisect(0.0, 1.0, &|c| {
+        // Ve rises until 1 - 1/(2N), so bisect only where it is monotone.
+        false => bisect(0.0, 1.0 - 0.5 / n, &|c| {
             expected_violations(n, tau_over_duration, c) < k
         }),
     };
@@ -300,14 +331,24 @@ fn posterior_from_count(violations: u64, n: f64, tau_over_duration: f64) -> Cont
     let mass = cumulative[STEPS];
     let quantile = |p| {
         let target = p * mass;
-        let i = cumulative.partition_point(|&x| x < target);
+        let i = cumulative.partition_point(|&x| x < target).max(1);
         let t = (target - cumulative[i - 1]) / (cumulative[i] - cumulative[i - 1]);
         (c_lo + (c_hi - c_lo) * (i as f64 - 1.0 + t) / STEPS as f64) as f32
     };
+    // 95% highest-density interval: the posterior is unimodal, so it is the
+    // narrowest [q(a), q(a + 0.95)]. With no violations the density falls from
+    // C = 0, so the interval starts at 0 instead of excluding the mode.
+    let (lo95, hi95) = (0..=100)
+        .map(|j| {
+            let a = 0.05 * j as f64 / 100.0;
+            (quantile(a), quantile(a + 0.95))
+        })
+        .min_by(|x, y| (x.1 - x.0).total_cmp(&(y.1 - y.0)))
+        .unwrap_or((f32::NAN, f32::NAN));
     ContaminationPosterior {
         mean: (moment / mass) as f32,
-        lo95: quantile(0.025),
-        hi95: quantile(0.975),
+        lo95,
+        hi95,
         violations: violations.min(u64::from(u32::MAX)) as u32,
     }
 }
@@ -345,9 +386,13 @@ mod tests {
 
     #[test]
     fn ibl_nominal_matrix_parity() {
-        // Seeded dead-time Poisson trains mirrored in sliding_rp_parity.py.
-        // IBL computeMatrix (correction=False), restricted to Sorrel's rounded
-        // right edges; individual cells also checked against IBL computeViol.
+        // Seeded dead-time Poisson trains (2 ms dead time). Reference values
+        // from IBL slidingRefractory python/slidingRP/metrics.py (main, 2026-11-19).
+        // Pair counts and each `cell` (Ve at the full edge, Poisson
+        // confidence) match IBL computeACG / computeViol exactly. The
+        // end-to-end `expected` results charge edge - 1 samples of exposure
+        // instead of IBL's full edge; the fractions and the argmax window
+        // (2.01 ms for the 2 ms dead time) still equal IBL's on these trains.
         let params = RefractoryParams::default();
         for (duration, rate, inject, n, expected, cell) in [
             (
@@ -355,7 +400,7 @@ mod tests {
                 25.0,
                 false,
                 43092,
-                Some((0.005, 25)),
+                Some((0.005, 66)),
                 (0.005, 57, 0, 0.9999999831686436),
             ),
             (
@@ -363,7 +408,7 @@ mod tests {
                 25.0,
                 true,
                 47880,
-                Some((0.105, 41)),
+                Some((0.105, 66)),
                 (0.105, 57, 405, 0.9551630055080321),
             ),
             (
@@ -425,11 +470,11 @@ mod tests {
             contaminated.lo95 < 0.1 && 0.1 < contaminated.hi95,
             "{contaminated:?}"
         );
-        // Values from the earlier fixed [0, 1] grid; the adaptive range
-        // agrees to well within its 5e-4 step.
-        assert!((contaminated.mean - 0.09747124).abs() < 1e-4);
-        assert!((contaminated.lo95 - 0.08706361).abs() < 1e-4);
-        assert!((contaminated.hi95 - 0.10851945).abs() < 1e-4);
+        // True contamination is exactly 10% (N/9 injected); the e - 1
+        // exposure puts the mean within 0.1 point of it.
+        assert!((contaminated.mean - 0.0996154).abs() < 1e-5);
+        assert!((contaminated.lo95 - 0.0887504).abs() < 1e-5);
+        assert!((contaminated.hi95 - 0.1106647).abs() < 1e-5);
     }
 
     #[test]
@@ -458,8 +503,9 @@ mod tests {
         let p = posterior_from_count(0, n, r);
         let near = |got: f32, want: f64| ((f64::from(got) - want) / want).abs() < 0.01;
         assert!(near(p.mean, 1.0 / a), "{p:?}");
-        assert!(near(p.lo95, -(0.975_f64).ln() / a), "{p:?}");
-        assert!(near(p.hi95, -(0.025_f64).ln() / a), "{p:?}");
+        // Highest-density interval of a decreasing density starts at 0.
+        assert_eq!(p.lo95, 0.0, "{p:?}");
+        assert!(near(p.hi95, -(0.05_f64).ln() / a), "{p:?}");
     }
 
     #[test]

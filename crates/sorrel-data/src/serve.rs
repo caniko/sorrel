@@ -256,7 +256,7 @@ fn read_tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
                 "fixed_ms": {"type": "number"}, "sweep_min_ms": {"type": "number", "description": "Exclusive lower bound"},
                 "sweep_max_ms": {"type": "number", "description": "Inclusive upper bound"}, "sweep_step_ms": {"type": "number"}}}}),
-        json!({"name": "metrics", "description": "Quality metrics of one cluster as JSON (same columns as cluster_qc.tsv, plus refractory settings). brief level 2 gives the same numbers for many units at once, quantised",
+        json!({"name": "metrics", "description": "Quality metrics of one cluster as JSON (same columns as cluster_qc.tsv, plus refractory settings). srp_contamination is a nominal 90% upper limit on contamination from the sliding-RP test; null means not confirmed at or below 35% (too few spikes or heavier contamination), so never treat null as clean. rpv_post_* is a contamination posterior at the fixed window (flat prior): read [lo95, hi95], not the mean alone; lo95 > x is evidence of contamination, a wide interval from near 0 is too little data. brief level 2 gives the same numbers for many units at once, quantised",
          "inputSchema": cluster}),
         json!({"name": "suggest", "description": "Merge components and split candidates for the current curation, each with a handle (m<k>, s<cluster>.<k>) and a one-line counterfactual; pass the handle as candidate to split/propose/eval",
          "inputSchema": {"type": "object", "properties": {}}}),

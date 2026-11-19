@@ -122,23 +122,36 @@ fn refractory_tooltip<P: DataProvider>(ui: &Ui, session: &Session<P>, c: Cluster
         session.provider.sample_rate(),
         session.refractory(),
     );
-    let srp = if srp.min_contamination.is_nan() {
-        "SRP n/a".to_owned()
-    } else {
-        format!(
-            "SRP ≤{:.1}% @ {:.2} ms",
-            100.0 * srp.min_contamination,
-            srp.rp_ms
-        )
+    // Two significant digits, so a tiny but non-zero bound does not print as 0.
+    let pct = |f: f32| {
+        let p = 100.0 * f;
+        let decimals = match p > 0.0 && p < 1.0 {
+            true => (1 - p.log10().floor() as i32) as usize,
+            false => 1,
+        };
+        format!("{p:.decimals$}%")
     };
+    let srp = match (srp.min_contamination.is_nan(), post.mean.is_nan()) {
+        (true, true) => "SRP n/a".to_owned(),
+        // Computable but nothing passed: too few spikes or > 35% contamination.
+        (true, false) => "SRP unconfirmed ≤35%".to_owned(),
+        (false, _) => format!(
+            "SRP ≤{} (90%) @ {:.2} ms",
+            pct(srp.min_contamination),
+            srp.rp_ms
+        ),
+    };
+    // The posterior uses the fixed window, not the SRP one; disagreement can
+    // mean the fixed window is longer than this unit's refractory period.
+    let fixed = session.refractory().fixed_ms;
     let text = if post.mean.is_nan() {
-        format!("{srp} · post n/a")
+        format!("{srp} · {fixed:.2} ms posterior n/a")
     } else {
         format!(
-            "{srp} · post {:.1}% [{:.1}–{:.1}%]",
-            100.0 * post.mean,
-            100.0 * post.lo95,
-            100.0 * post.hi95
+            "{srp} · {fixed:.2} ms posterior {} (95% CrI {}–{})",
+            pct(post.mean),
+            pct(post.lo95),
+            pct(post.hi95)
         )
     };
     ui.data_mut(|d| d.insert_temp(id, (key, text.clone())));
