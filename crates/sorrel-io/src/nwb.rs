@@ -82,11 +82,9 @@ mod imp {
             let raw = params.raw_path.map(open_hdf5).transpose()?;
             let recording = raw.as_ref().unwrap_or(&f);
             let series = find_electrical_series(recording, params.series, raw.is_some())?;
-            let units_rate = if raw.is_some() || series.is_none() {
-                read_units_rate(&spike_times)?
-            } else {
-                read_units_rate(&spike_times).ok().flatten()
-            };
+            // In a single file with a series, an invalid resolution value is
+            // not a clock statement; its storage type must still be exact.
+            let units_rate = read_units_rate(&spike_times, raw.is_some() || series.is_none())?;
 
             let mut legacy_identity = false;
             let mut comparison_rate = None;
@@ -318,16 +316,19 @@ mod imp {
         Ok(rate)
     }
 
-    fn read_units_rate(spike_times: &hdf5::Dataset) -> Result<Option<f64>> {
+    fn read_units_rate(spike_times: &hdf5::Dataset, strict: bool) -> Result<Option<f64>> {
         let Ok(attr) = spike_times.attr("resolution") else {
             return Ok(None);
         };
         exact_float(attr.dtype(), "/units/spike_times resolution")?;
         match attr.read_scalar::<f64>()? {
             -1.0 => Ok(None), // Unspecified in the NWB schema.
-            resolution => checked_rate(resolution.recip())
-                .map(Some)
-                .context("invalid /units/spike_times resolution"),
+            resolution => match checked_rate(resolution.recip()) {
+                Err(_) if !strict => Ok(None),
+                rate => rate
+                    .map(Some)
+                    .context("invalid /units/spike_times resolution"),
+            },
         }
     }
 
