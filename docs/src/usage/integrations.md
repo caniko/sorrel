@@ -205,9 +205,9 @@ Spike indices must fit
 inside the raw series. The files must have the same `timestamps_reference_time`;
 Sorrel does not infer an offset between files.
 
-The reader needs a local NWB with `/units`. HDF5 files require `cargo build
---features hdf5`. One series is read per session; multi-segment stitching and
-DANDI/HTTP streaming are not supported.
+The reader needs an NWB with `/units`. HDF5 files require `cargo build
+--features hdf5`. One series is read per session; multi-segment stitching is not
+supported.
 
 - Timestamps with float64 spacing greater than 0.01 samples are refused; if sampling was regular, rewrite the series with `starting_time` and `rate`.
 - With per-sample `timestamps`, each spike must map to a sample inside the series whose recorded timestamp is nearest to the spike time (ties are allowed). Sorrel refuses the file if the inferred grid disagrees.
@@ -231,6 +231,35 @@ An edit that deliberately preserves chunk size and mtime is not detected.
 
 The test fixtures in `release/fixtures/nwb/` are written by PyNWB and hdmf-zarr
 (`generate.py` pins both versions).
+
+### DANDI streaming
+
+```sh
+# This units-only example needs an explicit sample grid; it has no recording clock.
+sorrel open --sample-rate 1000 'dandi://dandi/000006@0.220126.1855/sub-anm369962/sub-anm369962_ses-20170316.nwb'
+sorrel describe --sample-rate 1000 'https://api.dandiarchive.org/api/assets/d97954f2-6d80-4dda-9ecf-89c7c10fed0b/download/'
+```
+
+Use `dandi://dandi/<dandiset>[@<version>]/<exact asset path>`. If you omit the
+version, Sorrel selects the latest published version, or `draft` if there is
+none. Prefer an explicit version for reproducibility. For embargoed data, set
+`DANDI_API_KEY` in the Sorrel process that opens the session (including an
+already-running GUI if it receives `sorrel open`). The key is used only for
+requests to the DANDI API, not to storage.
+
+Streaming is read-only. Sorrel loads metadata and sorting data, then fetches
+trace windows on demand. Direct HTTPS HDF5 URLs must support range GETs and
+provide a strong ETag. For Zarr, use a DANDI locator or DANDI API asset download
+URL: a bare storage prefix doesn't provide the required object list. The same
+NWBs and series that local readers refuse are refused remotely. The `dandi`
+feature is on by default; HDF5 streaming also needs `hdf5`.
+
+The default journal and save directory is local, under the Sorrel user data
+directory (`$XDG_DATA_HOME/sorrel` or `~/.local/share/sorrel` on Linux), in
+`dandi/<dandiset>/<version>/<path hash>/`. Direct HTTPS URLs are stored under
+`dandi/https/<URL hash>/`, without the signed query. Use `--journal` or the
+command's `--out` to choose a different location. An asset whose ETags or sizes
+have changed does not match the old journal seal.
 
 ### Writing curated units to NWB
 
