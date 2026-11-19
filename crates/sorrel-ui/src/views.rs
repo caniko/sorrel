@@ -505,7 +505,7 @@ pub fn selection_summary<P, F>(
             ui.heading(format!("{n} clusters selected"));
             let sr = session.provider.sample_rate().max(1.0);
             let total_samples = session.provider.n_samples().0;
-            let refractory = (sr * 0.0015).round() as u64;
+            let refractory = session.refractory().fixed_samples(sr);
             egui::Grid::new("summary-grid")
                 .num_columns(6)
                 .spacing([14.0, 6.0])
@@ -1413,7 +1413,9 @@ pub fn cluster_statistics_view_for<P: DataProvider>(
     }
 
     // Collect three series, indexed by cluster id (NaN = no value).
-    let refractory_samples = (session.provider.sample_rate() * 0.001).round() as u64;
+    let refractory_samples = session
+        .refractory()
+        .fixed_samples(session.provider.sample_rate());
     let mut spike_counts: Vec<f32> = Vec::with_capacity(n);
     let mut mean_amps: Vec<f32> = Vec::with_capacity(n);
     let mut isi_viols: Vec<f32> = Vec::with_capacity(n);
@@ -1705,7 +1707,7 @@ impl SuggestCache {
         session: &Session<P>,
         jobs: &crate::jobs::JobCtx<Session<P>>,
     ) -> Option<std::sync::Arc<SuggestResult>> {
-        let key = (session.version(), self.force);
+        let key = (session.metrics_version(), self.force);
         let config = self.config;
         let (scores, positions) = (self.scores.clone(), self.positions.clone());
         self.memo
@@ -1789,7 +1791,7 @@ where
                     "{} merges · {} splits · refractory {:.1} ms · CCG ±{:.0} ms",
                     r.merges.len(),
                     r.splits.len(),
-                    cache.config.refractory_seconds * 1000.0,
+                    session.refractory().fixed_ms,
                     cache.config.ccg_max_lag_seconds * 1000.0,
                 ));
             }
@@ -1842,7 +1844,7 @@ where
                     Some((a, b)) => cache.tips.hover(
                         ui,
                         jobs,
-                        session.version(),
+                        session.metrics_version(),
                         a,
                         b,
                         crate::similarity_view::ghost_of(&sel, a, b),
@@ -2167,7 +2169,7 @@ impl QualityCache {
         selection: &[ClusterId],
         jobs: &crate::jobs::JobCtx<Session<P>>,
     ) -> Option<std::sync::Arc<Vec<QualityBreakdown>>> {
-        let key = (selection.to_vec(), session.version());
+        let key = (selection.to_vec(), session.metrics_version());
         let clusters = selection.to_vec();
         self.memo
             .ensure(key, &jobs.session, jobs.repaint(), move |s, cancel| {
@@ -2646,7 +2648,7 @@ pub fn contamination_over_time_view<P: DataProvider>(
         return;
     }
     let total_s = total_samples as f32 / sr;
-    let refractory_samples = (sr * 0.0015).round() as u64;
+    let refractory_samples = session.refractory().fixed_samples(sr);
     const N_WINDOWS: usize = 60;
     const MIN_SPIKES_PER_WINDOW: usize = 20;
 

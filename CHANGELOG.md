@@ -13,6 +13,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
+- **Refractory-period settings.** CLI flags, GUI settings and the MCP `refractory` tool share one window configuration. The default fixed window is 1.5 ms and the contamination sweep tests 0.75–10 ms in 0.25 ms steps. Model feature extraction keeps its original windows.
 - **New leaf icon.** The app, crate, favicon and design-file marks use the new sorrel leaf. `assets/icon/generate.cjs` regenerates the SVG copy, PNG sizes and ICO from `logo/logo-clean.svg` in one step.
 - **Redesigned website.** The landing page leads with the native workspace and adds a linked-evidence showcase and gallery. The download page recommends the pip route with a copyable command, hides Windows package options on other platforms, and links each install route to its guide section.
 - **Citation guide.** `CITATION.cff` and a "Citing Sorrel" docs page with BibTeX, authorship and the acknowledgment of the data used in development. The release steps now update its version and date.

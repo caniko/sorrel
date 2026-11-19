@@ -903,7 +903,7 @@ fn launcher() {
             .with_theme(theme)
             .wgpu_setup(vulkan_only())
             .build_eframe(|cc| {
-                Shell::new_in_memory(cc, Box::new(|_, _, _| anyhow::bail!("no opener")), None)
+                Shell::new_in_memory(cc, Box::new(|_, _, _, _| anyhow::bail!("no opener")), None)
             });
         h.run_ok();
         h.remove_cursor();

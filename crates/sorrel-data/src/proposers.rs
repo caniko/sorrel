@@ -7,12 +7,13 @@
 //! wiring (`cluster_feature_space`, `kmeans_split`, `outlier_split`) only
 //! gathers PC features.
 
+use crate::refractory::RefractoryWindows;
 use crate::session::Session;
-use crate::suggest::{MergeCandidate, SplitCandidate, SuggestConfig};
+use crate::suggest::{MergeCandidate, SplitCandidate};
 use sorrel_compute::linalg::{chi2_sf, covariance, invert, mahalanobis_sq, row_mean};
 use sorrel_compute::{
     fit_diag_gmm, isi_violations, kmeans, kmeans_assign, lda_d_prime, quality_breakdown,
-    refractory_contamination, sliding_refractory_argmin,
+    refractory_contamination,
 };
 use sorrel_io::{ClusterId, DataProvider};
 
@@ -541,10 +542,24 @@ pub fn kmeans_split<P: DataProvider>(
     cluster: ClusterId,
     globals: &[u32],
 ) -> Option<KmeansSplit> {
+    kmeans_split_with(
+        session,
+        cluster,
+        globals,
+        RefractoryWindows::Session(session.refractory()),
+    )
+}
+
+pub(crate) fn kmeans_split_with<P: DataProvider>(
+    session: &Session<P>,
+    cluster: ClusterId,
+    globals: &[u32],
+    windows: RefractoryWindows<'_>,
+) -> Option<KmeansSplit> {
     let (feats, d) = cluster_feature_space(session, cluster, globals)?;
     let times = session.spike_times(cluster);
     let sr = session.provider.sample_rate().max(1.0);
-    let refractory = (sr * SuggestConfig::default().refractory_seconds).round() as u64;
+    let refractory = windows.fixed_samples(sr);
     let duration = session.provider.n_samples().0;
     kmeans_split_proposal(&feats, d, |idx| {
         let t: Vec<_> = idx.iter().map(|&i| times[i as usize]).collect();
@@ -560,6 +575,20 @@ pub fn core_split<P: DataProvider>(
     cluster: ClusterId,
     globals: &[u32],
 ) -> Option<CoreSplit> {
+    core_split_with(
+        session,
+        cluster,
+        globals,
+        RefractoryWindows::Session(session.refractory()),
+    )
+}
+
+pub(crate) fn core_split_with<P: DataProvider>(
+    session: &Session<P>,
+    cluster: ClusterId,
+    globals: &[u32],
+    windows: RefractoryWindows<'_>,
+) -> Option<CoreSplit> {
     let times = session.spike_times(cluster);
     let sr = session.provider.sample_rate().max(1.0);
     let duration = session.provider.n_samples().0;
@@ -568,21 +597,14 @@ pub fn core_split<P: DataProvider>(
         globals.len(),
         || feature_space(session, cluster, globals, CORE_CHANNELS),
         |idx| {
-            let (c, rp) = sliding_refractory_argmin(
-                &pick(idx),
-                (sr * 0.0005) as u64,
-                (sr * 0.010) as u64,
-                20,
-                duration,
-                sr,
-            );
+            let (c, rp) = windows.sweep(&pick(idx), duration, sr);
             if rp > 0 {
                 c
             } else {
                 f32::NAN
             }
         },
-        |idx| isi_violations(&pick(idx), (sr * 0.0015).round() as u64),
+        |idx| isi_violations(&pick(idx), windows.fixed_samples(sr)),
     )
 }
 
@@ -639,7 +661,7 @@ pub fn attention_with<P: DataProvider>(
     splits: &[SplitCandidate],
 ) -> (f32, Vec<&'static str>) {
     let sr = session.provider.sample_rate().max(1.0);
-    let refractory = (sr * SuggestConfig::default().refractory_seconds).round() as u64;
+    let refractory = session.refractory().fixed_samples(sr);
     let quality = quality_breakdown(
         session.spike_times(cluster),
         session.spike_amplitudes(cluster),
@@ -699,7 +721,7 @@ pub fn attention_with<P: DataProvider>(
 
 /// Attention for every non-empty cluster, highest first. Pass the
 /// suggestions in (compute them once with unbounded `top_*`, see
-/// [`SuggestConfig`]) so a caller that already ranked merges/splits does
+/// [`crate::SuggestConfig`]) so a caller that already ranked merges/splits does
 /// not pay for them again.
 pub fn attention_all<P: DataProvider>(
     session: &Session<P>,

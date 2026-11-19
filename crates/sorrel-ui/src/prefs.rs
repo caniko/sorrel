@@ -179,7 +179,6 @@ impl Default for WaveformParams {
 pub struct CcgParams {
     pub bin_ms: f32,
     pub window_ms: f32,
-    pub refrac_ms: f32,
     /// `n`: one y scale for every cell instead of per-cell.
     pub uniform: bool,
 }
@@ -189,7 +188,6 @@ impl Default for CcgParams {
         Self {
             bin_ms: 1.0,
             window_ms: 50.0,
-            refrac_ms: 2.0,
             uniform: false,
         }
     }
