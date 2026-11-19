@@ -675,7 +675,7 @@ fn clock_values_must_be_stored_as_float32_or_float64() {
     }
     let err = format!("{:#}", NwbProvider::open(&path).err().expect("refused"));
     assert!(
-        err.contains("starting_time rate must be float32 or float64"),
+        err.contains("starting_time rate must be stored as native IEEE float32 or float64"),
         "{err}"
     );
 }

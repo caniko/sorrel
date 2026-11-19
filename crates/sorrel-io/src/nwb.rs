@@ -295,14 +295,19 @@ mod imp {
         H5File::open(path).with_context(|| format!("open NWB {}", path.display()))
     }
 
-    /// Clock values are read as f64; only float32/float64 storage converts
-    /// exactly. HDF5 would silently round a long double (or other float).
+    /// Clock values are read as f64; only native IEEE float32/float64
+    /// storage converts exactly (H5Tequal compares size, precision, offset,
+    /// exponent/mantissa layout and byte order). HDF5 would silently round a
+    /// long double, a custom float layout or a foreign byte order is refused.
     fn exact_float(dtype: hdf5::Result<hdf5::Datatype>, what: &str) -> Result<()> {
-        match dtype?.to_descriptor() {
-            Ok(TypeDescriptor::Float(FloatSize::U4 | FloatSize::U8)) => Ok(()),
-            Ok(other) => anyhow::bail!("{what} must be float32 or float64, found {other}"),
-            Err(e) => anyhow::bail!("{what} must be float32 or float64, found {e}"),
-        }
+        let dtype = dtype?;
+        let ieee = dtype == hdf5::Datatype::from_type::<f64>()?
+            || dtype == hdf5::Datatype::from_type::<f32>()?;
+        ensure!(
+            ieee,
+            "{what} must be stored as native IEEE float32 or float64"
+        );
+        Ok(())
     }
 
     fn checked_rate(rate: f64) -> Result<f64> {
