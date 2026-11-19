@@ -99,24 +99,29 @@ The MCP tool `refractory` returns the current and default parameters without arg
 
 `sorrel qc`, MCP `metrics`, and rules expose these columns. In the GUI, hover over a cluster's coloured badge in the ISI view to see both results.
 
-| Column              | Meaning                                                                                                                          |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `srp_contamination` | Smallest contamination fraction confirmed by the sliding-RP test at nominal confidence strictly above 90%.                       |
-| `srp_rp_ms`         | First tested window (ms) that reaches that confidence at the reported fraction. This is not the neuron's true refractory period. |
-| `rpv_post_mean`     | Posterior mean contamination fraction at the session's fixed window.                                                             |
-| `rpv_post_lo95`     | Lower bound of the 95% equal-tailed credible interval.                                                                           |
-| `rpv_post_hi95`     | Upper bound of the 95% equal-tailed credible interval.                                                                           |
+| Column              | Meaning                                                                                                                                        |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `srp_contamination` | Nominal upper limit: the smallest contamination fraction the sliding-RP test confirms at confidence strictly above 90%, under the model below. |
+| `srp_rp_ms`         | Window (ms) of highest confidence at the reported fraction, IBL's estimate of the unit's refractory period.                                    |
+| `rpv_post_mean`     | Posterior mean contamination fraction at the session's fixed window (not the SRP window), conditional on the model below.                      |
+| `rpv_post_lo95`     | Lower bound of the 95% highest-density credible interval.                                                                                      |
+| `rpv_post_hi95`     | Upper bound of the 95% highest-density credible interval.                                                                                      |
 
-Both metrics count all spike pairs with a positive lag strictly inside the window, not just consecutive ISIs. Windows are rounded to sample edges. The sliding-RP test ([Roth et al., 2026](https://doi.org/10.64898/2026.03.06.710130)) uses a fixed 0.5–35% contamination grid in 0.5 percentage-point steps, with no correction for testing multiple windows. Sorrel uses the configured sweep above, rather than IBL's every sample bin above 0.5 ms. The SRP columns are unavailable if no tested fraction reaches confidence; this does not distinguish high contamination from too few spikes to tell.
+Both metrics count all spike pairs with a positive lag strictly inside the window, not just consecutive ISIs. Exact duplicates (zero lag) are not counted, so they need their own check. Windows are rounded to sample edges, and a window of `e` samples is charged `e − 1` samples of exposure, which is what integer lags 1 to `e − 1` can observe. IBL charges the full window; the difference is small at 30 kHz but matters on coarse timestamps, where IBL's charge would understate contamination. Windows shorter than two samples or longer than half the recording are skipped. The sliding-RP test ([Roth et al., 2026](https://doi.org/10.64898/2026.03.06.710130)) uses a fixed 0.5–35% contamination grid in 0.5 percentage-point steps, with no correction for testing multiple windows. Sorrel uses the configured sweep above, rather than IBL's every sample bin above 0.5 ms. The SRP columns are unavailable if no tested fraction reaches confidence; this does not distinguish contamination above 35% from too few spikes to tell.
 
-The posterior uses a uniform Beta(1,1) prior on the contamination fraction and a Poisson likelihood with the same expected-violation model as the sliding test ([Llobet et al., 2022](https://doi.org/10.1101/2022.02.08.479192)). It assumes stationary spike rates and a fixed window no longer than the neuron's true refractory period. A wide interval means too little data to tell, even with zero observed violations. With fewer than two spikes or invalid recording duration or sample rate, both results are unavailable (`NaN` in Rust, `null` in JSON and blank in TSV).
+The posterior uses a uniform Beta(1,1) prior on the contamination fraction and a Poisson likelihood with the same expected-violation model as the sliding test ([Llobet et al., 2022](https://doi.org/10.1101/2022.02.08.479192)). Both results assume stationary spike rates, a window no longer than the neuron's true refractory period, and diffuse contamination: contaminating spikes arrive as a Poisson process, so they also violate each other. A unit whose contamination comes from one other refractory neuron produces fewer violations than this model expects, so both results understate it. If the posterior sits near 100% while the sliding test passes at a shorter window, the fixed window is probably longer than this unit's refractory period. The interval is the 95% highest-density interval, so with no violations it starts at 0. An interval from near 0 to high values means too little data to tell; one bounded well above 0 can still be wide, because the expected violations flatten as contamination nears 100%. The flat prior pulls the mean of a sparse unit towards 50%, so read the interval, not the mean alone. A unit firing in bursts, or drifting, can show more violations than any contamination explains, which pins the posterior near 100%. With fewer than two spikes or invalid recording duration or sample rate, both results are unavailable (`NaN` in Rust, `null` in JSON and blank in TSV).
 
-For example, this `rules.toml` policy labels a unit `mua` for review when the posterior's upper bound exceeds 10%. This is a review trigger, not evidence that contamination exceeds 10%.
+For example, this `rules.toml` policy labels a unit `mua` only when the evidence says contamination exceeds 10%, that is when the posterior's lower bound does. To find units that are merely uncertain (a wide interval, as with very few spikes), run `rules_eval` with `rpv_post_hi95 > 0.1` and review them instead of relabelling.
+
+Two traps when writing such rules:
+
+- A rule never matches a missing (`NaN`) value. With `default = "good"`, a rule `srp_contamination > 0.1` labels every unit above 35% contamination `good`, because their `srp_contamination` is missing. Write it the other way round: `default = "mua"` with `srp_contamination <= 0.1` labelling `good`.
+- The posterior uses the fixed window. If it is longer than a unit's refractory period, as 1.5 ms can be for fast-spiking interneurons, a clean unit shows high contamination there while `srp_contamination` passes at a shorter window. Lower **Fixed** for such recordings, or check `srp_contamination` before acting on the posterior.
 
 ```toml
 [[rule]]
-name = "review refractory evidence"
-metric = "rpv_post_hi95"
+name = "refractory contamination"
+metric = "rpv_post_lo95"
 op = ">"
 value = 0.1
 label = "mua"
