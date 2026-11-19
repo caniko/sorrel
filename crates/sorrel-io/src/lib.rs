@@ -15,6 +15,9 @@ pub mod ks4_rez;
 pub mod mda;
 pub mod npy;
 pub mod nwb;
+pub mod nwb_units;
+#[cfg(feature = "hdf5")]
+pub mod nwb_write;
 pub mod open_ephys;
 pub mod params;
 pub mod probeinterface;

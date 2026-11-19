@@ -173,8 +173,35 @@ impl Session {
     /// The unit id as `curation.json` writes it, as text: SpikeInterface's
     /// own string (`"007"`, `"unit_a"`) when it stored strings.
     fn unit_name(&self, cluster: u32) -> String {
-        let v = with_session!(self, s => s.provider.unit_id_json(ClusterId(cluster)));
-        sorrel_io::curation_json::unit_id_text(&v).unwrap_or_else(|| v.to_string())
+        with_session!(self, s => sorrel_data::nwb_export::unit_name(&s.provider, ClusterId(cluster)))
+    }
+
+    fn _nwb_units(&self, py: Python<'_>, starting_time: f64) -> PyResult<PyObject> {
+        use sorrel_io::nwb_units::Values;
+        let table = with_session!(self, s =>
+            s.provider.exact_sample_rate().and_then(|rate|
+                sorrel_data::nwb_export::collect_units(s, rate, starting_time)))
+        .map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
+        let columns: Vec<_> = table
+            .columns
+            .into_iter()
+            .map(|c| {
+                let (dtype, data): (&str, PyObject) = match c.data {
+                    Values::Float(v) => ("float64", v.into_py(py)),
+                    Values::Int(v) => ("int64", v.into_py(py)),
+                    Values::Text(v) => ("str", v.into_py(py)),
+                };
+                (c.name, c.description, dtype, data, c.index)
+            })
+            .collect();
+        Ok((
+            table.description,
+            table.resolution,
+            table.id,
+            columns,
+            table.generated_by.to_vec(),
+        )
+            .into_py(py))
     }
 
     /// Tags of `cluster` (`src:human`, `review:*`, ...).

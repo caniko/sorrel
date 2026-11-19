@@ -38,7 +38,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 pub struct SortingAnalyzerProvider {
-    sample_rate: f32,
+    sample_rate: f64,
+    root: PathBuf,
     n_channels: u32,
     n_samples: SampleIndex,
     dtype: TraceDtype,
@@ -179,6 +180,7 @@ impl SortingAnalyzerProvider {
 
         Ok(Self {
             sample_rate: recording_meta.sample_rate,
+            root: root.to_path_buf(),
             n_channels: recording_meta.n_channels,
             n_samples,
             dtype: recording_meta.dtype,
@@ -212,7 +214,7 @@ impl SortingAnalyzerProvider {
 
 #[derive(Debug, Clone)]
 struct RecordingMeta {
-    sample_rate: f32,
+    sample_rate: f64,
     n_channels: u32,
     dtype: TraceDtype,
     /// Paths as written in the JSON; relative ones resolve against `base`.
@@ -385,7 +387,6 @@ fn parse_recording_value(
             .with_context(|| format!("read {}", binary_json.display()))?;
         return parse_recording_json_at(&text, &binary_json, &folder, true);
     };
-    let sample_rate = sample_rate as f32;
     let n_channels = kwargs
         .get("num_channels")
         .or_else(|| kwargs.get("num_chan"))
@@ -471,7 +472,7 @@ fn provider_identity_bytes(root: &Path, rec: &RecordingMeta) -> Vec<u8> {
         hasher.update(b"numpysorting_info.json");
         hasher.update(&bytes);
     }
-    hasher.update(&rec.sample_rate.to_le_bytes());
+    hasher.update(&(rec.sample_rate as f32).to_le_bytes());
     hasher.update(&rec.n_channels.to_le_bytes());
     hasher.update(&rec.offset.to_le_bytes());
     for path in paths {
@@ -743,7 +744,27 @@ impl DataProvider for SortingAnalyzerProvider {
 
     #[inline]
     fn sample_rate(&self) -> f32 {
-        self.sample_rate
+        self.sample_rate as f32
+    }
+    fn exact_sample_rate(&self) -> Result<f64> {
+        for (name, key) in [
+            ("sorting/numpysorting_info.json", "num_segments"),
+            ("recording_info/recording_attributes.json", "num_samples"),
+        ] {
+            let path = self.root.join(name);
+            if path.is_file() {
+                let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+                if let Some(value) = v.get(key) {
+                    let count = if key == "num_segments" {
+                        value.as_u64()
+                    } else {
+                        value.as_array().map(|a| a.len() as u64)
+                    };
+                    anyhow::ensure!(count == Some(1), "{}: multi-segment or invalid recording; cannot place spikes on one time axis", path.display());
+                }
+            }
+        }
+        Ok(self.sample_rate)
     }
     #[inline]
     fn n_channels(&self) -> u32 {

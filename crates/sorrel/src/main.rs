@@ -32,6 +32,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "dev")]
 mod dev;
+#[cfg(feature = "hdf5")]
+mod export_nwb;
 mod rescue;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -355,6 +357,9 @@ enum Cmd {
         #[arg(long)]
         copy_raw: bool,
     },
+    /// Write curated units to a new or existing NWB file
+    #[cfg(feature = "hdf5")]
+    ExportNwb(export_nwb::ExportNwb),
     /// Remove <DATA_DIR>/.sorrel/cache/
     ClearCache {
         /// Dataset directory (or an .nwb / rez.mat file inside it)
@@ -2635,6 +2640,8 @@ fn main() -> Result<()> {
             out,
             copy_raw,
         }) => with_session(&open, ExportPhy { out, copy_raw }),
+        #[cfg(feature = "hdf5")]
+        Some(Cmd::ExportNwb(args)) => args.run(),
         Some(Cmd::Share { open, port, relay }) => run_share(&open, port, relay),
         Some(Cmd::Join {
             code,

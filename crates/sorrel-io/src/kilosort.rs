@@ -57,6 +57,7 @@ impl PhyLabel {
 pub struct KilosortProvider {
     root: PathBuf,
     sample_rate: f32,
+    exact_sample_rate: f64,
     n_channels: u32,
     n_samples: SampleIndex,
     dtype: TraceDtype,
@@ -189,6 +190,10 @@ impl KilosortProvider {
             .sample_rate
             .or(params.sample_rate)
             .context("sample_rate not in params.py and no override given")?;
+        let exact_sample_rate = params
+            .exact_sample_rate
+            .filter(|rate| *rate as f32 == sample_rate)
+            .unwrap_or_else(|| f64::from(sample_rate));
         let n_channels = overrides
             .n_channels
             .or(params.n_channels_dat)
@@ -426,6 +431,7 @@ impl KilosortProvider {
         Ok(Self {
             root,
             sample_rate,
+            exact_sample_rate,
             n_channels,
             n_samples,
             dtype,
@@ -515,6 +521,9 @@ impl DataProvider for KilosortProvider {
     #[inline]
     fn sample_rate(&self) -> f32 {
         self.sample_rate
+    }
+    fn exact_sample_rate(&self) -> Result<f64> {
+        Ok(self.exact_sample_rate)
     }
     #[inline]
     fn n_channels(&self) -> u32 {
