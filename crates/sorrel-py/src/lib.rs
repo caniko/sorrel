@@ -180,7 +180,7 @@ impl Session {
         use sorrel_io::nwb_units::Values;
         let table = with_session!(self, s =>
             s.provider.exact_sample_rate().and_then(|rate|
-                sorrel_data::nwb_export::collect_units(s, rate, starting_time)))
+                sorrel_data::nwb_export::collect_units(s, rate, starting_time, None)))
         .map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
         let columns: Vec<_> = table
             .columns

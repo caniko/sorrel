@@ -25,6 +25,7 @@ pub use stub::open_stub;
 mod imp {
     use crate::extras::{HasGeometry, HasQualityMetrics, QualityMetrics};
     use crate::kilosort::{pinned_sorter, valid_tag, PhyLabel};
+    use crate::nwb_units::STARTING_TIME_ATTR;
     use crate::provider::{
         appended_unit_id, ChannelId, ClusterId, DataProvider, SampleIndex, TraceSamples,
         TraceSlice, UnitAnnotation,
@@ -135,12 +136,25 @@ mod imp {
                     ensure!(explicit == declared,
                         "--sample-rate {explicit} Hz is not a clock this NWB declares; pass one of: {declared} Hz (/units/spike_times resolution)");
                 }
+                // Units-only native exports keep the original NWB clock but
+                // have no ElectricalSeries in which to store the offset.
+                let t0 = if spike_times
+                    .attr_names()?
+                    .iter()
+                    .any(|name| name == STARTING_TIME_ATTR)
+                {
+                    let t0 = spike_times.attr(STARTING_TIME_ATTR)?.read_scalar::<f64>()?;
+                    ensure!(t0.is_finite(), "invalid {STARTING_TIME_ATTR} {t0}");
+                    t0
+                } else {
+                    0.0
+                };
                 (
                         None,
                         units_rate.or(params.sample_rate).map(checked_rate).transpose()?.context(
                             "no ElectricalSeries time base in the sorting NWB and no /units/spike_times resolution; pass --sample-rate HZ",
                         )?,
-                        0.0,
+                        t0,
                         read_units_only_channels(&f)?,
                         None,
                     )
@@ -178,6 +192,8 @@ mod imp {
                 identity_bytes.extend(rate.to_le_bytes());
                 if let Some(raw_path) = params.raw_path {
                     identity_bytes.extend(provider_identity_bytes(raw_path));
+                } else if series.is_none() && t0 != 0.0 {
+                    identity_bytes.extend(t0.to_le_bytes());
                 }
             }
             let metadata = read_unit_metadata(&units, &unit_ids)?;

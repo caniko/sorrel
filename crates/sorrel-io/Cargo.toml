@@ -8,7 +8,6 @@ description = "Data providers and file-format backends for Sorrel spike-sorting 
 
 [dependencies]
 anyhow.workspace = true
-thiserror.workspace = true
 memmap2.workspace = true
 bytemuck.workspace = true
 blake3.workspace = true

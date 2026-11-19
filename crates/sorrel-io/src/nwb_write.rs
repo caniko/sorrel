@@ -1,7 +1,7 @@
 //! Native HDF5 serialization of curated units. Layout mirrors the cached
 //! schemas in `nwb_schema` and https://nwb-schema.readthedocs.io/en/stable/format.html.
 
-use crate::nwb_units::{Units, Values};
+use crate::nwb_units::{Units, Values, STARTING_TIME_ATTR};
 use crate::ChannelId;
 use anyhow::{ensure, Context, Result};
 use hdf5_metno::types::{TypeDescriptor, VarLenAscii, VarLenUnicode};
@@ -343,14 +343,16 @@ fn reference_attr(from: &Location, attr: &str, group: &Group, to: &str) -> Resul
 }
 
 fn write_units(f: &File, units: &Units) -> Result<()> {
+    // Always create local datasets, including on append. The reader rejects
+    // non-local storage for the datasets it uses to map spikes to samples.
     let g = f.create_group("units")?;
     typed(&g, "core", "Units")?;
     text_attr(&g, "description", &units.description)?;
-    colnames(&g, units.columns.iter().map(|c| c.name))?;
+    colnames(&g, units.columns.iter().map(|c| c.name.as_str()))?;
     let id = dataset(&g, "id", &units.id)?;
     typed(&id, HDMF, "ElementIdentifiers")?;
     for col in &units.columns {
-        let (name, doc) = (col.name, col.description.as_str());
+        let (name, doc) = (col.name.as_str(), col.description.as_str());
         let ds = match &col.data {
             Values::Float(v) => vector(&g, name, doc, v)?,
             Values::Int(v) => vector(&g, name, doc, v)?,
@@ -366,6 +368,12 @@ fn write_units(f: &File, units: &Units) -> Result<()> {
                 .shape(())
                 .create("resolution")?
                 .write_scalar(&units.resolution)?;
+            if units.starting_time != 0.0 {
+                ds.new_attr::<f64>()
+                    .shape(())
+                    .create(STARTING_TIME_ATTR)?
+                    .write_scalar(&units.starting_time)?;
+            }
         }
         if let Some(ends) = &col.index {
             let index = dataset(&g, &format!("{name}_index"), ends)?;
@@ -525,9 +533,7 @@ mod tests {
     use crate::{ClusterId, DataProvider, NwbProvider, SampleIndex};
 
     #[test]
-    fn appended_units_round_trip_with_trunk_reader() -> Result<()> {
-        // The trunk reader requires an ElectricalSeries (native --out does
-        // not write one). Append to the fixture's acquisition instead.
+    fn appended_units_round_trip_with_local_storage() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let recording = tmp.path().join("recording.nwb");
         fs::copy(
@@ -541,9 +547,10 @@ mod tests {
         let units = Units {
             description: "Curated units".into(),
             resolution: 0.001,
+            starting_time: 0.5,
             id: vec![5, 9],
             columns: vec![Column {
-                name: "spike_times",
+                name: "spike_times".into(),
                 description: "Spike times in seconds".into(),
                 data: Values::Float(vec![0.55, 0.701, 0.79]),
                 index: Some(vec![2, 3]),

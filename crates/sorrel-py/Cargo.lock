@@ -637,7 +637,6 @@ dependencies = [
  "memmap2",
  "serde",
  "serde_json",
- "thiserror",
 ]
 
 [[package]]
