@@ -115,7 +115,7 @@ mod imp {
                 let shape = data.shape();
                 let (n_samples, n_channels) = (shape[0], shape.get(1).copied().unwrap_or(1));
                 let (stored_rate, t0, timestamps) =
-                    read_time_base(recording, series, name, n_samples)?;
+                    read_time_base(recording, name, n_samples)?;
                 let units_clock = if let Some(declared) = units_rate {
                     // The one-ppm gate decides whether resolution declares a clock,
                     // not whether an explicit value matches that clock.
@@ -318,7 +318,7 @@ mod imp {
     }
 
     fn read_units_rate(spike_times: &Dataset, strict: bool) -> Result<Option<f64>> {
-        let Ok(attr) = spike_times.attr("resolution") else {
+        let Some(attr) = spike_times.optional_attr("resolution")? else {
             return Ok(None);
         };
         match attr.exact_number("/units/spike_times resolution")? {
@@ -362,14 +362,15 @@ mod imp {
             .group("/intervals/trials")
             .with_context(|| format!("{}: no /intervals/trials table", path.display()))?;
         let starts: Vec<f64> = g.dataset("start_time")?.read_raw()?;
-        let names = ["trial_type", "stimulus", "condition"]
-            .into_iter()
-            .filter_map(|c| g.dataset(c).ok())
-            .find_map(|ds| {
-                ds.strings()
-                    .ok()
-                    .filter(|names| names.len() == starts.len())
-            });
+        let mut names = None;
+        for column in ["trial_type", "stimulus", "condition"] {
+            if let Some(ds) = g.optional_dataset(column)? {
+                if let Some(values) = ds.strings().ok().filter(|v| v.len() == starts.len()) {
+                    names = Some(values);
+                    break;
+                }
+            }
+        }
         let mut events = crate::Events::default();
         for (i, t) in starts.into_iter().enumerate() {
             events.push(t, names.as_ref().map_or("trial", |n| n[i].as_str()));
@@ -472,9 +473,9 @@ mod imp {
                 };
                 let path = format!("{path}/{name}");
                 if child
-                    .attr("neurodata_type")
-                    .ok()
-                    .and_then(|a| a.string().ok())
+                    .optional_attr("neurodata_type")?
+                    .map(|a| a.string())
+                    .transpose()?
                     .is_some_and(|t| is_series(&t))
                 {
                     found.push((path, child));
@@ -490,26 +491,20 @@ mod imp {
         let is_series = |t: &str| is_electrical_series(t, &parents);
         let mut found = Vec::new();
         for (root, depth) in [("/acquisition", 0), ("/processing", 32)] {
-            if f.link_exists(root)? {
-                collect(&f.group(root)?, root, depth, &is_series, &mut found)?;
+            if let Some(group) = f.optional_group(root)? {
+                collect(&group, root, depth, &is_series, &mut found)?;
             }
         }
         found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let has_2d_data = |g: &Group| g.dataset("data").is_ok_and(|d| d.ndim() == 2);
-        let supported_data = |g: &Group| {
-            g.dataset("data").is_ok_and(|d| match d.shape().as_slice() {
-                [_] => true,
-                [_, channels] => *channels > 0,
-                _ => false,
-            })
+        let data_rank = |g: &Group| -> Result<usize> {
+            Ok(
+                match g.optional_dataset("data")?.map(|d| d.shape()).as_deref() {
+                    Some([_]) => 1,
+                    Some([_, channels]) if *channels > 0 => 2,
+                    _ => 0,
+                },
+            )
         };
-        // Keep the first 2-D acquisition as the historical default, but list
-        // unsupported shapes too so a selection error can name them.
-        let default_index = found
-            .iter()
-            .position(|(_, g)| has_2d_data(g) && supported_data(g))
-            .or_else(|| found.iter().position(|(_, g)| supported_data(g)))
-            .unwrap_or(0);
         let available = || {
             if found.is_empty() {
                 "none".to_string()
@@ -527,15 +522,16 @@ mod imp {
             } else {
                 format!("/acquisition/{requested}")
             };
-            found
-                .iter()
-                .position(|(name, _)| *name == path)
-                .with_context(|| {
-                    format!(
-                        "no ElectricalSeries matching {requested:?}; available series: {}",
-                        available()
-                    )
-                })?
+            if let Some(index) = found.iter().position(|(name, _)| *name == path) {
+                index
+            } else {
+                // A selected path outside the discovery walk can still contain a link.
+                f.optional_group(&path)?;
+                anyhow::bail!(
+                    "no ElectricalSeries matching {requested:?}; available series: {}",
+                    available()
+                );
+            }
         } else if found.is_empty() {
             ensure!(
                 !required,
@@ -543,11 +539,19 @@ mod imp {
             );
             return Ok(None);
         } else {
-            default_index
+            let mut best = (0, 0);
+            for (i, (path, group)) in found.iter().enumerate() {
+                let rank = data_rank(group)
+                    .with_context(|| format!("ElectricalSeries {path}: invalid data"))?;
+                if rank > best.0 {
+                    best = (rank, i);
+                }
+            }
+            best.1
         };
         let (path, group) = &found[index];
         ensure!(
-            supported_data(group),
+            data_rank(group).with_context(|| format!("ElectricalSeries {path}: invalid data"))? != 0,
             "ElectricalSeries {path} requires 1-D data (one channel) or 2-D data (time × channels); available series: {}",
             available()
         );
@@ -563,22 +567,18 @@ mod imp {
     /// `(rate Hz, starting_time s, recorded timestamps)`.
     fn read_time_base(
         file: &Group,
-        g: &Group,
         name: &str,
         n_samples: usize,
     ) -> Result<(f64, f64, Option<Dataset>)> {
         let read = || {
-            if g.link_exists("timestamps")? {
-                let ds = file.stored_dataset(&format!("{name}/timestamps"))?;
+            if let Some(ds) = file.optional_stored_dataset(&format!("{name}/timestamps"))? {
                 ds.exact_float("timestamps")?;
                 let (rate, t0) = regular_timestamps(&ds, n_samples)?;
                 return Ok((rate, t0, Some(ds)));
             }
-            ensure!(
-                g.link_exists("starting_time")?,
-                "neither starting_time nor timestamps"
-            );
-            let st = file.stored_dataset(&format!("{name}/starting_time"))?;
+            let st = file
+                .optional_stored_dataset(&format!("{name}/starting_time"))?
+                .context("neither starting_time nor timestamps")?;
             let rate = st.attr("rate").context("starting_time has no rate")?;
             st.exact_float("starting_time")?;
             let rate = checked_rate(rate.exact_number("starting_time rate")?)?;
@@ -664,11 +664,9 @@ mod imp {
     }
 
     fn read_units_only_channels(f: &Group) -> Result<Channels> {
-        // The parent group may also be absent; avoid a nested link_exists
-        // call on an absent parent (an HDF5 error, not just a missing link).
-        match f.group(ELECTRODES) {
-            Ok(table) => read_electrodes(&table, None),
-            Err(_) => Ok(Channels::default()),
+        match f.optional_group(ELECTRODES)? {
+            Some(table) => read_electrodes(&table, None),
+            None => Ok(Channels::default()),
         }
     }
 
@@ -694,11 +692,20 @@ mod imp {
                     .map_err(|_| anyhow!("electrode id {} does not fit u32", ids[r]))
             })
             .collect::<Result<_>>()?;
-        let column = |c: &str| -> Option<Vec<f32>> {
-            let v: Vec<f32> = table.dataset(c).and_then(|d| d.read_raw()).ok()?;
-            (v.len() == ids.len()).then_some(v)
+        let column = |c: &str| -> Result<Option<Vec<f32>>> {
+            let Some(ds) = table.optional_dataset(c)? else {
+                return Ok(None);
+            };
+            let values: Vec<f32> = ds
+                .read_raw()
+                .with_context(|| format!("read electrodes {c}"))?;
+            ensure!(
+                values.len() == ids.len(),
+                "electrodes {c} length does not match id"
+            );
+            Ok(Some(values))
         };
-        let positions = match (column("rel_x"), column("rel_y")) {
+        let positions = match (column("rel_x")?, column("rel_y")?) {
             (Some(x), Some(y)) => rows.iter().map(|&r| [x[r], y[r]]).collect(),
             _ => Vec::new(),
         };
@@ -830,23 +837,26 @@ mod imp {
         name: &str,
         n_channels: usize,
     ) -> Result<(Vec<f64>, f64)> {
-        if let Some(unit) = data.attr("unit").ok().and_then(|a| a.string().ok()) {
+        if let Some(unit) = data.optional_attr("unit")? {
+            let unit = unit.string()?;
             ensure!(
                 unit.eq_ignore_ascii_case("volts"),
                 "ElectricalSeries {name}: data unit is {unit:?}, expected volts"
             );
         }
         let scalar = |attr: &str, default: f64| -> Result<f64> {
-            match data.attr(attr) {
-                Ok(a) => Ok(a.number()?),
-                Err(_) => Ok(default),
+            match data.optional_attr(attr)? {
+                Some(a) => a
+                    .number()
+                    .with_context(|| format!("ElectricalSeries {name}: invalid {attr}")),
+                None => Ok(default),
             }
         };
         let conversion = scalar("conversion", 1.0)?;
         let offset_uv = scalar("offset", 0.0)? * 1e6;
-        let channel_conversion: Vec<f64> = match series.dataset("channel_conversion") {
-            Ok(d) => d.read_raw()?,
-            Err(_) => vec![1.0; n_channels],
+        let channel_conversion: Vec<f64> = match series.optional_dataset("channel_conversion")? {
+            Some(d) => d.read_raw().context("read channel_conversion")?,
+            None => vec![1.0; n_channels],
         };
         ensure!(
             channel_conversion.len() == n_channels,
@@ -1096,14 +1106,16 @@ mod imp {
 
     fn read_unit_metadata(units: &Group, ids: &[u32]) -> Result<UnitMetadata> {
         let n = ids.len();
-        let string_column = |name| {
-            let ds = units.dataset(name).ok()?;
-            (ds.shape() == [n]).then(|| ds.strings().ok()).flatten()
+        let string_column = |name| -> Result<Option<Vec<String>>> {
+            let Some(ds) = units.optional_dataset(name)? else {
+                return Ok(None);
+            };
+            Ok((ds.shape() == [n]).then(|| ds.strings().ok()).flatten())
         };
-        let label_columns: Vec<_> = ["label", "quality", "KSLabel"]
-            .into_iter()
-            .filter_map(string_column)
-            .collect();
+        let mut label_columns = Vec::new();
+        for name in ["label", "quality", "KSLabel"] {
+            label_columns.extend(string_column(name)?);
+        }
         let labels = (0..n)
             .map(|i| {
                 label_columns
@@ -1119,40 +1131,43 @@ mod imp {
             })
             .collect();
 
-        let index = |column: &str| -> Option<Vec<usize>> {
-            let ds = units.dataset(&format!("{column}_index")).ok()?;
+        let index = |column: &str| -> Result<Option<Vec<usize>>> {
+            let Some(ds) = units.optional_dataset(&format!("{column}_index"))? else {
+                return Ok(None);
+            };
             if ds.shape() != [n] {
-                return None;
+                return Ok(None);
             }
-            ds.read_raw::<u64>()
-                .ok()?
-                .into_iter()
-                .map(|v| usize::try_from(v).ok())
-                .collect()
+            Ok(ds
+                .read_raw::<u64>()
+                .ok()
+                .and_then(|ends| ends.into_iter().map(|v| usize::try_from(v).ok()).collect()))
         };
-        let tags = (|| {
-            let ends = index("tags")?;
-            let ds = units.dataset("tags").ok()?;
-            let values = ds.strings().ok()?;
-            let mut rows = ragged_rows(&values, &ends)?;
-            for row in &mut rows {
-                row.retain(|tag| valid_tag(tag));
-            }
-            Some(rows)
-        })()
-        .unwrap_or_default();
+        let tag_index = index("tags")?;
+        let tag_values = units.optional_dataset("tags")?;
+        let tags = tag_index
+            .zip(tag_values)
+            .and_then(|(ends, ds)| {
+                let values = ds.strings().ok()?;
+                let mut rows = ragged_rows(&values, &ends)?;
+                for row in &mut rows {
+                    row.retain(|tag| valid_tag(tag));
+                }
+                Some(rows)
+            })
+            .unwrap_or_default();
         let mut annotations = vec![UnitAnnotation::default(); n];
-        if let Some(origins) = string_column("origin") {
+        if let Some(origins) = string_column("origin")? {
             for (annotation, origin) in annotations.iter_mut().zip(origins) {
                 annotation.origin = origin;
             }
         }
-        if let Some(parents) = (|| {
-            let ends = index("parent_unit_ids")?;
-            let ds = units.dataset("parent_unit_ids").ok()?;
+        let parent_index = index("parent_unit_ids")?;
+        let parent_values = units.optional_dataset("parent_unit_ids")?;
+        if let Some(parents) = parent_index.zip(parent_values).and_then(|(ends, ds)| {
             let values = ds.read_raw::<i64>().ok()?;
             ragged_rows(&values, &ends)
-        })() {
+        }) {
             let clusters: HashMap<_, _> = ids
                 .iter()
                 .enumerate()
@@ -1170,7 +1185,7 @@ mod imp {
                 }
             }
         }
-        let names = string_column("unit_name").filter(|names| {
+        let names = string_column("unit_name")?.filter(|names| {
             let mut unique = std::collections::HashSet::new();
             names
                 .iter()
@@ -1179,6 +1194,11 @@ mod imp {
 
         let mut metrics = QualityMetrics::new();
         for name in units.member_names()? {
+            // An unresolved link may hide a Sorrel metric. Unrecognized local
+            // datatypes may belong to other writers and remain outside our schema.
+            if !units.local_member_exists(&name)? {
+                continue;
+            }
             let Ok(ds) = units.dataset(&name) else {
                 continue;
             };
@@ -1191,9 +1211,10 @@ mod imp {
                     .and_then(|a| a.string().ok())
                     .is_some_and(|d| d.starts_with("Sorrel QC metric. "))
             {
-                if let Ok(values) = ds.read_raw::<f32>() {
-                    metrics.insert(name, values);
-                }
+                let values = ds
+                    .read_raw::<f32>()
+                    .with_context(|| format!("read Units metric {name}"))?;
+                metrics.insert(name, values);
             }
         }
         metrics.sort_by_name();

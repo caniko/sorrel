@@ -63,12 +63,20 @@ impl Group {
     }
 
     pub fn group(&self, path: &str) -> Result<Self> {
-        dispatch!(self, Self, g => Ok(Self::Hdf5(g.group(path)?)), Ok(Self::Zarr(g.group(path)?)))
+        self.optional_group(path)?
+            .with_context(|| format!("missing NWB group {path}"))
+    }
+
+    pub fn optional_group(&self, path: &str) -> Result<Option<Self>> {
+        dispatch!(self, Self, g => {
+            if !hdf::hard_link_exists(g, path)? { return Ok(None); }
+            Ok(Some(Self::Hdf5(g.group(path).with_context(|| format!("open HDF5 group {path}"))?)))
+        }, g.local_path(path)?.map(|path| g.open_group(&path).map(Self::Zarr)).transpose())
     }
 
     pub fn child_group(&self, name: &str) -> Result<Option<Self>> {
         dispatch!(self, Self, g => {
-            if g.loc_type_by_name(name).ok() == Some(h5::LocationType::Group) {
+            if hdf::hard_link_exists(g, name)? && g.loc_type_by_name(name)? == h5::LocationType::Group {
                 Ok(Some(Self::Hdf5(g.group(name)?)))
             } else {
                 Ok(None)
@@ -90,23 +98,42 @@ impl Group {
         dispatch!(self, Self, g => Ok(g.member_names()?), g.member_names())
     }
 
-    pub fn dataset(&self, path: &str) -> Result<Dataset> {
-        dispatch!(self, Self, g => Ok(Dataset::Hdf5(g.dataset(path)?)), Ok(Dataset::Zarr(Box::new(g.dataset(path, false)?))))
+    pub fn local_member_exists(&self, path: &str) -> Result<bool> {
+        dispatch!(self, Self, g => hdf::hard_link_exists(g, path), Ok(g.local_path(path)?.is_some()))
     }
 
-    pub fn stored_dataset(&self, path: &str) -> Result<Dataset> {
-        dispatch!(self, Self, g => hdf::stored_dataset(g, path).map(Dataset::Hdf5),
-            g.dataset(path, true).map(|d| Dataset::Zarr(Box::new(d))))
+    pub fn dataset(&self, path: &str) -> Result<Dataset> {
+        self.optional_dataset(path)?
+            .with_context(|| format!("missing NWB dataset {path}"))
+    }
+
+    /// `None` means absent, not a broken link, wrong node type, or open error.
+    pub fn optional_dataset(&self, path: &str) -> Result<Option<Dataset>> {
+        dispatch!(self, Self, g => {
+            if !hdf::hard_link_exists(g, path)? { return Ok(None); }
+            hdf::local_dataset(g, path).map(Dataset::Hdf5).map(Some)
+        }, g.local_path(path)?.map(|path| g.open_dataset(&path).map(|d| Dataset::Zarr(Box::new(d)))
+            .with_context(|| format!("open Zarr dataset {path}"))).transpose())
+    }
+
+    pub fn optional_stored_dataset(&self, path: &str) -> Result<Option<Dataset>> {
+        self.optional_dataset(path)
         .with_context(|| format!("NWB dataset {path} must be stored in this file; open the file that holds the data directly, or pass the recording file via --dat"))
     }
 
-    pub fn link_exists(&self, path: &str) -> Result<bool> {
-        dispatch!(self, Self, g => Ok(g.link_exists(path)), g.link_exists(path))
+    pub fn stored_dataset(&self, path: &str) -> Result<Dataset> {
+        self.optional_stored_dataset(path)?
+            .with_context(|| format!("missing NWB dataset {path}"))
     }
 
     pub fn attr(&self, name: &str) -> Result<Attr> {
-        dispatch!(self, Self, g => Ok(Attr::Hdf5(g.attr(name)?)),
-            Ok(Attr::Zarr(g.attr(name)?.clone())))
+        self.optional_attr(name)?
+            .with_context(|| format!("missing {name} attribute"))
+    }
+
+    pub fn optional_attr(&self, name: &str) -> Result<Option<Attr>> {
+        dispatch!(self, Self, g => hdf_attr(g, name),
+            Ok(g.optional_attr(name).cloned().map(Attr::Zarr)))
     }
 
     pub fn supports_legacy_seal(&self) -> bool {
@@ -115,6 +142,15 @@ impl Group {
 
     pub fn identity(&self, path: &Path) -> Result<Vec<u8>> {
         dispatch!(self, Self, _g => Ok(hdf::identity(path)), zarr::identity(path))
+    }
+}
+
+#[cfg(feature = "hdf5")]
+fn hdf_attr(location: &h5::Location, name: &str) -> Result<Option<Attr>> {
+    if location.attr_names()?.iter().any(|attr| attr == name) {
+        Ok(Some(Attr::Hdf5(location.attr(name)?)))
+    } else {
+        Ok(None)
     }
 }
 
@@ -194,8 +230,13 @@ impl Dataset {
     }
 
     pub fn attr(&self, name: &str) -> Result<Attr> {
-        dispatch!(self, Self, d => Ok(Attr::Hdf5(d.attr(name)?)),
-            Ok(Attr::Zarr(d.attr(name)?.clone())))
+        self.optional_attr(name)?
+            .with_context(|| format!("missing {name} attribute"))
+    }
+
+    pub fn optional_attr(&self, name: &str) -> Result<Option<Attr>> {
+        dispatch!(self, Self, d => hdf_attr(d, name),
+            Ok(d.optional_attr(name)?.cloned().map(Attr::Zarr)))
     }
 
     pub fn read_rows<T: Number>(&self, range: Range<usize>) -> Result<Vec<T>> {

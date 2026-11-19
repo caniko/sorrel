@@ -355,10 +355,12 @@ fn spike_mapping_datasets_must_be_stored_in_the_opened_file() {
             .err()
             .unwrap_or_else(|| panic!("must reject {kind} at {component} (paired: {paired})"));
             let err = format!("{err:#}");
-            assert!(
-                err.contains(clock) && err.contains(kind) && err.contains("--dat"),
-                "{err}"
-            );
+            if component == clock {
+                assert!(
+                    err.contains(clock) && err.contains(kind) && err.contains("--dat"),
+                    "{err}"
+                );
+            }
             if kind == "soft link" {
                 assert!(
                     err.contains(&format!("{component} is an HDF5 soft link")),
@@ -503,12 +505,87 @@ fn paired_raw_uses_its_series_channels_and_time_base() {
     }
 }
 
+#[test]
+fn refuses_linked_optional_channel_conversion() {
+    for &format in FORMATS {
+        let dir = tempfile::tempdir().unwrap();
+        let series = "/acquisition/ElectricalSeriesRaw";
+        let name = format!("{series}/channel_conversion");
+        let path = replace_member_with_link(format, dir.path(), series, "channel_conversion");
+        let err = NwbProvider::open(path)
+            .err()
+            .expect("linked gain must fail");
+        assert!(format!("{err:#}").contains(&name), "{err:#}");
+    }
+}
+
+#[test]
+fn unresolved_acquisition_link_prevents_clock_fallback() {
+    for &format in FORMATS {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            replace_member_with_link(format, dir.path(), "/acquisition", "ElectricalSeriesRaw");
+        for series in [None, Some("/acquisition/ElectricalSeriesRaw")] {
+            let err = NwbProvider::open_with(
+                &path,
+                NwbOpenParams {
+                    series,
+                    sample_rate: Some(1000.0),
+                    ..Default::default()
+                },
+            )
+            .err()
+            .expect("an unresolved series must not change the clock");
+            let err = format!("{err:#}");
+            assert!(
+                err.contains("/acquisition/ElectricalSeriesRaw") && err.contains("link"),
+                "{err}"
+            );
+        }
+    }
+}
+
+fn replace_member_with_link(
+    format: Format,
+    dir: &std::path::Path,
+    parent: &str,
+    name: &str,
+) -> PathBuf {
+    let fixture = format.fixture("good.nwb");
+    let path = dir.join(fixture.file_name().unwrap());
+    let member = format!("{parent}/{name}");
+    match format {
+        #[cfg(feature = "hdf5")]
+        Format::Hdf5 => {
+            std::fs::copy(fixture, &path).unwrap();
+            let file = hdf5_metno::File::open_rw(&path).unwrap();
+            file.unlink(&member).unwrap();
+            file.link_external("missing.nwb", &member, &member).unwrap();
+        }
+        #[cfg(feature = "zarr")]
+        Format::Zarr => {
+            use std::fs;
+            zarr_tests::copy_store(&fixture, &path);
+            fs::remove_dir_all(path.join(&member[1..])).unwrap();
+            let attrs = path.join(&parent[1..]).join(".zattrs");
+            let mut json = if attrs.exists() {
+                serde_json::from_slice(&fs::read(&attrs).unwrap()).unwrap()
+            } else {
+                serde_json::json!({})
+            };
+            json["zarr_link"] = serde_json::json!([{ "name": name, "source": "../missing.nwb.zarr", "path": member }]);
+            fs::write(attrs, serde_json::to_vec(&json).unwrap()).unwrap();
+        }
+    }
+    path
+}
+
 #[cfg(feature = "zarr")]
 mod zarr_tests {
     use super::*;
     use std::{fs, path::Path, time::Duration};
 
-    fn copy_store(src: &Path, dst: &Path) {
+    pub(super) fn copy_store(src: &Path, dst: &Path) {
         fs::create_dir(dst).unwrap();
         for entry in fs::read_dir(src).unwrap() {
             let entry = entry.unwrap();

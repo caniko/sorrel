@@ -153,38 +153,49 @@ fn fixed_strings(
 
 // The journal only seals explicitly opened files. Check each link before
 // following it: even a link that resolves back into this file can go via a sidecar.
-pub(super) fn stored_dataset(file: &hdf5::Group, path: &str) -> Result<hdf5::Dataset> {
-    use hdf5::plist::dataset_create::Layout;
+pub(super) fn hard_link_exists(group: &hdf5::Group, path: &str) -> Result<bool> {
     use hdf5_metno_sys::{
         h5l::{self, H5L_info1_t, H5L_TYPE_EXTERNAL, H5L_TYPE_HARD, H5L_TYPE_SOFT},
-        h5p::{H5Pget_external_count, H5P_DEFAULT},
+        h5p::H5P_DEFAULT,
     };
     use std::ffi::{c_int, CString};
     use std::mem::MaybeUninit;
 
-    let mut prefix = String::new();
+    let mut prefix = if path.starts_with('/') {
+        String::new()
+    } else {
+        group.name().trim_end_matches('/').to_owned()
+    };
     for component in path.trim_start_matches('/').split('/') {
+        ensure!(
+            !component.is_empty() && !matches!(component, "." | ".."),
+            "invalid HDF5 object path {path:?}"
+        );
         prefix.push('/');
         prefix.push_str(component);
         let name = CString::new(prefix.as_str())?;
         let mut info = MaybeUninit::<H5L_info1_t>::uninit();
         let kind = hdf5::sync::sync(|| {
-            // SAFETY: file and the NUL-terminated name are live, info points to
+            // SAFETY: group and the NUL-terminated name are live, info points to
             // writable storage, and the HDF5 lock serializes the call. Read the
             // type as a C int, since user-defined links can use other enum values.
             unsafe {
+                if hdf5::h5check(h5l::H5Lexists(group.id(), name.as_ptr(), H5P_DEFAULT))? == 0 {
+                    return Ok(None);
+                }
                 // Use the ABI available on both older and newer HDF5 releases.
                 #[allow(deprecated)]
                 hdf5::h5check(h5l::H5Lget_info1(
-                    file.id(),
+                    group.id(),
                     name.as_ptr(),
                     info.as_mut_ptr(),
                     H5P_DEFAULT,
                 ))?;
-                Ok::<_, hdf5::Error>(info.as_ptr().cast::<c_int>().read())
+                Ok::<_, hdf5::Error>(Some(info.as_ptr().cast::<c_int>().read()))
             }
         })
         .with_context(|| format!("cannot inspect HDF5 link {prefix}"))?;
+        let Some(kind) = kind else { return Ok(false) };
         let kind = match kind {
             k if k == H5L_TYPE_HARD as c_int => continue,
             k if k == H5L_TYPE_SOFT as c_int => "soft link",
@@ -193,7 +204,16 @@ pub(super) fn stored_dataset(file: &hdf5::Group, path: &str) -> Result<hdf5::Dat
         };
         anyhow::bail!("{prefix} is an HDF5 {kind}");
     }
-    let ds = file.dataset(path).context("cannot open dataset")?;
+    Ok(true)
+}
+
+pub(super) fn local_dataset(file: &hdf5::Group, path: &str) -> Result<hdf5::Dataset> {
+    use hdf5::plist::dataset_create::Layout;
+    use hdf5_metno_sys::h5p::H5Pget_external_count;
+
+    let ds = file
+        .dataset(path)
+        .with_context(|| format!("cannot open HDF5 dataset {path}"))?;
     let dcpl = ds
         .dcpl()
         .context("cannot inspect dataset creation properties")?;

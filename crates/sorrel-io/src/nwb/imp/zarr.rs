@@ -30,21 +30,18 @@ pub(super) fn exact_number(value: &Value, what: &str) -> Result<f64> {
 
 pub(super) fn open(path: &Path) -> Result<Group> {
     let store: ReadableListableStorage = Arc::new(FilesystemStore::new(path)?);
-    Group::open(store, "/")
+    Group::open(store, path.into(), "/")
 }
 
-pub(in crate::nwb::imp) struct Group(ZarrGroup<Store>);
+pub(in crate::nwb::imp) struct Group(ZarrGroup<Store>, Arc<Path>);
 
 impl Group {
-    fn open(store: ReadableListableStorage, path: &str) -> Result<Self> {
-        Ok(Self(ZarrGroup::open(store, path)?))
+    fn open(store: ReadableListableStorage, root: Arc<Path>, path: &str) -> Result<Self> {
+        Ok(Self(ZarrGroup::open(store, path)?, root))
     }
 
-    pub fn attr(&self, name: &str) -> Result<&Value> {
-        self.0
-            .attributes()
-            .get(name)
-            .with_context(|| format!("missing {name} attribute"))
+    pub fn optional_attr(&self, name: &str) -> Option<&Value> {
+        self.0.attributes().get(name)
     }
 
     fn links(&self) -> Result<&[Value]> {
@@ -55,19 +52,31 @@ impl Group {
     }
 
     fn link(&self, name: &str) -> Result<Option<&Value>> {
-        Ok(self
-            .links()?
-            .iter()
-            .find(|link| link["name"].as_str() == Some(name)))
+        let mut found = None;
+        for link in self.links()? {
+            if link["name"].as_str().context("zarr_link has no name")? == name {
+                ensure!(found.is_none(), "duplicate zarr_link {name}");
+                found = Some(link);
+            }
+        }
+        Ok(found)
     }
 
     pub fn member_names(&self) -> Result<Vec<String>> {
-        let mut names: Vec<_> = self
-            .0
-            .children(false)?
-            .iter()
-            .map(|n| n.name().to_string())
-            .collect();
+        let dir = self.1.join(&self.0.path().as_str()[1..]);
+        let mut names = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() || kind.is_symlink() {
+                names.push(
+                    entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("non-UTF-8 Zarr member name"))?,
+                );
+            }
+        }
         for link in self.links()? {
             names.push(
                 link["name"]
@@ -81,67 +90,80 @@ impl Group {
         Ok(names)
     }
 
-    /// Walk the lexical path, checking each component before opening it. A
-    /// zarr_link is a soft alias even when its target is in the same store.
-    fn resolve(&self, path: &str, stored: bool) -> Result<String> {
+    /// Only a missing lexical member is absent. Do not follow aliases.
+    pub fn local_path(&self, path: &str) -> Result<Option<String>> {
         let base = self.0.path().as_str().trim_end_matches('/');
-        let mut path = if path.starts_with('/') {
+        let path = if path.starts_with('/') {
             path.to_owned()
         } else {
             format!("{base}/{path}")
         };
-        let store = self.0.storage();
-        'resolve: for _ in 0..32 {
-            let components = components(&path)?;
-            let mut prefix = String::new();
-            for (i, name) in components.iter().enumerate() {
-                let parent =
-                    Self::open(store.clone(), if prefix.is_empty() { "/" } else { &prefix })?;
-                prefix.push('/');
-                prefix.push_str(name);
-                if let Some(link) = parent.link(name)? {
-                    ensure!(
-                        link["source"].as_str() == Some("."),
-                        "{prefix} is an external zarr_link"
-                    );
-                    ensure!(!stored, "{prefix} is a same-store zarr_link (soft link)");
-                    let target = link["path"].as_str().context("zarr_link has no path")?;
-                    path = std::iter::once(target.trim_end_matches('/'))
-                        .chain(components[i + 1..].iter().copied())
-                        .collect::<Vec<_>>()
-                        .join("/");
-                    if path.is_empty() {
-                        path.push('/');
-                    }
-                    continue 'resolve;
+        let mut prefix = String::new();
+        for name in components(&path)? {
+            let parent_path = if prefix.is_empty() { "/" } else { &prefix };
+            let parent;
+            let group = if self.0.path().as_str() == parent_path {
+                self
+            } else {
+                parent = self.open_group(parent_path)?;
+                &parent
+            };
+            prefix.push('/');
+            prefix.push_str(name);
+            if let Some(link) = group.link(name)? {
+                ensure!(
+                    link["source"].as_str() == Some("."),
+                    "{prefix} is an external zarr_link"
+                );
+                bail!("{prefix} is a same-store zarr_link (soft link)");
+            }
+            match fs::symlink_metadata(self.1.join(&prefix[1..])) {
+                Ok(meta) => ensure!(
+                    meta.is_dir(),
+                    "{prefix} is not a Zarr directory (files and symbolic links are unsupported)"
+                ),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => {
+                    return Err(err).with_context(|| format!("inspect Zarr member {prefix}"))
                 }
             }
-            return Ok(path);
         }
-        bail!("too many nested zarr_link entries")
+        Ok(Some(path))
     }
 
-    pub fn group(&self, name: &str) -> Result<Self> {
-        Self::open(self.0.storage(), &self.resolve(name, false)?)
+    pub fn open_group(&self, path: &str) -> Result<Self> {
+        Self::open(self.0.storage(), self.1.clone(), path)
+            .with_context(|| format!("open Zarr group {path}"))
     }
 
     pub fn child_group(&self, name: &str) -> Result<Option<Self>> {
-        // An unrelated external link need not prevent listing local series.
-        Ok(self.group(name).ok())
-    }
-
-    pub fn link_exists(&self, name: &str) -> Result<bool> {
-        Ok(self.link(name)?.is_some()
-            || self
-                .member_names()?
-                .iter()
-                .any(|n| n == name.trim_start_matches('/')))
-    }
-
-    pub fn dataset(&self, name: &str, stored: bool) -> Result<Dataset> {
-        let path = self.resolve(name, stored)?;
+        let Some(path) = self.local_path(name)? else {
+            return Ok(None);
+        };
         let store = self.0.storage();
-        let data = match Array::open(store.clone(), &path) {
+        let key = |name| StoreKey::new(format!("{}/{name}", &path[1..]));
+        // Classify arrays from metadata without requiring a supported codec.
+        if let Some(meta) = store.get(&key("zarr.json")?)? {
+            if serde_json::from_slice::<Value>(&meta)?["node_type"] == "array" {
+                return Ok(None);
+            }
+        } else if let Some(meta) = store.get(&key(".zarray")?)? {
+            ensure!(
+                store.get(&key(".zgroup")?)?.is_none(),
+                "ambiguous Zarr node {path}: both .zarray and .zgroup"
+            );
+            ensure!(
+                serde_json::from_slice::<Value>(&meta)?["zarr_format"] == 2,
+                "invalid Zarr array metadata for {path}"
+            );
+            return Ok(None);
+        }
+        self.open_group(&path).map(Some)
+    }
+
+    pub fn open_dataset(&self, path: &str) -> Result<Dataset> {
+        let store = self.0.storage();
+        let data = match Array::open(store.clone(), path) {
             Ok(array) => Data::Array(Box::new(array)),
             Err(error) => {
                 // hdmf-zarr writes cached specs as a single uncompressed
@@ -242,11 +264,8 @@ impl Dataset {
         }
     }
 
-    pub fn attr(&self, name: &str) -> Result<&Value> {
-        self.array()?
-            .attributes()
-            .get(name)
-            .with_context(|| format!("missing {name} attribute"))
+    pub fn optional_attr(&self, name: &str) -> Result<Option<&Value>> {
+        Ok(self.array()?.attributes().get(name))
     }
 
     pub fn reference_path(&self, name: &str) -> Result<Option<String>> {
@@ -321,7 +340,11 @@ impl Dataset {
 
     fn check_scalar(&self) -> Result<()> {
         ensure!(
-            self.shape.is_empty() || (self.shape == [1] && self.attr("zarr_dtype")? == "scalar"),
+            self.shape.is_empty()
+                || (self.shape == [1]
+                    && self
+                        .optional_attr("zarr_dtype")?
+                        .is_some_and(|v| v == "scalar")),
             "expected a scalar Zarr dataset"
         );
         Ok(())
