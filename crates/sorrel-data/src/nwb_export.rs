@@ -5,7 +5,7 @@ use anyhow::{ensure, Result};
 use sorrel_io::curation_json::unit_id_text;
 use sorrel_io::extras::QualityMetrics;
 use sorrel_io::kilosort::PhyLabel;
-use sorrel_io::nwb_units::{Column, Units, Values};
+use sorrel_io::nwb_units::{exact_sample, Column, Units, Values};
 use sorrel_io::{ClusterId, DataProvider, HasGeometry};
 use std::collections::BTreeMap;
 
@@ -19,9 +19,17 @@ pub fn collect_units<P>(
 where
     P: DataProvider<Label = PhyLabel> + HasGeometry,
 {
+    let rounded_rate = rate as f32;
     ensure!(
-        rate.is_finite() && rate > 0.0 && (1.0 / rate).is_finite(),
+        rounded_rate.is_finite() && rounded_rate > 0.0,
         "invalid sample rate {rate}"
+    );
+    let resolution = rate.recip();
+    let units_rate = resolution.recip();
+    // The reader compares clocks only when they share a float32 representation.
+    ensure!(
+        units_rate as f32 == rounded_rate,
+        "Units resolution for {rate} Hz rounds to a different float32 sample rate"
     );
     ensure!(starting_time.is_finite(), "starting_time must be finite");
     let clusters: Vec<_> = (0..session.n_clusters())
@@ -34,16 +42,24 @@ where
         .iter()
         .map(|&c| i64::from(provider.unit_id(c)))
         .collect();
-    let times = ragged(clusters.iter().map(|&c| {
-        session
-            .spike_times(c)
-            .iter()
-            .map(|s| s.0 as f64 / rate + starting_time)
-    }));
-    ensure!(
-        times.0.iter().all(|t| t.is_finite()),
-        "spike times overflow the NWB time axis"
-    );
+    let mut times = Vec::new();
+    let mut times_index = Vec::with_capacity(clusters.len());
+    for &c in &clusters {
+        for &s in session.spike_times(c) {
+            let sample = s.0 as f64;
+            let seconds = sample / rate + starting_time;
+            // Check both the selected clock and the clock recovered from the
+            // written resolution (whose reciprocal can differ by one ULP).
+            ensure!(
+                exact_sample(seconds, starting_time, rate) == sample
+                    && (units_rate == rate || exact_sample(seconds, starting_time, units_rate) == sample),
+                "unit {}: cannot represent sample {} on the NWB time axis (starting time {starting_time} s, {rate} Hz)",
+                provider.unit_id(c), s.0
+            );
+            times.push(seconds);
+        }
+        times_index.push(times.len() as u64);
+    }
     let parents = ragged(clusters.iter().map(|&c| {
         session
             .parents(c)
@@ -53,7 +69,7 @@ where
     }));
     let tags = ragged(clusters.iter().map(|&c| session.tags(c).iter().cloned()));
     let mut columns = vec![
-        column("spike_times", "Spike times in seconds: sample_index / sample_rate + starting_time.", Values::Float(times.0), Some(times.1)),
+        column("spike_times", "Spike times in seconds: sample_index / sample_rate + starting_time.", Values::Float(times), Some(times_index)),
         column("quality", "Sorrel curation label: good, mua, noise or unsorted.", Values::Text(clusters.iter().map(|c| session.labels()[c.idx()].as_str().to_owned()).collect()), None),
         column("origin", "How the unit was made: Auto[<sorter>] if the sorter produced it, Sorrel[<method>] if a Sorrel split created it (Manual, Algo:<name>, LLM:<name>).", Values::Text(clusters.iter().map(|&c| session.origin_label(c)).collect()), None),
         column("parent_unit_ids", "Unit ids this unit came from in Sorrel: the unit it was split from, or the units merged into it. A parent with no spikes left has no row in this table.", Values::Int(parents.0), Some(parents.1)),
@@ -150,7 +166,7 @@ where
     );
     Ok(Units {
         description,
-        resolution: 1.0 / rate,
+        resolution,
         id,
         columns,
         generated_by: ["sorrel-ephys", version],

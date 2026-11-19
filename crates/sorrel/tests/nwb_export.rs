@@ -1,6 +1,8 @@
 #![cfg(feature = "hdf5")]
 
-use sorrel_io::{ClusterId, DataProvider, HasQualityMetrics, NwbOpenParams, NwbProvider};
+use sorrel_io::{
+    ClusterId, DataProvider, HasQualityMetrics, NwbOpenParams, NwbProvider, SampleIndex,
+};
 use std::{fs, path::Path, process::Command};
 
 fn fixtures() -> &'static Path {
@@ -75,8 +77,10 @@ fn native_export_round_trips_curated_units_without_electrodes() {
 fn native_export_round_trips_reader_time_bases() {
     let temp = tempfile::tempdir().unwrap();
     let raw = fixtures().join("rounded_raw.nwb");
+    let precise = 30000.123;
     for (fixture, params, options) in [
         ("timestamps.nwb", NwbOpenParams::default(), vec![]),
+        ("precise_rate_short.nwb", NwbOpenParams::default(), vec![]),
         (
             "legacy_series.nwb",
             NwbOpenParams {
@@ -89,9 +93,10 @@ fn native_export_round_trips_reader_time_bases() {
             "precise_units.nwb",
             NwbOpenParams {
                 raw_path: Some(&raw),
+                sample_rate: Some(precise),
                 ..Default::default()
             },
-            vec!["--dat", raw.to_str().unwrap()],
+            vec!["--dat", raw.to_str().unwrap(), "--sample-rate", "30000.123"],
         ),
     ] {
         let input = temp.path().join(fixture);
@@ -102,7 +107,15 @@ fn native_export_round_trips_reader_time_bases() {
         let reopened = NwbProvider::open(&output).unwrap();
         assert_eq!(reopened.starting_time(), 0.0, "{fixture}");
         let rate = source.exact_sample_rate().unwrap();
-        assert_eq!(reopened.exact_sample_rate().unwrap(), rate, "{fixture}");
+        assert_eq!(
+            reopened.exact_sample_rate().unwrap(),
+            rate.recip().recip(),
+            "{fixture}"
+        );
+        if fixture == "precise_rate_short.nwb" {
+            assert_eq!(rate, f64::from(precise as f32));
+            assert_eq!(reopened.spike_times(ClusterId(0)), [SampleIndex(100)]);
+        }
         let paired = NwbProvider::open_with(
             &output,
             NwbOpenParams {
@@ -112,6 +125,7 @@ fn native_export_round_trips_reader_time_bases() {
         )
         .unwrap();
         assert_eq!(paired.starting_time(), source.starting_time(), "{fixture}");
+        assert_eq!(paired.exact_sample_rate().unwrap(), rate, "{fixture}");
         let active: Vec<_> = (0..source.n_clusters())
             .map(ClusterId)
             .filter(|&c| !source.spike_times(c).is_empty())
@@ -130,4 +144,52 @@ fn native_export_round_trips_reader_time_bases() {
             }
         }
     }
+}
+
+#[test]
+fn native_export_long_recording_requires_explicit_rate_when_paired() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("long.nwb");
+    let output = temp.path().join("export.nwb");
+    fs::copy(fixtures().join("precise_rate_long.nwb"), &input).unwrap();
+    export(&input, &output, &["--sample-rate", "30000.123"]);
+    let expected = [SampleIndex(330_000_000)];
+    let params = NwbOpenParams {
+        raw_path: Some(&input),
+        ..Default::default()
+    };
+    let err = NwbProvider::open_with(&output, params).err().unwrap();
+    assert!(format!("{err:#}").contains("Ambiguous NWB sample rate"));
+    let paired = NwbProvider::open_with(
+        &output,
+        NwbOpenParams {
+            sample_rate: Some(30000.123),
+            ..params
+        },
+    )
+    .unwrap();
+    assert_eq!(paired.exact_sample_rate().unwrap(), 30000.123);
+    assert_eq!(paired.spike_times(ClusterId(0)), expected);
+    let standalone = NwbProvider::open(&output).unwrap();
+    assert_eq!(standalone.spike_times(ClusterId(0)), expected);
+}
+
+#[test]
+fn native_export_refuses_lossy_spike_times() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("short.nwb");
+    let output = temp.path().join("export.nwb");
+    fs::copy(fixtures().join("precise_rate_short.nwb"), &input).unwrap();
+    // At this offset the spacing between f64 timestamps exceeds one sample.
+    let result = Command::new(env!("CARGO_BIN_EXE_sorrel"))
+        .arg("export-nwb")
+        .arg(&input)
+        .arg("--out")
+        .arg(&output)
+        .args(["--starting-time", "1099511627776"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("cannot represent sample 100"));
+    assert!(!output.exists());
 }

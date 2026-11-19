@@ -303,6 +303,10 @@ or a paired raw file via `--dat`), or from the Units resolution or `--sample-rat
 when there is no series. Reopening a Units-only export uses a zero offset for
 its relative sample indices; pair the raw NWB with `--dat` to recover the raw
 series' time base or to reopen a file with negative spike times.
+If Sorrel requires `--sample-rate` to resolve a stored float32 series rate
+that disagrees with the Units clock, use the same rate for export and when
+reopening against the recording. Export refuses to write a spike time that
+cannot be mapped back to its original sample on the chosen time base.
 Unlike `export-phy`, `export-nwb` does not need channels: if no electrode
 geometry is available, the new file contains Units but no electrodes table.
 
