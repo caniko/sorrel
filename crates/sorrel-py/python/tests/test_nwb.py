@@ -239,6 +239,11 @@ def test_native_units_match_python(curated: Path, tmp_path: Path, native_cli, ap
     cmd = [native_cli, "export-nwb", curated, *args, "--starting-time", str(START)]
     subprocess.run(cmd, check=True)
     assert not validate(path=native)
+    with h5py.File(native, "r") as f:
+        for name in ("id", "spike_times", "spike_times_index"):
+            assert isinstance(f["units"].get(name, getlink=True), h5py.HardLink)
+            dataset = f[f"units/{name}"]
+            assert not dataset.is_virtual and not dataset.external
     with NWBHDF5IO(native, "r") as actual, NWBHDF5IO(python, "r") as expected:
         dest, src = actual.read(), expected.read()
         got, want = dest.units, src.units
@@ -292,6 +297,23 @@ def test_native_export_from_nwb(tmp_path: Path, native_cli):
         np.testing.assert_allclose(dest.units["spike_times"][0], src.units["spike_times"][0])
         np.testing.assert_allclose(dest.units["spike_times"][1], src.units["spike_times"][2])
         np.testing.assert_array_equal(dest.electrodes.id[:], [13, 10, 15, 11])
+
+
+def test_native_export_units_only_with_explicit_rate(tmp_path: Path, native_cli):
+    source = tmp_path / "input.nwb"
+    shutil.copyfile(FIXTURE.parent / "nwb" / "curated_units.nwb", source)
+    with h5py.File(source, "r+") as f:
+        del f["units/spike_times"].attrs["resolution"]
+    out = tmp_path / "sort.nwb"
+    rate = 1234.5
+    subprocess.run([native_cli, "export-nwb", source, "--out", out,
+                    "--sample-rate", str(rate)], check=True)
+    assert not validate(path=out)
+    with NWBHDF5IO(out, "r") as io:
+        nwb = io.read()
+        assert nwb.electrodes is None
+        assert nwb.units.resolution == 1 / rate
+        assert nwb.units["spike_times"][0][0] == round(0.55 * rate) / rate
 
 
 def test_native_export_destinations(native_cli):

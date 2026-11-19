@@ -3,13 +3,19 @@
 use crate::{collect_qc_rows_with, provenance, Session};
 use anyhow::{ensure, Result};
 use sorrel_io::curation_json::unit_id_text;
+use sorrel_io::extras::QualityMetrics;
 use sorrel_io::kilosort::PhyLabel;
 use sorrel_io::nwb_units::{Column, Units, Values};
 use sorrel_io::{ClusterId, DataProvider, HasGeometry};
 use std::collections::BTreeMap;
 
 /// `rate` and `starting_time` place the recording's sample indices on the NWB time axis.
-pub fn collect_units<P>(session: &Session<P>, rate: f64, starting_time: f64) -> Result<Units>
+pub fn collect_units<P>(
+    session: &Session<P>,
+    rate: f64,
+    starting_time: f64,
+    stored_metrics: Option<&QualityMetrics>,
+) -> Result<Units>
 where
     P: DataProvider<Label = PhyLabel> + HasGeometry,
 {
@@ -43,6 +49,7 @@ where
             .parents(c)
             .iter()
             .map(|&p| i64::from(provider.unit_id(p)))
+            .chain(session.missing_parent_unit_ids(c).iter().copied())
     }));
     let tags = ragged(clusters.iter().map(|&c| session.tags(c).iter().cloned()));
     let mut columns = vec![
@@ -53,31 +60,6 @@ where
         column("tags", "Sorrel tags: src:* is who last touched the unit, review:* asks for review, split/tuned mark structural edits.", Values::Text(tags.0), Some(tags.1)),
     ];
 
-    let qc = collect_qc_rows_with(session, Some(provider.channel_positions()));
-    // The previous Python path used null for non-finite values and cast the
-    // two count metrics from the same QC representation as the other metrics.
-    for (name, doc) in metric_docs() {
-        let values: Vec<_> = clusters
-            .iter()
-            .map(|c| {
-                let v = qc[c.idx()].get(name).unwrap_or(f32::NAN);
-                if v.is_finite() {
-                    f64::from(v)
-                } else {
-                    f64::NAN
-                }
-            })
-            .collect();
-        if values.iter().any(|v| !v.is_nan()) {
-            let data = match name {
-                "n_spikes" | "isi_violations" => {
-                    Values::Int(values.into_iter().map(|v| v as i64).collect())
-                }
-                _ => Values::Float(values),
-            };
-            columns.push(column(name, format!("Sorrel QC metric. {doc}"), data, None));
-        }
-    }
     let names: Vec<_> = clusters.iter().map(|&c| unit_name(provider, c)).collect();
     if names.iter().zip(&id).any(|(n, id)| *n != id.to_string()) {
         columns.push(column(
@@ -86,6 +68,68 @@ where
             Values::Text(names),
             None,
         ));
+    }
+
+    let qc = std::cell::OnceCell::new();
+    let computed = |c: ClusterId, name: &str| {
+        let rows =
+            qc.get_or_init(|| collect_qc_rows_with(session, Some(provider.channel_positions())));
+        rows[c.idx()]
+            .get(name)
+            .filter(|v| v.is_finite())
+            .unwrap_or(f32::NAN)
+    };
+    if let Some(stored) = stored_metrics.filter(|m| !m.is_empty()) {
+        for name in stored.names() {
+            if name == "id"
+                || columns.iter().any(|c| {
+                    c.name == *name
+                        || (c.index.is_some() && name.strip_suffix("_index") == Some(&c.name))
+                })
+            {
+                continue;
+            }
+            // Imported metrics describe the original trains. Keep them for
+            // unchanged rows; recompute what we can for edited trains.
+            let original = stored.get(name).unwrap_or_default();
+            let values = clusters
+                .iter()
+                .map(|&c| {
+                    let v = if session.spike_times(c) == provider.spike_times(c) {
+                        original.get(c.idx()).copied().unwrap_or(f32::NAN)
+                    } else {
+                        computed(c, name)
+                    };
+                    f64::from(v)
+                })
+                .collect();
+            let doc = metric_docs().find(|(key, _)| *key == name).map_or(
+                "Metric imported from the source Units table.",
+                |(_, doc)| doc,
+            );
+            columns.push(column(
+                name,
+                format!("Sorrel QC metric. {doc}"),
+                Values::Float(values),
+                None,
+            ));
+        }
+    } else {
+        for (name, doc) in metric_docs() {
+            let values: Vec<_> = clusters
+                .iter()
+                .map(|&c| f64::from(computed(c, name)))
+                .collect();
+            if values.iter().any(|v| !v.is_nan()) {
+                let data = match name {
+                    "n_spikes" | "isi_violations" => {
+                        Values::Int(values.into_iter().map(|v| v as i64).collect())
+                    }
+                    _ => Values::Float(values),
+                };
+                columns.push(column(name, format!("Sorrel QC metric. {doc}"), data, None));
+            }
+        }
     }
 
     let p = provenance(session)?;
@@ -107,6 +151,7 @@ where
     Ok(Units {
         description,
         resolution: 1.0 / rate,
+        starting_time,
         id,
         columns,
         generated_by: ["sorrel-ephys", version],
@@ -130,13 +175,13 @@ fn ragged<T>(rows: impl Iterator<Item = impl IntoIterator<Item = T>>) -> (Vec<T>
 }
 
 fn column(
-    name: &'static str,
+    name: &str,
     description: impl Into<String>,
     data: Values,
     index: Option<Vec<u64>>,
 ) -> Column {
     Column {
-        name,
+        name: name.to_owned(),
         description: description.into(),
         data,
         index,

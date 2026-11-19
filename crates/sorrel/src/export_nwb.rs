@@ -40,7 +40,13 @@ impl ExportNwb {
         };
         let source = (backend == Backend::Nwb).then(|| self.open.root().to_path_buf());
         if let Some(journal) = &self.open.journal {
-            for path in source.iter().chain(self.out.iter()).chain(self.into.iter()) {
+            let raw = self.open.dat.iter().filter(|_| backend == Backend::Nwb);
+            for path in source
+                .iter()
+                .chain(raw)
+                .chain(self.out.iter())
+                .chain(self.into.iter())
+            {
                 reject_journal_alias(journal, path)?;
             }
         }
@@ -72,6 +78,7 @@ impl ExportNwb {
             Export {
                 destination,
                 starting_time: self.starting_time,
+                preserve_metrics: backend == Backend::Nwb,
                 sample_rate: self
                     .open
                     .sample_rate
@@ -121,6 +128,7 @@ enum Destination {
 struct Export {
     destination: Destination,
     starting_time: Option<f64>,
+    preserve_metrics: bool,
     sample_rate: Option<f64>,
 }
 
@@ -136,6 +144,7 @@ impl SessionVisitor for Export {
             &session,
             rate,
             self.starting_time.unwrap_or(ctx.nwb_start_time),
+            self.preserve_metrics.then_some(&ctx.metrics),
         )?;
         let (path, result) = match self.destination {
             Destination::New(path, metadata) => {
