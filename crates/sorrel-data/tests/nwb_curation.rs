@@ -9,6 +9,9 @@ use sorrel_io::kilosort::PhyLabel;
 use sorrel_io::{ClusterId, DataProvider, NwbOpenParams, NwbProvider, SampleIndex};
 use std::path::{Path, PathBuf};
 
+// The f64 reciprocal of the resolution in the precise_rate and close_f64_rate fixtures.
+const UNITS_CLOCK: f64 = 30000.123;
+
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../release/fixtures/nwb")
@@ -110,12 +113,15 @@ fn nwb_trunk_journal_replays_only_with_the_trunk_series() {
 
 #[test]
 fn nwb_trunk_journal_replays_when_precise_rate_leaves_samples_unchanged() {
-    for name in ["precise_rate_short.nwb", "close_f64_rate_short.nwb"] {
-        assert_unchanged_mapping_replays_trunk_journal(&fixture(name));
+    for (name, stored) in [
+        ("precise_rate_short.nwb", 30000.123046875),
+        ("close_f64_rate_short.nwb", 30_000.123_026_999_998),
+    ] {
+        assert_unchanged_mapping_replays_trunk_journal(&fixture(name), stored);
     }
 }
 
-fn assert_unchanged_mapping_replays_trunk_journal(path: &Path) {
+fn assert_unchanged_mapping_replays_trunk_journal(path: &Path, stored: f64) {
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("trunk.journal");
     {
@@ -132,7 +138,7 @@ fn assert_unchanged_mapping_replays_trunk_journal(path: &Path) {
     }
 
     // An explicit choice with the same sample mapping also preserves the seal.
-    for sample_rate in [None, Some(30000.123)] {
+    for sample_rate in [None, Some(stored), Some(UNITS_CLOCK)] {
         let provider = NwbProvider::open_with(
             path,
             NwbOpenParams {
@@ -163,13 +169,13 @@ fn nwb_trunk_journal_replays_only_with_stored_clock_when_mappings_differ() {
         )
     };
     assert!(open(None).is_err());
-    let stored = open(Some(f64::from(30000.123_f32))).unwrap();
+    let stored = open(Some(30000.123046875)).unwrap();
     assert_eq!(stored.spike_times(ClusterId(0)), [SampleIndex(330_000_001)]);
     drop(trunk_journal(&path, &journal, stored.n_clusters()));
     let opts = JournalOpts::default();
     open_identity_sealed(stored, &journal, &opts).unwrap();
 
-    let precise = open(Some(30000.123)).unwrap();
+    let precise = open(Some(UNITS_CLOCK)).unwrap();
     let Err(err) = open_identity_sealed(precise, &journal, &opts) else {
         panic!("trunk journal accepted for a different spike mapping");
     };

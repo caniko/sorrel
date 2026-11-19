@@ -47,7 +47,7 @@ mod imp {
         pub series: Option<&'a str>,
         /// Read the ElectricalSeries from this file instead of the units file.
         pub raw_path: Option<&'a Path>,
-        /// Sampling rate (Hz) for units without a time base or with ambiguous clocks.
+        /// Exact declared clock (Hz), or a supplied rate for units without a time base.
         pub sample_rate: Option<f64>,
     }
 
@@ -85,13 +85,7 @@ mod imp {
             let units_rate = if raw.is_some() || series.is_none() {
                 read_units_rate(&spike_times)?
             } else {
-                None
-            };
-            let check_explicit = |name: &str, rate, float32| -> Result<()> {
-                if let Some(explicit) = params.sample_rate {
-                    check_matching_rate("--sample-rate", explicit, name, rate, float32)?;
-                }
-                Ok(())
+                read_units_rate(&spike_times).ok().flatten()
             };
 
             let mut legacy_identity = false;
@@ -104,80 +98,44 @@ mod imp {
                 let data = series.dataset("data")?;
                 let shape = data.shape();
                 let (n_samples, n_channels) = (shape[0], shape.get(1).copied().unwrap_or(1));
-                let (stored_rate, t0, float32_rate, timestamps) =
+                let (stored_rate, t0, timestamps) =
                     read_time_base(recording, series, name, n_samples)?;
-                let units_clock = if timestamps.is_some() {
-                    if let Some(declared) = units_rate {
-                        check_matching_rate(
-                            "sorting sample rate",
-                            declared,
-                            name,
-                            stored_rate,
-                            false,
-                        )?;
-                    }
+                let units_clock = if let Some(declared) = units_rate {
+                    // The one-ppm gate decides whether resolution declares a clock,
+                    // not whether an explicit value matches that clock.
+                    let close = (declared - stored_rate).abs() <= 1e-6 * stored_rate;
+                    ensure!(close || raw.is_none(),
+                        "NWB rate mismatch: sorting sample rate is {declared} Hz but {name} is {stored_rate} Hz");
+                    close.then_some(declared)
+                } else {
                     None
-                } else {
-                    let declared = if raw.is_some() {
-                        units_rate
-                    } else {
-                        read_units_rate(&spike_times).ok().flatten()
-                    };
-                    if let Some(declared) = declared {
-                        // One ppm covers float32 rounding (~6e-8) and ppb-level float64 differences.
-                        let close = (declared - stored_rate).abs() <= 1e-6 * stored_rate;
-                        ensure!(close || raw.is_none(),
-                            "NWB rate mismatch: sorting sample rate is {declared} Hz but {name} is {stored_rate} Hz");
-                        (close && declared != stored_rate).then_some(declared)
-                    } else {
-                        None
-                    }
                 };
-                let explicit_units_clock = units_clock.filter(|&declared| {
-                    params
-                        .sample_rate
-                        .is_some_and(|explicit| rates_match(explicit, declared, false))
-                });
-                if let Some(declared) =
-                    explicit_units_clock.or(units_rate.filter(|_| timestamps.is_some()))
-                {
-                    check_explicit("/units/spike_times resolution", declared, false)?;
-                } else {
-                    check_explicit(name, stored_rate, float32_rate)?;
+                let rate = params.sample_rate.unwrap_or(stored_rate);
+                if rate != stored_rate && Some(rate) != units_clock {
+                    let source = if timestamps.is_some() {
+                        "timestamps"
+                    } else {
+                        "starting_time.rate"
+                    };
+                    let units = units_clock.map_or_else(String::new, |units| {
+                        format!(", {units} Hz (/units/spike_times resolution)")
+                    });
+                    anyhow::bail!("--sample-rate {rate} Hz is not a clock this NWB declares; pass one of: {stored_rate} Hz (series {name} {source}){units}");
                 }
                 legacy_identity =
                     raw.is_none() && timestamps.is_none() && is_trunk_series(&f, name);
-                let rate = match params.sample_rate {
-                    Some(explicit) if float32_rate || units_clock.is_some() => {
-                        // --sample-rate picks a clock (the nearer one if it
-                        // matches both); use that clock's exact value. Only a
-                        // float32 stored rate needs the typed digits, since
-                        // they are more precise than the file.
-                        let stored = if float32_rate { explicit } else { stored_rate };
-                        let chosen = match explicit_units_clock {
-                            Some(units)
-                                if (explicit - units).abs() < (explicit - stored_rate).abs() =>
-                            {
-                                units
-                            }
-                            _ => stored,
-                        };
-                        comparison_rate =
-                            (legacy_identity && chosen != stored_rate).then_some(stored_rate);
-                        chosen
-                    }
-                    None => {
-                        comparison_rate = units_clock;
-                        stored_rate
-                    }
-                    Some(_) => stored_rate,
+                comparison_rate = if params.sample_rate.is_none() {
+                    units_clock.filter(|&units| units != stored_rate)
+                } else {
+                    (legacy_identity && rate != stored_rate).then_some(stored_rate)
                 };
                 let channels = read_channels(recording, series, name, n_channels)?;
                 let trace = NwbTrace::new(series, data, name, n_samples, n_channels)?;
                 (Some(trace), rate, t0, channels, timestamps)
             } else {
-                if let Some(declared) = units_rate {
-                    check_explicit("/units/spike_times resolution", declared, false)?;
+                if let (Some(explicit), Some(declared)) = (params.sample_rate, units_rate) {
+                    ensure!(explicit == declared,
+                        "--sample-rate {explicit} Hz is not a clock this NWB declares; pass one of: {declared} Hz (/units/spike_times resolution)");
                 }
                 (
                         None,
@@ -364,31 +322,6 @@ mod imp {
         value
             .parse()
             .map_err(|err| anyhow!("invalid NWB epoch {value:?}: {err}"))
-    }
-
-    fn rates_match(a: f64, b: f64, b_float32: bool) -> bool {
-        if b_float32 {
-            a as f32 == b as f32
-        } else {
-            (a - b).abs() <= 1e-9 * b
-        }
-    }
-
-    fn check_matching_rate(
-        a_name: &str,
-        a: f64,
-        b_name: &str,
-        b: f64,
-        b_float32: bool,
-    ) -> Result<()> {
-        let a = checked_rate(a)?;
-        // Only allow round-off from reciprocals or timestamp-derived rates,
-        // not a nominally similar clock that could drift by many samples.
-        ensure!(
-            rates_match(a, b, b_float32),
-            "NWB rate mismatch: {a_name} is {a} Hz but {b_name} is {b} Hz"
-        );
-        Ok(())
     }
 
     impl HasGeometry for NwbProvider {
@@ -797,18 +730,18 @@ mod imp {
         check().with_context(|| format!("NWB dataset {path} must be stored in this file; open the file that holds the data directly, or pass the recording file via --dat"))
     }
 
-    /// `(rate Hz, starting_time s, rate stored as float32, recorded timestamps)`.
+    /// `(rate Hz, starting_time s, recorded timestamps)`.
     fn read_time_base(
         file: &H5File,
         g: &hdf5::Group,
         name: &str,
         n_samples: usize,
-    ) -> Result<(f64, f64, bool, Option<hdf5::Dataset>)> {
+    ) -> Result<(f64, f64, Option<hdf5::Dataset>)> {
         let read = || {
             if g.link_exists("timestamps") {
                 let ds = stored_dataset(file, &format!("{name}/timestamps"))?;
                 let (rate, t0) = regular_timestamps(&ds, n_samples)?;
-                return Ok((rate, t0, false, Some(ds)));
+                return Ok((rate, t0, Some(ds)));
             }
             ensure!(
                 g.link_exists("starting_time"),
@@ -816,12 +749,11 @@ mod imp {
             );
             let st = stored_dataset(file, &format!("{name}/starting_time"))?;
             let rate = st.attr("rate").context("starting_time has no rate")?;
-            let float32_rate =
-                rate.dtype()?.to_descriptor()? == TypeDescriptor::Float(FloatSize::U4);
+            // Reading as f64 widens a float32 attribute exactly.
             let rate = checked_rate(rate.read_scalar()?)?;
             let t0: f64 = st.read_scalar()?;
             ensure!(t0.is_finite(), "invalid starting_time {t0}");
-            Ok((rate, t0, float32_rate, None))
+            Ok((rate, t0, None))
         };
         read().with_context(|| format!("ElectricalSeries {name}: invalid time base"))
     }

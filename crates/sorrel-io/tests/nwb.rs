@@ -137,6 +137,57 @@ fn timestamps_supply_the_same_time_base_as_starting_time() {
 }
 
 #[test]
+fn timestamps_and_close_units_resolution_are_both_selectable_clocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("timestamps.nwb");
+    std::fs::copy(fixture("timestamps.nwb"), &path).unwrap();
+    let stored = {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        let timestamps = file
+            .dataset("/acquisition/ElectricalSeriesRaw/timestamps")
+            .unwrap()
+            .read_raw::<f64>()
+            .unwrap();
+        file.dataset("/units/spike_times")
+            .unwrap()
+            .new_attr::<f64>()
+            .create("resolution")
+            .unwrap()
+            .write_scalar(&0.0009999995_f64)
+            .unwrap();
+        ((timestamps[timestamps.len() - 1] - timestamps[0]) / (timestamps.len() - 1) as f64).recip()
+    };
+    let units = 0.0009999995_f64.recip();
+    let open = |raw_path, sample_rate| {
+        NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                raw_path,
+                sample_rate,
+                ..Default::default()
+            },
+        )
+    };
+    for raw_path in [None, Some(path.as_path())] {
+        let expected = open(raw_path, None).unwrap();
+        for rate in [stored, units] {
+            let p = open(raw_path, Some(rate)).unwrap();
+            assert_eq!(
+                p.spike_times(ClusterId(0)),
+                expected.spike_times(ClusterId(0))
+            );
+            assert!(p
+                .identity_bytes()
+                .windows(8)
+                .any(|bytes| bytes == rate.to_le_bytes()));
+        }
+        let near = 1000.00000001;
+        let err = open(raw_path, Some(near)).err().unwrap();
+        assert_eq!(err.to_string(), format!("--sample-rate {near} Hz is not a clock this NWB declares; pass one of: {stored} Hz (series /acquisition/ElectricalSeriesRaw timestamps), {units} Hz (/units/spike_times resolution)"));
+    }
+}
+
+#[test]
 fn refuses_spikes_that_disagree_with_recorded_timestamps() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("midpoint.nwb");
@@ -337,6 +388,19 @@ fn units_only_have_no_trace_and_use_resolution_or_sample_rate() {
     )
     .unwrap();
     assert_eq!(p.spike_times(ClusterId(0))[0], SampleIndex(1200));
+    let with_resolution = |sample_rate| {
+        NwbProvider::open_with(
+            fixture("units_only.nwb"),
+            NwbOpenParams {
+                sample_rate: Some(sample_rate),
+                ..Default::default()
+            },
+        )
+    };
+    let exact = with_resolution(1000.0).unwrap();
+    assert_eq!(exact.spike_times(ClusterId(0))[0], SampleIndex(600));
+    let err = with_resolution(1000.00000001).err().unwrap();
+    assert_eq!(err.to_string(), "--sample-rate 1000.00000001 Hz is not a clock this NWB declares; pass one of: 1000 Hz (/units/spike_times resolution)");
 }
 
 #[test]
@@ -372,10 +436,7 @@ fn paired_raw_uses_its_series_channels_and_time_base() {
     .err()
     .unwrap()
     .to_string();
-    assert!(
-        err.contains("rate mismatch") && err.contains("2000") && err.contains("1000"),
-        "{err}"
-    );
+    assert_eq!(err, "--sample-rate 2000 Hz is not a clock this NWB declares; pass one of: 1000 Hz (series /acquisition/ElectricalSeriesRaw starting_time.rate)");
     let err = NwbProvider::open_with(
         fixture("units_only.nwb"),
         NwbOpenParams {
@@ -436,7 +497,7 @@ fn paired_series_supplies_rate_without_units_resolution() {
 }
 
 #[test]
-fn single_file_float32_rate_requires_clock_choice_for_long_recording() {
+fn single_file_float32_maps_long_recording_at_either_exact_clock() {
     let err = open_err("precise_rate_long.nwb");
     for part in [
         "30000.123046875 Hz",
@@ -448,16 +509,18 @@ fn single_file_float32_rate_requires_clock_choice_for_long_recording() {
     ] {
         assert!(err.contains(part), "{err}");
     }
-    let p = NwbProvider::open_with(
-        fixture("precise_rate_long.nwb"),
-        NwbOpenParams {
-            sample_rate: Some(30000.123),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(p.n_samples(), SampleIndex(330_000_002));
-    assert_eq!(p.spike_times(ClusterId(0)), [SampleIndex(330_000_000)]);
+    for (rate, sample) in [(30000.123, 330_000_000), (30000.123046875, 330_000_001)] {
+        let p = NwbProvider::open_with(
+            fixture("precise_rate_long.nwb"),
+            NwbOpenParams {
+                sample_rate: Some(rate),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(p.n_samples(), SampleIndex(330_000_002));
+        assert_eq!(p.spike_times(ClusterId(0)), [SampleIndex(sample)]);
+    }
 }
 
 #[test]
@@ -486,13 +549,16 @@ fn single_file_float32_rate_does_not_assume_resampled_units_use_acquisition_cloc
 }
 
 #[test]
-fn single_file_float64_rate_requires_clock_choice_for_long_recording() {
+fn single_file_float64_maps_long_recording_at_either_exact_clock() {
     let name = "close_f64_rate_long.nwb";
     let err = open_err(name);
     assert!(err.contains("660000001 vs 660000000"), "{err}");
     assert!(err.contains("--sample-rate <Hz>"), "{err}");
 
-    for (rate, sample) in [(30000.123, 660_000_000), (30000.123027, 660_000_001)] {
+    for (rate, sample) in [
+        (30000.123, 660_000_000),
+        (30_000.123_026_999_998, 660_000_001),
+    ] {
         let p = NwbProvider::open_with(
             fixture(name),
             NwbOpenParams {
@@ -506,45 +572,87 @@ fn single_file_float64_rate_requires_clock_choice_for_long_recording() {
 }
 
 #[test]
-fn explicit_rate_uses_the_exact_clock_it_matches() {
-    // Both declared clocks (stored 30000.000029 Hz, Units 1/resolution
-    // ≈ 30000.00001 Hz) put the spike at sample 101; 30000 itself would give
-    // 100. `--sample-rate 30000` matches them within 1 ppb, so it must
-    // select a clock, not replace it with the typed digits.
+fn reviewer_short_files_require_exact_clock_values() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("approx.nwb");
-    std::fs::copy(fixture("close_f64_rate_short.nwb"), &path).unwrap();
-    {
-        let f = hdf5_metno::File::open_rw(&path).unwrap();
-        let st = f
-            .dataset("/acquisition/ElectricalSeriesRaw/starting_time")
-            .unwrap();
-        st.attr("rate")
-            .unwrap()
-            .write_scalar(&30000.000029_f64)
-            .unwrap();
-        let spikes = f.dataset("/units/spike_times").unwrap();
-        spikes
-            .attr("resolution")
-            .unwrap()
-            .write_scalar(&3.333333322222222e-05_f64)
-            .unwrap();
-        spikes.write_raw(&[0.5033499999983333_f64]).unwrap();
-    }
-    for sample_rate in [None, Some(30000.0)] {
-        let p = NwbProvider::open_with(
-            &path,
-            NwbOpenParams {
-                sample_rate,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            p.spike_times(ClusterId(0)),
-            [SampleIndex(101)],
-            "{sample_rate:?}"
-        );
+    // Keep the attribute types of the committed source files. All three
+    // spikes are close enough to a half-sample to expose a changed clock.
+    for (name, source, stored, resolution, spike, near, stored_sample) in [
+        (
+            "near-f64.nwb",
+            "close_f64_rate_short.nwb",
+            30000.0_f64,
+            3.3333333305555553e-5_f64,
+            0.503_349_999_997_487_5_f64,
+            30000.00002,
+            100,
+        ),
+        (
+            "near-f32.nwb",
+            "precise_rate_short.nwb",
+            30000.0,
+            3.333333332222222e-5,
+            0.5033499999991067,
+            30000.000006,
+            100,
+        ),
+        (
+            "approx-short.nwb",
+            "close_f64_rate_short.nwb",
+            30000.000029,
+            3.333333322222222e-5,
+            0.5033499999983333,
+            30000.0,
+            101,
+        ),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::copy(fixture(source), &path).unwrap();
+        {
+            let f = hdf5_metno::File::open_rw(&path).unwrap();
+            let start = f
+                .dataset("/acquisition/ElectricalSeriesRaw/starting_time")
+                .unwrap();
+            start.write_scalar(&0.5_f64).unwrap();
+            start.attr("rate").unwrap().write_scalar(&stored).unwrap();
+            let spikes = f.dataset("/units/spike_times").unwrap();
+            spikes
+                .attr("resolution")
+                .unwrap()
+                .write_scalar(&resolution)
+                .unwrap();
+            spikes.write_raw(&[spike]).unwrap();
+        }
+        let open = |sample_rate| {
+            NwbProvider::open_with(
+                &path,
+                NwbOpenParams {
+                    sample_rate,
+                    ..Default::default()
+                },
+            )
+        };
+        let units = resolution.recip();
+        for (rate, sample) in [(stored, stored_sample), (units, 101)] {
+            let p = open(Some(rate)).unwrap();
+            assert_eq!(
+                p.spike_times(ClusterId(0)),
+                [SampleIndex(sample)],
+                "{name} at {rate}"
+            );
+        }
+        let err = open(Some(near)).err().expect(name);
+        assert_eq!(err.to_string(), format!("--sample-rate {near} Hz is not a clock this NWB declares; pass one of: {stored} Hz (series /acquisition/ElectricalSeriesRaw starting_time.rate), {units} Hz (/units/spike_times resolution)"));
+        if stored_sample == 101 {
+            let default = open(None).unwrap();
+            assert_eq!(default.spike_times(ClusterId(0)), [SampleIndex(101)]);
+            assert_eq!(
+                default.identity_bytes(),
+                open(Some(units)).unwrap().identity_bytes()
+            );
+        } else {
+            let err = open(None).err().expect(name);
+            assert!(format!("{err:#}").contains("100 vs 101"), "{name}: {err:#}");
+        }
     }
 }
 
@@ -566,6 +674,16 @@ fn coarse_units_resolution_is_ignored_only_in_a_single_file() {
     let p = NwbProvider::open(&sorting).unwrap();
     assert_eq!(p.sample_rate(), 30000.123_f32);
     assert_eq!(p.spike_times(ClusterId(0)), [SampleIndex(100)]);
+    let err = NwbProvider::open_with(
+        &sorting,
+        NwbOpenParams {
+            sample_rate: Some(10000.0),
+            ..Default::default()
+        },
+    )
+    .err()
+    .unwrap();
+    assert_eq!(err.to_string(), "--sample-rate 10000 Hz is not a clock this NWB declares; pass one of: 30000.123026999998 Hz (series /acquisition/ElectricalSeriesRaw starting_time.rate)");
 
     let err = NwbProvider::open_with(
         &sorting,
@@ -611,7 +729,7 @@ fn paired_rate_within_one_ppm_requires_mapping_agreement() {
 }
 
 #[test]
-fn paired_float32_rate_requires_clock_choice_and_seals_that_rate() {
+fn paired_float32_requires_and_seals_an_exact_clock_choice() {
     let raw = fixture("rounded_raw.nwb");
     let open = |sample_rate| {
         NwbProvider::open_with(
@@ -637,6 +755,8 @@ fn paired_float32_rate_requires_clock_choice_and_seals_that_rate() {
     assert_eq!(precise.spike_times(ClusterId(0)), [SampleIndex(30)]);
     assert_eq!(rounded.spike_times(ClusterId(0)), [SampleIndex(31)]);
     assert_ne!(precise.identity_bytes(), rounded.identity_bytes());
+    let err = open(Some(30000.12301)).err().unwrap();
+    assert_eq!(err.to_string(), "--sample-rate 30000.12301 Hz is not a clock this NWB declares; pass one of: 30000.123046875 Hz (series /acquisition/ElectricalSeriesRaw starting_time.rate), 30000.123 Hz (/units/spike_times resolution)");
 }
 
 #[test]
