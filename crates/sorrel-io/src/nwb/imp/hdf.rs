@@ -86,6 +86,19 @@ pub(super) fn strings(data: &hdf5::Container) -> Result<Vec<String>> {
     }
 }
 
+pub(super) fn optional_strings(data: &hdf5::Container) -> Result<Option<Vec<String>>> {
+    use hdf5_metno_sys::h5t::{H5Tget_class, H5T_NO_CLASS, H5T_STRING};
+
+    let dtype = data.dtype()?;
+    // Query the class, not a full descriptor (some non-string classes have none).
+    let class = hdf5::sync::sync(|| unsafe { H5Tget_class(dtype.id()) });
+    ensure!(
+        class != H5T_NO_CLASS,
+        "cannot determine HDF5 datatype class"
+    );
+    (class == H5T_STRING).then(|| strings(data)).transpose()
+}
+
 fn fixed_strings(
     data: &hdf5::Container,
     dtype: &hdf5::Datatype,

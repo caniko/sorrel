@@ -34,6 +34,11 @@ mod stub {
 #[cfg(not(any(feature = "hdf5", feature = "zarr")))]
 pub use stub::open_stub;
 
+/// The NWB file has no trials table (as opposed to an unreadable table).
+#[derive(Debug, thiserror::Error)]
+#[error("no /intervals/trials table")]
+pub struct NoTrials;
+
 #[cfg(any(feature = "hdf5", feature = "zarr"))]
 mod imp {
     mod specs;
@@ -452,13 +457,23 @@ mod imp {
 
     fn trials_from_group(f: &Group) -> Result<crate::Events> {
         let g = f
-            .group("/intervals/trials")
-            .context("no /intervals/trials table")?;
-        let starts: Vec<f64> = g.dataset("start_time")?.read_raw()?;
+            .optional_group("/intervals/trials")?
+            .ok_or(super::NoTrials)?;
+        let starts: Vec<f64> = g
+            .dataset("start_time")?
+            .read_raw()
+            .context("read NWB trials/start_time")?;
         let mut names = None;
         for column in ["trial_type", "stimulus", "condition"] {
             if let Some(ds) = g.optional_dataset(column)? {
-                if let Some(values) = ds.strings().ok().filter(|v| v.len() == starts.len()) {
+                if let Some(values) = ds
+                    .optional_strings()
+                    .with_context(|| format!("read NWB trials/{column}"))?
+                {
+                    ensure!(
+                        values.len() == starts.len(),
+                        "NWB trials/{column} length differs from start_time"
+                    );
                     names = Some(values);
                     break;
                 }

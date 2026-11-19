@@ -327,6 +327,10 @@ impl Dataset {
         dispatch!(self, Self, d => hdf::strings(d), d.strings())
     }
 
+    pub fn optional_strings(&self) -> Result<Option<Vec<String>>> {
+        dispatch!(self, Self, d => hdf::optional_strings(d), d.optional_strings())
+    }
+
     pub fn spec_text(&self, legacy: bool) -> Result<String> {
         if legacy {
             dispatch!(self, Self, _d => hdf::legacy_string(_d), Err(anyhow::anyhow!("no legacy Zarr seal")))

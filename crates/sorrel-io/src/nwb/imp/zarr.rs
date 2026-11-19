@@ -599,6 +599,17 @@ impl Dataset {
             }
         }
     }
+
+    pub fn optional_strings(&self) -> Result<Option<Vec<String>>> {
+        if let Data::Array(a) = &self.data {
+            if String::validate_data_type(a.data_type()).is_err()
+                && Vec::<u8>::validate_data_type(a.data_type()).is_err()
+            {
+                return Ok(None);
+            }
+        }
+        self.strings().map(Some)
+    }
 }
 
 /// Seal metadata contents and stat chunks without reading the recording. Like
@@ -652,6 +663,44 @@ pub(super) fn identity(root: &Path) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn unreadable_trial_labels_are_not_generic_trials() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let trials = root.join("intervals/trials");
+        fs::create_dir_all(&trials)?;
+        for group in [root, &root.join("intervals"), &trials] {
+            fs::write(group.join(".zgroup"), r#"{"zarr_format":2}"#)?;
+        }
+        let column = |name, dtype, filters, bytes: &[u8]| -> Result<_> {
+            let column = trials.join(name);
+            fs::create_dir(&column)?;
+            let meta = json!({
+                "zarr_format": 2, "shape": [1], "chunks": [1], "dtype": dtype,
+                "compressor": null, "order": "C", "fill_value": 0, "filters": filters
+            });
+            fs::write(column.join(".zarray"), meta.to_string())?;
+            let chunk = column.join("0");
+            fs::write(&chunk, bytes)?;
+            Ok(chunk)
+        };
+        column("start_time", "<f8", Value::Null, &0.6f64.to_le_bytes())?;
+        column("trial_type", "<i8", Value::Null, &1i64.to_le_bytes())?;
+        let chunk = column(
+            "stimulus",
+            "|O",
+            json!([{"id": "vlen-utf8"}]),
+            b"\x01\0\0\0\x04\0\0\0left",
+        )?;
+        let read = || crate::nwb::read_trials(root);
+        assert_eq!(read()?.names, ["left"]);
+
+        fs::write(chunk, b"broken chunk")?;
+        let error = format!("{:#}", read().unwrap_err());
+        assert!(error.contains("read NWB trials/stimulus"), "{error}");
+        Ok(())
+    }
 
     #[test]
     fn json_clock_attributes_roundtrip_without_rounding_stored_integers() {

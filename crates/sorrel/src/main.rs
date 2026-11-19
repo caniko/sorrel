@@ -1014,7 +1014,7 @@ impl SessionVisitor for TabBuilder<'_> {
     #[cfg(feature = "dandi")]
     fn read_remote_trials(&mut self, provider: &sorrel_io::NwbProvider) {
         if self.open.events.is_none() {
-            self.remote_trials = provider.read_remote_trials().ok();
+            self.remote_trials = implicit_nwb_trials(provider.read_remote_trials());
         }
     }
 
@@ -1968,6 +1968,17 @@ where
     app
 }
 
+fn implicit_nwb_trials(trials: Result<Events>) -> Option<Events> {
+    match trials {
+        Ok(events) => Some(events),
+        Err(e) if e.is::<sorrel_io::nwb::NoTrials>() => None,
+        Err(e) => {
+            log::warn!("ignoring NWB trials: {e:#}");
+            None
+        }
+    }
+}
+
 /// `--events`, else (for an NWB file without sidecar events) its trials table.
 fn load_events(
     open: &OpenArgs,
@@ -1991,7 +2002,7 @@ fn load_events(
                 Ok(None)
             ) =>
         {
-            Events::read(open.root()).ok()
+            implicit_nwb_trials(Events::read(open.root()))
         }
         None => None,
     };
