@@ -131,6 +131,9 @@ pub fn build_trace_vertices_cfg_shanked<P: DataProvider>(
             TraceSamples::OwnedI16(v) => {
                 lttb_per_channel(&v, nc, target_points_per_channel, x_origin, x_step, cap)
             }
+            TraceSamples::OwnedF32(v) => {
+                lttb_per_channel(&v, nc, target_points_per_channel, x_origin, x_step, cap)
+            }
         };
     }
 

@@ -8,7 +8,8 @@
 //!   Other acquisitions are ignored; a file without one is rejected.
 //!   - Time base: `starting_time` (seconds) and its `rate` attribute. A
 //!     series with per-sample `timestamps` instead is rejected.
-//!   - Samples: int16, uint16, int32 or float32 `data`, scaled to
+//!   - Samples: int8, uint8, int16, uint16, int32, uint32, int64, float32 or
+//!     float64 `data`, scaled to
 //!     microvolts as `data × conversion × channel_conversion[ch] + offset`
 //!     (volts × 10⁶). Any other dtype is rejected.
 //!   - Channels: the series' `electrodes` region maps each data column to a
@@ -26,8 +27,7 @@
 //! - Local files only; no DANDI streaming.
 //! - One series: multiple segments or probes collapse to the first
 //!   `ElectricalSeries`.
-//! - The trace is loaded eagerly as float32 µV; a large recording uses that
-//!   much RAM.
+//! - The trace is read on demand with a bounded cache of float32 µV windows.
 
 #[cfg(not(feature = "hdf5"))]
 mod stub {
@@ -57,8 +57,9 @@ mod imp {
     use hdf5_metno as hdf5;
     use hdf5_metno::types::{FloatSize, IntSize, TypeDescriptor, VarLenAscii, VarLenUnicode};
     use hdf5_metno::File as H5File;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::path::Path;
+    use std::sync::Mutex;
 
     const ELECTRODES: &str = "/general/extracellular_ephys/electrodes";
 
@@ -72,9 +73,7 @@ mod imp {
         channel_positions: Vec<[f32; 2]>,
         channel_map: Vec<ChannelId>,
         identity_bytes: Vec<u8>,
-        /// Interleaved samples in µV. HDF5 datasets are usually chunked and
-        /// compressed, so there is no file to map.
-        trace: Vec<f32>,
+        trace: NwbTrace,
     }
 
     impl NwbProvider {
@@ -87,7 +86,7 @@ mod imp {
             let (n_samples, n_channels) = (shape[0], shape[1]);
             let (rate, t0) = read_time_base(&series, &name)?;
             let (channel_map, channel_positions) = read_channels(&f, &series, &name, n_channels)?;
-            let trace = read_microvolts(&series, &data, &name, n_channels)?;
+            let trace = NwbTrace::new(&series, data, &name, n_samples, n_channels)?;
             let (spikes_per_cluster, unit_ids) = load_units(&f, rate, t0).context("load /units")?;
             Ok(Self {
                 sample_rate: rate as f32,
@@ -128,17 +127,16 @@ mod imp {
         }
 
         fn trace(&self, start: SampleIndex, len: u32) -> TraceSlice<'_> {
-            let nc = self.n_channels as usize;
-            let e = start
-                .idx()
-                .saturating_add(len as usize)
-                .saturating_mul(nc)
-                .min(self.trace.len());
-            let s = start.idx().saturating_mul(nc).min(e);
+            let samples = self.trace.window(start, len).unwrap_or_else(|err| {
+                // The trace interface cannot propagate I/O errors. Returning
+                // no samples avoids mistaking a partial read for real data.
+                log::error!("read NWB trace at sample {start}: {err:#}");
+                Vec::new()
+            });
             TraceSlice {
                 start,
                 n_channels: self.n_channels,
-                samples: TraceSamples::F32(&self.trace[s..e]),
+                samples: TraceSamples::OwnedF32(samples),
             }
         }
 
@@ -358,14 +356,122 @@ mod imp {
         Ok((map, positions))
     }
 
-    /// The samples in µV: `data × conversion × channel_conversion + offset`
-    /// volts, times 10⁶.
-    fn read_microvolts(
+    /// Each of eight cached blocks targets at most 1 MiB of scaled samples
+    /// (or one frame if wider). A caller owns only its requested window.
+    const TRACE_CACHE_BLOCKS: usize = 8;
+    const TRACE_BLOCK_BYTES: usize = 1024 * 1024;
+
+    struct NwbTrace {
+        data: hdf5::Dataset,
+        dtype: TypeDescriptor,
+        gain: Vec<f64>,
+        offset_uv: f64,
+        n_samples: usize,
+        block_frames: usize,
+        // ponytail: one lock through the read to avoid duplicate decompression;
+        // split it only if parallel readers become a bottleneck.
+        cache: Mutex<VecDeque<(usize, Vec<f32>)>>,
+    }
+
+    impl NwbTrace {
+        fn new(
+            series: &hdf5::Group,
+            data: hdf5::Dataset,
+            name: &str,
+            n_samples: usize,
+            n_channels: usize,
+        ) -> Result<Self> {
+            ensure!(n_channels > 0, "ElectricalSeries {name}: no channels");
+            let dtype = data.dtype()?.to_descriptor()?;
+            ensure!(
+                matches!(
+                    dtype,
+                    TypeDescriptor::Integer(_)
+                        | TypeDescriptor::Unsigned(IntSize::U1 | IntSize::U2 | IntSize::U4)
+                        | TypeDescriptor::Float(_)
+                ),
+                "ElectricalSeries {name}: {dtype} samples are not supported \
+                 (expected int8, uint8, int16, uint16, int32, uint32, int64, float32 or float64)"
+            );
+            let (gain, offset_uv) = trace_scale(series, &data, name, n_channels)?;
+            let max_frames = (TRACE_BLOCK_BYTES / 4 / n_channels).max(1);
+            let block_frames = data
+                .chunk()
+                .map_or((max_frames / 4).max(1), |chunk| chunk[0].min(max_frames));
+            Ok(Self {
+                data,
+                dtype,
+                gain,
+                offset_uv,
+                n_samples,
+                block_frames,
+                cache: Mutex::new(VecDeque::new()),
+            })
+        }
+
+        fn window(&self, start: SampleIndex, len: u32) -> Result<Vec<f32>> {
+            let start = usize::try_from(start.0)
+                .unwrap_or(usize::MAX)
+                .min(self.n_samples);
+            let end = start.saturating_add(len as usize).min(self.n_samples);
+            let nc = self.gain.len();
+            let mut out = Vec::with_capacity((end - start) * nc);
+            let mut t = start;
+            while t < end {
+                let base = t / self.block_frames * self.block_frames;
+                let mut cache = self.cache.lock().expect("NWB trace cache poisoned");
+                if let Some(i) = cache.iter().position(|(key, _)| *key == base) {
+                    let entry = cache.remove(i).expect("position in cache");
+                    cache.push_front(entry);
+                } else {
+                    if cache.len() == TRACE_CACHE_BLOCKS {
+                        cache.pop_back();
+                    }
+                    let stop = base.saturating_add(self.block_frames).min(self.n_samples);
+                    cache.push_front((base, self.read_block(base, stop)?));
+                }
+                let (_, block) = &cache[0];
+                let stop = end.min(base + block.len() / nc);
+                out.extend_from_slice(&block[(t - base) * nc..(stop - base) * nc]);
+                t = stop;
+            }
+            Ok(out)
+        }
+
+        fn read_block(&self, start: usize, end: usize) -> Result<Vec<f32>> {
+            // Read in the stored type: HDF5 conversion can clip (e.g. uint16
+            // to int16). Scale in f64 before narrowing, including f64 input.
+            macro_rules! read_scaled {
+                ($ty:ty) => {{
+                    let raw = self.data.read_slice_2d::<$ty, _>((start..end, ..))?;
+                    raw.iter()
+                        .zip(self.gain.iter().cycle())
+                        .map(|(&v, g)| (v as f64 * g + self.offset_uv) as f32)
+                        .collect()
+                }};
+            }
+            Ok(match self.dtype {
+                TypeDescriptor::Integer(IntSize::U1) => read_scaled!(i8),
+                TypeDescriptor::Unsigned(IntSize::U1) => read_scaled!(u8),
+                TypeDescriptor::Integer(IntSize::U2) => read_scaled!(i16),
+                TypeDescriptor::Unsigned(IntSize::U2) => read_scaled!(u16),
+                TypeDescriptor::Integer(IntSize::U4) => read_scaled!(i32),
+                TypeDescriptor::Unsigned(IntSize::U4) => read_scaled!(u32),
+                TypeDescriptor::Integer(IntSize::U8) => read_scaled!(i64),
+                TypeDescriptor::Float(FloatSize::U4) => read_scaled!(f32),
+                TypeDescriptor::Float(FloatSize::U8) => read_scaled!(f64),
+                _ => unreachable!("dtype checked on open"),
+            })
+        }
+    }
+
+    /// `data × conversion × channel_conversion + offset` volts, times 10⁶.
+    fn trace_scale(
         series: &hdf5::Group,
         data: &hdf5::Dataset,
         name: &str,
         n_channels: usize,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<(Vec<f64>, f64)> {
         if let Some(unit) = data.attr("unit").ok().and_then(read_str) {
             ensure!(
                 unit.eq_ignore_ascii_case("volts"),
@@ -389,36 +495,11 @@ mod imp {
             "ElectricalSeries {name}: channel_conversion has {} entries for {n_channels} channels",
             channel_conversion.len()
         );
-        let gain: Vec<f64> = channel_conversion
+        let gain = channel_conversion
             .iter()
             .map(|c| c * conversion * 1e6)
             .collect();
-        fn scale<T: Copy + Into<f64>>(raw: Vec<T>, gain: &[f64], offset: f64) -> Vec<f32> {
-            raw.iter()
-                .zip(gain.iter().cycle())
-                .map(|(&v, g)| (v.into() * g + offset) as f32)
-                .collect()
-        }
-        // Read in the stored dtype: HDF5 would otherwise convert on read and
-        // clip (uint16 → int16 saturates at 32767).
-        Ok(match data.dtype()?.to_descriptor()? {
-            TypeDescriptor::Integer(IntSize::U2) => {
-                scale(data.read_raw::<i16>()?, &gain, offset_uv)
-            }
-            TypeDescriptor::Unsigned(IntSize::U2) => {
-                scale(data.read_raw::<u16>()?, &gain, offset_uv)
-            }
-            TypeDescriptor::Integer(IntSize::U4) => {
-                scale(data.read_raw::<i32>()?, &gain, offset_uv)
-            }
-            TypeDescriptor::Float(FloatSize::U4) => {
-                scale(data.read_raw::<f32>()?, &gain, offset_uv)
-            }
-            other => bail!(
-                "ElectricalSeries {name}: {other} samples are not supported \
-                 (int16, uint16, int32 or float32)"
-            ),
-        })
+        Ok((gain, offset_uv))
     }
 
     /// Spike sample indices per unit (relative to `t0`) and the units
@@ -475,6 +556,35 @@ mod imp {
             start = end;
         }
         Ok((out, unit_ids))
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn lazy_window_matches_eager_scaling_across_chunks_and_end() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../release/fixtures/nwb/good.nwb");
+        let p = NwbProvider::open(path).unwrap();
+        let trace = &p.trace;
+        assert_eq!(trace.block_frames, 32);
+        assert!(trace.cache.lock().unwrap().is_empty());
+        let eager: Vec<f32> = trace
+            .data
+            .read_raw::<i16>()
+            .unwrap()
+            .into_iter()
+            .zip(trace.gain.iter().cycle())
+            .map(|(v, gain)| (v as f64 * gain + trace.offset_uv) as f32)
+            .collect();
+        let slice = p.trace(SampleIndex(29), 300);
+        assert_eq!(slice.start, SampleIndex(29));
+        assert_eq!(slice.n_channels, 4);
+        assert_eq!(slice.samples.to_f32_centred(), eager[29 * 4..]);
+        assert_eq!(trace.cache.lock().unwrap().len(), TRACE_CACHE_BLOCKS);
+        assert_eq!(
+            p.trace(SampleIndex(290), 10).samples.to_f32_centred(),
+            eager[290 * 4..]
+        );
+        assert!(p.trace(SampleIndex(u64::MAX), 1).samples.is_empty());
     }
 }
 

@@ -503,6 +503,7 @@ impl SnipScratch {
                 TraceSamples::OwnedI16(v) => self
                     .buf
                     .extend(v[margin_values..].iter().map(|&v| v as f32)),
+                TraceSamples::OwnedF32(v) => self.buf.extend_from_slice(&v[margin_values..]),
             }
         } else {
             match borrow {
@@ -513,6 +514,7 @@ impl SnipScratch {
                 TraceSamples::I32(s) => self.buf.extend(s.iter().map(|&v| v as f32)),
                 TraceSamples::F32(s) => self.buf.extend_from_slice(s),
                 TraceSamples::OwnedI16(v) => self.buf.extend(v.iter().map(|&v| v as f32)),
+                TraceSamples::OwnedF32(v) => self.buf.extend_from_slice(&v),
             }
             apply_preproc_cpu(&mut self.buf, nc, cfg, sr, shanks);
             if margin_values > 0 && margin_values < self.buf.len() {

@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+from hdmf.backends.hdf5.h5_utils import H5DataIO
 from pynwb import NWBFile, NWBHDF5IO, get_class, load_namespaces
 from pynwb.base import TimeSeries
 from pynwb.ecephys import ElectricalSeries
@@ -101,7 +102,7 @@ def write_good():
     nwbfile = make_file("sorrel-fixture-good")
     add_series(
         nwbfile,
-        good_data(),
+        H5DataIO(good_data(), chunks=(32, N_CHANNELS), compression="gzip"),
         rate=1000.0,
         starting_time=0.5,
         conversion=0.195e-6,
@@ -125,18 +126,16 @@ def write_uint16():
     write(nwbfile, "uint16.nwb")
 
 
-def write_float64():
-    nwbfile = make_file("sorrel-fixture-float64")
-    data = np.arange(N_SAMPLES)[:, None] + np.arange(N_CHANNELS)[None, :]
+def write_dtype(dtype, value):
+    nwbfile = make_file(f"sorrel-fixture-{dtype}")
     add_series(
         nwbfile,
-        data.astype(np.float64),
+        np.full((1, N_CHANNELS), value, dtype=dtype),
         rate=1000.0,
         starting_time=0.5,
-        conversion=1e-6,
-        offset=0.0,
+        conversion=1e44 if dtype == "float64" else 1e-6,
     )
-    write(nwbfile, "float64.nwb")
+    write(nwbfile, f"{dtype}.nwb")
 
 
 def write_timestamps():
@@ -200,7 +199,12 @@ def write_subtype():
 def main():
     write_good()
     write_uint16()
-    write_float64()
+    for dtype, value in [
+        ("int8", -120), ("uint8", 250), ("int32", -2_000_000_000),
+        ("uint32", 4_000_000_000), ("int64", -2**48),
+        ("float32", 0.125), ("float64", 1e-50), ("uint64", 2**63),
+    ]:
+        write_dtype(dtype, value)
     write_timestamps()
     write_not_electrical()
     write_subtype()

@@ -296,10 +296,8 @@ impl TraceDtype {
     }
 }
 
-/// Typed view into the raw mmap. Each variant carries a slice in the native
-/// dtype so consumers can run dtype-specialised inner loops without copying.
-/// `OwnedI16` is the one exception: decompressing sources (mtscomp `.cbin`)
-/// cannot hand out a borrow into a file, so they return the decoded window.
+/// Typed trace samples for dtype-specialised inner loops. Windowed sources
+/// such as mtscomp and NWB return owned samples instead of borrowing a mmap.
 /// Consumers match on [`TraceSamples::borrow`] and never see the difference.
 #[derive(Debug)]
 pub enum TraceSamples<'a> {
@@ -308,10 +306,11 @@ pub enum TraceSamples<'a> {
     I32(&'a [i32]),
     F32(&'a [f32]),
     OwnedI16(Vec<i16>),
+    OwnedF32(Vec<f32>),
 }
 
 impl<'a> TraceSamples<'a> {
-    /// A borrowing view; the owned variant becomes `I16`.
+    /// A borrowing view; owned variants become their borrowed equivalents.
     #[inline]
     pub fn borrow(&self) -> TraceSamples<'_> {
         match self {
@@ -320,6 +319,7 @@ impl<'a> TraceSamples<'a> {
             Self::I32(s) => TraceSamples::I32(s),
             Self::F32(s) => TraceSamples::F32(s),
             Self::OwnedI16(v) => TraceSamples::I16(v),
+            Self::OwnedF32(v) => TraceSamples::F32(v),
         }
     }
     #[inline]
@@ -330,6 +330,7 @@ impl<'a> TraceSamples<'a> {
             Self::I32(s) => s.len(),
             Self::F32(s) => s.len(),
             Self::OwnedI16(v) => v.len(),
+            Self::OwnedF32(v) => v.len(),
         }
     }
     #[inline]
@@ -341,7 +342,7 @@ impl<'a> TraceSamples<'a> {
             Self::I16(_) | Self::OwnedI16(_) => TraceDtype::I16,
             Self::U16(_) => TraceDtype::U16,
             Self::I32(_) => TraceDtype::I32,
-            Self::F32(_) => TraceDtype::F32,
+            Self::F32(_) | Self::OwnedF32(_) => TraceDtype::F32,
         }
     }
 
@@ -353,6 +354,7 @@ impl<'a> TraceSamples<'a> {
             Self::I32(s) => bytemuck::cast_slice(s),
             Self::F32(s) => bytemuck::cast_slice(s),
             Self::OwnedI16(v) => bytemuck::cast_slice(v),
+            Self::OwnedF32(v) => bytemuck::cast_slice(v),
         }
     }
 
@@ -398,11 +400,12 @@ impl<'a> TraceSamples<'a> {
             TraceSamples::I32(s) => s.iter().map(|&v| v as f32).collect(),
             TraceSamples::F32(s) => s.to_vec(),
             TraceSamples::OwnedI16(v) => v.iter().map(|&v| v as f32).collect(),
+            TraceSamples::OwnedF32(v) => v,
         }
     }
 }
 
-/// A contiguous, zero-copy slice into a memory-mapped trace buffer.
+/// A contiguous window of trace samples, borrowed or owned.
 ///
 /// `samples` is interleaved `[t0_ch0, t0_ch1, ..., t0_chN-1, t1_ch0, ...]`
 /// in the backend's native dtype.
@@ -438,7 +441,7 @@ pub trait DataProvider: Send + Sync + 'static {
     /// Spike sample indices for a single cluster, sorted ascending.
     fn spike_times(&self, cluster: ClusterId) -> &[SampleIndex];
 
-    /// Borrow a window of the raw trace as a zero-copy slice.
+    /// Read a window of the raw trace; memory-mapped backends lend a slice.
     fn trace(&self, start: SampleIndex, len: u32) -> TraceSlice<'_>;
 
     /// Initial label vector loaded from the backend's on-disk schema.

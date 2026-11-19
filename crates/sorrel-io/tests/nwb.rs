@@ -86,6 +86,22 @@ fn uint16_samples_are_read_unsigned() {
 }
 
 #[test]
+fn samples_are_scaled_from_their_stored_dtype() {
+    for (dtype, value) in [
+        ("int8", -120.0),
+        ("uint8", 250.0),
+        ("int32", -2e9),
+        ("uint32", 4e9),
+        ("int64", -(2.0f32).powi(48)),
+        ("float32", 0.125),
+        ("float64", 1.0),
+    ] {
+        let p = open(&format!("{dtype}.nwb")).unwrap();
+        assert_eq!(frame(&p, 0), [value; 4], "{dtype}");
+    }
+}
+
+#[test]
 fn electrical_series_subtypes_are_accepted() {
     let p = open("subtype.nwb").unwrap();
     assert_eq!(p.n_channels(), 4);
@@ -96,8 +112,8 @@ fn electrical_series_subtypes_are_accepted() {
 fn rejects_what_it_cannot_read_faithfully() {
     let e = open_err("not_electrical.nwb");
     assert!(e.contains("ElectricalSeries"), "{e}");
-    let e = open_err("float64.nwb");
-    assert!(e.contains("float64"), "{e}");
+    let e = open_err("uint64.nwb");
+    assert!(e.contains("uint64"), "{e}");
     let e = open_err("timestamps.nwb");
     assert!(e.contains("timestamps"), "{e}");
 }
