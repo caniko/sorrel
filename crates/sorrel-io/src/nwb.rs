@@ -149,9 +149,22 @@ mod imp {
                     raw.is_none() && timestamps.is_none() && is_trunk_series(&f, name);
                 let rate = match params.sample_rate {
                     Some(explicit) if float32_rate || units_clock.is_some() => {
+                        // --sample-rate picks a clock (the nearer one if it
+                        // matches both); use that clock's exact value. Only a
+                        // float32 stored rate needs the typed digits, since
+                        // they are more precise than the file.
+                        let stored = if float32_rate { explicit } else { stored_rate };
+                        let chosen = match explicit_units_clock {
+                            Some(units)
+                                if (explicit - units).abs() < (explicit - stored_rate).abs() =>
+                            {
+                                units
+                            }
+                            _ => stored,
+                        };
                         comparison_rate =
-                            (legacy_identity && explicit != stored_rate).then_some(stored_rate);
-                        explicit
+                            (legacy_identity && chosen != stored_rate).then_some(stored_rate);
+                        chosen
                     }
                     None => {
                         comparison_rate = units_clock;

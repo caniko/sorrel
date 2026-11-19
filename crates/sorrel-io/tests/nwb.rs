@@ -506,6 +506,49 @@ fn single_file_float64_rate_requires_clock_choice_for_long_recording() {
 }
 
 #[test]
+fn explicit_rate_uses_the_exact_clock_it_matches() {
+    // Both declared clocks (stored 30000.000029 Hz, Units 1/resolution
+    // ≈ 30000.00001 Hz) put the spike at sample 101; 30000 itself would give
+    // 100. `--sample-rate 30000` matches them within 1 ppb, so it must
+    // select a clock, not replace it with the typed digits.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("approx.nwb");
+    std::fs::copy(fixture("close_f64_rate_short.nwb"), &path).unwrap();
+    {
+        let f = hdf5_metno::File::open_rw(&path).unwrap();
+        let st = f
+            .dataset("/acquisition/ElectricalSeriesRaw/starting_time")
+            .unwrap();
+        st.attr("rate")
+            .unwrap()
+            .write_scalar(&30000.000029_f64)
+            .unwrap();
+        let spikes = f.dataset("/units/spike_times").unwrap();
+        spikes
+            .attr("resolution")
+            .unwrap()
+            .write_scalar(&3.333333322222222e-05_f64)
+            .unwrap();
+        spikes.write_raw(&[0.5033499999983333_f64]).unwrap();
+    }
+    for sample_rate in [None, Some(30000.0)] {
+        let p = NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                sample_rate,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            p.spike_times(ClusterId(0)),
+            [SampleIndex(101)],
+            "{sample_rate:?}"
+        );
+    }
+}
+
+#[test]
 fn coarse_units_resolution_is_ignored_only_in_a_single_file() {
     let dir = tempfile::tempdir().unwrap();
     let sorting = dir.path().join("coarse.nwb");
