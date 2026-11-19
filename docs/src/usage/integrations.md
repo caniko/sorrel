@@ -154,6 +154,7 @@ What Sorrel reads:
   instead of loading the entire trace. It looks for `ElectricalSeries` (or an
   extension subtype declared in `/specifications`) under `/acquisition` and
   `/processing`, with 2-D `data` (time × channels) or 1-D `data` (one channel).
+  Conflicting cached type definitions that affect series selection are refused.
   By default it prefers 2-D series, then takes the first series by path
   (acquisitions before processed series), and logs the available paths when there is
   more than one. Linked series and linked datasets used by the reader are

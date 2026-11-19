@@ -57,7 +57,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   - Data columns map to electrodes through the series' `electrodes` region, giving channel ids and `rel_x`/`rel_y` positions. The first N table rows were paired with the N columns, and brain `x`/`y` stood in for probe geometry.
   - Samples are read in their stored dtype and scaled to µV with `conversion`, `channel_conversion` and `offset`. uint16 data was clipped at 32767, and the scale fields were ignored.
   - Only an `ElectricalSeries` (or a subtype declared in the file's cached spec) is read as the trace; previously any 2-D acquisition with a rate was accepted.
-  - ElectricalSeries discovery distinguishes extension types from same-named core types and refuses ambiguous ancestry rather than guessing the recording clock.
+  - ElectricalSeries discovery checks cached parents by type name and refuses conflicting definitions that affect series selection rather than guessing the recording clock.
 - **Kilosort 4 phy folders open.** Kilosort 4 writes `channel_shanks.npy` as float32. Id arrays now accept floats holding whole non-negative numbers and still refuse anything else.
 - **`sorrel blind` drops partial sorter label files.** phy rewrites `cluster_KSLabel.tsv`, `cluster_ContamPct.tsv` and `cluster_Amplitude.tsv` on save with rows only for the clusters that exist then, so the rows left over marked the roots the human never edited. A file that doesn't cover every root no longer reaches the blind input.
 
