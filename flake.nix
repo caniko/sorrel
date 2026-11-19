@@ -325,6 +325,8 @@
         || pkgs.lib.hasSuffix "sorrel-remote/wordlist.txt" path
         # SpikeInterface sidecar `sorrel auto` embeds with include_str!.
         || pkgs.lib.hasSuffix "crates/sorrel/src/sorrel_auto.py" path
+        # The patched zarrs crate includes its status docs at compile time.
+        || pkgs.lib.hasInfix "/vendor/zarrs/doc/" path
         # `sorrel agent-guide`'s primer, also embedded with include_str!.
         || pkgs.lib.hasSuffix "crates/sorrel/src/agent_guide.md" path;
       src = pkgs.lib.cleanSourceWith {
@@ -394,11 +396,6 @@
           windows-aarch64 = {
             buildInputs = [];
             inherit (deps) nativeBuildInputs;
-            # Blosc's bundled Snappy uses C++. cc-rs defaults to libstdc++
-            # for MinGW, but the LLVM toolchain has libc++ instead. Link the
-            # static archive so the EXEs need no libc++ DLL.
-            CXXSTDLIB_aarch64_pc_windows_gnullvm = "static=c++";
-            CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_RUSTFLAGS = "-L native=${cross.windowsAarch64.pkgsCross.llvmPackages.libcxx}/lib";
             # aws-lc-sys (via libp2p-quic) compiles jitterentropy, which needs
             # winpthreads' <sched.h>; llvm-mingw's sysroot does not carry it, and nixpkgs'
             # aarch64 winpthreads does not build with clang (winver.h). The

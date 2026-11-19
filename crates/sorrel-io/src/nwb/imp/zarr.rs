@@ -8,6 +8,9 @@ use zarrs::group::Group as ZarrGroup;
 use zarrs::metadata::{v2::DataTypeMetadataV2, ArrayMetadata};
 use zarrs::storage::{ReadableListableStorage, ReadableListableStorageTraits, StoreKey};
 
+#[path = "zarr/blosc.rs"]
+mod blosc;
+
 type Store = dyn ReadableListableStorageTraits;
 
 pub(super) fn exact_number(value: &Value, what: &str) -> Result<f64> {
@@ -25,6 +28,7 @@ pub(super) fn exact_number(value: &Value, what: &str) -> Result<f64> {
 }
 
 pub(super) fn open(path: &Path) -> Result<Group> {
+    blosc::register();
     let store: ReadableListableStorage = Arc::new(FilesystemStore::new(path)?);
     Group::open(store, "/")
 }

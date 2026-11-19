@@ -1,5 +1,6 @@
 {rustfmtPackage}: {pkgs, ...}: {
   projectRootFile = "flake.nix";
+  settings.global.excludes = ["vendor/zarrs/**"];
 
   programs.rustfmt = {
     enable = true;

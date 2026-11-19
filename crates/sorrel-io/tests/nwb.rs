@@ -506,7 +506,7 @@ fn paired_raw_uses_its_series_channels_and_time_base() {
 #[cfg(feature = "zarr")]
 mod zarr_tests {
     use super::*;
-    use std::{fs, path::Path, sync::Arc, time::Duration};
+    use std::{fs, path::Path, time::Duration};
 
     fn copy_store(src: &Path, dst: &Path) {
         fs::create_dir(dst).unwrap();
@@ -591,11 +591,11 @@ mod zarr_tests {
         let chunk = array.join("0");
         let original_chunk = fs::read(&chunk).unwrap();
         let stamp = fs::metadata(&chunk).unwrap().modified().unwrap();
-        let backing = Arc::new(zarrs::filesystem::FilesystemStore::new(&store).unwrap());
-        let spikes = zarrs::array::Array::open(backing, "/units/spike_times").unwrap();
-        spikes
-            .store_array_subset(&spikes.subset_all(), vec![0.61, 0.7, 0.75, 0.55, 0.79])
-            .unwrap();
+        // Sorrel's Blosc plugin only decodes; replace the chunk with a
+        // numcodecs-encoded version containing different spike times.
+        let edited_chunk = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../release/fixtures/zarr-blosc/edited-spikes.bin");
+        fs::copy(edited_chunk, &chunk).unwrap();
         assert_ne!(original_chunk, fs::read(&chunk).unwrap());
         let file = fs::OpenOptions::new().write(true).open(&chunk).unwrap();
         file.set_modified(stamp - Duration::from_secs(2)).unwrap();
