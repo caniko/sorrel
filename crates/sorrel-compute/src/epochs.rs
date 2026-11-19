@@ -1,12 +1,12 @@
 //! Stable firing-rate and amplitude epochs.
 //!
-//! Exact optimal partitioning of 100 recording bins with a bounded
-//! (biweight) loss, after Fearnhead & Rigaill (2019), "Changepoint detection
-//! in the presence of outliers", JASA 114(525):169–183,
-//! doi:10.1080/01621459.2017.1385466. Each series is standardized by a noise
-//! scale taken from the median absolute first difference between bins, so
+//! Exact optimal partitioning of 100 recording bins with bounded per-bin
+//! losses, after the biweight loss of Fearnhead & Rigaill (2019),
+//! "Changepoint detection in the presence of outliers", JASA
+//! 114(525):169–183, doi:10.1080/01621459.2017.1385466. Each series is scaled
+//! by a noise level measured from robust differences between bins, so
 //! overdispersion from bursts, quantized amplitudes and correlated spikes is
-//! measured from the data rather than assumed away.
+//! taken from the data rather than assumed away.
 
 use sorrel_io::SampleIndex;
 
@@ -108,6 +108,84 @@ fn biweight_min(events: &[Event], points: usize) -> f64 {
     best
 }
 
+/// Where a bin's count enters (`enter`) or leaves the inlier set of the
+/// bounded Poisson deviance as the segment mean count μ increases.
+#[derive(Clone, Copy)]
+struct CountEvent {
+    at: f64,
+    c: f64,
+    enter: bool,
+}
+
+/// The μ interval on which a count's Poisson deviance
+/// `2 [c ln(c/μ) - c + μ]` is below `cap`. It is convex in ln μ with its
+/// minimum 0 at μ = c, so each side has one root, found by bisection.
+fn deviance_interval(c: f64, cap: f64) -> (f64, f64) {
+    let t = cap / 2.0;
+    if c == 0.0 {
+        return (0.0, t);
+    }
+    let f = |x: f64| c * c.ln() - c * x - c + x.exp() - t;
+    let root = |mut a: f64, mut b: f64| {
+        let positive_at_a = f(a) > 0.0;
+        for _ in 0..200 {
+            let mid = a.midpoint(b);
+            if (f(mid) > 0.0) == positive_at_a {
+                a = mid;
+            } else {
+                b = mid;
+            }
+        }
+        a.midpoint(b)
+    };
+    let x0 = c.ln();
+    let bracket = |sign: f64| {
+        let mut s = 1.0;
+        while f(x0 + sign * s) <= 0.0 {
+            s *= 2.0;
+        }
+        x0 + sign * s
+    };
+    (root(bracket(-1.0), x0).exp(), root(x0, bracket(1.0)).exp())
+}
+
+fn insert_count(events: &mut Vec<CountEvent>, c: f64, (lo, hi): (f64, f64)) {
+    for (at, enter) in [(lo, true), (hi, false)] {
+        let i = events.partition_point(|x| x.at <= at);
+        events.insert(i, CountEvent { at, c, enter });
+    }
+}
+
+/// Exact `min over μ of Σ min(D(c, μ) / φ, K²)` with the Poisson deviance D.
+/// Between events the inlier set is fixed and its deviance is convex in μ,
+/// minimized at the inlier mean count clamped to the interval.
+fn poisson_min(events: &[CountEvent], points: usize, phi: f64) -> f64 {
+    let mut best = K2 * points as f64;
+    let (mut m, mut s, mut slc) = (0_usize, 0.0, 0.0);
+    for (k, e) in events.iter().enumerate() {
+        let clc = if e.c > 0.0 { e.c * e.c.ln() } else { 0.0 };
+        if e.enter {
+            (m, s, slc) = (m + 1, s + e.c, slc + clc);
+        } else {
+            (m, s, slc) = (m - 1, s - e.c, slc - clc);
+            if m == 0 {
+                (s, slc) = (0.0, 0.0);
+            }
+        }
+        if m > 0 {
+            let end = events.get(k + 1).map_or(e.at, |next| next.at);
+            let mu = (s / m as f64).clamp(e.at, end);
+            let half = if s > 0.0 {
+                slc - s * mu.ln() - s + m as f64 * mu
+            } else {
+                m as f64 * mu
+            };
+            best = best.min(2.0 * half.max(0.0) / phi + K2 * (points - m) as f64);
+        }
+    }
+    best
+}
+
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_unstable_by(f64::total_cmp);
     let m = v.len() / 2;
@@ -159,15 +237,16 @@ fn noise_scale(points: &[(f64, f64)], long_run: bool) -> f64 {
 /// Fit a constant firing rate and (if available) amplitude level over 100
 /// equal recording bins, with at least five bins per segment.
 ///
-/// Rate: the counts are variance-stabilized as `2 sqrt(c + 3/8)` (Anscombe)
-/// and divided by their first-difference noise scale (at least one).
-/// Amplitude: the bin mean amplitudes of nonempty bins, weighted by spike
-/// count and divided by the per-spike noise scale from first differences,
-/// widened to the long-run scale when neighbouring bins are correlated (see
-/// `noise_scale`). Each series costs `min(w (y - θ)², 9)` per bin at its
-/// best level θ, so a bin more than three noise units from its segment's
-/// level (a burst, a stray bin) costs a bounded amount instead of buying a
-/// boundary.
+/// Rate: each bin costs `min(D(c, μ) / φ, 9)`, its Poisson deviance from the
+/// segment's mean count μ divided by the dispersion φ, the squared
+/// first-difference noise scale of the Anscombe-transformed counts
+/// `2 sqrt(c + 3/8)` (at least one, the Poisson value). Amplitude: the bin
+/// mean amplitudes of nonempty bins, weighted by spike count and divided by
+/// the per-spike noise scale from first differences, widened to the
+/// long-run scale when neighbouring bins are correlated (see `noise_scale`);
+/// each bin costs `min(w (y - θ)², 9)` at the segment's level θ. Either way a
+/// bin more than about three noise units from its segment's level (a burst,
+/// a stray bin) costs a bounded amount instead of buying a boundary.
 ///
 /// Each fitted level costs ln(100) (one rate per segment, one amplitude per
 /// nonempty segment when fitted), and each boundary costs 2 ln(91) for the
@@ -212,11 +291,14 @@ pub fn stable_epochs(
     let anscombe = counts.map(|c| 2.0 * (f64::from(c) + 0.375).sqrt());
     // Poisson counts have unit variance on this scale, and discrete low
     // counts often have a zero median difference. Bursts last milliseconds,
-    // so they do not correlate counts across bins.
+    // so they do not correlate counts across bins. The deviance (not the
+    // transformed count) is what is fitted: near silence a single spike is
+    // strong evidence of firing, which a Gaussian on the transform misses.
     let sigma_rate = noise_scale(&anscombe.map(|y| (y, 1.0)), false).max(1.0);
-    let rate = anscombe.map(|y| Point {
-        y: y / sigma_rate,
-        w: 1.0,
+    let phi = sigma_rate * sigma_rate;
+    let rate: [(f64, (f64, f64)); BINS] = std::array::from_fn(|b| {
+        let c = f64::from(counts[b]);
+        (c, deviance_interval(c, K2 * phi))
     });
     let nonempty: Vec<_> = (0..BINS)
         .filter(|&b| counts[b] > 0)
@@ -259,7 +341,7 @@ pub fn stable_epochs(
         let (mut rate_events, mut amp_events) = (Vec::new(), Vec::new());
         let mut amp_bins = 0;
         for end in start + 1..=BINS {
-            insert(&mut rate_events, rate[end - 1]);
+            insert_count(&mut rate_events, rate[end - 1].0, rate[end - 1].1);
             if let Some(p) = amp[end - 1] {
                 insert(&mut amp_events, p);
                 amp_bins += 1;
@@ -267,7 +349,7 @@ pub fn stable_epochs(
             if end - start < MIN_BINS {
                 continue;
             }
-            let mut cost = base + biweight_min(&rate_events, end - start);
+            let mut cost = base + poisson_min(&rate_events, end - start, phi);
             if amp_bins > 0 {
                 cost += biweight_min(&amp_events, amp_bins) + level_penalty;
             }
@@ -316,11 +398,16 @@ mod tests {
     const SR: f32 = 1_000.0;
     const TOTAL: u64 = BINS as u64 * 1_000;
 
+    /// SplitMix64, uniform in (0, 1). A plain LCG from small seeds gave
+    /// visibly overdispersed spike trains.
     fn rng(seed: u64) -> impl FnMut() -> f64 {
         let mut state = seed;
         move || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            (1 + (state >> 33)) as f64 / ((1_u64 << 31) + 1) as f64
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            ((z ^ (z >> 31)) >> 11) as f64 / (1_u64 << 53) as f64 + 0.5 / (1_u64 << 53) as f64
         }
     }
 
@@ -375,6 +462,58 @@ mod tests {
                 "{exact} {grid}"
             );
         }
+    }
+
+    #[test]
+    fn bounded_deviance_minimum_matches_a_grid() {
+        let mut uniform = rng(11);
+        for phi in [1.0, 2.7] {
+            for _ in 0..20 {
+                let counts: Vec<f64> = (0..12)
+                    .map(|i| (12.0 * uniform()).floor() + if i % 5 == 0 { 40.0 } else { 0.0 })
+                    .collect();
+                let mut events = Vec::new();
+                for &c in &counts {
+                    insert_count(&mut events, c, deviance_interval(c, K2 * phi));
+                }
+                let deviance = |c: f64, mu: f64| {
+                    2.0 * (if c > 0.0 { c * (c / mu).ln() } else { 0.0 } - c + mu)
+                };
+                let loss = |mu: f64| -> f64 {
+                    counts
+                        .iter()
+                        .map(|&c| (deviance(c, mu) / phi).min(K2))
+                        .sum()
+                };
+                let grid = (1..=400_000)
+                    .map(|i| loss(i as f64 * 1.5e-4))
+                    .fold(f64::INFINITY, f64::min);
+                let exact = poisson_min(&events, counts.len(), phi);
+                assert!(
+                    exact <= grid + 1e-9 && grid - exact < 1e-6,
+                    "{exact} {grid}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_spike_bins_stay_with_firing() {
+        // A one-spike bin next to silence is far more likely under firing
+        // than under silence; a Gaussian on transformed counts said otherwise.
+        let times: Vec<_> = (0..100)
+            .flat_map(|b| {
+                let n = match b {
+                    29 => 1,
+                    30..70 => 0,
+                    _ => 5,
+                };
+                (0..n).map(move |i| SampleIndex(b * 1000 + i * 1000 / n))
+            })
+            .collect();
+        let e = stable_epochs(&times, &[], TOTAL, SR);
+        assert_eq!(e.len(), 3, "{e:?}");
+        assert_eq!((e[1].start_s, e[1].end_s, e[1].n), (30.0, 70.0, 0));
     }
 
     #[test]
@@ -506,7 +645,7 @@ mod tests {
 
     #[test]
     fn silence_has_no_amplitude_parameter() {
-        // Splitting off the five silent bins gains ~15.5 in the rate cost,
+        // Splitting off the five silent bins gains ~17.5 in the rate deviance,
         // which pays for a boundary and a rate (~13.6) but would not also pay
         // for an amplitude level (~4.6) on the silent segment.
         let times: Vec<_> = (5..100)
