@@ -1,0 +1,10 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "dim0"
+    ],
+    "description": "y coordinate of the channel location in the brain.",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorData",
+    "object_id": "8a531377-7160-4bed-9bf9-7a60d2a72c06",
+    "zarr_dtype": "float64"
+}

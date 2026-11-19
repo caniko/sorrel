@@ -1,0 +1,11 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "num_times",
+        "num_channels"
+    ],
+    "conversion": 1.95e-07,
+    "offset": -2e-06,
+    "resolution": -1.0,
+    "unit": "volts",
+    "zarr_dtype": "int16"
+}

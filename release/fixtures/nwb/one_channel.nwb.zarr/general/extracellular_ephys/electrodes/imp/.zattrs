@@ -1,0 +1,10 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "dim0"
+    ],
+    "description": "Impedance of the channel, in ohms.",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorData",
+    "object_id": "6bc45b47-b88b-4dc9-840d-c335e41e7145",
+    "zarr_dtype": "float64"
+}

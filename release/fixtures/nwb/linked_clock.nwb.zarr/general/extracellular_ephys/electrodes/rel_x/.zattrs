@@ -1,0 +1,10 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "dim0"
+    ],
+    "description": "x coordinate in electrode group.",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorData",
+    "object_id": "80d99255-20ae-4d42-83eb-f2adebff087f",
+    "zarr_dtype": "float64"
+}

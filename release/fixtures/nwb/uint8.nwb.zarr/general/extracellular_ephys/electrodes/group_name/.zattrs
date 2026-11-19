@@ -1,0 +1,10 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "dim0"
+    ],
+    "description": "Name of the ElectrodeGroup.",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorData",
+    "object_id": "6260892d-f553-411a-b4a9-e04bfe4b7eeb",
+    "zarr_dtype": "str"
+}

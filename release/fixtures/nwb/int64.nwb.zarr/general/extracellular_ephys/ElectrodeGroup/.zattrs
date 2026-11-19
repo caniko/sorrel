@@ -1,0 +1,14 @@
+{
+    "description": "CA1 electrodes",
+    "location": "CA1",
+    "namespace": "core",
+    "neurodata_type": "ElectrodeGroup",
+    "object_id": "fdca72ec-b1a4-4a58-aabe-6725ba828dc1",
+    "zarr_link": [
+        {
+            "name": "device",
+            "path": "/general/devices/Device",
+            "source": "."
+        }
+    ]
+}

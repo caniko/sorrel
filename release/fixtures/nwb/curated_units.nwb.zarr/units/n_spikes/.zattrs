@@ -1,0 +1,10 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "dim0"
+    ],
+    "description": "Sorrel QC metric. Number of spikes assigned to the cluster after curation edits (count); 0 for an empty cluster.",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorData",
+    "object_id": "308987e5-730a-4906-ad24-4e4a7d6273e3",
+    "zarr_dtype": "int"
+}

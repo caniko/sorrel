@@ -1,0 +1,9 @@
+{
+    "colnames": [
+        "spike_times"
+    ],
+    "description": "data on spiking units",
+    "namespace": "core",
+    "neurodata_type": "Units",
+    "object_id": "d75b78da-26c6-4c4b-a0c5-af4ecbc3a887"
+}

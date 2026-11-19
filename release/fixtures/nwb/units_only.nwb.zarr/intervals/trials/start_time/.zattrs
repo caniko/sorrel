@@ -1,0 +1,10 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "dim0"
+    ],
+    "description": "Start time of epoch, in seconds",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorData",
+    "object_id": "d9c82f91-090f-4c5a-9333-093143c6f952",
+    "zarr_dtype": "float64"
+}

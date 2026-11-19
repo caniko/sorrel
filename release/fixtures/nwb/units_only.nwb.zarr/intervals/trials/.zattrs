@@ -1,0 +1,10 @@
+{
+    "colnames": [
+        "start_time",
+        "stop_time"
+    ],
+    "description": "experimental trials",
+    "namespace": "core",
+    "neurodata_type": "TimeIntervals",
+    "object_id": "c0135455-0305-4550-a187-c69bbe1872e9"
+}

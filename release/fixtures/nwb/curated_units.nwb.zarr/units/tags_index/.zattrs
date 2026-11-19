@@ -1,0 +1,19 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "dim0"
+    ],
+    "description": "Index for VectorData 'tags'",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorIndex",
+    "object_id": "ca44b119-4dc9-480c-8b9b-01ff0bd715f7",
+    "target": {
+        "value": {
+            "object_id": null,
+            "path": "/units/tags",
+            "source": ".",
+            "source_object_id": "94ebd1bc-cae9-42e3-9a0d-9af17ec2be4e"
+        },
+        "zarr_dtype": "object"
+    },
+    "zarr_dtype": "uint8"
+}

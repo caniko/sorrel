@@ -1,0 +1,10 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "dim0"
+    ],
+    "description": "Location of the electrode (channel).",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorData",
+    "object_id": "1de5a274-14fc-471b-a91d-cb98fb25519a",
+    "zarr_dtype": "str"
+}

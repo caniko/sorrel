@@ -1,0 +1,19 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "dim0"
+    ],
+    "description": "Index for VectorData 'parent_unit_ids'",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorIndex",
+    "object_id": "0513350c-fb51-447c-900a-8a9b78b6fc26",
+    "target": {
+        "value": {
+            "object_id": null,
+            "path": "/units/parent_unit_ids",
+            "source": ".",
+            "source_object_id": "94ebd1bc-cae9-42e3-9a0d-9af17ec2be4e"
+        },
+        "zarr_dtype": "object"
+    },
+    "zarr_dtype": "uint8"
+}

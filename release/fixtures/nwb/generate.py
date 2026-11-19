@@ -6,11 +6,14 @@
 #     "hdmf==6.2.0",
 #     "h5py==3.16.0",
 #     "numpy==2.5.4",
+#     "hdmf-zarr==0.13.0",
+#     "zarr==2.18.7",
+#     "numcodecs==0.15.1",
 # ]
 # ///
-"""Tiny deterministic NWB fixtures for sorrel's reader tests.
+"""Tiny HDF5 and Zarr v2 NWB fixtures for sorrel's reader tests.
 
-Pinned to PyNWB 4.2.0 (hdmf 6.2.0, h5py 3.16.0, numpy 2.5.4).
+Pinned to PyNWB 4.2.0 and hdmf-zarr 0.13.0 (see script dependencies).
 Regenerate exactly with:
 
     nix shell nixpkgs#uv -c uv run --python-preference only-managed release/fixtures/nwb/generate.py
@@ -18,11 +21,13 @@ Regenerate exactly with:
 Files are written next to this script. Contents are deterministic for a fixed
 toolchain (identifiers, session_start_time and file_create_date are fixed).
 Byte-identity is not guaranteed: PyNWB assigns a random object_id UUID to every
-container, so re-running changes object_ids but not the h5py-visible content.
+container, so re-running changes object_ids but not the values under test.
 """
 
 import os
+import shutil
 import tempfile
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -30,6 +35,8 @@ import h5py
 import numpy as np
 from hdmf.backends.hdf5.h5_utils import H5DataIO
 from hdmf.common import VectorData, VectorIndex
+from hdmf_zarr import NWBZarrIO, ZarrDataIO
+from numcodecs import Zlib
 from pynwb import NWBFile, NWBHDF5IO, get_class, load_namespaces
 from pynwb.base import TimeSeries
 from pynwb.ecephys import ElectricalSeries, FilteredEphys
@@ -101,25 +108,35 @@ def good_data():
     return ((t % 50) * (c + 1) - 100).astype(np.int16)
 
 
-def write(nwbfile, name, cache_spec=False):
+def write(nwbfile, name, cache_spec=False, zarr_file=None):
+    # Build an independent container graph: HDMF remembers each source path.
+    hdf_only = name in {"legacy_series.nwb", "rounded_raw.nwb"}
+    if not hdf_only and zarr_file is None:
+        zarr_file = deepcopy(nwbfile)
     path = OUT / name
     with NWBHDF5IO(path, "w") as io:
         io.write(nwbfile, cache_spec=cache_spec)
     print(f"wrote {path.name}: {path.stat().st_size} bytes")
+    if hdf_only:
+        return
+    path = OUT / f"{name}.zarr"
+    if path.exists():
+        shutil.rmtree(path)
+    with NWBZarrIO(path=str(path), mode="w") as io:
+        io.write(zarr_file, cache_spec=cache_spec, consolidate_metadata=(name == "good.nwb"))
+    print(f"wrote {path.name}")
 
 
 def write_good():
-    nwbfile = make_file("sorrel-fixture-good")
-    add_series(
-        nwbfile,
-        H5DataIO(good_data(), chunks=(32, N_CHANNELS), compression="gzip"),
-        rate=1000.0,
-        starting_time=0.5,
-        conversion=0.195e-6,
-        offset=-2e-6,
-        channel_conversion=[1.0, 2.0, 1.0, 0.5],
-    )
-    write(nwbfile, "good.nwb")
+    def build(data):
+        nwbfile = make_file("sorrel-fixture-good")
+        add_series(nwbfile, data, rate=1000.0, starting_time=0.5,
+                   conversion=0.195e-6, offset=-2e-6,
+                   channel_conversion=[1.0, 2.0, 1.0, 0.5])
+        return nwbfile
+
+    write(build(H5DataIO(good_data(), chunks=(32, N_CHANNELS), compression="gzip")),
+          "good.nwb", zarr_file=build(ZarrDataIO(good_data(), chunks=(32, N_CHANNELS))))
 
 
 def write_uint16():
@@ -150,19 +167,31 @@ def write_dtype(dtype, value):
 
 def write_timestamps(irregular=False):
     name = "irregular_timestamps" if irregular else "timestamps"
-    nwbfile = make_file(f"sorrel-fixture-{name}")
     timestamps = 0.5 + np.arange(N_SAMPLES) / 1000.0
     if irregular:
         timestamps[197] += 3e-4
-    add_series(
-        nwbfile,
-        good_data(),
-        timestamps=timestamps,
-        conversion=0.195e-6,
-        offset=-2e-6,
-        channel_conversion=[1.0, 2.0, 1.0, 0.5],
-    )
-    write(nwbfile, f"{name}.nwb")
+    def build(data):
+        nwbfile = make_file(f"sorrel-fixture-{name}")
+        add_series(nwbfile, data, timestamps=timestamps, conversion=0.195e-6,
+                   offset=-2e-6, channel_conversion=[1.0, 2.0, 1.0, 0.5])
+        return nwbfile
+
+    write(build(good_data()), f"{name}.nwb",
+          zarr_file=build(ZarrDataIO(good_data(), compressor=Zlib())))
+
+
+def write_zarr_link():
+    path = OUT / "linked_clock.nwb.zarr"
+    if path.exists():
+        shutil.rmtree(path)
+    with NWBZarrIO(path=str(OUT / "timestamps.nwb.zarr"), mode="r") as source:
+        nwbfile = make_file("sorrel-fixture-linked-clock")
+        add_series(
+            nwbfile, good_data(),
+            timestamps=source.read().acquisition["ElectricalSeriesRaw"].timestamps,
+        )
+        with NWBZarrIO(path=str(path), mode="w") as io:
+            io.write(nwbfile, cache_spec=False, consolidate_metadata=False)
 
 
 def write_multiple_series():
@@ -369,6 +398,7 @@ def main():
     write_foreign_quality()
     write_not_electrical()
     write_subtype()
+    write_zarr_link()
 
 
 if __name__ == "__main__":

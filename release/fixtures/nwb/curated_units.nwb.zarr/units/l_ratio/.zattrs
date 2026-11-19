@@ -1,0 +1,10 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "dim0"
+    ],
+    "description": "Sorrel QC metric. Mean chi-squared survival (df = 3 PCs) of background spikes' Mahalanobis squared distances divided by n_in; lower is better; NaN with fewer than 50 spikes or no PC features.",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorData",
+    "object_id": "d5a25137-126f-47db-a6ff-d13f4065a75c",
+    "zarr_dtype": "float"
+}

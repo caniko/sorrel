@@ -1,0 +1,18 @@
+{
+    "colnames": [
+        "location",
+        "group",
+        "group_name",
+        "x",
+        "y",
+        "z",
+        "imp",
+        "filtering",
+        "rel_x",
+        "rel_y"
+    ],
+    "description": "metadata about extracellular electrodes",
+    "namespace": "core",
+    "neurodata_type": "ElectrodesTable",
+    "object_id": "42650247-fddf-4949-b792-1d7094356737"
+}

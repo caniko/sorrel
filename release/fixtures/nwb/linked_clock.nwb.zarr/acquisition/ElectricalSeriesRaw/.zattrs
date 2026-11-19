@@ -1,0 +1,14 @@
+{
+    "comments": "no comments",
+    "description": "no description",
+    "namespace": "core",
+    "neurodata_type": "ElectricalSeries",
+    "object_id": "10bd4ee2-8b0a-4c07-af64-9791248b8d68",
+    "zarr_link": [
+        {
+            "name": "timestamps",
+            "path": "/acquisition/ElectricalSeriesRaw/timestamps",
+            "source": "../timestamps.nwb.zarr"
+        }
+    ]
+}

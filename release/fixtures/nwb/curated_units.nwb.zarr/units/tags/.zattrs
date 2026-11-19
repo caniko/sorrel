@@ -1,0 +1,10 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "dim0"
+    ],
+    "description": "Sorrel tags",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorData",
+    "object_id": "9fa307a9-eb6b-49f1-95a1-0fbf639a870e",
+    "zarr_dtype": "str"
+}

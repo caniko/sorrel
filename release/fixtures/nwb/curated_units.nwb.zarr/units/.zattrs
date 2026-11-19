@@ -1,0 +1,16 @@
+{
+    "colnames": [
+        "spike_times",
+        "quality",
+        "origin",
+        "parent_unit_ids",
+        "tags",
+        "unit_name",
+        "n_spikes",
+        "l_ratio"
+    ],
+    "description": "data on spiking units",
+    "namespace": "core",
+    "neurodata_type": "Units",
+    "object_id": "fad45ae8-4ddb-4230-8ff2-f7233b98d7d0"
+}

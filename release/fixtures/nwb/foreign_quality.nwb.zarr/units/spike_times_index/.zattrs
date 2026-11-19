@@ -1,0 +1,19 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "num_rows"
+    ],
+    "description": "Index for VectorData 'spike_times'",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorIndex",
+    "object_id": "778bd6ef-7c8a-420a-8505-caef8dcfc80b",
+    "target": {
+        "value": {
+            "object_id": null,
+            "path": "/units/spike_times",
+            "source": ".",
+            "source_object_id": "48e36fc3-4a7d-4589-9ae7-a22e597efd89"
+        },
+        "zarr_dtype": "object"
+    },
+    "zarr_dtype": "uint8"
+}

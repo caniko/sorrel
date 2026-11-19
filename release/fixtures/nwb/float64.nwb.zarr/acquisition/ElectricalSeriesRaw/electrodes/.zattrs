@@ -1,0 +1,19 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "num_rows"
+    ],
+    "description": "permuted subset",
+    "namespace": "hdmf-common",
+    "neurodata_type": "DynamicTableRegion",
+    "object_id": "96cea50e-d5d8-4970-9074-49e17f48769d",
+    "table": {
+        "value": {
+            "object_id": "2a01c925-96f7-47e6-974b-585b90997576",
+            "path": "/general/extracellular_ephys/electrodes",
+            "source": ".",
+            "source_object_id": "697c6963-39a6-4194-b7a3-380c0d8729d8"
+        },
+        "zarr_dtype": "object"
+    },
+    "zarr_dtype": "int64"
+}

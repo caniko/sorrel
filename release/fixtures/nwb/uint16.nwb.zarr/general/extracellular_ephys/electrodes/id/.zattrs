@@ -1,0 +1,9 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "num_rows"
+    ],
+    "namespace": "hdmf-common",
+    "neurodata_type": "ElementIdentifiers",
+    "object_id": "d7838d60-4cf1-4792-b2af-6b9c096b028e",
+    "zarr_dtype": "int64"
+}
