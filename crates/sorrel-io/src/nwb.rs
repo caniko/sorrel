@@ -1122,13 +1122,12 @@ mod imp {
                 .iter()
                 .enumerate()
                 .map(|(spike, &t)| {
-                    let relative = t - t0;
-                    let s = (relative * rate).round();
+                    let s = exact_sample(t, t0, rate);
                     ensure!(s.is_finite() && (0.0..u64::MAX as f64).contains(&s)
                         && timestamps.is_none_or(|(_, n_samples)| (s as u64) < n_samples as u64),
                         "unit {id}: spike at {t} s is outside the sample index range (starting time {t0} s, {rate} Hz)");
                     if let Some((other_rate, require_agreement)) = comparison {
-                        let other = (relative * other_rate).round();
+                        let other = exact_sample(t, t0, other_rate);
                         if other != s {
                             n_differing += 1;
                             if require_agreement {
@@ -1158,6 +1157,60 @@ mod imp {
             );
         }
         Ok((out, unit_ids, n_differing == 0))
+    }
+
+    fn two_sum(a: f64, b: f64) -> (f64, f64) {
+        let s = a + b;
+        let bb = s - a;
+        (s, (a - (s - bb)) + (b - bb))
+    }
+
+    /// Sign of the exact sum of `terms` (Shewchuk's grow-expansion: the
+    /// components stay non-overlapping in increasing magnitude, so the last
+    /// nonzero one carries the sign).
+    fn exact_sign(terms: &[f64]) -> std::cmp::Ordering {
+        let mut expansion: Vec<f64> = Vec::with_capacity(terms.len());
+        for &term in terms {
+            let mut q = term;
+            let mut next = Vec::with_capacity(expansion.len() + 1);
+            for &e in &expansion {
+                let (s, err) = two_sum(q, e);
+                if err != 0.0 {
+                    next.push(err);
+                }
+                q = s;
+            }
+            next.push(q);
+            expansion = next;
+        }
+        let top = expansion.iter().rev().find(|&&x| x != 0.0).copied();
+        top.map_or(std::cmp::Ordering::Equal, |x| x.total_cmp(&0.0))
+    }
+
+    /// `floor((t - t0) × rate + 0.5)` of the exact real product, not of its
+    /// f64 rounding: near a half-sample boundary the rounded product can land
+    /// on the wrong side. The difference is split exactly (TwoSum) and each
+    /// part multiplied exactly (FMA), so the position is a sum of four f64s.
+    /// ponytail: exact unless an FMA error term underflows into subnormals,
+    /// i.e. for sub-1e-300-sample remainders that no recording produces.
+    fn exact_sample(t: f64, t0: f64, rate: f64) -> f64 {
+        let (d_hi, d_lo) = two_sum(t, -t0);
+        let p_hi = d_hi * rate;
+        let p_lo = d_hi.mul_add(rate, -p_hi);
+        let q_hi = d_lo * rate;
+        let q_lo = d_lo.mul_add(rate, -q_hi);
+        let n = (p_hi + p_lo + q_hi + q_lo).round();
+        if !n.is_finite() {
+            return n;
+        }
+        let cmp = |c: f64| exact_sign(&[p_hi, p_lo, q_hi, q_lo, -c]);
+        if cmp(n - 0.5).is_lt() {
+            n - 1.0
+        } else if cmp(n + 0.5).is_ge() {
+            n + 1.0
+        } else {
+            n
+        }
     }
 
     fn check_timestamp_spikes(
@@ -1442,6 +1495,22 @@ mod imp {
                 "{error}"
             );
         }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn exact_sample_rounds_the_real_product() {
+        // 8.333333333333333e-05 × 30000 is just below 2.5 but rounds to 2.5 in f64.
+        let t = 8.333333333333333e-05;
+        assert_eq!(t * 30000.0, 2.5);
+        assert_eq!(exact_sample(t, 0.0, 30000.0), 2.0);
+        // Exact ties and plain cases keep f64::round's answer for positions ≥ 0.
+        assert_eq!(exact_sample(2.5, 0.0, 1.0), 3.0);
+        assert_eq!(exact_sample(1.25, 0.25, 1000.0), 1000.0);
+        assert_eq!(exact_sample(11000.0, 0.0, 30000.0), 330_000_000.0);
+        // The subtraction is exact too: 2.5 - 2^-60 rounds to 2.5 in f64.
+        assert_eq!(2.5 - 2f64.powi(-60), 2.5);
+        assert_eq!(exact_sample(2.5, 2f64.powi(-60), 1.0), 2.0);
     }
 
     #[cfg(test)]
