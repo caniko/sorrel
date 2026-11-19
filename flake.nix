@@ -58,7 +58,6 @@
           "formatting"
           "hm-module"
           "workspace-tests"
-          "hdf5-tests"
           "dev-tests"
           "binstall-metadata"
           "binstall-metadata-sorrel-remote"

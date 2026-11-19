@@ -47,7 +47,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **SortingAnalyzers on a SpikeInterface binary folder open.** An analyzer whose recording came from `rec.save(folder=...)` (a `BinaryFolderRecording`) failed with "missing sampling_frequency". Sorrel now follows `folder_path` to that folder's `binary.json`, and through preprocessing chains that keep every channel and sample (filters, common reference, whitening, phase shift, scaling) to their binary source, without re-applying the chain. Slicing, resampling and other classes fail with an error that names the class; Zarr analyzers and recordings fail with the SpikeInterface call that converts them.
 - **NWB export keeps a caller's `was_generated_by`** when it was passed as a tuple.
 - **`saving.md` round-trip example** passed a path to `apply_curation`, which only takes a dict; it now uses `sorrel.read_curation`.
-- **NWB reader keeps NWB's identities and units.** Tested against PyNWB-written fixtures in `release/fixtures/nwb/` (`checks.hdf5-tests`).
+- **NWB reader keeps NWB's identities and units.** Tested against PyNWB-written fixtures in `release/fixtures/nwb/` (`checks.workspace-tests`, now that HDF5 is a default feature).
   - Unit ids come from `/units/id`; a table with ids `5, 7, 9` was reported to `curation.json` and MCP evidence as `0, 1, 2`.
   - Spike times are taken relative to the series' `starting_time`; they were offset by it.
   - Data columns map to electrodes through the series' `electrodes` region, giving channel ids and `rel_x`/`rel_y` positions. The first N table rows were paired with the N columns, and brain `x`/`y` stood in for probe geometry.
