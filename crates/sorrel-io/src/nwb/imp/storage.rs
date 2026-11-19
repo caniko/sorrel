@@ -126,11 +126,6 @@ impl Group {
             .with_context(|| format!("missing NWB dataset {path}"))
     }
 
-    pub fn attr(&self, name: &str) -> Result<Attr> {
-        self.optional_attr(name)?
-            .with_context(|| format!("missing {name} attribute"))
-    }
-
     pub fn optional_attr(&self, name: &str) -> Result<Option<Attr>> {
         dispatch!(self, Self, g => hdf_attr(g, name),
             Ok(g.optional_attr(name).cloned().map(Attr::Zarr)))
@@ -142,20 +137,20 @@ impl Group {
 
     // Historical lookups only: never use these to choose or load current data.
     pub fn legacy_group(&self, name: &str) -> Result<Option<Self>> {
-        dispatch!(self, Self, g => {
-            if !g.link_exists(name) || g.loc_type_by_name(name)? != h5::LocationType::Group {
+        dispatch!(self, Self, _g => {
+            if !_g.link_exists(name) || _g.loc_type_by_name(name)? != h5::LocationType::Group {
                 return Ok(None);
             }
-            Ok(Some(Self::Hdf5(g.group(name)?)))
+            Ok(Some(Self::Hdf5(_g.group(name)?)))
         }, { let _ = name; Ok(None) })
     }
 
     pub fn legacy_dataset_rank(&self, name: &str) -> Result<Option<usize>> {
-        dispatch!(self, Self, g => {
-            if !g.link_exists(name) || g.loc_type_by_name(name)? != h5::LocationType::Dataset {
+        dispatch!(self, Self, _g => {
+            if !_g.link_exists(name) || _g.loc_type_by_name(name)? != h5::LocationType::Dataset {
                 return Ok(None);
             }
-            Ok(Some(g.dataset(name)?.ndim()))
+            Ok(Some(_g.dataset(name)?.ndim()))
         }, { let _ = name; Ok(None) })
     }
 
@@ -230,10 +225,6 @@ use zarr::Number;
 impl Dataset {
     pub fn shape(&self) -> Vec<usize> {
         dispatch!(self, Self, d => d.shape(), d.shape().to_vec())
-    }
-
-    pub fn ndim(&self) -> usize {
-        dispatch!(self, Self, d => d.ndim(), d.shape().len())
     }
 
     pub fn chunk(&self) -> Option<Vec<usize>> {

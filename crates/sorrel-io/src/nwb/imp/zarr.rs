@@ -541,6 +541,16 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn json_clock_attributes_roundtrip_without_rounding_stored_integers() {
+        let parse = |token| exact_number(&serde_json::from_str(token).unwrap(), "rate");
+        assert_eq!(parse("12711.729583157607").unwrap(), 12711.729583157607);
+        assert_eq!(parse("9007199254740992").unwrap(), 9007199254740992.0);
+        assert!(parse("9007199254740993").is_err());
+        assert!(parse("18446744073709551615").is_err());
+        assert!(parse(r#""1000""#).is_err());
+    }
+
+    #[test]
     fn consolidated_metadata_must_match_in_both_directions() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

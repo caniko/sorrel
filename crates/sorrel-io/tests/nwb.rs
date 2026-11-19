@@ -704,6 +704,7 @@ mod zarr_tests {
 
         for dtype in [">f8", "<i8"] {
             meta["dtype"] = json!(dtype);
+            meta["fill_value"] = json!(0);
             fs::write(&array, meta.to_string()).unwrap();
             let err = open(Some(1000.0)).err().expect(dtype);
             assert!(format!("{err:#}").contains("/units/spike_times must be stored as Zarr v2 little-endian IEEE float32 or float64"), "{err:#}");
