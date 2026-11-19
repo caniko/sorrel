@@ -272,6 +272,19 @@ fn nwb_call_only_reuses_matching_running_session() {
         "{}",
         String::from_utf8_lossy(&same.stderr)
     );
+    let discard = call(&[
+        "--nwb-series",
+        "A_first",
+        "--journal",
+        "first.journal",
+        "--discard-journal",
+    ]);
+    assert!(!discard.status.success());
+    let err = String::from_utf8_lossy(&discard.stderr);
+    assert!(
+        err.contains("stop the running session or omit the flag"),
+        "{err}"
+    );
     for different in [
         ["--journal", "first.journal", "--nwb-series", "Z_second"],
         ["--journal", "first.journal", "--nwb-series", "nonexistent"],

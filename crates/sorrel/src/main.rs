@@ -1563,6 +1563,7 @@ fn run_mcp(open: &OpenArgs) -> Result<()> {
     if sorrel_data::serve::attach_for_session(
         &host_dir(open),
         Some(&session_key(open)?),
+        open.discard_journal,
         std::io::stdin(),
         std::io::stdout(),
     )? {
@@ -1857,7 +1858,12 @@ fn tab_opener() -> Opener {
             .enumerate()
             .find(|(_, tab)| session_path(tab.dataset()) == dir)
         {
-            sorrel_data::serve::check_session_key("open tab", tab.session_key(), &key)?;
+            sorrel_data::serve::check_session_reuse(
+                "open tab",
+                tab.session_key(),
+                &key,
+                open.discard_journal,
+            )?;
             return Ok(Opened::Existing(i));
         }
         let mut tab = None;
@@ -2207,6 +2213,7 @@ fn run_call(open: &OpenArgs, tool: &str, args: Option<&str>, raw: bool) -> Resul
     let reply = match sorrel_data::serve::call_once_for_session(
         &host_dir(open),
         Some(&session_key(open)?),
+        open.discard_journal,
         &request,
     )? {
         Some(r) => r,

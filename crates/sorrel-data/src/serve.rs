@@ -2041,13 +2041,14 @@ pub fn attach(
     input: impl Read + Send + 'static,
     output: impl Write,
 ) -> Result<bool> {
-    attach_for_session(save_dir, None, input, output)
+    attach_for_session(save_dir, None, false, input, output)
 }
 
 /// Attach only if the running host matches an explicitly requested session.
 pub fn attach_for_session(
     save_dir: &Path,
     session_key: Option<&str>,
+    discard_journal: bool,
     input: impl Read + Send + 'static,
     mut output: impl Write,
 ) -> Result<bool> {
@@ -2060,7 +2061,7 @@ pub fn attach_for_session(
         return Ok(false);
     };
     if let Some(key) = session_key {
-        check_session_key("running host", running_key.as_deref(), key)?;
+        check_session_reuse("running host", running_key.as_deref(), key, discard_journal)?;
     }
     let mut up = stream;
     std::thread::spawn(move || {
@@ -2087,7 +2088,14 @@ pub fn attach_for_session(
     Ok(true)
 }
 
-pub fn check_session_key(location: &str, current: Option<&str>, requested: &str) -> Result<()> {
+pub fn check_session_reuse(
+    location: &str,
+    current: Option<&str>,
+    requested: &str,
+    discard_journal: bool,
+) -> Result<()> {
+    anyhow::ensure!(!discard_journal,
+        "cannot use --discard-journal with the {location}; stop the running session or omit the flag");
     anyhow::ensure!(current == Some(requested),
         "session conflict: the {location} was opened with a different dataset path or options; close it or use the same open arguments (including --dat, --journal and, for NWB, --nwb-series)");
     Ok(())
@@ -2096,17 +2104,18 @@ pub fn check_session_key(location: &str, current: Option<&str>, requested: &str)
 /// One JSON-RPC `request` to the host in `save_dir`, and its first reply.
 /// `Ok(None)` when no host listens there (see [`attach`]).
 pub fn call_once(save_dir: &Path, request: &Value) -> Result<Option<Value>> {
-    call_once_for_session(save_dir, None, request)
+    call_once_for_session(save_dir, None, false, request)
 }
 
 pub fn call_once_for_session(
     save_dir: &Path,
     session_key: Option<&str>,
+    discard_journal: bool,
     request: &Value,
 ) -> Result<Option<Value>> {
     let mut out = Vec::new();
     let input = std::io::Cursor::new(format!("{request}\n"));
-    if !attach_for_session(save_dir, session_key, input, &mut out)? {
+    if !attach_for_session(save_dir, session_key, discard_journal, input, &mut out)? {
         return Ok(None);
     }
     let line = out.split(|&b| b == b'\n').next().unwrap_or_default();
