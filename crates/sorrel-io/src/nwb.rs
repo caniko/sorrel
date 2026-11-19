@@ -25,7 +25,6 @@ pub use stub::open_stub;
 mod imp {
     use crate::extras::{HasGeometry, HasQualityMetrics, QualityMetrics};
     use crate::kilosort::{pinned_sorter, valid_tag, PhyLabel};
-    use crate::nwb_units::STARTING_TIME_ATTR;
     use crate::provider::{
         appended_unit_id, ChannelId, ClusterId, DataProvider, SampleIndex, TraceSamples,
         TraceSlice, UnitAnnotation,
@@ -136,25 +135,12 @@ mod imp {
                     ensure!(explicit == declared,
                         "--sample-rate {explicit} Hz is not a clock this NWB declares; pass one of: {declared} Hz (/units/spike_times resolution)");
                 }
-                // Units-only native exports keep the original NWB clock but
-                // have no ElectricalSeries in which to store the offset.
-                let t0 = if spike_times
-                    .attr_names()?
-                    .iter()
-                    .any(|name| name == STARTING_TIME_ATTR)
-                {
-                    let t0 = spike_times.attr(STARTING_TIME_ATTR)?.read_scalar::<f64>()?;
-                    ensure!(t0.is_finite(), "invalid {STARTING_TIME_ATTR} {t0}");
-                    t0
-                } else {
-                    0.0
-                };
                 (
                         None,
                         units_rate.or(params.sample_rate).map(checked_rate).transpose()?.context(
                             "no ElectricalSeries time base in the sorting NWB and no /units/spike_times resolution; pass --sample-rate HZ",
                         )?,
-                        t0,
+                        0.0,
                         read_units_only_channels(&f)?,
                         None,
                     )
@@ -175,7 +161,7 @@ mod imp {
                 &spike_times_index,
                 rate,
                 t0,
-                timestamps.as_ref().map(|ds| (ds, n_samples)),
+                trace.as_ref().map(|t| (t.n_samples, timestamps.as_ref())),
                 comparison_rate.map(|other_rate| (other_rate, require_agreement)),
             )
             .context("load /units")?;
@@ -192,8 +178,6 @@ mod imp {
                 identity_bytes.extend(rate.to_le_bytes());
                 if let Some(raw_path) = params.raw_path {
                     identity_bytes.extend(provider_identity_bytes(raw_path));
-                } else if series.is_none() && t0 != 0.0 {
-                    identity_bytes.extend(t0.to_le_bytes());
                 }
             }
             let metadata = read_unit_metadata(&units, &unit_ids)?;
@@ -396,24 +380,24 @@ mod imp {
         hasher.finalize().as_bytes().to_vec()
     }
 
-    fn read_str(data: &hdf5::Container) -> Result<String> {
+    pub(crate) fn read_str(data: &hdf5::Container) -> Result<String> {
         ensure!(data.is_scalar(), "expected a scalar HDF5 string");
         strings(data)?.pop().context("missing HDF5 string")
     }
 
-    fn strings(data: &hdf5::Container) -> Result<Vec<String>> {
+    pub(crate) fn strings(data: &hdf5::Container) -> Result<Vec<String>> {
         let dtype = data.dtype()?;
         match dtype.to_descriptor()? {
-            TypeDescriptor::VarLenUnicode => Ok(data
+            TypeDescriptor::VarLenUnicode => data
                 .read_raw::<VarLenUnicode>()?
                 .iter()
-                .map(ToString::to_string)
-                .collect()),
-            TypeDescriptor::VarLenAscii => Ok(data
+                .map(|s| Ok(std::str::from_utf8(s.as_bytes())?.to_owned()))
+                .collect(),
+            TypeDescriptor::VarLenAscii => data
                 .read_raw::<VarLenAscii>()?
                 .iter()
-                .map(ToString::to_string)
-                .collect()),
+                .map(|s| Ok(std::str::from_utf8(s.as_bytes())?.to_owned()))
+                .collect(),
             TypeDescriptor::FixedAscii(width) | TypeDescriptor::FixedUnicode(width) => {
                 fixed_strings(data, &dtype, width)
             }
@@ -1087,9 +1071,10 @@ mod imp {
         spike_times_index: &hdf5::Dataset,
         rate: f64,
         t0: f64,
-        timestamps: Option<(&hdf5::Dataset, usize)>,
+        series_clock: Option<(usize, Option<&hdf5::Dataset>)>,
         mut comparison: Option<(f64, bool)>,
     ) -> Result<(Vec<Vec<SampleIndex>>, Vec<u32>, bool)> {
+        let timestamps = series_clock.and_then(|(n_samples, ds)| ds.map(|ds| (ds, n_samples)));
         let ids: Vec<i64> = ids.read_raw()?;
         exact_float(spike_times.dtype(), "/units/spike_times")?;
         let mut all: Vec<f64> = spike_times.read_raw()?;
@@ -1129,7 +1114,12 @@ mod imp {
                     let s = exact_sample(t, t0, rate);
                     ensure!(s.is_finite() && (0.0..u64::MAX as f64).contains(&s)
                         && timestamps.is_none_or(|(_, n_samples)| (s as u64) < n_samples as u64),
-                        "unit {id}: spike at {t} s is outside the sample index range or cannot be placed on a sample exactly (starting time {t0} s, {rate} Hz)");
+                        "unit {id}: spike at {t} s is outside the sample index range or cannot be placed on a sample exactly (starting time {t0} s, {rate} Hz){}",
+                        if series_clock.is_none() && t < 0.0 {
+                            "; pair the raw NWB file with --dat to restore its time base"
+                        } else {
+                            ""
+                        });
                     if let Some((other_rate, require_agreement)) = comparison {
                         let other = exact_sample(t, t0, other_rate);
                         if other != s {
@@ -1608,6 +1598,6 @@ mod imp {
 }
 
 #[cfg(feature = "hdf5")]
-pub(crate) use imp::read_trials;
+pub(crate) use imp::{read_str, read_trials, strings};
 #[cfg(feature = "hdf5")]
 pub use imp::{NwbOpenParams, NwbProvider};

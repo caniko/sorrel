@@ -26,6 +26,15 @@ fn export(source: &Path, dest: &Path, options: &[&str]) {
     );
 }
 
+fn spike_seconds(provider: &NwbProvider, unit: ClusterId) -> Vec<f64> {
+    let rate = provider.exact_sample_rate().unwrap();
+    provider
+        .spike_times(unit)
+        .iter()
+        .map(|s| provider.starting_time() + s.0 as f64 / rate)
+        .collect()
+}
+
 #[test]
 fn native_export_round_trips_curated_units_without_electrodes() {
     let temp = tempfile::tempdir().unwrap();
@@ -35,6 +44,7 @@ fn native_export_round_trips_curated_units_without_electrodes() {
     let source = NwbProvider::open(&input).unwrap();
     export(&input, &output, &[]);
     let reopened = NwbProvider::open(&output).unwrap();
+    assert_eq!(reopened.starting_time(), 0.0);
     assert_eq!(reopened.n_channels(), 0);
     assert_eq!(reopened.n_clusters(), source.n_clusters());
     assert_eq!(reopened.initial_labels(), source.initial_labels());
@@ -46,7 +56,7 @@ fn native_export_round_trips_curated_units_without_electrodes() {
     for c in (0..source.n_clusters()).map(ClusterId) {
         assert_eq!(reopened.unit_id_json(c), source.unit_id_json(c));
         assert_eq!(reopened.unit_id(c), source.unit_id(c));
-        assert_eq!(reopened.spike_times(c), source.spike_times(c));
+        assert_eq!(spike_seconds(&reopened, c), spike_seconds(&source, c));
     }
     let metrics = source.quality_metrics();
     let actual = reopened.quality_metrics();
@@ -90,16 +100,18 @@ fn native_export_round_trips_reader_time_bases() {
         let source = NwbProvider::open_with(&input, params).unwrap();
         export(&input, &output, &options);
         let reopened = NwbProvider::open(&output).unwrap();
-        assert_eq!(
-            reopened.starting_time(),
-            source.starting_time(),
-            "{fixture}"
-        );
-        assert_eq!(
-            reopened.exact_sample_rate().unwrap(),
-            source.exact_sample_rate().unwrap(),
-            "{fixture}"
-        );
+        assert_eq!(reopened.starting_time(), 0.0, "{fixture}");
+        let rate = source.exact_sample_rate().unwrap();
+        assert_eq!(reopened.exact_sample_rate().unwrap(), rate, "{fixture}");
+        let paired = NwbProvider::open_with(
+            &output,
+            NwbOpenParams {
+                raw_path: params.raw_path.or(Some(&input)),
+                ..params
+            },
+        )
+        .unwrap();
+        assert_eq!(paired.starting_time(), source.starting_time(), "{fixture}");
         let active: Vec<_> = (0..source.n_clusters())
             .map(ClusterId)
             .filter(|&c| !source.spike_times(c).is_empty())
@@ -108,7 +120,14 @@ fn native_export_round_trips_reader_time_bases() {
         for (row, c) in active.into_iter().enumerate() {
             let r = ClusterId(row as u32);
             assert_eq!(reopened.unit_id(r), source.unit_id(c), "{fixture}");
-            assert_eq!(reopened.spike_times(r), source.spike_times(c), "{fixture}");
+            assert_eq!(paired.spike_times(r), source.spike_times(c), "{fixture}");
+            let expected = spike_seconds(&source, c);
+            let relative = spike_seconds(&reopened, r);
+            assert_eq!(relative.len(), expected.len(), "{fixture}");
+            // The units-only sample grid is anchored at zero, not at the raw offset.
+            for (relative, expected) in relative.into_iter().zip(expected) {
+                assert!((relative - expected).abs() <= 0.5 / rate, "{fixture}");
+            }
         }
     }
 }

@@ -300,9 +300,9 @@ Pass `--starting-time SECONDS` to set the first sample's time on the file's
 NWB time axis. By default, export uses the rate and offset Sorrel used to open
 the session: from the selected ElectricalSeries (including regular timestamps
 or a paired raw file via `--dat`), or from the Units resolution or `--sample-rate`
-when there is no series. Units-only input defaults to a zero offset. Native
-export records a nonzero offset as `sorrel_starting_time` on `units/spike_times`
-so Sorrel can recover the same sample indices when reopening without a series.
+when there is no series. Reopening a Units-only export uses a zero offset for
+its relative sample indices; pair the raw NWB with `--dat` to recover the raw
+series' time base or to reopen a file with negative spike times.
 Unlike `export-phy`, `export-nwb` does not need channels: if no electrode
 geometry is available, the new file contains Units but no electrodes table.
 
