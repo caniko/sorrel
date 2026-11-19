@@ -244,7 +244,7 @@ impl Api {
             Source {
                 label: canonical.clone(),
                 agent: self.agent.clone(),
-                url: Some(url),
+                url: Some((url, false)),
                 refresh: None,
                 identity: None,
             },

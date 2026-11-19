@@ -171,7 +171,10 @@ fn range_case(fault: Fault, expected: &str) {
                     1000
                 }))
                 .agent,
-            url: Some(server.base.join("/storage?secret=signature").unwrap()),
+            url: Some((
+                server.base.join("/storage?secret=signature").unwrap(),
+                false,
+            )),
             refresh: None,
             identity: None,
         },
@@ -253,11 +256,11 @@ fn blob_refresh_pins_effective_object_and_seal() -> Result<()> {
         Source {
             label: "asset".into(),
             agent: api.agent.clone(),
-            url: Some(base.join("?versionId=one&X-Amz-Signature=0")?),
+            url: None,
             identity: None,
             refresh: Some(Box::new(move || {
                 let n = current.load(Ordering::Relaxed);
-                let revision = if n == 1 { "one" } else { "two" };
+                let revision = if n < 2 { "one" } else { "two" };
                 Ok(base.join(&format!("?X-Amz-Signature={n}&versionId={revision}"))?)
             })),
         },
@@ -281,15 +284,50 @@ fn blob_refresh_pins_effective_object_and_seal() -> Result<()> {
         first.identity,
         api.resolve(refreshed_url("two")?.as_str())?.identity
     );
-    assert_eq!(
-        first.identity,
-        api.resolve(
-            refreshed_url("one")?
-                .join("?Expires=5&versionId=one&response-content-type=binary")?
-                .as_str()
-        )?
-        .identity
-    );
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "hdf5")]
+fn direct_query_pins_resource_across_redirects() -> Result<()> {
+    use std::sync::atomic::AtomicBool;
+    const BLOCK: usize = 256 * 1024;
+    let redirected = Arc::new(AtomicBool::new(false));
+    let flag = redirected.clone();
+    let a = vec![1; 2 * BLOCK];
+    let b = vec![2; 2 * BLOCK];
+    let server = Server::new(move |url, headers, stream| {
+        let other = url.query() == Some("Signature=B");
+        if !other && flag.load(Ordering::Relaxed) {
+            reply(
+                stream,
+                302,
+                "Location: /data.nwb?Signature=B\r\nContent-Length: 0\r\n",
+                &[],
+            );
+        } else {
+            serve_range(
+                stream,
+                headers,
+                if other { &b } else { &a },
+                Fault::None,
+                "\"initial\"",
+            );
+        }
+    });
+    let api = server.api(Duration::from_secs(2));
+    let first = api.resolve(server.base.join("/data.nwb?Signature=A")?.as_str())?;
+    let second = api.resolve(server.base.join("/data.nwb?Signature=B")?.as_str())?;
+    assert_ne!(first.identity, second.identity);
+    let Store::Blob(object) = first.store else {
+        unreachable!()
+    };
+    let read = |offset| object.read_uninit(offset, &mut [MaybeUninit::uninit(); 1], false);
+    read(0)?;
+    redirected.store(true, Ordering::Relaxed);
+    let error = format!("{:#}", read(BLOCK as u64).unwrap_err());
+    assert!(error.contains("object identity changed"), "{error}");
+    assert!(!error.contains("Signature="), "{error}");
     Ok(())
 }
 
@@ -314,7 +352,7 @@ fn distant_seeks_coalesce_and_share_cached_reads() -> Result<()> {
         Source {
             label: "large asset".into(),
             agent: server.api(Duration::from_secs(2)).agent,
-            url: Some(server.base.join("/storage").unwrap()),
+            url: Some((server.base.join("/storage").unwrap(), false)),
             refresh: None,
             identity: None,
         },

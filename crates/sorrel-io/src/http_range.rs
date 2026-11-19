@@ -93,7 +93,14 @@ pub(crate) fn strong_etag(value: &str) -> Result<&str> {
     Ok(value)
 }
 
-fn object_identity(url: &Url) -> String {
+fn object_identity(url: &Url, from_dandi_api: bool) -> String {
+    let dandi_storage = url.host_str() == Some("dandiarchive.s3.amazonaws.com")
+        && url.port_or_known_default() == Some(443);
+    #[cfg(test)]
+    let dandi_storage = dandi_storage || url.host_str() == Some("127.0.0.1");
+    if !(from_dandi_api && dandi_storage) {
+        return url.as_str().to_owned();
+    }
     let mut identity = url[..Position::AfterPath].to_owned();
     if let Some(query) = url.query() {
         let mut separator = '?';
@@ -129,7 +136,8 @@ pub(crate) type Refresh = Box<dyn Fn() -> Result<Url> + Send + Sync>;
 pub(crate) struct Source {
     pub label: String,
     pub agent: ureq::Agent,
-    pub url: Option<Url>,
+    // The flag marks URLs issued directly by the DANDI API, not by storage redirects.
+    pub url: Option<(Url, bool)>,
     pub refresh: Option<Refresh>,
     pub identity: Option<String>,
 }
@@ -161,13 +169,16 @@ impl Source {
         let mut refreshed = false;
         let mut candidate = self.url.clone();
         for _ in 0..=6 {
-            let url = match candidate.take() {
-                Some(url) => url,
-                None => self.refresh.as_ref().context("missing download URL")?()?,
+            let (url, from_dandi_api) = match candidate.take() {
+                Some(candidate) => candidate,
+                None => (
+                    self.refresh.as_ref().context("missing download URL")?()?,
+                    true,
+                ),
             };
             let mut res = request(&self.agent, &url, &headers)?;
             if res.status().is_redirection() {
-                candidate = Some(redirect(&url, &res)?);
+                candidate = Some((redirect(&url, &res)?, false));
                 continue;
             }
             if res.status() == StatusCode::FORBIDDEN && self.refresh.is_some() && !refreshed {
@@ -179,7 +190,7 @@ impl Source {
                 "expected HTTP 206, got HTTP {}",
                 res.status().as_u16()
             );
-            let identity = object_identity(&url);
+            let identity = object_identity(&url, from_dandi_api);
             ensure!(
                 self.identity
                     .as_ref()
@@ -234,7 +245,7 @@ impl Source {
                 .read_to_end(&mut data)
                 .map_err(|_| anyhow!("could not read complete range body"))?;
             ensure!(data.len() as u64 == count, "wrong range body length");
-            self.url = Some(url);
+            self.url = Some((url, from_dandi_api));
             self.identity = Some(identity);
             return Ok((data, actual_total, actual_tag));
         }
