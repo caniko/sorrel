@@ -74,6 +74,12 @@ mod imp {
             let units = f
                 .group("/units")
                 .context("missing /units in the sorting NWB file")?;
+            reject_external_links(
+                &f,
+                &units,
+                &["spike_times", "spike_times_index", "id"],
+                "open the NWB file that holds the units directly",
+            )?;
             let spike_times = units
                 .dataset("spike_times")
                 .context("missing /units/spike_times")?;
@@ -110,6 +116,12 @@ mod imp {
             let (trace, rate, t0, (channel_map, channel_positions)) = if let Some((name, series)) =
                 &series
             {
+                reject_external_links(
+                    recording,
+                    series,
+                    &["starting_time", "timestamps"],
+                    "open the NWB file that holds the series directly, or pass it via --dat",
+                )?;
                 let data = series.dataset("data")?;
                 let shape = data.shape();
                 let (n_samples, n_channels) = (shape[0], shape.get(1).copied().unwrap_or(1));
@@ -656,6 +668,37 @@ mod imp {
         Ok(Some(found.swap_remove(index)))
     }
 
+    // The journal only seals the explicitly opened files. Check link metadata
+    // before reading time-base or unit data, even when the external target is missing.
+    fn reject_external_links(
+        file: &H5File,
+        group: &hdf5::Group,
+        names: &[&str],
+        advice: &str,
+    ) -> Result<()> {
+        let fileno = file.loc_info()?.fileno;
+        ensure!(
+            group.loc_info()?.fileno == fileno,
+            "{} resolves through an HDF5 external link; {advice}",
+            group.name()
+        );
+        let links = group.iter_visit_default(Vec::new(), |_, name, info, links| {
+            if names.contains(&name) && info.link_type != hdf5::LinkType::Hard {
+                links.push((name.to_owned(), info.link_type));
+            }
+            true
+        })?;
+        for (name, kind) in links {
+            // A soft link is local only if its resolved object is in this file.
+            ensure!(
+                kind == hdf5::LinkType::Soft && group.loc_info_by_name(&name)?.fileno == fileno,
+                "{}/{name} resolves through an HDF5 external link; {advice}",
+                group.name()
+            );
+        }
+        Ok(())
+    }
+
     /// `(rate Hz, starting_time s, rate stored as float32)`.
     fn read_time_base(g: &hdf5::Group, name: &str, n_samples: usize) -> Result<(f64, f64, bool)> {
         let read = || {
@@ -696,6 +739,10 @@ mod imp {
         } else {
             scale.next_up() - scale
         };
+        // A 0.01-sample ULP caps the tolerance at 0.041 samples, well below
+        // half a sample, and allows 30 kHz Unix-epoch timestamps (~0.0072).
+        ensure!(ulp * rate <= 0.01,
+            "timestamps are too coarse at this magnitude to verify regular sampling; if sampling was regular, rewrite the series with starting_time + rate");
         // The grid interpolates two rounded endpoints. Allow a few ulps
         // for their error, each rounded timestamp, and the arithmetic.
         let limit = 1e-3 + 4.0 * ulp * rate;
@@ -1177,6 +1224,59 @@ mod imp {
             .unwrap();
         let err = regular_timestamps(&ds, times.len()).unwrap_err();
         assert!(err.to_string().contains("max deviation 0.200000 samples"));
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn rejects_external_links_for_spike_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../release/fixtures/nwb");
+        for (fixture, dataset) in [
+            ("good.nwb", "/acquisition/ElectricalSeriesRaw/starting_time"),
+            (
+                "timestamps.nwb",
+                "/acquisition/ElectricalSeriesRaw/timestamps",
+            ),
+            ("good.nwb", "/units/spike_times"),
+            ("good.nwb", "/units/spike_times_index"),
+            ("good.nwb", "/units/id"),
+        ] {
+            let source = fixtures.join(fixture);
+            let path = dir.path().join(fixture);
+            std::fs::write(&path, std::fs::read(&source).unwrap()).unwrap();
+            {
+                let file = H5File::open_rw(&path).unwrap();
+                file.unlink(dataset).unwrap();
+                file.link_external(source.to_str().unwrap(), dataset, dataset)
+                    .unwrap();
+            }
+            let error = NwbProvider::open(&path).err().expect(dataset);
+            assert!(
+                format!("{error:#}")
+                    .contains(&format!("{dataset} resolves through an HDF5 external link")),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn timestamp_validation_rejects_coarse_epoch_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = H5File::create(dir.path().join("timestamps.h5")).unwrap();
+        let origin = 1_700_000_000.0_f64;
+        let ulp = origin.next_up() - origin;
+        let mut times: Vec<_> = (0..128)
+            .map(|i| origin + f64::from(i) * 4.0 * ulp)
+            .collect();
+        times[50] += 3.0 * ulp; // 0.75 samples of jitter, exactly representable.
+        let ds = file
+            .new_dataset_builder()
+            .with_data(&times)
+            .create("timestamps")
+            .unwrap();
+        let error = regular_timestamps(&ds, times.len()).unwrap_err();
+        assert!(error.to_string().contains("timestamps are too coarse"));
     }
 
     #[cfg(test)]

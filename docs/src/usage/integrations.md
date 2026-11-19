@@ -197,6 +197,9 @@ The reader requires HDF5 support (`cargo build --features hdf5`) and a local
 HDF5 file with `/units`. One series is read per session; multi-segment stitching,
 NWB-Zarr and DANDI/HTTP streaming are not supported.
 
+- Timestamps with float64 spacing greater than 0.01 samples are refused; if sampling was regular, rewrite the series with `starting_time` and `rate`.
+- HDF5 external links to `starting_time` (including its `rate`), `timestamps`, or `/units`' `spike_times`, `spike_times_index`, or `id` are refused. Open the file holding the data directly, or pass the recording file via `--dat`.
+
 The test fixtures in `release/fixtures/nwb/` are written by PyNWB
 (`generate.py` pins the version).
 
