@@ -358,8 +358,14 @@ geometry, but no traces, waveforms or subject metadata. For DANDI, add real
 subject metadata or export into an NWB recording that already has it.
 
 Pass `--starting-time SECONDS` to set the first sample's time on the file's
-NWB time axis. The default is the source ElectricalSeries offset for NWB
-inputs, and zero for other inputs.
+NWB time axis. By default, export uses the rate and offset Sorrel used to open
+the session: from the selected ElectricalSeries (including regular timestamps
+or a paired raw file via `--dat`), or from the Units resolution or `--sample-rate`
+when there is no series. Units-only input defaults to a zero offset. Native
+export records a nonzero offset as `sorrel_starting_time` on `units/spike_times`
+so Sorrel can recover the same sample indices when reopening without a series.
+Unlike `export-phy`, `export-nwb` does not need channels: if no electrode
+geometry is available, the new file contains Units but no electrodes table.
 
 ```sh
 sorrel export-nwb my_run/phy --into recording.nwb --starting-time 0.5
