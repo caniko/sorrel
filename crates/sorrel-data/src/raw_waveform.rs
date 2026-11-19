@@ -96,7 +96,9 @@ pub fn measure<P: DataProvider>(session: &Session<P>, c: ClusterId) -> Result<Ra
     // skipped, rather than mixing early and late data through parity sampling.
     let split_time = times[times.len() / 2];
     for (start, _) in windows {
-        let trace = p.trace(start, len as u32);
+        let trace = p
+            .read_trace(start, len as u32)
+            .map_err(|err| format!("{err:#}"))?;
         if trace.start != start
             || trace.n_channels as usize != nc
             || trace.samples.len() != len * nc
@@ -173,6 +175,7 @@ mod tests {
         times: Vec<SampleIndex>,
         samples: Vec<f32>,
         missing: bool,
+        failed_start: Option<SampleIndex>,
     }
     impl crate::session::ApplyPhyLabel for Raw {
         fn label_from_op(op: crate::command::PhyLabelOp) -> u8 {
@@ -210,12 +213,16 @@ mod tests {
             TraceSlice {
                 start,
                 n_channels: 2,
-                samples: TraceSamples::F32(if self.missing {
+                samples: TraceSamples::F32(if self.missing || self.failed_start == Some(start) {
                     &[]
                 } else {
                     &self.samples[lo..hi]
                 }),
             }
+        }
+        fn read_trace(&self, start: SampleIndex, len: u32) -> anyhow::Result<TraceSlice<'_>> {
+            anyhow::ensure!(self.failed_start != Some(start), "remote range read failed");
+            Ok(self.trace(start, len))
         }
     }
 
@@ -237,6 +244,7 @@ mod tests {
             times,
             samples,
             missing: false,
+            failed_start: None,
         }
     }
 
@@ -261,6 +269,20 @@ mod tests {
         let history = s.history_len();
         let _ = measure(&s, ClusterId(0)).unwrap();
         assert_eq!(s.history_len(), history, "probe must remain read-only");
+    }
+
+    #[test]
+    fn failed_in_bounds_waveform_read_is_not_skipped() {
+        let t = tempfile::tempdir().unwrap();
+        let mut p = raw();
+        p.failed_start = Some(SampleIndex(480)); // Plenty of other valid windows.
+        p.times.insert(0, SampleIndex(0)); // Outside the recording, not a read failure.
+        p.times.push(p.n_samples());
+        let s = Session::new(p, Journal::open(&t.path().join("journal")).unwrap());
+        assert_eq!(
+            measure(&s, ClusterId(0)).err().as_deref(),
+            Some("remote range read failed")
+        );
     }
 
     #[test]
