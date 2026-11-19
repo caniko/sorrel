@@ -39,6 +39,13 @@ pub trait Tab {
     fn request_close(&mut self);
     fn close_state(&self) -> CloseState;
     fn on_exit(&mut self);
+    fn update_refractory(
+        &mut self,
+        _old: sorrel_compute::RefractoryParams,
+        _new: sorrel_compute::RefractoryParams,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     /// Called every frame while the tab is not the active one, to keep its
     /// pop-out windows alive (egui drops a viewport that is not shown).
     fn popouts(&mut self, _ctx: &egui::Context) {}
@@ -66,6 +73,7 @@ pub type Opener = Box<
         &OpenRequest,
         &[&dyn Tab],
         Option<&eframe::egui_wgpu::RenderState>,
+        sorrel_compute::RefractoryParams,
     ) -> anyhow::Result<Opened>,
 >;
 
@@ -147,7 +155,12 @@ impl Shell {
     fn try_open(&mut self, req: OpenRequest) -> anyhow::Result<()> {
         let open: Vec<&dyn Tab> = self.tabs.iter().map(Box::as_ref).collect();
         let rs = self.rs.clone();
-        let i = match (self.opener)(&req, &open, rs.as_ref())? {
+        let i = match (self.opener)(
+            &req,
+            &open,
+            rs.as_ref(),
+            crate::settings::refractory(&self.ctx),
+        )? {
             Opened::Existing(i) if i < self.tabs.len() => i,
             Opened::Existing(i) => anyhow::bail!("no tab {i}"),
             Opened::Tab(tab, root) => {
@@ -487,7 +500,16 @@ impl eframe::App for Shell {
                 ui.label(warning);
             });
         }
-        crate::settings::show(&ctx);
+        if let Some((old, new)) = crate::settings::show(&ctx) {
+            for tab in &mut self.tabs {
+                if let Err(err) = tab.update_refractory(old, new) {
+                    self.error = Some(format!(
+                        "{}: refractory settings not applied: {err}",
+                        tab.label()
+                    ));
+                }
+            }
+        }
     }
 
     fn on_exit(&mut self) {

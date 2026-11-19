@@ -250,8 +250,6 @@ pub(crate) fn clamp_params(p: &mut CcgParams) {
     let fin = |x: f32, lo: f32, hi: f32, d: f32| if x.is_finite() { x.clamp(lo, hi) } else { d };
     p.bin_ms = fin(p.bin_ms, 0.1, 1000.0, 1.0);
     p.window_ms = fin(p.window_ms, 1.0, 5000.0, 50.0).max(p.bin_ms);
-    // phy `:cr` accepts 0.1 to 100 ms.
-    p.refrac_ms = fin(p.refrac_ms, 0.1, 100.0, 2.0);
 }
 
 /// Top of the y axis: the cell's own max (per-cell) or the grid's (uniform),
@@ -327,12 +325,7 @@ fn chip(painter: &egui::Painter, pos: egui::Pos2, text: &str, bg: Color32) -> eg
 /// One row: window inline, the rest behind the gear.
 fn header(ui: &mut Ui, p: &mut CcgParams) {
     let caption = format!("ACG/CCG · {}", ccg_caption(p.window_ms, p.bin_ms));
-    let (window, bin, refrac, uniform) = (
-        &mut p.window_ms,
-        &mut p.bin_ms,
-        &mut p.refrac_ms,
-        &mut p.uniform,
-    );
+    let (window, bin, uniform) = (&mut p.window_ms, &mut p.bin_ms, &mut p.uniform);
     param_bar(
         ui,
         &caption,
@@ -352,14 +345,6 @@ fn header(ui: &mut Ui, p: &mut CcgParams) {
                     egui::DragValue::new(bin)
                         .speed(0.1)
                         .range(0.1..=1000.0)
-                        .suffix(" ms"),
-                );
-                ui.end_row();
-                ui.label("refractory");
-                ui.add(
-                    egui::DragValue::new(refrac)
-                        .speed(0.1)
-                        .range(0.1..=100.0)
                         .suffix(" ms"),
                 );
                 ui.end_row();
@@ -507,6 +492,7 @@ fn grid<P: DataProvider>(
     half: usize,
     n_real: usize,
 ) {
+    let refractory_ms = session.refractory().fixed_ms;
     let n = shown.len();
     let nb = data.counts[0][0].len();
     let bin_ms = data.bin_ms;
@@ -630,11 +616,11 @@ fn grid<P: DataProvider>(
             }
             let dp = painter.with_clip_rect(data_rect);
             let x_of = |ms: f32| data_rect.left() + (ms + ext) / (2.0 * ext) * data_rect.width();
-            // Refractory band (±refrac_ms) and the zero-lag line.
+            // Refractory band and the zero-lag line.
             dp.rect_filled(
                 egui::Rect::from_min_max(
-                    egui::pos2(x_of(-p.refrac_ms), data_rect.top()),
-                    egui::pos2(x_of(p.refrac_ms), data_rect.bottom()),
+                    egui::pos2(x_of(-refractory_ms.min(p.window_ms)), data_rect.top()),
+                    egui::pos2(x_of(refractory_ms.min(p.window_ms)), data_rect.bottom()),
                 ),
                 0.0,
                 band_fill(theme),
@@ -699,7 +685,7 @@ fn grid<P: DataProvider>(
             "Diagonal: autocorrelograms. Off-diagonal: cross-correlograms. \
              The shaded band is the ±{:.1} ms refractory period; the dark line is the \
              count expected from independent firing.{note}",
-            p.refrac_ms
+            refractory_ms
         )
     }));
 }
@@ -865,11 +851,10 @@ mod tests {
         let mut p = CcgParams {
             bin_ms: f32::NAN,
             window_ms: 0.0,
-            refrac_ms: 1e6,
             uniform: false,
         };
         clamp_params(&mut p);
-        assert_eq!((p.bin_ms, p.window_ms, p.refrac_ms), (1.0, 1.0, 100.0));
+        assert_eq!((p.bin_ms, p.window_ms), (1.0, 1.0));
         p.bin_ms = 20.0;
         p.window_ms = 5.0;
         clamp_params(&mut p);

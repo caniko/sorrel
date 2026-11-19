@@ -11,11 +11,13 @@ use crate::quality_ext::DEFAULT_K_NN;
 use anyhow::ensure;
 use anyhow::{bail, Result};
 use sorrel_cache::{CacheKey, CacheStore, Fingerprint};
+use sorrel_compute::RefractoryParams;
 use sorrel_io::{
     ClusterId, DataProvider, HasAmplitudes, HasPcFeatures, HasSpikeTemplates, HasTemplateWaveforms,
     SampleIndex,
 };
 use std::collections::{HashMap, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 
 const MAX_CACHE_INVALIDATIONS: usize = 1024;
@@ -140,6 +142,8 @@ pub type RecordSink = Box<dyn FnMut(&CurationCommand) + Send + Sync>;
 
 pub struct Session<P: DataProvider> {
     pub provider: P,
+    refractory: RefractoryParams,
+    refractory_revision: u64,
     /// Indexed by `ClusterId`. `P::Label` is `Copy + 'static`, so this is a
     /// flat, cache-friendly buffer (1 byte per cluster for `PhyLabel`).
     labels: Vec<P::Label>,
@@ -207,6 +211,8 @@ impl<P: DataProvider> Session<P> {
         let cluster_index = ClusterIndex::from_provider(&provider);
         Self {
             provider,
+            refractory: RefractoryParams::default(),
+            refractory_revision: 0,
             labels,
             tags,
             origins,
@@ -330,6 +336,27 @@ impl<P: DataProvider> Session<P> {
     #[inline]
     pub fn version(&self) -> u64 {
         self.key(self.head)
+    }
+
+    pub fn refractory(&self) -> &RefractoryParams {
+        &self.refractory
+    }
+
+    pub fn set_refractory(&mut self, params: RefractoryParams) -> std::result::Result<(), String> {
+        params.validate()?;
+        if self.refractory != params {
+            self.refractory = params;
+            self.refractory_revision = self.refractory_revision.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    /// Cache key for data that depends on the refractory settings as well as
+    /// curation state. Settings never change the journal's identity.
+    pub fn metrics_version(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        (self.version(), self.refractory_revision).hash(&mut hasher);
+        hasher.finish()
     }
 
     fn key(&self, node: Option<u64>) -> u64 {

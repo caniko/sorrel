@@ -13,6 +13,7 @@ use crate::views::{
 };
 use crate::widgets::TraceCache;
 use eframe::egui;
+use sorrel_compute::RefractoryParams;
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::SpikeDepths;
 use sorrel_data::{
@@ -790,6 +791,33 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             };
             self.apply_prefs(prefs, n, sr);
         }
+    }
+
+    /// Apply only the fields a Settings save changed, so values set by launch
+    /// flags or MCP for the other fields stay in force.
+    fn update_refractory(
+        &mut self,
+        old: RefractoryParams,
+        new: RefractoryParams,
+    ) -> Result<(), String> {
+        self.suggest_cache.cancel();
+        let mut session = write(&self.session);
+        let mut params = *session.refractory();
+        for (o, n, field) in [
+            (old.fixed_ms, new.fixed_ms, &mut params.fixed_ms),
+            (old.sweep_min_ms, new.sweep_min_ms, &mut params.sweep_min_ms),
+            (old.sweep_max_ms, new.sweep_max_ms, &mut params.sweep_max_ms),
+            (
+                old.sweep_step_ms,
+                new.sweep_step_ms,
+                &mut params.sweep_step_ms,
+            ),
+        ] {
+            if o != n {
+                *field = n;
+            }
+        }
+        session.set_refractory(params)
     }
 
     /// Write the phy artifacts into `dir`, dropping stale derived-cache
@@ -2713,7 +2741,11 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
             rt.shell_owned
         };
         if !shell_owned {
-            crate::settings::show(&ctx);
+            if let Some((old, new)) = crate::settings::show(&ctx) {
+                if let Err(err) = self.update_refractory(old, new) {
+                    log::warn!("refractory settings not applied: {err}");
+                }
+            }
         }
     }
 
@@ -2729,6 +2761,14 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
 }
 
 impl<P: DataProvider + ApplyPhyLabel> crate::shell::Tab for SorrelApp<P> {
+    fn update_refractory(
+        &mut self,
+        old: RefractoryParams,
+        new: RefractoryParams,
+    ) -> Result<(), String> {
+        SorrelApp::update_refractory(self, old, new)
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         eframe::App::ui(self, ui, frame);
     }

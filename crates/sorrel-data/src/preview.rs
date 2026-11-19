@@ -20,7 +20,6 @@ use crate::session::Session;
 use sorrel_compute::{isolation_metrics, quality_breakdown, IsolationMetrics, QualityBreakdown};
 use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 
-const REFRACTORY_SECONDS: f32 = 0.0015;
 const PRESENCE_BINS: usize = 50;
 
 /// Preview the result of merging `sources` into `target`. Returns the
@@ -32,7 +31,7 @@ pub fn preview_merge<P: DataProvider>(
     target: ClusterId,
 ) -> MergePreview {
     let sr = session.provider.sample_rate().max(1.0);
-    let refractory_samples = (sr * REFRACTORY_SECONDS).round() as u64;
+    let refractory_samples = session.refractory().fixed_samples(sr);
     let total_duration = session.provider.n_samples();
 
     // Pre-merge target breakdown (session-level so isolation is included).
@@ -93,7 +92,7 @@ pub fn preview_split<P: DataProvider>(
     inside_local: &[u32],
 ) -> SplitPreview {
     let sr = session.provider.sample_rate().max(1.0);
-    let refractory_samples = (sr * REFRACTORY_SECONDS).round() as u64;
+    let refractory_samples = session.refractory().fixed_samples(sr);
     let total = session.provider.n_samples().0;
     let times = session.spike_times(cluster);
     let amps = session.spike_amplitudes(cluster);

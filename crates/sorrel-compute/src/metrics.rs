@@ -210,9 +210,8 @@ pub fn isi_violation_rate(
 /// The estimator inverts the expected-violation relation
 /// `N_viol = 2·t_ref·N²·f_p·(1−f_p) / T` (Hill et al. 2011, J. Neurosci.
 /// 31:8699). We use the small-contamination linearisation
-/// `f_p ≈ N_viol·T / (2·t_ref·N²)`; the full quadratic has no real root once
-/// the observed violation count implies `f_p > 0.5`, in which case the unit
-/// is at least half contaminated and we saturate to `1.0`.
+/// `f_p ≈ N_viol·T / (2·t_ref·N²)` and clamp the result to `[0, 1]`;
+/// we do not solve the full quadratic or apply a separate saturation cutoff.
 ///
 /// Note the `N²` denominator: `N_viol` grows with the number of spike *pairs*,
 /// so the contamination *fraction* normalises by `N²`, not `N`. The `N²` term
@@ -238,19 +237,108 @@ pub fn refractory_contamination(
     }
     // Hill 2011 linearised false-positive fraction: N_viol·T / (2·t_ref·N²).
     let f_p = viol * total_s / (2.0 * rp_s * n * n);
-    // f_p > 0.5 means the quadratic has no real root → at least half
-    // contaminated; clamp to the valid [0, 1] fraction range.
     (f_p as f32).clamp(0.0, 1.0)
 }
 
-/// Llobet et al. (2022) sliding-refractory minimum contamination.
+/// Refractory-period windows in milliseconds. The default fixed window comes
+/// from SpikeInterface's `compute_isi_violations` (1.5 ms). The default sweep
+/// follows SpikeInterface's `compute_sliding_rp_violations` (0.25 ms steps,
+/// excluding windows <= 0.5 ms, up to 10 ms), consistent with IBL/Steinmetz
+/// slidingRP (Roth et al., 2026 preprint). Bombcell's `qualityParamValues.m`
+/// uses a stricter 1 ms first window; set the exclusive minimum to 0.75 ms
+/// with a 0.25 ms step to match that grid. These are defaults only, not an
+/// implementation of the upstream statistical tests.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct RefractoryParams {
+    pub fixed_ms: f32,
+    /// Exclusive lower bound; the first window is `sweep_min_ms + sweep_step_ms`.
+    pub sweep_min_ms: f32,
+    /// Inclusive upper bound; only tested if it falls on the grid.
+    pub sweep_max_ms: f32,
+    pub sweep_step_ms: f32,
+}
+
+impl Default for RefractoryParams {
+    fn default() -> Self {
+        Self {
+            fixed_ms: 1.5,
+            sweep_min_ms: 0.5,
+            sweep_max_ms: 10.0,
+            sweep_step_ms: 0.25,
+        }
+    }
+}
+
+impl RefractoryParams {
+    pub fn fixed_samples(&self, sr: f32) -> u64 {
+        (f64::from(self.fixed_ms) * f64::from(sr) / 1000.0).round() as u64
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some((name, _)) = [
+            ("fixed_ms", self.fixed_ms),
+            ("sweep_min_ms", self.sweep_min_ms),
+            ("sweep_max_ms", self.sweep_max_ms),
+            ("sweep_step_ms", self.sweep_step_ms),
+        ]
+        .into_iter()
+        .find(|(_, value)| !value.is_finite() || *value <= 0.0)
+        {
+            return Err(format!("{name} must be finite and greater than zero"));
+        }
+        if self.sweep_min_ms >= self.sweep_max_ms {
+            return Err("sweep_min_ms must be less than sweep_max_ms".into());
+        }
+        if !(1..=1000).contains(&self.window_count()) {
+            return Err("refractory sweep must contain between 1 and 1000 windows".into());
+        }
+        Ok(())
+    }
+
+    fn window_count(&self) -> usize {
+        let n = (f64::from(self.sweep_max_ms) - f64::from(self.sweep_min_ms))
+            / f64::from(self.sweep_step_ms);
+        // Snap within 1e-3 of a step so decimal f32 inputs (0.1 .. 0.9 by 0.1)
+        // keep an on-grid maximum; `windows` clamps the last one to the max.
+        (n + 1e-3).floor() as usize
+    }
+
+    fn window_ms(&self, k: usize) -> f64 {
+        f64::from(self.sweep_min_ms) + k as f64 * f64::from(self.sweep_step_ms)
+    }
+
+    fn windows(&self, sr: f32) -> impl Iterator<Item = u64> + '_ {
+        (1..=self.window_count()).map(move |k| {
+            let ms = self.window_ms(k).min(f64::from(self.sweep_max_ms));
+            (ms * f64::from(sr) / 1000.0).round() as u64
+        })
+    }
+
+    /// Minimise the linearised Hill estimate over the configured grid, rounded
+    /// to samples. Ties prefer the longest window. Returns `(0.0, 0)` for an
+    /// invalid grid or insufficient data.
+    pub fn sweep(&self, times: &[SampleIndex], total_samples: u64, sr: f32) -> (f32, u64) {
+        if !sr.is_finite() || sr <= 0.0 || self.validate().is_err() {
+            return (0.0, 0);
+        }
+        refractory_argmin(
+            times,
+            self.windows(sr).filter(|&rp| rp > 0),
+            total_samples,
+            sr,
+        )
+    }
+}
+
+/// Minimum of the linearised Hill estimate over a grid of refractory windows.
 ///
 /// The true biological refractory period of a unit is unknown and varies, so
 /// estimating contamination at a single fixed window is fragile. This sweeps
 /// a range of candidate refractory periods `[min, max]` in `n_steps` and
-/// returns the **smallest** Hill false-positive fraction across them — the
-/// most likely true contamination, since the window that best matches the
-/// unit's real refractory period yields the cleanest (lowest) estimate.
+/// returns the **smallest** Hill false-positive fraction across them. This
+/// heuristic is biased low because short windows without violations win.
+/// It is neither the Llobet et al. (2022) estimator nor the IBL sliding-RP test.
 ///
 /// Returns 0 when there are too few spikes or the window range is degenerate.
 /// The result is the same `[0, 1]` fraction as [`refractory_contamination`].
@@ -274,9 +362,10 @@ pub fn min_contamination_sliding_refractory(
 }
 
 /// [`min_contamination_sliding_refractory`] plus the window (samples) that
-/// attains it. Ties resolve to the **longest** such window: a clean unit is
-/// contamination-free up to its true refractory period, so this estimates
-/// it. `(0.0, 0)` in the degenerate cases.
+/// attains it. Ties resolve to the **longest** such window. This is a grid
+/// minimum of the linearised Hill estimate, not a sliding-RP statistical test
+/// or an unbiased estimate of the true refractory period. `(0.0, 0)` in
+/// degenerate cases.
 pub fn sliding_refractory_argmin(
     spike_times: &[SampleIndex],
     min_refractory_samples: u64,
@@ -285,24 +374,33 @@ pub fn sliding_refractory_argmin(
     total_duration_samples: u64,
     sample_rate: f32,
 ) -> (f32, u64) {
-    if spike_times.len() < 2
-        || n_steps == 0
-        || total_duration_samples == 0
-        || max_refractory_samples < min_refractory_samples
-        || max_refractory_samples == 0
-    {
+    if max_refractory_samples < min_refractory_samples || max_refractory_samples == 0 {
         return (0.0, 0);
     }
     let lo = min_refractory_samples.max(1);
     let hi = max_refractory_samples.max(lo);
-    let (mut min_contam, mut best_rp) = (f32::INFINITY, 0);
-    for step in 0..n_steps {
+    let windows = (0..n_steps).map(|step| {
         // Linearly spaced refractory windows from lo to hi (inclusive).
-        let rp = if n_steps == 1 {
+        if n_steps == 1 {
             hi
         } else {
             lo + ((hi - lo) * step as u64) / (n_steps as u64 - 1)
-        };
+        }
+    });
+    refractory_argmin(spike_times, windows, total_duration_samples, sample_rate)
+}
+
+fn refractory_argmin(
+    spike_times: &[SampleIndex],
+    windows: impl Iterator<Item = u64>,
+    total_duration_samples: u64,
+    sample_rate: f32,
+) -> (f32, u64) {
+    if spike_times.len() < 2 || total_duration_samples == 0 {
+        return (0.0, 0);
+    }
+    let (mut min_contam, mut best_rp) = (f32::INFINITY, 0);
+    for rp in windows {
         let c = refractory_contamination(spike_times, rp, total_duration_samples, sample_rate);
         if c <= min_contam {
             (min_contam, best_rp) = (c, rp);
@@ -387,6 +485,79 @@ pub fn fraction_below(amps: &[f32], threshold: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_refractory_grid_at_30_khz() {
+        let params = RefractoryParams::default();
+        assert_eq!(params.fixed_samples(30_000.0), 45);
+        assert_eq!(params.validate(), Ok(()));
+        let expected: Vec<_> = (3_u64..=40)
+            .map(|quarter_ms| (15 * quarter_ms).div_ceil(2))
+            .collect();
+        assert_eq!(expected.len(), 38);
+        assert_eq!(params.windows(30_000.0).collect::<Vec<_>>(), expected);
+        assert_eq!(params.sweep(&si([0, 300, 600]), 900, 30_000.0), (0.0, 300));
+        assert_eq!(params.sweep(&[], 900, 30_000.0), (0.0, 0));
+    }
+
+    #[test]
+    fn rejects_invalid_refractory_params() {
+        let d = RefractoryParams::default();
+        for p in [
+            RefractoryParams {
+                sweep_min_ms: d.sweep_max_ms,
+                ..d
+            },
+            RefractoryParams {
+                sweep_min_ms: d.sweep_max_ms + 1.0,
+                ..d
+            },
+            RefractoryParams {
+                sweep_step_ms: 0.0,
+                ..d
+            },
+            RefractoryParams {
+                sweep_step_ms: -1.0,
+                ..d
+            },
+            RefractoryParams {
+                fixed_ms: f32::NAN,
+                ..d
+            },
+            RefractoryParams {
+                sweep_step_ms: 0.001,
+                ..d
+            },
+            RefractoryParams {
+                sweep_step_ms: 20.0,
+                ..d
+            },
+        ] {
+            assert!(p.validate().is_err(), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn decimal_refractory_step_includes_rounded_endpoint() {
+        let params = RefractoryParams {
+            sweep_step_ms: 0.1,
+            ..Default::default()
+        };
+        assert_eq!(params.windows(30_000.0).count(), 95);
+        assert_eq!(params.windows(30_000.0).last(), Some(300));
+        let short = RefractoryParams {
+            sweep_min_ms: 0.1,
+            sweep_step_ms: 0.1,
+            sweep_max_ms: 0.9,
+            ..Default::default()
+        };
+        assert_eq!(short.windows(30_000.0).count(), 8);
+        assert_eq!(short.windows(30_000.0).last(), Some(27));
+        let off_grid = RefractoryParams {
+            sweep_max_ms: 0.95,
+            ..short
+        };
+        assert_eq!(off_grid.windows(30_000.0).last(), Some(27));
+    }
     use super::*;
 
     fn si<const N: usize>(xs: [u64; N]) -> [SampleIndex; N] {

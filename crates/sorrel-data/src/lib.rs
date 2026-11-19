@@ -31,6 +31,7 @@ pub mod proposers;
 pub mod qc_export;
 pub mod quality_ext;
 pub mod raw_waveform;
+mod refractory;
 pub mod report;
 pub mod robust_cleanup;
 pub mod rules;

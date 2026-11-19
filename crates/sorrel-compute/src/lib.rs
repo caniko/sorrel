@@ -44,6 +44,7 @@ pub use metrics::{
     amplitude_snr, auto_correlogram, ccg_baseline, correlograms, cross_correlogram, fraction_below,
     isi_violation_rate, isi_violations, mean_amplitude, min_contamination_sliding_refractory,
     presence_ratio, refractory_contamination, sliding_refractory_argmin, std_amplitude,
+    RefractoryParams,
 };
 pub use metrics_iso::{
     isolation_metrics, lda_d_prime, nn_isolation_metric, simplified_silhouette, IsolationMetrics,
