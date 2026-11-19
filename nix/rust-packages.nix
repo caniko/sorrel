@@ -44,6 +44,9 @@
           buildInputs = buildInputs ++ [hdf5C];
           HDF5_DIR = "${hdf5C}";
           cargoExtraArgs = "-p sorrel --locked --features hdf5";
+          # Its NWB tests read release/fixtures, which this source omits; they
+          # run in checks.hdf5-tests.
+          doCheck = false;
           nativeBuildInputs = nativeBuildInputs ++ [pkgs.installShellFiles];
           postInstall = completions;
           postFixup = rpathFixup;

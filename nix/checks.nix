@@ -73,7 +73,11 @@ in
         buildInputs = commonArgs.buildInputs ++ [hdf5C];
         HDF5_DIR = "${hdf5C}";
         # sorrel-data's other tests already run in workspace-tests.
-        cargoNextestExtraArgs = "-p sorrel-io -p sorrel-data --features sorrel-io/hdf5,sorrel-data/hdf5 --no-fail-fast -E 'package(sorrel-io) | binary(nwb_curation)'";
+        cargoNextestExtraArgs = "-p sorrel-io -p sorrel-data -p sorrel --features sorrel-io/hdf5,sorrel-data/hdf5,sorrel/hdf5 --no-fail-fast -E 'package(sorrel-io) | binary(nwb_curation) | (package(sorrel) & test(nwb))'";
+        preCheck = ''
+          export HOME=$(mktemp -d)
+          export XDG_RUNTIME_DIR=$HOME
+        '';
       });
 
     # `sorrel dev ...` (bench, learn) and the bench results DB live behind the
