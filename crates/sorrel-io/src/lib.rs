@@ -45,4 +45,4 @@ pub use spikeglx::SpikeGlxMeta;
 #[cfg(feature = "hdf5")]
 pub use ks4_rez::{Ks4RezOpenParams, Ks4RezProvider};
 #[cfg(feature = "hdf5")]
-pub use nwb::NwbProvider;
+pub use nwb::{NwbOpenParams, NwbProvider};

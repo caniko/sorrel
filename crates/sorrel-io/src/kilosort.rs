@@ -1500,7 +1500,7 @@ pub fn read_annotations_tsv(path: &Path) -> Vec<UnitAnnotation> {
 
 /// The sorter name an `Auto[<sorter>]` row pins (first one wins). A saved
 /// `Auto[unknown]` pins nothing, so a later `--sorter` or detection can fill it.
-fn pinned_sorter(rows: &[UnitAnnotation]) -> Option<String> {
+pub(crate) fn pinned_sorter(rows: &[UnitAnnotation]) -> Option<String> {
     rows.iter().find_map(|r| {
         let inner = r.origin.strip_prefix("Auto[")?.strip_suffix(']')?;
         (!inner.is_empty() && inner != "unknown").then(|| inner.to_string())

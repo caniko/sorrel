@@ -28,9 +28,11 @@ from pathlib import Path
 
 import numpy as np
 from hdmf.backends.hdf5.h5_utils import H5DataIO
+from hdmf.common import VectorData, VectorIndex
 from pynwb import NWBFile, NWBHDF5IO, get_class, load_namespaces
 from pynwb.base import TimeSeries
-from pynwb.ecephys import ElectricalSeries
+from pynwb.ecephys import ElectricalSeries, FilteredEphys
+from pynwb.misc import Units
 from pynwb.spec import NWBGroupSpec, NWBNamespaceBuilder
 
 OUT = Path(__file__).resolve().parent
@@ -44,8 +46,8 @@ REL_Y = [0.0, 20.0, 0.0, 20.0, 0.0, 20.0]
 UNITS = [(5, [0.6, 0.7, 0.75]), (7, []), (9, [0.55, 0.79])]
 
 
-def make_file(identifier):
-    """NWBFile with the shared Device, ElectrodeGroup, electrodes and units."""
+def make_file(identifier, *, units=True, electrodes=True, resolution=None):
+    """NWBFile with optional electrodes and units."""
     nwbfile = NWBFile(
         session_description="sorrel NWB reader fixture",
         identifier=identifier,
@@ -53,6 +55,13 @@ def make_file(identifier):
         file_create_date=[FILE_CREATE],
         session_id="sorrel-fixture",
     )
+    if units:
+        if resolution is not None:
+            nwbfile.units = Units(name="units", resolution=resolution)
+        for unit_id, spike_times in UNITS:
+            nwbfile.add_unit(id=unit_id, spike_times=spike_times)
+    if not electrodes:
+        return nwbfile
     device = nwbfile.create_device(name="Device")
     group = nwbfile.create_electrode_group(
         name="ElectrodeGroup",
@@ -73,16 +82,16 @@ def make_file(identifier):
             rel_x=REL_X[i],
             rel_y=REL_Y[i],
         )
-    for unit_id, spike_times in UNITS:
-        nwbfile.add_unit(id=unit_id, spike_times=spike_times)
     return nwbfile
 
 
-def add_series(nwbfile, data, name="ElectricalSeriesRaw", **kwargs):
+def make_series(nwbfile, data, name="ElectricalSeriesRaw", **kwargs):
     region = nwbfile.create_electrode_table_region(CHANNEL_REGION, "permuted subset")
-    nwbfile.add_acquisition(
-        ElectricalSeries(name=name, data=data, electrodes=region, **kwargs)
-    )
+    return ElectricalSeries(name=name, data=data, electrodes=region, **kwargs)
+
+
+def add_series(nwbfile, data, **kwargs):
+    nwbfile.add_acquisition(make_series(nwbfile, data, **kwargs))
 
 
 def good_data():
@@ -138,17 +147,84 @@ def write_dtype(dtype, value):
     write(nwbfile, f"{dtype}.nwb")
 
 
-def write_timestamps():
-    nwbfile = make_file("sorrel-fixture-timestamps")
+def write_timestamps(irregular=False):
+    name = "irregular_timestamps" if irregular else "timestamps"
+    nwbfile = make_file(f"sorrel-fixture-{name}")
+    timestamps = 0.5 + np.arange(N_SAMPLES) / 1000.0
+    if irregular:
+        timestamps[197] += 1e-4
     add_series(
         nwbfile,
         good_data(),
-        timestamps=0.5 + np.arange(N_SAMPLES) / 1000.0,
+        timestamps=timestamps,
         conversion=0.195e-6,
         offset=-2e-6,
         channel_conversion=[1.0, 2.0, 1.0, 0.5],
     )
-    write(nwbfile, "timestamps.nwb")
+    write(nwbfile, f"{name}.nwb")
+
+
+def write_multiple_series():
+    nwbfile = make_file("sorrel-fixture-multiple-series", resolution=0.001)
+    for name, value in [("Z_second", 2), ("A_first", 1)]:
+        add_series(nwbfile, np.full((N_SAMPLES, N_CHANNELS), value, dtype=np.int16),
+                   name=name, rate=1000.0, starting_time=0.5, conversion=1e-6)
+    processed = make_series(
+        nwbfile, np.full((N_SAMPLES, N_CHANNELS), 3, dtype=np.int16),
+        name="Processed", rate=1000.0, starting_time=0.5, conversion=1e-6,
+    )
+    module = nwbfile.create_processing_module("ecephys", "Processed ephys")
+    filtered = FilteredEphys()
+    module.add(filtered)
+    filtered.add_electrical_series(processed)
+    write(nwbfile, "multiple_series.nwb")
+
+
+def write_units_and_raw():
+    units = make_file("sorrel-fixture-units-only", resolution=0.001)
+    units.add_trial(start_time=0.6, stop_time=0.7)
+    write(units, "units_only.nwb")
+    raw = make_file("sorrel-fixture-raw-only", units=False)
+    add_series(raw, good_data(), rate=1000.0, starting_time=0.5, conversion=1e-6)
+    write(raw, "raw_only.nwb")
+
+
+def write_curated_units():
+    """Use the same Units column layout as sorrel.nwb.add_units_to_nwbfile."""
+    nwbfile = make_file("sorrel-fixture-curated", units=False, electrodes=False)
+
+    def ragged(name, rows, dtype, doc):
+        data = VectorData(name=name, description=doc,
+                          data=np.array([x for row in rows for x in row], dtype=dtype))
+        index = VectorIndex(name=f"{name}_index", target=data,
+                            data=np.cumsum([len(row) for row in rows], dtype=np.int64))
+        return [data, index]
+
+    nwbfile.units = Units(name="units", id=[9, 5], resolution=1.0 / 1000.0, columns=[
+        *ragged("spike_times", [[0.55, 0.79], [0.6, 0.7, 0.75]], np.float64,
+                "Spike times in seconds: sample_index / sample_rate + starting_time."),
+        VectorData(name="quality", description="Sorrel curation label: good, mua, noise or unsorted.",
+                   data=["mua", "good"]),
+        VectorData(name="origin", description="How the unit was made", data=["Auto[kilosort4]", "Sorrel[Manual]"]),
+        *ragged("parent_unit_ids", [[], [9, 77]], np.int64, "Unit ids this unit came from in Sorrel"),
+        *ragged("tags", [[], ["split", "review:waveform"]], str, "Sorrel tags"),
+        VectorData(name="unit_name", description="The sorter's unit id (SpikeInterface unit_ids) when it is not an integer.",
+                   data=["007", "unit_a"]),
+        VectorData(name="n_spikes", description="Sorrel QC metric. Number of spikes assigned to the cluster after curation edits (count); 0 for an empty cluster.",
+                   data=[2, 3]),
+        VectorData(name="l_ratio", description="Sorrel QC metric. Mean chi-squared survival (df = 3 PCs) of background spikes' Mahalanobis squared distances divided by n_in; lower is better; NaN with fewer than 50 spikes or no PC features.",
+                   data=[float("nan"), 0.25]),
+    ])
+    write(nwbfile, "curated_units.nwb")
+
+
+def write_foreign_quality():
+    nwbfile = make_file("sorrel-fixture-quality", units=False, electrodes=False)
+    for name in ["quality", "KSLabel", "unrelated_number"]:
+        nwbfile.add_unit_column(name=name, description=f"Foreign {name}")
+    for (idx, times), quality, ks in zip(UNITS, [" GOOD ", "ambiguous", "unknown"], ["mua", "NoIsE", "???"]):
+        nwbfile.add_unit(id=idx, spike_times=times, quality=quality, KSLabel=ks, unrelated_number=3.5)
+    write(nwbfile, "foreign_quality.nwb")
 
 
 def write_not_electrical():
@@ -206,6 +282,11 @@ def main():
     ]:
         write_dtype(dtype, value)
     write_timestamps()
+    write_timestamps(irregular=True)
+    write_multiple_series()
+    write_units_and_raw()
+    write_curated_units()
+    write_foreign_quality()
     write_not_electrical()
     write_subtype()
 

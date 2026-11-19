@@ -78,7 +78,7 @@ impl Events {
                 Self::parse_csv(&text)?
             }
             #[cfg(feature = "hdf5")]
-            "nwb" => Self::read_nwb_trials(path)?,
+            "nwb" => crate::nwb::read_trials(path)?,
             other => bail!("{}: unsupported events file type {other:?}", path.display()),
         };
         // Keep (time, label) pairs together while sorting by time.
@@ -117,7 +117,7 @@ impl Events {
         Ok(ev)
     }
 
-    fn push(&mut self, t: f64, name: &str) {
+    pub(crate) fn push(&mut self, t: f64, name: &str) {
         let idx = match self.names.iter().position(|x| x == name) {
             Some(i) => i,
             None => {
@@ -127,35 +127,6 @@ impl Events {
         };
         self.times_s.push(t);
         self.label.push(idx as u16);
-    }
-
-    #[cfg(feature = "hdf5")]
-    fn read_nwb_trials(path: &Path) -> Result<Self> {
-        use hdf5_metno::types::{VarLenAscii, VarLenUnicode};
-        let f =
-            hdf5_metno::File::open(path).with_context(|| format!("open NWB {}", path.display()))?;
-        let g = f
-            .group("intervals/trials")
-            .with_context(|| format!("{}: no /intervals/trials table", path.display()))?;
-        let starts: Vec<f64> = g.dataset("start_time")?.read_raw()?;
-        let names: Option<Vec<String>> = ["trial_type", "stimulus", "condition"]
-            .iter()
-            .filter_map(|c| g.dataset(c).ok())
-            .find_map(|ds| {
-                ds.read_raw::<VarLenUnicode>()
-                    .map(|v| v.iter().map(|s| s.to_string()).collect())
-                    .or_else(|_| {
-                        ds.read_raw::<VarLenAscii>()
-                            .map(|v| v.iter().map(|s| s.to_string()).collect())
-                    })
-                    .ok()
-            })
-            .filter(|n: &Vec<String>| n.len() == starts.len());
-        let mut ev = Self::default();
-        for (i, &t) in starts.iter().enumerate() {
-            ev.push(t, names.as_ref().map_or("trial", |n| n[i].as_str()));
-        }
-        Ok(ev)
     }
 }
 

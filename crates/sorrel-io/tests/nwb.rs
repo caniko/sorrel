@@ -2,15 +2,21 @@
 //! (`release/fixtures/nwb/generate.py`).
 #![cfg(feature = "hdf5")]
 
-use sorrel_io::{ChannelId, ClusterId, DataProvider, HasGeometry, NwbProvider, SampleIndex};
+use sorrel_io::kilosort::PhyLabel;
+use sorrel_io::{
+    ChannelId, ClusterId, DataProvider, HasGeometry, HasQualityMetrics, NwbOpenParams, NwbProvider,
+    SampleIndex,
+};
 use std::path::PathBuf;
 
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../release/fixtures/nwb")
+        .join(name)
+}
+
 fn open(name: &str) -> anyhow::Result<NwbProvider> {
-    NwbProvider::open(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../release/fixtures/nwb")
-            .join(name),
-    )
+    NwbProvider::open(fixture(name))
 }
 
 fn open_err(name: &str) -> String {
@@ -114,6 +120,184 @@ fn rejects_what_it_cannot_read_faithfully() {
     assert!(e.contains("ElectricalSeries"), "{e}");
     let e = open_err("uint64.nwb");
     assert!(e.contains("uint64"), "{e}");
-    let e = open_err("timestamps.nwb");
-    assert!(e.contains("timestamps"), "{e}");
+    let e = open_err("irregular_timestamps.nwb");
+    assert!(
+        e.contains("irregular timestamps") && e.contains("197"),
+        "{e}"
+    );
+}
+
+#[test]
+fn timestamps_supply_the_same_time_base_as_starting_time() {
+    let p = open("timestamps.nwb").unwrap();
+    let good = open("good.nwb").unwrap();
+    assert_eq!(p.sample_rate(), 1000.0);
+    assert_eq!(p.spike_times(ClusterId(0)), good.spike_times(ClusterId(0)));
+    assert_eq!(frame(&p, 7), frame(&good, 7));
+}
+
+#[test]
+fn series_selection_prefers_acquisition_and_lists_available_paths() {
+    let path = fixture("multiple_series.nwb");
+    let default = NwbProvider::open(&path).unwrap();
+    assert_eq!(frame(&default, 0), [1.0; 4]);
+    for (series, value) in [
+        ("A_first", 1.0),
+        ("Z_second", 2.0),
+        ("/acquisition/Z_second", 2.0),
+        ("/processing/ecephys/FilteredEphys/Processed", 3.0),
+    ] {
+        let p = NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                series: Some(series),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(frame(&p, 0), [value; 4]);
+        assert_eq!(p.identity_bytes() == default.identity_bytes(), value == 1.0);
+    }
+    let err = NwbProvider::open_with(
+        &path,
+        NwbOpenParams {
+            series: Some("Processed"),
+            ..Default::default()
+        },
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    for path in [
+        "/acquisition/A_first",
+        "/acquisition/Z_second",
+        "/processing/ecephys/FilteredEphys/Processed",
+    ] {
+        assert!(err.contains(path), "{err}");
+    }
+}
+
+#[test]
+fn units_only_have_no_trace_and_use_resolution_or_sample_rate() {
+    let p = open("units_only.nwb").unwrap();
+    assert_eq!(p.sample_rate(), 1000.0);
+    assert_eq!(p.n_samples(), SampleIndex(0));
+    assert_eq!(p.channel_map(), (10..16).map(ChannelId).collect::<Vec<_>>());
+    assert_eq!(p.channel_positions()[3], [16.0, 20.0]);
+    assert_eq!(p.spike_times(ClusterId(0))[0], SampleIndex(600));
+    let window = p.trace(SampleIndex(12), 10);
+    assert_eq!(window.n_channels, 6);
+    assert_eq!(window.start, SampleIndex(12));
+    assert!(window.samples.is_empty());
+    let err = open_err("not_electrical.nwb");
+    assert!(err.contains("--sample-rate"), "{err}");
+    let p = NwbProvider::open_with(
+        fixture("not_electrical.nwb"),
+        NwbOpenParams {
+            sample_rate: Some(2000.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(p.spike_times(ClusterId(0))[0], SampleIndex(1200));
+}
+
+#[test]
+fn paired_raw_uses_its_series_channels_and_time_base() {
+    let raw = fixture("raw_only.nwb");
+    let p = NwbProvider::open_with(
+        fixture("units_only.nwb"),
+        NwbOpenParams {
+            raw_path: Some(&raw),
+            series: Some("ElectricalSeriesRaw"),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(p.sample_rate(), 1000.0);
+    assert_eq!(p.n_samples(), SampleIndex(300));
+    assert_eq!(
+        p.channel_map(),
+        [ChannelId(13), ChannelId(10), ChannelId(15), ChannelId(11)]
+    );
+    assert_eq!(p.spike_times(ClusterId(0))[0], SampleIndex(100));
+    assert_eq!(frame(&p, 0), [-100.0; 4]);
+    assert!(open_err("raw_only.nwb").contains("/units"));
+
+    let err = NwbProvider::open_with(
+        fixture("not_electrical.nwb"),
+        NwbOpenParams {
+            raw_path: Some(&raw),
+            sample_rate: Some(2000.0),
+            ..Default::default()
+        },
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(
+        err.contains("rate mismatch") && err.contains("2000") && err.contains("1000"),
+        "{err}"
+    );
+    let err = NwbProvider::open_with(
+        fixture("units_only.nwb"),
+        NwbOpenParams {
+            raw_path: Some(&fixture("not_electrical.nwb")),
+            ..Default::default()
+        },
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(err.contains("available series: none"), "{err}");
+}
+
+#[test]
+fn reads_python_export_metadata_by_unit_row() {
+    let p = open("curated_units.nwb").unwrap();
+    assert_eq!(p.n_channels(), 0);
+    assert_eq!(p.initial_labels(), [PhyLabel::Mua, PhyLabel::Good]);
+    assert_eq!(
+        p.initial_tags(),
+        [
+            vec![],
+            vec!["split".to_string(), "review:waveform".to_string()]
+        ]
+    );
+    assert_eq!(p.sorter().as_deref(), Some("kilosort4"));
+    let annotations = p.initial_annotations();
+    assert_eq!(annotations[0].origin, "Auto[kilosort4]");
+    assert_eq!(annotations[1].origin, "Sorrel[Manual]");
+    assert_eq!(
+        annotations[1].parents,
+        [ClusterId(0)],
+        "parent 77 has no row"
+    );
+    assert_eq!(p.unit_id(ClusterId(1)), 5);
+    assert_eq!(p.unit_id_json(ClusterId(0)), serde_json::json!("007"));
+    assert_eq!(p.unit_id_json(ClusterId(1)), serde_json::json!("unit_a"));
+    assert_eq!(p.unit_id_json(ClusterId(2)), serde_json::json!("10"));
+    assert_eq!(p.metric_names(), ["l_ratio", "n_spikes"]);
+    assert_eq!(p.metric_values("n_spikes").unwrap(), [2.0, 3.0]);
+    let l_ratio = p.metric_values("l_ratio").unwrap();
+    assert!(l_ratio[0].is_nan());
+    assert_eq!(l_ratio[1], 0.25);
+}
+
+#[test]
+fn accepts_recognized_foreign_labels_without_guessing_other_columns() {
+    let p = NwbProvider::open_with(
+        fixture("foreign_quality.nwb"),
+        NwbOpenParams {
+            sample_rate: Some(1000.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        p.initial_labels(),
+        [PhyLabel::Good, PhyLabel::Noise, PhyLabel::Unsorted]
+    );
+    assert!(p.metric_names().is_empty());
+    assert_eq!(p.unit_id_json(ClusterId(0)), serde_json::json!(5));
 }

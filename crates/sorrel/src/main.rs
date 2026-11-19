@@ -455,12 +455,16 @@ struct OpenArgs {
     /// kilosort | sorting-analyzer | nwb | ks4-rez (auto-detected by default)
     #[arg(long, value_name = "NAME", value_parser = parse_backend)]
     backend: Option<Backend>,
-    /// Raw recording (overrides params.py:dat_path)
+    /// Raw recording (overrides params.py:dat_path, or pairs NWB units with a raw NWB)
     #[arg(long, value_name = "PATH")]
     dat: Option<PathBuf>,
-    /// Overrides params.py:sample_rate
+    /// Overrides params.py:sample_rate, or provides the rate for NWB units without resolution
     #[arg(long, value_name = "Hz")]
-    sample_rate: Option<f32>,
+    sample_rate: Option<f64>,
+    /// NWB ElectricalSeries name under /acquisition or absolute HDF5 path
+    #[cfg(feature = "hdf5")]
+    #[arg(long, value_name = "PATH|NAME")]
+    nwb_series: Option<String>,
     /// Overrides params.py:n_channels_dat
     #[arg(long = "channels", value_name = "N")]
     n_channels: Option<u32>,
@@ -655,6 +659,8 @@ struct OpenCtx<P: DataProvider> {
     /// Per-cluster quality metrics (KS `cluster_*.tsv`, SI `quality_metrics.csv`);
     /// empty when the backend has none.
     metrics: sorrel_io::QualityMetrics,
+    /// NWB session-clock offset for the PSTH's trials; CSV/NPY are already relative.
+    nwb_start_time: f64,
     /// Per-spike depth for the drift map; needs PC features + geometry, so
     /// only the phy backend provides it (`sorrel_data::spike_depths`).
     depth_source: Option<sorrel_ui::app::DepthFn<P>>,
@@ -687,7 +693,7 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
     match backend {
         Backend::Kilosort => {
             let mut params = KilosortOpenParams {
-                sample_rate: open.sample_rate,
+                sample_rate: open.sample_rate.map(|r| r as f32),
                 n_channels: open.n_channels,
                 dtype: open.dtype,
                 offset: open.offset,
@@ -718,6 +724,7 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
                     positions,
                     shanks,
                     metrics,
+                    nwb_start_time: 0.0,
                     depth_source: None,
                 },
             )
@@ -725,9 +732,20 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
         #[cfg(feature = "hdf5")]
         Backend::Nwb => {
             let path = open.root().to_path_buf();
-            let provider = sorrel_io::NwbProvider::open(&path)?;
-            let (session, ctx) =
+            let provider = sorrel_io::NwbProvider::open_with(
+                &path,
+                sorrel_io::NwbOpenParams {
+                    series: open.nwb_series.as_deref(),
+                    raw_path: open.dat.as_deref(),
+                    sample_rate: open.sample_rate,
+                },
+            )?;
+            let starting_time = provider.starting_time();
+            let metrics = provider.quality_metrics().clone();
+            let (session, mut ctx) =
                 open_file_backed(open, provider, &path, "nwb", sorrel_io::Backend::Nwb)?;
+            ctx.nwb_start_time = starting_time;
+            ctx.metrics = metrics;
             v.visit(session, Box::new(|s| s.replay_journal()), ctx)
         }
         #[cfg(feature = "hdf5")]
@@ -793,6 +811,7 @@ fn open_kilosort(
             positions,
             shanks,
             metrics,
+            nwb_start_time: 0.0,
             depth_source: Some(sorrel_data::spike_depths),
         },
     ))
@@ -819,7 +838,7 @@ fn run_share(open: &OpenArgs, port: u16, relay: Option<sorrel_remote::Multiaddr>
         bail!("remote share supports kilosort/phy datasets");
     }
     let mut params = KilosortOpenParams {
-        sample_rate: open.sample_rate,
+        sample_rate: open.sample_rate.map(|r| r as f32),
         n_channels: open.n_channels,
         dtype: open.dtype,
         offset: open.offset,
@@ -881,6 +900,7 @@ fn run_join(
         positions: joined.positions.clone(),
         shanks: Vec::new(),
         metrics: Default::default(),
+        nwb_start_time: 0.0,
         depth_source: Some(sorrel_data::spike_depths),
     };
     // The network state lives in this process, so the window is standalone
@@ -940,6 +960,7 @@ where
             positions,
             shanks,
             metrics: Default::default(),
+            nwb_start_time: 0.0,
             depth_source: None,
         },
     ))
@@ -951,7 +972,7 @@ where
 /// a [`Tab`], so the visitor trait stays unchanged).
 struct TabBuilder<'a> {
     out: &'a mut Option<Box<dyn Tab>>,
-    events: Option<Events>,
+    open: &'a OpenArgs,
     rs: Option<&'a RenderState>,
 }
 impl SessionVisitor for TabBuilder<'_> {
@@ -959,13 +980,8 @@ impl SessionVisitor for TabBuilder<'_> {
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
-        *self.out = Some(Box::new(build_tab(
-            session,
-            seed,
-            ctx,
-            self.events,
-            self.rs,
-        )));
+        let events = load_events(self.open, ctx.nwb_start_time)?;
+        *self.out = Some(Box::new(build_tab(session, seed, ctx, events, self.rs)));
         Ok(())
     }
 }
@@ -1685,17 +1701,15 @@ where
 }
 
 /// `--events`, else (for an NWB file without sidecar events) its trials table.
-fn load_events(open: &OpenArgs) -> Result<Option<Events>> {
-    Ok(match &open.events {
+fn load_events(open: &OpenArgs, nwb_start_time: f64) -> Result<Option<Events>> {
+    let is_nwb = |p: &Path| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("nwb"));
+    let mut events = match &open.events {
         Some(p) => {
             Some(Events::read(p).with_context(|| format!("reading events {}", p.display()))?)
         }
         // Sidecar events next to an NWB file win (the app detects them);
         // otherwise its trials table, whose absence is normal.
-        None if open
-            .root()
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("nwb"))
+        None if is_nwb(open.root())
             && matches!(
                 Events::detect(open.root().parent().unwrap_or(Path::new("."))),
                 Ok(None)
@@ -1704,7 +1718,18 @@ fn load_events(open: &OpenArgs) -> Result<Option<Events>> {
             Events::read(open.root()).ok()
         }
         None => None,
-    })
+    };
+    if let Some(ev) = events
+        .as_mut()
+        .filter(|_| is_nwb(open.events.as_deref().unwrap_or(open.root())))
+    {
+        // A trial before the trace starts must not be clamped to sample zero.
+        let first = ev.times_s.partition_point(|&t| t < nwb_start_time);
+        ev.times_s.drain(..first);
+        ev.label.drain(..first);
+        ev.times_s.iter_mut().for_each(|t| *t -= nwb_start_time);
+    }
+    Ok(events)
 }
 
 /// The shell's opener: a forwarded `sorrel open`'s args become a tab, or the
@@ -1719,13 +1744,12 @@ fn tab_opener() -> Opener {
         if let Some(i) = open_dirs.iter().position(|d| canon(d) == dir) {
             return Ok(Opened::Existing(i));
         }
-        let events = load_events(&open)?;
         let mut tab = None;
         with_session(
             &open,
             TabBuilder {
                 out: &mut tab,
-                events,
+                open: &open,
                 rs,
             },
         )?;
@@ -2781,6 +2805,39 @@ mod tests {
         };
         open.rebase(Path::new("/cwd"));
         assert_eq!((open.root, open.dat), (rel("/abs/ds"), None));
+    }
+
+    #[cfg(feature = "hdf5")]
+    #[test]
+    fn nwb_flags_and_trial_times() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../release/fixtures/nwb/units_only.nwb"
+        );
+        let Some(Cmd::Open(open)) = Cli::try_parse_from([
+            "sorrel",
+            "open",
+            path,
+            "--dat",
+            "raw.nwb",
+            "--nwb-series",
+            "ElectricalSeriesRaw",
+            "--sample-rate",
+            "1000",
+            "--events",
+            path,
+        ])
+        .unwrap()
+        .cmd
+        else {
+            panic!("expected open")
+        };
+        assert_eq!(open.nwb_series.as_deref(), Some("ElectricalSeriesRaw"));
+        assert_eq!(open.dat.as_deref(), Some(Path::new("raw.nwb")));
+        assert_eq!(open.sample_rate, Some(1000.0));
+        let events = load_events(&open, 0.5).unwrap().unwrap();
+        assert_eq!(events.samples(1000.0, None), [sorrel_io::SampleIndex(100)]);
+        assert!(load_events(&open, 0.61).unwrap().unwrap().is_empty());
     }
 
     #[test]
