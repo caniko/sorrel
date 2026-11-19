@@ -436,6 +436,13 @@ fn paired_series_supplies_rate_without_units_resolution() {
 }
 
 #[test]
+fn single_file_float32_rate_uses_precise_units_rate_for_spikes() {
+    let p = open("precise_rate_long.nwb").unwrap();
+    assert_eq!(p.n_samples(), SampleIndex(330_000_002));
+    assert_eq!(p.spike_times(ClusterId(0)), [SampleIndex(330_000_000)]);
+}
+
+#[test]
 fn paired_float32_rate_uses_precise_units_rate_for_spikes() {
     let raw = fixture("rounded_raw.nwb");
     let p = NwbProvider::open_with(

@@ -83,17 +83,7 @@ mod imp {
             let recording = raw.as_ref().unwrap_or(&f);
             let series = find_electrical_series(recording, params.series, raw.is_some())?;
             let units_rate = if raw.is_some() || series.is_none() {
-                let rate = match spike_times.attr("resolution") {
-                    // -1 means unspecified in the NWB schema.
-                    Ok(attr) => match attr.read_scalar::<f64>()? {
-                        -1.0 => None,
-                        resolution => Some(
-                            checked_rate(resolution.recip())
-                                .context("invalid /units/spike_times resolution")?,
-                        ),
-                    },
-                    Err(_) => None,
-                };
+                let rate = read_units_rate(&spike_times)?;
                 if let (Some(declared), Some(explicit)) = (rate, params.sample_rate) {
                     check_matching_rate(
                         "--sample-rate",
@@ -108,7 +98,7 @@ mod imp {
                 None
             };
 
-            let mut legacy_identity = false;
+            let mut legacy_rate = None;
             let (trace, rate, t0, (channel_map, channel_positions), timestamps) = if let Some((
                 name,
                 series,
@@ -119,19 +109,35 @@ mod imp {
                 let (n_samples, n_channels) = (shape[0], shape.get(1).copied().unwrap_or(1));
                 let (stored_rate, t0, float32_rate, timestamps) =
                     read_time_base(recording, series, name, n_samples)?;
-                let mut rate = stored_rate;
-                if let Some(expected) = units_rate.or(params.sample_rate) {
-                    check_matching_rate("sorting sample rate", expected, name, rate, float32_rate)?;
-                    if float32_rate {
-                        rate = expected;
+                let required_rate = units_rate.or(params.sample_rate);
+                // With a same-file clock, resolution is a precision hint, not
+                // necessarily a declaration of the recording's sample period.
+                let expected = required_rate.or_else(|| {
+                    if raw.is_none() && float32_rate {
+                        read_units_rate(&spike_times).ok().flatten()
+                    } else {
+                        None
                     }
-                }
+                });
+                let rate = if let Some(expected) = expected {
+                    match check_matching_rate(
+                        "sorting sample rate",
+                        expected,
+                        name,
+                        stored_rate,
+                        float32_rate,
+                    ) {
+                        Ok(()) if float32_rate => expected,
+                        Err(err) if required_rate.is_some() => return Err(err),
+                        _ => stored_rate,
+                    }
+                } else {
+                    stored_rate
+                };
                 let channels = read_channels(recording, series, name, n_channels)?;
                 let trace = NwbTrace::new(series, data, name, n_samples, n_channels)?;
-                legacy_identity = raw.is_none()
-                    && rate == stored_rate
-                    && timestamps.is_none()
-                    && is_trunk_series(&f, name);
+                legacy_rate = (raw.is_none() && timestamps.is_none() && is_trunk_series(&f, name))
+                    .then_some(stored_rate);
                 (Some(trace), rate, t0, channels, timestamps)
             } else {
                 (
@@ -153,14 +159,14 @@ mod imp {
                     "NWB timestamps_reference_time mismatch: sorting NWB uses {units_epoch}, paired raw NWB uses {raw_epoch}");
             }
             let n_samples = trace.as_ref().map_or(0, |t| t.n_samples);
-            let (spikes_per_cluster, unit_ids) = load_units(
+            let (spikes_per_cluster, unit_ids, legacy_identity) = load_units(
                 &ids,
                 &spike_times,
                 &spike_times_index,
                 rate,
                 t0,
-                timestamps.as_ref(),
-                n_samples,
+                timestamps.as_ref().map(|ds| (ds, n_samples)),
+                legacy_rate,
             )
             .context("load /units")?;
             if raw.is_some() {
@@ -297,6 +303,18 @@ mod imp {
             "invalid sample rate {rate} Hz"
         );
         Ok(rate)
+    }
+
+    fn read_units_rate(spike_times: &hdf5::Dataset) -> Result<Option<f64>> {
+        let Ok(attr) = spike_times.attr("resolution") else {
+            return Ok(None);
+        };
+        match attr.read_scalar::<f64>()? {
+            -1.0 => Ok(None), // Unspecified in the NWB schema.
+            resolution => checked_rate(resolution.recip())
+                .map(Some)
+                .context("invalid /units/spike_times resolution"),
+        }
     }
 
     fn timestamp_epoch(file: &H5File) -> Result<jiff::Timestamp> {
@@ -1045,17 +1063,17 @@ mod imp {
         Ok((gain, offset_uv))
     }
 
-    /// Spike sample indices per unit (relative to `t0`) and the units
-    /// table's ids.
+    /// Spike sample indices per unit (relative to `t0`), unit ids, and
+    /// whether the spike mapping still qualifies for the legacy seal.
     fn load_units(
         ids: &hdf5::Dataset,
         spike_times: &hdf5::Dataset,
         spike_times_index: &hdf5::Dataset,
         rate: f64,
         t0: f64,
-        timestamps: Option<&hdf5::Dataset>,
-        n_samples: usize,
-    ) -> Result<(Vec<Vec<SampleIndex>>, Vec<u32>)> {
+        timestamps: Option<(&hdf5::Dataset, usize)>,
+        mut legacy_rate: Option<f64>,
+    ) -> Result<(Vec<Vec<SampleIndex>>, Vec<u32>, bool)> {
         let ids: Vec<i64> = ids.read_raw()?;
         let mut all: Vec<f64> = spike_times.read_raw()?;
         let ends: Vec<i64> = spike_times_index.read_raw()?;
@@ -1088,10 +1106,14 @@ mod imp {
             let mut bucket = times
                 .iter()
                 .map(|&t| {
-                    let s = ((t - t0) * rate).round();
+                    let relative = t - t0;
+                    let s = (relative * rate).round();
                     ensure!(s.is_finite() && (0.0..u64::MAX as f64).contains(&s)
-                        && (timestamps.is_none() || (s as u64) < n_samples as u64),
+                        && timestamps.is_none_or(|(_, n_samples)| (s as u64) < n_samples as u64),
                         "unit {id}: spike at {t} s is outside the sample index range (starting time {t0} s, {rate} Hz)");
+                    if legacy_rate.is_some_and(|stored| stored != rate && (relative * stored).round() != s) {
+                        legacy_rate = None;
+                    }
                     Ok(SampleIndex::new(s as u64))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -1101,10 +1123,10 @@ mod imp {
             out.push(bucket);
             start = end;
         }
-        if let Some(ds) = timestamps {
+        if let Some((ds, n_samples)) = timestamps {
             check_timestamp_spikes(ds, n_samples, &all, &unit_ids, &out)?;
         }
-        Ok((out, unit_ids))
+        Ok((out, unit_ids, legacy_rate.is_some()))
     }
 
     fn check_timestamp_spikes(

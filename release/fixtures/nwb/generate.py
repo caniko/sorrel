@@ -256,6 +256,19 @@ def write_reader_edge_cases():
     write(shifted, "shifted_raw.nwb")
 
 
+def write_single_file_precise_rates():
+    rate = 30000.123
+    for length, sample in [("short", 100), ("long", 330_000_000)]:
+        name = f"precise_rate_{length}"
+        nwbfile = make_file(name, units=False)
+        nwbfile.units = Units(name="units", resolution=1 / rate)
+        nwbfile.add_unit(id=0, spike_times=[sample / rate])
+        # Chunked data with no allocated samples, even for the long recording.
+        data = H5DataIO(shape=(sample + 2, N_CHANNELS), dtype=np.int16, chunks=(64, N_CHANNELS))
+        add_series(nwbfile, data, rate=np.float32(rate), starting_time=0.0)
+        write(nwbfile, name + ".nwb")
+
+
 def write_foreign_quality():
     nwbfile = make_file("sorrel-fixture-quality", units=False, electrodes=False)
     for name in ["quality", "KSLabel", "unrelated_number"]:
@@ -326,6 +339,7 @@ def main():
     write_units_and_raw()
     write_curated_units()
     write_reader_edge_cases()
+    write_single_file_precise_rates()
     write_foreign_quality()
     write_not_electrical()
     write_subtype()
