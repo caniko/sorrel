@@ -1519,9 +1519,9 @@ mod imp {
 
 #[cfg(feature = "hdf5")]
 pub(crate) use imp::check_append_rate;
-#[cfg(feature = "hdf5")]
-pub(crate) use imp::storage::{read_str, strings};
 #[cfg(any(feature = "hdf5", feature = "zarr"))]
 pub(crate) use imp::read_trials;
+#[cfg(feature = "hdf5")]
+pub(crate) use imp::storage::{read_str, strings};
 #[cfg(any(feature = "hdf5", feature = "zarr"))]
 pub use imp::{NwbOpenParams, NwbProvider};

@@ -59,6 +59,7 @@
           "hm-module"
           "workspace-tests"
           "dev-tests"
+          "nwb-export-assets"
           "binstall-metadata"
           "binstall-metadata-sorrel-remote"
         ];
