@@ -16,9 +16,8 @@ mod blosc;
 type Store = dyn ReadableListableStorageTraits;
 
 pub(super) fn exact_number(value: &Value, what: &str) -> Result<f64> {
-    // Decimal floating-point tokens are parsed with float_roundtrip. JSON
-    // integers may have been stored as integers by serde_json; don't round
-    // those during conversion (use wider types to avoid saturating at i64/u64).
+    // Don't round stored integers during conversion (use wider types to
+    // avoid saturating at i64/u64). optional_attr checks for parser overflow.
     value
         .as_f64()
         .filter(|&f| {
@@ -300,7 +299,11 @@ impl Group {
                 .collect::<Result<_, _>>()?,
             Data::JsonString { .. } => vec![1],
         };
-        Ok(Dataset { data, shape })
+        Ok(Dataset {
+            data,
+            shape,
+            attrs_key: key(".zattrs")?,
+        })
     }
 }
 
@@ -335,6 +338,7 @@ enum Data {
 pub(in crate::nwb::imp) struct Dataset {
     data: Data,
     shape: Vec<usize>,
+    attrs_key: StoreKey,
 }
 
 pub(in crate::nwb::imp) trait Number:
@@ -368,7 +372,25 @@ impl Dataset {
     }
 
     pub fn optional_attr(&self, name: &str) -> Result<Option<&Value>> {
-        Ok(self.array()?.attributes().get(name))
+        let array = self.array()?;
+        let value = array.attributes().get(name);
+        if value.is_some_and(Value::is_f64) {
+            // serde_json also exposes overflowing integer tokens as f64.
+            // Check the original token without changing JSON parsing across
+            // the workspace (arbitrary_precision affects other decoders).
+            let raw = array
+                .storage()
+                .get(&self.attrs_key)?
+                .context("missing Zarr .zattrs")?;
+            let attrs: std::collections::HashMap<String, &serde_json::value::RawValue> =
+                serde_json::from_slice(&raw)?;
+            let token = attrs.get(name).context("missing raw Zarr attribute")?.get();
+            ensure!(
+                token.contains(['.', 'e', 'E']) || token == "-0",
+                "Zarr attribute {name}: JSON integer is outside the supported i64/u64 range"
+            );
+        }
+        Ok(value)
     }
 
     pub fn reference_path(&self, name: &str) -> Result<Option<String>> {

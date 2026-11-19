@@ -308,19 +308,35 @@ mod imp {
         }
     }
 
+    // At 2^53 an adjacent integer can round to the same f64.
+    const CLOCK_LIMIT: f64 = 9_007_199_254_740_992.0;
+
     fn checked_rate(rate: f64) -> Result<f64> {
         ensure!(
-            (rate as f32).is_finite() && (rate as f32) > 0.0,
-            "invalid sample rate {rate} Hz"
+            rate < CLOCK_LIMIT && (rate as f32) > 0.0,
+            "invalid sample rate {rate} Hz (must be positive and below 2^53 Hz)"
         );
         Ok(rate)
+    }
+
+    fn check_time(t: f64, what: &str) -> Result<()> {
+        ensure!(
+            t.abs() < CLOCK_LIMIT,
+            "invalid {what} {t} s (must be finite and have magnitude below 2^53 s)"
+        );
+        Ok(())
     }
 
     fn read_units_rate(spike_times: &Dataset, strict: bool) -> Result<Option<f64>> {
         let Some(attr) = spike_times.optional_attr("resolution")? else {
             return Ok(None);
         };
-        match attr.exact_number("/units/spike_times resolution")? {
+        let resolution = attr.exact_number("/units/spike_times resolution")?;
+        ensure!(
+            !(resolution.abs() >= CLOCK_LIMIT || (resolution > 0.0 && resolution <= CLOCK_LIMIT.recip())),
+            "invalid /units/spike_times resolution {resolution} s (resolution and sample rate must be below 2^53)"
+        );
+        match resolution {
             -1.0 => Ok(None), // Unspecified in the NWB schema.
             resolution => match checked_rate(resolution.recip()) {
                 Err(_) if !strict => Ok(None),
@@ -639,7 +655,7 @@ mod imp {
         name: &str,
         n_samples: usize,
     ) -> Result<(f64, f64, Option<Dataset>)> {
-        let read = || {
+        let read = || -> Result<_> {
             if let Some(ds) = file.optional_stored_dataset(&format!("{name}/timestamps"))? {
                 ds.exact_float("timestamps")?;
                 let (rate, t0) = regular_timestamps(&ds, n_samples)?;
@@ -652,7 +668,7 @@ mod imp {
             st.exact_float("starting_time")?;
             let rate = checked_rate(rate.exact_number("starting_time rate")?)?;
             let t0: f64 = st.read_scalar()?;
-            ensure!(t0.is_finite(), "invalid starting_time {t0}");
+            check_time(t0, "starting_time")?;
             Ok((rate, t0, None))
         };
         read().with_context(|| format!("ElectricalSeries {name}: invalid time base"))
@@ -661,7 +677,11 @@ mod imp {
     const TIMESTAMP_BLOCK: usize = 65_536;
 
     fn read_timestamp_block(ds: &Dataset, range: Range<usize>) -> Result<Vec<f64>> {
-        ds.read_rows(range)
+        let times = ds.read_rows(range)?;
+        for &t in &times {
+            check_time(t, "timestamps value")?;
+        }
+        Ok(times)
     }
 
     fn regular_timestamps(ds: &Dataset, n: usize) -> Result<(f64, f64)> {
@@ -677,11 +697,7 @@ mod imp {
         let rate =
             checked_rate(period.recip()).context("irregular timestamps: invalid mean interval")?;
         let scale = t0.abs().max(last.abs());
-        let ulp = if scale == f64::MAX {
-            scale - scale.next_down()
-        } else {
-            scale.next_up() - scale
-        };
+        let ulp = scale.next_up() - scale;
         // A 0.01-sample ULP caps the tolerance at 0.041 samples, well below
         // half a sample, and allows 30 kHz Unix-epoch timestamps (~0.0072).
         ensure!(ulp * rate <= 0.01,
@@ -987,6 +1003,7 @@ mod imp {
                 .iter()
                 .enumerate()
                 .map(|(spike, &t)| {
+                    check_time(t, "/units/spike_times value")?;
                     let s = exact_sample(t, t0, rate);
                     ensure!(s.is_finite() && (0.0..u64::MAX as f64).contains(&s)
                         && timestamps.is_none_or(|(_, n_samples)| (s as u64) < n_samples as u64),

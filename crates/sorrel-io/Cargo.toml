@@ -46,6 +46,7 @@ default = []
 hdf5 = ["dep:hdf5-metno", "dep:hdf5-metno-sys", "dep:jiff"]
 zarr = [
   "dep:inventory",
+  "serde_json/raw_value",
   "dep:zarrs",
   "dep:num-traits",
   "dep:jiff",

@@ -230,7 +230,7 @@ impl Attr {
             #[cfg(feature = "hdf5")]
             Self::Hdf5(a) => Ok(a.read_scalar()?),
             #[cfg(feature = "zarr")]
-            Self::Zarr(a) => a.as_f64().context("expected a numeric attribute"),
+            Self::Zarr(a) => zarr::exact_number(a, "Zarr numeric attribute"),
         }
     }
 

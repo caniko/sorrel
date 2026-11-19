@@ -205,6 +205,57 @@ fn subtype_discovery_uses_local_cached_specs_or_refuses_to_choose_a_clock() {
 }
 
 #[test]
+fn refuses_clock_rates_outside_the_exact_integer_region() {
+    const LIMIT: f64 = 9_007_199_254_740_992.0;
+    for format in FORMATS {
+        let dir = tempfile::tempdir().unwrap();
+        let src = format.fixture("good.nwb");
+        let path = dir.path().join(src.file_name().unwrap());
+        let clock = "/acquisition/ElectricalSeriesRaw/starting_time";
+        match format {
+            #[cfg(feature = "hdf5")]
+            Format::Hdf5 => {
+                std::fs::copy(src, &path).unwrap();
+                let f = hdf5_metno::File::open_rw(&path).unwrap();
+                f.dataset(clock)
+                    .unwrap()
+                    .attr("rate")
+                    .unwrap()
+                    .write_scalar(&LIMIT)
+                    .unwrap();
+            }
+            #[cfg(feature = "zarr")]
+            Format::Zarr => {
+                zarr_tests::copy_store(&src, &path);
+                std::fs::remove_file(path.join(".zmetadata")).unwrap();
+                let attrs = path.join(&clock[1..]).join(".zattrs");
+                std::fs::write(
+                    &attrs,
+                    r#"{"rate":36893488147419103231,"zarr_dtype":"scalar"}"#,
+                )
+                .unwrap();
+                let err = NwbProvider::open(&path)
+                    .err()
+                    .expect("overflowing JSON integer");
+                assert!(format!("{err:#}").contains("JSON integer"), "{err:#}");
+                std::fs::write(
+                    attrs,
+                    format!(r#"{{"rate":{LIMIT},"zarr_dtype":"scalar"}}"#),
+                )
+                .unwrap();
+            }
+        }
+        let err = NwbProvider::open(&path)
+            .err()
+            .expect("oversized stored rate");
+        assert!(
+            format!("{err:#}").contains("invalid sample rate"),
+            "{err:#}"
+        );
+    }
+}
+
+#[test]
 fn rejects_what_it_cannot_read_faithfully() {
     for format in FORMATS {
         let e = format.open_err("not_electrical.nwb");
