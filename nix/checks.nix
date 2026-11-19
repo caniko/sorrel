@@ -60,13 +60,13 @@ in
         '';
       });
 
-    # Explicitly enable the readers when testing the library crates on their own.
+    # Match buildDepsOnly's workspace selection so Cargo reuses the bundled HDF5.
     hdf5-tests = craneLib.cargoNextest (commonArgs
       // {
         inherit cargoArtifacts;
         src = testSrc;
         # sorrel-data's other tests already run in workspace-tests.
-        cargoNextestExtraArgs = "-p sorrel-io -p sorrel-data --features sorrel-io/hdf5,sorrel-data/hdf5 --no-fail-fast -E 'package(sorrel-io) | binary(nwb_curation)'";
+        cargoNextestExtraArgs = "--workspace --no-fail-fast -E 'package(sorrel-io) | (package(sorrel-data) & binary(nwb_curation))'";
       });
 
     # `sorrel dev ...` (bench, learn) and the bench results DB live behind the
