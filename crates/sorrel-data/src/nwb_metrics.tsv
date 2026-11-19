@@ -1,0 +1,32 @@
+n_spikes	Number of spikes assigned to the cluster after curation edits (count); 0 for an empty cluster.
+firing_rate	Mean firing rate in Hz over the whole recording, n_spikes divided by n_samples / sample_rate; 0 when the recording has zero duration.
+mean_amplitude	Mean per-spike amplitude in the sorter's amplitude units (raw ADC counts for int16 data, µV only when the input is calibrated); NaN when the cluster has no amplitudes.
+presence_ratio	Fraction (0-1) of 50 equal-duration bins across the recording that contain at least one spike; 0 for an empty cluster.
+isi_violations	Count of consecutive inter-spike intervals shorter than the 1.5 ms refractory window.
+isi_violation_ratio	ISI violations per second of the cluster's own first-to-last spike span (a rate, not a fraction); 0 with fewer than 2 spikes.
+amplitude_cutoff	Estimated fraction (0-0.5) of spikes missed below the detection threshold, from a 30-bin mirror-tail fit of the amplitude histogram; 0 with fewer than 8 spikes.
+amplitude_snr	Absolute mean divided by the sample SD of per-spike amplitudes (dimensionless); 0 with fewer than 2 spikes or zero SD.
+drift_correlation	Pearson correlation (-1 to 1) between spike time and per-spike amplitude; 0 with fewer than 3 spikes or constant values.
+longest_silent_gap	Longest silent stretch, including before the first and after the last spike, as a fraction (0-1) of the recording duration; 1.0 for an empty cluster.
+composite_quality	Geometric mean (0-1) of the contamination, presence, coverage, SNR, completeness and stability sub-scores, plus the isolation score when available.
+isolation_distance_sq	Squared Mahalanobis distance to the n_in-th nearest background spike in a 3-PC subspace of template-relative channel 0; NaN under 50 cluster spikes, no PC features, or too few background spikes.
+l_ratio	Mean chi-squared survival (df = 3 PCs) of background spikes' Mahalanobis squared distances divided by n_in; lower is better; NaN under 50 cluster spikes, no PC features, or ill-conditioned covariance.
+nn_isolation	Fraction (0-1) of the 8 nearest neighbours, in a background-balanced PC pool, that belong to the cluster; NaN with fewer than 2 cluster spikes or no background.
+d_prime	Standardized separation of cluster and background means along the Fisher LDA axis in PC space (dimensionless, about 4 or more is well isolated); NaN if either class has fewer than 2 spikes.
+silhouette	Mean of (b - a) / max(a, b) over cluster spikes, with a and b the distances to the cluster and background centroids in PC space; range -1 to 1; NaN without both classes.
+trough_to_peak_ms	Milliseconds from the trough (minimum) to the following peak (maximum) of the primary template on its peak channel; NaN without seeded templates.
+half_width_ms	Width of the primary template's trough at half its depth, linearly interpolated, in milliseconds, on its peak channel; NaN without seeded templates.
+peak_trough_ratio	Peak value after the trough divided by the absolute trough depth, for the primary template on its peak channel (dimensionless); NaN without seeded templates.
+repolarisation_slope	(peak - trough) / trough_to_peak_ms for the primary template on its peak channel, in amplitude units per millisecond; 0 when the trace never recovers; NaN without templates.
+n_extrema	Count of interior local extrema in the primary template's peak-channel trace with magnitude at least 20% of the peak-to-peak amplitude; 3 or more suggests a multi-peak waveform.
+x_um	X coordinate (µm) of the template footprint centroid, weighted by per-channel peak-to-peak amplitude squared; NaN without probe geometry or seeded templates.
+y_um	Y coordinate (µm) of the template footprint centroid, weighted by per-channel peak-to-peak amplitude squared; NaN without probe geometry or seeded templates.
+footprint_decay_um	Decay length (µm) from a log-linear fit of per-channel peak-to-peak amplitude versus distance from the peak channel, over channels at 5%+ of the max; NaN without 3 such channels and a negative slope.
+footprint_r80_um	Radius (µm) around the footprint centroid that encloses 80% of the summed squared per-channel peak-to-peak amplitudes; NaN without seeded templates or probe geometry.
+n_active_channels	Count of channels whose peak-to-peak template amplitude is at least 20% of the maximum channel's; NaN without seeded templates or probe geometry.
+propagation_ms_per_100um	Least-squares slope of per-channel trough time in ms versus distance from the peak channel over active channels, in ms per 100 µm; NaN with fewer than 3 active channels.
+burst_index	Mean autocorrelogram count at 2-10 ms lags divided by the mean at 30-50 ms lags, from a 1 ms-bin, +/-50 ms ACG (dimensionless); NaN when the baseline is 0 or the ACG is too short.
+rp_estimate_ms	Refractory window in milliseconds (0.5-10 ms, 20 steps) with the lowest Hill contamination estimate, ties resolving to the longest window; NaN with fewer than 2 spikes.
+rp_contamination	Hill false-positive fraction (0-1) at rp_estimate_ms, the estimated share of spikes that belong to other units; NaN when no refractory window could be estimated.
+amplitude_dip	Hartigan dip statistic (0-0.25) of up to 5000 evenly strided per-spike amplitudes; larger values indicate a second amplitude mode; NaN with fewer than 4 amplitudes.
+drift_slope	Least-squares slope of per-spike amplitude versus time in seconds, in amplitude units per second; NaN with fewer than 2 spikes or when spike and amplitude counts differ.

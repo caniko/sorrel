@@ -8,12 +8,11 @@ description = "Data providers and file-format backends for Sorrel spike-sorting 
 
 [dependencies]
 anyhow.workspace = true
-thiserror.workspace = true
 memmap2.workspace = true
 bytemuck.workspace = true
 blake3.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 flate2.workspace = true
 log.workspace = true
 dunce = "1"
@@ -24,11 +23,21 @@ dunce = "1"
 # (vs. the upstream-stale `hdf5` crate), which supports libhdf5 ≥ 1.14.
 hdf5-metno = { version = "0.12.4", optional = true }
 hdf5-metno-sys = { version = "0.11.3", optional = true }
-jiff = { version = "0.2", default-features = false, optional = true }
+jiff = { version = "0.2", default-features = false, features = [
+  "std",
+], optional = true }
+tempfile = { workspace = true, optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
 
 [features]
 default = []
-hdf5 = ["dep:hdf5-metno", "dep:hdf5-metno-sys", "dep:jiff"]
+hdf5 = [
+  "dep:hdf5-metno",
+  "dep:hdf5-metno-sys",
+  "dep:jiff",
+  "dep:tempfile",
+  "dep:uuid",
+]
 
 [dev-dependencies]
 tempfile.workspace = true
