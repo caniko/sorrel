@@ -1,7 +1,7 @@
 //! Native HDF5 serialization of curated units. Layout mirrors the cached
 //! schemas in `nwb_schema` and https://nwb-schema.readthedocs.io/en/stable/format.html.
 
-use crate::nwb::{read_str, strings};
+use crate::nwb::{check_append_rate, read_str, strings};
 use crate::nwb_units::{Units, Values};
 use crate::ChannelId;
 use anyhow::{ensure, Context, Result};
@@ -166,6 +166,7 @@ pub fn append(path: &Path, units: &Units) -> Result<()> {
         "{} already has /units; refusing to replace it",
         path.display()
     );
+    check_append_rate(&source, units.resolution.recip())?;
     let mut tmp = sibling_temp(&path)?;
     std::io::copy(&mut original, tmp.as_file_mut())?;
     let f = File::open_rw(tmp.path())?;
@@ -286,6 +287,12 @@ fn write_units(f: &File, units: &Units) -> Result<()> {
     typed(&id, HDMF, "ElementIdentifiers")?;
     for col in &units.columns {
         let (name, doc) = (col.name.as_str(), col.description.as_str());
+        // Spike times and resolution are new native f64 objects, never
+        // converted to the destination series' (possibly f32) clock type.
+        ensure!(
+            name != "spike_times" || matches!(&col.data, Values::Float(_)),
+            "spike_times must be stored as native IEEE float64"
+        );
         let ds = match &col.data {
             Values::Float(v) => vector(&g, name, doc, v)?,
             Values::Int(v) => vector(&g, name, doc, v)?,

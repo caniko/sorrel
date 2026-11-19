@@ -19,17 +19,17 @@ pub fn collect_units<P>(
 where
     P: DataProvider<Label = PhyLabel> + HasGeometry,
 {
-    let rounded_rate = rate as f32;
     ensure!(
-        rounded_rate.is_finite() && rounded_rate > 0.0,
+        (rate as f32).is_finite() && (rate as f32) > 0.0,
         "invalid sample rate {rate}"
     );
     let resolution = rate.recip();
     let units_rate = resolution.recip();
-    // The reader compares clocks only when they share a float32 representation.
+    // Both clocks must be readable. The f32 check is the provider's range
+    // check, not a requirement that the clocks round to the same rate.
     ensure!(
-        units_rate as f32 == rounded_rate,
-        "Units resolution for {rate} Hz rounds to a different float32 sample rate"
+        (units_rate as f32).is_finite() && (units_rate as f32) > 0.0,
+        "invalid Units sample rate {units_rate} recovered from resolution {resolution}"
     );
     ensure!(starting_time.is_finite(), "starting_time must be finite");
     let clusters: Vec<_> = (0..session.n_clusters())

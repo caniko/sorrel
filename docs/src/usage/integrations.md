@@ -303,10 +303,11 @@ or a paired raw file via `--dat`), or from the Units resolution or `--sample-rat
 when there is no series. Reopening a Units-only export uses a zero offset for
 its relative sample indices; pair the raw NWB with `--dat` to recover the raw
 series' time base or to reopen a file with negative spike times.
-If Sorrel requires `--sample-rate` to resolve a stored float32 series rate
-that disagrees with the Units clock, use the same rate for export and when
-reopening against the recording. Export refuses to write a spike time that
-cannot be mapped back to its original sample on the chosen time base.
+If the series and Units clocks map spikes to different samples, reopen with
+`--sample-rate` set to the exact Units clock listed in the error. The Units
+clock is recovered from the written resolution and may differ by one ULP
+from the export rate. Export checks that both rates map each written spike
+back to its original sample.
 Unlike `export-phy`, `export-nwb` does not need channels: if no electrode
 geometry is available, the new file contains Units but no electrodes table.
 
@@ -318,6 +319,10 @@ sorrel export-nwb my_run/phy --into recording.nwb --starting-time 0.5
 existing `/units` table. When the NWB source and destination have different
 `timestamps_reference_time` values, pass `--starting-time` explicitly on the
 destination's time axis; Sorrel does not rebase the times automatically.
+If the destination's default ElectricalSeries has a rate more than one part
+per million from the exported Units clock, append refuses rather than
+writing a clock Sorrel would ignore on reopen. Use `--out` for a separate
+Units file instead.
 Append needs space for a sibling copy of the entire destination and replaces
 the original only after a successful write. Do not edit the destination concurrently.
 

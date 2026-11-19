@@ -77,7 +77,7 @@ fn native_export_round_trips_curated_units_without_electrodes() {
 fn native_export_round_trips_reader_time_bases() {
     let temp = tempfile::tempdir().unwrap();
     let raw = fixtures().join("rounded_raw.nwb");
-    let precise = 30000.123;
+    let series_rate = 30000.123046875_f64; // Exact widening of the stored float32.
     for (fixture, params, options) in [
         ("timestamps.nwb", NwbOpenParams::default(), vec![]),
         ("precise_rate_short.nwb", NwbOpenParams::default(), vec![]),
@@ -93,10 +93,15 @@ fn native_export_round_trips_reader_time_bases() {
             "precise_units.nwb",
             NwbOpenParams {
                 raw_path: Some(&raw),
-                sample_rate: Some(precise),
+                sample_rate: Some(series_rate),
                 ..Default::default()
             },
-            vec!["--dat", raw.to_str().unwrap(), "--sample-rate", "30000.123"],
+            vec![
+                "--dat",
+                raw.to_str().unwrap(),
+                "--sample-rate",
+                "30000.123046875",
+            ],
         ),
     ] {
         let input = temp.path().join(fixture);
@@ -113,13 +118,15 @@ fn native_export_round_trips_reader_time_bases() {
             "{fixture}"
         );
         if fixture == "precise_rate_short.nwb" {
-            assert_eq!(rate, f64::from(precise as f32));
+            assert_eq!(rate, series_rate);
+            assert_ne!(reopened.exact_sample_rate().unwrap(), series_rate);
             assert_eq!(reopened.spike_times(ClusterId(0)), [SampleIndex(100)]);
         }
         let paired = NwbProvider::open_with(
             &output,
             NwbOpenParams {
                 raw_path: params.raw_path.or(Some(&input)),
+                sample_rate: None, // Short recordings agree without an override.
                 ..params
             },
         )
@@ -149,29 +156,39 @@ fn native_export_round_trips_reader_time_bases() {
 #[test]
 fn native_export_long_recording_requires_explicit_rate_when_paired() {
     let temp = tempfile::tempdir().unwrap();
-    let input = temp.path().join("long.nwb");
-    let output = temp.path().join("export.nwb");
-    fs::copy(fixtures().join("precise_rate_long.nwb"), &input).unwrap();
-    export(&input, &output, &["--sample-rate", "30000.123"]);
-    let expected = [SampleIndex(330_000_000)];
-    let params = NwbOpenParams {
-        raw_path: Some(&input),
-        ..Default::default()
-    };
-    let err = NwbProvider::open_with(&output, params).err().unwrap();
-    assert!(format!("{err:#}").contains("Ambiguous NWB sample rate"));
-    let paired = NwbProvider::open_with(
-        &output,
-        NwbOpenParams {
-            sample_rate: Some(30000.123),
-            ..params
-        },
-    )
-    .unwrap();
-    assert_eq!(paired.exact_sample_rate().unwrap(), 30000.123);
-    assert_eq!(paired.spike_times(ClusterId(0)), expected);
-    let standalone = NwbProvider::open(&output).unwrap();
-    assert_eq!(standalone.spike_times(ClusterId(0)), expected);
+    for (fixture, sample, start) in [
+        ("precise_rate_long.nwb", 330_000_000, 0.0),
+        ("close_f64_rate_long.nwb", 660_000_000, 0.5),
+    ] {
+        let input = temp.path().join(fixture);
+        let output = input.with_extension("export.nwb");
+        fs::copy(fixtures().join(fixture), &input).unwrap();
+        // This is the exact Units clock declared in both source files.
+        export(&input, &output, &["--sample-rate", "30000.123"]);
+        let standalone = NwbProvider::open(&output).unwrap();
+        let declared = standalone.exact_sample_rate().unwrap();
+        assert_eq!(declared, 30000.123);
+        let params = NwbOpenParams {
+            raw_path: Some(&input),
+            ..Default::default()
+        };
+        let err = NwbProvider::open_with(&output, params).err().unwrap();
+        assert!(format!("{err:#}").contains("Ambiguous NWB sample rate"));
+        let paired = NwbProvider::open_with(
+            &output,
+            NwbOpenParams {
+                sample_rate: Some(declared),
+                ..params
+            },
+        )
+        .unwrap();
+        assert_eq!(paired.exact_sample_rate().unwrap(), declared);
+        assert_eq!(paired.starting_time(), start);
+        assert_eq!(paired.spike_times(ClusterId(0)), [SampleIndex(sample)]);
+        if start == 0.0 {
+            assert_eq!(standalone.spike_times(ClusterId(0)), [SampleIndex(sample)]);
+        }
+    }
 }
 
 #[test]
