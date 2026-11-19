@@ -31,7 +31,12 @@
       cargoBuildCommand = "cargo zigbuild --profile release --target ${rustTarget}.${glibc}";
       # sorrel-relay ships in the same tarball: `cargo binstall sorrel-remote`
       # needs it next to sorrel's binaries.
-      cargoExtraArgs = "-p sorrel -p sorrel-remote --locked";
+      # Zig 0.16 emits an undefined relocation for zlib's deflate table on
+      # x86_64 at -O1 and above. Keep the workaround local to libz-sys.
+      cargoExtraArgs =
+        "-p sorrel -p sorrel-remote --locked"
+        + pkgs.lib.optionalString (rustTarget == "x86_64-unknown-linux-gnu")
+        " --config profile.release.package.libz-sys.opt-level=0";
       doCheck = false;
       preBuild = ''
         export HOME=$TMPDIR ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local

@@ -392,12 +392,13 @@
           # windres) through depsBuildBuild and the CC_/RC_/linker env.
           windows-aarch64 = {
             buildInputs = [];
-            inherit (deps) nativeBuildInputs;
+            nativeBuildInputs = deps.nativeBuildInputs ++ [pkgs.llvmPackages.lld];
             # aws-lc-sys (via libp2p-quic) compiles jitterentropy, which needs
             # winpthreads' <sched.h>; llvm-mingw's sysroot does not carry it, and nixpkgs'
             # aarch64 winpthreads does not build with clang (winver.h). The
             # headers are arch-neutral, so borrow the x64 package's.
-            CFLAGS_aarch64_pc_windows_gnullvm = "-I${cross.winpthreads}/include";
+            # CMake links compiler probes; GNU ld on the build host cannot link PE/ARM64.
+            CFLAGS_aarch64_pc_windows_gnullvm = "-I${cross.winpthreads}/include -fuse-ld=lld";
             doCheck = false;
           };
           darwin-aarch64 = {
