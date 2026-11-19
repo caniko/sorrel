@@ -4,11 +4,12 @@ trap 'echo "release smoke check failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 VERSION="${1:?usage: smoke.sh VERSION RELEASE_DIR}"
 RELEASE_DIR="${2:?usage: smoke.sh VERSION RELEASE_DIR}"
-NWB_FIXTURE=${SORREL_NWB_FIXTURE:-$(realpath "$(dirname "${BASH_SOURCE[0]}")/fixtures/nwb/good.nwb")}
+NWB_FIXTURES=${SORREL_NWB_FIXTURES:-$(realpath "$(dirname "${BASH_SOURCE[0]}")/fixtures/nwb")}
 
 cd "$RELEASE_DIR"
 
 expected=(
+  "sorrel-${VERSION}-third-party-notices.zip"
   "sorrel-${VERSION}-x86_64-linux.tar.gz"
   "sorrel-${VERSION}-aarch64-linux.tar.gz"
   "sorrel-${VERSION}-x86_64-windows.zip"
@@ -46,6 +47,7 @@ unzip -Z1 "sorrel-${VERSION}-aarch64-windows.zip" | grep -Fx 'sorrelw.exe' >/dev
 unzip -p "sorrel-${VERSION}-aarch64-windows.zip" sorrel.exe | cmp - "sorrel-${VERSION}-aarch64-windows.exe"
 unzip -p "sorrel-${VERSION}-aarch64-windows.zip" sorrelw.exe | cmp - "sorrel-${VERSION}-aarch64-windows-gui.exe"
 tar -tzf "sorrel-${VERSION}.tar.gz" | grep -Fx "sorrel-${VERSION}/Cargo.toml" >/dev/null
+unzip -Z1 "sorrel-${VERSION}-third-party-notices.zip" | grep -Fx 'THIRD-PARTY-HDF5.txt' >/dev/null
 
 for wheel in sorrel_ephys-"${VERSION}"-cp38-abi3-*.whl; do
   unzip -Z1 "$wheel" | grep -Ex 'sorrel/_native\.(abi3\.so|pyd)' >/dev/null
@@ -56,15 +58,17 @@ file "sorrel-${VERSION}-x86_64.AppImage" | grep -Eiq 'executable|appimage|squash
 test -x "sorrel-${VERSION}-x86_64.AppImage"
 
 # Exercise the archived executable, not a local Cargo build. `describe`
-# opens the dataset and reads its units without starting a GUI or GPU.
+# reads compressed traces and units without starting a GUI or GPU.
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 describe_nwb() {
-  local data
-  data=$(mktemp -d "$tmp/nwb.XXXXXX")
-  cp "$NWB_FIXTURE" "$data/good.nwb"
-  "$@" describe "$data/good.nwb" --json > "$data/describe.json"
-  grep -F '"# spikes": "5"' "$data/describe.json"
+  local filter data
+  for filter in deflate lzf; do
+    data=$(mktemp -d "$tmp/$filter.XXXXXX")
+    cp "$NWB_FIXTURES/$filter.nwb" "$data/$filter.nwb"
+    "$@" describe "$data/$filter.nwb" --json > "$data/describe.json"
+    grep -F '"# spikes": "5"' "$data/describe.json"
+  done
 }
 for arch in x86_64 aarch64; do
   tar -xOzf "sorrel-${VERSION}-${arch}-linux.tar.gz" ./sorrel > "$tmp/sorrel-$arch"

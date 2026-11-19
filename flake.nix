@@ -468,7 +468,7 @@
           [coreutils diffutils file findutils gnugrep gzip gnutar unzip]
           ++ lib.optional (system == "x86_64-linux") qemu-user;
         runtimeEnv =
-          {SORREL_NWB_FIXTURE = "${./release/fixtures/nwb/good.nwb}";}
+          {SORREL_NWB_FIXTURES = "${./release/fixtures/nwb}";}
           // pkgs.lib.optionalAttrs (system == "x86_64-linux") (let
             arm = pkgs.pkgsCross.aarch64-multiplatform;
           in {

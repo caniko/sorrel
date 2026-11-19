@@ -36,6 +36,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **Native Windows on ARM release.** Each release now includes `sorrel-<VERSION>-aarch64-windows.zip` (plus standalone `.exe` and `-gui.exe` assets), built for `aarch64-pc-windows-gnullvm`, and winget serves it to ARM64 machines. Smoke-tested on a `windows-11-arm` runner (DX12; Vulkan on ARM64 is untested because the pinned lavapipe is x64-only) without the wheel step; Chocolatey and the Python wheel stay x64.
 
 - **NWB and Kilosort 4 `rez.mat` support ships by default.** Release binaries (including the CLI in the Python wheel), Cargo installs, and the default Nix package bundle HDF5 with gzip/deflate and LZF. The separate `sorrelHdf5` package is no longer needed.
+- **Third-party notices for standalone Windows downloads.** The release page includes `sorrel-<version>-third-party-notices.zip`, so you don't need to download the full Windows archive for the bundled HDF5, LZF and zlib notices.
 
 ### Fixed
 

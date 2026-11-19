@@ -73,15 +73,20 @@ Assert-Ok 'version' (Invoke-Native 'version' $exe @('--version'))
 $got = (Get-Content (Join-Path $OutDir 'version.out.txt') -Raw).Trim()
 if ($got -ne "sorrel $version") { throw "sorrel.exe --version is '$got', expected 'sorrel $version'" }
 
-# The NWB fixture has five spikes. Copy it because opening creates a sidecar.
+# Each NWB fixture has compressed traces and five spikes. Copy it because
+# opening creates a sidecar; keep the two fixtures in separate directories.
 $nwbDir = Join-Path ([IO.Path]::GetTempPath()) "sorrel-nwb-$PID"
-New-Item -ItemType Directory $nwbDir | Out-Null
-$nwb = Join-Path $nwbDir 'good.nwb'
-Copy-Item (Join-Path $repo 'release\fixtures\nwb\good.nwb') $nwb
 try {
-    Assert-Ok 'describe-nwb' (Invoke-Native 'describe-nwb' $exe @('describe', $nwb, '--json'))
-    $nwbInfo = Get-Content (Join-Path $OutDir 'describe-nwb.out.txt') -Raw | ConvertFrom-Json
-    if ($nwbInfo.'# spikes' -ne '5') { throw 'NWB fixture should have five spikes' }
+    foreach ($filter in @('deflate', 'lzf')) {
+        $dir = Join-Path $nwbDir $filter
+        New-Item -ItemType Directory -Force $dir | Out-Null
+        $nwb = Join-Path $dir "$filter.nwb"
+        Copy-Item (Join-Path $repo "release\fixtures\nwb\$filter.nwb") $nwb
+        $step = "describe-nwb-$filter"
+        Assert-Ok $step (Invoke-Native $step $exe @('describe', $nwb, '--json'))
+        $nwbInfo = Get-Content (Join-Path $OutDir "$step.out.txt") -Raw | ConvertFrom-Json
+        if ($nwbInfo.'# spikes' -ne '5') { throw "$filter NWB fixture should have five spikes" }
+    }
 }
 finally { Remove-Item -Recurse -Force $nwbDir }
 
