@@ -162,7 +162,11 @@ What Sorrel reads:
   an open tab or attach `call` or `mcp` to its host, pass the same open options;
   conflicting options are refused rather than silently ignored.
 - **Time base.** Spike times on the NWB session clock become sample indices as
-  `round((t - starting_time) × rate)`. With per-sample `timestamps`, the first
+  `round((t - starting_time) × rate)`. If `starting_time.rate` is stored as
+  float32, Sorrel uses the more precise `1 / spike_times.resolution` when it
+  rounds to the same float32 rate, whether the Units table and series are in
+  one file or two. In a single file, an explicit `--sample-rate` takes
+  precedence and must also match the series rate. With per-sample `timestamps`, the first
   timestamp gives the start and the end-to-end mean interval gives the rate.
   Timestamps must strictly increase and stay within 0.001 samples of the
   inferred grid, plus four floating-point steps at the largest absolute
