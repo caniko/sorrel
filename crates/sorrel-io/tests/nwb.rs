@@ -153,6 +153,59 @@ fn electrical_series_subtypes_are_accepted() {
 }
 
 #[test]
+fn extension_lfp_uses_the_recording_clock() {
+    const SERIES: &str = "acquisition/TestSeriesRaw";
+    const CACHE: &str = "specifications/ndx-sorrel-test/0.1.0/ndx-sorrel-test.extensions";
+    const SPEC: &str =
+        r#"{"groups":[{"neurodata_type_def":"LFP","neurodata_type_inc":"ElectricalSeries"}]}"#;
+    // Rename the fixture's extension type to LFP. The core cache still
+    // defines its own LFP, which is not an ElectricalSeries.
+    for format in FORMATS {
+        let dir = tempfile::tempdir().unwrap();
+        let src = format.fixture("subtype.nwb");
+        let path = dir.path().join(src.file_name().unwrap());
+        match format {
+            #[cfg(feature = "hdf5")]
+            Format::Hdf5 => {
+                use hdf5_metno::types::VarLenUnicode;
+                std::fs::copy(src, &path).unwrap();
+                let f = hdf5_metno::File::open_rw(&path).unwrap();
+                f.group(SERIES)
+                    .unwrap()
+                    .attr("neurodata_type")
+                    .unwrap()
+                    .write_scalar(&"LFP".parse::<VarLenUnicode>().unwrap())
+                    .unwrap();
+                f.dataset(CACHE)
+                    .unwrap()
+                    .write_scalar(&SPEC.parse::<VarLenUnicode>().unwrap())
+                    .unwrap();
+            }
+            #[cfg(feature = "zarr")]
+            Format::Zarr => {
+                zarr_tests::copy_store(&src, &path);
+                let attrs = path.join(SERIES).join(".zattrs");
+                let mut tags: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&attrs).unwrap()).unwrap();
+                tags["neurodata_type"] = "LFP".into();
+                std::fs::write(attrs, tags.to_string()).unwrap();
+                let chunk = serde_json::json!([SPEC, "|O", [1]]);
+                std::fs::write(path.join(CACHE).join("0"), chunk.to_string()).unwrap();
+            }
+        }
+        let p = NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                sample_rate: Some(1000.0), // The units-only fallback would also succeed.
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(p.spike_times(ClusterId(2))[0], SampleIndex(50));
+    }
+}
+
+#[test]
 fn subtype_discovery_uses_local_cached_specs_or_refuses_to_choose_a_clock() {
     for format in FORMATS {
         let dir = tempfile::tempdir().unwrap();

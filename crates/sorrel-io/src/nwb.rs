@@ -36,6 +36,7 @@ pub use stub::open_stub;
 
 #[cfg(any(feature = "hdf5", feature = "zarr"))]
 mod imp {
+    mod specs;
     mod storage;
     use crate::extras::{HasGeometry, HasQualityMetrics, QualityMetrics};
     use crate::kilosort::{pinned_sorter, valid_tag, PhyLabel};
@@ -44,6 +45,7 @@ mod imp {
         TraceSlice, UnitAnnotation,
     };
     use anyhow::{anyhow, ensure, Context, Result};
+    use specs::{core_series, legacy_is_series, legacy_type_parents, TypeSpecs};
     use std::cmp::Reverse;
     use std::collections::{BinaryHeap, HashMap, VecDeque};
     use std::ops::Range;
@@ -393,103 +395,6 @@ mod imp {
         Ok(events)
     }
 
-    /// `neurodata_type_def → neurodata_type_inc` for every type in the
-    /// file's cached specifications (core and extensions).
-    fn type_parents(f: &Group, legacy: bool) -> Result<HashMap<String, Option<String>>> {
-        fn collect(
-            v: &serde_json::Value,
-            out: &mut HashMap<String, Option<String>>,
-            legacy: bool,
-        ) -> Result<()> {
-            match v {
-                serde_json::Value::Object(m) => {
-                    if let Some(def) = m.get("neurodata_type_def").and_then(|v| v.as_str()) {
-                        let parent = m
-                            .get("neurodata_type_inc")
-                            .map(|v| {
-                                v.as_str()
-                                    .map(str::to_owned)
-                                    .context("invalid neurodata_type_inc")
-                            })
-                            .transpose();
-                        if legacy {
-                            if let Ok(Some(parent)) = parent {
-                                out.insert(def.to_owned(), Some(parent));
-                            }
-                        } else {
-                            let parent = parent?;
-                            ensure!(
-                                out.get(def).is_none_or(|old| *old == parent),
-                                "conflicting cached definitions of {def:?}"
-                            );
-                            out.insert(def.to_owned(), parent);
-                        }
-                    }
-                    for child in m.values() {
-                        collect(child, out, legacy)?;
-                    }
-                }
-                serde_json::Value::Array(a) => {
-                    for child in a {
-                        collect(child, out, legacy)?;
-                    }
-                }
-                _ => {}
-            }
-            Ok(())
-        }
-        let mut out = HashMap::new();
-        for ns in f.spec_group(legacy)?.spec_groups()? {
-            for version in ns.spec_groups()? {
-                for ds in version.spec_datasets()? {
-                    let spec = ds
-                        .spec_text(legacy)
-                        .and_then(|t| Ok(serde_json::from_str(&t)?));
-                    match spec {
-                        Ok(v) => collect(&v, &mut out, legacy)?,
-                        Err(_) if legacy => continue,
-                        Err(err) => return Err(err).context("unreadable cached NWB specification"),
-                    }
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    fn is_electrical_series(
-        ty: &str,
-        parents: Option<&HashMap<String, Option<String>>>,
-        legacy: bool,
-    ) -> Option<bool> {
-        let mut ty = ty;
-        // Bounded walk: a malformed spec could loop.
-        for _ in 0..32 {
-            if ty == "ElectricalSeries" {
-                return Some(true);
-            }
-            // Core types with known non-ElectricalSeries ancestry, including
-            // common processing wrappers that can contain a series.
-            if !legacy
-                && matches!(
-                    ty,
-                    "TimeSeries"
-                        | "ProcessingModule"
-                        | "LFP"
-                        | "FilteredEphys"
-                        | "NWBDataInterface"
-                        | "NWBContainer"
-                )
-            {
-                return Some(false);
-            }
-            match parents?.get(ty)? {
-                Some(parent) => ty = parent,
-                None => return Some(false),
-            }
-        }
-        None
-    }
-
     /// Mirror trunk's discovery for the journal seal, including the old
     /// variable-length-only decoder for both type tags and cached specs.
     fn is_trunk_series(f: &Group, selected: &str) -> bool {
@@ -502,7 +407,7 @@ mod imp {
         let Ok(names) = acq.member_names() else {
             return false;
         };
-        let parents = type_parents(f, true).ok();
+        let parents = legacy_type_parents(f).unwrap_or_default();
         for candidate in names {
             let g = match acq.legacy_group(&candidate) {
                 Ok(Some(g)) => g,
@@ -513,7 +418,7 @@ mod imp {
                 Ok(attr) => attr.and_then(|a| a.legacy_string().ok()),
                 Err(_) => return false,
             };
-            if ty.is_some_and(|t| is_electrical_series(&t, parents.as_ref(), true) == Some(true)) {
+            if ty.is_some_and(|t| legacy_is_series(&t, &parents)) {
                 match g.legacy_dataset_rank("data") {
                     Ok(Some(2)) => return candidate == name,
                     Ok(_) => (),
@@ -533,7 +438,7 @@ mod imp {
             group: &Group,
             path: &str,
             depth: usize,
-            is_series: &impl Fn(&str, &str) -> Result<bool>,
+            is_series: &impl Fn(Option<&str>, &str, &str) -> Result<bool>,
             found: &mut Vec<(String, Group)>,
         ) -> Result<()> {
             for name in group.member_names()? {
@@ -545,12 +450,17 @@ mod imp {
                     .optional_attr("neurodata_type")?
                     .map(|a| a.string())
                     .transpose()?;
-                if ty
-                    .as_deref()
-                    .map(|t| is_series(t, &path))
-                    .transpose()?
-                    .unwrap_or(false)
-                {
+                let is_series_node = if let Some(ty) = ty {
+                    let ns = child
+                        .optional_attr("namespace")?
+                        .map(|a| a.string())
+                        .transpose()
+                        .with_context(|| format!("invalid namespace on {path}"))?;
+                    is_series(ns.as_deref(), &ty, &path)?
+                } else {
+                    false
+                };
+                if is_series_node {
                     found.push((path, child));
                 } else if depth > 0 {
                     // Bound the recursion in case of cyclic HDF5 links.
@@ -560,19 +470,19 @@ mod imp {
             Ok(())
         }
 
-        let parents = std::cell::OnceCell::new();
-        let is_series = |ty: &str, path: &str| {
-            if let Some(answer) = is_electrical_series(ty, None, false) {
+        let specs = std::cell::OnceCell::new();
+        let is_series = |ns: Option<&str>, ty: &str, path: &str| {
+            if let Some(answer) = ns.and_then(|ns| core_series(ns, ty)) {
                 return Ok(answer);
             }
             let unavailable = || {
-                format!("cannot determine ElectricalSeries ancestry of {path} ({ty:?}); readable same-file cached NWB specifications are required")
+                format!("cannot determine ElectricalSeries ancestry of {path} ({ns:?}, {ty:?}); readable same-file cached NWB specifications are required")
             };
-            let parents = parents.get_or_init(|| type_parents(f, false));
-            let parents = parents
+            let specs = specs.get_or_init(|| TypeSpecs::read(f));
+            let specs = specs
                 .as_ref()
                 .map_err(|err| anyhow!("{}: {err:#}", unavailable()))?;
-            is_electrical_series(ty, Some(parents), false).with_context(unavailable)
+            specs.is_series(ns, ty).with_context(unavailable)
         };
         let mut found = Vec::new();
         for (root, depth) in [("/acquisition", 0), ("/processing", 32)] {
