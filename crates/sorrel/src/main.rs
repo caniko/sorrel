@@ -10,7 +10,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use eframe::egui_wgpu::RenderState;
-#[cfg(feature = "hdf5")]
+#[cfg(any(feature = "hdf5", feature = "zarr"))]
 use sorrel_data::baseline_hash;
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::InstanceRequest;
@@ -19,7 +19,7 @@ use sorrel_data::{
     rank_split_candidates, save_session as save_dir_session, save_to_phy, serve, write_report,
     Journal, ReportFilter, RuleSet, Session, SuggestConfig,
 };
-#[cfg(feature = "hdf5")]
+#[cfg(any(feature = "hdf5", feature = "zarr"))]
 use sorrel_io::detect_sorter;
 use sorrel_io::kilosort::{read_cluster_group_tsv, KilosortOpenParams, PhyLabel};
 use sorrel_io::open_ephys::OebinMeta;
@@ -38,7 +38,7 @@ mod rescue;
 enum Backend {
     Kilosort,
     SortingAnalyzer,
-    #[cfg(feature = "hdf5")]
+    #[cfg(any(feature = "hdf5", feature = "zarr"))]
     Nwb,
     #[cfg(feature = "hdf5")]
     Ks4Rez,
@@ -449,7 +449,7 @@ enum LlmBackend {
 /// and every headless subcommand.
 #[derive(Args, Debug, Clone, Default)]
 struct OpenArgs {
-    /// phy / Kilosort or SortingAnalyzer directory, or a *.nwb / rez.mat file
+    /// phy / Kilosort, SortingAnalyzer, NWB (.nwb or .nwb.zarr), or rez.mat
     #[arg(value_name = "DATA_DIR", required = true)]
     root: Option<PathBuf>,
     /// kilosort | sorting-analyzer | nwb | ks4-rez (auto-detected by default)
@@ -461,8 +461,8 @@ struct OpenArgs {
     /// Overrides params.py:sample_rate. For NWB, select an exact declared clock (copy a value from the error), or supply a rate if no clock is declared
     #[arg(long, value_name = "Hz")]
     sample_rate: Option<f64>,
-    /// NWB ElectricalSeries name under /acquisition or absolute HDF5 path
-    #[cfg(feature = "hdf5")]
+    /// NWB ElectricalSeries name under /acquisition or absolute NWB object path
+    #[cfg(any(feature = "hdf5", feature = "zarr"))]
     #[arg(long, value_name = "PATH|NAME")]
     nwb_series: Option<String>,
     /// Overrides params.py:n_channels_dat
@@ -534,12 +534,14 @@ fn parse_backend(s: &str) -> std::result::Result<Backend, String> {
     Ok(match s {
         "kilosort" | "phy" => Backend::Kilosort,
         "sorting-analyzer" | "spikeinterface" | "si" => Backend::SortingAnalyzer,
-        #[cfg(feature = "hdf5")]
+        #[cfg(any(feature = "hdf5", feature = "zarr"))]
         "nwb" => Backend::Nwb,
+        #[cfg(not(any(feature = "hdf5", feature = "zarr")))]
+        "nwb" => return Err("backend nwb requires building with --features hdf5 or zarr".into()),
         #[cfg(feature = "hdf5")]
         "ks4-rez" | "rez" => Backend::Ks4Rez,
         #[cfg(not(feature = "hdf5"))]
-        "nwb" | "ks4-rez" | "rez" => {
+        "ks4-rez" | "rez" => {
             return Err(format!(
                 "backend {s} requires building with --features hdf5"
             ));
@@ -564,59 +566,46 @@ fn journal_opts(open: &OpenArgs) -> sorrel_data::JournalOpts {
 }
 
 /// `--journal`, else `<dir>/<stem>.journal` (see [`sorrel_data::journal_path`]).
-#[cfg(feature = "hdf5")]
+#[cfg(any(feature = "hdf5", feature = "zarr"))]
 fn journal_path(open: &OpenArgs, dir: &Path, stem: &str) -> PathBuf {
     sorrel_data::journal_path(&journal_opts(open), dir, stem)
 }
 
 /// Open the journal sealed against `baseline`, honouring `--discard-journal`.
-#[cfg(feature = "hdf5")]
+#[cfg(any(feature = "hdf5", feature = "zarr"))]
 fn open_journal(open: &OpenArgs, path: &Path, baseline: u64, n_clusters: u32) -> Result<Journal> {
     sorrel_data::open_journal(&journal_opts(open), path, baseline, n_clusters)
 }
 
-/// Detect which backend a path looks like. Phy markers take precedence
-/// because they're the most specific; HDF5 backends are leaf-file based
-/// (`.nwb` / `rez.mat`) so they trigger only when the path is a file.
 fn detect_backend(root: &Path) -> Result<Backend> {
-    if root.is_file() {
-        let name = root.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let ext = root
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
+    Ok(match sorrel_io::detect_backend(root)? {
+        sorrel_io::Backend::Kilosort => Backend::Kilosort,
+        sorrel_io::Backend::SortingAnalyzer => Backend::SortingAnalyzer,
+        sorrel_io::Backend::Nwb => {
+            let (enabled, feature) = if root.is_dir() {
+                (cfg!(feature = "zarr"), "zarr")
+            } else {
+                (cfg!(feature = "hdf5"), "hdf5")
+            };
+            anyhow::ensure!(
+                enabled,
+                "{} requires building with --features {feature}",
+                root.display()
+            );
+            #[cfg(any(feature = "hdf5", feature = "zarr"))]
+            {
+                Backend::Nwb
+            }
+            #[cfg(not(any(feature = "hdf5", feature = "zarr")))]
+            unreachable!()
+        }
         #[cfg(feature = "hdf5")]
-        {
-            if ext == "nwb" {
-                return Ok(Backend::Nwb);
-            }
-            if name == "rez.mat" || name == "rez2.mat" {
-                return Ok(Backend::Ks4Rez);
-            }
-        }
+        sorrel_io::Backend::Ks4Rez => Backend::Ks4Rez,
         #[cfg(not(feature = "hdf5"))]
-        {
-            if ext == "nwb" || name == "rez.mat" || name == "rez2.mat" {
-                bail!("{} requires building with --features hdf5", root.display());
-            }
+        sorrel_io::Backend::Ks4Rez => {
+            bail!("{} requires building with --features hdf5", root.display())
         }
-        bail!("unrecognised file {}; expected a directory", root.display());
-    }
-
-    if root.join("spike_times.npy").exists() && root.join("spike_clusters.npy").exists() {
-        return Ok(Backend::Kilosort);
-    }
-    if (root.join("recording.json").exists() || root.join("binary.json").exists())
-        && root.join("sorting").is_dir()
-    {
-        return Ok(Backend::SortingAnalyzer);
-    }
-    bail!(
-        "could not detect a supported backend in {} \
-         (looked for kilosort outputs and a SortingAnalyzer folder)",
-        root.display()
-    );
+    })
 }
 
 /// Apply SpikeGLX/Open Ephys metadata overrides to a `KilosortOpenParams`,
@@ -729,7 +718,7 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
                 },
             )
         }
-        #[cfg(feature = "hdf5")]
+        #[cfg(any(feature = "hdf5", feature = "zarr"))]
         Backend::Nwb => {
             let path = open.root().to_path_buf();
             let provider = sorrel_io::NwbProvider::open_with(
@@ -772,7 +761,7 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
 }
 
 /// Wrap `Session::new` and name the sorter: `--sorter`, else the saved pin, else detected from the data.
-#[cfg(feature = "hdf5")]
+#[cfg(any(feature = "hdf5", feature = "zarr"))]
 fn new_session<P: DataProvider>(
     provider: P,
     journal: Journal,
@@ -926,9 +915,8 @@ fn run_join(
     )
 }
 
-/// Shared open path for single-file backends (`.nwb`, `rez.mat`): the
-/// journal and save artifacts live next to the file, named after it.
-#[cfg(feature = "hdf5")]
+/// NWB and rez.mat journals and save artifacts live beside the file or store.
+#[cfg(any(feature = "hdf5", feature = "zarr"))]
 fn open_file_backed<P>(
     open: &OpenArgs,
     provider: P,
@@ -1507,10 +1495,14 @@ fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> Vec<(&'static 
 /// directory or a single file's parent.
 fn host_dir(open: &OpenArgs) -> PathBuf {
     let root = open.root();
-    match root.is_dir() {
+    match is_dataset_directory(root) {
         true => root.to_path_buf(),
         false => root.parent().unwrap_or(Path::new(".")).to_path_buf(),
     }
+}
+
+fn is_dataset_directory(path: &Path) -> bool {
+    path.is_dir() && !sorrel_io::nwb::is_zarr_path(path)
 }
 
 fn session_path(path: &Path) -> PathBuf {
@@ -1528,7 +1520,7 @@ fn session_key(open: &OpenArgs) -> Result<String> {
     // Discard is a one-shot action, not a property of the live session.
     args.discard_journal = false;
     // A file's name matters even through a symlink: it names its journal.
-    args.root = Some(if args.root().is_dir() {
+    args.root = Some(if is_dataset_directory(args.root()) {
         session_path(args.root())
     } else {
         session_path(&host_dir(&args)).join(
@@ -1549,7 +1541,7 @@ fn session_key(open: &OpenArgs) -> Result<String> {
     {
         *path = session_path(path);
     }
-    #[cfg(feature = "hdf5")]
+    #[cfg(any(feature = "hdf5", feature = "zarr"))]
     if let Some(name) = args.nwb_series.as_mut().filter(|s| !s.starts_with('/')) {
         *name = format!("/acquisition/{name}");
     }
@@ -1638,7 +1630,7 @@ fn mcp_open_args(open: &OpenArgs) -> Result<String> {
             path.map(|p| sorrel_io::fsutil::display_path(&p).to_string()),
         );
     }
-    #[cfg(feature = "hdf5")]
+    #[cfg(any(feature = "hdf5", feature = "zarr"))]
     flag("nwb-series", open.nwb_series);
     flag("sample-rate", open.sample_rate.map(|r| r.to_string()));
     flag("channels", open.n_channels.map(|n| n.to_string()));
@@ -1651,7 +1643,7 @@ fn mcp_open_args(open: &OpenArgs) -> Result<String> {
             match b {
                 Backend::Kilosort => "kilosort",
                 Backend::SortingAnalyzer => "sorting-analyzer",
-                #[cfg(feature = "hdf5")]
+                #[cfg(any(feature = "hdf5", feature = "zarr"))]
                 Backend::Nwb => "nwb",
                 #[cfg(feature = "hdf5")]
                 Backend::Ks4Rez => "ks4-rez",
@@ -1733,7 +1725,7 @@ fn gpu_check() -> Result<()> {
 }
 
 fn clear_cache(root: &Path) -> Result<()> {
-    let dataset_dir = if root.is_file() {
+    let dataset_dir = if root.is_file() || sorrel_io::nwb::is_zarr_path(root) {
         root.parent().unwrap_or_else(|| Path::new("."))
     } else {
         root
@@ -1814,7 +1806,10 @@ where
 
 /// `--events`, else (for an NWB file without sidecar events) its trials table.
 fn load_events(open: &OpenArgs, nwb_start_time: f64) -> Result<Option<Events>> {
-    let is_nwb = |p: &Path| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("nwb"));
+    let is_nwb = |p: &Path| {
+        p.extension().is_some_and(|e| e.eq_ignore_ascii_case("nwb"))
+            || sorrel_io::nwb::is_zarr_path(p)
+    };
     let mut events = match &open.events {
         Some(p) => {
             Some(Events::read(p).with_context(|| format!("reading events {}", p.display()))?)
@@ -2972,6 +2967,42 @@ mod tests {
         let events = load_events(&open, 0.5).unwrap().unwrap();
         assert_eq!(events.samples(1000.0, None), [sorrel_io::SampleIndex(100)]);
         assert!(load_events(&open, 0.61).unwrap().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "zarr")]
+    #[test]
+    fn nwb_zarr_detects_suffix_and_nwb_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let named = dir.path().join("recording.nwb.zarr");
+        let unnamed = dir.path().join("download");
+        std::fs::create_dir(&named).unwrap();
+        std::fs::create_dir(&unnamed).unwrap();
+        assert!(detect_backend(&unnamed).is_err());
+        std::fs::write(unnamed.join(".zattrs"), br#"{"nwb_version":"2.10.0"}"#).unwrap();
+        for root in [named, unnamed] {
+            assert_eq!(detect_backend(&root).unwrap(), Backend::Nwb);
+            let open = OpenArgs {
+                root: Some(root),
+                ..Default::default()
+            };
+            assert_eq!(host_dir(&open), dir.path());
+        }
+    }
+
+    #[cfg(feature = "zarr")]
+    #[test]
+    fn nwb_zarr_trial_times_are_relative_to_the_trace() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../release/fixtures/nwb/units_only.nwb.zarr");
+        if !path.is_dir() {
+            return;
+        } // Cargo package builds omit workspace fixtures.
+        let open = OpenArgs {
+            root: Some(path),
+            ..Default::default()
+        };
+        let events = load_events(&open, 0.5).unwrap().unwrap();
+        assert_eq!(events.samples(1000.0, None), [sorrel_io::SampleIndex(100)]);
     }
 
     #[test]

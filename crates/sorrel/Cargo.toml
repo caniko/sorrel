@@ -45,10 +45,11 @@ rand = { version = "0.9", optional = true }
 eframe = { workspace = true, features = ["wayland", "x11"] }
 
 [features]
-default = ["phy-export"]
+default = ["phy-export", "zarr"]
 # `sorrel export-phy`, the serve tool and the GUI button.
 phy-export = ["sorrel-data/phy-export"]
 hdf5 = ["sorrel-io/hdf5", "sorrel-data/hdf5"]
+zarr = ["sorrel-io/zarr", "sorrel-data/zarr"]
 # `sorrel dev ...` and `sorrel diff --record`: the bench results DB.
 dev = ["sorrel-data/dev", "dep:serde", "dep:blake3", "dep:tempfile", "dep:rand"]
 
