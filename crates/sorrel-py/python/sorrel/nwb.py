@@ -61,8 +61,8 @@ METRIC_DESCRIPTIONS = {
     "srp_contamination": "Nominal upper limit on the contamination fraction (0-1): the smallest that the sliding-RP test confirms at confidence above 90%, assuming diffuse (Poisson) contamination; NaN if none of the 0.5%-35% grid passes, which means either contamination above 35% or too few spikes to tell.",
     "srp_rp_ms": "Tested refractory window (ms) of highest confidence at srp_contamination, the sliding-RP estimate of the refractory period; NaN when no tested combination passes.",
     "rpv_post_mean": "Mean contamination fraction (0-1) at the fixed refractory window under a diffuse-contamination Poisson likelihood and uniform Beta(1,1) prior; conditional on that model.",
-    "rpv_post_lo95": "Lower endpoint of the fixed-window contamination posterior's 95% highest-density credible interval (fraction, 0-1).",
-    "rpv_post_hi95": "Upper endpoint of the fixed-window contamination posterior's 95% highest-density credible interval (fraction, 0-1).",
+    "rpv_post_lo95": "Lower endpoint of the fixed-window contamination posterior's shortest 95% credible interval (fraction, 0-1).",
+    "rpv_post_hi95": "Upper endpoint of the fixed-window contamination posterior's shortest 95% credible interval (fraction, 0-1).",
 }
 _INT_METRICS = {"n_spikes", "isi_violations"}
 

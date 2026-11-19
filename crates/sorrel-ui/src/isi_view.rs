@@ -131,10 +131,10 @@ fn refractory_tooltip<P: DataProvider>(ui: &Ui, session: &Session<P>, c: Cluster
         };
         format!("{p:.decimals$}%")
     };
-    let srp = match (srp.min_contamination.is_nan(), post.mean.is_nan()) {
-        (true, true) => "SRP n/a".to_owned(),
-        // Computable but nothing passed: too few spikes or > 35% contamination.
-        (true, false) => "SRP unconfirmed ≤35%".to_owned(),
+    let srp = match (srp.min_contamination.is_nan(), srp.tested) {
+        (true, false) => "SRP n/a".to_owned(),
+        // Tested but nothing passed: too few spikes or heavy contamination.
+        (true, true) => "SRP unconfirmed ≤35%".to_owned(),
         (false, _) => format!(
             "SRP ≤{} (90%) @ {:.2} ms",
             pct(srp.min_contamination),
@@ -143,7 +143,9 @@ fn refractory_tooltip<P: DataProvider>(ui: &Ui, session: &Session<P>, c: Cluster
     };
     // The posterior uses the fixed window, not the SRP one; disagreement can
     // mean the fixed window is longer than this unit's refractory period.
-    let fixed = session.refractory().fixed_ms;
+    // Shown as the sample edge actually used, like the SRP window.
+    let sr = session.provider.sample_rate();
+    let fixed = session.refractory().fixed_samples(sr) as f32 * 1000.0 / sr;
     let text = if post.mean.is_nan() {
         format!("{srp} · {fixed:.2} ms posterior n/a")
     } else {
