@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use percent_encoding::percent_decode_str;
 use serde::{de::DeserializeOwned, Deserialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::Read,
     path::{Path, PathBuf},
     sync::Arc,
@@ -28,6 +28,7 @@ pub fn is_remote(path: &Path) -> bool {
         .is_some_and(|s| s.starts_with("dandi://") || s.starts_with("https://"))
 }
 
+#[derive(Clone)]
 pub(crate) enum Store {
     #[cfg(feature = "hdf5")]
     Blob(Arc<Object>),
@@ -35,6 +36,7 @@ pub(crate) enum Store {
 }
 
 /// A verified NWB asset revision and the store pinned to it.
+#[derive(Clone)]
 pub struct Resolved {
     pub(crate) store: Store,
     pub(crate) identity: Vec<u8>,
@@ -58,26 +60,37 @@ pub fn resolve(input: &str) -> Result<Resolved> {
     Api::production().resolve(input)
 }
 
+/// Resolve remote sorting and recording locators in one request. Local inputs are `None`.
+/// Versionless locators share one version lookup per Dandiset; identical locators share a store.
+pub fn resolve_pair(root: Option<&str>, dat: Option<&str>) -> Result<[Option<Resolved>; 2]> {
+    if root.is_none() && dat.is_none() {
+        return Ok([None, None]);
+    }
+    Api::production().resolve_pair(root, dat)
+}
+
 /// Pin a DANDI locator to an explicit version for both session lookup and open.
 /// Non-DANDI paths and HTTPS URLs have no Dandiset version to pin.
 pub fn pin_version(input: &str) -> Result<Option<String>> {
     if !input.starts_with(LOCATOR_PREFIX) {
         return Ok(None);
     }
-    Ok(Api::production().dandiset_locator(input)?.map(|locator| {
-        let Locator {
-            id,
-            version,
-            encoded_path,
-            ..
-        } = locator;
-        format!("{LOCATOR_PREFIX}{id}@{version}/{encoded_path}")
-    }))
+    Ok(Api::production()
+        .dandiset_locator(input, &mut HashMap::new())?
+        .map(|locator| {
+            let Locator {
+                id,
+                version,
+                encoded_path,
+                ..
+            } = locator;
+            format!("{LOCATOR_PREFIX}{id}@{version}/{encoded_path}")
+        }))
 }
 
 /// Find the local state subdirectory without opening or listing the asset.
 pub fn state_path(input: &str) -> Result<PathBuf> {
-    if let Some(locator) = Api::production().dandiset_locator(input)? {
+    if let Some(locator) = Api::production().dandiset_locator(input, &mut HashMap::new())? {
         return Ok(locator.state_path());
     }
     Ok(https_state_path(&https_url(input)?))
@@ -187,7 +200,11 @@ impl Api {
         }
     }
 
-    fn dandiset_locator<'a>(&self, input: &'a str) -> Result<Option<Locator<'a>>> {
+    fn dandiset_locator<'a>(
+        &self,
+        input: &'a str,
+        versions: &mut HashMap<&'a str, String>,
+    ) -> Result<Option<Locator<'a>>> {
         let Some(rest) = input.strip_prefix(LOCATOR_PREFIX) else {
             return Ok(None);
         };
@@ -207,17 +224,20 @@ impl Api {
                 && !path.chars().any(char::is_control),
             "invalid DANDI asset path"
         );
-        let version = match version {
-            Some(version) => component(version)?.to_owned(),
-            None => {
-                let dataset: Dandiset = self.json(&self.endpoint(&format!("dandisets/{id}/")))?;
-                dataset
-                    .most_recent_published_version
-                    .unwrap_or(dataset.draft_version)
-                    .version
-            }
+        let version = if let Some(version) = version {
+            component(version)?.to_owned()
+        } else if let Some(version) = versions.get(id) {
+            version.clone()
+        } else {
+            let dataset: Dandiset = self.json(&self.endpoint(&format!("dandisets/{id}/")))?;
+            let version = dataset
+                .most_recent_published_version
+                .unwrap_or(dataset.draft_version)
+                .version;
+            component(&version)?;
+            versions.insert(id, version.clone());
+            version
         };
-        component(&version)?;
         Ok(Some(Locator {
             id,
             version,
@@ -227,7 +247,35 @@ impl Api {
     }
 
     fn resolve(&self, input: &str) -> Result<Resolved> {
-        if let Some(locator) = self.dandiset_locator(input)? {
+        self.resolve_with_versions(input, &mut HashMap::new())
+    }
+
+    fn resolve_pair<'a>(
+        &self,
+        root: Option<&'a str>,
+        dat: Option<&'a str>,
+    ) -> Result<[Option<Resolved>; 2]> {
+        let mut versions = HashMap::new();
+        let mut resolve = |input: Option<&'a str>| {
+            input
+                .map(|input| self.resolve_with_versions(input, &mut versions))
+                .transpose()
+        };
+        let sorting = resolve(root).context("resolve remote dataset")?;
+        let recording = if root == dat {
+            sorting.clone()
+        } else {
+            resolve(dat).context("resolve remote --dat")?
+        };
+        Ok([sorting, recording])
+    }
+
+    fn resolve_with_versions<'a>(
+        &self,
+        input: &'a str,
+        versions: &mut HashMap<&'a str, String>,
+    ) -> Result<Resolved> {
+        if let Some(locator) = self.dandiset_locator(input, versions)? {
             let Locator {
                 id, version, path, ..
             } = &locator;

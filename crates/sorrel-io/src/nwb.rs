@@ -94,7 +94,14 @@ mod imp {
         pub fn open_with(path: impl AsRef<Path>, params: NwbOpenParams<'_>) -> Result<Self> {
             let path = path.as_ref();
             #[cfg(feature = "dandi")]
-            return Self::open_pinned(path, params, None, Self::resolve_raw(params)?);
+            return Self::open_pinned(
+                path,
+                params,
+                None,
+                Self::remote_raw_locator(params)
+                    .map(crate::dandi::resolve)
+                    .transpose()?,
+            );
             #[cfg(not(feature = "dandi"))]
             Self::from_group(Group::open(path)?, path, params, None)
         }
@@ -105,31 +112,25 @@ mod imp {
             locator: &str,
             params: NwbOpenParams<'_>,
         ) -> Result<(Self, std::path::PathBuf)> {
-            let resolved = crate::dandi::resolve(locator)?;
-            let state = resolved.state.clone();
-            Ok((Self::open_resolved(resolved, params)?, state))
+            let [root, raw] =
+                crate::dandi::resolve_pair(Some(locator), Self::remote_raw_locator(params))?;
+            let state = root
+                .as_ref()
+                .context("missing resolved NWB dataset")?
+                .state
+                .clone();
+            Ok((
+                Self::open_pinned(Path::new(locator), params, root, raw)?,
+                state,
+            ))
         }
 
         #[cfg(feature = "dandi")]
-        pub(crate) fn open_resolved(
-            resolved: crate::dandi::Resolved,
-            params: NwbOpenParams<'_>,
-        ) -> Result<Self> {
-            Self::open_pinned(
-                Path::new("remote NWB"),
-                params,
-                Some(resolved),
-                Self::resolve_raw(params)?,
-            )
-        }
-
-        #[cfg(feature = "dandi")]
-        fn resolve_raw(params: NwbOpenParams<'_>) -> Result<Option<crate::dandi::Resolved>> {
+        fn remote_raw_locator(params: NwbOpenParams<'_>) -> Option<&str> {
             params
                 .raw_path
                 .filter(|path| crate::dandi::is_remote(path))
-                .map(|path| crate::dandi::resolve(path.to_str().unwrap()))
-                .transpose()
+                .and_then(Path::to_str)
         }
 
         /// Open NWB using the supplied remote revisions, never resolving their locators again.

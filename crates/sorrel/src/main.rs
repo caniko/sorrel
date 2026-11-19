@@ -1637,22 +1637,10 @@ impl RemoteInputs {
     fn resolve(open: &OpenArgs) -> Result<Self> {
         #[cfg(feature = "dandi")]
         {
-            let resolve = |path: &Path| {
-                path.to_str()
-                    .filter(|_| is_remote(path))
-                    .map(sorrel_io::dandi::resolve)
-                    .transpose()
-            };
-            Ok(Self {
-                root: resolve(open.root()).context("resolve remote dataset")?,
-                dat: open
-                    .dat
-                    .as_deref()
-                    .map(resolve)
-                    .transpose()
-                    .context("resolve remote --dat")?
-                    .flatten(),
-            })
+            let [root, dat] = [Some(open.root()), open.dat.as_deref()]
+                .map(|path| path.filter(|path| is_remote(path)).and_then(Path::to_str));
+            let [root, dat] = sorrel_io::dandi::resolve_pair(root, dat)?;
+            Ok(Self { root, dat })
         }
         #[cfg(not(feature = "dandi"))]
         {

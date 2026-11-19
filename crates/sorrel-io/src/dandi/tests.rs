@@ -386,6 +386,74 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+#[test]
+#[cfg(feature = "hdf5")]
+fn paired_locators_share_implicit_release_and_identical_store() -> Result<()> {
+    use std::sync::atomic::AtomicUsize;
+    let versions = Arc::new(AtomicUsize::new(0));
+    let listings = Arc::new(AtomicUsize::new(0));
+    let (lookups, assets) = (versions.clone(), listings.clone());
+    let server = Server::new(move |url, headers, stream| match url.path() {
+        "/api/dandisets/000123/" => {
+            let version = if lookups.fetch_add(1, Ordering::Relaxed) == 0 {
+                "0.42.1"
+            } else {
+                "0.42.2"
+            };
+            json_reply(
+                stream,
+                json!({"most_recent_published_version": {"version": version}, "draft_version": {"version": "draft"}}),
+            );
+        }
+        "/api/dandisets/000123/versions/0.42.1/assets/"
+        | "/api/dandisets/000123/versions/0.42.2/assets/" => {
+            assets.fetch_add(1, Ordering::Relaxed);
+            let path = url
+                .query_pairs()
+                .find(|(name, _)| name == "path")
+                .unwrap()
+                .1;
+            json_reply(
+                stream,
+                json!({"next": null, "results": [{"asset_id": "asset", "blob": "blob", "size": 8, "path": path}]}),
+            );
+        }
+        "/api/assets/asset/download/" => {
+            reply(stream, 302, "Location: /blob\r\nContent-Length: 0\r\n", &[])
+        }
+        "/blob" => {
+            serve_range(stream, headers, b"12345678", Fault::None, "\"one\"");
+        }
+        _ => panic!("unexpected URL: {url}"),
+    });
+    let api = server.api(Duration::from_secs(2));
+    let root = Some("dandi://dandi/000123/sorting.nwb");
+    let dat = Some("dandi://dandi/000123/recording.nwb");
+    for (asset, path) in api
+        .resolve_pair(root, dat)?
+        .into_iter()
+        .zip(["sorting.nwb", "recording.nwb"])
+    {
+        let asset = asset.unwrap();
+        assert_eq!(
+            asset.state_path(),
+            Path::new("000123/0.42.1").join(blake3::hash(path.as_bytes()).to_hex().as_str())
+        );
+    }
+    assert_eq!(versions.load(Ordering::Relaxed), 1);
+    assert_eq!(listings.load(Ordering::Relaxed), 2);
+
+    let [a, b] = api.resolve_pair(root, root)?.map(Option::unwrap);
+    assert_eq!(a.state_path().parent(), Some(Path::new("000123/0.42.2")));
+    let (Store::Blob(a), Store::Blob(b)) = (a.store, b.store) else {
+        panic!("expected pinned blobs");
+    };
+    assert!(Arc::ptr_eq(&a, &b));
+    assert_eq!(versions.load(Ordering::Relaxed), 2);
+    assert_eq!(listings.load(Ordering::Relaxed), 3);
+    Ok(())
+}
+
 fn objects(path: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(root: &Path, path: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
         for entry in fs::read_dir(path).unwrap() {
@@ -543,11 +611,15 @@ fn parity(name: &'static str, draft: bool) -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
     let (server, bytes) = remote_fixture(name, draft);
     let local = NwbProvider::open(fixture(name));
-    let remote = NwbProvider::open_resolved(
-        server
-            .api(Duration::from_secs(2))
-            .resolve(&format!("dandi://dandi/000123/test/{name}"))?,
+    let remote = NwbProvider::open_pinned(
+        Path::new("remote NWB"),
         NwbOpenParams::default(),
+        Some(
+            server
+                .api(Duration::from_secs(2))
+                .resolve(&format!("dandi://dandi/000123/test/{name}"))?,
+        ),
+        None,
     );
     if let Err(local) = local {
         let remote = remote
@@ -687,7 +759,12 @@ fn direct_dandi_https_asset_endpoint_resolves_zarr() -> Result<()> {
     let direct = api.resolve(server.base.join("assets/asset-id/download/")?.as_str())?;
     let by_path = api.resolve("dandi://dandi/000123/test/good.nwb.zarr")?;
     assert_eq!(direct.identity, by_path.identity);
-    let provider = NwbProvider::open_resolved(direct, NwbOpenParams::default())?;
+    let provider = NwbProvider::open_pinned(
+        Path::new("remote NWB"),
+        NwbOpenParams::default(),
+        Some(direct),
+        None,
+    )?;
     assert!(provider.n_clusters() > 0);
     Ok(())
 }
@@ -742,9 +819,14 @@ fn public_zarr() -> Result<()> {
         .context("missing NWB-Zarr root attributes")?;
     let attrs: Value = serde_json::from_slice(&attrs)?;
     assert_eq!(attrs["neurodata_type"], "NWBFile");
-    let error = NwbProvider::open_resolved(resolved, NwbOpenParams::default())
-        .err()
-        .context("unexpectedly opened the unsupported benchmark")?;
+    let error = NwbProvider::open_pinned(
+        Path::new("remote NWB"),
+        NwbOpenParams::default(),
+        Some(resolved),
+        None,
+    )
+    .err()
+    .context("unexpectedly opened the unsupported benchmark")?;
     let message = format!("{error:#}");
     assert!(
         message.contains("parse .zmetadata") || message.contains("/units"),
