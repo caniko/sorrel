@@ -1144,7 +1144,7 @@ mod imp {
                     block_start..next_block.saturating_add(1).min(n_samples),
                 )?;
             }
-            let distance = |j: usize| (t - block[j - block_start]).abs();
+            let distance = |j: usize| exact_distance(t, block[j - block_start]);
             let mut nearest = i;
             // The timestamps strictly increase and were verified to differ by
             // far less than half a sample from the grid, so only neighbors can win.
@@ -1161,6 +1161,21 @@ mod imp {
             }
         }
         Ok(())
+    }
+
+    /// `|a - b|` as an unevaluated sum `(hi, lo)` (TwoSum), compared
+    /// lexicographically. Rounding is monotonic, so unequal `hi` already order
+    /// the exact distances, and equal `hi` leave the exact difference in `lo`.
+    /// A plain `(a - b).abs()` can round two different distances to a tie.
+    fn exact_distance(a: f64, b: f64) -> (f64, f64) {
+        let hi = a - b;
+        let bb = hi - a;
+        let lo = (a - (hi - bb)) + (-b - bb);
+        if hi < 0.0 || (hi == 0.0 && lo < 0.0) {
+            (-hi, -lo)
+        } else {
+            (hi, lo)
+        }
     }
 
     struct UnitMetadata {
@@ -1374,6 +1389,19 @@ mod imp {
                 "{error}"
             );
         }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn exact_distance_breaks_rounded_ties() {
+        // |2^-11 - 2^-70| rounds to 2^-11 = |2^-11 - 2^-10|, but the first is nearer.
+        let t = 2f64.powi(-11);
+        assert_eq!((t - 2f64.powi(-70)).abs(), (t - 2f64.powi(-10)).abs());
+        assert!(exact_distance(t, 2f64.powi(-70)) < exact_distance(t, 2f64.powi(-10)));
+        assert!(exact_distance(t, 2f64.powi(-10)) > exact_distance(t, 2f64.powi(-70)));
+        // A true tie stays a tie, from either side.
+        assert_eq!(exact_distance(1.5, 1.0), exact_distance(1.5, 2.0));
+        assert_eq!(exact_distance(1.0, 1.5), exact_distance(2.0, 1.5));
     }
 
     #[cfg(test)]
