@@ -138,3 +138,78 @@ fn nwb_call_preserves_exported_parent_without_a_row() {
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("\t0,unit:77\t"), "{text}");
 }
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn nwb_call_only_reuses_matching_running_session() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, Stdio};
+
+    struct Host(Child);
+    impl Drop for Host {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../release/fixtures/nwb/multiple_series.nwb");
+    std::fs::copy(src, tmp.path().join("units.nwb")).unwrap();
+    let mut host = Host(
+        Command::new(env!("CARGO_BIN_EXE_sorrel"))
+            .current_dir(tmp.path())
+            .env("SORREL_USER_DIR", tmp.path())
+            .args([
+                "run",
+                "--headless",
+                "units.nwb",
+                "--nwb-series",
+                "A_first",
+                "--journal",
+                "first.journal",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = BufReader::new(host.0.stdout.take().unwrap());
+    assert!(stdout
+        .lines()
+        .next()
+        .unwrap()
+        .unwrap()
+        .starts_with("sorrel host on"));
+    let call = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_sorrel"))
+            .current_dir(tmp.path())
+            .env("SORREL_USER_DIR", tmp.path())
+            .args(["call", "./units.nwb"])
+            .args(extra)
+            .arg("list_clusters")
+            .output()
+            .unwrap()
+    };
+    let same = call(&[
+        "--nwb-series",
+        "/acquisition/A_first",
+        "--journal",
+        "./first.journal",
+    ]);
+    assert!(
+        same.status.success(),
+        "{}",
+        String::from_utf8_lossy(&same.stderr)
+    );
+    for different in [
+        ["--journal", "first.journal", "--nwb-series", "Z_second"],
+        ["--journal", "first.journal", "--nwb-series", "nonexistent"],
+        ["--nwb-series", "A_first", "--journal", "other.journal"],
+        ["--journal", "first.journal", "--dat", "raw.nwb"],
+    ] {
+        let out = call(&different);
+        assert!(!out.status.success(), "{different:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("session conflict"));
+    }
+}

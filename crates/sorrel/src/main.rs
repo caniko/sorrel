@@ -908,7 +908,7 @@ fn run_join(
     // the window closes).
     let session = joined.session;
     let mut once = Some(move |rs: Option<&RenderState>| {
-        let app = build_tab(session, Box::new(|_| Ok(())), ctx, None, rs);
+        let app = build_tab(session, Box::new(|_| Ok(())), ctx, None, rs, None);
         Opened::Tab(Box::new(app) as Box<dyn Tab>, root)
     });
     let opener: Opener = Box::new(move |_, _, rs| {
@@ -974,6 +974,7 @@ struct TabBuilder<'a> {
     out: &'a mut Option<Box<dyn Tab>>,
     open: &'a OpenArgs,
     rs: Option<&'a RenderState>,
+    session_key: String,
 }
 impl SessionVisitor for TabBuilder<'_> {
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
@@ -981,7 +982,14 @@ impl SessionVisitor for TabBuilder<'_> {
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
         let events = load_events(self.open, ctx.nwb_start_time)?;
-        *self.out = Some(Box::new(build_tab(session, seed, ctx, events, self.rs)));
+        *self.out = Some(Box::new(build_tab(
+            session,
+            seed,
+            ctx,
+            events,
+            self.rs,
+            Some(self.session_key),
+        )));
         Ok(())
     }
 }
@@ -1505,9 +1513,57 @@ fn host_dir(open: &OpenArgs) -> PathBuf {
     }
 }
 
+fn session_path(path: &Path) -> PathBuf {
+    let path = if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    };
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn session_key(open: &OpenArgs) -> Result<String> {
+    let mut args = open.clone();
+    args.rebase(&std::env::current_dir()?);
+    // A file's name matters even through a symlink: it names its journal.
+    args.root = Some(if args.root().is_dir() {
+        session_path(args.root())
+    } else {
+        session_path(&host_dir(&args)).join(
+            args.root()
+                .file_name()
+                .context("missing dataset filename")?,
+        )
+    });
+    for path in [
+        &mut args.dat,
+        &mut args.journal,
+        &mut args.spikeglx_meta,
+        &mut args.oebin,
+        &mut args.events,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        *path = session_path(path);
+    }
+    #[cfg(feature = "hdf5")]
+    if let Some(name) = args.nwb_series.as_mut().filter(|s| !s.starts_with('/')) {
+        *name = format!("/acquisition/{name}");
+    }
+    // ponytail: compare normalized open arguments rather than reopening a
+    // provider to resolve implicit defaults. Use the same flags to attach.
+    Ok(format!("open-args-v1:{args:?}"))
+}
+
 /// `sorrel mcp`: bridge stdio to a running host, else serve in-process.
 fn run_mcp(open: &OpenArgs) -> Result<()> {
-    if sorrel_data::attach(&host_dir(open), std::io::stdin(), std::io::stdout())? {
+    if sorrel_data::serve::attach_for_session(
+        &host_dir(open),
+        Some(&session_key(open)?),
+        std::io::stdin(),
+        std::io::stdout(),
+    )? {
         return Ok(());
     }
     // attach found no listener. If another process still has the journal
@@ -1528,19 +1584,20 @@ fn busy_hint(e: anyhow::Error) -> anyhow::Error {
 }
 
 /// `sorrel run --headless`: the host and its MCP listener, no window.
-struct Headless;
+struct Headless(String);
 impl SessionVisitor for Headless {
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
         let host = std::sync::Arc::new(sorrel_data::SessionHost::new(seeded(session, seed)?));
-        let listener = sorrel_data::spawn_listener(
+        let listener = sorrel_data::serve::spawn_listener_for_session(
             host,
             &ctx.save_dir,
             ctx.reseal_on_save,
             phy_label_str,
             None,
+            Some(&self.0),
         )?;
         println!(
             "sorrel host on 127.0.0.1:{}; connect an agent with `sorrel mcp {}`; Ctrl-C stops",
@@ -1647,12 +1704,16 @@ fn build_tab<P>(
     ctx: OpenCtx<P>,
     events: Option<Events>,
     rs: Option<&RenderState>,
+    session_key: Option<String>,
 ) -> SorrelApp<P>
 where
     P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
 {
     // Seeding and replay run on a worker behind the loading screen.
     let mut app = SorrelApp::with_loader(session, phy_label_str, seed);
+    if let Some(key) = session_key {
+        app.set_session_key(key);
+    }
     #[cfg(feature = "phy-export")]
     {
         // A sibling of the dataset, so `share` (which syncs everything under
@@ -1735,13 +1796,18 @@ fn load_events(open: &OpenArgs, nwb_start_time: f64) -> Result<Option<Events>> {
 /// The shell's opener: a forwarded `sorrel open`'s args become a tab, or the
 /// index of the tab that already shows the dataset.
 fn tab_opener() -> Opener {
-    Box::new(|req, open_dirs, rs| {
+    Box::new(|req, open_tabs, rs| {
         let args = std::iter::once("sorrel").chain(req.args.iter().map(String::as_str));
         let mut open = TabCli::try_parse_from(args)?.open;
         open.rebase(&req.cwd);
-        let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-        let dir = canon(&host_dir(&open));
-        if let Some(i) = open_dirs.iter().position(|d| canon(d) == dir) {
+        let key = session_key(&open)?;
+        let dir = session_path(&host_dir(&open));
+        if let Some((i, tab)) = open_tabs
+            .iter()
+            .enumerate()
+            .find(|(_, tab)| session_path(tab.dataset()) == dir)
+        {
+            sorrel_data::serve::check_session_key("open tab", tab.session_key(), &key)?;
             return Ok(Opened::Existing(i));
         }
         let mut tab = None;
@@ -1751,6 +1817,7 @@ fn tab_opener() -> Opener {
                 out: &mut tab,
                 open: &open,
                 rs,
+                session_key: key,
             },
         )?;
         let tab = tab.context("backend produced no tab")?;
@@ -2081,7 +2148,11 @@ fn run_call(open: &OpenArgs, tool: &str, args: Option<&str>, raw: bool) -> Resul
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": tool, "arguments": args},
     });
-    let reply = match sorrel_data::call_once(&host_dir(open), &request)? {
+    let reply = match sorrel_data::serve::call_once_for_session(
+        &host_dir(open),
+        Some(&session_key(open)?),
+        &request,
+    )? {
         Some(r) => r,
         None => {
             let mut reply = None;
@@ -2289,7 +2360,7 @@ fn main() -> Result<()> {
             standalone,
             headless,
         }) => match headless {
-            true => with_session(&open, Headless),
+            true => with_session(&open, Headless(session_key(&open)?)),
             false => run_gui(&open, standalone),
         },
         Some(Cmd::Status { dir, json }) => run_status(dir.as_deref(), json),

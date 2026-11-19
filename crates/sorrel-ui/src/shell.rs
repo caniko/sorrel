@@ -25,8 +25,11 @@ pub trait Tab {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame);
     /// Dataset directory name, for the tab bar.
     fn label(&self) -> String;
-    /// The directory curation is saved to; identifies the tab.
+    /// The directory curation is saved to.
     fn dataset(&self) -> &Path;
+    fn session_key(&self) -> Option<&str> {
+        None
+    }
     fn dirty(&self) -> bool;
     fn window_title(&self) -> String;
     /// Close if clean, else ask: the answer shows in [`Self::close_state`].
@@ -53,12 +56,12 @@ pub enum Opened {
     Existing(usize),
 }
 
-/// Builds a tab for a request. Gets the open tabs' datasets so it can answer
+/// Builds a tab for a request. Gets the open tabs so it can answer
 /// [`Opened::Existing`] instead of opening a dataset twice.
 pub type Opener = Box<
     dyn FnMut(
         &OpenRequest,
-        &[PathBuf],
+        &[&dyn Tab],
         Option<&eframe::egui_wgpu::RenderState>,
     ) -> anyhow::Result<Opened>,
 >;
@@ -139,7 +142,7 @@ impl Shell {
     }
 
     fn try_open(&mut self, req: OpenRequest) -> anyhow::Result<()> {
-        let open: Vec<PathBuf> = self.tabs.iter().map(|t| t.dataset().into()).collect();
+        let open: Vec<&dyn Tab> = self.tabs.iter().map(Box::as_ref).collect();
         let rs = self.rs.clone();
         let i = match (self.opener)(&req, &open, rs.as_ref())? {
             Opened::Existing(i) if i < self.tabs.len() => i,
