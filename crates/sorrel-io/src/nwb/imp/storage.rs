@@ -4,6 +4,9 @@
 #[cfg(feature = "hdf5")]
 #[path = "hdf.rs"]
 mod hdf;
+#[cfg(all(feature = "dandi", feature = "hdf5"))]
+#[path = "http_vfd.rs"]
+mod http_vfd;
 #[cfg(feature = "zarr")]
 #[path = "zarr.rs"]
 mod zarr;
@@ -46,6 +49,17 @@ macro_rules! dispatch {
 }
 
 impl Group {
+    #[cfg(feature = "dandi")]
+    pub fn open_remote(store: crate::dandi::Store) -> Result<Self> {
+        match store {
+            #[cfg(feature = "hdf5")]
+            crate::dandi::Store::Blob(object) => {
+                Ok(Self::Hdf5(http_vfd::open(&object)?.group("/")?))
+            }
+            crate::dandi::Store::Zarr(store) => Ok(Self::Zarr(zarr::open_remote(store)?)),
+        }
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let open = || -> Result<Self> {
             if path.is_dir() {

@@ -87,6 +87,40 @@ mod imp {
         pub fn open_with(path: impl AsRef<Path>, params: NwbOpenParams<'_>) -> Result<Self> {
             let path = path.as_ref();
             let f = Group::open(path)?;
+            Self::from_group(f, path, params, None)
+        }
+
+        /// Open a DANDI asset or HTTPS NWB stream and return its relative local state directory.
+        #[cfg(feature = "dandi")]
+        pub fn open_remote(
+            locator: &str,
+            params: NwbOpenParams<'_>,
+        ) -> Result<(Self, std::path::PathBuf)> {
+            let resolved = crate::dandi::resolve(locator)?;
+            let state = resolved.state.clone();
+            Ok((Self::open_resolved(resolved, params)?, state))
+        }
+
+        #[cfg(feature = "dandi")]
+        pub(crate) fn open_resolved(
+            resolved: crate::dandi::Resolved,
+            params: NwbOpenParams<'_>,
+        ) -> Result<Self> {
+            let group = Group::open_remote(resolved.store)?;
+            Self::from_group(
+                group,
+                Path::new("remote NWB"),
+                params,
+                Some(resolved.identity),
+            )
+        }
+
+        fn from_group(
+            f: Group,
+            path: &Path,
+            params: NwbOpenParams<'_>,
+            remote_identity: Option<Vec<u8>>,
+        ) -> Result<Self> {
             let spike_times = f.stored_dataset("/units/spike_times")?;
             let spike_times_index = f.stored_dataset("/units/spike_times_index")?;
             let ids = f.stored_dataset("/units/id")?;
@@ -141,6 +175,7 @@ mod imp {
                 }
                 legacy_identity = raw.is_none()
                     && timestamps.is_none()
+                    && remote_identity.is_none()
                     && f.supports_legacy_seal()
                     && is_trunk_series(&f, name);
                 comparison_rate = if params.sample_rate.is_none() {
@@ -190,7 +225,10 @@ mod imp {
                 ensure!(spikes_per_cluster.iter().filter_map(|s| s.last()).all(|s| s.0 < n_samples as u64),
                     "spike times extend past the paired ElectricalSeries (starting time {t0} s, {n_samples} samples at {rate} Hz)");
             }
-            let mut identity_bytes = f.identity(path)?;
+            let mut identity_bytes = match remote_identity {
+                Some(identity) => identity,
+                None => f.identity(path)?,
+            };
             if !(legacy_identity && same_mapping) {
                 if let Some((name, _)) = &series {
                     identity_bytes.extend_from_slice(name.as_bytes());
@@ -247,22 +285,28 @@ mod imp {
         }
 
         fn trace(&self, start: SampleIndex, len: u32) -> TraceSlice<'_> {
+            self.read_trace(start, len).unwrap_or_else(|err| {
+                // Interactive callers using the infallible trait get no samples, never zeros.
+                log::error!("read NWB trace at sample {start}: {err:#}");
+                TraceSlice {
+                    start,
+                    n_channels: self.n_channels,
+                    samples: TraceSamples::F32(&[]),
+                }
+            })
+        }
+
+        fn read_trace(&self, start: SampleIndex, len: u32) -> Result<TraceSlice<'_>> {
             let samples = self
                 .trace
                 .as_ref()
                 .map(|trace| trace.window(start, len))
-                .transpose()
-                .unwrap_or_else(|err| {
-                    // The trace interface cannot propagate I/O errors. Returning
-                    // no samples avoids mistaking a partial read for real data.
-                    log::error!("read NWB trace at sample {start}: {err:#}");
-                    None
-                });
-            TraceSlice {
+                .transpose()?;
+            Ok(TraceSlice {
                 start,
                 n_channels: self.n_channels,
                 samples: samples.map_or(TraceSamples::F32(&[]), TraceSamples::OwnedF32),
-            }
+            })
         }
 
         fn unit_id(&self, cluster: ClusterId) -> u32 {

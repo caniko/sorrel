@@ -1,8 +1,9 @@
 //! Identity-pinned, read-only HTTP range I/O. URLs and HTTP-library errors
 //! never escape this module's request boundary (they can contain signatures).
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use lru::LruCache;
 use std::io::Read;
+use std::mem::MaybeUninit;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -235,6 +236,7 @@ pub(crate) struct Object {
 }
 
 impl Object {
+    #[cfg(feature = "hdf5")]
     pub fn probe(mut source: Source, expected_size: Option<u64>) -> Result<Arc<Self>> {
         let (_, size, etag) = source.fetch(0, 7, expected_size, None)?;
         Ok(Arc::new(Self::new(0, Cache::new(), source, size, etag)))
@@ -261,8 +263,15 @@ impl Object {
         Ok(())
     }
 
-    pub fn read(self: &Arc<Self>, offset: u64, buf: &mut [u8], readahead: bool) -> Result<()> {
-        let end = offset.saturating_add(buf.len() as u64);
+    pub fn read_uninit(
+        self: &Arc<Self>,
+        offset: u64,
+        buf: &mut [MaybeUninit<u8>],
+        readahead: bool,
+    ) -> Result<()> {
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .context("range offset overflow")?;
         ensure!(
             end <= self.size,
             "{}: bytes {offset}..{end} exceed EOF",
@@ -290,8 +299,9 @@ impl Object {
             let mut cache = self.cache.0.lock().unwrap();
             if let Some(block) = cache.get(&(self.id, start)) {
                 let stop = end.min(start + block.len() as u64);
-                buf[(pos - offset) as usize..(stop - offset) as usize]
-                    .copy_from_slice(&block[(pos - start) as usize..(stop - start) as usize]);
+                let dest = &mut buf[(pos - offset) as usize..(stop - offset) as usize];
+                let src = &block[(pos - start) as usize..(stop - start) as usize];
+                dest.write_copy_of_slice(src);
                 pos = stop;
             } else {
                 drop(cache);

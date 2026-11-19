@@ -212,7 +212,7 @@ fn mean_templates<P: DataProvider>(session: &Session<P>) -> (Vec<f32>, [usize; 3
                 if start + n_t as u64 > n_samples {
                     continue;
                 }
-                let window = p.trace(SampleIndex(start), n_t as u32);
+                let window = p.read_trace(SampleIndex(start), n_t as u32)?;
                 let window = window.samples.to_f32_centred();
                 // A remote mirror returns an empty window while fetching.
                 if window.len() != sum.len() {
@@ -250,7 +250,7 @@ fn stream_raw<P: DataProvider>(p: &P, path: &Path) -> Result<TraceDtype> {
         let mut start = 0;
         while start < n_samples {
             let len = (n_samples - start).min(STREAM_FRAMES);
-            let window = p.trace(SampleIndex(start), len as u32);
+            let window = p.read_trace(SampleIndex(start), len as u32)?;
             if window.samples.len() != len as usize * n_ch {
                 return Err(std::io::Error::other(format!(
                     "trace window at sample {start} came back incomplete"

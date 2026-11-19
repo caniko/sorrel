@@ -446,6 +446,11 @@ pub trait DataProvider: Send + Sync + 'static {
     /// Read a window of the raw trace; memory-mapped backends lend a slice.
     fn trace(&self, start: SampleIndex, len: u32) -> TraceSlice<'_>;
 
+    /// Fallible trace read for callers that must report a failed window.
+    fn read_trace(&self, start: SampleIndex, len: u32) -> anyhow::Result<TraceSlice<'_>> {
+        Ok(self.trace(start, len))
+    }
+
     /// Initial label vector loaded from the backend's on-disk schema.
     fn initial_labels(&self) -> Vec<Self::Label>;
 
