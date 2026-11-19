@@ -519,6 +519,11 @@ fn parity(name: &'static str, draft: bool) -> Result<()> {
         return Ok(());
     }
     let (local, remote) = (local?, remote?);
+    if name == "units_only.nwb.zarr" {
+        let trials = remote.read_remote_trials()?;
+        assert!(!trials.is_empty());
+        assert_eq!(trials, crate::Events::read(&fixture(name))?);
+    }
     assert_eq!(local.n_clusters(), remote.n_clusters());
     assert_eq!(local.sample_rate(), remote.sample_rate());
     assert_eq!(local.n_samples(), remote.n_samples());
@@ -576,6 +581,7 @@ fn zarr_parity() -> Result<()> {
         "curated_units.nwb.zarr",
         "irregular_timestamps.nwb.zarr",
         "multiple_series.nwb.zarr",
+        "units_only.nwb.zarr",
     ] {
         parity(name, true)?;
     }

@@ -78,15 +78,20 @@ impl Events {
                 Self::parse_csv(&text)?
             }
             #[cfg(any(feature = "hdf5", feature = "zarr"))]
-            _ if ext == "nwb" || crate::nwb::is_zarr_path(path) => crate::nwb::read_trials(path)?,
+            _ if ext == "nwb" || crate::nwb::is_zarr_path(path) => {
+                return crate::nwb::read_trials(path)
+            }
             other => bail!("{}: unsupported events file type {other:?}", path.display()),
         };
-        // Keep (time, label) pairs together while sorting by time.
-        let mut order: Vec<usize> = (0..ev.len()).collect();
-        order.sort_by(|&a, &b| ev.times_s[a].total_cmp(&ev.times_s[b]));
-        ev.times_s = order.iter().map(|&i| ev.times_s[i]).collect();
-        ev.label = order.iter().map(|&i| ev.label[i]).collect();
+        ev.sort_by_time();
         Ok(ev)
+    }
+
+    pub(crate) fn sort_by_time(&mut self) {
+        let mut order: Vec<usize> = (0..self.len()).collect();
+        order.sort_by(|&a, &b| self.times_s[a].total_cmp(&self.times_s[b]));
+        self.times_s = order.iter().map(|&i| self.times_s[i]).collect();
+        self.label = order.iter().map(|&i| self.label[i]).collect();
     }
 
     fn parse_csv(text: &str) -> Result<Self> {

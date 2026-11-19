@@ -672,6 +672,9 @@ type Seed<P> = Box<dyn FnOnce(&mut Session<P>) -> Result<()> + Send + 'static>;
 
 /// A subcommand body, monomorphised once per backend by [`with_session`].
 trait SessionVisitor {
+    #[cfg(feature = "dandi")]
+    fn read_remote_trials(&mut self, _: &sorrel_io::NwbProvider) {}
+
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry;
@@ -686,6 +689,8 @@ fn seeded<P: DataProvider>(mut session: Session<P>, seed: Seed<P>) -> Result<Ses
 /// Open the backend named (or detected) by `open`, seal and replay its
 /// journal, then hand the typed session to `v`.
 fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
+    #[cfg(feature = "dandi")]
+    let mut v = v;
     let backend = match (open.backend, is_remote(open.root())) {
         (backend, true) => {
             let detected = detect_backend(open.root())?;
@@ -750,6 +755,7 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
             let (provider, path) = if is_remote(&path) {
                 let (provider, state) =
                     sorrel_io::NwbProvider::open_remote(path.to_str().unwrap(), params)?;
+                v.read_remote_trials(&provider);
                 let dir = dandi_data_dir()?.join(state);
                 let mut builder = std::fs::DirBuilder::new();
                 builder.recursive(true);
@@ -1002,13 +1008,21 @@ struct TabBuilder<'a> {
     open: &'a OpenArgs,
     rs: Option<&'a RenderState>,
     session_key: String,
+    remote_trials: Option<Events>,
 }
 impl SessionVisitor for TabBuilder<'_> {
+    #[cfg(feature = "dandi")]
+    fn read_remote_trials(&mut self, provider: &sorrel_io::NwbProvider) {
+        if self.open.events.is_none() {
+            self.remote_trials = provider.read_remote_trials().ok();
+        }
+    }
+
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
-        let events = load_events(self.open, ctx.nwb_start_time)?;
+        let events = load_events(self.open, ctx.nwb_start_time, self.remote_trials)?;
         *self.out = Some(Box::new(build_tab(
             session,
             seed,
@@ -1955,7 +1969,11 @@ where
 }
 
 /// `--events`, else (for an NWB file without sidecar events) its trials table.
-fn load_events(open: &OpenArgs, nwb_start_time: f64) -> Result<Option<Events>> {
+fn load_events(
+    open: &OpenArgs,
+    nwb_start_time: f64,
+    remote_trials: Option<Events>,
+) -> Result<Option<Events>> {
     let is_nwb = |p: &Path| {
         p.extension().is_some_and(|e| e.eq_ignore_ascii_case("nwb"))
             || sorrel_io::nwb::is_zarr_path(p)
@@ -1964,10 +1982,10 @@ fn load_events(open: &OpenArgs, nwb_start_time: f64) -> Result<Option<Events>> {
         Some(p) => {
             Some(Events::read(p).with_context(|| format!("reading events {}", p.display()))?)
         }
+        None if is_remote(open.root()) => remote_trials,
         // Sidecar events next to an NWB file win (the app detects them);
         // otherwise its trials table, whose absence is normal.
-        None if !is_remote(open.root())
-            && is_nwb(open.root())
+        None if is_nwb(open.root())
             && matches!(
                 Events::detect(open.root().parent().unwrap_or(Path::new("."))),
                 Ok(None)
@@ -1977,10 +1995,11 @@ fn load_events(open: &OpenArgs, nwb_start_time: f64) -> Result<Option<Events>> {
         }
         None => None,
     };
-    if let Some(ev) = events
-        .as_mut()
-        .filter(|_| is_nwb(open.events.as_deref().unwrap_or(open.root())))
-    {
+    if let Some(ev) = events.as_mut().filter(|_| {
+        open.events
+            .as_deref()
+            .map_or_else(|| is_remote(open.root()) || is_nwb(open.root()), is_nwb)
+    }) {
         // A trial before the trace starts must not be clamped to sample zero.
         let first = ev.times_s.partition_point(|&t| t < nwb_start_time);
         ev.times_s.drain(..first);
@@ -2020,6 +2039,7 @@ fn tab_opener() -> Opener {
         with_session(
             &open,
             TabBuilder {
+                remote_trials: None,
                 out: &mut tab,
                 open: &open,
                 rs,
@@ -3158,9 +3178,9 @@ mod tests {
         assert_eq!(open.nwb_series.as_deref(), Some("ElectricalSeriesRaw"));
         assert_eq!(open.dat.as_deref(), Some(Path::new("raw.nwb")));
         assert_eq!(open.sample_rate, Some(1000.0));
-        let events = load_events(&open, 0.5).unwrap().unwrap();
+        let events = load_events(&open, 0.5, None).unwrap().unwrap();
         assert_eq!(events.samples(1000.0, None), [sorrel_io::SampleIndex(100)]);
-        assert!(load_events(&open, 0.61).unwrap().unwrap().is_empty());
+        assert!(load_events(&open, 0.61, None).unwrap().unwrap().is_empty());
     }
 
     #[cfg(feature = "zarr")]
@@ -3195,8 +3215,34 @@ mod tests {
             root: Some(path),
             ..Default::default()
         };
-        let events = load_events(&open, 0.5).unwrap().unwrap();
+        let events = load_events(&open, 0.5, None).unwrap().unwrap();
         assert_eq!(events.samples(1000.0, None), [sorrel_io::SampleIndex(100)]);
+    }
+
+    #[cfg(feature = "dandi")]
+    #[test]
+    fn remote_nwb_trials_align_and_explicit_events_win() -> Result<()> {
+        let mut open = OpenArgs {
+            root: Some("https://example.test/asset/download/".into()),
+            ..Default::default()
+        };
+        let trials = Events {
+            times_s: vec![0.4, 0.6],
+            label: vec![0, 1],
+            names: vec!["pre-trace".into(), "remote trial".into()],
+        };
+        let events = load_events(&open, 0.5, Some(trials.clone()))?.unwrap();
+        assert_eq!(events.samples(1000.0, None), [sorrel_io::SampleIndex(100)]);
+        assert_eq!(events.names[events.label[0] as usize], "remote trial");
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("events.csv");
+        std::fs::write(&path, "time,label\n0.2,explicit\n")?;
+        open.events = Some(path);
+        let events = load_events(&open, 0.5, Some(trials))?.unwrap();
+        assert_eq!(events.samples(1000.0, None), [sorrel_io::SampleIndex(200)]);
+        assert_eq!(events.names[events.label[0] as usize], "explicit");
+        Ok(())
     }
 
     #[test]

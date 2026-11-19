@@ -77,6 +77,8 @@ mod imp {
         channel_map: Vec<ChannelId>,
         identity_bytes: Vec<u8>,
         trace: Option<NwbTrace>,
+        #[cfg(feature = "dandi")]
+        remote_root: Option<Group>,
     }
 
     impl NwbProvider {
@@ -238,6 +240,8 @@ mod imp {
                 ensure!(spikes_per_cluster.iter().filter_map(|s| s.last()).all(|s| s.0 < n_samples as u64),
                     "spike times extend past the paired ElectricalSeries (starting time {t0} s, {n_samples} samples at {rate} Hz)");
             }
+            #[cfg(feature = "dandi")]
+            let remote = remote_identity.is_some();
             let mut identity_bytes = match remote_identity {
                 Some(identity) => identity,
                 None => f.identity(path)?,
@@ -268,7 +272,15 @@ mod imp {
                 channel_map,
                 identity_bytes,
                 trace,
+                #[cfg(feature = "dandi")]
+                remote_root: remote.then_some(f),
             })
+        }
+
+        /// Read trials from the same remote sorting file and revision already opened.
+        #[cfg(feature = "dandi")]
+        pub fn read_remote_trials(&self) -> Result<crate::Events> {
+            trials_from_group(self.remote_root.as_ref().context("not a remote NWB")?)
         }
 
         /// First sample time in seconds on the NWB session clock.
@@ -435,9 +447,13 @@ mod imp {
 
     pub(crate) fn read_trials(path: &Path) -> Result<crate::Events> {
         let f = Group::open(path)?;
+        trials_from_group(&f).with_context(|| format!("{}: read NWB trials", path.display()))
+    }
+
+    fn trials_from_group(f: &Group) -> Result<crate::Events> {
         let g = f
             .group("/intervals/trials")
-            .with_context(|| format!("{}: no /intervals/trials table", path.display()))?;
+            .context("no /intervals/trials table")?;
         let starts: Vec<f64> = g.dataset("start_time")?.read_raw()?;
         let mut names = None;
         for column in ["trial_type", "stimulus", "condition"] {
@@ -452,6 +468,7 @@ mod imp {
         for (i, t) in starts.into_iter().enumerate() {
             events.push(t, names.as_ref().map_or("trial", |n| n[i].as_str()));
         }
+        events.sort_by_time();
         Ok(events)
     }
 
