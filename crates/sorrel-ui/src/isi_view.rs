@@ -147,7 +147,8 @@ fn refractory_tooltip<P: DataProvider>(ui: &Ui, session: &Session<P>, c: Cluster
     let sr = session.provider.sample_rate();
     let fixed = session.refractory().fixed_samples(sr) as f32 * 1000.0 / sr;
     let text = if post.mean.is_nan() {
-        format!("{srp} · {fixed:.2} ms posterior n/a")
+        // No window: it may not exist (e.g. a zero sample rate gives NaN ms).
+        format!("{srp} · posterior n/a")
     } else {
         format!(
             "{srp} · {fixed:.2} ms posterior {} (95% CrI {}–{})",
