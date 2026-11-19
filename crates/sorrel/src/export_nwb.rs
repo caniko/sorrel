@@ -79,10 +79,6 @@ impl ExportNwb {
                 destination,
                 starting_time: self.starting_time,
                 preserve_metrics: backend == Backend::Nwb,
-                sample_rate: self
-                    .open
-                    .sample_rate
-                    .filter(|_| backend == Backend::Kilosort),
             },
         )
     }
@@ -129,7 +125,6 @@ struct Export {
     destination: Destination,
     starting_time: Option<f64>,
     preserve_metrics: bool,
-    sample_rate: Option<f64>,
 }
 
 impl SessionVisitor for Export {
@@ -139,7 +134,7 @@ impl SessionVisitor for Export {
     {
         let session = seeded(session, seed)?;
         let p = &session.provider;
-        let rate = self.sample_rate.map_or_else(|| p.exact_sample_rate(), Ok)?;
+        let rate = p.exact_sample_rate()?;
         let units = collect_units(
             &session,
             rate,

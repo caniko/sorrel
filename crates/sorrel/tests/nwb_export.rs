@@ -175,6 +175,74 @@ fn native_export_long_recording_requires_explicit_rate_when_paired() {
 }
 
 #[test]
+fn native_phy_export_preserves_the_winning_exact_sample_rate() {
+    use sorrel_io::npy::{write_1d_u32_atomic, write_1d_u64_atomic};
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path();
+    let params_rate = 30000.123_f64;
+    let meta_rate = 30000.123027_f64;
+    let explicit_rate = 30000.123054_f64;
+    // All sources round to the same f32, but their f64 clocks are distinct.
+    assert_eq!(params_rate as f32, meta_rate as f32);
+    assert_eq!(params_rate as f32, explicit_rate as f32);
+    fs::write(
+        source.join("params.py"),
+        format!("dat_path = 'continuous.dat'\nsample_rate = {params_rate}\nn_channels_dat = 1\n"),
+    )
+    .unwrap();
+    fs::write(source.join("continuous.dat"), [0; 8]).unwrap();
+    write_1d_u64_atomic(&source.join("spike_times.npy"), &[1]).unwrap();
+    write_1d_u32_atomic(&source.join("spike_clusters.npy"), &[0]).unwrap();
+    let meta = source.join("recording.meta");
+    fs::write(&meta, format!("imSampRate={meta_rate}\nnSavedChans=1\n")).unwrap();
+    let meta = meta.to_str().unwrap();
+    let oebin = source.join("structure.oebin");
+    fs::write(
+        &oebin,
+        format!(
+            r#"{{"continuous":[{{"folder_name":".","sample_rate":{meta_rate},"num_channels":1}}]}}"#
+        ),
+    )
+    .unwrap();
+    let explicit = explicit_rate.to_string();
+
+    for (name, rate, flags) in [
+        ("params", params_rate, vec![]),
+        ("spikeglx", meta_rate, vec!["--spikeglx-meta", meta]),
+        ("oebin", meta_rate, vec!["--oebin", oebin.to_str().unwrap()]),
+        (
+            "explicit",
+            explicit_rate,
+            vec!["--spikeglx-meta", meta, "--sample-rate", &explicit],
+        ),
+    ] {
+        let out = source.join(format!("{name}.nwb"));
+        let mut options = vec![
+            "--identifier",
+            "phy-clock",
+            "--session-description",
+            "Phy clock precedence",
+            "--session-start-time",
+            "2026-01-01T00:00:00Z",
+        ];
+        options.extend(flags);
+        export(source, &out, &options);
+        let reopened = NwbProvider::open(&out).unwrap();
+        assert_eq!(
+            reopened.exact_sample_rate().unwrap(),
+            rate.recip().recip(),
+            "{name}"
+        );
+        assert_eq!(
+            reopened.spike_times(ClusterId(0)),
+            [SampleIndex(1)],
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn native_export_refuses_lossy_spike_times() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("short.nwb");

@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 pub struct OebinStream {
     /// Subdirectory under the experiment root that contains `continuous.dat`.
     pub folder: PathBuf,
-    pub sample_rate: f32,
+    pub sample_rate: f64,
     pub n_channels: u32,
     /// Per-channel calibration in µV/bit. Non-empty when present in the JSON.
     pub bit_volts: Vec<f32>,
@@ -64,8 +64,7 @@ impl OebinMeta {
             let sample_rate = s
                 .get("sample_rate")
                 .and_then(|x| x.as_f64())
-                .ok_or_else(|| anyhow!("oebin stream missing sample_rate"))?
-                as f32;
+                .ok_or_else(|| anyhow!("oebin stream missing sample_rate"))?;
             let n_channels = s
                 .get("num_channels")
                 .and_then(|x| x.as_u64())
