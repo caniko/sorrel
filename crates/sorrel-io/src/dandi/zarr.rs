@@ -1,11 +1,13 @@
 use super::{hash_field, Api};
 use crate::http_range::{strong_etag, Cache, Object};
-use anyhow::{ensure, Result};
-use serde::Deserialize;
+use anyhow::{ensure, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
     sync::Arc,
 };
+use ureq::http::StatusCode;
 use zarrs::storage::{
     byte_range::{ByteRange, ByteRangeIterator},
     ListableStorageTraits, MaybeBytesIterator, ReadableStorageTraits, StorageError, StoreKey,
@@ -24,8 +26,109 @@ struct Entry {
     size: u64,
 }
 
+#[derive(Deserialize)]
+struct Record {
+    checksum: Option<String>,
+}
+
+// Match zarr_checksum 0.4.7's ZarrChecksumManifest and tree processing:
+// https://github.com/dandi/zarr_checksum/blob/v0.4.7/zarr_checksum/checksum.py
+// Field order, name sorting and Python's compact ASCII JSON are part of the digest.
+#[derive(Serialize, Default)]
+struct Manifest<'a> {
+    directories: Vec<Child<'a>>,
+    files: Vec<Child<'a>>,
+    #[serde(skip)]
+    count: usize,
+    #[serde(skip)]
+    size: u64,
+}
+
+#[derive(Serialize)]
+struct Child<'a> {
+    digest: String,
+    name: &'a str,
+    size: u64,
+}
+
+fn listing_checksum(objects: &BTreeMap<StoreKey, Arc<Object>>) -> Result<String> {
+    let split = |path: &str| path.rfind('/').map_or(0, |i| i + 1);
+    let mut dirs = BTreeMap::from([("", Manifest::default())]);
+    let add = |manifest: &mut Manifest<'_>, count, size| -> Result<()> {
+        manifest.count += count;
+        manifest.size = manifest
+            .size
+            .checked_add(size)
+            .context("Zarr listing size overflow")?;
+        Ok(())
+    };
+    for (key, object) in objects {
+        let (parent, name) = key.as_str().split_at(split(key.as_str()));
+        let dir = dirs.entry(parent).or_default();
+        add(dir, 1, object.size)?;
+        dir.files.push(Child {
+            digest: object.etag[1..object.etag.len() - 1].to_owned(),
+            name,
+            size: object.size,
+        });
+    }
+    // Every directory prefix sorts before its descendants, so pop each child first.
+    while let Some((path, mut dir)) = dirs.pop_last() {
+        dir.directories.sort_unstable_by_key(|c| c.name);
+        dir.files.sort_unstable_by_key(|c| c.name);
+        let json = serde_json::to_string(&dir)?;
+        let mut ascii = String::with_capacity(json.len());
+        for c in json.chars() {
+            if c < '\u{7f}' {
+                ascii.push(c);
+            } else {
+                for unit in c.encode_utf16(&mut [0; 2]) {
+                    write!(ascii, "\\u{unit:04x}").unwrap();
+                }
+            }
+        }
+        let digest = format!("{:x}-{}--{}", md5::compute(ascii), dir.count, dir.size);
+        if path.is_empty() {
+            return Ok(digest);
+        }
+        let path = path.strip_suffix('/').unwrap();
+        let (parent, name) = path.split_at(split(path));
+        let parent = dirs.entry(parent).or_default();
+        add(parent, dir.count, dir.size)?;
+        parent.directories.push(Child {
+            digest,
+            name,
+            size: dir.size,
+        });
+    }
+    unreachable!("checksum tree always has a root")
+}
+
 impl ZarrStore {
-    pub(super) fn open(api: &Api, asset: &str, zarr: &str) -> Result<(Self, Vec<u8>)> {
+    pub(super) fn open(
+        api: &Api,
+        asset: &str,
+        zarr: &str,
+        asset_checksum: Option<&str>,
+    ) -> Result<(Self, Vec<u8>)> {
+        let record_url = api.endpoint(&format!("zarr/{zarr}/"));
+        let response = api.get(&record_url)?;
+        let record_checksum = if response.status() == StatusCode::NOT_FOUND {
+            None
+        } else {
+            Api::decode_json::<Record>(&record_url, response)?.checksum
+        };
+        let record_checksum = record_checksum.as_deref().filter(|s| !s.is_empty());
+        let asset_checksum = asset_checksum.filter(|s| !s.is_empty());
+        if let (Some(record), Some(asset)) = (record_checksum, asset_checksum) {
+            ensure!(
+                record == asset,
+                "DANDI Zarr record and asset checksums disagree"
+            );
+        }
+        let expected = record_checksum
+            .or(asset_checksum)
+            .context("no DANDI Zarr checksum available")?;
         let endpoint = api.endpoint(&format!("zarr/{zarr}/files/"));
         let cache = Cache::new();
         let mut objects = BTreeMap::new();
@@ -56,6 +159,11 @@ impl ZarrStore {
             );
             Ok(())
         })?;
+        let actual = listing_checksum(&objects)?;
+        ensure!(
+            actual == expected,
+            "Zarr listing checksum mismatch: expected {expected}, computed {actual}"
+        );
         let mut hash =
             blake3::Hasher::new_derive_key("sorrel-provider-identity-v1/remote-nwb-zarr");
         hash_field(&mut hash, asset);

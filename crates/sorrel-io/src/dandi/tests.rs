@@ -173,6 +173,7 @@ fn range_case(fault: Fault, expected: &str) {
                 .agent,
             url: Some(server.base.join("/storage?secret=signature").unwrap()),
             refresh: None,
+            identity: None,
         },
         16,
         "\"initial\"".into(),
@@ -222,6 +223,77 @@ fn forbidden_without_refresh() {
 }
 
 #[test]
+#[cfg(feature = "hdf5")]
+fn blob_refresh_pins_effective_object_and_seal() -> Result<()> {
+    use std::sync::atomic::AtomicUsize;
+    let refresh = Arc::new(AtomicUsize::new(0));
+    let current = refresh.clone();
+    let data = vec![7; 3 * 256 * 1024];
+    let server = Server::new(move |url, headers, stream| {
+        let signature = url.query_pairs().find(|(k, _)| k == "X-Amz-Signature");
+        let expired =
+            signature.is_some_and(|(_, v)| v != current.load(Ordering::Relaxed).to_string());
+        serve_range(
+            stream,
+            headers,
+            &data,
+            if expired {
+                Fault::Forbidden
+            } else {
+                Fault::None
+            },
+            "\"initial\"",
+        );
+    });
+    let api = server.api(Duration::from_secs(2));
+    let refreshed_url = |revision| server.base.join(&format!("/object?versionId={revision}"));
+    let base = refreshed_url("one")?;
+    let current = refresh.clone();
+    let resolved = Api::blob(
+        Source {
+            label: "asset".into(),
+            agent: api.agent.clone(),
+            url: Some(base.join("?versionId=one&X-Amz-Signature=0")?),
+            identity: None,
+            refresh: Some(Box::new(move || {
+                let n = current.load(Ordering::Relaxed);
+                let revision = if n == 1 { "one" } else { "two" };
+                Ok(base.join(&format!("?X-Amz-Signature={n}&versionId={revision}"))?)
+            })),
+        },
+        None,
+        "asset-id".into(),
+        Some("blob-id".into()),
+        PathBuf::new(),
+    )?;
+    let Store::Blob(obj) = resolved.store else {
+        unreachable!()
+    };
+    let read = |offset| obj.read_uninit(offset, &mut [MaybeUninit::uninit(); 1], false);
+    read(0)?;
+    refresh.store(1, Ordering::Relaxed);
+    read(256 * 1024)?; // Same object, new signature.
+    refresh.store(2, Ordering::Relaxed);
+    assert!(format!("{:#}", read(2 * 256 * 1024).unwrap_err()).contains("object identity changed"));
+    read(0)?; // Existing cache entries still belong to the pinned revision.
+    let first = api.resolve(refreshed_url("one")?.as_str())?;
+    assert_ne!(
+        first.identity,
+        api.resolve(refreshed_url("two")?.as_str())?.identity
+    );
+    assert_eq!(
+        first.identity,
+        api.resolve(
+            refreshed_url("one")?
+                .join("?Expires=5&versionId=one&response-content-type=binary")?
+                .as_str()
+        )?
+        .identity
+    );
+    Ok(())
+}
+
+#[test]
 fn distant_seeks_coalesce_and_share_cached_reads() -> Result<()> {
     use std::sync::atomic::AtomicUsize;
     const SIZE: usize = 12 * 1024 * 1024;
@@ -244,6 +316,7 @@ fn distant_seeks_coalesce_and_share_cached_reads() -> Result<()> {
             agent: server.api(Duration::from_secs(2)).agent,
             url: Some(server.base.join("/storage").unwrap()),
             refresh: None,
+            identity: None,
         },
         SIZE as u64,
         "\"initial\"".into(),
@@ -305,10 +378,28 @@ fn remote_fixture(
     name: &'static str,
     draft: bool,
 ) -> (Server, Arc<std::sync::atomic::AtomicUsize>) {
+    remote_fixture_without(name, draft, None)
+}
+
+fn remote_fixture_without(
+    name: &'static str,
+    draft: bool,
+    omitted: Option<&'static str>,
+) -> (Server, Arc<std::sync::atomic::AtomicUsize>) {
     use std::sync::atomic::AtomicUsize;
     let data = objects(&fixture(name));
     let blob = data.get("blob");
     let asset = json!({"asset_id":"asset-id", "path":format!("test/{name}"), "size":blob.map_or(0, Vec::len), "blob":blob.map(|_| "blob-id"), "zarr":blob.is_none().then_some("zarr-id")});
+    // Reference zarr_checksum 0.4.7, with the mock ETag "initial" on every file.
+    let checksum = match name {
+        "good.nwb.zarr" => "e30a3acf1096e11521a59d4e87ba1692-103--42756",
+        "curated_units.nwb.zarr" => "d4aabfd7d190242c4710b2a4cdf1ba99-65--11884",
+        "float32.nwb.zarr" => "da97f19336aba618bfd758992f7b173e-90--16048",
+        "irregular_timestamps.nwb.zarr" => "683159f77981e56c45db8835c7be677f-93--18364",
+        "multiple_series.nwb.zarr" => "c9e6511e852d0a0bdda3186910cab7e9-116--20707",
+        "units_only.nwb.zarr" => "7ea57689edf3a39bde84a2d3b26b6ff7-91--15980",
+        _ => "",
+    };
     let version = if draft { "draft" } else { "0.42.17" };
     let downloads = AtomicUsize::new(0);
     let bytes = Arc::new(AtomicUsize::new(0));
@@ -329,10 +420,11 @@ fn remote_fixture(
                 reply(
                     stream,
                     302,
-                    &format!("Location: /storage?key=blob&signature={n}\r\nContent-Length: 0\r\n"),
+                    &format!("Location: /storage?key=blob&Signature={n}\r\nContent-Length: 0\r\n"),
                     &[],
                 );
             }
+            "/api/zarr/zarr-id/" => json_reply(stream, json!({"checksum": checksum})),
             "/api/zarr/zarr-id/files/" if query.contains_key("download") => {
                 assert_eq!(query["download"], "true");
                 let n = downloads.fetch_add(1, Ordering::Relaxed);
@@ -340,7 +432,7 @@ fn remote_fixture(
                 storage
                     .query_pairs_mut()
                     .append_pair("key", &query["prefix"])
-                    .append_pair("signature", &n.to_string());
+                    .append_pair("Signature", &n.to_string());
                 reply(
                     stream,
                     302,
@@ -356,7 +448,9 @@ fn remote_fixture(
                 let results: Vec<_> = data
                     .iter()
                     .enumerate()
-                    .filter(|(idx, _)| (*idx >= 7) == second)
+                    .filter(|(idx, (key, _))| {
+                        (*idx >= 7) == second && Some(key.as_str()) != omitted
+                    })
                     .map(|(_, (key, value))| json!({"Key":key,"ETag":"initial","Size":value.len()}))
                     .collect();
                 json_reply(
@@ -365,7 +459,7 @@ fn remote_fixture(
                 );
             }
             "/storage" => {
-                let fault = if query["signature"] == "0" {
+                let fault = if query["Signature"] == "0" {
                     Fault::Forbidden
                 } else {
                     Fault::None
@@ -457,6 +551,21 @@ fn parity(name: &'static str, draft: bool) -> Result<()> {
         assert_eq!(before, bytes.load(Relaxed));
     }
     Ok(())
+}
+
+#[test]
+fn incomplete_zarr_listing_is_refused() {
+    let (server, _) = remote_fixture_without(
+        "good.nwb.zarr",
+        true,
+        Some("acquisition/ElectricalSeriesRaw/data/0.0"),
+    );
+    let error = server
+        .api(Duration::from_secs(2))
+        .resolve("dandi://dandi/000123@draft/test/good.nwb.zarr")
+        .err()
+        .expect("accepted a listing missing a real chunk");
+    assert!(format!("{error:#}").contains("Zarr listing checksum mismatch"));
 }
 
 #[test]

@@ -82,6 +82,18 @@ struct Asset {
     size: u64,
     blob: Option<String>,
     zarr: Option<String>,
+    metadata: Option<AssetMetadata>,
+}
+
+#[derive(Deserialize)]
+struct AssetMetadata {
+    digest: Option<AssetDigest>,
+}
+
+#[derive(Deserialize)]
+struct AssetDigest {
+    #[serde(rename = "dandi:dandi-zarr-checksum")]
+    zarr_checksum: Option<String>,
 }
 
 fn component(part: &str) -> Result<&str> {
@@ -180,7 +192,9 @@ impl Api {
         if let Some(locator) = self.dandiset_locator(input)? {
             let Locator { id, version, path } = &locator;
             let mut list = self.endpoint(&format!("dandisets/{id}/versions/{version}/assets/"));
-            list.query_pairs_mut().append_pair("path", path);
+            list.query_pairs_mut()
+                .append_pair("path", path)
+                .append_pair("metadata", "true");
             let mut exact = None;
             self.pages(list, |asset: Asset| {
                 if asset.path == path.as_ref() {
@@ -232,9 +246,11 @@ impl Api {
                 agent: self.agent.clone(),
                 url: Some(url),
                 refresh: None,
+                identity: None,
             },
             None,
             canonical,
+            None,
             state,
         )
     }
@@ -243,17 +259,23 @@ impl Api {
         let id = component(&asset.asset_id)?;
         let label = format!("DANDI asset {id}");
         match (asset.blob, asset.zarr) {
-            (Some(_), None) => Self::blob(
+            (Some(blob), None) => Self::blob(
                 self.source(
                     label,
                     download.unwrap_or_else(|| self.endpoint(&format!("assets/{id}/download/"))),
                 ),
                 Some(asset.size),
                 asset.asset_id,
+                Some(blob),
                 state,
             ),
             (None, Some(zarr)) => {
-                let (store, identity) = ZarrStore::open(self, id, component(&zarr)?)
+                let zarr = component(&zarr)?;
+                let digest = asset
+                    .metadata
+                    .and_then(|m| m.digest)
+                    .and_then(|d| d.zarr_checksum);
+                let (store, identity) = ZarrStore::open(self, id, zarr, digest.as_deref())
                     .with_context(|| format!("list objects for {label}"))?;
                 Ok(Resolved {
                     store: Store::Zarr(Arc::new(store)),
@@ -265,18 +287,26 @@ impl Api {
         }
     }
 
-    fn blob(source: Source, size: Option<u64>, id: String, state: PathBuf) -> Result<Resolved> {
+    fn blob(
+        source: Source,
+        size: Option<u64>,
+        id: String,
+        blob: Option<String>,
+        state: PathBuf,
+    ) -> Result<Resolved> {
         #[cfg(not(feature = "hdf5"))]
         {
-            let _ = (source, size, id, state);
+            let _ = (source, size, id, blob, state);
             bail!("streaming HDF5 NWB assets requires building with --features hdf5");
         }
         #[cfg(feature = "hdf5")]
         {
-            let object = Object::probe(source, size)?;
+            let (object, effective_identity) = Object::probe(source, size)?;
             let mut hash =
-                blake3::Hasher::new_derive_key("sorrel-provider-identity-v1/remote-nwb-blob");
+                blake3::Hasher::new_derive_key("sorrel-provider-identity-v2/remote-nwb-blob");
             hash_field(&mut hash, &id);
+            hash_field(&mut hash, blob.as_deref().unwrap_or_default());
+            hash_field(&mut hash, &effective_identity);
             hash_field(&mut hash, &object.etag);
             hash.update(&object.size.to_le_bytes());
             Ok(Resolved {
@@ -304,7 +334,13 @@ impl Api {
     }
 
     fn json<T: DeserializeOwned>(&self, url: &Url) -> Result<T> {
-        let mut response = self.get(url)?;
+        Self::decode_json(url, self.get(url)?)
+    }
+
+    fn decode_json<T: DeserializeOwned>(
+        url: &Url,
+        mut response: Response<ureq::Body>,
+    ) -> Result<T> {
         ensure!(
             response.status().is_success(),
             "DANDI API {}: HTTP {}",
@@ -364,6 +400,7 @@ impl Api {
             label,
             agent: self.agent.clone(),
             url: None,
+            identity: None,
             refresh: Some(Box::new(move || {
                 let response = api.get(&endpoint)?;
                 http_range::redirect(&endpoint, &response)

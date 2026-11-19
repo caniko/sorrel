@@ -8,7 +8,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use ureq::http::{Response, StatusCode};
-use url::Url;
+use url::{Position, Url};
 
 const BLOCK: u64 = 256 * 1024;
 const RUN: u64 = 8 * BLOCK;
@@ -93,6 +93,37 @@ pub(crate) fn strong_etag(value: &str) -> Result<&str> {
     Ok(value)
 }
 
+fn object_identity(url: &Url) -> String {
+    let mut identity = url[..Position::AfterPath].to_owned();
+    if let Some(query) = url.query() {
+        let mut separator = '?';
+        for field in query.split('&') {
+            let key = field.split_once('=').map_or(field, |(key, _)| key);
+            if key.starts_with("X-Amz-")
+                || matches!(
+                    key,
+                    "Signature"
+                        | "Expires"
+                        | "AWSAccessKeyId"
+                        | "response-cache-control"
+                        | "response-content-disposition"
+                        | "response-content-encoding"
+                        | "response-content-language"
+                        | "response-content-type"
+                        | "response-expires"
+                )
+            {
+                continue;
+            }
+            // Preserve raw bytes, ordering, and duplicates for unknown parameters.
+            identity.push(separator);
+            identity.push_str(field);
+            separator = '&';
+        }
+    }
+    identity
+}
+
 pub(crate) type Refresh = Box<dyn Fn() -> Result<Url> + Send + Sync>;
 
 pub(crate) struct Source {
@@ -100,6 +131,7 @@ pub(crate) struct Source {
     pub agent: ureq::Agent,
     pub url: Option<Url>,
     pub refresh: Option<Refresh>,
+    pub identity: Option<String>,
 }
 
 impl Source {
@@ -127,18 +159,18 @@ impl Source {
             headers.push(("If-Match", tag));
         }
         let mut refreshed = false;
+        let mut candidate = self.url.clone();
         for _ in 0..=6 {
-            if self.url.is_none() {
-                self.url = Some(self.refresh.as_ref().context("missing download URL")?()?);
-            }
-            let url = self.url.as_ref().unwrap();
-            let mut res = request(&self.agent, url, &headers)?;
+            let url = match candidate.take() {
+                Some(url) => url,
+                None => self.refresh.as_ref().context("missing download URL")?()?,
+            };
+            let mut res = request(&self.agent, &url, &headers)?;
             if res.status().is_redirection() {
-                self.url = Some(redirect(url, &res)?);
+                candidate = Some(redirect(&url, &res)?);
                 continue;
             }
             if res.status() == StatusCode::FORBIDDEN && self.refresh.is_some() && !refreshed {
-                self.url = None;
                 refreshed = true;
                 continue;
             }
@@ -146,6 +178,13 @@ impl Source {
                 res.status() == StatusCode::PARTIAL_CONTENT,
                 "expected HTTP 206, got HTTP {}",
                 res.status().as_u16()
+            );
+            let identity = object_identity(&url);
+            ensure!(
+                self.identity
+                    .as_ref()
+                    .is_none_or(|pinned| *pinned == identity),
+                "download object identity changed"
             );
             let h = res.headers();
             ensure!(
@@ -195,12 +234,16 @@ impl Source {
                 .read_to_end(&mut data)
                 .map_err(|_| anyhow!("could not read complete range body"))?;
             ensure!(data.len() as u64 == count, "wrong range body length");
+            self.url = Some(url);
+            self.identity = Some(identity);
             return Ok((data, actual_total, actual_tag));
         }
         bail!("too many download redirects")
     }
 }
 
+// The ID is unique to an Object within this cache. Its source identity can
+// only be set once, and every fill must match that identity, ETag and size.
 type Blocks = LruCache<(usize, u64), Vec<u8>>;
 
 #[derive(Clone)]
@@ -237,9 +280,13 @@ pub(crate) struct Object {
 
 impl Object {
     #[cfg(feature = "hdf5")]
-    pub fn probe(mut source: Source, expected_size: Option<u64>) -> Result<Arc<Self>> {
+    pub fn probe(mut source: Source, expected_size: Option<u64>) -> Result<(Arc<Self>, String)> {
         let (_, size, etag) = source.fetch(0, 7, expected_size, None)?;
-        Ok(Arc::new(Self::new(0, Cache::new(), source, size, etag)))
+        let identity = source.identity.as_ref().unwrap().clone();
+        Ok((
+            Arc::new(Self::new(0, Cache::new(), source, size, etag)),
+            identity,
+        ))
     }
 
     pub fn new(id: usize, cache: Cache, source: Source, size: u64, etag: String) -> Self {

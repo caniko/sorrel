@@ -46,6 +46,7 @@ ureq = { version = "3.3", default-features = false, features = [
 url = { version = "2.5", optional = true }
 percent-encoding = { version = "2.3", optional = true }
 lru = { version = "0.16", optional = true }
+md5 = { version = "0.8", optional = true }
 
 [build-dependencies]
 cc = { version = "1", optional = true }
@@ -60,6 +61,7 @@ dandi = [
   "dep:url",
   "dep:percent-encoding",
   "dep:lru",
+  "dep:md5",
 ]
 zarr = [
   "dep:inventory",
