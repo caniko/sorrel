@@ -107,6 +107,7 @@ mod imp {
             };
 
             let mut series_identity = None;
+            let seal_rate;
             let (trace, rate, t0, (channel_map, channel_positions)) = if let Some((
                 name,
                 series,
@@ -117,6 +118,9 @@ mod imp {
                 let shape = data.shape();
                 let (n_samples, n_channels) = (shape[0], shape.get(1).copied().unwrap_or(1));
                 let (mut rate, t0, float32_rate) = read_time_base(&series, &name, n_samples)?;
+                // Files alone don't pin the effective rate when a float32 clock
+                // can be refined by the sorting rate or --sample-rate.
+                seal_rate = float32_rate;
                 if let Some(expected) = units_rate.or(params.sample_rate) {
                     check_matching_rate(
                         "sorting sample rate",
@@ -131,12 +135,13 @@ mod imp {
                 }
                 let channels = read_channels(recording, &series, &name, n_channels)?;
                 let trace = NwbTrace::new(&series, data, &name, n_samples, n_channels)?;
-                // Keep existing journals usable for the historical default acquisition.
+                // Don't add a series path to the historical default acquisition's seal.
                 if raw.is_some() || !default_series {
                     series_identity = Some(name);
                 }
                 (Some(trace), rate, t0, channels)
             } else {
+                seal_rate = true;
                 (
                         None,
                         units_rate.context(
@@ -168,7 +173,7 @@ mod imp {
             if let Some(series) = series_identity {
                 identity_bytes.extend(series.into_bytes());
             }
-            if trace.is_none() {
+            if seal_rate {
                 identity_bytes.extend(rate.to_le_bytes());
             }
             let metadata = read_unit_metadata(&units, &unit_ids)?;

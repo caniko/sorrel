@@ -313,6 +313,39 @@ fn paired_float32_rate_uses_precise_units_rate_for_spikes() {
 }
 
 #[test]
+fn paired_float32_rate_seals_the_effective_rate() {
+    let dir = tempfile::tempdir().unwrap();
+    let units = dir.path().join("units.nwb");
+    std::fs::copy(fixture("precise_units.nwb"), &units).unwrap();
+    hdf5_metno::File::open_rw(&units)
+        .unwrap()
+        .dataset("/units/spike_times")
+        .unwrap()
+        .attr("resolution")
+        .unwrap()
+        .write_scalar(&-1.0_f64)
+        .unwrap();
+    let raw = fixture("rounded_raw.nwb");
+    let open = |rate| {
+        NwbProvider::open_with(
+            &units,
+            NwbOpenParams {
+                raw_path: Some(&raw),
+                sample_rate: Some(rate),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let precise = open(30000.123);
+    let rounded = open(f64::from(30000.123_f32));
+    assert_eq!(precise.sample_rate(), rounded.sample_rate());
+    assert_eq!(precise.spike_times(ClusterId(0)), [SampleIndex(30)]);
+    assert_eq!(rounded.spike_times(ClusterId(0)), [SampleIndex(31)]);
+    assert_ne!(precise.identity_bytes(), rounded.identity_bytes());
+}
+
+#[test]
 fn paired_series_rejects_different_timestamp_epoch() {
     let raw = fixture("shifted_raw.nwb");
     let err = NwbProvider::open_with(
