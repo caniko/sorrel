@@ -155,20 +155,41 @@ fn decode_frame(src: &[u8], decoded: BytesRepresentation) -> Result<Vec<u8>, Cod
             .ok_or_else(malformed);
     }
 
-    let table_len = nbytes.div_ceil(blocksize) * 4;
+    let table_len = nbytes
+        .div_ceil(blocksize)
+        .checked_mul(4)
+        .ok_or_else(malformed)?;
     let table = body.get(..table_len).ok_or_else(malformed)?;
+    // Parallel c-Blosc writes can put blocks out of table order. Sort in
+    // physical order to find each block's end, then decode in logical order.
+    let mut physical = Vec::new();
+    physical
+        .try_reserve_exact(table_len / 4)
+        .map_err(|e| CodecError::from(e.to_string()))?;
+    for (index, entry) in table.as_chunks::<4>().0.iter().enumerate() {
+        let offset = u32_le(entry)?;
+        if !(HEADER + table_len..src.len()).contains(&offset) {
+            return Err(malformed());
+        }
+        physical.push((offset, 0, index));
+    }
+    physical.sort_unstable();
+    let mut end = src.len();
+    for (start, stop, _) in physical.iter_mut().rev() {
+        if *start == end {
+            return Err(malformed());
+        }
+        *stop = end;
+        end = *start;
+    }
+    physical.sort_unstable_by_key(|(_, _, index)| *index);
     let mut output = Vec::new();
     output
         .try_reserve_exact(nbytes)
         .map_err(|e| CodecError::from(e.to_string()))?;
     let mut shuffled = Vec::new();
-    for (index, entry) in table.as_chunks::<4>().0.iter().enumerate() {
-        // Parallel c-Blosc writes can put blocks out of table order.
-        let offset = u32_le(entry)?;
-        if offset < HEADER + table_len {
-            return Err(malformed());
-        }
-        let mut streams = src.get(offset..).ok_or_else(malformed)?;
+    for (offset, end, index) in physical {
+        let mut streams = &src[offset..end];
         let start = index * blocksize;
         let len = blocksize.min(nbytes - start);
         let count =
@@ -394,6 +415,49 @@ mod tests {
         assert_ne!(frames[2] & MEMCPY, 0);
         check(&mut frames, 112, 2);
         assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn block_extents_follow_physical_offsets() {
+        // Two raw 8-byte streams, physically in reverse logical order.
+        let frame: Vec<u8> = [2, 1, DONT_SPLIT, 1]
+            .into_iter()
+            .chain(
+                [16u32, 8, 48, 36, 24, 8]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes),
+            )
+            .chain([2; 8])
+            .chain(8u32.to_le_bytes())
+            .chain([1; 8])
+            .collect();
+        let decode = |src: &[u8]| decode_frame(src, BytesRepresentation::FixedSize(16));
+        assert_eq!(decode(&frame).unwrap(), [[1; 8], [2; 8]].concat());
+
+        // Pointing inside another block can otherwise decode a valid stream.
+        let mut overlap = frame.clone();
+        overlap[16..20].copy_from_slice(&32u32.to_le_bytes());
+        overlap[32..36].copy_from_slice(&8u32.to_le_bytes());
+        assert!(decode(&overlap).is_err(), "overlapping blocks");
+
+        for (field, value) in [
+            (16, 24u32),
+            (16, 16),
+            (16, 48),
+            (16, u32::MAX),
+            (4, 0),
+            (8, 0),
+            (8, 17),
+        ] {
+            let mut bad = frame.clone();
+            bad[field..field + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(decode(&bad).is_err(), "field {field} = {value}");
+        }
+        for len in HEADER..frame.len() {
+            let mut truncated = frame[..len].to_vec();
+            truncated[12..16].copy_from_slice(&(len as u32).to_le_bytes());
+            assert!(decode(&truncated).is_err(), "truncated to {len} bytes");
+        }
     }
 
     #[test]
