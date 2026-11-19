@@ -525,3 +525,35 @@ fn public_blob() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+#[cfg(feature = "hdf5")]
+#[ignore = "requires SORREL_DANDI_NETWORK=1 and public DANDI/S3 access"]
+fn public_zarr() -> Result<()> {
+    use zarrs::storage::{ReadableStorageTraits, StoreKey};
+
+    if std::env::var("SORREL_DANDI_NETWORK").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    // This small intracellular electrophysiology benchmark lacks Units and
+    // also has non-JSON consolidated metadata. Verify that we can resolve and
+    // range-read the real archive before the shared NWB reader refuses it.
+    let resolved = resolve(concat!(
+        "dandi://dandi/000719@draft/icephys_DS_11_21_24/",
+        "sub-1214579789_ses-1214621812_icephys_DirectoryStore.nwb.zarr"
+    ))?;
+    let Store::Zarr(store) = &resolved.store else {
+        bail!("expected a Zarr asset");
+    };
+    let attrs = store
+        .get(&StoreKey::new(".zattrs")?)?
+        .context("missing NWB-Zarr root attributes")?;
+    let attrs: Value = serde_json::from_slice(&attrs)?;
+    assert_eq!(attrs["neurodata_type"], "NWBFile");
+    let error = NwbProvider::open_resolved(resolved, NwbOpenParams::default())
+        .err()
+        .context("unexpectedly opened the unsupported benchmark")?;
+    let message = format!("{error:#}");
+    assert!(message.contains("parse .zmetadata") || message.contains("/units"), "{message}");
+    Ok(())
+}

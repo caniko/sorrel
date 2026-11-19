@@ -180,7 +180,7 @@ impl Api {
         if let Some(locator) = self.dandiset_locator(input)? {
             let Locator { id, version, path } = &locator;
             let mut list = self.endpoint(&format!("dandisets/{id}/versions/{version}/assets/"));
-            list.query_pairs_mut().append_pair("path", &path);
+            list.query_pairs_mut().append_pair("path", path);
             let mut exact = None;
             self.pages(list, |asset: Asset| {
                 if asset.path == path.as_ref() {
