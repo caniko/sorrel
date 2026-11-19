@@ -365,11 +365,12 @@ inputs, and zero for other inputs.
 sorrel export-nwb my_run/phy --into recording.nwb --starting-time 0.5
 ```
 
-`--into` adds root `/units` to an existing NWB file. `--in-place` uses the
-input NWB file as that destination. Both refuse any file that already has
-`/units`; use `--out` to export a sort loaded from such a file. Append needs
-space for a sibling copy of the entire destination and replaces the original
-only after a successful write. Do not edit the destination concurrently.
+`--into` adds root `/units` to an existing NWB file and refuses to replace an
+existing `/units` table. When the NWB source and destination have different
+`timestamps_reference_time` values, pass `--starting-time` explicitly on the
+destination's time axis; Sorrel does not rebase the times automatically.
+Append needs space for a sibling copy of the entire destination and replaces
+the original only after a successful write. Do not edit the destination concurrently.
 
 ### NeuroConv
 
