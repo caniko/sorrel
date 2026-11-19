@@ -144,7 +144,7 @@ impl Source {
             }
             ensure!(
                 res.status() == StatusCode::PARTIAL_CONTENT,
-                "expected HTTP 206, got {}",
+                "expected HTTP 206, got HTTP {}",
                 res.status().as_u16()
             );
             let h = res.headers();
@@ -301,7 +301,11 @@ impl Object {
                 let stop = end.min(start + block.len() as u64);
                 let dest = &mut buf[(pos - offset) as usize..(stop - offset) as usize];
                 let src = &block[(pos - start) as usize..(stop - start) as usize];
-                dest.write_copy_of_slice(src);
+                // MaybeUninit<u8> has the layout of u8; the slices have the
+                // same length and the HDF5/output buffer cannot alias the cache.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), dest.as_mut_ptr().cast(), src.len())
+                };
                 pos = stop;
             } else {
                 drop(cache);

@@ -40,14 +40,15 @@ pub(crate) struct Resolved {
 }
 
 pub(crate) fn resolve(input: &str) -> Result<Resolved> {
-    let api = Api {
-        base: Url::parse(BASE).expect("valid DANDI API base"),
-        key: std::env::var("DANDI_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty()),
-        agent: http_range::agent(Duration::from_secs(15)),
-    };
-    api.resolve(input)
+    Api::production().resolve(input)
+}
+
+/// Find the local state subdirectory without opening or listing the asset.
+pub fn state_path(input: &str) -> Result<PathBuf> {
+    if let Some(locator) = Api::production().dandiset_locator(input)? {
+        return Ok(locator.state_path());
+    }
+    Ok(https_state_path(&https_url(input)?))
 }
 
 #[derive(Clone)]
@@ -102,42 +103,87 @@ pub(super) fn hash_field(hash: &mut blake3::Hasher, field: &str) {
     hash.update(field.as_bytes());
 }
 
+struct Locator<'a> {
+    id: &'a str,
+    version: String,
+    path: std::borrow::Cow<'a, str>,
+}
+
+impl Locator<'_> {
+    fn state_path(&self) -> PathBuf {
+        PathBuf::from(self.id)
+            .join(&self.version)
+            .join(blake3::hash(self.path.as_bytes()).to_hex().as_str())
+    }
+}
+
+fn https_url(input: &str) -> Result<Url> {
+    let url = Url::parse(input).map_err(|_| anyhow!("invalid remote NWB URL"))?;
+    http_range::validate_url(&url)?;
+    Ok(url)
+}
+
+fn https_state_path(url: &Url) -> PathBuf {
+    PathBuf::from("https").join(
+        blake3::hash(url[..Position::AfterPath].as_bytes())
+            .to_hex()
+            .as_str(),
+    )
+}
+
 impl Api {
+    fn production() -> Self {
+        Self {
+            base: Url::parse(BASE).expect("valid DANDI API base"),
+            key: std::env::var("DANDI_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            agent: http_range::agent(Duration::from_secs(15)),
+        }
+    }
+
+    fn dandiset_locator<'a>(&self, input: &'a str) -> Result<Option<Locator<'a>>> {
+        let Some(rest) = input.strip_prefix("dandi://dandi/") else {
+            return Ok(None);
+        };
+        let (dataset, path) = rest.split_once('/').context("missing DANDI asset path")?;
+        let (id, version) = dataset
+            .split_once('@')
+            .map_or((dataset, None), |(id, v)| (id, Some(v)));
+        ensure!(
+            id.len() == 6 && id.bytes().all(|b| b.is_ascii_digit()),
+            "expected a six-digit Dandiset ID"
+        );
+        let path = percent_decode_str(path)
+            .decode_utf8()
+            .context("asset path is not UTF-8")?;
+        ensure!(
+            path.split('/').all(|p| !matches!(p, "" | "." | ".."))
+                && !path.chars().any(char::is_control),
+            "invalid DANDI asset path"
+        );
+        let version = match version {
+            Some(version) => component(version)?.to_owned(),
+            None => {
+                let dataset: Dandiset = self.json(&self.endpoint(&format!("dandisets/{id}/")))?;
+                dataset
+                    .most_recent_published_version
+                    .unwrap_or(dataset.draft_version)
+                    .version
+            }
+        };
+        component(&version)?;
+        Ok(Some(Locator { id, version, path }))
+    }
+
     fn resolve(&self, input: &str) -> Result<Resolved> {
-        if let Some(rest) = input.strip_prefix("dandi://dandi/") {
-            let (dataset, path) = rest.split_once('/').context("missing DANDI asset path")?;
-            let (id, version) = dataset
-                .split_once('@')
-                .map_or((dataset, None), |(id, v)| (id, Some(v)));
-            ensure!(
-                id.len() == 6 && id.bytes().all(|b| b.is_ascii_digit()),
-                "expected a six-digit Dandiset ID"
-            );
-            let path = percent_decode_str(path)
-                .decode_utf8()
-                .context("asset path is not UTF-8")?;
-            ensure!(
-                path.split('/').all(|p| !matches!(p, "" | "." | ".."))
-                    && !path.chars().any(char::is_control),
-                "invalid DANDI asset path"
-            );
-            let version = match version {
-                Some(version) => component(version)?.to_owned(),
-                None => {
-                    let dataset: Dandiset =
-                        self.json(&self.endpoint(&format!("dandisets/{id}/")))?;
-                    dataset
-                        .most_recent_published_version
-                        .unwrap_or(dataset.draft_version)
-                        .version
-                }
-            };
-            let version = component(&version)?;
+        if let Some(locator) = self.dandiset_locator(input)? {
+            let Locator { id, version, path } = &locator;
             let mut list = self.endpoint(&format!("dandisets/{id}/versions/{version}/assets/"));
             list.query_pairs_mut().append_pair("path", &path);
             let mut exact = None;
             self.pages(list, |asset: Asset| {
-                if asset.path == path {
+                if asset.path == path.as_ref() {
                     ensure!(
                         exact.replace(asset).is_none(),
                         "multiple DANDI assets have the exact path"
@@ -148,17 +194,12 @@ impl Api {
             .with_context(|| format!("list Dandiset {id}@{version}"))?;
             let asset =
                 exact.with_context(|| format!("Dandiset {id}@{version} has no asset at {path}"))?;
-            let state = PathBuf::from(id)
-                .join(version)
-                .join(blake3::hash(path.as_bytes()).to_hex().as_str());
-            return self.asset(asset, state, None);
+            return self.asset(asset, locator.state_path(), None);
         }
 
-        let url = Url::parse(input).map_err(|_| anyhow!("invalid remote NWB URL"))?;
-        http_range::validate_url(&url)?;
+        let url = https_url(input)?;
         let canonical = url[..Position::AfterPath].to_owned();
-        let state =
-            PathBuf::from("https").join(blake3::hash(canonical.as_bytes()).to_hex().as_str());
+        let state = https_state_path(&url);
         // DANDI API download URLs can describe either kind of asset, including
         // Zarr assets whose download endpoint cannot return a single object.
         if url.origin() == self.base.origin() {

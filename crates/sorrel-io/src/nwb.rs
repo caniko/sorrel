@@ -133,8 +133,21 @@ mod imp {
             let units = f
                 .group("/units")
                 .context("missing /units in the sorting NWB file")?;
-            let raw = params.raw_path.map(Group::open).transpose()?;
-            let recording = raw.as_ref().unwrap_or(&f);
+            let raw = params
+                .raw_path
+                .map(|path| {
+                    #[cfg(feature = "dandi")]
+                    if crate::dandi::is_remote(path) {
+                        let resolved = crate::dandi::resolve(path.to_str().unwrap())?;
+                        return Ok::<_, anyhow::Error>((
+                            Group::open_remote(resolved.store)?,
+                            Some(resolved.identity),
+                        ));
+                    }
+                    Ok((Group::open(path)?, None))
+                })
+                .transpose()?;
+            let recording = raw.as_ref().map_or(&f, |(group, _)| group);
             let series = find_electrical_series(recording, params.series, raw.is_some())?;
             // In a single file with a series, an invalid resolution value is
             // not a clock statement; its storage type must still be exact.
@@ -201,7 +214,7 @@ mod imp {
                         None,
                     )
             };
-            if let Some(raw) = &raw {
+            if let Some((raw, _)) = &raw {
                 let units_epoch =
                     timestamp_epoch(&f).context("sorting NWB timestamps_reference_time")?;
                 let raw_epoch =
@@ -235,8 +248,11 @@ mod imp {
                 }
                 identity_bytes.push(0); // Terminate the path (empty for units-only).
                 identity_bytes.extend(rate.to_le_bytes());
-                if let Some((raw, raw_path)) = raw.as_ref().zip(params.raw_path) {
-                    identity_bytes.extend(raw.identity(raw_path)?);
+                if let Some(((raw, raw_identity), raw_path)) = raw.zip(params.raw_path) {
+                    identity_bytes.extend(match raw_identity {
+                        Some(identity) => identity,
+                        None => raw.identity(raw_path)?,
+                    });
                 }
             }
             let metadata = read_unit_metadata(&units, &unit_ids)?;

@@ -155,7 +155,7 @@ fn write_arrays<P: DataProvider + HasGeometry>(session: &Session<P>, out: &Path)
     // One template per cluster, so a spike's template is its cluster.
     let clusters: Vec<u32> = index.spike_clusters().iter().map(|c| c.0).collect();
     write_1d_u32_atomic(&out.join("spike_templates.npy"), &clusters)?;
-    let (templates, shape) = mean_templates(session);
+    let (templates, shape) = mean_templates(session)?;
     write_f32_atomic(&out.join("templates.npy"), &shape, &templates)?;
 
     // Templates span every raw-dat row in order, and `HasGeometry` indexes
@@ -179,7 +179,7 @@ fn write_arrays<P: DataProvider + HasGeometry>(session: &Session<P>, out: &Path)
 /// One mean waveform per cluster over every channel, `(n_clusters, n_t,
 /// n_ch)` in C order. Clusters with no usable spikes (merged away, all at
 /// the recording edges) stay zero.
-fn mean_templates<P: DataProvider>(session: &Session<P>) -> (Vec<f32>, [usize; 3]) {
+fn mean_templates<P: DataProvider>(session: &Session<P>) -> Result<(Vec<f32>, [usize; 3])> {
     let p = &session.provider;
     let sr = p.sample_rate();
     let before = (sr * MS_BEFORE / 1000.0).round() as u64;
@@ -190,15 +190,15 @@ fn mean_templates<P: DataProvider>(session: &Session<P>) -> (Vec<f32>, [usize; 3
     let mut out = vec![0f32; n_clusters * n_t * n_ch];
     let shape = [n_clusters, n_t, n_ch];
     if out.is_empty() {
-        return (out, shape);
+        return Ok((out, shape));
     }
     if n_samples == 0 {
         log::warn!("no raw samples: templates.npy is all zeros");
-        return (out, shape);
+        return Ok((out, shape));
     }
     out.par_chunks_mut(n_t * n_ch)
         .enumerate()
-        .for_each(|(c, template)| {
+        .try_for_each(|(c, template)| -> Result<()> {
             let times = session.spike_times(ClusterId(c as u32));
             // ponytail: a strided subsample is deterministic but can alias
             // with periodic firing; a seeded random draw is the upgrade.
@@ -222,7 +222,7 @@ fn mean_templates<P: DataProvider>(session: &Session<P>) -> (Vec<f32>, [usize; 3
                 n += 1;
             }
             if n == 0 {
-                return;
+                return Ok(());
             }
             for (dst, s) in template.iter_mut().zip(&sum) {
                 *dst = (*s / n as f64) as f32;
@@ -234,8 +234,9 @@ fn mean_templates<P: DataProvider>(session: &Session<P>) -> (Vec<f32>, [usize; 3
                 let mean = (0..n_t).map(|i| template[i * n_ch + ch]).sum::<f32>() / n_t as f32;
                 (0..n_t).for_each(|i| template[i * n_ch + ch] -= mean);
             }
-        });
-    (out, shape)
+            Ok(())
+        })?;
+    Ok((out, shape))
 }
 
 /// Stream the whole trace into `path` in the backend's native dtype, which
@@ -250,7 +251,9 @@ fn stream_raw<P: DataProvider>(p: &P, path: &Path) -> Result<TraceDtype> {
         let mut start = 0;
         while start < n_samples {
             let len = (n_samples - start).min(STREAM_FRAMES);
-            let window = p.read_trace(SampleIndex(start), len as u32)?;
+            let window = p
+                .read_trace(SampleIndex(start), len as u32)
+                .map_err(std::io::Error::other)?;
             if window.samples.len() != len as usize * n_ch {
                 return Err(std::io::Error::other(format!(
                     "trace window at sample {start} came back incomplete"

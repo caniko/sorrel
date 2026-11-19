@@ -319,6 +319,7 @@
       srcFilter = path: type:
         (craneLib.filterCargoSources path type)
         || pkgs.lib.hasSuffix ".wgsl" path
+        || pkgs.lib.hasSuffix "crates/sorrel-io/src/nwb/imp/http_vfd.c" path
         # Window icon (include_bytes!) and the Windows resources build.rs embeds.
         || pkgs.lib.hasInfix "crates/sorrel/assets" path
         # BIP-39 list embedded by sorrel-remote's pairing codes.

@@ -449,7 +449,7 @@ enum LlmBackend {
 /// and every headless subcommand.
 #[derive(Args, Debug, Clone, Default)]
 struct OpenArgs {
-    /// phy / Kilosort, SortingAnalyzer, NWB (.nwb or .nwb.zarr), or rez.mat
+    /// phy / Kilosort, SortingAnalyzer, NWB (local, DANDI or HTTPS), or rez.mat
     #[arg(value_name = "DATA_DIR", required = true)]
     root: Option<PathBuf>,
     /// kilosort | sorting-analyzer | nwb | ks4-rez (auto-detected by default)
@@ -507,9 +507,12 @@ impl OpenArgs {
     /// Make the path fields absolute against `cwd`: the args came from a
     /// `sorrel open` run somewhere else.
     fn rebase(&mut self, cwd: &Path) {
+        for p in [&mut self.root, &mut self.dat].into_iter().flatten() {
+            if !is_remote(p) {
+                *p = cwd.join(&*p);
+            }
+        }
         for p in [
-            &mut self.root,
-            &mut self.dat,
             &mut self.journal,
             &mut self.spikeglx_meta,
             &mut self.oebin,
@@ -578,6 +581,12 @@ fn open_journal(open: &OpenArgs, path: &Path, baseline: u64, n_clusters: u32) ->
 }
 
 fn detect_backend(root: &Path) -> Result<Backend> {
+    if is_remote(root) {
+        #[cfg(feature = "dandi")]
+        return Ok(Backend::Nwb);
+        #[cfg(not(feature = "dandi"))]
+        bail!("remote NWB datasets require building with --features dandi");
+    }
     Ok(match sorrel_io::detect_backend(root)? {
         sorrel_io::Backend::Kilosort => Backend::Kilosort,
         sorrel_io::Backend::SortingAnalyzer => Backend::SortingAnalyzer,
@@ -675,9 +684,17 @@ fn seeded<P: DataProvider>(mut session: Session<P>, seed: Seed<P>) -> Result<Ses
 /// Open the backend named (or detected) by `open`, seal and replay its
 /// journal, then hand the typed session to `v`.
 fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
-    let backend = match open.backend {
-        Some(b) => b,
-        None => detect_backend(open.root())?,
+    let backend = match (open.backend, is_remote(open.root())) {
+        (backend, true) => {
+            let detected = detect_backend(open.root())?;
+            anyhow::ensure!(
+                backend.is_none_or(|b| b == detected),
+                "a remote dataset requires the NWB backend"
+            );
+            detected
+        }
+        (Some(b), false) => b,
+        (None, false) => detect_backend(open.root())?,
     };
     match backend {
         Backend::Kilosort => {
@@ -721,14 +738,29 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
         #[cfg(any(feature = "hdf5", feature = "zarr"))]
         Backend::Nwb => {
             let path = open.root().to_path_buf();
-            let provider = sorrel_io::NwbProvider::open_with(
-                &path,
-                sorrel_io::NwbOpenParams {
-                    series: open.nwb_series.as_deref(),
-                    raw_path: open.dat.as_deref(),
-                    sample_rate: open.sample_rate,
-                },
-            )?;
+            let params = sorrel_io::NwbOpenParams {
+                series: open.nwb_series.as_deref(),
+                raw_path: open.dat.as_deref(),
+                sample_rate: open.sample_rate,
+            };
+            #[cfg(feature = "dandi")]
+            let (provider, path) = if is_remote(&path) {
+                let (provider, state) =
+                    sorrel_io::NwbProvider::open_remote(path.to_str().unwrap(), params)?;
+                let dir = dandi_data_dir()?.join(state);
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true);
+                #[cfg(unix)]
+                std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+                builder
+                    .create(&dir)
+                    .context("create local DANDI state directory")?;
+                (provider, dir.join("nwb"))
+            } else {
+                (sorrel_io::NwbProvider::open_with(&path, params)?, path)
+            };
+            #[cfg(not(feature = "dandi"))]
+            let provider = sorrel_io::NwbProvider::open_with(&path, params)?;
             let starting_time = provider.starting_time();
             let metrics = provider.quality_metrics().clone();
             let (session, mut ctx) =
@@ -1501,8 +1533,55 @@ fn host_dir(open: &OpenArgs) -> PathBuf {
     }
 }
 
+fn session_host_dir(open: &OpenArgs) -> Result<PathBuf> {
+    if is_remote(open.root()) {
+        #[cfg(feature = "dandi")]
+        return Ok(
+            dandi_data_dir()?.join(sorrel_io::dandi::state_path(open.root().to_str().unwrap())?)
+        );
+        #[cfg(not(feature = "dandi"))]
+        bail!("remote NWB datasets require building with --features dandi");
+    }
+    Ok(host_dir(open))
+}
+
 fn is_dataset_directory(path: &Path) -> bool {
-    path.is_dir() && !sorrel_io::nwb::is_zarr_path(path)
+    !is_remote(path) && path.is_dir() && !sorrel_io::nwb::is_zarr_path(path)
+}
+
+fn is_remote(path: &Path) -> bool {
+    #[cfg(feature = "dandi")]
+    return sorrel_io::dandi::is_remote(path);
+    #[cfg(not(feature = "dandi"))]
+    path.to_str()
+        .is_some_and(|s| s.starts_with("dandi://") || s.starts_with("https://"))
+}
+
+#[cfg(feature = "dandi")]
+fn dandi_data_dir() -> Result<PathBuf> {
+    let var = |key| {
+        std::env::var_os(key)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    let root = if let Some(dir) = var("SORREL_USER_DIR") {
+        dir
+    } else if cfg!(windows) {
+        var("LOCALAPPDATA")
+            .context("LOCALAPPDATA is not set")?
+            .join("sorrel")
+    } else if let Some(dir) = var("XDG_DATA_HOME").filter(|path| path.is_absolute()) {
+        dir.join("sorrel")
+    } else if cfg!(target_os = "macos") {
+        var("HOME")
+            .context("HOME is not set")?
+            .join("Library/Application Support/sorrel")
+    } else {
+        var("HOME")
+            .context("HOME is not set")?
+            .join(".local/share/sorrel")
+    };
+    Ok(root.join("dandi"))
 }
 
 fn session_path(path: &Path) -> PathBuf {
@@ -1520,7 +1599,19 @@ fn session_key(open: &OpenArgs) -> Result<String> {
     // Discard is a one-shot action, not a property of the live session.
     args.discard_journal = false;
     // A file's name matters even through a symlink: it names its journal.
-    args.root = Some(if is_dataset_directory(args.root()) {
+    args.root = Some(if is_remote(args.root()) {
+        // Session keys can be written to the MCP registry. Never put a signed URL there.
+        #[cfg(feature = "dandi")]
+        {
+            PathBuf::from(
+                blake3::hash(args.root().as_os_str().as_encoded_bytes())
+                    .to_hex()
+                    .as_str(),
+            )
+        }
+        #[cfg(not(feature = "dandi"))]
+        bail!("remote NWB datasets require building with --features dandi");
+    } else if is_dataset_directory(args.root()) {
         session_path(args.root())
     } else {
         session_path(&host_dir(&args)).join(
@@ -1539,7 +1630,20 @@ fn session_key(open: &OpenArgs) -> Result<String> {
     .into_iter()
     .flatten()
     {
-        *path = session_path(path);
+        if is_remote(path) {
+            #[cfg(feature = "dandi")]
+            {
+                *path = PathBuf::from(
+                    blake3::hash(path.as_os_str().as_encoded_bytes())
+                        .to_hex()
+                        .as_str(),
+                );
+            }
+            #[cfg(not(feature = "dandi"))]
+            bail!("remote NWB datasets require building with --features dandi");
+        } else {
+            *path = session_path(path);
+        }
     }
     #[cfg(any(feature = "hdf5", feature = "zarr"))]
     if let Some(name) = args.nwb_series.as_mut().filter(|s| !s.starts_with('/')) {
@@ -1553,7 +1657,7 @@ fn session_key(open: &OpenArgs) -> Result<String> {
 /// `sorrel mcp`: bridge stdio to a running host, else serve in-process.
 fn run_mcp(open: &OpenArgs) -> Result<()> {
     if sorrel_data::serve::attach_for_session(
-        &host_dir(open),
+        &session_host_dir(open)?,
         Some(&session_key(open)?),
         open.discard_journal,
         std::io::stdin(),
@@ -1611,7 +1715,11 @@ impl SessionVisitor for Headless<'_> {
 fn mcp_open_args(open: &OpenArgs) -> Result<String> {
     let mut open = open.clone();
     open.rebase(&std::env::current_dir()?);
-    let mut args = shell_quote(&sorrel_io::fsutil::display_path(open.root()).to_string());
+    let mut args = if is_remote(open.root()) {
+        "'<remote NWB locator>'".into()
+    } else {
+        shell_quote(&sorrel_io::fsutil::display_path(open.root()).to_string())
+    };
     let mut flag = |name, value: Option<String>| {
         if let Some(value) = value {
             let sep = if value.starts_with('-') { "=" } else { " " };
@@ -1627,7 +1735,13 @@ fn mcp_open_args(open: &OpenArgs) -> Result<String> {
     ] {
         flag(
             name,
-            path.map(|p| sorrel_io::fsutil::display_path(&p).to_string()),
+            path.map(|p| {
+                if is_remote(&p) {
+                    "<remote NWB locator>".into()
+                } else {
+                    sorrel_io::fsutil::display_path(&p).to_string()
+                }
+            }),
         );
     }
     #[cfg(any(feature = "hdf5", feature = "zarr"))]
@@ -1816,7 +1930,8 @@ fn load_events(open: &OpenArgs, nwb_start_time: f64) -> Result<Option<Events>> {
         }
         // Sidecar events next to an NWB file win (the app detects them);
         // otherwise its trials table, whose absence is normal.
-        None if is_nwb(open.root())
+        None if !is_remote(open.root())
+            && is_nwb(open.root())
             && matches!(
                 Events::detect(open.root().parent().unwrap_or(Path::new("."))),
                 Ok(None)
@@ -1847,12 +1962,16 @@ fn tab_opener() -> Opener {
         let mut open = TabCli::try_parse_from(args)?.open;
         open.rebase(&req.cwd);
         let key = session_key(&open)?;
-        let dir = session_path(&host_dir(&open));
-        if let Some((i, tab)) = open_tabs
-            .iter()
-            .enumerate()
-            .find(|(_, tab)| session_path(tab.dataset()) == dir)
-        {
+        let remote = is_remote(open.root());
+        let dir = (!remote).then(|| session_path(&host_dir(&open)));
+        if let Some((i, tab)) = open_tabs.iter().enumerate().find(|(_, tab)| {
+            if remote {
+                tab.session_key() == Some(key.as_str())
+            } else {
+                dir.as_ref()
+                    .is_some_and(|d| session_path(tab.dataset()) == *d)
+            }
+        }) {
             sorrel_data::serve::check_session_reuse(
                 "open tab",
                 tab.session_key(),
@@ -1872,7 +1991,12 @@ fn tab_opener() -> Opener {
             },
         )?;
         let tab = tab.context("backend produced no tab")?;
-        Ok(Opened::Tab(tab, open.root().to_path_buf()))
+        let display = if remote {
+            PathBuf::from(open.root().to_str().unwrap().split('?').next().unwrap())
+        } else {
+            open.root().to_path_buf()
+        };
+        Ok(Opened::Tab(tab, display))
     })
 }
 
@@ -2018,7 +2142,7 @@ fn run_bare() -> Result<()> {
 
 fn require_exists(open: &OpenArgs) -> Result<()> {
     anyhow::ensure!(
-        open.root().exists(),
+        is_remote(open.root()) || open.root().exists(),
         "{} does not exist",
         sorrel_io::fsutil::display_path(open.root())
     );
@@ -2206,7 +2330,7 @@ fn run_call(open: &OpenArgs, tool: &str, args: Option<&str>, raw: bool) -> Resul
         "params": {"name": tool, "arguments": args},
     });
     let reply = match sorrel_data::serve::call_once_for_session(
-        &host_dir(open),
+        &session_host_dir(open)?,
         Some(&session_key(open)?),
         open.discard_journal,
         &request,

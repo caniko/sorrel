@@ -218,7 +218,55 @@ fn changed_etag() {
 }
 #[test]
 fn forbidden_without_refresh() {
-    range_case(Fault::Forbidden, "got 403");
+    range_case(Fault::Forbidden, "got HTTP 403");
+}
+
+#[test]
+fn distant_seeks_coalesce_and_share_cached_reads() -> Result<()> {
+    use std::sync::atomic::AtomicUsize;
+    const SIZE: usize = 12 * 1024 * 1024;
+    let gets = Arc::new(AtomicUsize::new(0));
+    let bytes = Arc::new(AtomicUsize::new(0));
+    let (gets_on_server, bytes_on_server) = (gets.clone(), bytes.clone());
+    let data = vec![19; SIZE];
+    let server = Server::new(move |_, headers, stream| {
+        gets_on_server.fetch_add(1, Ordering::Relaxed);
+        bytes_on_server.fetch_add(
+            serve_range(stream, headers, &data, Fault::None, "\"initial\""),
+            Ordering::Relaxed,
+        );
+    });
+    let object = Arc::new(http_range::Object::new(
+        0,
+        http_range::Cache::new(),
+        Source {
+            label: "large asset".into(),
+            agent: server.api(Duration::from_secs(2)).agent,
+            url: Some(server.base.join("/storage").unwrap()),
+            refresh: None,
+        },
+        SIZE as u64,
+        "\"initial\"".into(),
+    ));
+    let read = |offset| -> Result<()> {
+        let mut out = vec![MaybeUninit::uninit(); 768 * 1024];
+        object.read_uninit(offset, &mut out, false)?;
+        // All bytes were initialized by the successful read.
+        assert!(out.into_iter().all(|b| unsafe { b.assume_init() } == 19));
+        Ok(())
+    };
+    read(0)?;
+    thread::scope(|scope| -> Result<()> {
+        let other = scope.spawn(|| read(10 * 1024 * 1024));
+        read(10 * 1024 * 1024)?;
+        other.join().unwrap()
+    })?;
+    let before = gets.load(Ordering::Relaxed);
+    assert_eq!(before, 2);
+    read(0)?;
+    assert_eq!(gets.load(Ordering::Relaxed), before);
+    assert!(bytes.load(Ordering::Relaxed) < SIZE / 4);
+    Ok(())
 }
 
 fn fixture(name: &str) -> PathBuf {
@@ -437,6 +485,18 @@ fn blob_parity() -> Result<()> {
     ] {
         parity(name, false)?;
     }
+    Ok(())
+}
+
+#[test]
+fn direct_dandi_https_asset_endpoint_resolves_zarr() -> Result<()> {
+    let (server, _) = remote_fixture("good.nwb.zarr", false);
+    let api = server.api(Duration::from_secs(2));
+    let direct = api.resolve(server.base.join("assets/asset-id/download/")?.as_str())?;
+    let by_path = api.resolve("dandi://dandi/000123/test/good.nwb.zarr")?;
+    assert_eq!(direct.identity, by_path.identity);
+    let provider = NwbProvider::open_resolved(direct, NwbOpenParams::default())?;
+    assert!(provider.n_clusters() > 0);
     Ok(())
 }
 
