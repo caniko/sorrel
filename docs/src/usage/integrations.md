@@ -278,6 +278,38 @@ The function refuses an `NWBFile` that already has a units table. It does
 not write traces, the electrodes table or waveforms. Use the recording's
 own NeuroConv interface for those.
 
+#### Native export
+
+Build Sorrel with `--features hdf5` to export the same Units table from the
+command line without Python:
+
+```sh
+sorrel export-nwb my_run/phy --out curated.nwb \
+  --identifier my-run --session-description 'Curated spike sorting' \
+  --session-start-time '2026-01-01T10:00:00+00:00'
+```
+
+New files use NWB 2.11.0 and never overwrite an existing file. The three
+metadata flags are required for non-NWB inputs; with an NWB input, Sorrel
+copies them and the timestamps reference time from the source. The output
+contains the Units table and, when available, probe-relative electrode
+geometry, but no traces, waveforms or subject metadata. For DANDI, add real
+subject metadata or export into an NWB recording that already has it.
+
+Pass `--starting-time SECONDS` to set the first sample's time on the file's
+NWB time axis. The default is the source ElectricalSeries offset for NWB
+inputs, and zero for other inputs.
+
+```sh
+sorrel export-nwb my_run/phy --into recording.nwb --starting-time 0.5
+```
+
+`--into` adds root `/units` to an existing NWB file. `--in-place` uses the
+input NWB file as that destination. Both refuse any file that already has
+`/units`; use `--out` to export a sort loaded from such a file. Append needs
+space for a sibling copy of the entire destination and replaces the original
+only after a successful write. Do not edit the destination concurrently.
+
 ### NeuroConv
 
 `sorrel.neuroconv.SorrelSortingInterface` wraps the same function as a
