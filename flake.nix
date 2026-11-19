@@ -509,6 +509,8 @@
         // crossSorrelPackages
         // crossSorrelPyPackages
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux portable
+        # Compatibility alias for configs that selected the former HDF5 build.
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {sorrelHdf5 = sorrel;}
         // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           release-bundle = import ./nix/release.nix {
             inherit pkgs harbor-rs;
