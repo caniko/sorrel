@@ -8,8 +8,12 @@ use crate::{linalg::ln_gamma, RefractoryParams};
 pub struct SlidingRp {
     /// Smallest confirmable contamination fraction, or `NaN`.
     pub min_contamination: f32,
-    /// First tested window achieving that confidence, in milliseconds, or `NaN`.
+    /// Highest-confidence window at that fraction (first on ties), as the
+    /// right sample edge in milliseconds, or `NaN`.
     pub rp_ms: f32,
+    /// Whether any sweep window was usable; `false` makes `NaN` "not tested"
+    /// rather than "nothing passed".
+    pub tested: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -24,6 +28,7 @@ pub struct ContaminationPosterior {
 const NO_SRP: SlidingRp = SlidingRp {
     min_contamination: f32::NAN,
     rp_ms: f32::NAN,
+    tested: false,
 };
 const NO_POSTERIOR: ContaminationPosterior = ContaminationPosterior {
     mean: f32::NAN,
@@ -53,7 +58,7 @@ pub fn sliding_rp(
 }
 
 /// Fixed-window contamination posterior with a uniform Beta(1,1) prior on
-/// [0, 1], a Poisson likelihood, and a 95% highest-density credible interval.
+/// [0, 1], a Poisson likelihood, and the shortest 95% credible interval.
 /// Assumes the tested window is no longer than the neuron's true refractory
 /// period, stationary rates and diffuse (Poisson) contamination. An interval
 /// from near 0 to high values means too little data to tell; one bounded well
@@ -157,9 +162,13 @@ fn compute_evidence(
                 best_edge(c).map(|edge| SlidingRp {
                     min_contamination: c as f32,
                     rp_ms: (edge as f64 * 1000.0 / f64::from(sr)) as f32,
+                    tested: true,
                 })
             })
-            .unwrap_or(NO_SRP)
+            .unwrap_or(SlidingRp {
+                tested: true,
+                ..NO_SRP
+            })
     };
     let posterior = if fixed > 0 {
         posterior_from_count(fixed_count, n, ratio(fixed))
@@ -333,22 +342,25 @@ fn posterior_from_count(violations: u64, n: f64, tau_over_duration: f64) -> Cont
         let target = p * mass;
         let i = cumulative.partition_point(|&x| x < target).max(1);
         let t = (target - cumulative[i - 1]) / (cumulative[i] - cumulative[i - 1]);
-        (c_lo + (c_hi - c_lo) * (i as f64 - 1.0 + t) / STEPS as f64) as f32
+        c_lo + (c_hi - c_lo) * (i as f64 - 1.0 + t) / STEPS as f64
     };
-    // 95% highest-density interval: the posterior is unimodal, so it is the
-    // narrowest [q(a), q(a + 0.95)]. With no violations the density falls from
-    // C = 0, so the interval starts at 0 instead of excluding the mode.
-    let (lo95, hi95) = (0..=100)
-        .map(|j| {
-            let a = 0.05 * j as f64 / 100.0;
-            (quantile(a), quantile(a + 0.95))
-        })
-        .min_by(|x, y| (x.1 - x.0).total_cmp(&(y.1 - y.0)))
-        .unwrap_or((f32::NAN, f32::NAN));
+    // Shortest contiguous 95% interval, [q(a), q(a + 0.95)] over a in 0..0.05
+    // (the highest-density one wherever the density is unimodal). With no
+    // violations the density falls from C = 0, so it is [0, q(0.95)].
+    let (lo95, hi95) = match k == 0.0 {
+        true => (0.0, quantile(0.95)),
+        false => (0..=100)
+            .map(|j| {
+                let a = 0.05 * j as f64 / 100.0;
+                (quantile(a), quantile(a + 0.95))
+            })
+            .min_by(|x, y| (x.1 - x.0).total_cmp(&(y.1 - y.0)))
+            .unwrap_or((f64::NAN, f64::NAN)),
+    };
     ContaminationPosterior {
         mean: (moment / mass) as f32,
-        lo95,
-        hi95,
+        lo95: lo95 as f32,
+        hi95: hi95 as f32,
         violations: violations.min(u64::from(u32::MAX)) as u32,
     }
 }
@@ -392,7 +404,8 @@ mod tests {
         // confidence) match IBL computeACG / computeViol exactly. The
         // end-to-end `expected` results charge edge - 1 samples of exposure
         // instead of IBL's full edge; the fractions and the argmax window
-        // (2.01 ms for the 2 ms dead time) still equal IBL's on these trains.
+        // bin (66, whose right edge Sorrel reports as 2.01 ms; IBL reports
+        // its centre) still equal IBL's on these trains.
         let params = RefractoryParams::default();
         for (duration, rate, inject, n, expected, cell) in [
             (
@@ -488,7 +501,7 @@ mod tests {
             (&times[..], 1000, 0.0),
         ] {
             let srp = sliding_rp(times, total, sr, &params);
-            assert!(srp.min_contamination.is_nan() && srp.rp_ms.is_nan());
+            assert!(srp.min_contamination.is_nan() && srp.rp_ms.is_nan() && !srp.tested);
             let p = contamination_posterior(times, total, sr, &params);
             assert!(p.mean.is_nan() && p.lo95.is_nan() && p.hi95.is_nan());
         }
@@ -505,6 +518,13 @@ mod tests {
         assert!(near(p.mean, 1.0 / a), "{p:?}");
         // Highest-density interval of a decreasing density starts at 0.
         assert_eq!(p.lo95, 0.0, "{p:?}");
+        // Sparse, zero violations: still starts at 0 (f32 rounding once
+        // made a shifted interval look shorter).
+        let three = [0, 100, 200].map(SampleIndex);
+        let params = RefractoryParams::default();
+        let (srp, sparse) = refractory_evidence(&three, 3600 * 30_000, 30_000.0, &params);
+        assert_eq!(sparse.lo95, 0.0, "{sparse:?}");
+        assert!(srp.tested && srp.min_contamination.is_nan(), "{srp:?}");
         assert!(near(p.hi95, -(0.05_f64).ln() / a), "{p:?}");
     }
 

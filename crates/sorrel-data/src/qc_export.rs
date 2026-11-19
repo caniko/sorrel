@@ -70,9 +70,9 @@ pub struct QcRow {
     pub drift_slope: f32,
     /// Minimum contamination fraction confirmed by sliding-RP, or `NaN`.
     pub srp_contamination: f32,
-    /// First passing window at that fraction (ms), or `NaN`.
+    /// Highest-confidence window at that fraction (ms, first on ties), or `NaN`.
     pub srp_rp_ms: f32,
-    /// Fixed-window contamination posterior mean and 95% highest-density bounds.
+    /// Fixed-window contamination posterior mean and shortest 95% interval.
     pub rpv_post_mean: f32,
     pub rpv_post_lo95: f32,
     pub rpv_post_hi95: f32,
