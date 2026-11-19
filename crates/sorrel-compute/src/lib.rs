@@ -9,6 +9,7 @@ pub mod cmr;
 pub mod contaminated_gaussian;
 pub mod distribution;
 pub mod drift;
+pub mod epochs;
 pub mod filter;
 pub mod gmm;
 pub mod gmm_diag;

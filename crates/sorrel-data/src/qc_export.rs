@@ -17,6 +17,7 @@ use crate::quality_ext::cluster_quality_with;
 use crate::refractory::RefractoryWindows;
 use crate::session::Session;
 use anyhow::{Context, Result};
+use sorrel_compute::epochs::{stable_epochs, Epoch};
 use sorrel_io::{ClusterId, DataProvider};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -76,6 +77,12 @@ pub struct QcRow {
     pub rpv_post_mean: f32,
     pub rpv_post_lo95: f32,
     pub rpv_post_hi95: f32,
+    /// Number of fitted stable epochs; `NaN` if not computed.
+    pub n_epochs: f32,
+    /// Lowest / highest fitted amplitude; `NaN` if an epoch lacks amplitudes.
+    pub epoch_amp_ratio: f32,
+    /// Lowest / highest fitted firing rate.
+    pub epoch_rate_ratio: f32,
 }
 
 impl Default for QcRow {
@@ -121,6 +128,9 @@ impl Default for QcRow {
             rpv_post_mean: n,
             rpv_post_lo95: n,
             rpv_post_hi95: n,
+            n_epochs: n,
+            epoch_amp_ratio: n,
+            epoch_rate_ratio: n,
         }
     }
 }
@@ -128,7 +138,7 @@ impl Default for QcRow {
 impl QcRow {
     /// Every metric column name, in TSV order. The single source of truth
     /// for names used by `get`, the rule engine, and the exports.
-    pub const METRICS: [&'static str; 37] = [
+    pub const METRICS: [&'static str; 40] = [
         "n_spikes",
         "firing_rate",
         "mean_amplitude",
@@ -166,6 +176,9 @@ impl QcRow {
         "rpv_post_mean",
         "rpv_post_lo95",
         "rpv_post_hi95",
+        "n_epochs",
+        "epoch_amp_ratio",
+        "epoch_rate_ratio",
     ];
 
     /// `{"cluster_id": .., "<metric>": number | null, ...}` — NaN becomes
@@ -227,6 +240,9 @@ impl QcRow {
             "rpv_post_mean" => self.rpv_post_mean,
             "rpv_post_lo95" => self.rpv_post_lo95,
             "rpv_post_hi95" => self.rpv_post_hi95,
+            "n_epochs" => self.n_epochs,
+            "epoch_amp_ratio" => self.epoch_amp_ratio,
+            "epoch_rate_ratio" => self.epoch_rate_ratio,
             _ => return None,
         })
     }
@@ -374,6 +390,12 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
                 // These are public QC metrics, not versioned model features.
                 RefractoryWindows::Learn => (nan, nan, nan, nan, nan),
             };
+        let epochs = match windows {
+            RefractoryWindows::Session(_) => {
+                stable_epochs(times, amps, total_samples.0, sample_rate)
+            }
+            RefractoryWindows::Learn => Vec::new(), // not a versioned model feature
+        };
         let acg = acg_or_compute(session, c, acg_bin, acg_window);
         // ponytail: evenly strided to <= 5000 points to bound the O(n log n)
         // sort per cluster; a rare second mode in a huge cluster can thin out.
@@ -429,9 +451,41 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
             rpv_post_mean,
             rpv_post_lo95,
             rpv_post_hi95,
+            n_epochs: if epochs.is_empty() {
+                nan
+            } else {
+                epochs.len() as f32
+            },
+            epoch_amp_ratio: epoch_amp_ratio(&epochs),
+            epoch_rate_ratio: epoch_ratio(&epochs, |e| e.rate_hz),
         });
     }
     rows
+}
+
+fn epoch_amp_ratio(epochs: &[Epoch]) -> f32 {
+    if epochs.iter().all(|e| e.amp_fitted) {
+        epoch_ratio(epochs, |e| e.amp_mean.abs())
+    } else {
+        f32::NAN
+    }
+}
+
+fn epoch_ratio(epochs: &[Epoch], level: impl Fn(&Epoch) -> f32) -> f32 {
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for x in epochs.iter().map(level) {
+        if !x.is_finite() {
+            return f32::NAN;
+        }
+        min = min.min(x);
+        max = max.max(x);
+    }
+    if max > 0.0 {
+        min / max
+    } else {
+        f32::NAN
+    }
 }
 
 /// Write QC rows to a tab-separated file.
@@ -714,6 +768,7 @@ pub(crate) mod tests {
             .unwrap();
         let json_keys: Vec<&str> = first_row.split('"').skip(1).step_by(2).collect();
         assert_eq!(tsv_keys, json_keys);
+        assert!(tsv_keys.ends_with(&["n_epochs", "epoch_amp_ratio", "epoch_rate_ratio"]));
         let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
         for name in [
             "srp_contamination",
@@ -721,6 +776,9 @@ pub(crate) mod tests {
             "rpv_post_mean",
             "rpv_post_lo95",
             "rpv_post_hi95",
+            "n_epochs",
+            "epoch_amp_ratio",
+            "epoch_rate_ratio",
         ] {
             let i = tsv_keys.iter().position(|&k| k == name).unwrap();
             for row in [2, 3] {

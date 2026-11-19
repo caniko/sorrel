@@ -35,3 +35,6 @@ srp_rp_ms	Tested refractory window (ms) of highest confidence at srp_contaminati
 rpv_post_mean	Mean contamination fraction (0-1) at the fixed refractory window under a diffuse-contamination Poisson likelihood and uniform Beta(1,1) prior; conditional on that model.
 rpv_post_lo95	Lower endpoint of the fixed-window contamination posterior's shortest 95% credible interval (fraction, 0-1).
 rpv_post_hi95	Upper endpoint of the fixed-window contamination posterior's shortest 95% credible interval (fraction, 0-1).
+n_epochs	Number of stable firing-rate and amplitude epochs inferred over the recording; NaN when not computed.
+epoch_amp_ratio	Smallest divided by largest magnitude of the epoch mean amplitudes; NaN if amplitudes were not fitted, any epoch is silent, or the largest magnitude is zero.
+epoch_rate_ratio	Lowest divided by highest epoch firing rate; 1 for one epoch, NaN when not computed.
