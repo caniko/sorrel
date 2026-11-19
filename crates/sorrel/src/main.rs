@@ -1417,7 +1417,12 @@ impl SessionVisitor for Report {
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
-        let out = dataset_output(&ctx, self.out, "sorrel_report.html", Some("sorrel_report.html"))?;
+        let out = dataset_output(
+            &ctx,
+            self.out,
+            "sorrel_report.html",
+            Some("sorrel_report.html"),
+        )?;
         let session = seeded(session, seed)?;
         let n = write_report(&session, &out, phy_label_str, &self.filter)?;
         println!("wrote {n} cluster cards → {}", out.display());
@@ -1566,7 +1571,9 @@ fn dataset_output<P: DataProvider>(
     } else if ctx.remote {
         Ok(ctx.save_dir.join(remote_name))
     } else {
-        Ok(PathBuf::from(local_default.context("--out is required for local datasets")?))
+        Ok(PathBuf::from(
+            local_default.context("--out is required for local datasets")?,
+        ))
     }
 }
 
@@ -2418,12 +2425,15 @@ fn run_status(dir: Option<&Path>, json: bool) -> Result<()> {
         None
     });
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let want = dir.map(|d| {
-        session_host_dir(&OpenArgs {
-            root: Some(d.into()),
-            ..Default::default()
-        }).map(|dir| canon(&dir))
-    }).transpose()?;
+    let want = dir
+        .map(|d| {
+            session_host_dir(&OpenArgs {
+                root: Some(d.into()),
+                ..Default::default()
+            })
+            .map(|dir| canon(&dir))
+        })
+        .transpose()?;
     // `list_hosts` paths carry no `\\?\` prefix, so compare without it.
     let canon = |p: &Path| sorrel_io::fsutil::simplified(&canon(p)).to_path_buf();
     let hosts: Vec<_> = sorrel_data::list_hosts()
@@ -3085,7 +3095,10 @@ mod tests {
         assert!(!session_key(&open)?.contains("signature="));
         assert!(!mcp_open_args(&open)?.contains("signature="));
         let hash = blake3::hash(b"test.nwb").to_hex();
-        assert_eq!(session_host_dir(&open)?, dandi_data_dir()?.join("000123/draft").join(hash.as_str()));
+        assert_eq!(
+            session_host_dir(&open)?,
+            dandi_data_dir()?.join("000123/draft").join(hash.as_str())
+        );
         Ok(())
     }
 

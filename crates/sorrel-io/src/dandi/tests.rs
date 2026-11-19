@@ -554,6 +554,9 @@ fn public_zarr() -> Result<()> {
         .err()
         .context("unexpectedly opened the unsupported benchmark")?;
     let message = format!("{error:#}");
-    assert!(message.contains("parse .zmetadata") || message.contains("/units"), "{message}");
+    assert!(
+        message.contains("parse .zmetadata") || message.contains("/units"),
+        "{message}"
+    );
     Ok(())
 }
