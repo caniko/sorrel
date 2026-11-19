@@ -239,7 +239,8 @@ def test_native_units_match_python(curated: Path, tmp_path: Path, native_cli, ap
     cmd = [native_cli, "export-nwb", curated, *args, "--starting-time", str(START)]
     subprocess.run(cmd, check=True)
     assert not validate(path=native)
-    with h5py.File(native, "r") as f:
+    with h5py.File(native, "r") as f, h5py.File(python, "r") as py:
+        assert set(f["units/spike_times"].attrs) == set(py["units/spike_times"].attrs)
         for name in ("id", "spike_times", "spike_times_index"):
             assert isinstance(f["units"].get(name, getlink=True), h5py.HardLink)
             dataset = f[f"units/{name}"]
@@ -346,7 +347,8 @@ def test_native_append_checks_timestamp_reference(tmp_path: Path, native_cli):
         assert io.read().units["spike_times"][0][0] == pytest.approx(first_spike + 10)
 
 
-def test_native_export_uses_selected_series_time_base(tmp_path: Path, native_cli):
+@pytest.mark.parametrize("start", [0.25, -0.25])
+def test_native_export_uses_selected_series_time_base(tmp_path: Path, native_cli, start):
     source, out = (tmp_path / name for name in ("source.nwb", "sort.nwb"))
     nwb = NWBFile("x", "x", datetime(2026, 1, 1, tzinfo=timezone.utc))
     device = nwb.create_device("probe")
@@ -356,9 +358,9 @@ def test_native_export_uses_selected_series_time_base(tmp_path: Path, native_cli
     for i in range(2):
         electrodes = nwb.create_electrode_table_region([0, 1], "test")
         nwb.add_acquisition(ElectricalSeries(name=f"series{i}", data=np.zeros((300, 2), np.int16),
-                                             electrodes=electrodes, starting_time=0.25 + i / 2,
-                                             rate=RATE))
-    first_spike = 0.25 + 25 / RATE
+                                             electrodes=electrodes, starting_time=start + i / 2,
+                                              rate=RATE))
+    first_spike = start + 25 / RATE
     nwb.add_unit(id=0, spike_times=[first_spike])
     with NWBHDF5IO(source, "w") as io:
         io.write(nwb)
@@ -368,6 +370,15 @@ def test_native_export_uses_selected_series_time_base(tmp_path: Path, native_cli
         units = io.read().units
         assert units.resolution == 1 / RATE
         assert units["spike_times"][0][0] == first_spike
+    if start < 0:
+        reopened = tmp_path / "reopened.nwb"
+        cmd = [native_cli, "export-nwb", out, "--out", reopened]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        assert result.returncode != 0 and "--dat" in result.stderr
+        subprocess.run([*cmd, "--dat", source], check=True)
+        assert not validate(path=reopened)
+        with NWBHDF5IO(reopened, "r") as io:
+            assert io.read().units["spike_times"][0][0] == first_spike
 
 
 def test_sorting_analyzer_sample_rate_parity(tmp_path: Path):
@@ -415,6 +426,19 @@ def test_native_append_records_modification_date(curated: Path, empty_nwb: Path,
         dates = io.read().file_create_date
         assert dates[:-1] == before
         assert earliest <= dates[-1] <= datetime.now(timezone.utc)
+
+
+def test_native_append_accepts_fixed_length_root_attributes(curated: Path, empty_nwb: Path,
+                                                           native_cli):
+    with h5py.File(empty_nwb, "r+") as f:
+        for name in ("nwb_version", "neurodata_type"):
+            value = np.bytes_(f.attrs[name])
+            del f.attrs[name]
+            f.attrs[name] = value
+    subprocess.run([native_cli, "export-nwb", curated, "--into", empty_nwb], check=True)
+    assert not validate(path=empty_nwb)
+    with NWBHDF5IO(empty_nwb, "r") as io:
+        assert sorted(io.read().units.id[:]) == sorted(expected_trains())
 
 
 def test_native_export_rejects_journal_aliases(tmp_path: Path, empty_nwb: Path, native_cli):

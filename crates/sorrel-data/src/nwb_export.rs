@@ -151,7 +151,6 @@ where
     Ok(Units {
         description,
         resolution: 1.0 / rate,
-        starting_time,
         id,
         columns,
         generated_by: ["sorrel-ephys", version],

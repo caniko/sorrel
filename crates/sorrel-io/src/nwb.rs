@@ -42,10 +42,9 @@ pub struct NoTrials;
 #[cfg(any(feature = "hdf5", feature = "zarr"))]
 mod imp {
     mod specs;
-    mod storage;
+    pub(super) mod storage;
     use crate::extras::{HasGeometry, HasQualityMetrics, QualityMetrics};
     use crate::kilosort::{pinned_sorter, valid_tag, PhyLabel};
-    use crate::nwb_units::STARTING_TIME_ATTR;
     use crate::provider::{
         appended_unit_id, ChannelId, ClusterId, DataProvider, SampleIndex, TraceSamples,
         TraceSlice, UnitAnnotation,
@@ -247,21 +246,12 @@ mod imp {
                     ensure!(explicit == declared,
                         "--sample-rate {explicit} Hz is not a clock this NWB declares; pass one of: {declared} Hz (/units/spike_times resolution)");
                 }
-                // Units-only native exports keep the original NWB clock but
-                // have no ElectricalSeries in which to store the offset.
-                let t0 = if let Some(attr) = spike_times.optional_attr(STARTING_TIME_ATTR)? {
-                    let t0 = attr.exact_number(STARTING_TIME_ATTR)?;
-                    ensure!(t0.is_finite(), "invalid {STARTING_TIME_ATTR} {t0}");
-                    t0
-                } else {
-                    0.0
-                };
                 (
                         None,
                         units_rate.or(params.sample_rate).map(checked_rate).transpose()?.context(
                             "no ElectricalSeries time base in the sorting NWB and no /units/spike_times resolution; pass --sample-rate HZ",
                         )?,
-                        t0,
+                        0.0,
                         read_units_only_channels(&f)?,
                         None,
                     )
@@ -282,7 +272,7 @@ mod imp {
                 &spike_times_index,
                 rate,
                 t0,
-                timestamps.as_ref().map(|ds| (ds, n_samples)),
+                trace.as_ref().map(|t| (t.n_samples, timestamps.as_ref())),
                 comparison_rate.map(|other_rate| (other_rate, require_agreement)),
             )
             .context("load /units")?;
@@ -307,8 +297,6 @@ mod imp {
                         Some(identity) => identity,
                         None => storage::local_identity(raw_path)?,
                     });
-                } else if series.is_none() && t0 != 0.0 {
-                    identity_bytes.extend(t0.to_le_bytes());
                 }
             }
             let metadata = read_unit_metadata(&units, &unit_ids)?;
@@ -1019,9 +1007,10 @@ mod imp {
         spike_times_index: &Dataset,
         rate: f64,
         t0: f64,
-        timestamps: Option<(&Dataset, usize)>,
+        series_clock: Option<(usize, Option<&Dataset>)>,
         mut comparison: Option<(f64, bool)>,
     ) -> Result<(Vec<Vec<SampleIndex>>, Vec<u32>, bool)> {
+        let timestamps = series_clock.and_then(|(n_samples, ds)| ds.map(|ds| (ds, n_samples)));
         let ids: Vec<i64> = ids.read_raw()?;
         spike_times.exact_float("/units/spike_times")?;
         let mut all: Vec<f64> = spike_times.read_raw()?;
@@ -1062,7 +1051,12 @@ mod imp {
                     let s = exact_sample(t, t0, rate);
                     ensure!(s.is_finite() && (0.0..u64::MAX as f64).contains(&s)
                         && timestamps.is_none_or(|(_, n_samples)| (s as u64) < n_samples as u64),
-                        "unit {id}: spike at {t} s is outside the sample index range or cannot be placed on a sample exactly (starting time {t0} s, {rate} Hz)");
+                        "unit {id}: spike at {t} s is outside the sample index range or cannot be placed on a sample exactly (starting time {t0} s, {rate} Hz){}",
+                        if series_clock.is_none() && t < 0.0 {
+                            "; pair the raw NWB file with --dat to restore its time base"
+                        } else {
+                            ""
+                        });
                     if let Some((other_rate, require_agreement)) = comparison {
                         let other = exact_sample(t, t0, other_rate);
                         if other != s {
@@ -1573,6 +1567,8 @@ mod imp {
     }
 }
 
+#[cfg(feature = "hdf5")]
+pub(crate) use imp::storage::{read_str, strings};
 #[cfg(any(feature = "hdf5", feature = "zarr"))]
 pub(crate) use imp::read_trials;
 #[cfg(any(feature = "hdf5", feature = "zarr"))]

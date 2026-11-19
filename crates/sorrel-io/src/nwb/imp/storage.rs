@@ -4,6 +4,8 @@
 #[cfg(feature = "hdf5")]
 #[path = "hdf.rs"]
 mod hdf;
+#[cfg(feature = "hdf5")]
+pub(crate) use hdf::{read_str, strings};
 #[cfg(all(feature = "dandi", feature = "hdf5"))]
 #[path = "http_vfd.rs"]
 mod http_vfd;

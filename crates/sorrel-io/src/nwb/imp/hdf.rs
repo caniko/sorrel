@@ -55,24 +55,24 @@ pub(super) fn identity(path: &Path, meta: &std::fs::Metadata) -> Result<Vec<u8>>
     Ok(hasher.finalize().as_bytes().to_vec())
 }
 
-pub(super) fn read_str(data: &hdf5::Container) -> Result<String> {
+pub(crate) fn read_str(data: &hdf5::Container) -> Result<String> {
     ensure!(data.is_scalar(), "expected a scalar HDF5 string");
     strings(data)?.pop().context("missing HDF5 string")
 }
 
-pub(super) fn strings(data: &hdf5::Container) -> Result<Vec<String>> {
+pub(crate) fn strings(data: &hdf5::Container) -> Result<Vec<String>> {
     let dtype = data.dtype()?;
     match dtype.to_descriptor()? {
-        TypeDescriptor::VarLenUnicode => Ok(data
+        TypeDescriptor::VarLenUnicode => data
             .read_raw::<VarLenUnicode>()?
             .iter()
-            .map(ToString::to_string)
-            .collect()),
-        TypeDescriptor::VarLenAscii => Ok(data
+            .map(|s| Ok(std::str::from_utf8(s.as_bytes())?.to_owned()))
+            .collect(),
+        TypeDescriptor::VarLenAscii => data
             .read_raw::<VarLenAscii>()?
             .iter()
-            .map(ToString::to_string)
-            .collect()),
+            .map(|s| Ok(std::str::from_utf8(s.as_bytes())?.to_owned()))
+            .collect(),
         TypeDescriptor::FixedAscii(width) | TypeDescriptor::FixedUnicode(width) => {
             fixed_strings(data, &dtype, width)
         }

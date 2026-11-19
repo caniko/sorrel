@@ -1,10 +1,11 @@
 //! Native HDF5 serialization of curated units. Layout mirrors the cached
 //! schemas in `nwb_schema` and https://nwb-schema.readthedocs.io/en/stable/format.html.
 
-use crate::nwb_units::{Units, Values, STARTING_TIME_ATTR};
+use crate::nwb::{read_str, strings};
+use crate::nwb_units::{Units, Values};
 use crate::ChannelId;
 use anyhow::{ensure, Context, Result};
-use hdf5_metno::types::{TypeDescriptor, VarLenAscii, VarLenUnicode};
+use hdf5_metno::types::VarLenUnicode;
 use hdf5_metno::{Dataset, File, Group, H5Type, Location, ObjectReference1};
 use std::fs;
 use std::path::Path;
@@ -44,15 +45,14 @@ impl Metadata {
 
     pub fn read(path: &Path) -> Result<Self> {
         let f = File::open(path)?;
-        let session_start_time = read_text(&f.dataset("session_start_time")?)?;
+        let read = |name| read_str(&*f.dataset(name)?);
         let mut metadata = Self::new(
-            read_text(&f.dataset("identifier")?)?,
-            read_text(&f.dataset("session_description")?)?,
-            session_start_time,
+            read("identifier")?,
+            read("session_description")?,
+            read("session_start_time")?,
         )?;
         if f.link_exists("timestamps_reference_time") {
-            metadata.timestamps_reference_time =
-                read_text(&f.dataset("timestamps_reference_time")?)?;
+            metadata.timestamps_reference_time = read("timestamps_reference_time")?;
         }
         Ok(metadata)
     }
@@ -67,7 +67,7 @@ pub fn check_timestamp_reference(source: &Path, destination: &Path) -> Result<()
         } else {
             "session_start_time"
         };
-        read_text(&f.dataset(name)?)
+        read_str(&*f.dataset(name)?)
     }
     let reference = |path: &Path| {
         read(path)
@@ -156,8 +156,8 @@ pub fn append(path: &Path, units: &Units) -> Result<()> {
     ensure!(before.is_file(), "{} is not a regular file", path.display());
     let source = File::open(&path)?;
     ensure!(
-        read_attr(&source, "nwb_version")?.starts_with("2.")
-            && read_attr(&source, "neurodata_type")? == "NWBFile",
+        read_str(&*source.attr("nwb_version")?)?.starts_with("2.")
+            && read_str(&*source.attr("neurodata_type")?)? == "NWBFile",
         "{} is not an NWB 2.x file",
         path.display()
     );
@@ -182,7 +182,10 @@ pub fn append(path: &Path, units: &Units) -> Result<()> {
     add_generated_by(&general, units.generated_by)?;
     let dates = f.dataset("file_create_date")?;
     ensure!(dates.ndim() == 1, "invalid /file_create_date shape");
-    let mut history = read_strings(&dates)?;
+    let mut history = strings(&dates)?
+        .iter()
+        .map(|s| text(s))
+        .collect::<Result<Vec<_>>>()?;
     history.push(text(&jiff::Timestamp::now().to_string())?);
     f.unlink("file_create_date")?;
     dataset(&f, "file_create_date", &history)?;
@@ -233,76 +236,6 @@ fn text_dataset(group: &Group, name: &str, value: &str) -> Result<()> {
         .create(name)?
         .write_scalar(&text(value)?)?;
     Ok(())
-}
-
-fn read_text(ds: &Dataset) -> Result<String> {
-    ensure!(ds.ndim() == 0, "expected scalar text for {}", ds.name());
-    read_strings(ds)?
-        .pop()
-        .map(|s| s.to_string())
-        .with_context(|| format!("missing text in {}", ds.name()))
-}
-
-fn read_strings(ds: &Dataset) -> Result<Vec<VarLenUnicode>> {
-    let dtype = ds.dtype()?;
-    match dtype.to_descriptor()? {
-        TypeDescriptor::VarLenUnicode => Ok(ds.read_raw::<VarLenUnicode>()?),
-        TypeDescriptor::VarLenAscii => ds
-            .read_raw::<VarLenAscii>()?
-            .iter()
-            .map(|s| text(std::str::from_utf8(s.as_bytes())?))
-            .collect(),
-        TypeDescriptor::FixedAscii(width) | TypeDescriptor::FixedUnicode(width) => {
-            use hdf5_metno_sys::{
-                h5d::H5Dread,
-                h5p::H5P_DEFAULT,
-                h5t::{H5Tget_strpad, H5T_STR_SPACEPAD},
-            };
-            let space = ds.space()?;
-            let len = space
-                .size()
-                .checked_mul(width)
-                .context("fixed string dataset too large")?;
-            ensure!(width != 0, "invalid fixed string width");
-            let mut bytes = vec![0u8; len];
-            let space_padded = hdf5_metno::sync::sync(|| {
-                // SAFETY: the memory dataspace describes exactly `space.size()`
-                // elements of `width` bytes in `bytes`, and all HDF5 IDs are live.
-                unsafe {
-                    let status = H5Dread(
-                        ds.id(),
-                        dtype.id(),
-                        space.id(),
-                        space.id(),
-                        H5P_DEFAULT,
-                        bytes.as_mut_ptr().cast(),
-                    );
-                    ensure!(status >= 0, "reading fixed strings from {}", ds.name());
-                    Ok(H5Tget_strpad(dtype.id()) == H5T_STR_SPACEPAD)
-                }
-            })?;
-            bytes
-                .chunks_exact(width)
-                .map(|bytes| {
-                    let bytes = bytes.split(|&b| b == 0).next().unwrap_or_default();
-                    let s = std::str::from_utf8(bytes)?;
-                    text(if space_padded {
-                        s.trim_end_matches(' ')
-                    } else {
-                        s
-                    })
-                })
-                .collect()
-        }
-        _ => anyhow::bail!("{} is not a string dataset", ds.name()),
-    }
-}
-
-fn read_attr(loc: &Location, name: &str) -> Result<String> {
-    let a = loc.attr(name)?;
-    Ok(a.read_scalar::<VarLenUnicode>()
-        .map(|v| v.to_string())
-        .or_else(|_| a.read_scalar::<VarLenAscii>().map(|v| v.to_string()))?)
 }
 
 fn typed(loc: &Location, namespace: &str, neurodata_type: &str) -> Result<()> {
@@ -368,12 +301,6 @@ fn write_units(f: &File, units: &Units) -> Result<()> {
                 .shape(())
                 .create("resolution")?
                 .write_scalar(&units.resolution)?;
-            if units.starting_time != 0.0 {
-                ds.new_attr::<f64>()
-                    .shape(())
-                    .create(STARTING_TIME_ATTR)?
-                    .write_scalar(&units.starting_time)?;
-            }
         }
         if let Some(ends) = &col.index {
             let index = dataset(&g, &format!("{name}_index"), ends)?;
@@ -459,13 +386,13 @@ fn write_electrodes(f: &File, positions: &[[f32; 2]], channels: &[ChannelId]) ->
 
 fn add_generated_by(g: &Group, entry: [&str; 2]) -> Result<()> {
     let name = "was_generated_by";
-    let mut values: Vec<VarLenUnicode> = if g.link_exists(name) {
+    let mut values = if g.link_exists(name) {
         let ds = g.dataset(name)?;
         ensure!(
             ds.ndim() == 2 && ds.shape()[1] == 2,
             "invalid /general/{name} shape"
         );
-        read_strings(&ds)?
+        strings(&ds)?
     } else {
         Vec::new()
     };
@@ -477,7 +404,8 @@ fn add_generated_by(g: &Group, entry: [&str; 2]) -> Result<()> {
     {
         return Ok(());
     }
-    values.extend([text(entry[0])?, text(entry[1])?]);
+    values.extend(entry.map(str::to_owned));
+    let values = values.iter().map(|s| text(s)).collect::<Result<Vec<_>>>()?;
     if g.link_exists(name) {
         g.unlink(name)?;
     }
@@ -547,7 +475,6 @@ mod tests {
         let units = Units {
             description: "Curated units".into(),
             resolution: 0.001,
-            starting_time: 0.5,
             id: vec![5, 9],
             columns: vec![Column {
                 name: "spike_times".into(),
