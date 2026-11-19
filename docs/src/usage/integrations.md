@@ -162,13 +162,15 @@ What Sorrel reads:
   an open tab or attach `call` or `mcp` to its host, pass the same open options;
   conflicting options are refused rather than silently ignored.
 - **Time base.** Spike times on the NWB session clock become sample indices as
-  `round((t - starting_time) × rate)`. If `starting_time.rate` is stored as
-  float32 and `1 / spike_times.resolution` rounds to that same rate, Sorrel
-  compares spike indices under both rates, whether the Units table and series
-  are in one file or two. If the indices agree for every spike, Sorrel uses
-  the stored rate. If any differ, pass `--sample-rate <Hz>` to choose the
-  clock that applies. For a float32 series the supplied rate must round to
-  the stored rate. With per-sample `timestamps`, the first
+  `round((t - starting_time) × rate)`. When `1 / spike_times.resolution` is
+  within one part per million of `starting_time.rate`, Sorrel compares spike
+  indices under both rates, regardless of how the series rate is stored. If
+  the indices agree for every spike, Sorrel uses the stored rate. If any
+  differ, pass `--sample-rate <Hz>` to choose the clock that applies. The
+  supplied rate must match the chosen clock within one part per billion, or
+  at float32 precision for a float32 series rate. In a single file, an
+  unspecified or more distant resolution does not override the stored rate.
+  With per-sample `timestamps`, the first
   timestamp gives the start and the end-to-end mean interval gives the rate.
   Timestamps must strictly increase and stay within 0.001 samples of the
   inferred grid, plus four floating-point steps at the largest absolute
@@ -193,10 +195,10 @@ when unspecified and no raw NWB is paired. Spike times are relative to zero
 The electrodes table supplies channels if present, but there is no raw trace
 or waveform extraction. With `--dat recording.nwb`, the raw file supplies
 the trace, channels and time base; `--nwb-series` selects from that file.
-If a units rate is declared or supplied, it must match the series rate
-within 1 part per billion, or at float32 precision if stored as float32.
-Float32 agreement alone does not choose the clock: the spike-index check
-above still applies unless you pass `--sample-rate`. Spike indices must fit
+If a Units rate is declared, it must be within one part per million of a
+stored series rate, or within one part per billion of a timestamp-derived
+rate. With a stored rate, the spike-index check above still applies unless
+you pass `--sample-rate`. Spike indices must fit
 inside the raw series. The files must have the same `timestamps_reference_time`;
 Sorrel does not infer an offset between files.
 
