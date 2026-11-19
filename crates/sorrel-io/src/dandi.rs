@@ -34,13 +34,27 @@ pub(crate) enum Store {
     Zarr(Arc<ZarrStore>),
 }
 
-pub(crate) struct Resolved {
-    pub store: Store,
-    pub identity: Vec<u8>,
-    pub state: PathBuf,
+/// A verified NWB asset revision and the store pinned to it.
+pub struct Resolved {
+    pub(crate) store: Store,
+    pub(crate) identity: Vec<u8>,
+    pub(crate) state: PathBuf,
 }
 
-pub(crate) fn resolve(input: &str) -> Result<Resolved> {
+impl Resolved {
+    /// The asset fingerprint used in the provider's journal identity.
+    pub fn fingerprint(&self) -> &[u8] {
+        &self.identity
+    }
+
+    /// Relative local state directory for the resolved locator.
+    pub fn state_path(&self) -> &Path {
+        &self.state
+    }
+}
+
+/// Resolve and verify an asset, without opening its NWB contents.
+pub fn resolve(input: &str) -> Result<Resolved> {
     Api::production().resolve(input)
 }
 

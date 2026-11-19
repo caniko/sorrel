@@ -642,6 +642,45 @@ fn blob_parity() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "hdf5")]
+fn pinned_remote_dat_supplies_samples_without_resolving_again() -> Result<()> {
+    let units = fixture("units_only.nwb");
+    let read = |provider: NwbProvider| {
+        Ok::<_, anyhow::Error>(
+            provider
+                .read_trace(SampleIndex(0), 1)?
+                .samples
+                .to_f32_centred(),
+        )
+    };
+    for name in ["good.nwb", "uint16.nwb"] {
+        let (server, _) = remote_fixture(name, false);
+        let raw = server
+            .api(Duration::from_secs(2))
+            .resolve(&format!("dandi://dandi/000123/test/{name}"))?;
+        let expected = NwbProvider::open_with(
+            &units,
+            NwbOpenParams {
+                raw_path: Some(&fixture(name)),
+                ..Default::default()
+            },
+        )?;
+        // This locator is unusable. Opening must use only the supplied store.
+        let pinned = NwbProvider::open_pinned(
+            &units,
+            NwbOpenParams {
+                raw_path: Some(Path::new("dandi://unresolvable")),
+                ..Default::default()
+            },
+            None,
+            Some(raw),
+        )?;
+        assert_eq!(read(pinned)?, read(expected)?);
+    }
+    Ok(())
+}
+
+#[test]
 fn direct_dandi_https_asset_endpoint_resolves_zarr() -> Result<()> {
     let (server, _) = remote_fixture("good.nwb.zarr", false);
     let api = server.api(Duration::from_secs(2));

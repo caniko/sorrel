@@ -504,19 +504,6 @@ impl OpenArgs {
         self.root.as_deref().expect("clap marks DATA_DIR required")
     }
 
-    fn pin_remote_version(
-        &mut self,
-        pin: impl FnOnce(&str) -> Result<Option<String>>,
-    ) -> Result<()> {
-        let Some(input) = self.root().to_str() else {
-            return Ok(());
-        };
-        if let Some(pinned) = pin(input)? {
-            self.root = Some(pinned.into());
-        }
-        Ok(())
-    }
-
     /// Make the path fields absolute against `cwd`: the args came from a
     /// `sorrel open` run somewhere else.
     fn rebase(&mut self, cwd: &Path) {
@@ -702,8 +689,18 @@ fn seeded<P: DataProvider>(mut session: Session<P>, seed: Seed<P>) -> Result<Ses
 /// Open the backend named (or detected) by `open`, seal and replay its
 /// journal, then hand the typed session to `v`.
 fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
+    with_resolved_session(open, RemoteInputs::resolve(open)?, v)
+}
+
+fn with_resolved_session<V: SessionVisitor>(
+    open: &OpenArgs,
+    inputs: RemoteInputs,
+    v: V,
+) -> Result<()> {
     #[cfg(feature = "dandi")]
     let mut v = v;
+    #[cfg(not(feature = "dandi"))]
+    let _ = inputs;
     let backend = match (open.backend, is_remote(open.root())) {
         (backend, true) => {
             let detected = detect_backend(open.root())?;
@@ -716,6 +713,11 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
         (Some(b), false) => b,
         (None, false) => detect_backend(open.root())?,
     };
+    #[cfg(feature = "dandi")]
+    anyhow::ensure!(
+        inputs.dat.is_none() || backend == Backend::Nwb,
+        "a remote --dat recording requires the NWB backend"
+    );
     match backend {
         Backend::Kilosort => {
             let mut params = KilosortOpenParams {
@@ -765,21 +767,28 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
                 sample_rate: open.sample_rate,
             };
             #[cfg(feature = "dandi")]
-            let (provider, path) = if is_remote(&path) {
-                let (provider, state) =
-                    sorrel_io::NwbProvider::open_remote(path.to_str().unwrap(), params)?;
-                v.read_remote_trials(&provider);
-                let dir = dandi_data_dir()?.join(state);
-                let mut builder = std::fs::DirBuilder::new();
-                builder.recursive(true);
-                #[cfg(unix)]
-                std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-                builder
-                    .create(&dir)
-                    .context("create local DANDI state directory")?;
-                (provider, dir.join("nwb"))
-            } else {
-                (sorrel_io::NwbProvider::open_with(&path, params)?, path)
+            let (provider, path) = {
+                let dir = inputs
+                    .root
+                    .as_ref()
+                    .map(|_| inputs.host_dir(open))
+                    .transpose()?;
+                let provider =
+                    sorrel_io::NwbProvider::open_pinned(&path, params, inputs.root, inputs.dat)?;
+                let path = if let Some(dir) = dir {
+                    v.read_remote_trials(&provider);
+                    let mut builder = std::fs::DirBuilder::new();
+                    builder.recursive(true);
+                    #[cfg(unix)]
+                    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+                    builder
+                        .create(&dir)
+                        .context("create local DANDI state directory")?;
+                    dir.join("nwb")
+                } else {
+                    path
+                };
+                (provider, path)
             };
             #[cfg(not(feature = "dandi"))]
             let provider = sorrel_io::NwbProvider::open_with(&path, params)?;
@@ -1616,13 +1625,63 @@ fn is_remote(path: &Path) -> bool {
         .is_some_and(|s| s.starts_with("dandi://") || s.starts_with("https://"))
 }
 
-fn pin_dandi_version(input: &str) -> Result<Option<String>> {
+/// Keep both verified stores with the request so lookup and open see the same revisions.
+struct RemoteInputs {
     #[cfg(feature = "dandi")]
-    return sorrel_io::dandi::pin_version(input);
-    #[cfg(not(feature = "dandi"))]
-    {
-        let _ = input;
-        Ok(None)
+    root: Option<sorrel_io::dandi::Resolved>,
+    #[cfg(feature = "dandi")]
+    dat: Option<sorrel_io::dandi::Resolved>,
+}
+
+impl RemoteInputs {
+    fn resolve(open: &OpenArgs) -> Result<Self> {
+        #[cfg(feature = "dandi")]
+        {
+            let resolve = |path: &Path| {
+                path.to_str()
+                    .filter(|_| is_remote(path))
+                    .map(sorrel_io::dandi::resolve)
+                    .transpose()
+            };
+            Ok(Self {
+                root: resolve(open.root()).context("resolve remote dataset")?,
+                dat: open
+                    .dat
+                    .as_deref()
+                    .map(resolve)
+                    .transpose()
+                    .context("resolve remote --dat")?
+                    .flatten(),
+            })
+        }
+        #[cfg(not(feature = "dandi"))]
+        {
+            anyhow::ensure!(
+                !is_remote(open.root()) && !open.dat.as_deref().is_some_and(is_remote),
+                "remote NWB datasets require building with --features dandi"
+            );
+            Ok(Self {})
+        }
+    }
+
+    fn session_key(&self, open: &OpenArgs) -> Result<String> {
+        #[cfg(feature = "dandi")]
+        let keys = [&self.root, &self.dat].map(|asset| {
+            asset
+                .as_ref()
+                .map(|asset| remote_session_path(asset.state_path(), asset.fingerprint()))
+        });
+        #[cfg(not(feature = "dandi"))]
+        let keys = [None, None];
+        session_key(open, keys)
+    }
+
+    fn host_dir(&self, open: &OpenArgs) -> Result<PathBuf> {
+        #[cfg(feature = "dandi")]
+        if let Some(asset) = &self.root {
+            return Ok(dandi_data_dir()?.join(asset.state_path()));
+        }
+        Ok(host_dir(open))
     }
 }
 
@@ -1662,24 +1721,24 @@ fn session_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn session_key(open: &OpenArgs) -> Result<String> {
+#[cfg(feature = "dandi")]
+fn remote_session_path(state: &Path, fingerprint: &[u8]) -> PathBuf {
+    // Preserve the resolved journal location, but never put signed URLs in the MCP registry.
+    PathBuf::from(format!(
+        "remote-nwb:{}:{}",
+        blake3::hash(state.as_os_str().as_encoded_bytes()),
+        blake3::hash(fingerprint)
+    ))
+}
+
+fn session_key(open: &OpenArgs, [root, dat]: [Option<PathBuf>; 2]) -> Result<String> {
     let mut args = open.clone();
     args.rebase(&std::env::current_dir()?);
     // Discard is a one-shot action, not a property of the live session.
     args.discard_journal = false;
     // A file's name matters even through a symlink: it names its journal.
     args.root = Some(if is_remote(args.root()) {
-        // Session keys can be written to the MCP registry. Never put a signed URL there.
-        #[cfg(feature = "dandi")]
-        {
-            PathBuf::from(
-                blake3::hash(args.root().as_os_str().as_encoded_bytes())
-                    .to_hex()
-                    .as_str(),
-            )
-        }
-        #[cfg(not(feature = "dandi"))]
-        bail!("remote NWB datasets require building with --features dandi");
+        root.context("missing fingerprint for remote dataset")?
     } else if is_dataset_directory(args.root()) {
         session_path(args.root())
     } else {
@@ -1689,8 +1748,14 @@ fn session_key(open: &OpenArgs) -> Result<String> {
                 .context("missing dataset filename")?,
         )
     });
+    if let Some(path) = args.dat.as_mut() {
+        *path = if is_remote(path) {
+            dat.context("missing fingerprint for remote --dat")?
+        } else {
+            session_path(path)
+        };
+    }
     for path in [
-        &mut args.dat,
         &mut args.journal,
         &mut args.spikeglx_meta,
         &mut args.oebin,
@@ -1699,35 +1764,22 @@ fn session_key(open: &OpenArgs) -> Result<String> {
     .into_iter()
     .flatten()
     {
-        if is_remote(path) {
-            #[cfg(feature = "dandi")]
-            {
-                *path = PathBuf::from(
-                    blake3::hash(path.as_os_str().as_encoded_bytes())
-                        .to_hex()
-                        .as_str(),
-                );
-            }
-            #[cfg(not(feature = "dandi"))]
-            bail!("remote NWB datasets require building with --features dandi");
-        } else {
-            *path = session_path(path);
-        }
+        *path = session_path(path);
     }
     #[cfg(any(feature = "hdf5", feature = "zarr"))]
     if let Some(name) = args.nwb_series.as_mut().filter(|s| !s.starts_with('/')) {
         *name = format!("/acquisition/{name}");
     }
-    // ponytail: compare normalized open arguments rather than reopening a
-    // provider to resolve implicit defaults. Use the same flags to attach.
+    // ponytail: compare normalized flags without opening a provider to resolve implicit defaults.
     Ok(format!("open-args-v1:{args:?}"))
 }
 
 /// `sorrel mcp`: bridge stdio to a running host, else serve in-process.
 fn run_mcp(open: &OpenArgs) -> Result<()> {
+    let inputs = RemoteInputs::resolve(open)?;
     if sorrel_data::serve::attach_for_session(
-        &session_host_dir(open)?,
-        Some(&session_key(open)?),
+        &inputs.host_dir(open)?,
+        Some(&inputs.session_key(open)?),
         open.discard_journal,
         std::io::stdin(),
         std::io::stdout(),
@@ -1736,7 +1788,7 @@ fn run_mcp(open: &OpenArgs) -> Result<()> {
     }
     // attach found no listener. If another process still has the journal
     // open, serving here would be a second writer: refuse and say so.
-    with_session(open, Serve).map_err(busy_hint)
+    with_resolved_session(open, inputs, Serve).map_err(busy_hint)
 }
 
 /// Name the process holding the journal when `e` is a [`JournalBusy`].
@@ -1752,13 +1804,12 @@ fn busy_hint(e: anyhow::Error) -> anyhow::Error {
 }
 
 /// `sorrel run --headless`: the host and its MCP listener, no window.
-struct Headless<'a>(&'a OpenArgs);
+struct Headless<'a>(&'a OpenArgs, String);
 impl SessionVisitor for Headless<'_> {
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
-        let key = session_key(self.0)?;
         let args = mcp_open_args(self.0)?;
         let host = std::sync::Arc::new(sorrel_data::SessionHost::new(seeded(session, seed)?));
         let listener = sorrel_data::serve::spawn_listener_for_session(
@@ -1767,7 +1818,7 @@ impl SessionVisitor for Headless<'_> {
             ctx.reseal_on_save,
             phy_label_str,
             None,
-            Some(&key),
+            Some(&self.1),
         )?;
         println!(
             "sorrel host on 127.0.0.1:{}; connect an agent with `sorrel mcp {}`; Ctrl-C stops",
@@ -2044,18 +2095,15 @@ fn load_events(
 }
 
 fn tab_target<'a>(
-    open: &mut OpenArgs,
+    open: &OpenArgs,
+    key: &str,
     tabs: impl Iterator<Item = (&'a Path, Option<&'a str>)>,
-    pin: impl FnOnce(&str) -> Result<Option<String>>,
-) -> Result<(String, Option<usize>)> {
-    // Resolve moving DANDI locators before lookup and keep the same version for open.
-    open.pin_remote_version(pin)?;
-    let key = session_key(open)?;
+) -> Result<Option<usize>> {
     let remote = is_remote(open.root());
     let dir = (!remote).then(|| session_path(&host_dir(open)));
     for (i, (dataset, tab_key)) in tabs.enumerate() {
         let matches = if remote {
-            tab_key == Some(key.as_str())
+            tab_key == Some(key)
         } else {
             dir.as_ref().is_some_and(|d| session_path(dataset) == *d)
         };
@@ -2063,13 +2111,13 @@ fn tab_target<'a>(
             sorrel_data::serve::check_session_reuse(
                 "open tab",
                 tab_key,
-                &key,
+                key,
                 open.discard_journal,
             )?;
-            return Ok((key, Some(i)));
+            return Ok(Some(i));
         }
     }
-    Ok((key, None))
+    Ok(None)
 }
 
 /// The shell's opener: a forwarded `sorrel open`'s args become a tab, or the
@@ -2079,7 +2127,7 @@ fn tab_opener() -> Opener {
         let args = std::iter::once("sorrel").chain(req.args.iter().map(String::as_str));
         let mut open = TabCli::try_parse_from(args)?.open;
         open.rebase(&req.cwd);
-        // Recents keep the user's locator, not the pinned version or a signed query.
+        // Recents keep the user's locator, without any signed query.
         let display = if is_remote(open.root()) {
             PathBuf::from(open.root().to_str().unwrap().split('?').next().unwrap())
         } else {
@@ -2088,13 +2136,15 @@ fn tab_opener() -> Opener {
         let tabs = open_tabs
             .iter()
             .map(|tab| (tab.dataset(), tab.session_key()));
-        let (key, existing) = tab_target(&mut open, tabs, pin_dandi_version)?;
-        if let Some(i) = existing {
+        let inputs = RemoteInputs::resolve(&open)?;
+        let key = inputs.session_key(&open)?;
+        if let Some(i) = tab_target(&open, &key, tabs)? {
             return Ok(Opened::Existing(i));
         }
         let mut tab = None;
-        with_session(
+        with_resolved_session(
             &open,
+            inputs,
             TabBuilder {
                 remote_trials: None,
                 out: &mut tab,
@@ -2437,9 +2487,10 @@ fn run_call(open: &OpenArgs, tool: &str, args: Option<&str>, raw: bool) -> Resul
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": tool, "arguments": args},
     });
+    let inputs = RemoteInputs::resolve(open)?;
     let reply = match sorrel_data::serve::call_once_for_session(
-        &session_host_dir(open)?,
-        Some(&session_key(open)?),
+        &inputs.host_dir(open)?,
+        Some(&inputs.session_key(open)?),
         open.discard_journal,
         &request,
     )? {
@@ -2447,8 +2498,9 @@ fn run_call(open: &OpenArgs, tool: &str, args: Option<&str>, raw: bool) -> Resul
         None => {
             let mut reply = None;
             let line = request.to_string();
-            with_session(
+            with_resolved_session(
                 open,
+                inputs,
                 CallOnce {
                     request: &line,
                     reply: &mut reply,
@@ -2665,26 +2717,24 @@ fn main() -> Result<()> {
         None => run_bare(),
         Some(Cmd::Open(open)) => run_open(&open),
         Some(Cmd::Run {
-            mut open,
+            open,
             standalone,
             headless,
         }) => match headless {
             true => {
-                open.pin_remote_version(pin_dandi_version)?;
-                with_session(&open, Headless(&open))
+                let inputs = RemoteInputs::resolve(&open)?;
+                let key = inputs.session_key(&open)?;
+                with_resolved_session(&open, inputs, Headless(&open, key))
             }
             false => run_gui(&open, standalone),
         },
         Some(Cmd::Status { dir, json }) => run_status(dir.as_deref(), json),
         Some(Cmd::Call {
-            mut open,
+            open,
             tool,
             args,
             raw,
-        }) => {
-            open.pin_remote_version(pin_dandi_version)?;
-            run_call(&open, &tool, args.as_deref(), raw)
-        }
+        }) => run_call(&open, &tool, args.as_deref(), raw),
         Some(Cmd::AgentGuide { prompt }) => {
             match prompt {
                 Some(_) => print!("{}", serve::review_prompt()?),
@@ -2856,13 +2906,10 @@ fn main() -> Result<()> {
                 truth,
             },
         ),
-        Some(Cmd::Mcp { mut open, sub }) => match (sub, open.root.is_some()) {
+        Some(Cmd::Mcp { open, sub }) => match (sub, open.root.is_some()) {
             (Some(McpCmd::Tools { json }), _) => mcp_tools(json),
             (Some(McpCmd::Config { client, dir }), _) => mcp_config(client, dir),
-            (None, true) => {
-                open.pin_remote_version(pin_dandi_version)?;
-                run_mcp(&open)
-            }
+            (None, true) => run_mcp(&open),
             (None, false) => run_mcp_active(),
         },
         Some(Cmd::Describe { open, json }) => with_session(&open, Describe { json }),
@@ -3189,7 +3236,12 @@ mod tests {
         assert_eq!(open.root(), Path::new(locator));
         assert_eq!(open.dat.as_deref(), Some(Path::new(url)));
         assert_eq!(open.journal, Some(cwd.join("override.journal")));
-        assert!(!session_key(&open)?.contains("signature="));
+        assert!(session_key(&open, [None, None]).is_err());
+        let keys = [
+            Some(remote_session_path(Path::new("draft"), b"sorting")),
+            Some(remote_session_path(Path::new("https"), b"recording")),
+        ];
+        assert!(!session_key(&open, keys)?.contains("signature="));
         assert!(!mcp_open_args(&open)?.contains("signature="));
         let hash = blake3::hash(b"test.nwb").to_hex();
         assert_eq!(
@@ -3201,53 +3253,38 @@ mod tests {
 
     #[test]
     #[cfg(feature = "dandi")]
-    fn versionless_dandi_reopen_reuses_only_the_resolved_version() -> Result<()> {
-        let locator = "dandi://dandi/000123/test/a%2520.nwb";
-        let open = || OpenArgs {
+    fn session_reuse_checks_both_remote_fingerprints() -> Result<()> {
+        let locator = "dandi://dandi/000123/test/moving.nwb";
+        let draft = Path::new("000123/draft/sorting");
+        let release = Path::new("000123/0.42.1/recording");
+        let root = |fingerprint| Some(remote_session_path(draft, fingerprint));
+        let dat = |fingerprint| Some(remote_session_path(release, fingerprint));
+        let mut open = OpenArgs {
             root: Some(locator.into()),
+            dat: Some(locator.into()),
             ..Default::default()
         };
-        // Mock the DANDI version lookup at the resolver boundary.
-        let pin = |version| {
-            move |input: &str| {
-                assert_eq!(input, locator);
-                Ok(Some(format!(
-                    "dandi://dandi/000123@{version}/test/a%2520.nwb"
-                )))
-            }
-        };
-
-        let mut first = open();
-        let (first_key, existing) = tab_target(&mut first, std::iter::empty(), pin("0.42.1"))?;
-        assert_eq!(existing, None);
-        let first_dir = session_host_dir(&first)?;
-
-        let mut second = open();
-        let (second_key, existing) = tab_target(
-            &mut second,
-            [(first_dir.as_path(), Some(first_key.as_str()))].into_iter(),
-            pin("0.42.2"),
-        )?;
-        assert_eq!(existing, None);
-        assert_eq!(
-            second.root(),
-            Path::new("dandi://dandi/000123@0.42.2/test/a%2520.nwb")
-        );
-        let second_dir = session_host_dir(&second)?;
-        assert_ne!(first_dir, second_dir);
-
-        let mut third = open();
-        let (_, existing) = tab_target(
-            &mut third,
-            [
-                (first_dir.as_path(), Some(first_key.as_str())),
-                (second_dir.as_path(), Some(second_key.as_str())),
-            ]
-            .into_iter(),
-            pin("0.42.2"),
-        )?;
-        assert_eq!(existing, Some(1));
-        assert_eq!(session_host_dir(&third)?, second_dir);
+        let first = session_key(&open, [root(b"one"), dat(b"one")])?;
+        let tabs = || [(draft, Some(first.as_str()))].into_iter();
+        let same = session_key(&open, [root(b"one"), dat(b"one")])?;
+        assert_eq!(tab_target(&open, &same, tabs())?, Some(0));
+        for keys in [[root(b"two"), dat(b"one")], [root(b"one"), dat(b"two")]] {
+            let changed = session_key(&open, keys)?;
+            assert_eq!(tab_target(&open, &changed, tabs())?, None);
+            assert!(serve::check_session_reuse("host", Some(&first), &changed, false).is_err());
+        }
+        // A local units file still owns the same journal; a changed remote --dat is a conflict.
+        let local = tempfile::tempdir()?;
+        open.root = Some(local.path().join("units.nwb"));
+        let first = session_key(&open, [None, dat(b"one")])?;
+        let tabs = || [(local.path(), Some(first.as_str()))].into_iter();
+        let newer = Some(remote_session_path(
+            Path::new("000123/0.42.2/recording"),
+            b"two",
+        ));
+        let changed = session_key(&open, [None, newer])?;
+        assert!(tab_target(&open, &changed, tabs()).is_err());
+        assert_eq!(tab_target(&open, &first, tabs())?, Some(0));
         Ok(())
     }
 

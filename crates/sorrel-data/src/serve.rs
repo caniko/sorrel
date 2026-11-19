@@ -2097,7 +2097,7 @@ pub fn check_session_reuse(
     anyhow::ensure!(!discard_journal,
         "cannot use --discard-journal with the {location}; stop the running session or omit the flag");
     anyhow::ensure!(current == Some(requested),
-        "session conflict: the {location} was opened with a different dataset path or options; close it or use the same open arguments (including --dat, --journal and, for NWB, --nwb-series)");
+        "session conflict: the {location} was opened with a different dataset path, options, or remote revision; close it or request the same dataset revision and open arguments (including --dat, --journal and, for NWB, --nwb-series)");
     Ok(())
 }
 

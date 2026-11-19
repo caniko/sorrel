@@ -93,8 +93,10 @@ mod imp {
 
         pub fn open_with(path: impl AsRef<Path>, params: NwbOpenParams<'_>) -> Result<Self> {
             let path = path.as_ref();
-            let f = Group::open(path)?;
-            Self::from_group(f, path, params, None)
+            #[cfg(feature = "dandi")]
+            return Self::open_pinned(path, params, None, Self::resolve_raw(params)?);
+            #[cfg(not(feature = "dandi"))]
+            Self::from_group(Group::open(path)?, path, params, None)
         }
 
         /// Open a DANDI asset or HTTPS NWB stream and return its relative local state directory.
@@ -113,13 +115,45 @@ mod imp {
             resolved: crate::dandi::Resolved,
             params: NwbOpenParams<'_>,
         ) -> Result<Self> {
-            let group = Group::open_remote(resolved.store)?;
-            Self::from_group(
-                group,
+            Self::open_pinned(
                 Path::new("remote NWB"),
                 params,
-                Some(resolved.identity),
+                Some(resolved),
+                Self::resolve_raw(params)?,
             )
+        }
+
+        #[cfg(feature = "dandi")]
+        fn resolve_raw(params: NwbOpenParams<'_>) -> Result<Option<crate::dandi::Resolved>> {
+            params
+                .raw_path
+                .filter(|path| crate::dandi::is_remote(path))
+                .map(|path| crate::dandi::resolve(path.to_str().unwrap()))
+                .transpose()
+        }
+
+        /// Open NWB using the supplied remote revisions, never resolving their locators again.
+        /// Local inputs are opened from `path` and `params.raw_path` as usual.
+        #[cfg(feature = "dandi")]
+        pub fn open_pinned(
+            path: &Path,
+            params: NwbOpenParams<'_>,
+            root: Option<crate::dandi::Resolved>,
+            raw: Option<crate::dandi::Resolved>,
+        ) -> Result<Self> {
+            ensure!(
+                root.is_some() || !crate::dandi::is_remote(path),
+                "missing resolved NWB dataset"
+            );
+            ensure!(
+                raw.is_some() == params.raw_path.is_some_and(crate::dandi::is_remote),
+                "remote NWB recording must be resolved before opening"
+            );
+            let (f, identity) = match root {
+                Some(root) => (Group::open_remote(root.store)?, Some(root.identity)),
+                None => (Group::open(path)?, None),
+            };
+            Self::from_group(f, path, params, identity, raw)
         }
 
         fn from_group(
@@ -127,6 +161,7 @@ mod imp {
             path: &Path,
             params: NwbOpenParams<'_>,
             remote_identity: Option<Vec<u8>>,
+            #[cfg(feature = "dandi")] resolved_raw: Option<crate::dandi::Resolved>,
         ) -> Result<Self> {
             let spike_times = f.stored_dataset("/units/spike_times")?;
             let spike_times_index = f.stored_dataset("/units/spike_times_index")?;
@@ -144,8 +179,7 @@ mod imp {
                 .raw_path
                 .map(|path| {
                     #[cfg(feature = "dandi")]
-                    if crate::dandi::is_remote(path) {
-                        let resolved = crate::dandi::resolve(path.to_str().unwrap())?;
+                    if let Some(resolved) = resolved_raw {
                         return Ok::<_, anyhow::Error>((
                             Group::open_remote(resolved.store)?,
                             Some(resolved.identity),
