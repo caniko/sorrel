@@ -5850,6 +5850,7 @@ dependencies = [
  "env_logger",
  "log",
  "rand 0.9.5",
+ "same-file",
  "serde",
  "serde_json",
  "sorrel-cache",

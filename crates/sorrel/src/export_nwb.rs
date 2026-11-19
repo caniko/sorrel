@@ -5,10 +5,10 @@ use anyhow::{ensure, Context, Result};
 use clap::Args;
 use sorrel_data::{nwb_export::collect_units, session::ApplyPhyLabel, Session};
 use sorrel_io::{kilosort::PhyLabel, nwb_write, DataProvider, HasGeometry};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Args, Debug)]
-#[command(group(clap::ArgGroup::new("destination").required(true).args(["out", "into", "in_place"])))]
+#[command(group(clap::ArgGroup::new("destination").required(true).args(["out", "into"])))]
 pub struct ExportNwb {
     #[command(flatten)]
     open: OpenArgs,
@@ -18,9 +18,6 @@ pub struct ExportNwb {
     /// Add /units to an existing NWB file (must not already have /units)
     #[arg(long, value_name = "FILE")]
     into: Option<PathBuf>,
-    /// Use the input NWB file as the append destination
-    #[arg(long)]
-    in_place: bool,
     /// NWB identifier; required for new files from non-NWB sources
     #[arg(long, requires = "out")]
     identifier: Option<String>,
@@ -42,6 +39,11 @@ impl ExportNwb {
             None => detect_backend(self.open.root())?,
         };
         let source = (backend == Backend::Nwb).then(|| self.open.root().to_path_buf());
+        if let Some(journal) = &self.open.journal {
+            for path in source.iter().chain(self.out.iter()).chain(self.into.iter()) {
+                reject_journal_alias(journal, path)?;
+            }
+        }
         let destination = if let Some(out) = self.out {
             let metadata = if let Some(source) = &source {
                 ensure!(self.identifier.is_none() && self.session_description.is_none() && self.session_start_time.is_none(),
@@ -59,22 +61,56 @@ impl ExportNwb {
             };
             Destination::New(out, metadata)
         } else {
-            Destination::Append(match self.into {
-                Some(path) => path,
-                None => source
-                    .clone()
-                    .context("--in-place requires an NWB source")?,
-            })
+            let into = self.into.context("expected --out or --into")?;
+            if let Some(source) = source.filter(|_| self.starting_time.is_none()) {
+                nwb_write::check_timestamp_reference(&source, &into)?;
+            }
+            Destination::Append(into)
         };
         with_session(
             &self.open,
             Export {
-                source,
                 destination,
                 starting_time: self.starting_time,
+                sample_rate: self
+                    .open
+                    .sample_rate
+                    .filter(|_| backend == Backend::Kilosort),
             },
         )
     }
+}
+
+fn reject_journal_alias(journal: &Path, nwb: &Path) -> Result<()> {
+    fn canonical(path: &Path) -> Result<(PathBuf, bool)> {
+        match path.canonicalize() {
+            Ok(path) => Ok((path, true)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling symlink isn't a new filename: opening it may create its target.
+                ensure!(!path.is_symlink(), "dangling symlink {}", path.display());
+                let name = path.file_name().context("missing file name")?;
+                let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+                Ok((
+                    parent.unwrap_or(Path::new(".")).canonicalize()?.join(name),
+                    false,
+                ))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+    let check = || -> Result<bool> {
+        let (journal, j_exists) = canonical(journal)?;
+        let (nwb, n_exists) = canonical(nwb)?;
+        Ok(journal == nwb || (j_exists && n_exists && same_file::is_same_file(journal, nwb)?))
+    };
+    ensure!(
+        !check()
+            .with_context(|| format!("checking whether --journal aliases {}", nwb.display()))?,
+        "--journal {} aliases NWB file {}",
+        journal.display(),
+        nwb.display()
+    );
+    Ok(())
 }
 
 enum Destination {
@@ -83,29 +119,24 @@ enum Destination {
 }
 
 struct Export {
-    source: Option<PathBuf>,
     destination: Destination,
     starting_time: Option<f64>,
+    sample_rate: Option<f64>,
 }
 
 impl SessionVisitor for Export {
-    fn visit<P>(self, session: Session<P>, seed: Seed<P>, _: OpenCtx<P>) -> Result<()>
+    fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
         let session = seeded(session, seed)?;
         let p = &session.provider;
-        let (rate, start) = if let Some(source) = self.source {
-            nwb_write::source_time_base(
-                &source,
-                p.n_samples().idx(),
-                p.n_channels() as usize,
-                p.sample_rate(),
-            )?
-        } else {
-            (p.exact_sample_rate()?, 0.0)
-        };
-        let units = collect_units(&session, rate, self.starting_time.unwrap_or(start))?;
+        let rate = self.sample_rate.map_or_else(|| p.exact_sample_rate(), Ok)?;
+        let units = collect_units(
+            &session,
+            rate,
+            self.starting_time.unwrap_or(ctx.nwb_start_time),
+        )?;
         let (path, result) = match self.destination {
             Destination::New(path, metadata) => {
                 let r = nwb_write::write_new(

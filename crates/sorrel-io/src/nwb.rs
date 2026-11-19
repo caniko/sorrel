@@ -208,6 +208,9 @@ mod imp {
         fn sample_rate(&self) -> f32 {
             self.rate as f32
         }
+        fn exact_sample_rate(&self) -> Result<f64> {
+            Ok(self.rate)
+        }
         fn n_channels(&self) -> u32 {
             self.n_channels
         }

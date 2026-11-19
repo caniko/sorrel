@@ -4,7 +4,7 @@
 use crate::nwb_units::{Units, Values};
 use crate::ChannelId;
 use anyhow::{ensure, Context, Result};
-use hdf5_metno::types::{VarLenAscii, VarLenUnicode};
+use hdf5_metno::types::{TypeDescriptor, VarLenAscii, VarLenUnicode};
 use hdf5_metno::{Dataset, File, Group, H5Type, Location, ObjectReference1};
 use std::fs;
 use std::path::Path;
@@ -58,40 +58,33 @@ impl Metadata {
     }
 }
 
-/// Recover double-precision timing without loading the traces a second time.
-/// ponytail: if multiple acquisition series match the reader's dimensions and
-/// f32 rate, refuse differing time bases rather than guessing which to export.
-/// Use the reader's own time axis once it exposes that metadata.
-pub fn source_time_base(
-    path: &Path,
-    n_samples: usize,
-    n_channels: usize,
-    rate: f32,
-) -> Result<(f64, f64)> {
-    let file = File::open(path)?;
-    let mut timing = None;
-    for g in file.group("acquisition")?.groups()? {
-        if !g.link_exists("electrodes")
-            || !g.link_exists("data")
-            || !g.link_exists("starting_time")
-            || g.dataset("data")?.shape() != [n_samples, n_channels]
-        {
-            continue;
-        }
-        let start = g.dataset("starting_time")?;
-        let exact = start.attr("rate")?.read_scalar::<f64>()?;
-        if exact as f32 != rate {
-            continue;
-        }
-        let candidate = (exact, start.read_scalar::<f64>()?);
-        ensure!(
-            timing.is_none_or(|other| other == candidate),
-            "ambiguous ElectricalSeries time base in {}",
-            path.display()
-        );
-        timing = Some(candidate);
+/// Require the two NWB time axes to have the same origin for implicit alignment.
+pub fn check_timestamp_reference(source: &Path, destination: &Path) -> Result<()> {
+    fn read(path: &Path) -> Result<String> {
+        let f = File::open(path)?;
+        let name = if f.link_exists("timestamps_reference_time") {
+            "timestamps_reference_time"
+        } else {
+            "session_start_time"
+        };
+        read_text(&f.dataset(name)?)
     }
-    timing.context("could not recover the source ElectricalSeries time base")
+    let reference = |path: &Path| {
+        read(path)
+            .with_context(|| format!("reading timestamps_reference_time in {}", path.display()))
+    };
+    let src = reference(source)?;
+    let dst = reference(destination)?;
+    let parse = |time: &str| {
+        time.parse::<jiff::Timestamp>()
+            .with_context(|| format!("invalid timestamps_reference_time {time:?}"))
+    };
+    ensure!(
+        parse(&src)? == parse(&dst)?,
+        "source timestamps_reference_time ({src}) differs from destination ({dst}); pass \
+         --starting-time in seconds on the destination's time axis"
+    );
+    Ok(())
 }
 
 /// Write a new NWB file. Never overwrite an existing path.
@@ -154,7 +147,11 @@ pub fn write_new(
 /// The caller must not let another process edit the destination concurrently.
 pub fn append(path: &Path, units: &Units) -> Result<()> {
     let path = fs::canonicalize(path)?;
-    let mut original = fs::File::open(&path)?;
+    let mut original = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {} for writing", path.display()))?;
     let before = original.metadata()?;
     ensure!(before.is_file(), "{} is not a regular file", path.display());
     let source = File::open(&path)?;
@@ -183,6 +180,13 @@ pub fn append(path: &Path, units: &Units) -> Result<()> {
     );
     write_units(&f, units)?;
     add_generated_by(&general, units.generated_by)?;
+    let dates = f.dataset("file_create_date")?;
+    ensure!(dates.ndim() == 1, "invalid /file_create_date shape");
+    let mut history = read_strings(&dates)?;
+    history.push(text(&jiff::Timestamp::now().to_string())?);
+    f.unlink("file_create_date")?;
+    dataset(&f, "file_create_date", &history)?;
+    drop(dates);
     drop(general);
     f.close()?;
     tmp.as_file().set_permissions(before.permissions())?;
@@ -232,10 +236,66 @@ fn text_dataset(group: &Group, name: &str, value: &str) -> Result<()> {
 }
 
 fn read_text(ds: &Dataset) -> Result<String> {
-    Ok(ds
-        .read_scalar::<VarLenUnicode>()
-        .map(|v| v.to_string())
-        .or_else(|_| ds.read_scalar::<VarLenAscii>().map(|v| v.to_string()))?)
+    ensure!(ds.ndim() == 0, "expected scalar text for {}", ds.name());
+    read_strings(ds)?
+        .pop()
+        .map(|s| s.to_string())
+        .with_context(|| format!("missing text in {}", ds.name()))
+}
+
+fn read_strings(ds: &Dataset) -> Result<Vec<VarLenUnicode>> {
+    let dtype = ds.dtype()?;
+    match dtype.to_descriptor()? {
+        TypeDescriptor::VarLenUnicode => Ok(ds.read_raw::<VarLenUnicode>()?),
+        TypeDescriptor::VarLenAscii => ds
+            .read_raw::<VarLenAscii>()?
+            .iter()
+            .map(|s| text(std::str::from_utf8(s.as_bytes())?))
+            .collect(),
+        TypeDescriptor::FixedAscii(width) | TypeDescriptor::FixedUnicode(width) => {
+            use hdf5_metno_sys::{
+                h5d::H5Dread,
+                h5p::H5P_DEFAULT,
+                h5t::{H5Tget_strpad, H5T_STR_SPACEPAD},
+            };
+            let space = ds.space()?;
+            let len = space
+                .size()
+                .checked_mul(width)
+                .context("fixed string dataset too large")?;
+            ensure!(width != 0, "invalid fixed string width");
+            let mut bytes = vec![0u8; len];
+            let space_padded = hdf5_metno::sync::sync(|| {
+                // SAFETY: the memory dataspace describes exactly `space.size()`
+                // elements of `width` bytes in `bytes`, and all HDF5 IDs are live.
+                unsafe {
+                    let status = H5Dread(
+                        ds.id(),
+                        dtype.id(),
+                        space.id(),
+                        space.id(),
+                        H5P_DEFAULT,
+                        bytes.as_mut_ptr().cast(),
+                    );
+                    ensure!(status >= 0, "reading fixed strings from {}", ds.name());
+                    Ok(H5Tget_strpad(dtype.id()) == H5T_STR_SPACEPAD)
+                }
+            })?;
+            bytes
+                .chunks_exact(width)
+                .map(|bytes| {
+                    let bytes = bytes.split(|&b| b == 0).next().unwrap_or_default();
+                    let s = std::str::from_utf8(bytes)?;
+                    text(if space_padded {
+                        s.trim_end_matches(' ')
+                    } else {
+                        s
+                    })
+                })
+                .collect()
+        }
+        _ => anyhow::bail!("{} is not a string dataset", ds.name()),
+    }
 }
 
 fn read_attr(loc: &Location, name: &str) -> Result<String> {
@@ -397,14 +457,7 @@ fn add_generated_by(g: &Group, entry: [&str; 2]) -> Result<()> {
             ds.ndim() == 2 && ds.shape()[1] == 2,
             "invalid /general/{name} shape"
         );
-        match ds.read_raw::<VarLenUnicode>() {
-            Ok(values) => values,
-            Err(_) => ds
-                .read_raw::<VarLenAscii>()?
-                .iter()
-                .map(|v| text(v.as_str()))
-                .collect::<Result<_>>()?,
-        }
+        read_strings(&ds)?
     } else {
         Vec::new()
     };
@@ -518,7 +571,7 @@ mod tests {
             &[SampleIndex(50), SampleIndex(201)]
         );
         assert_eq!(r.spike_times(ClusterId(1)), &[SampleIndex(290)]);
-        assert_eq!(source_time_base(&recording, 300, 4, 1000.)?, (1000., 0.5));
+        assert_eq!((r.exact_sample_rate()?, r.starting_time()), (1000., 0.5));
 
         let before = fs::read(&recording)?;
         assert!(append(&recording, &units)
