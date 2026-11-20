@@ -58,8 +58,6 @@
           "formatting"
           "hm-module"
           "workspace-tests"
-          "sorrel-hdf5"
-          "hdf5-tests"
           "dev-tests"
           "binstall-metadata"
           "binstall-metadata-sorrel-remote"
@@ -357,7 +355,6 @@
         inherit pkgs craneLib src deps;
       };
       inherit (rustPackages) sorrel sorrelRelay commonArgs cargoArtifacts;
-      sorrelHdf5 = rustPackages.sorrelHdf5 or null;
 
       sorrelVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
       crossSorrelPackages = harbor-rs.lib.mkCrossPackages {
@@ -368,6 +365,7 @@
           inherit src;
           version = sorrelVersion;
           strictDeps = true;
+          dontUseCmakeConfigure = true;
           inherit (deps) nativeBuildInputs;
           # sorrel-relay rides along in every archive (cargo binstall
           # sorrel-remote); crane installs every executable in the build log.
@@ -395,12 +393,13 @@
           # windres) through depsBuildBuild and the CC_/RC_/linker env.
           windows-aarch64 = {
             buildInputs = [];
-            inherit (deps) nativeBuildInputs;
+            nativeBuildInputs = deps.nativeBuildInputs ++ [pkgs.llvmPackages.lld];
             # aws-lc-sys (via libp2p-quic) compiles jitterentropy, which needs
             # winpthreads' <sched.h>; llvm-mingw's sysroot does not carry it, and nixpkgs'
             # aarch64 winpthreads does not build with clang (winver.h). The
             # headers are arch-neutral, so borrow the x64 package's.
-            CFLAGS_aarch64_pc_windows_gnullvm = "-I${cross.winpthreads}/include";
+            # CMake links compiler probes; GNU ld on the build host cannot link PE/ARM64.
+            CFLAGS_aarch64_pc_windows_gnullvm = "-I${cross.winpthreads}/include -fuse-ld=lld";
             doCheck = false;
           };
           darwin-aarch64 = {
@@ -466,7 +465,17 @@
 
       releaseSmoke = pkgs.writeShellApplication {
         name = "sorrel-release-smoke";
-        runtimeInputs = with pkgs; [coreutils diffutils file findutils gnugrep gzip gnutar unzip];
+        runtimeInputs = with pkgs;
+          [coreutils diffutils file findutils gnugrep gzip gnutar unzip]
+          ++ lib.optional (system == "x86_64-linux") qemu-user;
+        runtimeEnv =
+          {SORREL_NWB_FIXTURES = "${./release/fixtures/nwb}";}
+          // pkgs.lib.optionalAttrs (system == "x86_64-linux") (let
+            arm = pkgs.pkgsCross.aarch64-multiplatform;
+          in {
+            SORREL_ARM_LD = "${arm.glibc}/lib/ld-linux-aarch64.so.1";
+            SORREL_ARM_LIBS = pkgs.lib.makeLibraryPath [arm.glibc arm.stdenv.cc.cc.lib];
+          });
         text = ''
           exec bash ${./release/smoke.sh} "$@"
         '';
@@ -500,8 +509,9 @@
         }
         // crossSorrelPackages
         // crossSorrelPyPackages
-        // pkgs.lib.optionalAttrs (sorrelHdf5 != null) {inherit sorrelHdf5;}
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux portable
+        # Compatibility alias for configs that selected the former HDF5 build.
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {sorrelHdf5 = sorrel;}
         // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           release-bundle = import ./nix/release.nix {
             inherit pkgs harbor-rs;
@@ -536,8 +546,8 @@
 
       checks =
         (import ./nix/checks.nix {
-          inherit pkgs craneLib commonArgs cargoArtifacts sorrel sorrelHdf5 testSrc;
-          inherit (deps) runtimeLibs hdf5C;
+          inherit pkgs craneLib commonArgs cargoArtifacts sorrel testSrc;
+          inherit (deps) runtimeLibs;
           hmModule = self.homeManagerModules.default;
         })
         // {

@@ -4,9 +4,7 @@
   commonArgs,
   cargoArtifacts,
   runtimeLibs,
-  hdf5C,
   sorrel,
-  sorrelHdf5,
   testSrc,
   hmModule,
 }: let
@@ -44,6 +42,9 @@ in
   // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
     # Every workspace test, the UI snapshot states included: they rasterise
     # on the pinned Mesa lavapipe (as in the dev shell) and must not skip.
+    # hdf5 is a default feature, so this also runs the NWB and rez.mat
+    # readers against release/fixtures (a separate HDF5 check would rebuild
+    # every test binary and run the runner out of memory in flake check).
     workspace-tests = craneLib.cargoNextest (commonArgs
       // {
         inherit cargoArtifacts;
@@ -60,20 +61,6 @@ in
           export HOME=$(mktemp -d)
           export XDG_RUNTIME_DIR=$HOME
         '';
-      });
-
-    # The NWB and rez.mat readers live behind the optional `hdf5` feature:
-    # build the binary with it, and run the readers' tests against the
-    # committed PyNWB fixtures (release/fixtures/nwb).
-    sorrel-hdf5 = sorrelHdf5;
-    hdf5-tests = craneLib.cargoNextest (commonArgs
-      // {
-        inherit cargoArtifacts;
-        src = testSrc;
-        buildInputs = commonArgs.buildInputs ++ [hdf5C];
-        HDF5_DIR = "${hdf5C}";
-        # sorrel-data's other tests already run in workspace-tests.
-        cargoNextestExtraArgs = "-p sorrel-io -p sorrel-data --features sorrel-io/hdf5,sorrel-data/hdf5 --no-fail-fast -E 'package(sorrel-io) | binary(nwb_curation)'";
       });
 
     # `sorrel dev ...` (bench, learn) and the bench results DB live behind the

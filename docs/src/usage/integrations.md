@@ -133,7 +133,7 @@ auto-detect — see [Backend detection](#backend-detection)).
 ## NWB
 
 ```sh
-sorrel open my_session.nwb            # build with --features hdf5
+sorrel open my_session.nwb
 ```
 
 What Sorrel reads:
@@ -162,8 +162,8 @@ What Sorrel reads:
 
 Limitations:
 
-- HDF5 backend is opt-in (`cargo build --features hdf5`); the default
-  build and the release binaries do not link libhdf5.
+- Default builds and release binaries bundle HDF5, including gzip/deflate
+  and LZF. No system HDF5 installation is needed.
 - Trace data is loaded eagerly into RAM as float32 (NWB datasets are
   typically chunked and compressed, so there is no mmap).
 - One `ElectricalSeries`; multi-segment recordings are not modelled.
@@ -276,7 +276,7 @@ The interface does not link units to electrodes.
 ## Kilosort 4 `rez.mat`
 
 ```sh
-sorrel open rez.mat --dat path/to/recording.bin   # build with --features hdf5
+sorrel open rez.mat --dat path/to/recording.bin
 ```
 
 Reads `rez/st3` for sample/template tuples, `rez/ops/fs` and
@@ -284,8 +284,8 @@ Reads `rez/st3` for sample/template tuples, `rez/ops/fs` and
 positions, and `rez/ops/fbinary`/`fproc` for the dat path (overridable
 with `--dat`).
 
-If you'd rather not enable the `hdf5` feature, KS4 writes a phy export
-under `<output>/phy/` automatically — open that directory instead.
+The `rez.mat` reader is included by default. If you build without it,
+open the phy export that KS4 writes under `<output>/phy/` instead.
 
 ## Python (Jupyter)
 

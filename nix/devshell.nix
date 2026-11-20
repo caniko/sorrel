@@ -10,20 +10,13 @@
   preCommitEnabledPackages ? [],
   shellHook ? "",
 }: let
-  inherit (deps) buildInputs runtimeLibs hdf5C;
-  hdf5Packages = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.hdf5];
+  inherit (deps) buildInputs runtimeLibs;
   # Pinned software Vulkan for the headless UI snapshot tests, so atlas and
   # GPU-less CI runners rasterise identically. Only a path: the GUI keeps
   # using the host driver.
   lavapipeEnv = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
     SORREL_LAVAPIPE_ICD = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.uname.processor}.json";
   };
-  hdf5Env =
-    if pkgs.stdenv.hostPlatform.isLinux
-    then {
-      HDF5_DIR = "${hdf5C}";
-    }
-    else {};
 in
   (harbor-rs.lib.mkDevShells {
     inherit pkgs cross cargoConfig craneLib checks;
@@ -32,6 +25,7 @@ in
     packages = with pkgs;
       [
         cargo-nextest
+        cmake
         imagemagick
         mdbook
         pre-commit
@@ -40,7 +34,6 @@ in
         xorg.xorgserver
       ]
       ++ [plinthProject]
-      ++ hdf5Packages
       ++ preCommitEnabledPackages
       ++ buildInputs;
 
@@ -51,7 +44,7 @@ in
         # which lives in winpthreads rather than the MinGW compiler's headers.
         CFLAGS_x86_64_pc_windows_gnu = "-I${cross.winpthreads}/include";
       }
-      // hdf5Env // lavapipeEnv;
+      // lavapipeEnv;
 
     extraShellHook = ''
       ${shellHook}
@@ -75,10 +68,9 @@ in
           mdbook
           pre-commit
         ]
-        ++ hdf5Packages
         ++ preCommitEnabledPackages
         ++ buildInputs;
-      extraEnv = {LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;} // hdf5Env;
+      extraEnv.LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
       extraShellHook = ''
         ${shellHook}
         echo "Documentation: mdbook serve docs"
