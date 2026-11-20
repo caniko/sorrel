@@ -454,6 +454,42 @@ fn paired_locators_share_implicit_release_and_identical_store() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn dandiset_asset_paths_reject_invalid_escapes_and_separators() {
+    for path in [
+        "test/%",
+        "test/%GG",
+        "test/%FF",
+        "test/%2Fraw.nwb",
+        "test%2fraw.nwb",
+        "test/%5craw.nwb",
+        "test/%2e%2e/raw.nwb",
+    ] {
+        let error = state_path(&format!("dandi://dandi/000123@draft/{path}")).expect_err(path);
+        assert!(error.to_string().contains("asset path"), "{error}");
+    }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn encoded_and_plain_draft_paths_share_one_pinned_store() -> Result<()> {
+    let (server, _) = remote_fixture("good.nwb", true);
+    let api = server.api(Duration::from_secs(2));
+    let plain = "dandi://dandi/000123/test/good.nwb";
+    let encoded = "dandi://dandi/000123@draft/test/%67ood.nwb";
+    for alias in [encoded, plain] {
+        let [a, b] = api
+            .resolve_pair(Some(plain), Some(alias))?
+            .map(Option::unwrap);
+        assert_eq!(a.state_path(), b.state_path());
+        let (Store::Blob(a), Store::Blob(b)) = (a.store, b.store) else {
+            panic!("expected pinned blobs");
+        };
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+    Ok(())
+}
+
 fn objects(path: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(root: &Path, path: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
         for entry in fs::read_dir(path).unwrap() {

@@ -56,7 +56,7 @@ pub fn resolve(input: &str) -> Result<Resolved> {
 }
 
 /// Resolve remote sorting and recording locators in one request. Local inputs are `None`.
-/// Versionless locators share one version lookup per Dandiset; identical locators share a store.
+/// Versionless locators share one version lookup per Dandiset; equivalent locators share a store.
 pub fn resolve_pair(root: Option<&str>, dat: Option<&str>) -> Result<[Option<Resolved>; 2]> {
     if root.is_none() && dat.is_none() {
         return Ok([None, None]);
@@ -136,10 +136,33 @@ pub(super) fn hash_field(hash: &mut blake3::Hasher, field: &str) {
     hash.update(field.as_bytes());
 }
 
+#[derive(PartialEq, Eq)]
 struct Locator<'a> {
     id: &'a str,
     version: String,
     path: std::borrow::Cow<'a, str>,
+}
+
+fn decode_asset_path(encoded: &str) -> Result<std::borrow::Cow<'_, str>> {
+    let bytes = encoded.as_bytes();
+    ensure!(
+        bytes.iter().enumerate().all(|(i, &b)| b != b'%'
+            || bytes
+                .get(i + 1..i + 3)
+                .is_some_and(|digits| digits.iter().all(u8::is_ascii_hexdigit))),
+        "invalid percent escape in DANDI asset path"
+    );
+    let path = percent_decode_str(encoded)
+        .decode_utf8()
+        .context("DANDI asset path is not UTF-8")?;
+    ensure!(
+        path.split('/').count() == encoded.split('/').count()
+            && path.split('/').all(|p| !matches!(p, "" | "." | ".."))
+            && !path.contains('\\')
+            && !path.chars().any(char::is_control),
+        "invalid or ambiguous DANDI asset path"
+    );
+    Ok(path)
 }
 
 impl Locator<'_> {
@@ -191,14 +214,7 @@ impl Api {
             id.len() == 6 && id.bytes().all(|b| b.is_ascii_digit()),
             "expected a six-digit Dandiset ID"
         );
-        let path = percent_decode_str(encoded_path)
-            .decode_utf8()
-            .context("asset path is not UTF-8")?;
-        ensure!(
-            path.split('/').all(|p| !matches!(p, "" | "." | ".."))
-                && !path.chars().any(char::is_control),
-            "invalid DANDI asset path"
-        );
+        let path = decode_asset_path(encoded_path)?;
         let version = if let Some(version) = version {
             component(version)?.to_owned()
         } else if let Some(version) = versions.get(id) {
@@ -217,7 +233,7 @@ impl Api {
     }
 
     fn resolve(&self, input: &str) -> Result<Resolved> {
-        self.resolve_with_versions(input, &mut HashMap::new())
+        self.resolve_input(input, self.dandiset_locator(input, &mut HashMap::new())?)
     }
 
     fn resolve_pair<'a>(
@@ -226,29 +242,33 @@ impl Api {
         dat: Option<&'a str>,
     ) -> Result<[Option<Resolved>; 2]> {
         let mut versions = HashMap::new();
-        let mut resolve = |input: Option<&'a str>| {
+        let mut locator = |input: Option<&'a str>| {
             input
-                .map(|input| self.resolve_with_versions(input, &mut versions))
+                .map(|input| self.dandiset_locator(input, &mut versions))
                 .transpose()
+                .map(Option::flatten)
         };
-        let sorting = resolve(root).context("resolve remote dataset")?;
-        let recording = if root == dat {
+        let sorting_locator = locator(root).context("resolve remote dataset")?;
+        let recording_locator = locator(dat).context("resolve remote --dat")?;
+        let same =
+            root == dat || (sorting_locator.is_some() && sorting_locator == recording_locator);
+        let sorting = root
+            .map(|input| self.resolve_input(input, sorting_locator))
+            .transpose()
+            .context("resolve remote dataset")?;
+        let recording = if same {
             sorting.clone()
         } else {
-            resolve(dat).context("resolve remote --dat")?
+            dat.map(|input| self.resolve_input(input, recording_locator))
+                .transpose()
+                .context("resolve remote --dat")?
         };
         Ok([sorting, recording])
     }
 
-    fn resolve_with_versions<'a>(
-        &self,
-        input: &'a str,
-        versions: &mut HashMap<&'a str, String>,
-    ) -> Result<Resolved> {
-        if let Some(locator) = self.dandiset_locator(input, versions)? {
-            let Locator {
-                id, version, path, ..
-            } = &locator;
+    fn resolve_input(&self, input: &str, locator: Option<Locator<'_>>) -> Result<Resolved> {
+        if let Some(locator) = locator {
+            let Locator { id, version, path } = &locator;
             let mut list = self.endpoint(&format!("dandisets/{id}/versions/{version}/assets/"));
             list.query_pairs_mut()
                 .append_pair("path", path)
