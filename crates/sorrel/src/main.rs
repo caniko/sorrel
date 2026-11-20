@@ -1697,7 +1697,15 @@ fn session_path(path: &Path) -> PathBuf {
     } else {
         path
     };
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    if let Ok(path) = path.canonicalize() {
+        return path;
+    }
+    // A file the host creates later (a journal) must key the same before and
+    // after it exists: canonicalize its nearest existing ancestor instead.
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => session_path(parent).join(name),
+        _ => path.to_path_buf(),
+    }
 }
 
 /// Only local requests may attach to a running session. Remote and mixed
@@ -3211,6 +3219,19 @@ mod tests {
             "removed flag"
         );
         assert!(parse(&["clear-cache", "/x"]).is_ok());
+    }
+
+    /// A host keys its journal before creating it; `call` keys it after.
+    /// (On Windows every canonical path differs: it gains a `\\?\` prefix.)
+    #[cfg(unix)]
+    #[test]
+    fn session_path_is_stable_when_the_file_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("link")).unwrap();
+        let journal = dir.path().join("link/first.journal");
+        let before = session_path(&journal);
+        std::fs::write(&journal, b"").unwrap();
+        assert_eq!(before, session_path(&journal));
     }
 
     #[test]
