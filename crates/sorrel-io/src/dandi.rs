@@ -337,11 +337,11 @@ impl Api {
             Some(DownloadAsset {
                 location: Some((id, "draft")),
                 asset_id,
-            }) => Some(DraftInput::Download(
-                url,
-                component(id)?.to_owned(),
-                component(asset_id)?.to_owned(),
-            )),
+            }) => {
+                let id = component(id)?.to_owned();
+                let asset_id = component(asset_id)?.to_owned();
+                Some(DraftInput::Download(url, id, asset_id))
+            }
             _ => None,
         })
     }
