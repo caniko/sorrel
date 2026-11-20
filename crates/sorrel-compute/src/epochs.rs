@@ -109,34 +109,51 @@ fn biweight_min(events: &[Event], points: usize) -> f64 {
 }
 
 /// Where a bin's count enters (`enter`) or leaves the inlier set of the
-/// bounded Poisson deviance as the segment mean count μ increases.
+/// bounded Poisson deviance as the segment mean count μ increases, with
+/// `ln μ` and `c ln c` precomputed because the sweep runs per segment.
 #[derive(Clone, Copy)]
 struct CountEvent {
     at: f64,
+    ln_at: f64,
     c: f64,
+    clc: f64,
     enter: bool,
 }
 
-/// The μ interval on which a count's Poisson deviance
-/// `2 [c ln(c/μ) - c + μ]` is below `cap`. It is convex in ln μ with its
-/// minimum 0 at μ = c, so each side has one root, found by bisection.
-fn deviance_interval(c: f64, cap: f64) -> (f64, f64) {
+/// A bin's count and the `(μ, ln μ)` ends of the interval on which its
+/// Poisson deviance `2 [c ln(c/μ) - c + μ]` is below `cap`. The deviance is
+/// convex in ln μ with its minimum 0 at μ = c, so each side has one root,
+/// found by bisection in ln μ.
+#[derive(Clone, Copy)]
+struct RateBin {
+    c: f64,
+    lo: (f64, f64),
+    hi: (f64, f64),
+}
+
+fn rate_bin(c: f64, cap: f64) -> RateBin {
     let t = cap / 2.0;
     if c == 0.0 {
-        return (0.0, t);
+        return RateBin {
+            c,
+            lo: (0.0, f64::NEG_INFINITY),
+            hi: (t, t.ln()),
+        };
     }
     let f = |x: f64| c * c.ln() - c * x - c + x.exp() - t;
     let root = |mut a: f64, mut b: f64| {
         let positive_at_a = f(a) > 0.0;
-        for _ in 0..200 {
+        loop {
             let mid = a.midpoint(b);
+            if mid == a || mid == b {
+                return mid;
+            }
             if (f(mid) > 0.0) == positive_at_a {
                 a = mid;
             } else {
                 b = mid;
             }
         }
-        a.midpoint(b)
     };
     let x0 = c.ln();
     let bracket = |sign: f64| {
@@ -146,13 +163,28 @@ fn deviance_interval(c: f64, cap: f64) -> (f64, f64) {
         }
         x0 + sign * s
     };
-    (root(bracket(-1.0), x0).exp(), root(x0, bracket(1.0)).exp())
+    let (lo, hi) = (root(bracket(-1.0), x0), root(x0, bracket(1.0)));
+    RateBin {
+        c,
+        lo: (lo.exp(), lo),
+        hi: (hi.exp(), hi),
+    }
 }
 
-fn insert_count(events: &mut Vec<CountEvent>, c: f64, (lo, hi): (f64, f64)) {
-    for (at, enter) in [(lo, true), (hi, false)] {
+fn insert_count(events: &mut Vec<CountEvent>, bin: &RateBin) {
+    let clc = if bin.c > 0.0 { bin.c * bin.c.ln() } else { 0.0 };
+    for ((at, ln_at), enter) in [(bin.lo, true), (bin.hi, false)] {
         let i = events.partition_point(|x| x.at <= at);
-        events.insert(i, CountEvent { at, c, enter });
+        events.insert(
+            i,
+            CountEvent {
+                at,
+                ln_at,
+                c: bin.c,
+                clc,
+                enter,
+            },
+        );
     }
 }
 
@@ -163,22 +195,30 @@ fn poisson_min(events: &[CountEvent], points: usize, phi: f64) -> f64 {
     let mut best = K2 * points as f64;
     let (mut m, mut s, mut slc) = (0_usize, 0.0, 0.0);
     for (k, e) in events.iter().enumerate() {
-        let clc = if e.c > 0.0 { e.c * e.c.ln() } else { 0.0 };
         if e.enter {
-            (m, s, slc) = (m + 1, s + e.c, slc + clc);
+            (m, s, slc) = (m + 1, s + e.c, slc + e.clc);
         } else {
-            (m, s, slc) = (m - 1, s - e.c, slc - clc);
+            (m, s, slc) = (m - 1, s - e.c, slc - e.clc);
             if m == 0 {
                 (s, slc) = (0.0, 0.0);
             }
         }
         if m > 0 {
-            let end = events.get(k + 1).map_or(e.at, |next| next.at);
-            let mu = (s / m as f64).clamp(e.at, end);
-            let half = if s > 0.0 {
-                slc - s * mu.ln() - s + m as f64 * mu
+            let (end, ln_end) = events
+                .get(k + 1)
+                .map_or((e.at, e.ln_at), |n| (n.at, n.ln_at));
+            let mean = s / m as f64;
+            let half = if s == 0.0 {
+                m as f64 * e.at
             } else {
-                m as f64 * mu
+                let (mu, ln_mu) = if mean < e.at {
+                    (e.at, e.ln_at)
+                } else if mean > end {
+                    (end, ln_end)
+                } else {
+                    (mean, mean.ln())
+                };
+                slc - s * ln_mu - s + m as f64 * mu
             };
             best = best.min(2.0 * half.max(0.0) / phi + K2 * (points - m) as f64);
         }
@@ -296,10 +336,7 @@ pub fn stable_epochs(
     // strong evidence of firing, which a Gaussian on the transform misses.
     let sigma_rate = noise_scale(&anscombe.map(|y| (y, 1.0)), false).max(1.0);
     let phi = sigma_rate * sigma_rate;
-    let rate: [(f64, (f64, f64)); BINS] = std::array::from_fn(|b| {
-        let c = f64::from(counts[b]);
-        (c, deviance_interval(c, K2 * phi))
-    });
+    let rate = counts.map(|c| rate_bin(f64::from(c), K2 * phi));
     let nonempty: Vec<_> = (0..BINS)
         .filter(|&b| counts[b] > 0)
         .map(|b| (sums[b] / f64::from(counts[b]), f64::from(counts[b])))
@@ -341,7 +378,7 @@ pub fn stable_epochs(
         let (mut rate_events, mut amp_events) = (Vec::new(), Vec::new());
         let mut amp_bins = 0;
         for end in start + 1..=BINS {
-            insert_count(&mut rate_events, rate[end - 1].0, rate[end - 1].1);
+            insert_count(&mut rate_events, &rate[end - 1]);
             if let Some(p) = amp[end - 1] {
                 insert(&mut amp_events, p);
                 amp_bins += 1;
@@ -474,7 +511,7 @@ mod tests {
                     .collect();
                 let mut events = Vec::new();
                 for &c in &counts {
-                    insert_count(&mut events, c, deviance_interval(c, K2 * phi));
+                    insert_count(&mut events, &rate_bin(c, K2 * phi));
                 }
                 let deviance = |c: f64, mu: f64| {
                     2.0 * (if c > 0.0 { c * (c / mu).ln() } else { 0.0 } - c + mu)
