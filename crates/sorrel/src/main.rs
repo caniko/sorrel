@@ -966,7 +966,7 @@ fn run_join(
     // the window closes).
     let session = joined.session;
     let mut once = Some(move |rs: Option<&RenderState>| {
-        let app = build_tab(session, Box::new(|_| Ok(())), ctx, None, rs, None);
+        let app = build_tab(session, Box::new(|_| Ok(())), ctx, None, rs, None, None);
         Opened::Tab(Box::new(app) as Box<dyn Tab>, root)
     });
     let opener: Opener = Box::new(move |_, _, rs| {
@@ -1055,6 +1055,7 @@ impl SessionVisitor for TabBuilder<'_> {
             events,
             self.rs,
             self.session_key,
+            remote_registry_key(self.open)?,
         )));
         Ok(())
     }
@@ -1734,6 +1735,28 @@ fn session_key(open: &OpenArgs) -> Result<Option<String>> {
     Ok(Some(format!("open-args-v1:{args:?}")))
 }
 
+/// A remote host can share its save directory with other sessions. Hash the
+/// full request (including meaningful URL queries) without recording it.
+#[cfg(feature = "dandi")]
+fn remote_registry_key(open: &OpenArgs) -> Result<Option<String>> {
+    if !open.has_remote_input() {
+        return Ok(None);
+    }
+    let mut args = open.clone();
+    args.rebase(&std::env::current_dir()?);
+    args.discard_journal = false;
+    Ok(Some(
+        blake3::hash(format!("{args:?}").as_bytes())
+            .to_hex()
+            .to_string(),
+    ))
+}
+
+#[cfg(not(feature = "dandi"))]
+fn remote_registry_key(_: &OpenArgs) -> Result<Option<String>> {
+    Ok(None)
+}
+
 /// `sorrel mcp`: bridge stdio to a running host, else serve in-process.
 fn run_mcp(open: &OpenArgs) -> Result<()> {
     if let Some(key) = session_key(open)? {
@@ -1783,6 +1806,7 @@ impl SessionVisitor for Headless<'_> {
             phy_label_str,
             None,
             self.1.as_deref(),
+            remote_registry_key(self.0)?.as_deref(),
         )?;
         println!(
             "sorrel host on 127.0.0.1:{}; connect an agent with `{command}`; Ctrl-C stops",
@@ -1945,6 +1969,7 @@ fn build_tab<P>(
     events: Option<Events>,
     rs: Option<&RenderState>,
     session_key: Option<String>,
+    registry_key: Option<String>,
 ) -> SorrelApp<P>
 where
     P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
@@ -1953,6 +1978,9 @@ where
     let mut app = SorrelApp::with_loader(session, phy_label_str, seed);
     if let Some(key) = session_key {
         app.set_session_key(key);
+    }
+    if let Some(key) = registry_key {
+        app.set_mcp_registry_key(key);
     }
     #[cfg(feature = "phy-export")]
     {
@@ -2304,34 +2332,37 @@ fn run_gui(open: &OpenArgs, standalone: bool) -> Result<()> {
     run_shell(tab_opener(), first, !standalone)
 }
 
-/// The dataset `sorrel mcp` (no DATA_DIR) serves: the GUI's active tab, else
-/// the only live host.
-fn mcp_target() -> Result<PathBuf> {
-    // A hung GUI is skipped: the host registry may still name its datasets.
-    let gui = sorrel_data::send_instance(&InstanceRequest::List)
-        .ok()
-        .flatten();
+/// The host `sorrel mcp` (no DATA_DIR) serves: the GUI's active tab, else
+/// the only live host. A save directory alone may name several remote hosts.
+fn mcp_target(
+    gui: Option<&serde_json::Value>,
+    hosts: impl FnOnce() -> Vec<sorrel_data::serve::HostRecord>,
+) -> Result<(PathBuf, Option<String>)> {
     let active = gui
-        .as_ref()
         .and_then(|v| v["tabs"].as_array())
-        .and_then(|t| t.iter().find(|t| t["active"] == true))
-        .and_then(|t| t["dataset"].as_str());
-    if let Some(d) = active {
-        return Ok(d.into());
+        .and_then(|t| t.iter().find(|t| t["active"] == true));
+    if let Some((tab, dir)) = active.and_then(|t| Some((t, t["dataset"].as_str()?))) {
+        return Ok((
+            dir.into(),
+            tab["mcp_registry_key"].as_str().map(str::to_owned),
+        ));
     }
-    let mut alive: Vec<_> = sorrel_data::list_hosts()
-        .into_iter()
-        .filter(|h| h.alive)
-        .collect();
-    match alive.len() {
-        0 => bail!("no running sorrel host; pass DATA_DIR"),
-        1 => Ok(alive.remove(0).dataset),
+    let alive: Vec<_> = hosts().into_iter().filter(|h| h.alive).collect();
+    match alive.as_slice() {
+        [] => bail!("no running sorrel host; pass DATA_DIR"),
+        [host] => Ok((host.dataset.clone(), host.registry_key.clone())),
         _ => bail!(
-            "several sorrel hosts are running; pass the dataset path and its open options. \
-             Host save directories:\n{}",
+            "several sorrel hosts are running; select a GUI tab, stop the other hosts, \
+             or pass DATA_DIR and its open options for a local session. Hosts:\n{}",
             alive
                 .iter()
-                .map(|h| format!("  {} ({}, pid {})", h.dataset.display(), h.kind, h.pid))
+                .map(|h| format!(
+                    "  {} ({}, pid {}, port {})",
+                    h.dataset.display(),
+                    h.kind,
+                    h.pid,
+                    h.port
+                ))
                 .collect::<Vec<_>>()
                 .join("\n")
         ),
@@ -2340,8 +2371,17 @@ fn mcp_target() -> Result<PathBuf> {
 
 /// `sorrel mcp` without DATA_DIR: bridge stdio to the target's host.
 fn run_mcp_active() -> Result<()> {
-    let dir = mcp_target()?;
-    if !sorrel_data::attach(&dir, std::io::stdin(), std::io::stdout())? {
+    // A hung GUI is skipped: its hosts may still appear in the registry.
+    let gui = sorrel_data::send_instance(&InstanceRequest::List)
+        .ok()
+        .flatten();
+    let (dir, key) = mcp_target(gui.as_ref(), sorrel_data::list_hosts)?;
+    if !sorrel_data::serve::attach_registered(
+        &dir,
+        key.as_deref(),
+        std::io::stdin(),
+        std::io::stdout(),
+    )? {
         bail!("the sorrel host for {} is not reachable", dir.display());
     }
     Ok(())
@@ -3198,6 +3238,52 @@ mod tests {
             session_host_dir(&open)?,
             dandi_data_dir()?.join("000123/draft").join(hash.as_str())
         );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "dandi")]
+    fn bare_mcp_distinguishes_remote_sessions_with_the_same_sorting() -> Result<()> {
+        let mut open = OpenArgs {
+            root: Some("dandi://dandi/000123@draft/sorting.nwb".into()),
+            dat: Some("https://example.org/first.nwb?signature=secret".into()),
+            ..Default::default()
+        };
+        let first = remote_registry_key(&open)?.unwrap();
+        assert!(!first.contains("signature="));
+        open.dat = Some("https://example.org/second.nwb?signature=secret".into());
+        let second = remote_registry_key(&open)?.unwrap();
+        assert_ne!(first, second);
+        open.events = Some("events.csv".into());
+        assert_ne!(
+            remote_registry_key(&open)?.as_deref(),
+            Some(second.as_str())
+        );
+
+        let dataset = PathBuf::from("save-dir");
+        let host = |port, key: &str| sorrel_data::serve::HostRecord {
+            dataset: dataset.clone(),
+            registry_key: Some(key.to_owned()),
+            port,
+            pid: 123,
+            kind: "headless".into(),
+            alive: true,
+        };
+        assert_eq!(
+            mcp_target(None, || vec![host(101, &first)])?,
+            (dataset.clone(), Some(first.clone()))
+        );
+        let both = || vec![host(101, &first), host(102, &second)];
+        let err = mcp_target(None, both).unwrap_err().to_string();
+        assert!(
+            err.contains("port 101") && err.contains("port 102"),
+            "{err}"
+        );
+        let gui = serde_json::json!({"tabs": [
+            {"active": false, "dataset": dataset, "mcp_registry_key": first},
+            {"active": true, "dataset": dataset, "mcp_registry_key": second},
+        ]});
+        assert_eq!(mcp_target(Some(&gui), both)?, (dataset, Some(second)));
         Ok(())
     }
 

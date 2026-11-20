@@ -14,10 +14,11 @@ sorrel mcp [<DATA_DIR>]              # the command an agent launches
 
 `sorrel mcp` speaks MCP (JSON-RPC 2.0, one object per line) on stdio. Without
 `<DATA_DIR>` it attaches to the GUI's active tab, or else to the only running
-host; if there are several, it errors and lists them. With `<DATA_DIR>` it
-connects to the host on that directory (the GUI or `run --headless`) when one
-is running. Otherwise it opens the dataset itself and serves it until stdin
-closes. `sorrel serve` is gone; use `sorrel mcp`.
+host; if there are several, it errors and lists them, even if they share a
+save directory. With a local `<DATA_DIR>` it connects to the matching host
+(the GUI or `run --headless`) when one is running. Otherwise, or when any
+input is remote, it opens the dataset itself and serves it until stdin closes.
+`sorrel serve` is gone; use `sorrel mcp`.
 
 `sorrel mcp config --client claude` prints the registration line for Claude
 Code, `--client codex` a Codex TOML block, and `--client json` an `mcpServers`

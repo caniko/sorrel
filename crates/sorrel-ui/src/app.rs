@@ -185,6 +185,7 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     /// when the user triggers a save. Cmd/Ctrl-S is a no-op when unset.
     save_dir: Option<PathBuf>,
     session_key: Option<String>,
+    mcp_registry_key: Option<String>,
     /// See [`SorrelApp::set_save_dir`].
     reseal_on_save: bool,
     /// Preferences read from the dataset, applied once loading completes.
@@ -373,6 +374,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             error: None,
             save_dir: None,
             session_key: None,
+            mcp_registry_key: None,
             reseal_on_save: false,
             pending_prefs: None,
             status: None,
@@ -531,6 +533,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         self.session_key = Some(key);
     }
 
+    pub fn set_mcp_registry_key(&mut self, key: String) {
+        self.mcp_registry_key = Some(key);
+    }
+
     /// Serve this window's session to MCP clients (`sorrel mcp` with matching open arguments
     /// attaches): a loopback listener next to the save directory, whose
     /// `select` moves this selection. Needs `set_save_dir` first.
@@ -562,6 +568,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             self.label_str,
             Some(Arc::new(ui)),
             self.session_key.as_deref(),
+            self.mcp_registry_key.as_deref(),
         )?;
         self.mcp = Some(McpLink {
             _listener: listener,
@@ -2736,6 +2743,9 @@ impl<P: DataProvider + ApplyPhyLabel> crate::shell::Tab for SorrelApp<P> {
     }
     fn session_key(&self) -> Option<&str> {
         self.session_key.as_deref()
+    }
+    fn mcp_registry_key(&self) -> Option<&str> {
+        self.mcp_registry_key.as_deref()
     }
     fn dirty(&self) -> bool {
         Self::dirty(self)

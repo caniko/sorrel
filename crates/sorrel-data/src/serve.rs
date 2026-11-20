@@ -1699,24 +1699,29 @@ fn canonical(save_dir: &Path) -> PathBuf {
 /// Where the listener file for `save_dir` lives; `attach` and the listener
 /// both go through here: `<user_dir>/mcp/<hash>.json`, named by a hash of the
 /// canonical dataset path (lowercased on Windows, where paths are
-/// case-insensitive). Off the dataset directory so another account that can
+/// case-insensitive) and, for remote inputs, the request digest. Off the
+/// dataset directory so another account that can
 /// read the dataset cannot read the token, and so [`list_hosts`] finds every
 /// running host in one place.
-fn mcp_json_path(save_dir: &Path) -> std::io::Result<PathBuf> {
+fn mcp_json_path(save_dir: &Path, registry_key: Option<&str>) -> std::io::Result<PathBuf> {
     let canon = canonical(save_dir).to_string_lossy().into_owned();
     let canon = if cfg!(windows) {
         canon.to_lowercase()
     } else {
         canon
     };
-    let key = blake3::hash(canon.as_bytes());
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(canon.as_bytes());
+    if let Some(key) = registry_key {
+        hasher.update(b"\0").update(key.as_bytes());
+    }
+    let key = hasher.finalize();
     Ok(user_dir()?
         .join("mcp")
         .join(format!("{}.json", &key.to_hex()[..32])))
 }
 
-/// `{port, token, pid, nonce, dataset, kind}` (see [`mcp_json_path`]).
-/// `kind` is `"gui"` or `"headless"`.
+/// Write the listener's endpoint and selection keys (see [`mcp_json_path`]).
 fn write_mcp_json(
     save_dir: &Path,
     port: u16,
@@ -1724,14 +1729,16 @@ fn write_mcp_json(
     nonce: &str,
     kind: &str,
     session_key: Option<&str>,
+    registry_key: Option<&str>,
 ) -> std::io::Result<PathBuf> {
-    let path = mcp_json_path(save_dir)?;
+    let path = mcp_json_path(save_dir, registry_key)?;
     // Not `mcp_json_path`'s hash key: that stays on the verbatim form.
     let dataset = sorrel_io::fsutil::display_path(&canonical(save_dir)).to_string();
     write_private_json(
         &path,
         &json!({"port": port, "token": token, "pid": std::process::id(), "nonce": nonce,
-                "dataset": dataset, "kind": kind, "session_key": session_key}),
+                "dataset": dataset, "kind": kind, "session_key": session_key,
+                "registry_key": registry_key}),
     )?;
     Ok(path)
 }
@@ -1822,10 +1829,11 @@ where
     P: DataProvider + ApplyPhyLabel + HasGeometry + 'static,
     Session<P>: Send + Sync,
 {
-    spawn_listener_for_session(host, save_dir, reseal_on_save, label_str, ui, None)
+    spawn_listener_for_session(host, save_dir, reseal_on_save, label_str, ui, None, None)
 }
 
-/// Like [`spawn_listener`], with an open-request identity for explicit CLI attaches.
+/// Like [`spawn_listener`], with an identity for explicit local attaches or a
+/// request digest to disambiguate remote hosts in the same directory.
 pub fn spawn_listener_for_session<P>(
     host: Arc<SessionHost<P>>,
     save_dir: &Path,
@@ -1833,6 +1841,7 @@ pub fn spawn_listener_for_session<P>(
     label_str: fn(&P::Label) -> &'static str,
     ui: Option<Arc<Ui>>,
     session_key: Option<&str>,
+    registry_key: Option<&str>,
 ) -> std::io::Result<ListenerHandle>
 where
     P: DataProvider + ApplyPhyLabel + HasGeometry + 'static,
@@ -1843,7 +1852,15 @@ where
     let token = random_token();
     let nonce = random_token();
     let kind = if ui.is_some() { "gui" } else { "headless" };
-    let mcp_json = write_mcp_json(save_dir, port, &token, &nonce, kind, session_key)?;
+    let mcp_json = write_mcp_json(
+        save_dir,
+        port,
+        &token,
+        &nonce,
+        kind,
+        session_key,
+        registry_key,
+    )?;
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = ListenerHandle {
         port,
@@ -1940,13 +1957,16 @@ fn read_endpoint(path: &Path) -> Option<(u16, String, Option<String>)> {
 
 /// `{port, token}` of a running host's listener in `save_dir`, if any.
 pub fn read_mcp_json(save_dir: &Path) -> Option<(u16, String)> {
-    read_port_token(&mcp_json_path(save_dir).ok()?)
+    read_port_token(&mcp_json_path(save_dir, None).ok()?)
 }
 
 /// A running host found in the registry.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HostRecord {
     pub dataset: PathBuf,
+    /// Distinguishes remote hosts that share a save directory.
+    #[serde(skip)]
+    pub registry_key: Option<String>,
     pub port: u16,
     pub pid: u32,
     /// `"gui"` or `"headless"`.
@@ -1981,6 +2001,7 @@ fn list_hosts_in(dir: &Path) -> Vec<HostRecord> {
                 // Older listener files may still hold a `\\?\` path.
                 dataset: sorrel_io::fsutil::simplified(Path::new(v["dataset"].as_str()?))
                     .to_path_buf(),
+                registry_key: v["registry_key"].as_str().map(str::to_owned),
                 port,
                 pid: u32::try_from(v["pid"].as_u64()?).ok()?,
                 kind: v["kind"].as_str()?.to_owned(),
@@ -2050,10 +2071,32 @@ pub fn attach_for_session(
     session_key: Option<&str>,
     discard_journal: bool,
     input: impl Read + Send + 'static,
+    output: impl Write,
+) -> Result<bool> {
+    attach_at(save_dir, None, session_key, discard_journal, input, output)
+}
+
+/// Bridge to the exact registry entry chosen by bare `sorrel mcp`.
+pub fn attach_registered(
+    save_dir: &Path,
+    registry_key: Option<&str>,
+    input: impl Read + Send + 'static,
+    output: impl Write,
+) -> Result<bool> {
+    attach_at(save_dir, registry_key, None, false, input, output)
+}
+
+fn attach_at(
+    save_dir: &Path,
+    registry_key: Option<&str>,
+    session_key: Option<&str>,
+    discard_journal: bool,
+    input: impl Read + Send + 'static,
     mut output: impl Write,
 ) -> Result<bool> {
-    let Some((port, token, running_key)) =
-        mcp_json_path(save_dir).ok().and_then(|p| read_endpoint(&p))
+    let Some((port, token, running_key)) = mcp_json_path(save_dir, registry_key)
+        .ok()
+        .and_then(|p| read_endpoint(&p))
     else {
         return Ok(false);
     };
@@ -2870,10 +2913,10 @@ mod tests {
     fn token_file_path_is_shared_by_writer_and_reader() {
         let _u = scoped_user_dir();
         let dir = tempfile::tempdir().unwrap();
-        let path = mcp_json_path(dir.path()).unwrap();
-        assert_eq!(path, mcp_json_path(dir.path()).unwrap());
+        let path = mcp_json_path(dir.path(), None).unwrap();
+        assert_eq!(path, mcp_json_path(dir.path(), None).unwrap());
         assert_eq!(
-            write_mcp_json(dir.path(), 1, "t", "n", "gui", None).unwrap(),
+            write_mcp_json(dir.path(), 1, "t", "n", "gui", None, None).unwrap(),
             path
         );
         assert_eq!(read_mcp_json(dir.path()), Some((1, "t".to_owned())));
@@ -2886,7 +2929,7 @@ mod tests {
     fn token_file_is_outside_the_dataset_and_lists_as_a_host() {
         let user = scoped_user_dir();
         let dir = tempfile::tempdir().unwrap();
-        let path = write_mcp_json(dir.path(), 1, "t", "n", "gui", None).unwrap();
+        let path = write_mcp_json(dir.path(), 1, "t", "n", "gui", None, None).unwrap();
         assert!(path.starts_with(user.path()) && !path.starts_with(dir.path()));
         let hosts = list_hosts();
         assert_eq!(hosts.len(), 1);
@@ -2895,6 +2938,36 @@ mod tests {
             sorrel_io::fsutil::simplified(&dir.path().canonicalize().unwrap())
         );
         assert_eq!((hosts[0].kind.as_str(), hosts[0].port), ("gui", 1));
+    }
+
+    #[test]
+    fn mcp_remote_registrations_in_one_save_dir_do_not_overwrite() {
+        let _u = scoped_user_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let host = Arc::new(SessionHost::new(mock_session(dir.path())));
+        let start = |key| {
+            spawn_listener_for_session(
+                host.clone(),
+                dir.path(),
+                false,
+                label,
+                None,
+                None,
+                Some(key),
+            )
+            .unwrap()
+        };
+        let (a, b) = (start("inputs-a"), start("inputs-b"));
+        assert_ne!(a.mcp_json, b.mcp_json);
+        let hosts = list_hosts();
+        assert_eq!(hosts.len(), 2);
+        for (handle, key) in [(&a, "inputs-a"), (&b, "inputs-b")] {
+            assert!(hosts.iter().any(|h| h.alive
+                && h.port == handle.port()
+                && h.registry_key.as_deref() == Some(key)));
+            assert!(attach_registered(dir.path(), Some(key), Cursor::new(""), Vec::new()).unwrap());
+        }
+        assert!(read_mcp_json(dir.path()).is_none());
     }
 
     /// Live port, dead port and garbage: only the first is alive, the
@@ -2931,11 +3004,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim");
         std::fs::write(&victim, "keep").unwrap();
-        let path = mcp_json_path(dir.path()).unwrap();
+        let path = mcp_json_path(dir.path(), None).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
         std::os::unix::fs::symlink(&victim, &tmp).unwrap();
-        write_mcp_json(dir.path(), 1, "t", "n", "gui", None).unwrap();
+        write_mcp_json(dir.path(), 1, "t", "n", "gui", None, None).unwrap();
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
         assert_eq!(read_mcp_json(dir.path()).unwrap().1, "t");
     }
@@ -2979,7 +3052,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(mcp_json_path(dir.path()).unwrap())
+            let mode = std::fs::metadata(mcp_json_path(dir.path(), None).unwrap())
                 .unwrap()
                 .permissions()
                 .mode();
@@ -3021,7 +3094,7 @@ mod tests {
         assert_eq!(call_once(dir.path(), &req).unwrap().unwrap()["id"], 9);
 
         drop(handle);
-        assert!(!mcp_json_path(dir.path()).unwrap().exists());
+        assert!(!mcp_json_path(dir.path(), None).unwrap().exists());
         assert!(call_once(dir.path(), &req).unwrap().is_none());
         let mut out = Vec::new();
         assert!(
@@ -3061,7 +3134,7 @@ mod tests {
         let dead = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = dead.local_addr().unwrap().port();
         drop(dead);
-        write_mcp_json(dir.path(), port, "t", "n", "gui", None).unwrap();
+        write_mcp_json(dir.path(), port, "t", "n", "gui", None, None).unwrap();
         assert!(!attach(dir.path(), none(), Vec::new()).unwrap());
         // Live but silent: accepts, never answers.
         let silent = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -3071,6 +3144,7 @@ mod tests {
             "t",
             "n",
             "gui",
+            None,
             None,
         )
         .unwrap();
@@ -3088,7 +3162,7 @@ mod tests {
         let h = Arc::new(SessionHost::new(mock_session(dir.path())));
         let _handle = spawn_listener(h, dir.path(), false, label, None).unwrap();
         let (port, _) = read_mcp_json(dir.path()).unwrap();
-        write_mcp_json(dir.path(), port, "wrong", "n", "gui", None).unwrap();
+        write_mcp_json(dir.path(), port, "wrong", "n", "gui", None, None).unwrap();
         let err = attach(dir.path(), Cursor::new(""), Vec::new()).unwrap_err();
         assert!(err.to_string().contains("rejected"), "{err}");
     }
@@ -3109,7 +3183,7 @@ mod tests {
         drop(first);
         assert_eq!(read_mcp_json(shared.path()).unwrap().0, second.port());
         drop(second);
-        assert!(!mcp_json_path(shared.path()).unwrap().exists());
+        assert!(!mcp_json_path(shared.path(), None).unwrap().exists());
     }
 
     /// A second host on a directory whose journal is already open fails
