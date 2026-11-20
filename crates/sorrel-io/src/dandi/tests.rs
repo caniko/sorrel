@@ -516,6 +516,32 @@ fn distinct_draft_assets_are_refused_before_pinning() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn unversioned_asset_id_is_draft_equivalent() -> Result<()> {
+    let server = Server::new(|url, _, stream| match url.path() {
+        "/api/dandisets/000123/versions/draft/assets/" => json_reply(
+            stream,
+            json!({"next": null, "results": [{"asset_id": "recording", "path": "recording.nwb", "size": 8, "blob": "blob"}]}),
+        ),
+        "/api/assets/sorting/info/" => reply(stream, 404, "Content-Length: 0\r\n", &[]),
+        _ => panic!("unexpected asset request: {url}"),
+    });
+    let api = server.api(Duration::from_secs(2));
+    let sorting = server.base.join("assets/sorting/download/")?;
+    let recording = "dandi://dandi/000123@draft/recording.nwb";
+    let error = api
+        .resolve_pair(Some(sorting.as_str()), Some(recording))
+        .err()
+        .expect("unversioned asset and distinct draft must not resolve as a pair");
+    assert!(
+        error
+            .to_string()
+            .contains("two different DANDI draft assets"),
+        "{error:#}"
+    );
+    Ok(())
+}
+
 #[cfg(feature = "hdf5")]
 #[test]
 fn draft_can_be_paired_with_a_published_or_local_input() -> Result<()> {

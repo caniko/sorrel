@@ -257,7 +257,8 @@ NWBs and series that local readers refuse are refused remotely. The `dandi`
 feature is on by default; HDF5 streaming also needs `hdf5`.
 
 Sessions with DANDI inputs always open fresh without reusing a tab or session
-host, and two different draft assets can't be combined in one session.
+host. A session can't combine two distinct draft assets; this also applies to
+DANDI asset-ID download URLs without a version.
 If a running session owns the journal, stop it or pass a different `--journal`.
 
 The default journal and save directory is local, under the Sorrel user data

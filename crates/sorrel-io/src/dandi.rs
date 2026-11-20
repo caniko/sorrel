@@ -291,7 +291,10 @@ impl Api {
                     }
                     (DraftInput::Path(locator), DraftInput::Download(url, id, asset_id))
                     | (DraftInput::Download(url, id, asset_id), DraftInput::Path(locator)) => {
-                        ensure!(locator.id == id, DISTINCT_DRAFTS);
+                        ensure!(
+                            id.as_deref().is_none_or(|id| locator.id == id),
+                            DISTINCT_DRAFTS
+                        );
                         let asset = self.find_asset(locator)?;
                         ensure!(asset.asset_id == asset_id, DISTINCT_DRAFTS);
                         let state = if sorting_locator.is_some() {
@@ -334,11 +337,13 @@ impl Api {
         }
         let path = decode_asset_path(url.path().trim_matches('/'))?;
         Ok(match download_asset(&path) {
-            Some(DownloadAsset {
-                location: Some((id, "draft")),
-                asset_id,
-            }) => {
-                let id = component(id)?.to_owned();
+            // A bare asset ID doesn't establish membership in any immutable version.
+            Some(DownloadAsset { location, asset_id })
+                if location.is_none_or(|(_, version)| version == "draft") =>
+            {
+                let id = location
+                    .map(|(id, _)| component(id).map(str::to_owned))
+                    .transpose()?;
                 let asset_id = component(asset_id)?.to_owned();
                 Some(DraftInput::Download(url, id, asset_id))
             }
@@ -570,7 +575,7 @@ impl Api {
 
 enum DraftInput<'a> {
     Path(&'a Locator<'a>),
-    Download(Url, String, String),
+    Download(Url, Option<String>, String),
 }
 
 #[cfg(test)]
