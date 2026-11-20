@@ -8,6 +8,11 @@
 }: let
   inherit (harbor-rs.lib) mkReleaseArchive mkReleaseArtifact mkReleaseBundle;
   pname = "sorrel";
+  notice = ../crates/sorrel/THIRD-PARTY-HDF5.txt;
+  noticeEntry."THIRD-PARTY-HDF5.txt" = {
+    source = "${notice}";
+    mode = "0644";
+  };
 
   archive = {
     package,
@@ -19,7 +24,9 @@
     mkReleaseArchive {
       inherit pkgs pname version package system rustTarget format;
       name = "sorrel-${version}-${system}.${format}";
-      entries = pkgs.lib.genAttrs binaries (b: "bin/${b}");
+      entries =
+        pkgs.lib.genAttrs binaries (b: "bin/${b}")
+        // noticeEntry;
     };
 
   # `pip install sorrel-ephys` wheels: the `_native` extension plus the GUI binary.
@@ -69,10 +76,20 @@
       source = wheel;
       sourcePath = wheel.file;
     };
+  # Simit's existing ZIP glob publishes this alongside the standalone EXEs.
+  notices = mkReleaseArchive {
+    inherit pkgs pname version;
+    name = "sorrel-${version}-third-party-notices.zip";
+    package = notice;
+    entries = noticeEntry;
+    format = "zip";
+    kind = "notice";
+  };
 in
   mkReleaseBundle {
     inherit pkgs pname version;
     artifacts = {
+      inherit notices;
       x86_64-linux = archive {
         package = packages.sorrel-portable;
         system = "x86_64-linux";
@@ -116,4 +133,4 @@ in
     };
   }
   # `nix build .#release-bundle.wheels.<target>` builds one wheel.
-  // {inherit wheels;}
+  // {inherit notices wheels;}

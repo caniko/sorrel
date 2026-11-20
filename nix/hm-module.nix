@@ -14,7 +14,7 @@ in {
       type = lib.types.package;
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.sorrel;
       defaultText = lib.literalExpression "sorrel.packages.\${system}.sorrel";
-      description = "The Sorrel package; use `sorrelHdf5` for NWB/HDF5 support.";
+      description = "The Sorrel package to install.";
     };
   };
 

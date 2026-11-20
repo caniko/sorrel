@@ -348,6 +348,19 @@ def write_subtype():
         write(nwbfile, "subtype.nwb", cache_spec=True)
 
 
+def write_compressed():
+    # The NWB reader loads traces when `describe` opens the file.
+    for name, compression in [("deflate", "gzip"), ("lzf", "lzf")]:
+        nwbfile = make_file(f"sorrel-fixture-{name}")
+        add_series(
+            nwbfile,
+            H5DataIO(good_data(), compression=compression),
+            rate=1000.0,
+            starting_time=0.5,
+        )
+        write(nwbfile, f"{name}.nwb")
+
+
 def main():
     write_good()
     write_uint16()
@@ -369,6 +382,7 @@ def main():
     write_foreign_quality()
     write_not_electrical()
     write_subtype()
+    write_compressed()
 
 
 if __name__ == "__main__":
