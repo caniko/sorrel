@@ -87,12 +87,6 @@ mod imp {
     }
 
     impl NwbProvider {
-        /// Compute the local storage revision used in the journal seal, without opening NWB data.
-        #[cfg(feature = "dandi")]
-        pub fn local_identity(path: &Path) -> Result<Vec<u8>> {
-            storage::local_identity(path)
-        }
-
         pub fn open(path: impl AsRef<Path>) -> Result<Self> {
             Self::open_with(path, NwbOpenParams::default())
         }

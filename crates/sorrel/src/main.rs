@@ -504,6 +504,10 @@ impl OpenArgs {
         self.root.as_deref().expect("clap marks DATA_DIR required")
     }
 
+    fn has_remote_input(&self) -> bool {
+        is_remote(self.root()) || self.dat.as_deref().is_some_and(is_remote)
+    }
+
     /// Make the path fields absolute against `cwd`: the args came from a
     /// `sorrel open` run somewhere else.
     fn rebase(&mut self, cwd: &Path) {
@@ -577,7 +581,13 @@ fn journal_path(open: &OpenArgs, dir: &Path, stem: &str) -> PathBuf {
 /// Open the journal sealed against `baseline`, honouring `--discard-journal`.
 #[cfg(any(feature = "hdf5", feature = "zarr"))]
 fn open_journal(open: &OpenArgs, path: &Path, baseline: u64, n_clusters: u32) -> Result<Journal> {
-    sorrel_data::open_journal(&journal_opts(open), path, baseline, n_clusters)
+    sorrel_data::open_journal(&journal_opts(open), path, baseline, n_clusters).map_err(|e| {
+        if open.has_remote_input() && e.is::<sorrel_data::journal::JournalBusy>() {
+            anyhow::anyhow!("{e}: stop the running session or pass a different --journal")
+        } else {
+            e
+        }
+    })
 }
 
 fn detect_backend(root: &Path) -> Result<Backend> {
@@ -689,14 +699,7 @@ fn seeded<P: DataProvider>(mut session: Session<P>, seed: Seed<P>) -> Result<Ses
 /// Open the backend named (or detected) by `open`, seal and replay its
 /// journal, then hand the typed session to `v`.
 fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
-    with_resolved_session(open, RemoteInputs::resolve(open)?, v)
-}
-
-fn with_resolved_session<V: SessionVisitor>(
-    open: &OpenArgs,
-    inputs: RemoteInputs,
-    v: V,
-) -> Result<()> {
+    let inputs = RemoteInputs::resolve(open)?;
     #[cfg(feature = "dandi")]
     let mut v = v;
     #[cfg(not(feature = "dandi"))]
@@ -771,7 +774,7 @@ fn with_resolved_session<V: SessionVisitor>(
                 let dir = inputs
                     .root
                     .as_ref()
-                    .map(|_| inputs.host_dir(open))
+                    .map(|asset| Ok::<_, anyhow::Error>(dandi_data_dir()?.join(asset.state_path())))
                     .transpose()?;
                 let provider =
                     sorrel_io::NwbProvider::open_pinned(&path, params, inputs.root, inputs.dat)?;
@@ -1029,7 +1032,7 @@ struct TabBuilder<'a> {
     out: &'a mut Option<Box<dyn Tab>>,
     open: &'a OpenArgs,
     rs: Option<&'a RenderState>,
-    session_key: String,
+    session_key: Option<String>,
     remote_trials: Option<Events>,
 }
 impl SessionVisitor for TabBuilder<'_> {
@@ -1051,7 +1054,7 @@ impl SessionVisitor for TabBuilder<'_> {
             ctx,
             events,
             self.rs,
-            Some(self.session_key),
+            self.session_key,
         )));
         Ok(())
     }
@@ -1625,7 +1628,7 @@ fn is_remote(path: &Path) -> bool {
         .is_some_and(|s| s.starts_with("dandi://") || s.starts_with("https://"))
 }
 
-/// Keep both verified stores with the request so lookup and open see the same revisions.
+/// Keep both verified stores with the request so the session opens exactly those revisions.
 struct RemoteInputs {
     #[cfg(feature = "dandi")]
     root: Option<sorrel_io::dandi::Resolved>,
@@ -1645,31 +1648,11 @@ impl RemoteInputs {
         #[cfg(not(feature = "dandi"))]
         {
             anyhow::ensure!(
-                !is_remote(open.root()) && !open.dat.as_deref().is_some_and(is_remote),
+                !open.has_remote_input(),
                 "remote NWB datasets require building with --features dandi"
             );
             Ok(Self {})
         }
-    }
-
-    fn session_key(&self, open: &OpenArgs) -> Result<String> {
-        #[cfg(feature = "dandi")]
-        let keys = [&self.root, &self.dat].map(|asset| {
-            asset
-                .as_ref()
-                .map(|asset| remote_session_path(asset.state_path(), asset.fingerprint()))
-        });
-        #[cfg(not(feature = "dandi"))]
-        let keys = [None, None];
-        session_key(open, keys)
-    }
-
-    fn host_dir(&self, open: &OpenArgs) -> Result<PathBuf> {
-        #[cfg(feature = "dandi")]
-        if let Some(asset) = &self.root {
-            return Ok(dandi_data_dir()?.join(asset.state_path()));
-        }
-        Ok(host_dir(open))
     }
 }
 
@@ -1709,36 +1692,18 @@ fn session_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-#[cfg(feature = "dandi")]
-fn remote_session_path(state: &Path, fingerprint: &[u8]) -> PathBuf {
-    // Preserve the resolved journal location, but never put signed URLs in the MCP registry.
-    PathBuf::from(format!(
-        "remote-nwb:{}:{}",
-        blake3::hash(state.as_os_str().as_encoded_bytes()),
-        blake3::hash(fingerprint)
-    ))
-}
-
-fn session_key(open: &OpenArgs, [root, dat]: [Option<PathBuf>; 2]) -> Result<String> {
+/// Only local requests may attach to a running session. Remote and mixed
+/// requests always open fresh and let the journal lock arbitrate ownership.
+fn session_key(open: &OpenArgs) -> Result<Option<String>> {
+    if open.has_remote_input() {
+        return Ok(None);
+    }
     let mut args = open.clone();
     args.rebase(&std::env::current_dir()?);
-    #[cfg(feature = "dandi")]
-    let local_revision = match (is_remote(args.root()), args.dat.as_deref()) {
-        (true, Some(path)) if !is_remote(path) => Some(path),
-        (false, Some(path)) if is_remote(path) => Some(args.root()),
-        _ => None,
-    }
-    .map(|path| {
-        sorrel_io::NwbProvider::local_identity(path)
-            .with_context(|| format!("verify local NWB revision for {}", path.display()))
-    })
-    .transpose()?;
     // Discard is a one-shot action, not a property of the live session.
     args.discard_journal = false;
     // A file's name matters even through a symlink: it names its journal.
-    args.root = Some(if is_remote(args.root()) {
-        root.context("missing fingerprint for remote dataset")?
-    } else if is_dataset_directory(args.root()) {
+    args.root = Some(if is_dataset_directory(args.root()) {
         session_path(args.root())
     } else {
         session_path(&host_dir(&args)).join(
@@ -1748,11 +1713,7 @@ fn session_key(open: &OpenArgs, [root, dat]: [Option<PathBuf>; 2]) -> Result<Str
         )
     });
     if let Some(path) = args.dat.as_mut() {
-        *path = if is_remote(path) {
-            dat.context("missing fingerprint for remote --dat")?
-        } else {
-            session_path(path)
-        };
+        *path = session_path(path);
     }
     for path in [
         &mut args.journal,
@@ -1770,31 +1731,24 @@ fn session_key(open: &OpenArgs, [root, dat]: [Option<PathBuf>; 2]) -> Result<Str
         *name = format!("/acquisition/{name}");
     }
     // ponytail: compare normalized flags without opening a provider to resolve implicit defaults.
-    #[cfg(feature = "dandi")]
-    if let Some(revision) = local_revision {
-        return Ok(format!(
-            "open-args-v1:{args:?}:local-nwb:{}",
-            blake3::hash(&revision)
-        ));
-    }
-    Ok(format!("open-args-v1:{args:?}"))
+    Ok(Some(format!("open-args-v1:{args:?}")))
 }
 
 /// `sorrel mcp`: bridge stdio to a running host, else serve in-process.
 fn run_mcp(open: &OpenArgs) -> Result<()> {
-    let inputs = RemoteInputs::resolve(open)?;
-    if sorrel_data::serve::attach_for_session(
-        &inputs.host_dir(open)?,
-        Some(&inputs.session_key(open)?),
-        open.discard_journal,
-        std::io::stdin(),
-        std::io::stdout(),
-    )? {
-        return Ok(());
+    if let Some(key) = session_key(open)? {
+        if sorrel_data::serve::attach_for_session(
+            &host_dir(open),
+            Some(&key),
+            open.discard_journal,
+            std::io::stdin(),
+            std::io::stdout(),
+        )? {
+            return Ok(());
+        }
     }
-    // attach found no listener. If another process still has the journal
-    // open, serving here would be a second writer: refuse and say so.
-    with_resolved_session(open, inputs, Serve).map_err(busy_hint)
+    // If another process holds the journal, the fresh open refuses a second writer.
+    with_session(open, Serve).map_err(busy_hint)
 }
 
 /// Name the process holding the journal when `e` is a [`JournalBusy`].
@@ -1810,13 +1764,17 @@ fn busy_hint(e: anyhow::Error) -> anyhow::Error {
 }
 
 /// `sorrel run --headless`: the host and its MCP listener, no window.
-struct Headless<'a>(&'a OpenArgs, String);
+struct Headless<'a>(&'a OpenArgs, Option<String>);
 impl SessionVisitor for Headless<'_> {
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
-        let args = mcp_open_args(self.0)?;
+        let command = if self.1.is_some() {
+            format!("sorrel mcp {}", mcp_open_args(self.0)?)
+        } else {
+            "sorrel mcp".to_owned()
+        };
         let host = std::sync::Arc::new(sorrel_data::SessionHost::new(seeded(session, seed)?));
         let listener = sorrel_data::serve::spawn_listener_for_session(
             host,
@@ -1824,12 +1782,11 @@ impl SessionVisitor for Headless<'_> {
             ctx.reseal_on_save,
             phy_label_str,
             None,
-            Some(&self.1),
+            self.1.as_deref(),
         )?;
         println!(
-            "sorrel host on 127.0.0.1:{}; connect an agent with `sorrel mcp {}`; Ctrl-C stops",
-            listener.port(),
-            args
+            "sorrel host on 127.0.0.1:{}; connect an agent with `{command}`; Ctrl-C stops",
+            listener.port()
         );
         // Ctrl-C returns, dropping the listener so it removes its registry file.
         sorrel_remote::wait_for_ctrl_c();
@@ -2102,18 +2059,13 @@ fn load_events(
 
 fn tab_target<'a>(
     open: &OpenArgs,
-    key: &str,
+    key: Option<&str>,
     tabs: impl Iterator<Item = (&'a Path, Option<&'a str>)>,
 ) -> Result<Option<usize>> {
-    let remote = is_remote(open.root());
-    let dir = (!remote).then(|| session_path(&host_dir(open)));
+    let Some(key) = key else { return Ok(None) };
+    let dir = session_path(&host_dir(open));
     for (i, (dataset, tab_key)) in tabs.enumerate() {
-        let matches = if remote {
-            tab_key == Some(key)
-        } else {
-            dir.as_ref().is_some_and(|d| session_path(dataset) == *d)
-        };
-        if matches {
+        if session_path(dataset) == dir {
             sorrel_data::serve::check_session_reuse(
                 "open tab",
                 tab_key,
@@ -2142,15 +2094,13 @@ fn tab_opener() -> Opener {
         let tabs = open_tabs
             .iter()
             .map(|tab| (tab.dataset(), tab.session_key()));
-        let inputs = RemoteInputs::resolve(&open)?;
-        let key = inputs.session_key(&open)?;
-        if let Some(i) = tab_target(&open, &key, tabs)? {
+        let key = session_key(&open)?;
+        if let Some(i) = tab_target(&open, key.as_deref(), tabs)? {
             return Ok(Opened::Existing(i));
         }
         let mut tab = None;
-        with_resolved_session(
+        with_session(
             &open,
-            inputs,
             TabBuilder {
                 remote_trials: None,
                 out: &mut tab,
@@ -2493,20 +2443,23 @@ fn run_call(open: &OpenArgs, tool: &str, args: Option<&str>, raw: bool) -> Resul
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": tool, "arguments": args},
     });
-    let inputs = RemoteInputs::resolve(open)?;
-    let reply = match sorrel_data::serve::call_once_for_session(
-        &inputs.host_dir(open)?,
-        Some(&inputs.session_key(open)?),
-        open.discard_journal,
-        &request,
-    )? {
+    let running_reply = if let Some(key) = session_key(open)? {
+        sorrel_data::serve::call_once_for_session(
+            &host_dir(open),
+            Some(&key),
+            open.discard_journal,
+            &request,
+        )?
+    } else {
+        None
+    };
+    let reply = match running_reply {
         Some(r) => r,
         None => {
             let mut reply = None;
             let line = request.to_string();
-            with_resolved_session(
+            with_session(
                 open,
-                inputs,
                 CallOnce {
                     request: &line,
                     reply: &mut reply,
@@ -2727,11 +2680,7 @@ fn main() -> Result<()> {
             standalone,
             headless,
         }) => match headless {
-            true => {
-                let inputs = RemoteInputs::resolve(&open)?;
-                let key = inputs.session_key(&open)?;
-                with_resolved_session(&open, inputs, Headless(&open, key))
-            }
+            true => with_session(&open, Headless(&open, session_key(&open)?)),
             false => run_gui(&open, standalone),
         },
         Some(Cmd::Status { dir, json }) => run_status(dir.as_deref(), json),
@@ -3228,7 +3177,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "dandi")]
-    fn remote_session_paths_survive_rebasing_and_redact_query() -> Result<()> {
+    fn remote_session_paths_survive_rebasing() -> Result<()> {
         let locator = "dandi://dandi/000123@draft/test.nwb";
         let url = "https://example.org/raw.nwb?signature=not-for-the-registry";
         let mut open = OpenArgs {
@@ -3242,12 +3191,7 @@ mod tests {
         assert_eq!(open.root(), Path::new(locator));
         assert_eq!(open.dat.as_deref(), Some(Path::new(url)));
         assert_eq!(open.journal, Some(cwd.join("override.journal")));
-        assert!(session_key(&open, [None, None]).is_err());
-        let keys = [
-            Some(remote_session_path(Path::new("draft"), b"sorting")),
-            Some(remote_session_path(Path::new("https"), b"recording")),
-        ];
-        assert!(!session_key(&open, keys)?.contains("signature="));
+        assert_eq!(session_key(&open)?, None);
         assert!(!mcp_open_args(&open)?.contains("signature="));
         let hash = blake3::hash(b"test.nwb").to_hex();
         assert_eq!(
@@ -3258,82 +3202,52 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "dandi")]
-    fn session_reuse_checks_both_remote_fingerprints() -> Result<()> {
-        let locator = "dandi://dandi/000123/test/moving.nwb";
-        let draft = Path::new("000123/draft/sorting");
-        let release = Path::new("000123/0.42.1/recording");
-        let root = |fingerprint| Some(remote_session_path(draft, fingerprint));
-        let dat = |fingerprint| Some(remote_session_path(release, fingerprint));
+    fn only_local_requests_reuse_a_tab_or_host() -> Result<()> {
+        let local = tempfile::tempdir()?;
         let mut open = OpenArgs {
-            root: Some(locator.into()),
-            dat: Some(locator.into()),
+            root: Some(local.path().join("sorting.nwb")),
+            dat: Some(local.path().join("recording.nwb")),
             ..Default::default()
         };
-        let first = session_key(&open, [root(b"one"), dat(b"one")])?;
-        let tabs = || [(draft, Some(first.as_str()))].into_iter();
-        let same = session_key(&open, [root(b"one"), dat(b"one")])?;
-        assert_eq!(tab_target(&open, &same, tabs())?, Some(0));
-        for keys in [[root(b"two"), dat(b"one")], [root(b"one"), dat(b"two")]] {
-            let changed = session_key(&open, keys)?;
-            assert_eq!(tab_target(&open, &changed, tabs())?, None);
-            assert!(serve::check_session_reuse("host", Some(&first), &changed, false).is_err());
-        }
-        // A local units file still owns the same journal; a changed remote --dat is a conflict.
-        let local = tempfile::tempdir()?;
-        open.root = Some(local.path().join("units.nwb.zarr"));
-        std::fs::create_dir(open.root())?;
-        let first = session_key(&open, [None, dat(b"one")])?;
-        let tabs = || [(local.path(), Some(first.as_str()))].into_iter();
-        let newer = Some(remote_session_path(
-            Path::new("000123/0.42.2/recording"),
-            b"two",
-        ));
-        let changed = session_key(&open, [None, newer])?;
-        assert!(tab_target(&open, &changed, tabs()).is_err());
-        assert_eq!(tab_target(&open, &first, tabs())?, Some(0));
+        let key = session_key(&open)?.unwrap();
+        let tabs = || [(local.path(), Some(key.as_str()))].into_iter();
+        assert_eq!(tab_target(&open, Some(&key), tabs())?, Some(0));
+        open.dat = Some("https://example.org/raw.nwb".into());
+        assert_eq!(session_key(&open)?, None);
+        assert_eq!(
+            tab_target(&open, session_key(&open)?.as_deref(), tabs())?,
+            None
+        );
+        open.root = Some("dandi://dandi/000123/test/sorting.nwb".into());
+        open.dat = None;
+        assert_eq!(session_key(&open)?, None);
+        assert_eq!(
+            tab_target(&open, session_key(&open)?.as_deref(), tabs())?,
+            None
+        );
         Ok(())
     }
 
     #[test]
-    #[cfg(all(feature = "dandi", feature = "hdf5"))]
-    fn mixed_session_reuse_checks_local_revision() -> Result<()> {
+    #[cfg(feature = "dandi")]
+    fn dandi_reopen_refuses_a_journal_held_by_another_session() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let local = dir.path().join("local.nwb");
-        let remote = PathBuf::from("dandi://dandi/000123/test/remote.nwb");
-        for (open, keys) in [
-            (
-                OpenArgs {
-                    root: Some(remote.clone()),
-                    dat: Some(local.clone()),
-                    ..Default::default()
-                },
-                [Some(PathBuf::from("pinned")), None],
-            ),
-            (
-                OpenArgs {
-                    root: Some(local.clone()),
-                    dat: Some(remote),
-                    ..Default::default()
-                },
-                [None, Some(PathBuf::from("pinned"))],
-            ),
-        ] {
-            std::fs::write(&local, b"old")?;
-            let before = session_key(&open, keys.clone())?;
-            assert_eq!(session_key(&open, keys.clone())?, before);
-
-            let replacement = dir.path().join("replacement.nwb");
-            std::fs::write(&replacement, b"new recording")?;
-            std::fs::rename(replacement, &local)?;
-            let after = session_key(&open, keys.clone())?;
-            let tabs = [(dir.path(), Some(before.as_str()))].into_iter();
-            assert!(!matches!(tab_target(&open, &after, tabs), Ok(Some(_))));
-            assert!(serve::check_session_reuse("host", Some(&before), &after, false).is_err());
-
-            std::fs::remove_file(&local)?;
-            assert!(session_key(&open, keys).is_err());
-        }
+        let mut open = OpenArgs {
+            root: Some("dandi://dandi/000123/test/sorting.nwb".into()),
+            ..Default::default()
+        };
+        let path = journal_path(&open, dir.path(), "nwb.sorrel");
+        let owner = open_journal(&open, &path, 23, 1)?;
+        open.discard_journal = true;
+        let err = open_journal(&open, &path, 23, 1).err().unwrap().to_string();
+        assert!(err.contains("already open"), "{err}");
+        assert!(
+            err.contains("stop the running session or pass a different --journal"),
+            "{err}"
+        );
+        open.journal = Some(dir.path().join("another.journal"));
+        let _other = open_journal(&open, &journal_path(&open, dir.path(), "nwb.sorrel"), 23, 1)?;
+        drop(owner);
         Ok(())
     }
 

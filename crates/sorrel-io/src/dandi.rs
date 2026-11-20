@@ -44,11 +44,6 @@ pub struct Resolved {
 }
 
 impl Resolved {
-    /// The asset fingerprint used in the provider's journal identity.
-    pub fn fingerprint(&self) -> &[u8] {
-        &self.identity
-    }
-
     /// Relative local state directory for the resolved locator.
     pub fn state_path(&self) -> &Path {
         &self.state
@@ -67,25 +62,6 @@ pub fn resolve_pair(root: Option<&str>, dat: Option<&str>) -> Result<[Option<Res
         return Ok([None, None]);
     }
     Api::production().resolve_pair(root, dat)
-}
-
-/// Pin a DANDI locator to an explicit version for both session lookup and open.
-/// Non-DANDI paths and HTTPS URLs have no Dandiset version to pin.
-pub fn pin_version(input: &str) -> Result<Option<String>> {
-    if !input.starts_with(LOCATOR_PREFIX) {
-        return Ok(None);
-    }
-    Ok(Api::production()
-        .dandiset_locator(input, &mut HashMap::new())?
-        .map(|locator| {
-            let Locator {
-                id,
-                version,
-                encoded_path,
-                ..
-            } = locator;
-            format!("{LOCATOR_PREFIX}{id}@{version}/{encoded_path}")
-        }))
 }
 
 /// Find the local state subdirectory without opening or listing the asset.
@@ -164,7 +140,6 @@ struct Locator<'a> {
     id: &'a str,
     version: String,
     path: std::borrow::Cow<'a, str>,
-    encoded_path: &'a str,
 }
 
 impl Locator<'_> {
@@ -238,12 +213,7 @@ impl Api {
             versions.insert(id, version.clone());
             version
         };
-        Ok(Some(Locator {
-            id,
-            version,
-            path,
-            encoded_path,
-        }))
+        Ok(Some(Locator { id, version, path }))
     }
 
     fn resolve(&self, input: &str) -> Result<Resolved> {
