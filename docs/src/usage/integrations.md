@@ -256,6 +256,10 @@ URL: a bare storage prefix doesn't provide the required object list. The same
 NWBs and series that local readers refuse are refused remotely. The `dandi`
 feature is on by default; HDF5 streaming also needs `hdf5`.
 
+Sessions with DANDI inputs always open fresh without reusing a tab or session
+host, and two different draft assets can't be combined in one session.
+If a running session owns the journal, stop it or pass a different `--journal`.
+
 The default journal and save directory is local, under the Sorrel user data
 directory (`$XDG_DATA_HOME/sorrel` or `~/.local/share/sorrel` on Linux), in
 `dandi/<dandiset>/<version>/<path hash>/`. Direct HTTPS URLs are stored under
@@ -263,6 +267,10 @@ directory (`$XDG_DATA_HOME/sorrel` or `~/.local/share/sorrel` on Linux), in
 command's `--out` to choose a different location. `export-phy`, `qc`, and
 `report` default to this directory for remote sessions. An asset whose ETags
 or sizes have changed does not match the old journal seal.
+
+**Limits:** As in any local session, local files are fingerprinted by name,
+size, and modification time; a replacement with the same name, size, and
+modification time is not detected.
 
 ### Writing curated units to NWB
 
