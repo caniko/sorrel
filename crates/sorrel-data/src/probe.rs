@@ -14,18 +14,20 @@ use crate::proposers::{cluster_feature_space, cluster_globals, core_split, kmean
 use crate::refractory::RefractoryWindows;
 use crate::session::Session;
 use crate::suggest::MergeCandidate;
+use sorrel_compute::epochs::stable_epochs;
 use sorrel_compute::{
     burst_index, gmm_split_proposal, log_bins, mean_amplitude, peak_channel, sax,
     waveform_landmarks, RefractoryParams,
 };
 use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 
-pub const GRAMMAR: &str = "probe grammar (ms for acg/ccg, seconds for window/split; [..] optional):
+pub const GRAMMAR: &str = "probe grammar (ms for acg/ccg, seconds for window/epochs/split; [..] optional):
   acg C [win=50] [bin=1]
   ccg A B [win=50] [bin=1]
   compare A B
   waveform C   (current-membership raw snippets, bounded; DC subtraction only)
   window C T0 T1
+  epochs C
   split C by=amp|time|pc|kmeans|core|robust|axis [at=X]   (axis lists up to 30 alternative PC/amplitude mixture handles; no at=; other methods give one handle)
   eval merge A B ..   |   eval s<C>.<k>   |   eval m<k>";
 
@@ -50,7 +52,8 @@ pub enum Query {
     Compare { a: u32, b: u32 },
     Waveform { c: u32 },
     Window { c: u32, t0: f32, t1: f32 },
-    Split { c: u32, by: By, at: Option<f32> },
+    Epochs { c: u32 },
+    Split { c: u32, by: By, at: Option<f64> },
     Merge(Vec<u32>),
     Handle(String),
 }
@@ -83,11 +86,8 @@ pub fn parse(q: &str) -> Result<Query, String> {
             None => Ok(()),
         }
     };
-    let opt = |key: &str| {
-        (kv.iter().rev().find(|(k, _)| *k == key))
-            .map(|(_, v)| num(v, key))
-            .transpose()
-    };
+    let value = |key: &str| kv.iter().rev().find(|(k, _)| *k == key).map(|&(_, v)| v);
+    let opt = |key: &str| value(key).map(|v| num(v, key)).transpose();
     let span = || -> Result<(f32, f32), String> {
         let (win, bin) = (opt("win")?.unwrap_or(50.0), opt("bin")?.unwrap_or(1.0));
         match win > 0.0 && bin > 0.0 && bin <= win {
@@ -137,6 +137,10 @@ pub fn parse(q: &str) -> Result<Query, String> {
             want(1, &[])?;
             Ok(Query::Waveform { c: id(pos[0])? })
         }
+        "epochs" => {
+            want(1, &[])?;
+            Ok(Query::Epochs { c: id(pos[0])? })
+        }
         "split" => {
             want(1, &["by", "at"])?;
             let by = match kv.iter().find(|(k, _)| *k == "by").map(|p| p.1) {
@@ -150,13 +154,25 @@ pub fn parse(q: &str) -> Result<Query, String> {
                 Some(o) => return Err(format!("unknown by={o}")),
                 None => return Err("split needs by=amp|time|pc|kmeans|core|robust|axis".into()),
             };
-            if matches!(by, By::Robust | By::Axis) && opt("at")?.is_some() {
+            if matches!(by, By::Robust | By::Axis) && value("at").is_some() {
                 return Err("by=robust/axis takes no at=".into());
             }
+            let at = if by == By::Time {
+                value("at")
+                    .map(|s| {
+                        s.parse::<f64>()
+                            .ok()
+                            .filter(|x| x.is_finite())
+                            .ok_or_else(|| format!("bad number {s:?} for at"))
+                    })
+                    .transpose()?
+            } else {
+                opt("at")?.map(f64::from)
+            };
             Ok(Query::Split {
                 c: id(pos[0])?,
                 by,
-                at: opt("at")?,
+                at,
             })
         }
         "eval" if pos.first() == Some(&"merge") => {
@@ -294,6 +310,50 @@ pub fn run<P: DataProvider>(
                 qn(w.shape.map_or(nan, |s| s.half_width_ms)),
                 w.shape.map_or_else(|| "-".into(), |s| s.n_extrema.to_string())))
         }
+        Query::Epochs { c } => {
+            let c = cl(session, *c)?;
+            let epochs = stable_epochs(
+                times(c),
+                session.spike_amplitudes(c),
+                session.provider.n_samples().0,
+                session.provider.sample_rate(),
+            );
+            if epochs.is_empty() {
+                return Ok(
+                    "epochs unavailable (need at least 10 spikes and valid recording timing)"
+                        .into(),
+                );
+            }
+            let mut lines = epochs
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{}-{} s n={} rate={}Hz amp={} fit={}",
+                        e.start_s,
+                        e.end_s,
+                        e.n,
+                        qn(e.rate_hz),
+                        qn(e.amp_mean),
+                        if e.amp_fitted { "rate+amp" } else { "rate" }
+                    )
+                })
+                .collect::<Vec<_>>();
+            // A time split only separates spikes if some boundary has spikes
+            // on both sides, not one that just cuts off leading silence.
+            let total: u32 = epochs.iter().map(|e| e.n).sum();
+            let splittable = epochs
+                .iter()
+                .scan(0, |before, e| {
+                    *before += e.n;
+                    Some(*before)
+                })
+                .take(epochs.len() - 1)
+                .any(|before| before > 0 && before < total);
+            if splittable {
+                lines.push(format!("Review a boundary with `split {} by=time at=T`; applying the handle is journaled and undoable.", c.0));
+            }
+            Ok(lines.join("\n"))
+        }
         Query::Split { c, by, at } => {
             let c = cl(session, *c)?;
             if *by == By::Axis {
@@ -309,7 +369,11 @@ pub fn run<P: DataProvider>(
             }
             let id = handles.add_split(session, c, minor, method, f32::NAN, bic);
             let line = handles.line(session, &id, &[])?;
-            Ok(used.map_or(line.clone(), |x| format!("{line} [at {}]", qn(x))))
+            Ok(match used {
+                Some(x) if *by == By::Time => format!("{line} [at {x}]"),
+                Some(x) => format!("{line} [at {}]", qn(x as f32)),
+                None => line,
+            })
         }
         Query::Merge(ids) => merge_line(session, merges, ids, &handles.extra),
         Query::Handle(h) => handles.line(session, h, merges),
@@ -611,6 +675,15 @@ fn above(keys: &[f32], at: f32) -> Vec<u32> {
         .collect()
 }
 
+/// First spike at or after `at` seconds. Recognise sample-aligned times in
+/// the same precision as `epochs`, even when multiplying back would land a
+/// fraction of an ulp above the sample and naïve rounding up would skip it.
+fn time_split_index(times: &[SampleIndex], at: f64, sr: f64) -> usize {
+    let nearest = (at * sr).round() as u64;
+    let cutoff = nearest.saturating_add(u64::from((nearest as f64 / sr) < at));
+    times.partition_point(|t| t.0 < cutoff)
+}
+
 /// `(minor local spike positions, handle method, bic, threshold used)`.
 /// ponytail: by=time without at= scans 20 coarse bin edges (each side >= 5% of
 /// the spikes, at least 10) for the largest mean-amplitude jump; a change-point
@@ -620,10 +693,9 @@ fn split_minor<P: DataProvider>(
     session: &Session<P>,
     c: ClusterId,
     by: By,
-    at: Option<f32>,
-) -> Result<(Vec<u32>, &'static str, f32, Option<f32>), String> {
+    at: Option<f64>,
+) -> Result<(Vec<u32>, &'static str, f32, Option<f64>), String> {
     let (times, amps) = (session.spike_times(c), session.spike_amplitudes(c));
-    let sr = session.provider.sample_rate().max(1.0);
     let n = times.len();
     let need_amps = || {
         (amps.len() == n)
@@ -635,7 +707,7 @@ fn split_minor<P: DataProvider>(
         By::Amp => {
             need_amps()?;
             match at {
-                Some(x) => Ok((above(amps, x), "amp", f32::NAN, None)),
+                Some(x) => Ok((above(amps, x as f32), "amp", f32::NAN, None)),
                 None => {
                     let p = gmm_split_proposal(amps)
                         .ok_or("no amplitude mixture found (unimodal); give at=")?;
@@ -644,12 +716,15 @@ fn split_minor<P: DataProvider>(
             }
         }
         By::Time => {
-            let secs: Vec<f32> = times.iter().map(|t| t.0 as f32 / sr).collect();
+            let sr = f64::from(session.provider.sample_rate());
+            if !sr.is_finite() || sr <= 0.0 {
+                return Err("invalid sample rate for time split".into());
+            }
             let x = match at {
                 Some(x) => x,
                 None => {
                     need_amps()?;
-                    let (first, last) = (secs[0], secs[n - 1]);
+                    let (first, last) = (times[0].0 as f64 / sr, times[n - 1].0 as f64 / sr);
                     let min = (n / 20).max(10);
                     let mut pre = vec![0.0f64];
                     pre.extend(amps.iter().scan(0.0f64, |s, &a| {
@@ -657,9 +732,9 @@ fn split_minor<P: DataProvider>(
                         Some(*s)
                     }));
                     (1..20)
-                        .map(|b| first + (last - first) * b as f32 / 20.0)
+                        .map(|b| first + (last - first) * f64::from(b) / 20.0)
                         .filter_map(|x| {
-                            let k = secs.partition_point(|&t| t <= x);
+                            let k = time_split_index(times, x, sr);
                             if k < min || n - k < min {
                                 return None;
                             }
@@ -672,7 +747,8 @@ fn split_minor<P: DataProvider>(
                         .ok_or("too few spikes for a time scan; give at=")?
                 }
             };
-            Ok((above(&secs, x), "time", f32::NAN, Some(x)))
+            let k = time_split_index(times, x, sr);
+            Ok(((k as u32..n as u32).collect(), "time", f32::NAN, Some(x)))
         }
         By::Pc | By::Kmeans | By::Core | By::Robust => {
             let globals = cluster_globals(session, c);
@@ -709,7 +785,7 @@ fn split_minor<P: DataProvider>(
             if at.is_none() && above(&proj, 0.0).len() * 2 > n {
                 proj.iter_mut().for_each(|p| *p = -*p);
             }
-            Ok((above(&proj, x), "pc", f32::NAN, Some(x)))
+            Ok((above(&proj, x as f32), "pc", f32::NAN, Some(x)))
         }
     }
 }

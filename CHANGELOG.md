@@ -13,6 +13,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
+- **Stable epochs.** Amplitudes marks inferred rate or amplitude change points. QC exports, MCP metrics and rules expose epoch counts and level ratios; `probe epochs C` lists the intervals for review and optional time splits.
 - **Refractory contamination evidence.** QC, MCP metrics and rules now expose the IBL sliding-RP result and a fixed-window contamination posterior with a 95% credible interval. Both are available in the ISI cluster tooltip.
 - **Refractory-period settings.** CLI flags, GUI settings and the MCP `refractory` tool share one window configuration. The default fixed window is 1.5 ms and the contamination sweep tests 0.75–10 ms in 0.25 ms steps. Model feature extraction keeps its original windows.
 - **New leaf icon.** The app, crate, favicon and design-file marks use the new sorrel leaf. `assets/icon/generate.cjs` regenerates the SVG copy, PNG sizes and ICO from `logo/logo-clean.svg` in one step.

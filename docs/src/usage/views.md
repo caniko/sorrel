@@ -127,6 +127,24 @@ value = 0.1
 label = "mua"
 ```
 
+### Stable epochs
+
+Thin lines in the **Amplitudes** view mark fitted changes for the selected units, using their stored sorter amplitudes regardless of the displayed amplitude type. The lines are hidden when Ctrl+R reorders spike times. `probe epochs C` lists each interval in seconds with its spike count, firing rate (Hz), and signed mean amplitude. QC exports, MCP `metrics`, and rules expose these summaries:
+
+| Column             | Meaning                                                                |
+| ------------------ | ---------------------------------------------------------------------- |
+| `n_epochs`         | Number of fitted segments, including 1 if no change was found.         |
+| `epoch_amp_ratio`  | Smallest divided by largest magnitude of the segment mean amplitudes.  |
+| `epoch_rate_ratio` | Lowest divided by highest segment firing rate; 1 for a single segment. |
+
+The fit divides the recording into 100 equal bins and finds the exact best piecewise-constant fit, with segments at least 5 bins long. Each bin gives two series: its spike count and the mean stored amplitude of its spikes. The count costs its Poisson deviance from the segment's rate, divided by a dispersion measured from differences between neighbouring bins (never below the Poisson value). The amplitude costs its squared distance from the segment's level, weighted by spike count and scaled by a noise level from robust differences between neighbouring bins; it widens when neighbouring bins are correlated, as when amplitudes drift on a timescale close to the bin width. Taking the noise from the data covers bursty firing and rounded amplitudes. Each bin's cost is capped at 9 (3 noise units squared), after the biweight loss of Fearnhead & Rigaill (2019), _JASA_ 114:169–183, so a burst or a stray bin cannot buy a boundary alone. Each fitted level costs `ln 100` (a rate per segment, plus an amplitude per nonempty segment when fitted) and each boundary `2 ln 91` for the search over its position.
+
+Missing or invalid amplitudes, or fewer than 21 nonempty bins, give a rate-only fit, and silent segments fit no amplitude. `probe epochs` marks each interval `fit=rate` or `fit=rate+amp`, and still shows descriptive means when amplitudes are valid but not fitted. Because a boundary in a `fit=rate+amp` unit also pays for an amplitude level, such units need a larger rate change to split; compare `n_epochs` and `epoch_rate_ratio` between units with the same fit. The amplitude ratio is unavailable if amplitudes were not fitted, any segment is silent, or the largest mean magnitude is zero. A single segment with a fitted nonzero mean has ratio 1. All three summaries are unavailable with fewer than 10 spikes or invalid recording timing (`NaN` in Rust, `null` in JSON, blank in TSV).
+
+Boundaries are change points of a step model, not transition times. A gradual drift becomes a staircase whose edges fall wherever the fit is cheapest, and the ratios compare segment means, so they understate the end-to-end change. In simulations, a linear 100 → 55 amplitude ramp over the recording (5 Hz, SD 10) gave 4 to 5 segments and a median `epoch_amp_ratio` of 0.63. Slow firing-rate modulation splits too: a ±40% rate oscillation with a 50 s period split 70% of 100 s recordings. Some steady units also split: bursts whose spike amplitudes shrink within the burst (23% of simulated units), and amplitude fluctuations that last several bins, which are likelier at low firing rates or in short recordings (a spike-to-spike amplitude correlation of 0.75 split 14–19% of units at 1–2 Hz over 100 s, or at 5 Hz over 20 s).
+
+A rate-only change is not by itself evidence of dropout: behaviour can change firing rates. For example, try `epoch_amp_ratio < 0.6` as a review rule in `rules_eval`, then inspect where the change occurred. To split at a boundary, copy the reported time into `split C by=time at=T` in `probe`; `probe epochs` suggests this only when some boundary has spikes on both sides. The handle moves spikes at or after the boundary, matching the fit's half-open intervals. Applying it is journaled and undoable; the fit itself makes no edits.
+
 **Cross-talk** (Sorrel extra). The views share four kinds of state, so a pick in one shows in all the others:
 
 - **Spike brush.** One set of spikes at a time, and the last writer wins. It comes from a Features lasso or k-means part, an Amplitudes lasso or threshold, a Spike data or Tmpl features lasso, or the ISI refractory band. Every spike view draws the brushed spikes in brush ink: white in dark, near-black in light. With a lasso or k-means brush, ISI, Waveforms and Quality also preview the split: the inside part dashed, the outside part dotted, and "if split" rows with the change in composite score.

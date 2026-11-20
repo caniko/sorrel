@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Ui};
 use rayon::prelude::*;
+use sorrel_compute::epochs::{stable_epochs, Epoch};
 use sorrel_data::Session;
 use sorrel_io::{ClusterId, DataProvider};
 use sorrel_render::{extract_snippet, TracePreproc};
@@ -111,6 +112,8 @@ pub struct AmplitudeViewState {
     split_requested: bool,
     want_full: bool,
     memo: Memo<AmpKey, Arc<AmpSet>>,
+    /// Stored sorter amplitudes, independent of the view's amplitude type.
+    epochs: (Option<u64>, HashMap<ClusterId, Vec<Epoch>>),
     /// Vertices for `(set generation, dark mode, threshold bits, preview
     /// generation)`, plus the upload generation they were built under.
     vertices: Option<(VertexKey, u64, Vertices)>,
@@ -293,6 +296,35 @@ pub fn amplitude_view<P: DataProvider>(
     );
 
     let dark = ui.visuals().dark_mode;
+    if current.is_some() && !reorder {
+        let (version, cache) = &mut state.epochs;
+        let metrics_version = session.metrics_version();
+        if *version != Some(metrics_version) {
+            cache.clear();
+            *version = Some(metrics_version);
+        }
+        let ink = painter.with_clip_rect(data);
+        for (slot, &cluster) in selection.iter().enumerate() {
+            let epochs = cache.entry(cluster).or_insert_with(|| {
+                stable_epochs(
+                    session.spike_times(cluster),
+                    session.spike_amplitudes(cluster),
+                    session.provider.n_samples().0,
+                    session.provider.sample_rate(),
+                )
+            });
+            let colour = selection_colour(slot).gamma_multiply(if dark { 0.46 } else { 0.55 });
+            for e in epochs
+                .iter()
+                .skip(1)
+                .map(|e| e.start_s as f32)
+                .filter(|&t| t > x.0 && t < x.1)
+            {
+                let px = egui::remap(e, x.0..=x.1, data.x_range());
+                ink.vline(px, data.y_range(), Stroke::new(1.0_f32, colour));
+            }
+        }
+    }
     let key: VertexKey = (
         set.generation,
         dark,
