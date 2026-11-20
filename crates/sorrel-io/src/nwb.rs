@@ -186,7 +186,7 @@ mod imp {
                             Some(resolved.identity),
                         ));
                     }
-                    Ok((Group::open(path)?, None))
+                    Ok::<_, anyhow::Error>((Group::open(path)?, None))
                 })
                 .transpose()?;
             let recording = raw.as_ref().map_or(&f, |(group, _)| group);
