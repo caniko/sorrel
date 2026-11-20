@@ -687,7 +687,7 @@ mod imp {
     fn stored_dataset(file: &H5File, path: &str) -> Result<hdf5::Dataset> {
         use hdf5::plist::dataset_create::Layout;
         use hdf5_metno_sys::{
-            h5l::{self, H5L_info1_t, H5L_TYPE_EXTERNAL, H5L_TYPE_HARD, H5L_TYPE_SOFT},
+            h5l::{self, H5L_info2_t, H5L_TYPE_EXTERNAL, H5L_TYPE_HARD, H5L_TYPE_SOFT},
             h5p::{H5Pget_external_count, H5P_DEFAULT},
         };
         use std::ffi::{c_int, CString};
@@ -699,15 +699,15 @@ mod imp {
                 prefix.push('/');
                 prefix.push_str(component);
                 let name = CString::new(prefix.as_str())?;
-                let mut info = MaybeUninit::<H5L_info1_t>::uninit();
+                let mut info = MaybeUninit::<H5L_info2_t>::uninit();
                 let kind = hdf5::sync::sync(|| {
                     // SAFETY: file and the NUL-terminated name are live, info points to
                     // writable storage, and the HDF5 lock serializes the call. Read the
                     // type as a C int, since user-defined links can use other enum values.
                     unsafe {
-                        // Use the ABI available on both older and newer HDF5 releases.
-                        #[allow(deprecated)]
-                        hdf5::h5check(h5l::H5Lget_info1(
+                        // HDF5 2.x (the bundled static build) no longer exports
+                        // H5Lget_info1; H5Lget_info2 exists since 1.12.
+                        hdf5::h5check(h5l::H5Lget_info2(
                             file.id(),
                             name.as_ptr(),
                             info.as_mut_ptr(),
