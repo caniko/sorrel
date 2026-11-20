@@ -1,0 +1,10 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "dim0"
+    ],
+    "description": "the spike times for each unit in seconds",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorData",
+    "object_id": "d5dc6f6c-4dd3-4516-a7e7-2cabf3aa9286",
+    "zarr_dtype": "float64"
+}

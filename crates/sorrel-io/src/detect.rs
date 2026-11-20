@@ -9,7 +9,7 @@ pub enum Backend {
     Kilosort,
     /// SpikeInterface `SortingAnalyzer` saved as `binary_folder`.
     SortingAnalyzer,
-    /// `*.nwb` file (needs the `hdf5` feature to open).
+    /// `*.nwb` file or NWB-Zarr directory (needs `hdf5` or `zarr`, respectively).
     Nwb,
     /// Kilosort `rez.mat` / `rez2.mat` (needs the `hdf5` feature to open).
     Ks4Rez,
@@ -36,6 +36,9 @@ pub fn detect_backend(root: &Path) -> Result<Backend> {
     }
     if root.join("spike_times.npy").exists() && root.join("spike_clusters.npy").exists() {
         return Ok(Backend::Kilosort);
+    }
+    if crate::nwb::is_zarr_path(root) {
+        return Ok(Backend::Nwb);
     }
     // A zarr SortingAnalyzer has no recording.json to read: zarr v2 marks the
     // store with `.zgroup`, zarr v3 with `zarr.json`.

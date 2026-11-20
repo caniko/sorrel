@@ -139,6 +139,35 @@ fn nwb_call_preserves_exported_parent_without_a_row() {
     assert!(text.contains("\t0,unit:77\t"), "{text}");
 }
 
+#[cfg(feature = "zarr")]
+#[test]
+fn nwb_zarr_call_keeps_the_journal_in_a_temp_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../release/fixtures/nwb/good.nwb.zarr");
+    if !fixture.is_dir() {
+        return; // Cargo packages omit workspace fixtures.
+    }
+    // `call` writes a journal next to the input unless explicitly redirected.
+    let journal = tmp.path().join("nwb.sorrel.journal");
+    let out = sorrel(
+        tmp.path(),
+        &[
+            Path::new("call"),
+            &fixture,
+            Path::new("list_clusters"),
+            Path::new("--journal"),
+            &journal,
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(journal.is_file());
+}
+
 #[cfg(feature = "hdf5")]
 struct Host(std::process::Child);
 

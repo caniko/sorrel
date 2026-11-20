@@ -1,0 +1,10 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "dim0"
+    ],
+    "description": "Foreign KSLabel",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorData",
+    "object_id": "123c4329-87f6-49ce-86b0-3d2a60e1ab8f",
+    "zarr_dtype": "str"
+}

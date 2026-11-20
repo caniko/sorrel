@@ -1,0 +1,10 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "dim0"
+    ],
+    "description": "Foreign unrelated_number",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorData",
+    "object_id": "023c7f65-79ea-4cb6-a9f0-c38b1b09ea3f",
+    "zarr_dtype": "float"
+}

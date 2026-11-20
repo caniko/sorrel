@@ -1,0 +1,6 @@
+{
+    "description": "Processed ephys",
+    "namespace": "core",
+    "neurodata_type": "ProcessingModule",
+    "object_id": "8511d4eb-863c-4f9d-9728-1eead334a977"
+}

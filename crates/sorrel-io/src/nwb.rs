@@ -2,27 +2,42 @@
 //!
 //! Reads `/units` and, optionally, one ElectricalSeries from `/acquisition`,
 //! `/processing` or a second file. Uses a regular time base and reads trace
-//! windows on demand as float32 µV. Enable with `--features hdf5`.
+//! windows on demand as float32 µV. Enable with `--features hdf5` or `--features zarr`.
 
-#[cfg(not(feature = "hdf5"))]
+/// Recognize an NWB-Zarr directory by its name or root NWB version attribute.
+pub fn is_zarr_path(path: &std::path::Path) -> bool {
+    path.is_dir()
+        && (path.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with(".nwb.zarr")
+        }) || std::fs::read(path.join(".zattrs"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|attrs| attrs.get("nwb_version").is_some()))
+}
+
+#[cfg(not(any(feature = "hdf5", feature = "zarr")))]
 mod stub {
     use anyhow::{bail, Result};
     use std::path::Path;
 
     pub fn open_stub(_path: impl AsRef<Path>) -> Result<()> {
         bail!(
-            "NWB backend not built; rebuild sorrel-io with `--features hdf5` \
-             to enable the HDF5-based reader, or export the units table to phy \
+            "NWB backend not built; rebuild sorrel-io with `--features hdf5` or `--features zarr`, \
+             or export the units table to phy \
              via SpikeInterface and open that directory instead"
         )
     }
 }
 
-#[cfg(not(feature = "hdf5"))]
+#[cfg(not(any(feature = "hdf5", feature = "zarr")))]
 pub use stub::open_stub;
 
-#[cfg(feature = "hdf5")]
+#[cfg(any(feature = "hdf5", feature = "zarr"))]
 mod imp {
+    mod specs;
+    mod storage;
     use crate::extras::{HasGeometry, HasQualityMetrics, QualityMetrics};
     use crate::kilosort::{pinned_sorter, valid_tag, PhyLabel};
     use crate::provider::{
@@ -30,20 +45,19 @@ mod imp {
         TraceSlice, UnitAnnotation,
     };
     use anyhow::{anyhow, ensure, Context, Result};
-    use hdf5_metno as hdf5;
-    use hdf5_metno::types::{FloatSize, IntSize, TypeDescriptor, VarLenAscii, VarLenUnicode};
-    use hdf5_metno::File as H5File;
+    use specs::{legacy_is_series, legacy_type_parents, TypeSpecs};
     use std::cmp::Reverse;
     use std::collections::{BinaryHeap, HashMap, VecDeque};
     use std::ops::Range;
     use std::path::Path;
     use std::sync::Mutex;
+    use storage::{Dataset, Group, SampleType};
 
     const ELECTRODES: &str = "/general/extracellular_ephys/electrodes";
 
     #[derive(Clone, Copy, Debug, Default)]
     pub struct NwbOpenParams<'a> {
-        /// Acquisition name or absolute HDF5 path, also applied to a paired file.
+        /// Acquisition name or absolute NWB path, also applied to a paired file.
         pub series: Option<&'a str>,
         /// Read the ElectricalSeries from this file instead of the units file.
         pub raw_path: Option<&'a Path>,
@@ -72,14 +86,20 @@ mod imp {
 
         pub fn open_with(path: impl AsRef<Path>, params: NwbOpenParams<'_>) -> Result<Self> {
             let path = path.as_ref();
-            let f = open_hdf5(path)?;
-            let spike_times = stored_dataset(&f, "/units/spike_times")?;
-            let spike_times_index = stored_dataset(&f, "/units/spike_times_index")?;
-            let ids = stored_dataset(&f, "/units/id")?;
+            let f = Group::open(path)?;
+            let spike_times = f.stored_dataset("/units/spike_times")?;
+            let spike_times_index = f.stored_dataset("/units/spike_times_index")?;
+            let ids = f.stored_dataset("/units/id")?;
+            if let Some(target) = spike_times_index.reference_path("target")? {
+                ensure!(
+                    target == "/units/spike_times",
+                    "invalid /units/spike_times_index target {target:?}"
+                );
+            }
             let units = f
                 .group("/units")
                 .context("missing /units in the sorting NWB file")?;
-            let raw = params.raw_path.map(open_hdf5).transpose()?;
+            let raw = params.raw_path.map(Group::open).transpose()?;
             let recording = raw.as_ref().unwrap_or(&f);
             let series = find_electrical_series(recording, params.series, raw.is_some())?;
             // In a single file with a series, an invalid resolution value is
@@ -96,8 +116,7 @@ mod imp {
                 let data = series.dataset("data")?;
                 let shape = data.shape();
                 let (n_samples, n_channels) = (shape[0], shape.get(1).copied().unwrap_or(1));
-                let (stored_rate, t0, timestamps) =
-                    read_time_base(recording, series, name, n_samples)?;
+                let (stored_rate, t0, timestamps) = read_time_base(recording, name, n_samples)?;
                 let units_clock = if let Some(declared) = units_rate {
                     // The one-ppm gate decides whether resolution declares a clock,
                     // not whether an explicit value matches that clock.
@@ -120,8 +139,10 @@ mod imp {
                     });
                     anyhow::bail!("--sample-rate {rate} Hz is not a clock this NWB declares; pass one of: {stored_rate} Hz (series {name} {source}){units}");
                 }
-                legacy_identity =
-                    raw.is_none() && timestamps.is_none() && is_trunk_series(&f, name);
+                legacy_identity = raw.is_none()
+                    && timestamps.is_none()
+                    && f.supports_legacy_seal()
+                    && is_trunk_series(&f, name);
                 comparison_rate = if params.sample_rate.is_none() {
                     units_clock.filter(|&units| units != stored_rate)
                 } else {
@@ -169,15 +190,15 @@ mod imp {
                 ensure!(spikes_per_cluster.iter().filter_map(|s| s.last()).all(|s| s.0 < n_samples as u64),
                     "spike times extend past the paired ElectricalSeries (starting time {t0} s, {n_samples} samples at {rate} Hz)");
             }
-            let mut identity_bytes = provider_identity_bytes(path);
+            let mut identity_bytes = f.identity(path)?;
             if !(legacy_identity && same_mapping) {
                 if let Some((name, _)) = &series {
                     identity_bytes.extend_from_slice(name.as_bytes());
                 }
                 identity_bytes.push(0); // Terminate the path (empty for units-only).
                 identity_bytes.extend(rate.to_le_bytes());
-                if let Some(raw_path) = params.raw_path {
-                    identity_bytes.extend(provider_identity_bytes(raw_path));
+                if let Some((raw, raw_path)) = raw.as_ref().zip(params.raw_path) {
+                    identity_bytes.extend(raw.identity(raw_path)?);
                 }
             }
             let metadata = read_unit_metadata(&units, &unit_ids)?;
@@ -289,39 +310,35 @@ mod imp {
         }
     }
 
-    fn open_hdf5(path: &Path) -> Result<H5File> {
-        H5File::open(path).with_context(|| format!("open NWB {}", path.display()))
-    }
-
-    /// Clock values are read as f64; only native IEEE float32/float64
-    /// storage converts exactly (H5Tequal compares size, precision, offset,
-    /// exponent/mantissa layout and byte order). HDF5 would silently round a
-    /// long double, a custom float layout or a foreign byte order is refused.
-    fn exact_float(dtype: hdf5::Result<hdf5::Datatype>, what: &str) -> Result<()> {
-        let dtype = dtype?;
-        let ieee = dtype == hdf5::Datatype::from_type::<f64>()?
-            || dtype == hdf5::Datatype::from_type::<f32>()?;
-        ensure!(
-            ieee,
-            "{what} must be stored as native IEEE float32 or float64"
-        );
-        Ok(())
-    }
+    // At 2^53 an adjacent integer can round to the same f64.
+    const CLOCK_LIMIT: f64 = 9_007_199_254_740_992.0;
 
     fn checked_rate(rate: f64) -> Result<f64> {
         ensure!(
-            (rate as f32).is_finite() && (rate as f32) > 0.0,
-            "invalid sample rate {rate} Hz"
+            rate < CLOCK_LIMIT && (rate as f32) > 0.0,
+            "invalid sample rate {rate} Hz (must be positive and below 2^53 Hz)"
         );
         Ok(rate)
     }
 
-    fn read_units_rate(spike_times: &hdf5::Dataset, strict: bool) -> Result<Option<f64>> {
-        let Ok(attr) = spike_times.attr("resolution") else {
+    fn check_time(t: f64, what: &str) -> Result<()> {
+        ensure!(
+            t.abs() < CLOCK_LIMIT,
+            "invalid {what} {t} s (must be finite and have magnitude below 2^53 s)"
+        );
+        Ok(())
+    }
+
+    fn read_units_rate(spike_times: &Dataset, strict: bool) -> Result<Option<f64>> {
+        let Some(attr) = spike_times.optional_attr("resolution")? else {
             return Ok(None);
         };
-        exact_float(attr.dtype(), "/units/spike_times resolution")?;
-        match attr.read_scalar::<f64>()? {
+        let resolution = attr.exact_number("/units/spike_times resolution")?;
+        ensure!(
+            !(resolution.abs() >= CLOCK_LIMIT || (resolution > 0.0 && resolution <= CLOCK_LIMIT.recip())),
+            "invalid /units/spike_times resolution {resolution} s (resolution and sample rate must be below 2^53)"
+        );
+        match resolution {
             -1.0 => Ok(None), // Unspecified in the NWB schema.
             resolution => match checked_rate(resolution.recip()) {
                 Err(_) if !strict => Ok(None),
@@ -332,10 +349,10 @@ mod imp {
         }
     }
 
-    fn timestamp_epoch(file: &H5File) -> Result<jiff::Timestamp> {
+    fn timestamp_epoch(file: &Group) -> Result<jiff::Timestamp> {
         // NWB defines time zero separately from the experiment's start time.
         let ds = file.dataset("/timestamps_reference_time")?;
-        let value = read_str(&ds)?;
+        let value = ds.read_string()?;
         value
             .parse()
             .map_err(|err| anyhow!("invalid NWB epoch {value:?}: {err}"))
@@ -356,132 +373,21 @@ mod imp {
         }
     }
 
-    fn provider_identity_bytes(path: &Path) -> Vec<u8> {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"sorrel-provider-identity-v1/nwb");
-        hasher.update(
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("")
-                .as_bytes(),
-        );
-        if let Ok(meta) = std::fs::metadata(path) {
-            hasher.update(&meta.len().to_le_bytes());
-            if let Ok(modified) = meta.modified() {
-                if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
-                    hasher.update(&duration.as_secs().to_le_bytes());
-                    hasher.update(&duration.subsec_nanos().to_le_bytes());
-                }
-            }
-        }
-        hasher.finalize().as_bytes().to_vec()
-    }
-
-    fn read_str(data: &hdf5::Container) -> Result<String> {
-        ensure!(data.is_scalar(), "expected a scalar HDF5 string");
-        strings(data)?.pop().context("missing HDF5 string")
-    }
-
-    fn strings(data: &hdf5::Container) -> Result<Vec<String>> {
-        let dtype = data.dtype()?;
-        match dtype.to_descriptor()? {
-            TypeDescriptor::VarLenUnicode => Ok(data
-                .read_raw::<VarLenUnicode>()?
-                .iter()
-                .map(ToString::to_string)
-                .collect()),
-            TypeDescriptor::VarLenAscii => Ok(data
-                .read_raw::<VarLenAscii>()?
-                .iter()
-                .map(ToString::to_string)
-                .collect()),
-            TypeDescriptor::FixedAscii(width) | TypeDescriptor::FixedUnicode(width) => {
-                fixed_strings(data, &dtype, width)
-            }
-            _ => Err(anyhow!("expected an HDF5 string datatype")),
-        }
-    }
-
-    fn fixed_strings(
-        data: &hdf5::Container,
-        dtype: &hdf5::Datatype,
-        width: usize,
-    ) -> Result<Vec<String>> {
-        use hdf5_metno_sys::{
-            h5a::H5Aread,
-            h5d::H5Dread,
-            h5i::{H5Iget_type, H5I_ATTR},
-            h5p::H5P_DEFAULT,
-            h5s::H5Sget_simple_extent_npoints,
-            h5t::{H5T_str_t::H5T_STR_SPACEPAD, H5Tget_strpad},
-        };
-
-        // hdf5-metno's fixed strings require a compile-time width. Read with
-        // the file datatype as the memory datatype instead (no conversion).
-        let space = data.space()?;
-        // SAFETY: space is a live HDF5 dataspace, accessed under the HDF5 lock.
-        let count = hdf5::sync::sync(|| unsafe {
-            hdf5::h5check(H5Sget_simple_extent_npoints(space.id()))
-        })?;
-        let count = usize::try_from(count)?;
-        if count == 0 {
-            return Ok(Vec::new());
-        }
-        let len = count
-            .checked_mul(width)
-            .filter(|&n| n != 0)
-            .context("invalid HDF5 string size")?;
-        let mut bytes = Vec::<u8>::new();
-        bytes.try_reserve_exact(len)?;
-        bytes.resize(len, 0);
-        let space_pad = hdf5::sync::sync(|| {
-            // SAFETY: data and dtype are live; bytes holds count * width bytes
-            // for the whole dataspace, and the HDF5 lock serializes the calls.
-            unsafe {
-                let buf = bytes.as_mut_ptr().cast();
-                hdf5::h5check(if H5Iget_type(data.id()) == H5I_ATTR {
-                    H5Aread(data.id(), dtype.id(), buf)
-                } else {
-                    H5Dread(
-                        data.id(),
-                        dtype.id(),
-                        space.id(),
-                        space.id(),
-                        H5P_DEFAULT,
-                        buf,
-                    )
-                })?;
-                Ok::<_, hdf5::Error>(H5Tget_strpad(dtype.id()) == H5T_STR_SPACEPAD)
-            }
-        })?;
-        bytes
-            .chunks_exact(width)
-            .map(|s| {
-                let s = std::str::from_utf8(s.split(|&b| b == 0).next().unwrap_or_default())?;
-                Ok(if space_pad {
-                    s.trim_end_matches(' ')
-                } else {
-                    s
-                }
-                .to_owned())
-            })
-            .collect()
-    }
-
     pub(crate) fn read_trials(path: &Path) -> Result<crate::Events> {
-        let f = open_hdf5(path)?;
+        let f = Group::open(path)?;
         let g = f
-            .group("intervals/trials")
+            .group("/intervals/trials")
             .with_context(|| format!("{}: no /intervals/trials table", path.display()))?;
         let starts: Vec<f64> = g.dataset("start_time")?.read_raw()?;
-        let names = ["trial_type", "stimulus", "condition"]
-            .into_iter()
-            .filter_map(|c| g.dataset(c).ok())
-            .find_map(|ds| {
-                strings(&ds)
-                    .ok()
-                    .filter(|names| names.len() == starts.len())
-            });
+        let mut names = None;
+        for column in ["trial_type", "stimulus", "condition"] {
+            if let Some(ds) = g.optional_dataset(column)? {
+                if let Some(values) = ds.strings().ok().filter(|v| v.len() == starts.len()) {
+                    names = Some(values);
+                    break;
+                }
+            }
+        }
         let mut events = crate::Events::default();
         for (i, t) in starts.into_iter().enumerate() {
             events.push(t, names.as_ref().map_or("trial", |n| n[i].as_str()));
@@ -489,116 +395,67 @@ mod imp {
         Ok(events)
     }
 
-    /// `neurodata_type_def → neurodata_type_inc` for every type in the
-    /// file's cached specifications (core and extensions).
-    fn type_parents(
-        f: &H5File,
-        read: impl Fn(&hdf5::Container) -> Result<String>,
-    ) -> HashMap<String, String> {
-        fn collect(v: &serde_json::Value, out: &mut HashMap<String, String>) {
-            match v {
-                serde_json::Value::Object(m) => {
-                    if let (Some(def), Some(inc)) = (
-                        m.get("neurodata_type_def").and_then(|v| v.as_str()),
-                        m.get("neurodata_type_inc").and_then(|v| v.as_str()),
-                    ) {
-                        out.insert(def.to_owned(), inc.to_owned());
-                    }
-                    m.values().for_each(|v| collect(v, out));
-                }
-                serde_json::Value::Array(a) => a.iter().for_each(|v| collect(v, out)),
-                _ => {}
-            }
-        }
-        let mut out = HashMap::new();
-        let specs = f.group("/specifications").and_then(|g| g.groups());
-        for version in specs
-            .into_iter()
-            .flatten()
-            .flat_map(|ns| ns.groups())
-            .flatten()
-        {
-            for ds in version.datasets().into_iter().flatten() {
-                let text = read(&ds);
-                if let Some(v) = text.ok().and_then(|t| serde_json::from_str(&t).ok()) {
-                    collect(&v, &mut out);
-                }
-            }
-        }
-        out
-    }
-
-    fn is_electrical_series(ty: &str, parents: &HashMap<String, String>) -> bool {
-        let mut ty = ty;
-        // Bounded walk: a malformed spec could loop.
-        for _ in 0..32 {
-            if ty == "ElectricalSeries" {
-                return true;
-            }
-            match parents.get(ty) {
-                Some(parent) => ty = parent,
-                None => return false,
-            }
-        }
-        false
-    }
-
     /// Mirror trunk's discovery for the journal seal, including the old
     /// variable-length-only decoder for both type tags and cached specs.
-    fn is_trunk_series(f: &H5File, selected: &str) -> bool {
-        fn read_legacy_str(data: &hdf5::Container) -> Result<String> {
-            Ok(data
-                .read_scalar::<VarLenUnicode>()
-                .map(|s| s.to_string())
-                .or_else(|_| data.read_scalar::<VarLenAscii>().map(|s| s.to_string()))?)
-        }
+    fn is_trunk_series(f: &Group, selected: &str) -> bool {
         let Some(name) = selected.strip_prefix("/acquisition/") else {
             return false;
         };
-        let Ok(acq) = f.group("/acquisition") else {
+        let Ok(Some(acq)) = f.legacy_group("/acquisition") else {
             return false;
         };
         let Ok(names) = acq.member_names() else {
             return false;
         };
-        let parents = type_parents(f, read_legacy_str);
-        names
-            .into_iter()
-            .find(|name| {
-                let Ok(g) = acq.group(name) else { return false };
-                g.attr("neurodata_type")
-                    .ok()
-                    .and_then(|a| read_legacy_str(&a).ok())
-                    .is_some_and(|t| is_electrical_series(&t, &parents))
-                    && g.dataset("data").is_ok_and(|d| d.ndim() == 2)
-            })
-            .is_some_and(|first| first == name)
+        let parents = legacy_type_parents(f).unwrap_or_default();
+        for candidate in names {
+            let g = match acq.legacy_group(&candidate) {
+                Ok(Some(g)) => g,
+                Ok(None) => continue,
+                Err(_) => return false, // Can't rule out an earlier group.
+            };
+            let ty = match g.optional_attr("neurodata_type") {
+                Ok(attr) => attr.and_then(|a| a.legacy_string().ok()),
+                Err(_) => return false,
+            };
+            if ty.is_some_and(|t| legacy_is_series(&t, &parents)) {
+                match g.legacy_dataset_rank("data") {
+                    Ok(Some(2)) => return candidate == name,
+                    Ok(_) => (),
+                    Err(_) => return false, // Might have been trunk's series.
+                }
+            }
+        }
+        false
     }
 
     fn find_electrical_series(
-        f: &H5File,
+        f: &Group,
         requested: Option<&str>,
         required: bool,
-    ) -> Result<Option<(String, hdf5::Group)>> {
+    ) -> Result<Option<(String, Group)>> {
         fn collect(
-            group: &hdf5::Group,
+            group: &Group,
             path: &str,
             depth: usize,
-            is_series: &impl Fn(&str) -> bool,
-            found: &mut Vec<(String, hdf5::Group)>,
+            is_series: &impl Fn(&str, &str) -> Result<bool>,
+            found: &mut Vec<(String, Group)>,
         ) -> Result<()> {
             for name in group.member_names()? {
-                if group.loc_type_by_name(&name).ok() != Some(hdf5::LocationType::Group) {
+                let Some(child) = group.child_group(&name)? else {
                     continue;
-                }
-                let child = group.group(&name)?;
+                };
                 let path = format!("{path}/{name}");
-                if child
-                    .attr("neurodata_type")
-                    .ok()
-                    .and_then(|a| read_str(&a).ok())
-                    .is_some_and(|t| is_series(&t))
-                {
+                let ty = child
+                    .optional_attr("neurodata_type")?
+                    .map(|a| a.string())
+                    .transpose()?;
+                let is_series_node = if let Some(ty) = ty {
+                    is_series(&ty, &path)?
+                } else {
+                    false
+                };
+                if is_series_node {
                     found.push((path, child));
                 } else if depth > 0 {
                     // Bound the recursion in case of cyclic HDF5 links.
@@ -608,30 +465,44 @@ mod imp {
             Ok(())
         }
 
-        let parents = type_parents(f, read_str);
-        let is_series = |t: &str| is_electrical_series(t, &parents);
+        let requested_path = requested.map(|path| {
+            if path.starts_with('/') {
+                path.to_owned()
+            } else {
+                format!("/acquisition/{path}")
+            }
+        });
+        let specs = std::cell::OnceCell::new();
+        let is_series = |ty: &str, path: &str| {
+            let unavailable = || {
+                format!("cannot determine ElectricalSeries ancestry of {path} ({ty:?}); readable same-file cached NWB specifications are required")
+            };
+            let specs = specs.get_or_init(|| TypeSpecs::read(f));
+            let specs = specs
+                .as_ref()
+                .map_err(|err| anyhow!("{}: {err:#}", unavailable()))?;
+            // Default selection ranks every discovered group (processing
+            // included), so any conflict there could change the pick; with
+            // --nwb-series only the requested group matters.
+            let refuse_conflicts = requested_path.as_deref().is_none_or(|p| p == path);
+            specs.is_series(ty, refuse_conflicts)
+        };
         let mut found = Vec::new();
         for (root, depth) in [("/acquisition", 0), ("/processing", 32)] {
-            if f.link_exists(root) {
-                collect(&f.group(root)?, root, depth, &is_series, &mut found)?;
+            if let Some(group) = f.optional_group(root)? {
+                collect(&group, root, depth, &is_series, &mut found)?;
             }
         }
         found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let has_2d_data = |g: &hdf5::Group| g.dataset("data").is_ok_and(|d| d.ndim() == 2);
-        let supported_data = |g: &hdf5::Group| {
-            g.dataset("data").is_ok_and(|d| match d.shape().as_slice() {
-                [_] => true,
-                [_, channels] => *channels > 0,
-                _ => false,
-            })
+        let data_rank = |g: &Group| -> Result<usize> {
+            Ok(
+                match g.optional_dataset("data")?.map(|d| d.shape()).as_deref() {
+                    Some([_]) => 1,
+                    Some([_, channels]) if *channels > 0 => 2,
+                    _ => 0,
+                },
+            )
         };
-        // Keep the first 2-D acquisition as the historical default, but list
-        // unsupported shapes too so a selection error can name them.
-        let default_index = found
-            .iter()
-            .position(|(_, g)| has_2d_data(g) && supported_data(g))
-            .or_else(|| found.iter().position(|(_, g)| supported_data(g)))
-            .unwrap_or(0);
         let available = || {
             if found.is_empty() {
                 "none".to_string()
@@ -643,21 +514,22 @@ mod imp {
                     .join(", ")
             }
         };
-        let index = if let Some(requested) = requested {
-            let path = if requested.starts_with('/') {
-                requested.to_owned()
+        let index = if let Some(path) = &requested_path {
+            if let Some(index) = found.iter().position(|(name, _)| name == path) {
+                index
             } else {
-                format!("/acquisition/{requested}")
-            };
-            found
-                .iter()
-                .position(|(name, _)| *name == path)
-                .with_context(|| {
-                    format!(
-                        "no ElectricalSeries matching {requested:?}; available series: {}",
-                        available()
-                    )
-                })?
+                // A selected path outside the discovery walk can still contain a link.
+                if let Some(group) = f.optional_group(path)? {
+                    if let Some(ty) = group.optional_attr("neurodata_type")? {
+                        is_series(&ty.string()?, path)?;
+                    }
+                }
+                let requested = requested.unwrap_or(path);
+                anyhow::bail!(
+                    "no ElectricalSeries matching {requested:?}; available series: {}",
+                    available()
+                );
+            }
         } else if found.is_empty() {
             ensure!(
                 !required,
@@ -665,11 +537,19 @@ mod imp {
             );
             return Ok(None);
         } else {
-            default_index
+            let mut best = (0, 0);
+            for (i, (path, group)) in found.iter().enumerate() {
+                let rank = data_rank(group)
+                    .with_context(|| format!("ElectricalSeries {path}: invalid data"))?;
+                if rank > best.0 {
+                    best = (rank, i);
+                }
+            }
+            best.1
         };
         let (path, group) = &found[index];
         ensure!(
-            supported_data(group),
+            data_rank(group).with_context(|| format!("ElectricalSeries {path}: invalid data"))? != 0,
             "ElectricalSeries {path} requires 1-D data (one channel) or 2-D data (time × channels); available series: {}",
             available()
         );
@@ -682,97 +562,26 @@ mod imp {
         Ok(Some(found.swap_remove(index)))
     }
 
-    // The journal only seals explicitly opened files. Check each link before
-    // following it: even a link that resolves back into this file can go via a sidecar.
-    fn stored_dataset(file: &H5File, path: &str) -> Result<hdf5::Dataset> {
-        use hdf5::plist::dataset_create::Layout;
-        use hdf5_metno_sys::{
-            h5l::{self, H5L_info2_t, H5L_TYPE_EXTERNAL, H5L_TYPE_HARD, H5L_TYPE_SOFT},
-            h5p::{H5Pget_external_count, H5P_DEFAULT},
-        };
-        use std::ffi::{c_int, CString};
-        use std::mem::MaybeUninit;
-
-        let check = || {
-            let mut prefix = String::new();
-            for component in path.trim_start_matches('/').split('/') {
-                prefix.push('/');
-                prefix.push_str(component);
-                let name = CString::new(prefix.as_str())?;
-                let mut info = MaybeUninit::<H5L_info2_t>::uninit();
-                let kind = hdf5::sync::sync(|| {
-                    // SAFETY: file and the NUL-terminated name are live, info points to
-                    // writable storage, and the HDF5 lock serializes the call. Read the
-                    // type as a C int, since user-defined links can use other enum values.
-                    unsafe {
-                        // HDF5 2.x (the bundled static build) no longer exports
-                        // H5Lget_info1; H5Lget_info2 exists since 1.12.
-                        hdf5::h5check(h5l::H5Lget_info2(
-                            file.id(),
-                            name.as_ptr(),
-                            info.as_mut_ptr(),
-                            H5P_DEFAULT,
-                        ))?;
-                        Ok::<_, hdf5::Error>(info.as_ptr().cast::<c_int>().read())
-                    }
-                })
-                .with_context(|| format!("cannot inspect HDF5 link {prefix}"))?;
-                let kind = match kind {
-                    k if k == H5L_TYPE_HARD as c_int => continue,
-                    k if k == H5L_TYPE_SOFT as c_int => "soft link",
-                    k if k == H5L_TYPE_EXTERNAL as c_int => "external link",
-                    _ => "non-hard link",
-                };
-                anyhow::bail!("{prefix} is an HDF5 {kind}");
-            }
-            let ds = file.dataset(path).context("cannot open dataset")?;
-            let dcpl = ds
-                .dcpl()
-                .context("cannot inspect dataset creation properties")?;
-            ensure!(
-                [Layout::Compact, Layout::Contiguous, Layout::Chunked].contains(
-                    &dcpl
-                        .get_layout()
-                        .context("cannot inspect HDF5 dataset layout")?
-                ),
-                "HDF5 virtual dataset layout"
-            );
-            // SAFETY: dcpl is a live dataset creation plist and HDF5 is locked.
-            let external =
-                hdf5::sync::sync(|| unsafe { hdf5::h5check(H5Pget_external_count(dcpl.id())) })
-                    .context("cannot inspect HDF5 external raw storage")?;
-            ensure!(external == 0, "HDF5 external raw storage");
-            Ok(ds)
-        };
-        check().with_context(|| format!("NWB dataset {path} must be stored in this file; open the file that holds the data directly, or pass the recording file via --dat"))
-    }
-
     /// `(rate Hz, starting_time s, recorded timestamps)`.
     fn read_time_base(
-        file: &H5File,
-        g: &hdf5::Group,
+        file: &Group,
         name: &str,
         n_samples: usize,
-    ) -> Result<(f64, f64, Option<hdf5::Dataset>)> {
-        let read = || {
-            if g.link_exists("timestamps") {
-                let ds = stored_dataset(file, &format!("{name}/timestamps"))?;
-                exact_float(ds.dtype(), "timestamps")?;
+    ) -> Result<(f64, f64, Option<Dataset>)> {
+        let read = || -> Result<_> {
+            if let Some(ds) = file.optional_stored_dataset(&format!("{name}/timestamps"))? {
+                ds.exact_float("timestamps")?;
                 let (rate, t0) = regular_timestamps(&ds, n_samples)?;
                 return Ok((rate, t0, Some(ds)));
             }
-            ensure!(
-                g.link_exists("starting_time"),
-                "neither starting_time nor timestamps"
-            );
-            let st = stored_dataset(file, &format!("{name}/starting_time"))?;
+            let st = file
+                .optional_stored_dataset(&format!("{name}/starting_time"))?
+                .context("neither starting_time nor timestamps")?;
             let rate = st.attr("rate").context("starting_time has no rate")?;
-            exact_float(rate.dtype(), "starting_time rate")?;
-            exact_float(st.dtype(), "starting_time")?;
-            // Reading as f64 widens a float32 attribute exactly.
-            let rate = checked_rate(rate.read_scalar()?)?;
+            st.exact_float("starting_time")?;
+            let rate = checked_rate(rate.exact_number("starting_time rate")?)?;
             let t0: f64 = st.read_scalar()?;
-            ensure!(t0.is_finite(), "invalid starting_time {t0}");
+            check_time(t0, "starting_time")?;
             Ok((rate, t0, None))
         };
         read().with_context(|| format!("ElectricalSeries {name}: invalid time base"))
@@ -780,14 +589,15 @@ mod imp {
 
     const TIMESTAMP_BLOCK: usize = 65_536;
 
-    fn read_timestamp_block(ds: &hdf5::Dataset, range: Range<usize>) -> Result<Vec<f64>> {
-        Ok(ds
-            .read_slice_1d::<f64, _>(range)?
-            .into_raw_vec_and_offset()
-            .0)
+    fn read_timestamp_block(ds: &Dataset, range: Range<usize>) -> Result<Vec<f64>> {
+        let times = ds.read_rows(range)?;
+        for &t in &times {
+            check_time(t, "timestamps value")?;
+        }
+        Ok(times)
     }
 
-    fn regular_timestamps(ds: &hdf5::Dataset, n: usize) -> Result<(f64, f64)> {
+    fn regular_timestamps(ds: &Dataset, n: usize) -> Result<(f64, f64)> {
         ensure!(
             ds.shape() == [n] && n >= 2,
             "timestamps must contain one time per sample and at least two times to infer a rate"
@@ -800,11 +610,7 @@ mod imp {
         let rate =
             checked_rate(period.recip()).context("irregular timestamps: invalid mean interval")?;
         let scale = t0.abs().max(last.abs());
-        let ulp = if scale == f64::MAX {
-            scale - scale.next_down()
-        } else {
-            scale.next_up() - scale
-        };
+        let ulp = scale.next_up() - scale;
         // A 0.01-sample ULP caps the tolerance at 0.041 samples, well below
         // half a sample, and allows 30 kHz Unix-epoch timestamps (~0.0072).
         ensure!(ulp * rate <= 0.01,
@@ -838,37 +644,31 @@ mod imp {
     /// series' `electrodes` region.
     type Channels = (Vec<ChannelId>, Vec<[f32; 2]>);
 
-    fn read_channels(
-        f: &H5File,
-        series: &hdf5::Group,
-        name: &str,
-        n_channels: usize,
-    ) -> Result<Channels> {
-        // ponytail: assumes the region points at the canonical electrodes
-        // table rather than dereferencing its `table` object reference.
-        let rows: Vec<i64> = series
+    fn read_channels(f: &Group, series: &Group, name: &str, n_channels: usize) -> Result<Channels> {
+        let region = series
             .dataset("electrodes")
-            .and_then(|d| d.read_raw())
             .with_context(|| format!("ElectricalSeries {name}: no electrodes region"))?;
+        let rows: Vec<i64> = region.read_raw()?;
         ensure!(
             rows.len() == n_channels,
             "ElectricalSeries {name}: {} electrodes for {n_channels} data columns",
             rows.len()
         );
-        let table = f.group(ELECTRODES).context("missing electrodes table")?;
+        let path = region.reference_path("table")?;
+        let table = f
+            .group(path.as_deref().unwrap_or(ELECTRODES))
+            .context("missing electrodes table")?;
         read_electrodes(&table, Some(rows))
     }
 
-    fn read_units_only_channels(f: &H5File) -> Result<Channels> {
-        // The parent group may also be absent; avoid a nested link_exists
-        // call on an absent parent (an HDF5 error, not just a missing link).
-        match f.group(ELECTRODES) {
-            Ok(table) => read_electrodes(&table, None),
-            Err(_) => Ok(Channels::default()),
+    fn read_units_only_channels(f: &Group) -> Result<Channels> {
+        match f.optional_group(ELECTRODES)? {
+            Some(table) => read_electrodes(&table, None),
+            None => Ok(Channels::default()),
         }
     }
 
-    fn read_electrodes(table: &hdf5::Group, rows: Option<Vec<i64>>) -> Result<Channels> {
+    fn read_electrodes(table: &Group, rows: Option<Vec<i64>>) -> Result<Channels> {
         let ids: Vec<i64> = table.dataset("id")?.read_raw()?;
         let rows = if let Some(rows) = rows {
             rows.into_iter()
@@ -890,11 +690,20 @@ mod imp {
                     .map_err(|_| anyhow!("electrode id {} does not fit u32", ids[r]))
             })
             .collect::<Result<_>>()?;
-        let column = |c: &str| -> Option<Vec<f32>> {
-            let v: Vec<f32> = table.dataset(c).and_then(|d| d.read_raw()).ok()?;
-            (v.len() == ids.len()).then_some(v)
+        let column = |c: &str| -> Result<Option<Vec<f32>>> {
+            let Some(ds) = table.optional_dataset(c)? else {
+                return Ok(None);
+            };
+            let values: Vec<f32> = ds
+                .read_raw()
+                .with_context(|| format!("read electrodes {c}"))?;
+            ensure!(
+                values.len() == ids.len(),
+                "electrodes {c} length does not match id"
+            );
+            Ok(Some(values))
         };
-        let positions = match (column("rel_x"), column("rel_y")) {
+        let positions = match (column("rel_x")?, column("rel_y")?) {
             (Some(x), Some(y)) => rows.iter().map(|&r| [x[r], y[r]]).collect(),
             _ => Vec::new(),
         };
@@ -907,8 +716,8 @@ mod imp {
     const TRACE_BLOCK_BYTES: usize = 1024 * 1024;
 
     struct NwbTrace {
-        data: hdf5::Dataset,
-        dtype: TypeDescriptor,
+        data: Dataset,
+        dtype: SampleType,
         gain: Vec<f64>,
         offset_uv: f64,
         n_samples: usize,
@@ -920,25 +729,32 @@ mod imp {
 
     impl NwbTrace {
         fn new(
-            series: &hdf5::Group,
-            data: hdf5::Dataset,
+            series: &Group,
+            data: Dataset,
             name: &str,
             n_samples: usize,
             n_channels: usize,
         ) -> Result<Self> {
             ensure!(n_channels > 0, "ElectricalSeries {name}: no channels");
-            let dtype = data.dtype()?.to_descriptor().with_context(|| {
-                format!("ElectricalSeries {name}: unsupported HDF5 sample datatype")
-            })?;
+            let dtype = data
+                .sample_type()
+                .with_context(|| format!("ElectricalSeries {name}: unsupported sample datatype"))?;
             ensure!(
                 matches!(
                     dtype,
-                    TypeDescriptor::Integer(_)
-                        | TypeDescriptor::Unsigned(IntSize::U1 | IntSize::U2 | IntSize::U4)
-                        | TypeDescriptor::Float(_)
+                    SampleType::I8
+                        | SampleType::U8
+                        | SampleType::I16
+                        | SampleType::U16
+                        | SampleType::I32
+                        | SampleType::U32
+                        | SampleType::I64
+                        | SampleType::F32
+                        | SampleType::F64
                 ),
-                "ElectricalSeries {name}: {dtype} samples are not supported \
-                 (expected int8, uint8, int16, uint16, int32, uint32, int64, float32 or float64)"
+                "ElectricalSeries {name}: {} samples are not supported \
+                 (expected int8, uint8, int16, uint16, int32, uint32, int64, float32 or float64)",
+                dtype.name()
             );
             let (gain, offset_uv) = trace_scale(series, &data, name, n_channels)?;
             let max_frames = (TRACE_BLOCK_BYTES / 4 / n_channels).max(1);
@@ -990,17 +806,7 @@ mod imp {
             // to int16). Scale in f64 before narrowing, including f64 input.
             macro_rules! read_scaled {
                 ($ty:ty) => {{
-                    let raw = if self.data.ndim() == 1 {
-                        self.data
-                            .read_slice_1d::<$ty, _>(start..end)?
-                            .into_raw_vec_and_offset()
-                            .0
-                    } else {
-                        self.data
-                            .read_slice_2d::<$ty, _>((start..end, ..))?
-                            .into_raw_vec_and_offset()
-                            .0
-                    };
+                    let raw = self.data.read_rows::<$ty>(start..end)?;
                     raw.into_iter()
                         .zip(self.gain.iter().cycle())
                         .map(|(v, g)| (v as f64 * g + self.offset_uv) as f32)
@@ -1008,15 +814,15 @@ mod imp {
                 }};
             }
             Ok(match self.dtype {
-                TypeDescriptor::Integer(IntSize::U1) => read_scaled!(i8),
-                TypeDescriptor::Unsigned(IntSize::U1) => read_scaled!(u8),
-                TypeDescriptor::Integer(IntSize::U2) => read_scaled!(i16),
-                TypeDescriptor::Unsigned(IntSize::U2) => read_scaled!(u16),
-                TypeDescriptor::Integer(IntSize::U4) => read_scaled!(i32),
-                TypeDescriptor::Unsigned(IntSize::U4) => read_scaled!(u32),
-                TypeDescriptor::Integer(IntSize::U8) => read_scaled!(i64),
-                TypeDescriptor::Float(FloatSize::U4) => read_scaled!(f32),
-                TypeDescriptor::Float(FloatSize::U8) => read_scaled!(f64),
+                SampleType::I8 => read_scaled!(i8),
+                SampleType::U8 => read_scaled!(u8),
+                SampleType::I16 => read_scaled!(i16),
+                SampleType::U16 => read_scaled!(u16),
+                SampleType::I32 => read_scaled!(i32),
+                SampleType::U32 => read_scaled!(u32),
+                SampleType::I64 => read_scaled!(i64),
+                SampleType::F32 => read_scaled!(f32),
+                SampleType::F64 => read_scaled!(f64),
                 _ => unreachable!("dtype checked on open"),
             })
         }
@@ -1024,28 +830,31 @@ mod imp {
 
     /// `data × conversion × channel_conversion + offset` volts, times 10⁶.
     fn trace_scale(
-        series: &hdf5::Group,
-        data: &hdf5::Dataset,
+        series: &Group,
+        data: &Dataset,
         name: &str,
         n_channels: usize,
     ) -> Result<(Vec<f64>, f64)> {
-        if let Some(unit) = data.attr("unit").ok().and_then(|a| read_str(&a).ok()) {
+        if let Some(unit) = data.optional_attr("unit")? {
+            let unit = unit.string()?;
             ensure!(
                 unit.eq_ignore_ascii_case("volts"),
                 "ElectricalSeries {name}: data unit is {unit:?}, expected volts"
             );
         }
         let scalar = |attr: &str, default: f64| -> Result<f64> {
-            match data.attr(attr) {
-                Ok(a) => Ok(a.read_scalar()?),
-                Err(_) => Ok(default),
+            match data.optional_attr(attr)? {
+                Some(a) => a
+                    .number()
+                    .with_context(|| format!("ElectricalSeries {name}: invalid {attr}")),
+                None => Ok(default),
             }
         };
         let conversion = scalar("conversion", 1.0)?;
         let offset_uv = scalar("offset", 0.0)? * 1e6;
-        let channel_conversion: Vec<f64> = match series.dataset("channel_conversion") {
-            Ok(d) => d.read_raw()?,
-            Err(_) => vec![1.0; n_channels],
+        let channel_conversion: Vec<f64> = match series.optional_dataset("channel_conversion")? {
+            Some(d) => d.read_raw().context("read channel_conversion")?,
+            None => vec![1.0; n_channels],
         };
         ensure!(
             channel_conversion.len() == n_channels,
@@ -1063,16 +872,16 @@ mod imp {
     /// whether the mapping agrees with the optional comparison rate. Any
     /// disagreement is an error when there is no explicit clock choice.
     fn load_units(
-        ids: &hdf5::Dataset,
-        spike_times: &hdf5::Dataset,
-        spike_times_index: &hdf5::Dataset,
+        ids: &Dataset,
+        spike_times: &Dataset,
+        spike_times_index: &Dataset,
         rate: f64,
         t0: f64,
-        timestamps: Option<(&hdf5::Dataset, usize)>,
+        timestamps: Option<(&Dataset, usize)>,
         mut comparison: Option<(f64, bool)>,
     ) -> Result<(Vec<Vec<SampleIndex>>, Vec<u32>, bool)> {
         let ids: Vec<i64> = ids.read_raw()?;
-        exact_float(spike_times.dtype(), "/units/spike_times")?;
+        spike_times.exact_float("/units/spike_times")?;
         let mut all: Vec<f64> = spike_times.read_raw()?;
         let ends: Vec<i64> = spike_times_index.read_raw()?;
         ensure!(
@@ -1107,6 +916,7 @@ mod imp {
                 .iter()
                 .enumerate()
                 .map(|(spike, &t)| {
+                    check_time(t, "/units/spike_times value")?;
                     let s = exact_sample(t, t0, rate);
                     ensure!(s.is_finite() && (0.0..u64::MAX as f64).contains(&s)
                         && timestamps.is_none_or(|(_, n_samples)| (s as u64) < n_samples as u64),
@@ -1215,7 +1025,7 @@ mod imp {
     }
 
     fn check_timestamp_spikes(
-        ds: &hdf5::Dataset,
+        ds: &Dataset,
         n_samples: usize,
         mut times: &[f64],
         unit_ids: &[u32],
@@ -1293,16 +1103,18 @@ mod imp {
         metrics: QualityMetrics,
     }
 
-    fn read_unit_metadata(units: &hdf5::Group, ids: &[u32]) -> Result<UnitMetadata> {
+    fn read_unit_metadata(units: &Group, ids: &[u32]) -> Result<UnitMetadata> {
         let n = ids.len();
-        let string_column = |name| {
-            let ds = units.dataset(name).ok()?;
-            (ds.shape() == [n]).then(|| strings(&ds).ok()).flatten()
+        let string_column = |name| -> Result<Option<Vec<String>>> {
+            let Some(ds) = units.optional_dataset(name)? else {
+                return Ok(None);
+            };
+            Ok((ds.shape() == [n]).then(|| ds.strings().ok()).flatten())
         };
-        let label_columns: Vec<_> = ["label", "quality", "KSLabel"]
-            .into_iter()
-            .filter_map(string_column)
-            .collect();
+        let mut label_columns = Vec::new();
+        for name in ["label", "quality", "KSLabel"] {
+            label_columns.extend(string_column(name)?);
+        }
         let labels = (0..n)
             .map(|i| {
                 label_columns
@@ -1318,40 +1130,43 @@ mod imp {
             })
             .collect();
 
-        let index = |column: &str| -> Option<Vec<usize>> {
-            let ds = units.dataset(&format!("{column}_index")).ok()?;
+        let index = |column: &str| -> Result<Option<Vec<usize>>> {
+            let Some(ds) = units.optional_dataset(&format!("{column}_index"))? else {
+                return Ok(None);
+            };
             if ds.shape() != [n] {
-                return None;
+                return Ok(None);
             }
-            ds.read_raw::<u64>()
-                .ok()?
-                .into_iter()
-                .map(|v| usize::try_from(v).ok())
-                .collect()
+            Ok(ds
+                .read_raw::<u64>()
+                .ok()
+                .and_then(|ends| ends.into_iter().map(|v| usize::try_from(v).ok()).collect()))
         };
-        let tags = (|| {
-            let ends = index("tags")?;
-            let ds = units.dataset("tags").ok()?;
-            let values = strings(&ds).ok()?;
-            let mut rows = ragged_rows(&values, &ends)?;
-            for row in &mut rows {
-                row.retain(|tag| valid_tag(tag));
-            }
-            Some(rows)
-        })()
-        .unwrap_or_default();
+        let tag_index = index("tags")?;
+        let tag_values = units.optional_dataset("tags")?;
+        let tags = tag_index
+            .zip(tag_values)
+            .and_then(|(ends, ds)| {
+                let values = ds.strings().ok()?;
+                let mut rows = ragged_rows(&values, &ends)?;
+                for row in &mut rows {
+                    row.retain(|tag| valid_tag(tag));
+                }
+                Some(rows)
+            })
+            .unwrap_or_default();
         let mut annotations = vec![UnitAnnotation::default(); n];
-        if let Some(origins) = string_column("origin") {
+        if let Some(origins) = string_column("origin")? {
             for (annotation, origin) in annotations.iter_mut().zip(origins) {
                 annotation.origin = origin;
             }
         }
-        if let Some(parents) = (|| {
-            let ends = index("parent_unit_ids")?;
-            let ds = units.dataset("parent_unit_ids").ok()?;
+        let parent_index = index("parent_unit_ids")?;
+        let parent_values = units.optional_dataset("parent_unit_ids")?;
+        if let Some(parents) = parent_index.zip(parent_values).and_then(|(ends, ds)| {
             let values = ds.read_raw::<i64>().ok()?;
             ragged_rows(&values, &ends)
-        })() {
+        }) {
             let clusters: HashMap<_, _> = ids
                 .iter()
                 .enumerate()
@@ -1369,7 +1184,7 @@ mod imp {
                 }
             }
         }
-        let names = string_column("unit_name").filter(|names| {
+        let names = string_column("unit_name")?.filter(|names| {
             let mut unique = std::collections::HashSet::new();
             names
                 .iter()
@@ -1378,6 +1193,11 @@ mod imp {
 
         let mut metrics = QualityMetrics::new();
         for name in units.member_names()? {
+            // An unresolved link may hide a Sorrel metric. Unrecognized local
+            // datatypes may belong to other writers and remain outside our schema.
+            if !units.local_member_exists(&name)? {
+                continue;
+            }
             let Ok(ds) = units.dataset(&name) else {
                 continue;
             };
@@ -1387,12 +1207,13 @@ mod imp {
                 && ds
                     .attr("description")
                     .ok()
-                    .and_then(|a| read_str(&a).ok())
+                    .and_then(|a| a.string().ok())
                     .is_some_and(|d| d.starts_with("Sorrel QC metric. "))
             {
-                if let Ok(values) = ds.read_raw::<f32>() {
-                    metrics.insert(name, values);
-                }
+                let values = ds
+                    .read_raw::<f32>()
+                    .with_context(|| format!("read Units metric {name}"))?;
+                metrics.insert(name, values);
             }
         }
         metrics.sort_by_name();
@@ -1422,37 +1243,59 @@ mod imp {
     #[cfg(test)]
     #[test]
     fn lazy_window_matches_eager_scaling_across_chunks_and_end() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../release/fixtures/nwb/good.nwb");
-        let p = NwbProvider::open(path).unwrap();
-        let trace = p.trace.as_ref().unwrap();
-        assert_eq!(trace.block_frames, 32);
-        assert!(trace.cache.lock().unwrap().is_empty());
-        let eager: Vec<f32> = trace
-            .data
-            .read_raw::<i16>()
-            .unwrap()
-            .into_iter()
-            .zip(trace.gain.iter().cycle())
-            .map(|(v, gain)| (v as f64 * gain + trace.offset_uv) as f32)
-            .collect();
-        let slice = p.trace(SampleIndex(29), 300);
-        assert_eq!(slice.start, SampleIndex(29));
-        assert_eq!(slice.n_channels, 4);
-        assert_eq!(slice.samples.to_f32_centred(), eager[29 * 4..]);
-        assert_eq!(trace.cache.lock().unwrap().len(), TRACE_CACHE_BLOCKS);
-        assert_eq!(
-            p.trace(SampleIndex(290), 10).samples.to_f32_centred(),
-            eager[290 * 4..]
-        );
-        assert!(p.trace(SampleIndex(u64::MAX), 1).samples.is_empty());
+        const FIXTURES: &[&str] = &[
+            #[cfg(feature = "hdf5")]
+            "good.nwb",
+            #[cfg(feature = "zarr")]
+            "good.nwb.zarr",
+        ];
+        for name in FIXTURES {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../release/fixtures/nwb")
+                .join(name);
+            let p = NwbProvider::open(path).unwrap();
+            let trace = p.trace.as_ref().unwrap();
+            assert_eq!(trace.block_frames, 32);
+            assert!(trace.cache.lock().unwrap().is_empty());
+            let eager: Vec<f32> = trace
+                .data
+                .read_raw::<i16>()
+                .unwrap()
+                .into_iter()
+                .zip(trace.gain.iter().cycle())
+                .map(|(v, gain)| (v as f64 * gain + trace.offset_uv) as f32)
+                .collect();
+            let slice = p.trace(SampleIndex(29), 300);
+            assert_eq!(slice.start, SampleIndex(29));
+            assert_eq!(slice.n_channels, 4);
+            assert_eq!(slice.samples.to_f32_centred(), eager[29 * 4..]);
+            assert_eq!(trace.cache.lock().unwrap().len(), TRACE_CACHE_BLOCKS);
+            assert_eq!(
+                p.trace(SampleIndex(290), 10).samples.to_f32_centred(),
+                eager[290 * 4..]
+            );
+            assert!(p.trace(SampleIndex(u64::MAX), 1).samples.is_empty());
+        }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "hdf5", feature = "zarr"))]
+    #[test]
+    fn zarr_and_hdf5_windows_match() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../release/fixtures/nwb");
+        for file in ["good.nwb", "timestamps.nwb"] {
+            // Blosc/LZ4 and zlib, respectively.
+            let hdf5 = NwbProvider::open(dir.join(file)).unwrap();
+            let zarr = NwbProvider::open(dir.join(format!("{file}.zarr"))).unwrap();
+            let window = |p: &NwbProvider| p.trace(SampleIndex(29), 176).samples.to_f32_centred();
+            assert_eq!(window(&hdf5), window(&zarr), "{file}");
+        }
+    }
+
+    #[cfg(all(test, feature = "hdf5"))]
     #[test]
     fn timestamp_validation_rejects_subsample_jitter() {
         let dir = tempfile::tempdir().unwrap();
-        let file = H5File::create(dir.path().join("timestamps.h5")).unwrap();
+        let file = hdf5_metno::File::create(dir.path().join("timestamps.h5")).unwrap();
         // Alternating 0.8/1.2 ms intervals on a nominal 1 kHz grid.
         let times = [0.5, 0.5008, 0.502, 0.5028, 0.504];
         let ds = file
@@ -1460,11 +1303,11 @@ mod imp {
             .with_data(&times)
             .create("timestamps")
             .unwrap();
-        let err = regular_timestamps(&ds, times.len()).unwrap_err();
+        let err = regular_timestamps(&Dataset::Hdf5(ds.clone()), times.len()).unwrap_err();
         assert!(err.to_string().contains("max deviation 0.200000 samples"));
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "hdf5"))]
     #[test]
     fn rejects_external_links_for_spike_mapping() {
         let dir = tempfile::tempdir().unwrap();
@@ -1483,7 +1326,7 @@ mod imp {
             let path = dir.path().join(fixture);
             std::fs::write(&path, std::fs::read(&source).unwrap()).unwrap();
             {
-                let file = H5File::open_rw(&path).unwrap();
+                let file = hdf5_metno::File::open_rw(&path).unwrap();
                 file.unlink(dataset).unwrap();
                 file.link_external(source.to_str().unwrap(), dataset, dataset)
                     .unwrap();
@@ -1541,11 +1384,11 @@ mod imp {
         assert_eq!(exact_distance(1.0, 1.5), exact_distance(2.0, 1.5));
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "hdf5"))]
     #[test]
     fn timestamp_validation_rejects_coarse_epoch_clock() {
         let dir = tempfile::tempdir().unwrap();
-        let file = H5File::create(dir.path().join("timestamps.h5")).unwrap();
+        let file = hdf5_metno::File::create(dir.path().join("timestamps.h5")).unwrap();
         let origin = 1_700_000_000.0_f64;
         let ulp = origin.next_up() - origin;
         let mut times: Vec<_> = (0..128)
@@ -1557,15 +1400,15 @@ mod imp {
             .with_data(&times)
             .create("timestamps")
             .unwrap();
-        let error = regular_timestamps(&ds, times.len()).unwrap_err();
+        let error = regular_timestamps(&Dataset::Hdf5(ds.clone()), times.len()).unwrap_err();
         assert!(error.to_string().contains("timestamps are too coarse"));
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "hdf5"))]
     #[test]
     fn timestamp_validation_checks_the_interval_between_read_blocks() {
         let dir = tempfile::tempdir().unwrap();
-        let file = H5File::create(dir.path().join("timestamps.h5")).unwrap();
+        let file = hdf5_metno::File::create(dir.path().join("timestamps.h5")).unwrap();
         let origin = 1_700_000_000.0;
         let mut times: Vec<f64> = (0..65_540)
             .map(|i| origin + f64::from(i) / 30_000.0)
@@ -1575,20 +1418,20 @@ mod imp {
             .with_data(&times)
             .create("timestamps")
             .unwrap();
-        let (rate, t0) = regular_timestamps(&ds, times.len()).unwrap();
+        let (rate, t0) = regular_timestamps(&Dataset::Hdf5(ds.clone()), times.len()).unwrap();
         assert!((rate - 30_000.0).abs() < 0.01);
         assert_eq!(t0, origin);
         // Duplicate the first timestamp in the second block at the boundary.
         times[65_537] = times[65_536];
         ds.write(&times).unwrap();
-        let error = regular_timestamps(&ds, times.len()).unwrap_err();
+        let error = regular_timestamps(&Dataset::Hdf5(ds.clone()), times.len()).unwrap_err();
         assert!(error
             .to_string()
             .contains("irregular timestamps at sample 65537"));
     }
 }
 
-#[cfg(feature = "hdf5")]
+#[cfg(any(feature = "hdf5", feature = "zarr"))]
 pub(crate) use imp::read_trials;
-#[cfg(feature = "hdf5")]
+#[cfg(any(feature = "hdf5", feature = "zarr"))]
 pub use imp::{NwbOpenParams, NwbProvider};

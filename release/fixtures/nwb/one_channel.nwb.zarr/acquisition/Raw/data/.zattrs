@@ -1,0 +1,10 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "num_times"
+    ],
+    "conversion": 1e-06,
+    "offset": 0.0,
+    "resolution": -1.0,
+    "unit": "volts",
+    "zarr_dtype": "int16"
+}

@@ -8,7 +8,7 @@
 //!   semicolon separator is accepted as for the metrics CSV.
 //! - `events.npy`: 1-D `f64` (or `f32`) seconds, one unnamed label.
 //!
-//! An NWB file (`hdf5` feature) contributes `/intervals/trials/start_time`,
+//! An NWB file or store contributes `/intervals/trials/start_time`,
 //! labelled by the first of `trial_type`, `stimulus`, `condition` that is a
 //! string column. It is read by [`Events::read`] only, never auto-detected.
 
@@ -77,8 +77,8 @@ impl Events {
                     .with_context(|| format!("read {}", path.display()))?;
                 Self::parse_csv(&text)?
             }
-            #[cfg(feature = "hdf5")]
-            "nwb" => crate::nwb::read_trials(path)?,
+            #[cfg(any(feature = "hdf5", feature = "zarr"))]
+            _ if ext == "nwb" || crate::nwb::is_zarr_path(path) => crate::nwb::read_trials(path)?,
             other => bail!("{}: unsupported events file type {other:?}", path.display()),
         };
         // Keep (time, label) pairs together while sorting by time.

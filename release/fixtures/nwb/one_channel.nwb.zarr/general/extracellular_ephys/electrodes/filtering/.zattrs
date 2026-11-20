@@ -1,0 +1,10 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "dim0"
+    ],
+    "description": "Description of hardware filtering.",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorData",
+    "object_id": "9009cb4f-0aa6-417a-b3cc-ba8f73a896dd",
+    "zarr_dtype": "str"
+}

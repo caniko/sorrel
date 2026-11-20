@@ -154,10 +154,13 @@ What Sorrel reads:
   instead of loading the entire trace. It looks for `ElectricalSeries` (or an
   extension subtype declared in `/specifications`) under `/acquisition` and
   `/processing`, with 2-D `data` (time × channels) or 1-D `data` (one channel).
+  Conflicting cached type definitions that affect series selection are refused.
   By default it prefers 2-D series, then takes the first series by path
   (acquisitions before processed series), and logs the available paths when there is
-  more than one. `--nwb-series` takes an acquisition name or an absolute path
-  in the NWB file, not a filesystem path. Use a separate `--journal` when
+  more than one. Linked series and linked datasets used by the reader are
+  refused; open the file or store that holds the data directly. `--nwb-series`
+  takes an acquisition name or an absolute path in the NWB file, not a
+  filesystem path. Use a separate `--journal` when
   curating against another series or a different paired recording. To reuse
   an open tab or attach `call` or `mcp` to its host, pass the same open options;
   conflicting options are refused rather than silently ignored.
@@ -202,17 +205,33 @@ Spike indices must fit
 inside the raw series. The files must have the same `timestamps_reference_time`;
 Sorrel does not infer an offset between files.
 
-The reader needs a local HDF5 file with `/units`. Default builds and release
+The reader needs a local NWB with `/units`. Default builds and release
 binaries bundle HDF5, including gzip/deflate and LZF, so no system HDF5
-installation is needed. One series is read per session; multi-segment stitching,
-NWB-Zarr and DANDI/HTTP streaming are not supported.
+installation is needed. One series is read per session; multi-segment
+stitching and DANDI/HTTP streaming are not supported.
 
 - Timestamps with float64 spacing greater than 0.01 samples are refused; if sampling was regular, rewrite the series with `starting_time` and `rate`.
 - With per-sample `timestamps`, each spike must map to a sample inside the series whose recorded timestamp is nearest to the spike time (ties are allowed). Sorrel refuses the file if the inferred grid disagrees.
-- The selected clock (`starting_time` with its `rate`, or `timestamps`) and `/units/id`, `/units/spike_times`, and `/units/spike_times_index` must be stored in their respective opened files. Every path component must be an HDF5 hard link; virtual datasets and external raw storage are refused. Open the file holding the data directly, or pass the recording file via `--dat`.
+- The selected clock (`starting_time` with its `rate`, or `timestamps`) and `/units/id`, `/units/spike_times`, and `/units/spike_times_index` must be stored in their respective opened files or stores. For HDF5, every path component must be a hard link; virtual datasets and external raw storage are refused. Open the file holding the data directly, or pass the recording file via `--dat`.
 
-The test fixtures in `release/fixtures/nwb/` are written by PyNWB
-(`generate.py` pins the version).
+**Zarr.** `sorrel open session.nwb.zarr` reads local NWB-Zarr v2 directories
+written by `NWBZarrIO`. Arrays must use C order and a defined fill value. Supported
+compressors are Blosc (default LZ4), zlib and gzip; uncompressed chunks are also
+supported. Sorrel refuses filters other than variable-length string encodings
+and the JSON encoding used for cached NWB specifications. If `.zmetadata` is
+present, it must match the individual metadata files. The
+`zarr` feature is on by default in `sorrel`. `--dat` can pair an HDF5 file with
+a Zarr store in either direction when both features are built. The same exact
+clock rules apply: Zarr clock attributes are finite JSON numbers read as
+float64, and clock arrays must use little-endian `<f4` or `<f8`. External links and references are not followed;
+even same-store `zarr_link` aliases are refused for the clock and spike-mapping
+columns, like HDF5 soft links. Pickled columns are not decoded. Journals live
+next to the store. Its seal hashes metadata contents and the paths, sizes and
+modification times of chunk files, without reading trace chunks at open.
+An edit that deliberately preserves chunk size and mtime is not detected.
+
+The test fixtures in `release/fixtures/nwb/` are written by PyNWB and hdmf-zarr
+(`generate.py` pins both versions).
 
 ### Writing curated units to NWB
 

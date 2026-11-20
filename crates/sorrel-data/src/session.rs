@@ -1889,7 +1889,7 @@ impl ApplyPhyLabel for sorrel_io::SortingAnalyzerProvider {
     }
 }
 
-#[cfg(feature = "hdf5")]
+#[cfg(any(feature = "hdf5", feature = "zarr"))]
 impl ApplyPhyLabel for sorrel_io::NwbProvider {
     #[inline]
     fn label_from_op(op: PhyLabelOp) -> Self::Label {

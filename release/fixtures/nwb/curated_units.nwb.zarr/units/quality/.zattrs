@@ -1,0 +1,10 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "dim0"
+    ],
+    "description": "Sorrel curation label: good, mua, noise or unsorted.",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorData",
+    "object_id": "da6c344f-cab9-4a67-af17-27a1fad69756",
+    "zarr_dtype": "str"
+}

@@ -31,6 +31,7 @@ default = ["phy-export"]
 phy-export = []
 # Forwarded to sorrel-io: enables HDF5-backed NWB and KS4 rez.mat readers.
 hdf5 = ["sorrel-io/hdf5"]
+zarr = ["sorrel-io/zarr"]
 # Results DB for the double-blind bench (`devdb`); off by default so release builds carry no SQLite.
 dev = ["dep:rusqlite"]
 

@@ -1,0 +1,10 @@
+{
+    "_ARRAY_DIMENSIONS": [
+        "dim0"
+    ],
+    "description": "The sorter's unit id (SpikeInterface unit_ids) when it is not an integer.",
+    "namespace": "hdmf-common",
+    "neurodata_type": "VectorData",
+    "object_id": "0d4c4274-d596-4fc4-bbf1-a9c08dbf752a",
+    "zarr_dtype": "str"
+}
