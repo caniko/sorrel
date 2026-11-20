@@ -2,7 +2,7 @@
   description = "Sorrel — spike-sorting curation GUI";
 
   inputs = {
-    harbor-rs.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk&rev=6055d7d2b3a05d7d91d50938c7fb6f862a5eec85";
+    harbor-rs.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk&rev=3017b628b3a0603c2ebf7347a46951e8457ad414";
 
     # Pinned SDK used by harbor-rs's reproducible osxcross builder.
     harbor-macos-sdk-pin.url = "git+https://github.com/caniko/harbor-macos-sdk-pin.git?ref=trunk";
@@ -317,6 +317,8 @@
       srcFilter = path: type:
         (craneLib.filterCargoSources path type)
         || pkgs.lib.hasSuffix ".wgsl" path
+        # askama templates compiled into sorrel-data (`sorrel report`).
+        || pkgs.lib.hasInfix "crates/sorrel-data/templates" path
         # Window icon (include_bytes!) and the Windows resources build.rs embeds.
         || pkgs.lib.hasInfix "crates/sorrel/assets" path
         # BIP-39 list embedded by sorrel-remote's pairing codes.

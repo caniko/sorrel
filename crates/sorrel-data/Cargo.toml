@@ -19,6 +19,7 @@ serde.workspace = true
 rkyv.workspace = true
 rmp-serde.workspace = true
 serde_json.workspace = true
+askama.workspace = true
 toml.workspace = true
 xxhash-rust.workspace = true
 log.workspace = true
