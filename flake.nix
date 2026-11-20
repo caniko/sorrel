@@ -2,7 +2,7 @@
   description = "Sorrel — spike-sorting curation GUI";
 
   inputs = {
-    harbor-rs.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk&rev=6055d7d2b3a05d7d91d50938c7fb6f862a5eec85";
+    harbor-rs.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk&rev=3017b628b3a0603c2ebf7347a46951e8457ad414";
 
     # Pinned SDK used by harbor-rs's reproducible osxcross builder.
     harbor-macos-sdk-pin.url = "git+https://github.com/caniko/harbor-macos-sdk-pin.git?ref=trunk";
@@ -58,8 +58,6 @@
           "formatting"
           "hm-module"
           "workspace-tests"
-          "sorrel-hdf5"
-          "hdf5-tests"
           "dev-tests"
           "binstall-metadata"
           "binstall-metadata-sorrel-remote"
@@ -320,6 +318,8 @@
         (craneLib.filterCargoSources path type)
         || pkgs.lib.hasSuffix ".wgsl" path
         || pkgs.lib.hasSuffix "crates/sorrel-io/src/nwb/imp/http_vfd.c" path
+        # askama templates compiled into sorrel-data (`sorrel report`).
+        || pkgs.lib.hasInfix "crates/sorrel-data/templates" path
         # Window icon (include_bytes!) and the Windows resources build.rs embeds.
         || pkgs.lib.hasInfix "crates/sorrel/assets" path
         # BIP-39 list embedded by sorrel-remote's pairing codes.
@@ -356,7 +356,6 @@
         inherit pkgs craneLib src deps;
       };
       inherit (rustPackages) sorrel sorrelRelay commonArgs cargoArtifacts;
-      sorrelHdf5 = rustPackages.sorrelHdf5 or null;
 
       sorrelVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
       crossSorrelPackages = harbor-rs.lib.mkCrossPackages {
@@ -367,6 +366,7 @@
           inherit src;
           version = sorrelVersion;
           strictDeps = true;
+          dontUseCmakeConfigure = true;
           inherit (deps) nativeBuildInputs;
           # sorrel-relay rides along in every archive (cargo binstall
           # sorrel-remote); crane installs every executable in the build log.
@@ -394,12 +394,13 @@
           # windres) through depsBuildBuild and the CC_/RC_/linker env.
           windows-aarch64 = {
             buildInputs = [];
-            inherit (deps) nativeBuildInputs;
+            nativeBuildInputs = deps.nativeBuildInputs ++ [pkgs.llvmPackages.lld];
             # aws-lc-sys (via libp2p-quic) compiles jitterentropy, which needs
             # winpthreads' <sched.h>; llvm-mingw's sysroot does not carry it, and nixpkgs'
             # aarch64 winpthreads does not build with clang (winver.h). The
             # headers are arch-neutral, so borrow the x64 package's.
-            CFLAGS_aarch64_pc_windows_gnullvm = "-I${cross.winpthreads}/include";
+            # CMake links compiler probes; GNU ld on the build host cannot link PE/ARM64.
+            CFLAGS_aarch64_pc_windows_gnullvm = "-I${cross.winpthreads}/include -fuse-ld=lld";
             doCheck = false;
           };
           darwin-aarch64 = {
@@ -465,7 +466,17 @@
 
       releaseSmoke = pkgs.writeShellApplication {
         name = "sorrel-release-smoke";
-        runtimeInputs = with pkgs; [coreutils diffutils file findutils gnugrep gzip gnutar unzip];
+        runtimeInputs = with pkgs;
+          [coreutils diffutils file findutils gnugrep gzip gnutar unzip]
+          ++ lib.optional (system == "x86_64-linux") qemu-user;
+        runtimeEnv =
+          {SORREL_NWB_FIXTURES = "${./release/fixtures/nwb}";}
+          // pkgs.lib.optionalAttrs (system == "x86_64-linux") (let
+            arm = pkgs.pkgsCross.aarch64-multiplatform;
+          in {
+            SORREL_ARM_LD = "${arm.glibc}/lib/ld-linux-aarch64.so.1";
+            SORREL_ARM_LIBS = pkgs.lib.makeLibraryPath [arm.glibc arm.stdenv.cc.cc.lib];
+          });
         text = ''
           exec bash ${./release/smoke.sh} "$@"
         '';
@@ -499,8 +510,9 @@
         }
         // crossSorrelPackages
         // crossSorrelPyPackages
-        // pkgs.lib.optionalAttrs (sorrelHdf5 != null) {inherit sorrelHdf5;}
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux portable
+        # Compatibility alias for configs that selected the former HDF5 build.
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {sorrelHdf5 = sorrel;}
         // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           release-bundle = import ./nix/release.nix {
             inherit pkgs harbor-rs;
@@ -535,8 +547,8 @@
 
       checks =
         (import ./nix/checks.nix {
-          inherit pkgs craneLib commonArgs cargoArtifacts sorrel sorrelHdf5 testSrc;
-          inherit (deps) runtimeLibs hdf5C;
+          inherit pkgs craneLib commonArgs cargoArtifacts sorrel testSrc;
+          inherit (deps) runtimeLibs;
           hmModule = self.homeManagerModules.default;
         })
         // {

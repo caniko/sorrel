@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>sorrel report</title>
+<style>
+:root{--bg:#fff;--ink:#1c2128;--muted:#5f6975;--faint:#8b949e;--line:#e3e6ea;--panel:#f6f7f9;
+--bar:#3b6ea5;--wave:#a3abb5;--peak:#0e7c6b;--dots:#3b6ea5;--review:#b42318;
+--good:#17784a;--good-bg:#e2f3e9;--mua:#93570a;--mua-bg:#fbefd9;--noise:#b42318;--noise-bg:#fce6e4;--other:#4b5563;--other-bg:#eceef1}
+@media screen and (prefers-color-scheme:dark){:root{--bg:#14171b;--ink:#e4e7eb;--muted:#a3abb5;--faint:#7b8490;--line:#2b3138;--panel:#1b1f24;
+--bar:#7aa7d8;--wave:#5d6670;--peak:#4fc3ad;--dots:#7aa7d8;--review:#f2867a;
+--good:#5fd08f;--good-bg:#173524;--mua:#f0b45a;--mua-bg:#3a2a10;--noise:#f2867a;--noise-bg:#3d1a17;--other:#b6bdc6;--other-bg:#262b31}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-variant-numeric:tabular-nums}
+main{max-width:1080px;margin:0 auto;padding:28px 16px 40px}
+a{color:inherit}
+h1{font-size:20px;font-weight:650;letter-spacing:-.01em;margin:0}
+.sub{color:var(--muted);margin:2px 0 20px}
+.chip{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:600;background:var(--other-bg);color:var(--other)}
+.chip.good{background:var(--good-bg);color:var(--good)}
+.chip.mua{background:var(--mua-bg);color:var(--mua)}
+.chip.noise{background:var(--noise-bg);color:var(--noise)}
+table{border-collapse:collapse}
+.index{width:100%;margin:0 0 24px;font-size:12px}
+.index th{font-size:10.5px;font-weight:500;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;text-align:right;padding:4px 8px;border-bottom:1px solid var(--line)}
+.index td{text-align:right;padding:3px 8px;border-bottom:1px solid var(--line)}
+.index th:nth-child(-n+2),.index td:nth-child(-n+2){text-align:left}
+.index tbody tr:hover{background:var(--panel)}
+.card{border:1px solid var(--line);border-radius:10px;padding:14px 18px 12px;margin:0 0 16px;break-inside:avoid;page-break-inside:avoid}
+.card header{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 10px}
+.card h2{font-size:16px;font-weight:650;margin:0}
+.origin{color:var(--muted);font-size:12px}
+.tags{flex-basis:100%;margin:2px 0 0;font-size:12px;color:var(--muted)}
+.tags b{color:var(--review);font-weight:600}
+.kpis{display:grid;grid-template-columns:repeat(8,1fr);gap:1px;margin:12px 0 14px;background:var(--line);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.kpis div{background:var(--panel);padding:6px 10px;min-width:0}
+.kpis dt{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}
+.kpis dd{margin:0;font-size:15px;font-weight:600}
+.kpis small{font-size:11px;font-weight:400;color:var(--muted);margin-left:2px}
+.plots{display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr;gap:14px 18px;align-items:end}
+figure{margin:0;min-width:0}
+figure svg{display:block;width:100%;height:auto;overflow:visible}
+figure.amp{grid-column:1/-1}
+figure.amp svg{height:56px}
+figcaption{display:flex;flex-wrap:wrap;justify-content:space-between;gap:0 8px;font-size:10.5px;color:var(--faint);margin-top:3px}
+figcaption b{color:var(--muted);font-weight:500}
+.none{color:var(--faint);font-size:12px;margin:0;padding:24px 0;text-align:center;border:1px dashed var(--line);border-radius:6px}
+.bars rect{fill:var(--bar)}
+.axis,.zero{stroke:var(--line);stroke-width:1;vector-effect:non-scaling-stroke}
+.zero{stroke-dasharray:2 3}
+polyline.wf{fill:none;stroke:var(--wave);stroke-width:1.4;stroke-linejoin:round}
+polyline.wf.peak{stroke:var(--peak);stroke-width:1.9}
+text.wf{font-size:9px;fill:var(--faint);text-anchor:middle}
+text.wf.peak{fill:var(--peak);font-weight:600}
+.dots{fill:none;stroke:var(--dots);stroke-width:2.4;stroke-linecap:round;opacity:.5;vector-effect:non-scaling-stroke}
+.all{width:100%;margin-top:12px;font-size:11px}
+.all tbody{display:grid;grid-template-columns:repeat(4,1fr);column-gap:22px;border-top:1px solid var(--line);padding-top:6px}
+.all tr{display:flex;justify-content:space-between;gap:8px;border-bottom:1px dotted var(--line);padding:1px 0}
+.all th{font-weight:400;color:var(--muted);text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+footer{color:var(--faint);font-size:11px;margin-top:24px}
+@media (max-width:760px){
+.kpis{grid-template-columns:repeat(4,1fr)}
+.plots{grid-template-columns:1fr 1fr}
+figure.wave{grid-column:1/-1}
+.all tbody{grid-template-columns:1fr 1fr}
+.index{display:block;overflow-x:auto}
+}
+@page{size:A4;margin:12mm}
+@media print{main{max-width:none;padding:0}body{font-size:11px}.card{border-color:#ccd1d7}a{text-decoration:none}}
+</style>
+</head>
+<body>
+<main>
+<h1>sorrel report</h1>
+<p class="sub">{{ cards.len() }} clusters{% for (label, n) in counts %} · {{ n }} {{ label }}{% endfor %} · {{ sample_rate_khz }} kHz · {{ duration_min }} min</p>
+
+<table class="index">
+<thead><tr><th>cluster</th><th>label</th>{% for (heading, metric, _unit) in kpis %}<th title="{{ metric }}">{{ heading }}</th>{% endfor %}</tr></thead>
+<tbody>
+{%- for c in cards %}
+<tr><td><a href="#cluster-{{ c.id }}">{{ c.id }}</a></td><td><span class="chip {{ c.label }}">{{ c.label }}</span></td>{% for v in c.kpis %}<td>{{ v }}</td>{% endfor %}</tr>
+{%- endfor %}
+</tbody>
+</table>
+
+{% for c in cards -%}
+<section id="cluster-{{ c.id }}" class="card">
+<header>
+<h2>Cluster {{ c.id }}</h2><span class="chip {{ c.label }}">{{ c.label }}</span><span class="origin">{{ c.origin }}</span>
+{%- if !c.tags.is_empty() %}
+<p class="tags">{% for t in c.tags %}{% if t.review %}<b>{{ t.text }}</b>{% else %}{{ t.text }}{% endif %}{% if !loop.last %} · {% endif %}{% endfor %}</p>
+{%- endif %}
+</header>
+<dl class="kpis">
+{%- for ((heading, metric, unit), v) in kpis.iter().zip(c.kpis.iter()) %}
+<div title="{{ metric }}"><dt>{{ heading }}</dt><dd>{{ v }}{% if !unit.is_empty() %}<small>{{ unit }}</small>{% endif %}</dd></div>
+{%- endfor %}
+</dl>
+<div class="plots">
+<figure class="wave">{% if let Some(svg) = c.svgs.waveform %}{{ svg|safe }}{% else %}<p class="none">no templates</p>{% endif %}<figcaption><b>template</b><span>{{ c.shape }}</span></figcaption></figure>
+<figure>{{ c.svgs.isi|safe }}<figcaption><span>0</span><b>ISI</b><span>50 ms</span></figcaption></figure>
+<figure>{{ c.svgs.log_isi|safe }}<figcaption><span>1 ms</span><b>ISI, log</b><span>1000 s</span></figcaption></figure>
+<figure>{{ c.svgs.acg|safe }}<figcaption><span>−50</span><b>ACG</b><span>+50 ms</span></figcaption></figure>
+<figure class="amp">{% if let Some(svg) = c.svgs.amplitude %}{{ svg|safe }}{% else %}<p class="none">no amplitudes</p>{% endif %}<figcaption><span>0</span><b>amplitude over time</b><span>{{ duration_min }} min</span></figcaption></figure>
+</div>
+<table class="all"><tbody>
+{%- for (name, v) in c.metrics %}
+<tr><th>{{ name }}</th><td>{{ v }}</td></tr>
+{%- endfor %}
+</tbody></table>
+</section>
+{% endfor -%}
+<footer>sorrel {{ version }}</footer>
+</main>
+</body>
+</html>

@@ -544,13 +544,17 @@ fn parse_backend(s: &str) -> std::result::Result<Backend, String> {
         #[cfg(any(feature = "hdf5", feature = "zarr"))]
         "nwb" => Backend::Nwb,
         #[cfg(not(any(feature = "hdf5", feature = "zarr")))]
-        "nwb" => return Err("backend nwb requires building with --features hdf5 or zarr".into()),
+        "nwb" => {
+            return Err(
+                "backend nwb is unavailable in this build; rebuild with default features".into(),
+            )
+        }
         #[cfg(feature = "hdf5")]
         "ks4-rez" | "rez" => Backend::Ks4Rez,
         #[cfg(not(feature = "hdf5"))]
         "ks4-rez" | "rez" => {
             return Err(format!(
-                "backend {s} requires building with --features hdf5"
+                "backend {s} is unavailable in this build; rebuild with default features"
             ));
         }
         other => return Err(format!("unknown backend {other}")),
@@ -608,7 +612,7 @@ fn detect_backend(root: &Path) -> Result<Backend> {
             };
             anyhow::ensure!(
                 enabled,
-                "{} requires building with --features {feature}",
+                "{} needs the {feature} feature; rebuild with default features",
                 root.display()
             );
             #[cfg(any(feature = "hdf5", feature = "zarr"))]
@@ -622,7 +626,10 @@ fn detect_backend(root: &Path) -> Result<Backend> {
         sorrel_io::Backend::Ks4Rez => Backend::Ks4Rez,
         #[cfg(not(feature = "hdf5"))]
         sorrel_io::Backend::Ks4Rez => {
-            bail!("{} requires building with --features hdf5", root.display())
+            bail!(
+                "{} is unsupported in this build; rebuild with default features",
+                root.display()
+            )
         }
     })
 }

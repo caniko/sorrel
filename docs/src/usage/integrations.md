@@ -133,7 +133,7 @@ auto-detect — see [Backend detection](#backend-detection)).
 ## NWB
 
 ```sh
-sorrel open my_session.nwb  # build with --features hdf5
+sorrel open my_session.nwb
 sorrel open my_session.nwb --nwb-series ElectricalSeriesRaw
 sorrel open my_session.nwb --nwb-series /processing/ecephys/FilteredEphys/Processed
 sorrel open sorted_units.nwb --dat recording.nwb
@@ -205,8 +205,9 @@ Spike indices must fit
 inside the raw series. The files must have the same `timestamps_reference_time`;
 Sorrel does not infer an offset between files.
 
-The reader needs an NWB with `/units`. HDF5 files require `cargo build
---features hdf5`. One series is read per session; multi-segment stitching is not
+The reader needs an NWB with `/units`. Default builds and release binaries
+bundle HDF5, including gzip/deflate and LZF, so no system HDF5 installation
+is needed. One series is read per session; multi-segment stitching is not
 supported.
 
 - Timestamps with float64 spacing greater than 0.01 samples are refused; if sampling was regular, rewrite the series with `starting_time` and `rate`.
@@ -253,8 +254,8 @@ Streaming is read-only. Sorrel loads metadata and sorting data, then fetches
 trace windows on demand. Direct HTTPS HDF5 URLs must support range GETs and
 provide a strong ETag. For Zarr, use a DANDI locator or DANDI API asset download
 URL: a bare storage prefix doesn't provide the required object list. The same
-NWBs and series that local readers refuse are refused remotely. The `dandi`
-feature is on by default; HDF5 streaming also needs `hdf5`.
+NWBs and series that local readers refuse are refused remotely. Default builds
+and release binaries include DANDI streaming.
 
 Sessions with DANDI inputs always open fresh without reusing a tab or session
 host. A session can't combine two distinct draft assets; this also applies to
@@ -376,7 +377,7 @@ The interface does not link units to electrodes.
 ## Kilosort 4 `rez.mat`
 
 ```sh
-sorrel open rez.mat --dat path/to/recording.bin   # build with --features hdf5
+sorrel open rez.mat --dat path/to/recording.bin
 ```
 
 Reads `rez/st3` for sample/template tuples, `rez/ops/fs` and
@@ -384,8 +385,8 @@ Reads `rez/st3` for sample/template tuples, `rez/ops/fs` and
 positions, and `rez/ops/fbinary`/`fproc` for the dat path (overridable
 with `--dat`).
 
-If you'd rather not enable the `hdf5` feature, KS4 writes a phy export
-under `<output>/phy/` automatically — open that directory instead.
+The `rez.mat` reader is included by default. If you build without it,
+open the phy export that KS4 writes under `<output>/phy/` instead.
 
 ## Python (Jupyter)
 
