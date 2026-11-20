@@ -399,13 +399,14 @@ pub struct ClusterRows {
 }
 
 /// Hover text for the origin cell; empty without parents.
-fn lineage(sorrel: bool, parents: &[ClusterId]) -> String {
+fn lineage(sorrel: bool, parents: &[ClusterId], missing: &[i64]) -> String {
     let ids = parents
         .iter()
         .map(|p| p.to_string())
+        .chain(missing.iter().map(|id| format!("unit:{id}")))
         .collect::<Vec<_>>()
         .join(", ");
-    match (sorrel, parents.len()) {
+    match (sorrel, parents.len() + missing.len()) {
         (_, 0) => String::new(),
         (true, 1) => format!("split from {ids}"),
         (true, _) => format!("merged from {ids}"),
@@ -525,7 +526,11 @@ impl ClusterRows {
                     session.origin(c),
                     sorrel_data::command::UnitOrigin::Sorrel(_)
                 );
-                lineage(sorrel, session.parents(c))
+                lineage(
+                    sorrel,
+                    session.parents(c),
+                    session.missing_parent_unit_ids(c),
+                )
             })
             .collect();
         self.group = (0..n as u32)
@@ -1452,12 +1457,12 @@ mod tests {
         assert_eq!(visible("origin == \"Sorrel[Manual]\""), [1]);
         assert_eq!(visible("note != \"\""), [1]);
         assert_eq!(visible("kilosort4"), [0]);
-        assert_eq!(lineage(true, &[ClusterId(12)]), "split from 12");
+        assert_eq!(lineage(true, &[ClusterId(12)], &[]), "split from 12");
         assert_eq!(
-            lineage(false, &[ClusterId(4), ClusterId(9)]),
+            lineage(false, &[ClusterId(4), ClusterId(9)], &[]),
             "absorbed 4, 9"
         );
-        assert_eq!(lineage(false, &[]), "");
+        assert_eq!(lineage(false, &[], &[]), "");
         for c in [ClusterColumn::Origin, ClusterColumn::Note] {
             assert!(!col_shown(&c, &[], false), "{c:?} is opt-in");
             assert!(!c.numeric());

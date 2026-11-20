@@ -1343,7 +1343,6 @@ where
                     s.replace(['\t', '\n'], " ")
                 }
             };
-            let ids = |v: Vec<u32>| v.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
             let mut out = String::from("id\tn\tlabel\ttags\torigin\tparents\tnote");
             for c in (0..session.n_clusters()).map(ClusterId) {
                 let n = session.spike_times(c).len();
@@ -1356,7 +1355,18 @@ where
                 {
                     continue;
                 }
-                let parents = ids(session.parents(c).iter().map(|p| p.0).collect());
+                let parents = session
+                    .parents(c)
+                    .iter()
+                    .map(ToString::to_string)
+                    .chain(
+                        session
+                            .missing_parent_unit_ids(c)
+                            .iter()
+                            .map(|id| format!("unit:{id}")),
+                    )
+                    .collect::<Vec<_>>()
+                    .join(",");
                 out += &format!(
                     "\n{}\t{n}\t{label}\t{}\t{}\t{}\t{}",
                     c.0,
@@ -1676,6 +1686,11 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn canonical(save_dir: &Path) -> PathBuf {
+    let save_dir = if save_dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        save_dir
+    };
     save_dir
         .canonicalize()
         .unwrap_or_else(|_| save_dir.to_owned())
@@ -1708,6 +1723,7 @@ fn write_mcp_json(
     token: &str,
     nonce: &str,
     kind: &str,
+    session_key: Option<&str>,
 ) -> std::io::Result<PathBuf> {
     let path = mcp_json_path(save_dir)?;
     // Not `mcp_json_path`'s hash key: that stays on the verbatim form.
@@ -1715,7 +1731,7 @@ fn write_mcp_json(
     write_private_json(
         &path,
         &json!({"port": port, "token": token, "pid": std::process::id(), "nonce": nonce,
-                "dataset": dataset, "kind": kind}),
+                "dataset": dataset, "kind": kind, "session_key": session_key}),
     )?;
     Ok(path)
 }
@@ -1806,12 +1822,28 @@ where
     P: DataProvider + ApplyPhyLabel + HasGeometry + 'static,
     Session<P>: Send + Sync,
 {
+    spawn_listener_for_session(host, save_dir, reseal_on_save, label_str, ui, None)
+}
+
+/// Like [`spawn_listener`], with an open-request identity for explicit CLI attaches.
+pub fn spawn_listener_for_session<P>(
+    host: Arc<SessionHost<P>>,
+    save_dir: &Path,
+    reseal_on_save: bool,
+    label_str: fn(&P::Label) -> &'static str,
+    ui: Option<Arc<Ui>>,
+    session_key: Option<&str>,
+) -> std::io::Result<ListenerHandle>
+where
+    P: DataProvider + ApplyPhyLabel + HasGeometry + 'static,
+    Session<P>: Send + Sync,
+{
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let token = random_token();
     let nonce = random_token();
     let kind = if ui.is_some() { "gui" } else { "headless" };
-    let mcp_json = write_mcp_json(save_dir, port, &token, &nonce, kind)?;
+    let mcp_json = write_mcp_json(save_dir, port, &token, &nonce, kind, session_key)?;
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = ListenerHandle {
         port,
@@ -1894,10 +1926,15 @@ pub(crate) fn handshake(
 
 /// `{port, token}` from a listener file, if it exists and parses.
 pub(crate) fn read_port_token(path: &Path) -> Option<(u16, String)> {
+    read_endpoint(path).map(|(port, token, _)| (port, token))
+}
+
+fn read_endpoint(path: &Path) -> Option<(u16, String, Option<String>)> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     Some((
         u16::try_from(v["port"].as_u64()?).ok()?,
         v["token"].as_str()?.to_owned(),
+        v["session_key"].as_str().map(str::to_owned),
     ))
 }
 
@@ -2002,14 +2039,30 @@ pub(crate) fn connect_authed(
 pub fn attach(
     save_dir: &Path,
     input: impl Read + Send + 'static,
+    output: impl Write,
+) -> Result<bool> {
+    attach_for_session(save_dir, None, false, input, output)
+}
+
+/// Attach only if the running host matches an explicitly requested session.
+pub fn attach_for_session(
+    save_dir: &Path,
+    session_key: Option<&str>,
+    discard_journal: bool,
+    input: impl Read + Send + 'static,
     mut output: impl Write,
 ) -> Result<bool> {
-    let Some((port, token)) = read_mcp_json(save_dir) else {
+    let Some((port, token, running_key)) =
+        mcp_json_path(save_dir).ok().and_then(|p| read_endpoint(&p))
+    else {
         return Ok(false);
     };
     let Some((stream, mut reader)) = connect_authed(port, &token)? else {
         return Ok(false);
     };
+    if let Some(key) = session_key {
+        check_session_reuse("running host", running_key.as_deref(), key, discard_journal)?;
+    }
     let mut up = stream;
     std::thread::spawn(move || {
         let mut input = std::io::BufReader::new(input);
@@ -2035,12 +2088,34 @@ pub fn attach(
     Ok(true)
 }
 
+pub fn check_session_reuse(
+    location: &str,
+    current: Option<&str>,
+    requested: &str,
+    discard_journal: bool,
+) -> Result<()> {
+    anyhow::ensure!(!discard_journal,
+        "cannot use --discard-journal with the {location}; stop the running session or omit the flag");
+    anyhow::ensure!(current == Some(requested),
+        "session conflict: the {location} was opened with a different dataset path or options; close it or use the same open arguments (including --dat, --journal and, for NWB, --nwb-series)");
+    Ok(())
+}
+
 /// One JSON-RPC `request` to the host in `save_dir`, and its first reply.
 /// `Ok(None)` when no host listens there (see [`attach`]).
 pub fn call_once(save_dir: &Path, request: &Value) -> Result<Option<Value>> {
+    call_once_for_session(save_dir, None, false, request)
+}
+
+pub fn call_once_for_session(
+    save_dir: &Path,
+    session_key: Option<&str>,
+    discard_journal: bool,
+    request: &Value,
+) -> Result<Option<Value>> {
     let mut out = Vec::new();
     let input = std::io::Cursor::new(format!("{request}\n"));
-    if !attach(save_dir, input, &mut out)? {
+    if !attach_for_session(save_dir, session_key, discard_journal, input, &mut out)? {
         return Ok(None);
     }
     let line = out.split(|&b| b == b'\n').next().unwrap_or_default();
@@ -2798,7 +2873,7 @@ mod tests {
         let path = mcp_json_path(dir.path()).unwrap();
         assert_eq!(path, mcp_json_path(dir.path()).unwrap());
         assert_eq!(
-            write_mcp_json(dir.path(), 1, "t", "n", "gui").unwrap(),
+            write_mcp_json(dir.path(), 1, "t", "n", "gui", None).unwrap(),
             path
         );
         assert_eq!(read_mcp_json(dir.path()), Some((1, "t".to_owned())));
@@ -2811,7 +2886,7 @@ mod tests {
     fn token_file_is_outside_the_dataset_and_lists_as_a_host() {
         let user = scoped_user_dir();
         let dir = tempfile::tempdir().unwrap();
-        let path = write_mcp_json(dir.path(), 1, "t", "n", "gui").unwrap();
+        let path = write_mcp_json(dir.path(), 1, "t", "n", "gui", None).unwrap();
         assert!(path.starts_with(user.path()) && !path.starts_with(dir.path()));
         let hosts = list_hosts();
         assert_eq!(hosts.len(), 1);
@@ -2860,7 +2935,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
         std::os::unix::fs::symlink(&victim, &tmp).unwrap();
-        write_mcp_json(dir.path(), 1, "t", "n", "gui").unwrap();
+        write_mcp_json(dir.path(), 1, "t", "n", "gui", None).unwrap();
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
         assert_eq!(read_mcp_json(dir.path()).unwrap().1, "t");
     }
@@ -2986,7 +3061,7 @@ mod tests {
         let dead = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = dead.local_addr().unwrap().port();
         drop(dead);
-        write_mcp_json(dir.path(), port, "t", "n", "gui").unwrap();
+        write_mcp_json(dir.path(), port, "t", "n", "gui", None).unwrap();
         assert!(!attach(dir.path(), none(), Vec::new()).unwrap());
         // Live but silent: accepts, never answers.
         let silent = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -2996,6 +3071,7 @@ mod tests {
             "t",
             "n",
             "gui",
+            None,
         )
         .unwrap();
         let hold = std::thread::spawn(move || silent.accept().map(|(s, _)| s));
@@ -3012,7 +3088,7 @@ mod tests {
         let h = Arc::new(SessionHost::new(mock_session(dir.path())));
         let _handle = spawn_listener(h, dir.path(), false, label, None).unwrap();
         let (port, _) = read_mcp_json(dir.path()).unwrap();
-        write_mcp_json(dir.path(), port, "wrong", "n", "gui").unwrap();
+        write_mcp_json(dir.path(), port, "wrong", "n", "gui", None).unwrap();
         let err = attach(dir.path(), Cursor::new(""), Vec::new()).unwrap_err();
         assert!(err.to_string().contains("rejected"), "{err}");
     }

@@ -184,6 +184,7 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     /// Directory to write `spike_clusters.npy` / `cluster_group.tsv` into
     /// when the user triggers a save. Cmd/Ctrl-S is a no-op when unset.
     save_dir: Option<PathBuf>,
+    session_key: Option<String>,
     /// See [`SorrelApp::set_save_dir`].
     reseal_on_save: bool,
     /// Preferences read from the dataset, applied once loading completes.
@@ -371,6 +372,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             target_points: 1024,
             error: None,
             save_dir: None,
+            session_key: None,
             reseal_on_save: false,
             pending_prefs: None,
             status: None,
@@ -525,7 +527,11 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         &self.host
     }
 
-    /// Serve this window's session to MCP clients (`sorrel mcp <dir>`
+    pub fn set_session_key(&mut self, key: String) {
+        self.session_key = Some(key);
+    }
+
+    /// Serve this window's session to MCP clients (`sorrel mcp` with matching open arguments
     /// attaches): a loopback listener next to the save directory, whose
     /// `select` moves this selection. Needs `set_save_dir` first.
     pub fn serve_mcp(&mut self) -> anyhow::Result<()>
@@ -549,12 +555,13 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             select: tx,
             wake: Arc::new(waker(&self.repaint)),
         };
-        let listener = sorrel_data::spawn_listener(
+        let listener = sorrel_data::serve::spawn_listener_for_session(
             Arc::clone(&self.host),
             &dir,
             self.reseal_on_save,
             self.label_str,
             Some(Arc::new(ui)),
+            self.session_key.as_deref(),
         )?;
         self.mcp = Some(McpLink {
             _listener: listener,
@@ -620,7 +627,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         ui.label(who).on_hover_text(if active {
             "An agent just edited; the touched clusters are highlighted"
         } else {
-            "MCP clients connected with `sorrel mcp <DATA_DIR>`"
+            "Connect with `sorrel mcp` and the same dataset path and open options"
         });
         let pending = self.host.proposals().len();
         if pending > 0
@@ -2726,6 +2733,9 @@ impl<P: DataProvider + ApplyPhyLabel> crate::shell::Tab for SorrelApp<P> {
     }
     fn dataset(&self) -> &Path {
         self.save_dir.as_deref().unwrap_or(Path::new(""))
+    }
+    fn session_key(&self) -> Option<&str> {
+        self.session_key.as_deref()
     }
     fn dirty(&self) -> bool {
         Self::dirty(self)

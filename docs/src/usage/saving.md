@@ -64,6 +64,11 @@ was recorded against.
 SortingAnalyzer, NWB and `rez.mat` sessions reload the original sort on
 every open, so they need no copies or checks.
 
+Saving an NWB session does not change the input NWB file. To write a Units
+table from a curated phy or SortingAnalyzer session, use the
+[Python NWB export](integrations.md#writing-curated-units-to-nwb). The HDF5
+reader can reopen those Units tables, alone or paired with a raw NWB file.
+
 ### `curation.json`
 
 Every save also writes SpikeInterface's manual-curation document next to
@@ -143,13 +148,16 @@ What goes into the directory depends on the source:
   `channel_shanks.npy` when known) and `cluster_group.tsv`. Templates are
   mean waveforms of up to 500 spikes per cluster, 1 ms before to 2 ms after
   each spike, from the raw trace with the per-channel mean removed (no
-  high-pass filter). There are no amplitudes, PC features or similarity
-  matrix, so phy falls back to its defaults for those views.
+  high-pass filter). Units-only NWB has no raw waveforms to average; if it
+  also has no channels, export requires pairing a raw NWB with `--dat`. There
+  are no amplitudes, PC features or similarity matrix, so phy falls back to
+  its defaults for those views.
 
 `params.py` points at the original raw recording by absolute path. With
-`--copy-raw`, or for NWB, whose trace is held in memory, the trace is
-streamed into `recording.dat` in its native dtype instead, which also
-decompresses an mtscomp `.cbin`. `params.py` is written last, so an
+`--copy-raw`, the trace is streamed into `recording.dat` in its native
+dtype, which also decompresses an mtscomp `.cbin`. NWB traces are always
+streamed to `recording.dat` as float32 microvolts; units-only NWB has no
+recording to copy. `params.py` is written last, so an
 interrupted export never looks complete to phy. The export refuses to
 write into the source directory. The exported directory has no journal:
 opening it in Sorrel starts a fresh curation on top of the exported state.

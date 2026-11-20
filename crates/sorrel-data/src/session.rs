@@ -150,6 +150,7 @@ pub struct Session<P: DataProvider> {
     /// missing slot means `Auto`, no parents, no note.
     origins: Vec<UnitOrigin>,
     parents: Vec<Vec<ClusterId>>,
+    missing_parent_unit_ids: HashMap<ClusterId, Vec<i64>>,
     notes: Vec<String>,
     /// Sorter name rendered in `Auto[<sorter>]`; `"unknown"` until set.
     sorter: String,
@@ -189,6 +190,7 @@ impl<P: DataProvider> Session<P> {
         let tags = provider.initial_tags();
         let mut origins = Vec::new();
         let mut parents = Vec::new();
+        let mut missing_parent_unit_ids = HashMap::new();
         let mut notes = Vec::new();
         for (i, a) in provider.initial_annotations().into_iter().enumerate() {
             let c = ClusterId(i as u32);
@@ -196,6 +198,9 @@ impl<P: DataProvider> Session<P> {
             let (origin, _) = UnitOrigin::parse(&a.origin).unwrap_or((UnitOrigin::Auto, None));
             set_slot(&mut origins, c, origin);
             set_slot(&mut parents, c, a.parents);
+            if !a.missing_parent_unit_ids.is_empty() {
+                missing_parent_unit_ids.insert(c, a.missing_parent_unit_ids);
+            }
             set_slot(&mut notes, c, a.note);
         }
         let sorter = provider.sorter().unwrap_or_else(|| "unknown".into());
@@ -206,6 +211,7 @@ impl<P: DataProvider> Session<P> {
             tags,
             origins,
             parents,
+            missing_parent_unit_ids,
             notes,
             sorter,
             cluster_index,
@@ -632,6 +638,13 @@ impl<P: DataProvider> Session<P> {
     /// merged into it); walk transitively for the full lineage.
     pub fn parents(&self, cluster: ClusterId) -> &[ClusterId] {
         self.parents.get(cluster.idx()).map_or(&[], Vec::as_slice)
+    }
+
+    /// Direct parent unit IDs that were exported without a row in this dataset.
+    pub fn missing_parent_unit_ids(&self, cluster: ClusterId) -> &[i64] {
+        self.missing_parent_unit_ids
+            .get(&cluster)
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Free-text note of `cluster` (empty when none).

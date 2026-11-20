@@ -134,41 +134,82 @@ auto-detect — see [Backend detection](#backend-detection)).
 
 ```sh
 sorrel open my_session.nwb
+sorrel open my_session.nwb --nwb-series ElectricalSeriesRaw
+sorrel open my_session.nwb --nwb-series /processing/ecephys/FilteredEphys/Processed
+sorrel open sorted_units.nwb --dat recording.nwb
+sorrel open sorted_units.nwb --sample-rate 30000  # if no resolution is recorded
 ```
 
 What Sorrel reads:
 
 - **Units.** `/units/spike_times` and `spike_times_index`, one unit per
-  row. The row's `/units/id` is the unit id Sorrel reports in
-  `curation.json` and MCP evidence, so a table with ids `5, 7, 9` stays
-  `5, 7, 9`. Units with no spikes are kept. Spike times (seconds) become
-  sample indices as `round((t - starting_time) × rate)`.
-- **Trace.** The first group under `/acquisition` whose `neurodata_type`
-  is `ElectricalSeries`, or an extension subtype declared in the file's
-  cached `/specifications`, with 2-D `data`. A file with none is rejected.
-  If there are several, Sorrel reads the first by name and logs the rest.
-- **Time base.** `starting_time` and its `rate`. A series with per-sample
-  `timestamps` is rejected rather than given an assumed rate.
-- **Units of the samples.** int16, uint16, int32 and float32 `data` are
-  read in their stored type and converted to microvolts:
-  `data × conversion × channel_conversion[ch] + offset`, times 10⁶.
-  Other dtypes (float64, int64, …) are rejected. Amplitudes from an NWB
-  file are therefore in µV.
+  row. Units with no spikes are kept. `/units/id` supplies the numeric unit
+  ID; a unique `unit_name` string column preserves the upstream names in
+  `curation.json`. Sorrel reads `good`, `mua`, `noise` and `unsorted` from
+  `label`, `quality` or `KSLabel`, in that order. Sorrel's Python-exported
+  origin, tags and parent IDs are restored. Parents without a table row are
+  displayed as `unit:<id>` instead of local cluster IDs. Columns marked `Sorrel QC metric.` populate the
+  cluster table, just like sidecar metrics. Unrecognized columns are ignored.
+- **Trace.** Sorrel reads single windows on demand and caches recent blocks
+  instead of loading the entire trace. It looks for `ElectricalSeries` (or an
+  extension subtype declared in `/specifications`) under `/acquisition` and
+  `/processing`, with 2-D `data` (time × channels) or 1-D `data` (one channel).
+  By default it prefers 2-D series, then takes the first series by path
+  (acquisitions before processed series), and logs the available paths when there is
+  more than one. `--nwb-series` takes an acquisition name or an absolute path
+  in the NWB file, not a filesystem path. Use a separate `--journal` when
+  curating against another series or a different paired recording. To reuse
+  an open tab or attach `call` or `mcp` to its host, pass the same open options;
+  conflicting options are refused rather than silently ignored.
+- **Time base.** Spike times on the NWB session clock become sample indices as
+  `round((t - starting_time) × rate)`. Sorrel uses the series rate by default.
+  If `1 / spike_times.resolution` is within one part per million of that rate,
+  it also declares a Units clock. If the two clocks place any spike on
+  different samples, pass `--sample-rate <Hz>` to choose one. The value must
+  equal a declared clock exactly, including the full value of a stored
+  float32 rate widened to float64. Copy one of the rates printed in the
+  error; approximate values are refused. In a single file, an unspecified
+  or more distant resolution is not a clock.
+  With per-sample `timestamps`, the first timestamp gives the start and
+  the end-to-end mean interval gives the series rate.
+  Timestamps must strictly increase and stay within 0.001 samples of the
+  inferred grid, plus four floating-point steps at the largest absolute
+  timestamp (converted to samples) to allow for rounding at large clock origins.
+  Irregular timestamps are refused.
+  NWB trials used as events are shifted by the same start time; CSV/NPY event
+  times are already relative to the recording.
+- **Sample types.** int8, uint8, int16, uint16, int32, uint32, int64, float32
+  and float64 are read in their stored type. Sorrel converts to float32
+  microvolts as `(data × conversion × channel_conversion[ch] + offset) × 10⁶`.
+  Other dtypes are refused.
 - **Channels.** The series' `electrodes` region maps each data column to
   an electrodes-table row. That row's `id` becomes the channel id and its
   `rel_x`/`rel_y` the probe position. `x`/`y`/`z` are brain coordinates
   and are not used as probe geometry; without `rel_x`/`rel_y` the session
   has no channel positions.
 
-Limitations:
+**Units without a trace.** Without an ElectricalSeries, Sorrel takes the
+rate from `1 / spike_times.resolution`. If that resolution is unspecified
+and no raw NWB is paired, supply the rate with `--sample-rate HZ` instead.
+Spike times are relative to zero
+(`timestamps_reference_time`).
+The electrodes table supplies channels if present, but there is no raw trace
+or waveform extraction. With `--dat recording.nwb`, the raw file supplies
+the trace, channels and time base; `--nwb-series` selects from that file.
+If a Units rate is declared, it must be within one part per million of the
+raw series rate. The same exact clock choice and spike-index check apply.
+Spike indices must fit
+inside the raw series. The files must have the same `timestamps_reference_time`;
+Sorrel does not infer an offset between files.
 
-- Default builds and release binaries bundle HDF5, including gzip/deflate
-  and LZF. No system HDF5 installation is needed.
-- Trace data is loaded eagerly into RAM as float32 (NWB datasets are
-  typically chunked and compressed, so there is no mmap).
-- One `ElectricalSeries`; multi-segment recordings are not modelled.
-- Local files only; DANDI streaming is not wired up. Sorrel does not write
-  NWB.
+The reader needs a local HDF5 file with `/units`. Default builds and release
+binaries bundle HDF5, including gzip/deflate and LZF, so no system HDF5
+installation is needed. One series is read per session; multi-segment stitching,
+NWB-Zarr and DANDI/HTTP streaming are not supported.
+
+- Timestamps with float64 spacing greater than 0.01 samples are refused; if sampling was regular, rewrite the series with `starting_time` and `rate`.
+- With per-sample `timestamps`, each spike must map to a sample inside the series whose recorded timestamp is nearest to the spike time (ties are allowed). Sorrel refuses the file if the inferred grid disagrees.
+- The selected clock (`starting_time` with its `rate`, or `timestamps`) and `/units/id`, `/units/spike_times`, and `/units/spike_times_index` must be stored in their respective opened files. Every path component must be an HDF5 hard link; virtual datasets and external raw storage are refused. Open the file holding the data directly, or pass the recording file via `--dat`.
 
 The test fixtures in `release/fixtures/nwb/` are written by PyNWB
 (`generate.py` pins the version).

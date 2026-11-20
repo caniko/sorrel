@@ -23,14 +23,17 @@ container, so re-running changes object_ids but not the h5py-visible content.
 
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import h5py
 import numpy as np
 from hdmf.backends.hdf5.h5_utils import H5DataIO
+from hdmf.common import VectorData, VectorIndex
 from pynwb import NWBFile, NWBHDF5IO, get_class, load_namespaces
 from pynwb.base import TimeSeries
-from pynwb.ecephys import ElectricalSeries
+from pynwb.ecephys import ElectricalSeries, FilteredEphys
+from pynwb.misc import Units
 from pynwb.spec import NWBGroupSpec, NWBNamespaceBuilder
 
 OUT = Path(__file__).resolve().parent
@@ -44,8 +47,8 @@ REL_Y = [0.0, 20.0, 0.0, 20.0, 0.0, 20.0]
 UNITS = [(5, [0.6, 0.7, 0.75]), (7, []), (9, [0.55, 0.79])]
 
 
-def make_file(identifier):
-    """NWBFile with the shared Device, ElectrodeGroup, electrodes and units."""
+def make_file(identifier, *, units=True, electrodes=True, resolution=None):
+    """NWBFile with optional electrodes and units."""
     nwbfile = NWBFile(
         session_description="sorrel NWB reader fixture",
         identifier=identifier,
@@ -53,6 +56,13 @@ def make_file(identifier):
         file_create_date=[FILE_CREATE],
         session_id="sorrel-fixture",
     )
+    if units:
+        if resolution is not None:
+            nwbfile.units = Units(name="units", resolution=resolution)
+        for unit_id, spike_times in UNITS:
+            nwbfile.add_unit(id=unit_id, spike_times=spike_times)
+    if not electrodes:
+        return nwbfile
     device = nwbfile.create_device(name="Device")
     group = nwbfile.create_electrode_group(
         name="ElectrodeGroup",
@@ -73,16 +83,16 @@ def make_file(identifier):
             rel_x=REL_X[i],
             rel_y=REL_Y[i],
         )
-    for unit_id, spike_times in UNITS:
-        nwbfile.add_unit(id=unit_id, spike_times=spike_times)
     return nwbfile
 
 
-def add_series(nwbfile, data, name="ElectricalSeriesRaw", **kwargs):
+def make_series(nwbfile, data, name="ElectricalSeriesRaw", **kwargs):
     region = nwbfile.create_electrode_table_region(CHANNEL_REGION, "permuted subset")
-    nwbfile.add_acquisition(
-        ElectricalSeries(name=name, data=data, electrodes=region, **kwargs)
-    )
+    return ElectricalSeries(name=name, data=data, electrodes=region, **kwargs)
+
+
+def add_series(nwbfile, data, **kwargs):
+    nwbfile.add_acquisition(make_series(nwbfile, data, **kwargs))
 
 
 def good_data():
@@ -102,7 +112,7 @@ def write_good():
     nwbfile = make_file("sorrel-fixture-good")
     add_series(
         nwbfile,
-        good_data(),
+        H5DataIO(good_data(), chunks=(32, N_CHANNELS), compression="gzip"),
         rate=1000.0,
         starting_time=0.5,
         conversion=0.195e-6,
@@ -126,31 +136,171 @@ def write_uint16():
     write(nwbfile, "uint16.nwb")
 
 
-def write_float64():
-    nwbfile = make_file("sorrel-fixture-float64")
-    data = np.arange(N_SAMPLES)[:, None] + np.arange(N_CHANNELS)[None, :]
+def write_dtype(dtype, value):
+    nwbfile = make_file(f"sorrel-fixture-{dtype}")
     add_series(
         nwbfile,
-        data.astype(np.float64),
+        np.full((1, N_CHANNELS), value, dtype=dtype),
         rate=1000.0,
         starting_time=0.5,
-        conversion=1e-6,
-        offset=0.0,
+        conversion=1e44 if dtype == "float64" else 1e-6,
     )
-    write(nwbfile, "float64.nwb")
+    write(nwbfile, f"{dtype}.nwb")
 
 
-def write_timestamps():
-    nwbfile = make_file("sorrel-fixture-timestamps")
+def write_timestamps(irregular=False):
+    name = "irregular_timestamps" if irregular else "timestamps"
+    nwbfile = make_file(f"sorrel-fixture-{name}")
+    timestamps = 0.5 + np.arange(N_SAMPLES) / 1000.0
+    if irregular:
+        timestamps[197] += 3e-4
     add_series(
         nwbfile,
         good_data(),
-        timestamps=0.5 + np.arange(N_SAMPLES) / 1000.0,
+        timestamps=timestamps,
         conversion=0.195e-6,
         offset=-2e-6,
         channel_conversion=[1.0, 2.0, 1.0, 0.5],
     )
-    write(nwbfile, "timestamps.nwb")
+    write(nwbfile, f"{name}.nwb")
+
+
+def write_multiple_series():
+    nwbfile = make_file("sorrel-fixture-multiple-series", resolution=0.001)
+    for name, value in [("Z_second", 2), ("A_first", 1)]:
+        add_series(nwbfile, np.full((N_SAMPLES, N_CHANNELS), value, dtype=np.int16),
+                   name=name, rate=1000.0, starting_time=0.5, conversion=1e-6)
+    processed = make_series(
+        nwbfile, np.full((N_SAMPLES, N_CHANNELS), 3, dtype=np.int16),
+        name="Processed", rate=1000.0, starting_time=0.5, conversion=1e-6,
+    )
+    module = nwbfile.create_processing_module("ecephys", "Processed ephys")
+    filtered = FilteredEphys()
+    module.add(filtered)
+    filtered.add_electrical_series(processed)
+    write(nwbfile, "multiple_series.nwb")
+
+
+def write_legacy_series():
+    nwbfile = make_file("sorrel-fixture-legacy-series")
+    add_series(nwbfile, good_data(), name="A_first", rate=1000.0, starting_time=0.52)
+    add_series(nwbfile, good_data(), name="Z_second", rate=np.float32(1000), starting_time=0.5)
+    name = "legacy_series.nwb"
+    write(nwbfile, name)
+    with h5py.File(OUT / name, "r+") as f:
+        attrs = f["acquisition/A_first"].attrs
+        del attrs["neurodata_type"]
+        attrs["neurodata_type"] = np.bytes_("ElectricalSeries")
+
+
+def write_units_and_raw():
+    units = make_file("sorrel-fixture-units-only", resolution=0.001)
+    units.add_trial(start_time=0.6, stop_time=0.7)
+    write(units, "units_only.nwb")
+    raw = make_file("sorrel-fixture-raw-only", units=False)
+    add_series(raw, good_data(), rate=1000.0, starting_time=0.5, conversion=1e-6)
+    write(raw, "raw_only.nwb")
+
+
+def write_curated_units():
+    """Use the same Units column layout as sorrel.nwb.add_units_to_nwbfile."""
+    nwbfile = make_file("sorrel-fixture-curated", units=False, electrodes=False)
+
+    def ragged(name, rows, dtype, doc):
+        data = VectorData(name=name, description=doc,
+                          data=np.array([x for row in rows for x in row], dtype=dtype))
+        index = VectorIndex(name=f"{name}_index", target=data,
+                            data=np.cumsum([len(row) for row in rows], dtype=np.int64))
+        return [data, index]
+
+    nwbfile.units = Units(name="units", id=[9, 5], resolution=1.0 / 1000.0, columns=[
+        *ragged("spike_times", [[0.55, 0.79], [0.6, 0.7, 0.75]], np.float64,
+                "Spike times in seconds: sample_index / sample_rate + starting_time."),
+        VectorData(name="quality", description="Sorrel curation label: good, mua, noise or unsorted.",
+                   data=["mua", "good"]),
+        VectorData(name="origin", description="How the unit was made", data=["Auto[kilosort4]", "Sorrel[Manual]"]),
+        *ragged("parent_unit_ids", [[], [9, 77]], np.int64, "Unit ids this unit came from in Sorrel"),
+        *ragged("tags", [[], ["split", "review:waveform"]], str, "Sorrel tags"),
+        VectorData(name="unit_name", description="The sorter's unit id (SpikeInterface unit_ids) when it is not an integer.",
+                   data=["007", "unit_a"]),
+        VectorData(name="n_spikes", description="Sorrel QC metric. Number of spikes assigned to the cluster after curation edits (count); 0 for an empty cluster.",
+                   data=[2, 3]),
+        VectorData(name="l_ratio", description="Sorrel QC metric. Mean chi-squared survival (df = 3 PCs) of background spikes' Mahalanobis squared distances divided by n_in; lower is better; NaN with fewer than 50 spikes or no PC features.",
+                   data=[float("nan"), 0.25]),
+    ])
+    write(nwbfile, "curated_units.nwb")
+
+
+def write_reader_edge_cases():
+    one = make_file("one-channel")
+    one.add_acquisition(ElectricalSeries(
+        name="Raw", data=np.arange(N_SAMPLES, dtype=np.int16),
+        electrodes=one.create_electrode_table_region([0], "only channel"),
+        rate=1000.0, starting_time=0.5, conversion=1e-6,
+    ))
+    write(one, "one_channel.nwb")
+
+    exact_rate = 30000.123
+    units = make_file("precise-units", units=False, electrodes=False)
+    units.units = Units(name="units", resolution=1.0 / exact_rate)
+    # The two rates round this timestamp to different samples.
+    units.add_unit(id=0, spike_times=[0.5 + 30.49999998 / exact_rate])
+    write(units, "precise_units.nwb")
+    raw = make_file("rounded-raw", units=False)
+    add_series(raw, good_data(), rate=np.float32(exact_rate), starting_time=0.5)
+    write(raw, "rounded_raw.nwb")
+
+    shifted = make_file("shifted-raw", units=False)
+    shifted.fields["timestamps_reference_time"] = SESSION_START - timedelta(milliseconds=50)
+    add_series(shifted, good_data(), rate=1000.0, starting_time=0.5)
+    write(shifted, "shifted_raw.nwb")
+
+
+def write_single_file_precise_rates():
+    rate = 30000.123
+    for name, stored_rate, start, sample in [
+        ("precise_rate_short", np.float32(rate), 0.0, 100),
+        ("precise_rate_long", np.float32(rate), 0.0, 330_000_000),
+        # Reproduce the append-clock mismatch with a float64 rate ~0.9 ppb away.
+        ("close_f64_rate_short", rate + 0.000027, 0.5, 100),
+        ("close_f64_rate_long", rate + 0.000027, 0.5, 660_000_000),
+    ]:
+        nwbfile = make_file(name, units=False)
+        nwbfile.units = Units(name="units", resolution=1 / rate)
+        nwbfile.add_unit(id=0, spike_times=[start + sample / rate])
+        # Chunked data with no allocated samples, even for the long recording.
+        data = H5DataIO(shape=(sample + 2, N_CHANNELS), dtype=np.int16, chunks=(64, N_CHANNELS))
+        add_series(nwbfile, data, rate=stored_rate, starting_time=start)
+        write(nwbfile, name + ".nwb")
+
+
+def write_resampled_units_clock():
+    raw_rate = 30000.0
+    sort_rate = 29999.9991
+    sort_t0 = 0.5 / raw_rate
+    nwbfile = make_file("resampled-units-clock", units=False)
+    nwbfile.units = Units(name="units", resolution=1 / sort_rate)
+    # This spike on the resampled clock rounds to 101 on the acquisition clock.
+    nwbfile.add_unit(id=0, spike_times=[sort_t0 + 100 / sort_rate])
+    traces = np.zeros((250, N_CHANNELS), dtype=np.int16)
+    traces[101, 0] = 42
+    add_series(nwbfile, traces, rate=np.float32(raw_rate), starting_time=0.0)
+    sorted_signal = make_series(
+        nwbfile, traces, name="ResampledForSorting", rate=sort_rate, starting_time=sort_t0
+    )
+    nwbfile.create_processing_module("ecephys", "Resampled for sorting").add(
+        FilteredEphys(electrical_series=sorted_signal)
+    )
+    write(nwbfile, "resampled_units_clock.nwb")
+
+
+def write_foreign_quality():
+    nwbfile = make_file("sorrel-fixture-quality", units=False, electrodes=False)
+    for name in ["quality", "KSLabel", "unrelated_number"]:
+        nwbfile.add_unit_column(name=name, description=f"Foreign {name}")
+    for (idx, times), quality, ks in zip(UNITS, [" GOOD ", "ambiguous", "unknown"], ["mua", "NoIsE", "???"]):
+        nwbfile.add_unit(id=idx, spike_times=times, quality=quality, KSLabel=ks, unrelated_number=3.5)
+    write(nwbfile, "foreign_quality.nwb")
 
 
 def write_not_electrical():
@@ -214,8 +364,22 @@ def write_compressed():
 def main():
     write_good()
     write_uint16()
-    write_float64()
+    for dtype, value in [
+        ("int8", -120), ("uint8", 250), ("int32", -2_000_000_000),
+        ("uint32", 4_000_000_000), ("int64", -2**48),
+        ("float32", 0.125), ("float64", 1e-50), ("uint64", 2**63),
+    ]:
+        write_dtype(dtype, value)
     write_timestamps()
+    write_timestamps(irregular=True)
+    write_multiple_series()
+    write_legacy_series()
+    write_units_and_raw()
+    write_curated_units()
+    write_reader_edge_cases()
+    write_single_file_precise_rates()
+    write_resampled_units_clock()
+    write_foreign_quality()
     write_not_electrical()
     write_subtype()
     write_compressed()

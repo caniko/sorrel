@@ -27,10 +27,11 @@ hdf5-metno = { version = "0.12.4", features = [
 ], optional = true }
 # 0.11.3 rejects the bundled HDF5 2.2 headers.
 hdf5-metno-sys = { version = "0.11.4", optional = true }
+jiff = { version = "0.2", default-features = false, optional = true }
 
 [features]
 default = []
-hdf5 = ["dep:hdf5-metno", "dep:hdf5-metno-sys"]
+hdf5 = ["dep:hdf5-metno", "dep:hdf5-metno-sys", "dep:jiff"]
 
 [dev-dependencies]
 tempfile.workspace = true

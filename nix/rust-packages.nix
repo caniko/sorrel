@@ -40,6 +40,9 @@
     // {
       inherit cargoArtifacts;
       cargoExtraArgs = "-p sorrel --locked";
+      # Its NWB tests read release/fixtures, which this source omits; they
+      # run in checks.workspace-tests.
+      doCheck = false;
       nativeBuildInputs = nativeBuildInputs ++ [pkgs.installShellFiles];
       postInstall =
         completions

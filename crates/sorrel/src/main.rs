@@ -77,7 +77,7 @@ enum Cmd {
         #[arg(long)]
         standalone: bool,
         /// Run the session host without a window: MCP clients connect with
-        /// `sorrel mcp <DATA_DIR>`. Stops on Ctrl-C
+        /// `sorrel mcp` and the same dataset path and open options. Stops on Ctrl-C
         #[arg(long, requires = "root", conflicts_with = "standalone")]
         headless: bool,
     },
@@ -455,12 +455,16 @@ struct OpenArgs {
     /// kilosort | sorting-analyzer | nwb | ks4-rez (auto-detected by default)
     #[arg(long, value_name = "NAME", value_parser = parse_backend)]
     backend: Option<Backend>,
-    /// Raw recording (overrides params.py:dat_path)
+    /// Raw recording (overrides params.py:dat_path, or pairs NWB units with a raw NWB)
     #[arg(long, value_name = "PATH")]
     dat: Option<PathBuf>,
-    /// Overrides params.py:sample_rate
+    /// Overrides params.py:sample_rate. For NWB, select an exact declared clock (copy a value from the error), or supply a rate if no clock is declared
     #[arg(long, value_name = "Hz")]
-    sample_rate: Option<f32>,
+    sample_rate: Option<f64>,
+    /// NWB ElectricalSeries name under /acquisition or absolute HDF5 path
+    #[cfg(feature = "hdf5")]
+    #[arg(long, value_name = "PATH|NAME")]
+    nwb_series: Option<String>,
     /// Overrides params.py:n_channels_dat
     #[arg(long = "channels", value_name = "N")]
     n_channels: Option<u32>,
@@ -658,6 +662,8 @@ struct OpenCtx<P: DataProvider> {
     /// Per-cluster quality metrics (KS `cluster_*.tsv`, SI `quality_metrics.csv`);
     /// empty when the backend has none.
     metrics: sorrel_io::QualityMetrics,
+    /// NWB session-clock offset for the PSTH's trials; CSV/NPY are already relative.
+    nwb_start_time: f64,
     /// Per-spike depth for the drift map; needs PC features + geometry, so
     /// only the phy backend provides it (`sorrel_data::spike_depths`).
     depth_source: Option<sorrel_ui::app::DepthFn<P>>,
@@ -690,7 +696,7 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
     match backend {
         Backend::Kilosort => {
             let mut params = KilosortOpenParams {
-                sample_rate: open.sample_rate,
+                sample_rate: open.sample_rate.map(|r| r as f32),
                 n_channels: open.n_channels,
                 dtype: open.dtype,
                 offset: open.offset,
@@ -721,6 +727,7 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
                     positions,
                     shanks,
                     metrics,
+                    nwb_start_time: 0.0,
                     depth_source: None,
                 },
             )
@@ -728,9 +735,20 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
         #[cfg(feature = "hdf5")]
         Backend::Nwb => {
             let path = open.root().to_path_buf();
-            let provider = sorrel_io::NwbProvider::open(&path)?;
-            let (session, ctx) =
+            let provider = sorrel_io::NwbProvider::open_with(
+                &path,
+                sorrel_io::NwbOpenParams {
+                    series: open.nwb_series.as_deref(),
+                    raw_path: open.dat.as_deref(),
+                    sample_rate: open.sample_rate,
+                },
+            )?;
+            let starting_time = provider.starting_time();
+            let metrics = provider.quality_metrics().clone();
+            let (session, mut ctx) =
                 open_file_backed(open, provider, &path, "nwb", sorrel_io::Backend::Nwb)?;
+            ctx.nwb_start_time = starting_time;
+            ctx.metrics = metrics;
             v.visit(session, Box::new(|s| s.replay_journal()), ctx)
         }
         #[cfg(feature = "hdf5")]
@@ -796,6 +814,7 @@ fn open_kilosort(
             positions,
             shanks,
             metrics,
+            nwb_start_time: 0.0,
             depth_source: Some(sorrel_data::spike_depths),
         },
     ))
@@ -822,7 +841,7 @@ fn run_share(open: &OpenArgs, port: u16, relay: Option<sorrel_remote::Multiaddr>
         bail!("remote share supports kilosort/phy datasets");
     }
     let mut params = KilosortOpenParams {
-        sample_rate: open.sample_rate,
+        sample_rate: open.sample_rate.map(|r| r as f32),
         n_channels: open.n_channels,
         dtype: open.dtype,
         offset: open.offset,
@@ -884,6 +903,7 @@ fn run_join(
         positions: joined.positions.clone(),
         shanks: Vec::new(),
         metrics: Default::default(),
+        nwb_start_time: 0.0,
         depth_source: Some(sorrel_data::spike_depths),
     };
     // The network state lives in this process, so the window is standalone
@@ -891,7 +911,7 @@ fn run_join(
     // the window closes).
     let session = joined.session;
     let mut once = Some(move |rs: Option<&RenderState>| {
-        let app = build_tab(session, Box::new(|_| Ok(())), ctx, None, rs);
+        let app = build_tab(session, Box::new(|_| Ok(())), ctx, None, rs, None);
         Opened::Tab(Box::new(app) as Box<dyn Tab>, root)
     });
     let opener: Opener = Box::new(move |_, _, rs| {
@@ -943,6 +963,7 @@ where
             positions,
             shanks,
             metrics: Default::default(),
+            nwb_start_time: 0.0,
             depth_source: None,
         },
     ))
@@ -954,20 +975,23 @@ where
 /// a [`Tab`], so the visitor trait stays unchanged).
 struct TabBuilder<'a> {
     out: &'a mut Option<Box<dyn Tab>>,
-    events: Option<Events>,
+    open: &'a OpenArgs,
     rs: Option<&'a RenderState>,
+    session_key: String,
 }
 impl SessionVisitor for TabBuilder<'_> {
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
+        let events = load_events(self.open, ctx.nwb_start_time)?;
         *self.out = Some(Box::new(build_tab(
             session,
             seed,
             ctx,
-            self.events,
+            events,
             self.rs,
+            Some(self.session_key),
         )));
         Ok(())
     }
@@ -1492,9 +1516,60 @@ fn host_dir(open: &OpenArgs) -> PathBuf {
     }
 }
 
+fn session_path(path: &Path) -> PathBuf {
+    let path = if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    };
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn session_key(open: &OpenArgs) -> Result<String> {
+    let mut args = open.clone();
+    args.rebase(&std::env::current_dir()?);
+    // Discard is a one-shot action, not a property of the live session.
+    args.discard_journal = false;
+    // A file's name matters even through a symlink: it names its journal.
+    args.root = Some(if args.root().is_dir() {
+        session_path(args.root())
+    } else {
+        session_path(&host_dir(&args)).join(
+            args.root()
+                .file_name()
+                .context("missing dataset filename")?,
+        )
+    });
+    for path in [
+        &mut args.dat,
+        &mut args.journal,
+        &mut args.spikeglx_meta,
+        &mut args.oebin,
+        &mut args.events,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        *path = session_path(path);
+    }
+    #[cfg(feature = "hdf5")]
+    if let Some(name) = args.nwb_series.as_mut().filter(|s| !s.starts_with('/')) {
+        *name = format!("/acquisition/{name}");
+    }
+    // ponytail: compare normalized open arguments rather than reopening a
+    // provider to resolve implicit defaults. Use the same flags to attach.
+    Ok(format!("open-args-v1:{args:?}"))
+}
+
 /// `sorrel mcp`: bridge stdio to a running host, else serve in-process.
 fn run_mcp(open: &OpenArgs) -> Result<()> {
-    if sorrel_data::attach(&host_dir(open), std::io::stdin(), std::io::stdout())? {
+    if sorrel_data::serve::attach_for_session(
+        &host_dir(open),
+        Some(&session_key(open)?),
+        open.discard_journal,
+        std::io::stdin(),
+        std::io::stdout(),
+    )? {
         return Ok(());
     }
     // attach found no listener. If another process still has the journal
@@ -1515,30 +1590,79 @@ fn busy_hint(e: anyhow::Error) -> anyhow::Error {
 }
 
 /// `sorrel run --headless`: the host and its MCP listener, no window.
-struct Headless;
-impl SessionVisitor for Headless {
+struct Headless<'a>(&'a OpenArgs);
+impl SessionVisitor for Headless<'_> {
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
+        let key = session_key(self.0)?;
+        let args = mcp_open_args(self.0)?;
         let host = std::sync::Arc::new(sorrel_data::SessionHost::new(seeded(session, seed)?));
-        let listener = sorrel_data::spawn_listener(
+        let listener = sorrel_data::serve::spawn_listener_for_session(
             host,
             &ctx.save_dir,
             ctx.reseal_on_save,
             phy_label_str,
             None,
+            Some(&key),
         )?;
         println!(
             "sorrel host on 127.0.0.1:{}; connect an agent with `sorrel mcp {}`; Ctrl-C stops",
             listener.port(),
-            sorrel_io::fsutil::display_path(&ctx.save_dir)
+            args
         );
         // Ctrl-C returns, dropping the listener so it removes its registry file.
         sorrel_remote::wait_for_ctrl_c();
         drop(listener);
         Ok(())
     }
+}
+
+fn mcp_open_args(open: &OpenArgs) -> Result<String> {
+    let mut open = open.clone();
+    open.rebase(&std::env::current_dir()?);
+    let mut args = shell_quote(&sorrel_io::fsutil::display_path(open.root()).to_string());
+    let mut flag = |name, value: Option<String>| {
+        if let Some(value) = value {
+            let sep = if value.starts_with('-') { "=" } else { " " };
+            args.push_str(&format!(" --{name}{sep}{}", shell_quote(&value)));
+        }
+    };
+    for (name, path) in [
+        ("dat", open.dat),
+        ("journal", open.journal),
+        ("spikeglx-meta", open.spikeglx_meta),
+        ("oebin", open.oebin),
+        ("events", open.events),
+    ] {
+        flag(
+            name,
+            path.map(|p| sorrel_io::fsutil::display_path(&p).to_string()),
+        );
+    }
+    #[cfg(feature = "hdf5")]
+    flag("nwb-series", open.nwb_series);
+    flag("sample-rate", open.sample_rate.map(|r| r.to_string()));
+    flag("channels", open.n_channels.map(|n| n.to_string()));
+    flag("dtype", open.dtype.map(|d| d.phy_name().into()));
+    flag("offset", open.offset.map(|n| n.to_string()));
+    flag("sorter", open.sorter);
+    flag(
+        "backend",
+        open.backend.map(|b| {
+            match b {
+                Backend::Kilosort => "kilosort",
+                Backend::SortingAnalyzer => "sorting-analyzer",
+                #[cfg(feature = "hdf5")]
+                Backend::Nwb => "nwb",
+                #[cfg(feature = "hdf5")]
+                Backend::Ks4Rez => "ks4-rez",
+            }
+            .into()
+        }),
+    );
+    Ok(args)
 }
 
 struct Serve;
@@ -1634,12 +1758,16 @@ fn build_tab<P>(
     ctx: OpenCtx<P>,
     events: Option<Events>,
     rs: Option<&RenderState>,
+    session_key: Option<String>,
 ) -> SorrelApp<P>
 where
     P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
 {
     // Seeding and replay run on a worker behind the loading screen.
     let mut app = SorrelApp::with_loader(session, phy_label_str, seed);
+    if let Some(key) = session_key {
+        app.set_session_key(key);
+    }
     #[cfg(feature = "phy-export")]
     {
         // A sibling of the dataset, so `share` (which syncs everything under
@@ -1688,17 +1816,15 @@ where
 }
 
 /// `--events`, else (for an NWB file without sidecar events) its trials table.
-fn load_events(open: &OpenArgs) -> Result<Option<Events>> {
-    Ok(match &open.events {
+fn load_events(open: &OpenArgs, nwb_start_time: f64) -> Result<Option<Events>> {
+    let is_nwb = |p: &Path| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("nwb"));
+    let mut events = match &open.events {
         Some(p) => {
             Some(Events::read(p).with_context(|| format!("reading events {}", p.display()))?)
         }
         // Sidecar events next to an NWB file win (the app detects them);
         // otherwise its trials table, whose absence is normal.
-        None if open
-            .root()
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("nwb"))
+        None if is_nwb(open.root())
             && matches!(
                 Events::detect(open.root().parent().unwrap_or(Path::new("."))),
                 Ok(None)
@@ -1707,29 +1833,50 @@ fn load_events(open: &OpenArgs) -> Result<Option<Events>> {
             Events::read(open.root()).ok()
         }
         None => None,
-    })
+    };
+    if let Some(ev) = events
+        .as_mut()
+        .filter(|_| is_nwb(open.events.as_deref().unwrap_or(open.root())))
+    {
+        // A trial before the trace starts must not be clamped to sample zero.
+        let first = ev.times_s.partition_point(|&t| t < nwb_start_time);
+        ev.times_s.drain(..first);
+        ev.label.drain(..first);
+        ev.times_s.iter_mut().for_each(|t| *t -= nwb_start_time);
+    }
+    Ok(events)
 }
 
 /// The shell's opener: a forwarded `sorrel open`'s args become a tab, or the
 /// index of the tab that already shows the dataset.
 fn tab_opener() -> Opener {
-    Box::new(|req, open_dirs, rs| {
+    Box::new(|req, open_tabs, rs| {
         let args = std::iter::once("sorrel").chain(req.args.iter().map(String::as_str));
         let mut open = TabCli::try_parse_from(args)?.open;
         open.rebase(&req.cwd);
-        let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-        let dir = canon(&host_dir(&open));
-        if let Some(i) = open_dirs.iter().position(|d| canon(d) == dir) {
+        let key = session_key(&open)?;
+        let dir = session_path(&host_dir(&open));
+        if let Some((i, tab)) = open_tabs
+            .iter()
+            .enumerate()
+            .find(|(_, tab)| session_path(tab.dataset()) == dir)
+        {
+            sorrel_data::serve::check_session_reuse(
+                "open tab",
+                tab.session_key(),
+                &key,
+                open.discard_journal,
+            )?;
             return Ok(Opened::Existing(i));
         }
-        let events = load_events(&open)?;
         let mut tab = None;
         with_session(
             &open,
             TabBuilder {
                 out: &mut tab,
-                events,
+                open: &open,
                 rs,
+                session_key: key,
             },
         )?;
         let tab = tab.context("backend produced no tab")?;
@@ -1950,7 +2097,8 @@ fn mcp_target() -> Result<PathBuf> {
         0 => bail!("no running sorrel host; pass DATA_DIR"),
         1 => Ok(alive.remove(0).dataset),
         _ => bail!(
-            "several sorrel hosts are running; pass DATA_DIR:\n{}",
+            "several sorrel hosts are running; pass the dataset path and its open options. \
+             Host save directories:\n{}",
             alive
                 .iter()
                 .map(|h| format!("  {} ({}, pid {})", h.dataset.display(), h.kind, h.pid))
@@ -1993,6 +2141,17 @@ fn mcp_tools(json: bool) -> Result<()> {
     Ok(())
 }
 
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || "/._-+:@".contains(c))
+    {
+        s.to_owned()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 /// `sorrel mcp config`: how to register this binary with an agent client.
 fn mcp_config(client: Client, dir: Option<PathBuf>) -> Result<()> {
     let exe = std::env::current_exe()?.display().to_string();
@@ -2000,21 +2159,15 @@ fn mcp_config(client: Client, dir: Option<PathBuf>) -> Result<()> {
     if let Some(d) = dir {
         args.push(std::path::absolute(d)?.display().to_string());
     }
-    let sh = |s: &str| {
-        if s.chars()
-            .all(|c| c.is_alphanumeric() || "/._-+:@".contains(c))
-        {
-            s.to_owned()
-        } else {
-            format!("'{}'", s.replace('\'', r"'\''"))
-        }
-    };
     let json = |s: &[String]| serde_json::to_string(s).expect("strings serialise");
     match client {
         Client::Claude => println!(
             "claude mcp add sorrel -- {} {}",
-            sh(&exe),
-            args.iter().map(|a| sh(a)).collect::<Vec<_>>().join(" ")
+            shell_quote(&exe),
+            args.iter()
+                .map(|a| shell_quote(a))
+                .collect::<Vec<_>>()
+                .join(" ")
         ),
         // JSON string escapes are valid TOML basic strings.
         Client::Codex => println!(
@@ -2060,7 +2213,12 @@ fn run_call(open: &OpenArgs, tool: &str, args: Option<&str>, raw: bool) -> Resul
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": tool, "arguments": args},
     });
-    let reply = match sorrel_data::call_once(&host_dir(open), &request)? {
+    let reply = match sorrel_data::serve::call_once_for_session(
+        &host_dir(open),
+        Some(&session_key(open)?),
+        open.discard_journal,
+        &request,
+    )? {
         Some(r) => r,
         None => {
             let mut reply = None;
@@ -2268,7 +2426,7 @@ fn main() -> Result<()> {
             standalone,
             headless,
         }) => match headless {
-            true => with_session(&open, Headless),
+            true => with_session(&open, Headless(&open)),
             false => run_gui(&open, standalone),
         },
         Some(Cmd::Status { dir, json }) => run_status(dir.as_deref(), json),
@@ -2784,6 +2942,39 @@ mod tests {
         };
         open.rebase(Path::new("/cwd"));
         assert_eq!((open.root, open.dat), (rel("/abs/ds"), None));
+    }
+
+    #[cfg(feature = "hdf5")]
+    #[test]
+    fn nwb_flags_and_trial_times() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../release/fixtures/nwb/units_only.nwb"
+        );
+        let Some(Cmd::Open(open)) = Cli::try_parse_from([
+            "sorrel",
+            "open",
+            path,
+            "--dat",
+            "raw.nwb",
+            "--nwb-series",
+            "ElectricalSeriesRaw",
+            "--sample-rate",
+            "1000",
+            "--events",
+            path,
+        ])
+        .unwrap()
+        .cmd
+        else {
+            panic!("expected open")
+        };
+        assert_eq!(open.nwb_series.as_deref(), Some("ElectricalSeriesRaw"));
+        assert_eq!(open.dat.as_deref(), Some(Path::new("raw.nwb")));
+        assert_eq!(open.sample_rate, Some(1000.0));
+        let events = load_events(&open, 0.5).unwrap().unwrap();
+        assert_eq!(events.samples(1000.0, None), [sorrel_io::SampleIndex(100)]);
+        assert!(load_events(&open, 0.61).unwrap().unwrap().is_empty());
     }
 
     #[test]

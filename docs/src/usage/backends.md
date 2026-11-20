@@ -10,7 +10,7 @@ Sorrel reads several sorting and recording formats. The general rule:
 | --------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Sorting   | phy / Kilosort directory                                 | First-class. Reads phy artefacts as-is.                                                                                                                                                                       |
 | Sorting   | SpikeInterface `SortingAnalyzer` (binary folder)         | Reads `recording.json` (binary, or a channel- and sample-preserving preprocessing chain over binary), the flat sorting under `sorting/`, optional `probe.json`, and `extensions/quality_metrics/metrics.csv`. |
-| Sorting   | NWB                                                      | HDF5 is bundled by default. Reads `/units` and the first `ElectricalSeries`; see [NWB](integrations.md#nwb).                                                                                                  |
+| Sorting   | NWB (local HDF5)                                         | HDF5 is bundled by default. Reads `/units`, with or without a trace. `--nwb-series` selects an acquisition or processed series; `--dat` pairs a separate raw NWB. See [NWB](integrations.md#nwb).             |
 | Sorting   | Kilosort 4 `rez.mat`                                     | HDF5 is bundled by default. Reads `rez/st3`, `rez/ops/*`, `rez/xc`, `rez/yc`.                                                                                                                                 |
 | Recording | SpikeGLX (`*.bin` + `*.meta`)                            | Use as `--dat`; pass `--spikeglx-meta` for sample rate / channels / dtype.                                                                                                                                    |
 | Recording | Open Ephys binary (`continuous.dat` + `structure.oebin`) | Use as `--dat`; pass `--oebin` to inherit metadata.                                                                                                                                                           |
@@ -43,6 +43,7 @@ Sorrel auto-loads cluster-level metrics at startup from any of:
 - `quality_metrics.csv` (one row per cluster, header columns become
   metric names — SI's format).
 - `cluster_<metric>.tsv` files (one file per metric — phy's format).
+- `/units` columns marked as Sorrel QC metrics by the [Python NWB export](integrations.md#writing-curated-units-to-nwb).
 
 NaNs mean the upstream tool didn't report a value for that cluster.
 

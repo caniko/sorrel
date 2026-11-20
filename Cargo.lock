@@ -6012,6 +6012,7 @@ dependencies = [
  "flate2",
  "hdf5-metno",
  "hdf5-metno-sys",
+ "jiff",
  "log",
  "memmap2",
  "serde",
