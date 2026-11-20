@@ -133,7 +133,7 @@ auto-detect — see [Backend detection](#backend-detection)).
 ## NWB
 
 ```sh
-sorrel open my_session.nwb  # build with --features hdf5
+sorrel open my_session.nwb
 sorrel open my_session.nwb --nwb-series ElectricalSeriesRaw
 sorrel open my_session.nwb --nwb-series /processing/ecephys/FilteredEphys/Processed
 sorrel open sorted_units.nwb --dat recording.nwb
@@ -205,9 +205,10 @@ Spike indices must fit
 inside the raw series. The files must have the same `timestamps_reference_time`;
 Sorrel does not infer an offset between files.
 
-The reader needs a local NWB with `/units`. HDF5 files require `cargo build
---features hdf5`. One series is read per session; multi-segment stitching and
-DANDI/HTTP streaming are not supported.
+The reader needs a local NWB with `/units`. Default builds and release
+binaries bundle HDF5, including gzip/deflate and LZF, so no system HDF5
+installation is needed. One series is read per session; multi-segment
+stitching and DANDI/HTTP streaming are not supported.
 
 - Timestamps with float64 spacing greater than 0.01 samples are refused; if sampling was regular, rewrite the series with `starting_time` and `rate`.
 - With per-sample `timestamps`, each spike must map to a sample inside the series whose recorded timestamp is nearest to the spike time (ties are allowed). Sorrel refuses the file if the inferred grid disagrees.
@@ -335,7 +336,7 @@ The interface does not link units to electrodes.
 ## Kilosort 4 `rez.mat`
 
 ```sh
-sorrel open rez.mat --dat path/to/recording.bin   # build with --features hdf5
+sorrel open rez.mat --dat path/to/recording.bin
 ```
 
 Reads `rez/st3` for sample/template tuples, `rez/ops/fs` and
@@ -343,8 +344,8 @@ Reads `rez/st3` for sample/template tuples, `rez/ops/fs` and
 positions, and `rez/ops/fbinary`/`fproc` for the dat path (overridable
 with `--dat`).
 
-If you'd rather not enable the `hdf5` feature, KS4 writes a phy export
-under `<output>/phy/` automatically — open that directory instead.
+The `rez.mat` reader is included by default. If you build without it,
+open the phy export that KS4 writes under `<output>/phy/` instead.
 
 ## Python (Jupyter)
 

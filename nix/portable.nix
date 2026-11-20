@@ -25,13 +25,18 @@
       nativeBuildInputs = [pkgs.cargo-zigbuild pkgs.zig pkgs.cmake];
       # aws-lc-sys (via libp2p-quic) links s2n-bignum's assembly with
       # unresolvable symbols under its cc builder + zig; its CMake builder
-      # links cleanly. cmake is only for that, not for configurePhase.
+      # links cleanly. Cargo uses CMake for aws-lc and HDF5.
       AWS_LC_SYS_CMAKE_BUILDER = "1";
       dontUseCmakeConfigure = true;
       cargoBuildCommand = "cargo zigbuild --profile release --target ${rustTarget}.${glibc}";
       # sorrel-relay ships in the same tarball: `cargo binstall sorrel-remote`
       # needs it next to sorrel's binaries.
-      cargoExtraArgs = "-p sorrel -p sorrel-remote --locked";
+      # Zig 0.16 emits an undefined relocation for zlib's deflate table on
+      # x86_64 at -O1 and above. Keep the workaround local to libz-sys.
+      cargoExtraArgs =
+        "-p sorrel -p sorrel-remote --locked"
+        + pkgs.lib.optionalString (rustTarget == "x86_64-unknown-linux-gnu")
+        " --config profile.release.package.libz-sys.opt-level=0";
       doCheck = false;
       preBuild = ''
         export HOME=$TMPDIR ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local
@@ -53,6 +58,7 @@
   appimage = pkgs.runCommand "sorrel-${version}.AppImage" {nativeBuildInputs = [pkgs.squashfsTools];} ''
     mkdir -p AppDir
     install -m755 ${x86_64}/bin/sorrel AppDir/AppRun
+    install -m644 ${../crates/sorrel/THIRD-PARTY-HDF5.txt} AppDir/THIRD-PARTY-HDF5.txt
     install -m644 ${desktop} AppDir/sorrel.desktop
     install -m644 ${../assets/icon/sorrel-256.png} AppDir/sorrel.png
     ln -s sorrel.png AppDir/.DirIcon

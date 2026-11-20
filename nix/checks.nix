@@ -4,9 +4,7 @@
   commonArgs,
   cargoArtifacts,
   runtimeLibs,
-  hdf5C,
   sorrel,
-  sorrelHdf5,
   testSrc,
   hmModule,
 }: let
@@ -44,6 +42,9 @@ in
   // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
     # Every workspace test, the UI snapshot states included: they rasterise
     # on the pinned Mesa lavapipe (as in the dev shell) and must not skip.
+    # hdf5 is a default feature, so this also runs the NWB and rez.mat
+    # readers against release/fixtures (a separate HDF5 check would rebuild
+    # every test binary and run the runner out of memory in flake check).
     workspace-tests = craneLib.cargoNextest (commonArgs
       // {
         inherit cargoArtifacts;
@@ -56,23 +57,6 @@ in
         SORREL_LAVAPIPE_ICD = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.uname.processor}.json";
         SORREL_REQUIRE_GPU = "1";
         LD_LIBRARY_PATH = lib.makeLibraryPath runtimeLibs;
-        preCheck = ''
-          export HOME=$(mktemp -d)
-          export XDG_RUNTIME_DIR=$HOME
-        '';
-      });
-
-    # Run both NWB storage adapters against the same fixtures and in
-    # mixed-format pairs, plus the optional HDF5 rez.mat reader.
-    sorrel-hdf5 = sorrelHdf5;
-    hdf5-tests = craneLib.cargoNextest (commonArgs
-      // {
-        inherit cargoArtifacts;
-        src = testSrc;
-        buildInputs = commonArgs.buildInputs ++ [hdf5C];
-        HDF5_DIR = "${hdf5C}";
-        # sorrel-data's other tests already run in workspace-tests.
-        cargoNextestExtraArgs = "-p sorrel-io -p sorrel-data -p sorrel --features sorrel-io/hdf5,sorrel-data/hdf5,sorrel-io/zarr,sorrel-data/zarr,sorrel/hdf5 --no-fail-fast -E 'package(sorrel-io) | binary(nwb_curation) | (package(sorrel) & test(nwb))'";
         preCheck = ''
           export HOME=$(mktemp -d)
           export XDG_RUNTIME_DIR=$HOME

@@ -6,6 +6,7 @@
   # sqlite needed in buildInputs.
   nativeBuildInputs = with pkgs; [
     clang
+    cmake
     mold
     pkg-config
   ];
@@ -67,17 +68,7 @@
       fontconfig
       freetype
     ];
-
-  # Optional libhdf5 for the NWB / Kilosort 4 rez.mat backends.
-  # `hdf5-metno-sys`'s build script wants headers and lib under one
-  # prefix, but nixpkgs splits libhdf5 into separate outputs (`out`
-  # has lib/, `dev` has include/). Symlink-join both into a single tree
-  # so the build script's HDF5_DIR detection works.
-  hdf5C = pkgs.symlinkJoin {
-    name = "hdf5-merged-${pkgs.hdf5.version}";
-    paths = [pkgs.hdf5 pkgs.hdf5.dev];
-  };
 in {
   buildInputs = lib.optionals stdenv.hostPlatform.isLinux linuxBuildInputs;
-  inherit nativeBuildInputs linuxBuildInputs aarch64LinuxBuildInputs runtimeLibs hdf5C;
+  inherit nativeBuildInputs linuxBuildInputs aarch64LinuxBuildInputs runtimeLibs;
 }

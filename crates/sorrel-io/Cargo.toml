@@ -19,11 +19,14 @@ log.workspace = true
 dunce = "1"
 
 # Optional HDF5 backend for NWB and Kilosort 4 `rez.mat` (MATLAB v7.3 = HDF5).
-# Off by default: pulls libhdf5 in as a system dependency. Enable with
-# `--features hdf5`. We use the actively-maintained `hdf5-metno` fork
-# (vs. the upstream-stale `hdf5` crate), which supports libhdf5 ≥ 1.14.
-hdf5-metno = { version = "0.12.4", optional = true }
-hdf5-metno-sys = { version = "0.11.3", optional = true }
+# Bundle HDF5 and the gzip/deflate and LZF filters used by NWB/h5py.
+hdf5-metno = { version = "0.12.4", features = [
+  "static",
+  "zlib",
+  "lzf",
+], optional = true }
+# 0.11.3 rejects the bundled HDF5 2.2 headers.
+hdf5-metno-sys = { version = "0.11.4", optional = true }
 num-traits = { version = "0.2", optional = true }
 lz4_flex = { version = "0.12.3", optional = true, default-features = false, features = [
   "std",

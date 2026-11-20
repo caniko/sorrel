@@ -11,9 +11,8 @@ The detector looks for, in order:
 1. `spike_times.npy` + `spike_clusters.npy` → **phy / Kilosort**.
 2. `recording.json` (or `binary.json`) + `sorting/` → **SpikeInterface
    `SortingAnalyzer`**.
-3. A `.nwb` file path → **NWB** (requires `--features hdf5`).
-4. A `rez.mat` / `rez2.mat` file path → **Kilosort 4 rez** (requires
-   `--features hdf5`).
+3. A `.nwb` file path → **NWB**.
+4. A `rez.mat` / `rez2.mat` file path → **Kilosort 4 rez**.
 
 You can force the choice with `--backend kilosort | sorting-analyzer |
 nwb | ks4-rez`.
@@ -55,9 +54,11 @@ flattened sorting under `<root>/sorting/`. A Zarr analyzer converts with
 
 ## NWB and KS4 rez
 
+Both readers are included by default.
+
 ```bash
-sorrel open my_session.nwb                           # --features hdf5
-sorrel open rez.mat --dat path/to/recording.bin      # --features hdf5
+sorrel open my_session.nwb
+sorrel open rez.mat --dat path/to/recording.bin
 ```
 
 ## Curation journal

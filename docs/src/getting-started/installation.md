@@ -1,8 +1,8 @@
 # Installation
 
-Sorrel is a Rust workspace and a Nix flake. The default build is pure Rust;
-the NWB and Kilosort 4 `rez.mat` backends are gated behind an `hdf5`
-feature that links against `libhdf5`.
+Sorrel includes the NWB and Kilosort 4 `rez.mat` readers by default.
+Prebuilt binaries and the default Nix package bundle HDF5; you don't need
+to install HDF5 or CMake to use them.
 
 Prebuilt binaries are on the
 [GitHub releases page](https://github.com/caniko/sorrel/releases), and are
@@ -19,15 +19,13 @@ The binary is written to `target/release/sorrel`. A second binary,
 `sorrelw`, is the console-free launcher for Windows (see [Windows](#windows)). Shell completions come from
 `sorrel completions <shell>`; see the [CLI reference](cli.md#completions).
 
-To enable the HDF5-backed readers (NWB, KS4 `rez.mat`):
-
-```bash
-cargo build --release -p sorrel --features hdf5
-```
+When building from source with Cargo (including `cargo install`), you need
+a C compiler and CMake 3.26 or newer to build the bundled HDF5 library.
 
 Full phy export (`sorrel export-phy`, the `export_phy` MCP tool, the
 **Export phy** button and `Session.export_phy` in `sorrel-py`) is the
-`phy-export` feature, on by default. Leave it out with:
+`phy-export` feature, on by default. To build the CLI without both HDF5 and
+phy export, use:
 
 ```bash
 cargo build --release -p sorrel --no-default-features
@@ -158,8 +156,7 @@ Vulkan on ARM64 is untested.
 ## With Nix
 
 ```bash
-nix build .#sorrel        # default build, no HDF5
-nix build .#sorrelHdf5    # with HDF5 features
+nix build .#sorrel        # includes HDF5
 ```
 
 `nix build` builds the default `sorrel` package. The flake also exposes:
@@ -183,8 +180,6 @@ Add the flake as an input and enable the module:
   # in your Home Manager configuration:
   imports = [inputs.sorrel.homeManagerModules.default];
   programs.sorrel.enable = true;
-  # NWB/HDF5 support:
-  # programs.sorrel.package = inputs.sorrel.packages.${system}.sorrelHdf5;
 }
 ```
 

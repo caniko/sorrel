@@ -342,6 +342,53 @@ dependencies = [
 ]
 
 [[package]]
+name = "askama"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6024d73179f43f15ccd2b881bfea6fee7f3a46ec53f33b52210dea749ebebaa4"
+dependencies = [
+ "askama_macros",
+ "itoa",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "askama_derive"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "071ee5ebf2138e3ad180e0aacf6940c2cab5e6d8333741d9925c7bee2b153f39"
+dependencies = [
+ "askama_parser",
+ "memchr",
+ "proc-macro2",
+ "quote",
+ "rustc-hash 2.1.2",
+ "syn 3.0.9",
+]
+
+[[package]]
+name = "askama_macros"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "643e1c7cbb6aec1d920332fe51a7c0d8219e273dcb8602db03f5263e4d16487b"
+dependencies = [
+ "askama_derive",
+]
+
+[[package]]
+name = "askama_parser"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c5ae75772275d268b03ab8bdccdd12117b6169ee23256942b34e46c9f476583"
+dependencies = [
+ "rustc-hash 2.1.2",
+ "unicode-ident",
+ "winnow 1.0.2",
+]
+
+[[package]]
 name = "asn1-rs"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2505,10 +2552,12 @@ checksum = "f43f0693fa3ce381110a9f355ba7bd2a2fb864278cc60f3307ac17fe30d6109a"
 dependencies = [
  "bitflags 2.11.1",
  "cfg-if",
+ "errno",
  "hdf5-metno-derive",
  "hdf5-metno-sys",
  "hdf5-metno-types",
  "libc",
+ "lzf-sys",
  "ndarray 0.17.2",
  "paste",
 ]
@@ -2527,13 +2576,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "hdf5-metno-sys"
-version = "0.11.3"
+name = "hdf5-metno-src"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b546cf84b629a51ea1e68c783b37ce2045c80f3d56e4ba1d2d882cfba0364738"
+checksum = "69c883c565498492954e344c482f8622525e58c7a71100dd9498c4940da82885"
 dependencies = [
+ "cmake",
+ "libz-sys",
+]
+
+[[package]]
+name = "hdf5-metno-sys"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8843570a6285f6815cf38d2eff90072f14ea2cbaa0158a22281088e71133610a"
+dependencies = [
+ "hdf5-metno-src",
  "libc",
  "libloading",
+ "libz-sys",
  "parking_lot",
  "pkg-config",
  "regex",
@@ -3586,6 +3647,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "libz-sys"
+version = "1.1.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fee3f59f4321dab0c78d828942e7aa09d0bd8ad6e78a501977e6bf3d02938045"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
 name = "linebender_resource_handle"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3670,6 +3743,15 @@ name = "lz4_flex"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac34a2669aea5e5a89a9c979652342c2ad557af1c690d43251702a924d11cf73"
+
+[[package]]
+name = "lzf-sys"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "411d1ba1d5d217b00615238cb6e9d68fbb93dc422f68e3396b5cf803ad832b6f"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "match-lookup"
@@ -6094,6 +6176,7 @@ name = "sorrel-data"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "askama",
  "blake3",
  "flate2",
  "log",

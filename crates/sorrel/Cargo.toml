@@ -45,7 +45,7 @@ rand = { version = "0.9", optional = true }
 eframe = { workspace = true, features = ["wayland", "x11"] }
 
 [features]
-default = ["phy-export", "zarr"]
+default = ["phy-export", "hdf5", "zarr"]
 # `sorrel export-phy`, the serve tool and the GUI button.
 phy-export = ["sorrel-data/phy-export"]
 hdf5 = ["sorrel-io/hdf5", "sorrel-data/hdf5"]
