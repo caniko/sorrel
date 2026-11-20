@@ -34,6 +34,11 @@ mod stub {
 #[cfg(not(any(feature = "hdf5", feature = "zarr")))]
 pub use stub::open_stub;
 
+/// The NWB file has no trials table (as opposed to an unreadable table).
+#[derive(Debug, thiserror::Error)]
+#[error("no /intervals/trials table")]
+pub struct NoTrials;
+
 #[cfg(any(feature = "hdf5", feature = "zarr"))]
 mod imp {
     mod specs;
@@ -77,6 +82,8 @@ mod imp {
         channel_map: Vec<ChannelId>,
         identity_bytes: Vec<u8>,
         trace: Option<NwbTrace>,
+        #[cfg(feature = "dandi")]
+        remote_root: Option<Group>,
     }
 
     impl NwbProvider {
@@ -86,7 +93,77 @@ mod imp {
 
         pub fn open_with(path: impl AsRef<Path>, params: NwbOpenParams<'_>) -> Result<Self> {
             let path = path.as_ref();
-            let f = Group::open(path)?;
+            #[cfg(feature = "dandi")]
+            return Self::open_pinned(
+                path,
+                params,
+                None,
+                Self::remote_raw_locator(params)
+                    .map(crate::dandi::resolve)
+                    .transpose()?,
+            );
+            #[cfg(not(feature = "dandi"))]
+            Self::from_group(Group::open(path)?, path, params, None)
+        }
+
+        /// Open a DANDI asset or HTTPS NWB stream and return its relative local state directory.
+        #[cfg(feature = "dandi")]
+        pub fn open_remote(
+            locator: &str,
+            params: NwbOpenParams<'_>,
+        ) -> Result<(Self, std::path::PathBuf)> {
+            let [root, raw] =
+                crate::dandi::resolve_pair(Some(locator), Self::remote_raw_locator(params))?;
+            let state = root
+                .as_ref()
+                .context("missing resolved NWB dataset")?
+                .state
+                .clone();
+            Ok((
+                Self::open_pinned(Path::new(locator), params, root, raw)?,
+                state,
+            ))
+        }
+
+        #[cfg(feature = "dandi")]
+        fn remote_raw_locator(params: NwbOpenParams<'_>) -> Option<&str> {
+            params
+                .raw_path
+                .filter(|path| crate::dandi::is_remote(path))
+                .and_then(Path::to_str)
+        }
+
+        /// Open NWB using the supplied remote revisions, never resolving their locators again.
+        /// Local inputs are opened from `path` and `params.raw_path` as usual.
+        #[cfg(feature = "dandi")]
+        pub fn open_pinned(
+            path: &Path,
+            params: NwbOpenParams<'_>,
+            root: Option<crate::dandi::Resolved>,
+            raw: Option<crate::dandi::Resolved>,
+        ) -> Result<Self> {
+            ensure!(
+                root.is_some() || !crate::dandi::is_remote(path),
+                "missing resolved NWB dataset"
+            );
+            ensure!(
+                raw.is_some() == params.raw_path.is_some_and(crate::dandi::is_remote),
+                "remote NWB recording must be resolved before opening"
+            );
+            let (f, identity) = match root {
+                Some(root) => (Group::open_remote(root.store)?, Some(root.identity)),
+                None => (Group::open(path)?, None),
+            };
+            Self::from_group(f, path, params, identity, raw)
+        }
+
+        fn from_group(
+            f: Group,
+            path: &Path,
+            params: NwbOpenParams<'_>,
+            remote_identity: Option<Vec<u8>>,
+            #[cfg(feature = "dandi")] resolved_raw: Option<crate::dandi::Resolved>,
+        ) -> Result<Self> {
             let spike_times = f.stored_dataset("/units/spike_times")?;
             let spike_times_index = f.stored_dataset("/units/spike_times_index")?;
             let ids = f.stored_dataset("/units/id")?;
@@ -99,8 +176,20 @@ mod imp {
             let units = f
                 .group("/units")
                 .context("missing /units in the sorting NWB file")?;
-            let raw = params.raw_path.map(Group::open).transpose()?;
-            let recording = raw.as_ref().unwrap_or(&f);
+            let raw = params
+                .raw_path
+                .map(|path| {
+                    #[cfg(feature = "dandi")]
+                    if let Some(resolved) = resolved_raw {
+                        return Ok::<_, anyhow::Error>((
+                            Group::open_remote(resolved.store)?,
+                            Some(resolved.identity),
+                        ));
+                    }
+                    Ok::<_, anyhow::Error>((Group::open(path)?, None))
+                })
+                .transpose()?;
+            let recording = raw.as_ref().map_or(&f, |(group, _)| group);
             let series = find_electrical_series(recording, params.series, raw.is_some())?;
             // In a single file with a series, an invalid resolution value is
             // not a clock statement; its storage type must still be exact.
@@ -141,6 +230,7 @@ mod imp {
                 }
                 legacy_identity = raw.is_none()
                     && timestamps.is_none()
+                    && remote_identity.is_none()
                     && f.supports_legacy_seal()
                     && is_trunk_series(&f, name);
                 comparison_rate = if params.sample_rate.is_none() {
@@ -166,7 +256,7 @@ mod imp {
                         None,
                     )
             };
-            if let Some(raw) = &raw {
+            if let Some((raw, _)) = &raw {
                 let units_epoch =
                     timestamp_epoch(&f).context("sorting NWB timestamps_reference_time")?;
                 let raw_epoch =
@@ -190,15 +280,23 @@ mod imp {
                 ensure!(spikes_per_cluster.iter().filter_map(|s| s.last()).all(|s| s.0 < n_samples as u64),
                     "spike times extend past the paired ElectricalSeries (starting time {t0} s, {n_samples} samples at {rate} Hz)");
             }
-            let mut identity_bytes = f.identity(path)?;
+            #[cfg(feature = "dandi")]
+            let remote = remote_identity.is_some();
+            let mut identity_bytes = match remote_identity {
+                Some(identity) => identity,
+                None => storage::local_identity(path)?,
+            };
             if !(legacy_identity && same_mapping) {
                 if let Some((name, _)) = &series {
                     identity_bytes.extend_from_slice(name.as_bytes());
                 }
                 identity_bytes.push(0); // Terminate the path (empty for units-only).
                 identity_bytes.extend(rate.to_le_bytes());
-                if let Some((raw, raw_path)) = raw.as_ref().zip(params.raw_path) {
-                    identity_bytes.extend(raw.identity(raw_path)?);
+                if let Some(((_, raw_identity), raw_path)) = raw.zip(params.raw_path) {
+                    identity_bytes.extend(match raw_identity {
+                        Some(identity) => identity,
+                        None => storage::local_identity(raw_path)?,
+                    });
                 }
             }
             let metadata = read_unit_metadata(&units, &unit_ids)?;
@@ -214,7 +312,15 @@ mod imp {
                 channel_map,
                 identity_bytes,
                 trace,
+                #[cfg(feature = "dandi")]
+                remote_root: remote.then_some(f),
             })
+        }
+
+        /// Read trials from the same remote sorting file and revision already opened.
+        #[cfg(feature = "dandi")]
+        pub fn read_remote_trials(&self) -> Result<crate::Events> {
+            trials_from_group(self.remote_root.as_ref().context("not a remote NWB")?)
         }
 
         /// First sample time in seconds on the NWB session clock.
@@ -247,22 +353,28 @@ mod imp {
         }
 
         fn trace(&self, start: SampleIndex, len: u32) -> TraceSlice<'_> {
+            self.read_trace(start, len).unwrap_or_else(|err| {
+                // Interactive callers using the infallible trait get no samples, never zeros.
+                log::error!("read NWB trace at sample {start}: {err:#}");
+                TraceSlice {
+                    start,
+                    n_channels: self.n_channels,
+                    samples: TraceSamples::F32(&[]),
+                }
+            })
+        }
+
+        fn read_trace(&self, start: SampleIndex, len: u32) -> Result<TraceSlice<'_>> {
             let samples = self
                 .trace
                 .as_ref()
                 .map(|trace| trace.window(start, len))
-                .transpose()
-                .unwrap_or_else(|err| {
-                    // The trace interface cannot propagate I/O errors. Returning
-                    // no samples avoids mistaking a partial read for real data.
-                    log::error!("read NWB trace at sample {start}: {err:#}");
-                    None
-                });
-            TraceSlice {
+                .transpose()?;
+            Ok(TraceSlice {
                 start,
                 n_channels: self.n_channels,
                 samples: samples.map_or(TraceSamples::F32(&[]), TraceSamples::OwnedF32),
-            }
+            })
         }
 
         fn unit_id(&self, cluster: ClusterId) -> u32 {
@@ -375,14 +487,28 @@ mod imp {
 
     pub(crate) fn read_trials(path: &Path) -> Result<crate::Events> {
         let f = Group::open(path)?;
+        trials_from_group(&f).with_context(|| format!("{}: read NWB trials", path.display()))
+    }
+
+    fn trials_from_group(f: &Group) -> Result<crate::Events> {
         let g = f
-            .group("/intervals/trials")
-            .with_context(|| format!("{}: no /intervals/trials table", path.display()))?;
-        let starts: Vec<f64> = g.dataset("start_time")?.read_raw()?;
+            .optional_group("/intervals/trials")?
+            .ok_or(super::NoTrials)?;
+        let starts: Vec<f64> = g
+            .dataset("start_time")?
+            .read_raw()
+            .context("read NWB trials/start_time")?;
         let mut names = None;
         for column in ["trial_type", "stimulus", "condition"] {
             if let Some(ds) = g.optional_dataset(column)? {
-                if let Some(values) = ds.strings().ok().filter(|v| v.len() == starts.len()) {
+                if let Some(values) = ds
+                    .optional_strings()
+                    .with_context(|| format!("read NWB trials/{column}"))?
+                {
+                    ensure!(
+                        values.len() == starts.len(),
+                        "NWB trials/{column} length differs from start_time"
+                    );
                     names = Some(values);
                     break;
                 }
@@ -392,6 +518,7 @@ mod imp {
         for (i, t) in starts.into_iter().enumerate() {
             events.push(t, names.as_ref().map_or("trial", |n| n[i].as_str()));
         }
+        events.sort_by_time();
         Ok(events)
     }
 

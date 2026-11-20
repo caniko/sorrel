@@ -46,3 +46,7 @@ pub use spikeglx::SpikeGlxMeta;
 pub use ks4_rez::{Ks4RezOpenParams, Ks4RezProvider};
 #[cfg(any(feature = "hdf5", feature = "zarr"))]
 pub use nwb::{NwbOpenParams, NwbProvider};
+#[cfg(feature = "dandi")]
+pub mod dandi;
+#[cfg(feature = "dandi")]
+mod http_range;

@@ -29,21 +29,88 @@ pub(super) fn exact_number(value: &Value, what: &str) -> Result<f64> {
 }
 
 pub(super) fn open(path: &Path) -> Result<Group> {
-    verify_consolidated_metadata(path)?;
     let store: ReadableListableStorage = Arc::new(FilesystemStore::new(path)?);
-    Group::open(store, path.into(), "/")
-}
-
-fn verify_consolidated_metadata(root: &Path) -> Result<()> {
-    let path = root.join(".zmetadata");
-    match fs::symlink_metadata(&path) {
-        Ok(meta) => ensure!(meta.is_file(), ".zmetadata is not a regular file"),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+    let consolidated = path.join(".zmetadata");
+    match fs::symlink_metadata(&consolidated) {
+        Ok(meta) => {
+            ensure!(meta.is_file(), ".zmetadata is not a regular file");
+            verify_consolidated_metadata(
+                &fs::read(&consolidated).context("read .zmetadata")?,
+                |compare| {
+                    fn walk(
+                        root: &Path,
+                        dir: &Path,
+                        compare: &mut dyn FnMut(&str, &[u8]) -> Result<()>,
+                    ) -> Result<()> {
+                        for entry in fs::read_dir(dir)? {
+                            let entry = entry?;
+                            let path = entry.path();
+                            let kind = entry.file_type()?;
+                            if is_metadata(entry.file_name().to_str()) {
+                                let key = path
+                                    .strip_prefix(root)?
+                                    .to_str()
+                                    .context("non-UTF-8 Zarr metadata key")?
+                                    .replace(std::path::MAIN_SEPARATOR, "/");
+                                ensure!(
+                                    kind.is_file(),
+                                    "Zarr metadata {key} is not a regular file"
+                                );
+                                compare(
+                                    &key,
+                                    &fs::read(&path)
+                                        .with_context(|| format!("read Zarr metadata {key}"))?,
+                                )?;
+                            } else if kind.is_dir() {
+                                walk(root, &path, compare)?;
+                            }
+                        }
+                        Ok(())
+                    }
+                    walk(path, path, compare)
+                },
+            )?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err).context("inspect .zmetadata"),
     }
-    let mut consolidated: Value =
-        serde_json::from_slice(&fs::read(path).context("read .zmetadata")?)
-            .context("parse .zmetadata")?;
+    Group::open(store, Root::Local(path.into()), "/")
+}
+
+#[cfg(feature = "dandi")]
+pub(super) fn open_remote(root: Arc<crate::dandi::ZarrStore>) -> Result<Group> {
+    let store: ReadableListableStorage = root.clone();
+    if let Some(data) = store
+        .get(&StoreKey::new(".zmetadata")?)
+        .context("read .zmetadata")?
+    {
+        verify_consolidated_metadata(&data, |compare| {
+            for key in store.list().context("list Zarr keys for .zmetadata")? {
+                let name = key.as_str();
+                if is_metadata(name.rsplit('/').next()) {
+                    let data = store
+                        .get(&key)?
+                        .with_context(|| format!("Zarr metadata {name} disappeared"))?;
+                    compare(name, &data)?;
+                }
+            }
+            Ok(())
+        })?;
+    }
+    Group::open(store, Root::Remote(root), "/")
+}
+
+fn is_metadata(name: Option<&str>) -> bool {
+    matches!(name, Some(".zattrs" | ".zarray" | ".zgroup"))
+}
+
+type CompareMetadata<'a> = dyn FnMut(&str, &[u8]) -> Result<()> + 'a;
+
+fn verify_consolidated_metadata(
+    data: &[u8],
+    visit: impl FnOnce(&mut CompareMetadata<'_>) -> Result<()>,
+) -> Result<()> {
+    let mut consolidated: Value = serde_json::from_slice(data).context("parse .zmetadata")?;
     ensure!(
         consolidated["zarr_consolidated_format"] == 1,
         "unsupported .zmetadata zarr_consolidated_format"
@@ -52,51 +119,38 @@ fn verify_consolidated_metadata(root: &Path) -> Result<()> {
         .as_object_mut()
         .context("expected a metadata object in .zmetadata")?;
 
-    // Walk lexical paths rather than resolving keys supplied by .zmetadata.
-    // Compare only metadata contents, never read data chunks here.
-    fn walk(root: &Path, dir: &Path, metadata: &mut serde_json::Map<String, Value>) -> Result<()> {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let kind = entry.file_type()?;
-            if matches!(
-                entry.file_name().to_str(),
-                Some(".zattrs" | ".zarray" | ".zgroup")
-            ) {
-                let key = path
-                    .strip_prefix(root)?
-                    .to_str()
-                    .context("non-UTF-8 Zarr metadata key")?
-                    .replace(std::path::MAIN_SEPARATOR, "/");
-                ensure!(kind.is_file(), "Zarr metadata {key} is not a regular file");
-                let expected = metadata.remove(&key).with_context(|| {
-                    format!("Zarr metadata key {key} is missing from .zmetadata")
-                })?;
-                let actual: Value = serde_json::from_slice(
-                    &fs::read(&path).with_context(|| format!("read Zarr metadata {key}"))?,
-                )
-                .with_context(|| format!("parse Zarr metadata {key}"))?;
-                ensure!(
-                    actual == expected,
-                    "Zarr metadata key {key} disagrees with .zmetadata"
-                );
-            } else if kind.is_dir() {
-                walk(root, &path, metadata)?;
-            }
-        }
+    // Enumerate real keys rather than resolving paths supplied by .zmetadata.
+    // Compare only metadata contents, never chunks.
+    visit(&mut |name, bytes| {
+        let expected = metadata
+            .remove(name)
+            .with_context(|| format!("Zarr metadata key {name} is missing from .zmetadata"))?;
+        let actual: Value =
+            serde_json::from_slice(bytes).with_context(|| format!("parse Zarr metadata {name}"))?;
+        ensure!(
+            actual == expected,
+            "Zarr metadata key {name} disagrees with .zmetadata"
+        );
         Ok(())
-    }
-    walk(root, root, metadata).context("verify .zmetadata")?;
+    })
+    .context("verify .zmetadata")?;
     if let Some(key) = metadata.keys().next() {
         bail!("Zarr metadata key {key} in .zmetadata has no matching per-node metadata file");
     }
     Ok(())
 }
 
-pub(in crate::nwb::imp) struct Group(ZarrGroup<Store>, Arc<Path>);
+#[derive(Clone)]
+enum Root {
+    Local(Arc<Path>),
+    #[cfg(feature = "dandi")]
+    Remote(Arc<crate::dandi::ZarrStore>),
+}
+
+pub(in crate::nwb::imp) struct Group(ZarrGroup<Store>, Root);
 
 impl Group {
-    fn open(store: ReadableListableStorage, root: Arc<Path>, path: &str) -> Result<Self> {
+    fn open(store: ReadableListableStorage, root: Root, path: &str) -> Result<Self> {
         Ok(Self(
             ZarrGroup::open_opt(store, path, &MetadataRetrieveVersion::V2)?,
             root,
@@ -126,20 +180,44 @@ impl Group {
     }
 
     pub fn member_names(&self) -> Result<Vec<String>> {
-        let dir = self.1.join(&self.0.path().as_str()[1..]);
-        let mut names = Vec::new();
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
-            if kind.is_dir() || kind.is_symlink() {
-                names.push(
-                    entry
-                        .file_name()
-                        .into_string()
-                        .map_err(|_| anyhow::anyhow!("non-UTF-8 Zarr member name"))?,
-                );
+        let subpath = &self.0.path().as_str()[1..];
+        let mut names = match &self.1 {
+            Root::Local(root) => {
+                let mut names = Vec::new();
+                for entry in fs::read_dir(root.join(subpath))? {
+                    let entry = entry?;
+                    let kind = entry.file_type()?;
+                    if kind.is_dir() || kind.is_symlink() {
+                        names.push(
+                            entry
+                                .file_name()
+                                .into_string()
+                                .map_err(|_| anyhow::anyhow!("non-UTF-8 Zarr member name"))?,
+                        );
+                    }
+                }
+                names
             }
-        }
+            #[cfg(feature = "dandi")]
+            Root::Remote(store) => {
+                use zarrs::storage::{ListableStorageTraits, StorePrefix};
+                let prefix = if subpath.is_empty() {
+                    StorePrefix::root()
+                } else {
+                    StorePrefix::new(format!("{subpath}/"))?
+                };
+                store
+                    .list_dir(&prefix)?
+                    .prefixes()
+                    .iter()
+                    .map(|child| {
+                        child.as_str()[prefix.as_str().len()..]
+                            .trim_end_matches('/')
+                            .to_owned()
+                    })
+                    .collect()
+            }
+        };
         for link in self.links()? {
             names.push(
                 link["name"]
@@ -180,15 +258,28 @@ impl Group {
                 );
                 bail!("{prefix} is a same-store zarr_link (soft link)");
             }
-            match fs::symlink_metadata(self.1.join(&prefix[1..])) {
-                Ok(meta) => ensure!(
+            match &self.1 {
+                #[cfg(feature = "dandi")]
+                Root::Remote(store) => {
+                    use zarrs::storage::ReadableStorageTraits;
+                    ensure!(
+                        store.size_key(&StoreKey::new(&prefix[1..])?)?.is_none(),
+                        "{prefix} is not a Zarr directory"
+                    );
+                    if !store.has_dir(&prefix[1..]) {
+                        return Ok(None);
+                    }
+                }
+                Root::Local(root) => match fs::symlink_metadata(root.join(&prefix[1..])) {
+                    Ok(meta) => ensure!(
                     meta.is_dir(),
                     "{prefix} is not a Zarr directory (files and symbolic links are unsupported)"
                 ),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(err) => {
-                    return Err(err).with_context(|| format!("inspect Zarr member {prefix}"))
-                }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(err) => {
+                        return Err(err).with_context(|| format!("inspect Zarr member {prefix}"))
+                    }
+                },
             }
         }
         Ok(Some(path))
@@ -508,6 +599,17 @@ impl Dataset {
             }
         }
     }
+
+    pub fn optional_strings(&self) -> Result<Option<Vec<String>>> {
+        if let Data::Array(a) = &self.data {
+            if String::validate_data_type(a.data_type()).is_err()
+                && Vec::<u8>::validate_data_type(a.data_type()).is_err()
+            {
+                return Ok(None);
+            }
+        }
+        self.strings().map(Some)
+    }
 }
 
 /// Seal metadata contents and stat chunks without reading the recording. Like
@@ -561,6 +663,44 @@ pub(super) fn identity(root: &Path) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn unreadable_trial_labels_are_not_generic_trials() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let trials = root.join("intervals/trials");
+        fs::create_dir_all(&trials)?;
+        for group in [root, &root.join("intervals"), &trials] {
+            fs::write(group.join(".zgroup"), r#"{"zarr_format":2}"#)?;
+        }
+        let column = |name, dtype, filters, bytes: &[u8]| -> Result<_> {
+            let column = trials.join(name);
+            fs::create_dir(&column)?;
+            let meta = json!({
+                "zarr_format": 2, "shape": [1], "chunks": [1], "dtype": dtype,
+                "compressor": null, "order": "C", "fill_value": 0, "filters": filters
+            });
+            fs::write(column.join(".zarray"), meta.to_string())?;
+            let chunk = column.join("0");
+            fs::write(&chunk, bytes)?;
+            Ok(chunk)
+        };
+        column("start_time", "<f8", Value::Null, &0.6f64.to_le_bytes())?;
+        column("trial_type", "<i8", Value::Null, &1i64.to_le_bytes())?;
+        let chunk = column(
+            "stimulus",
+            "|O",
+            json!([{"id": "vlen-utf8"}]),
+            b"\x01\0\0\0\x04\0\0\0left",
+        )?;
+        let read = || crate::nwb::read_trials(root);
+        assert_eq!(read()?.names, ["left"]);
+
+        fs::write(chunk, b"broken chunk")?;
+        let error = format!("{:#}", read().unwrap_err());
+        assert!(error.contains("read NWB trials/stimulus"), "{error}");
+        Ok(())
+    }
 
     #[test]
     fn json_clock_attributes_roundtrip_without_rounding_stored_integers() {

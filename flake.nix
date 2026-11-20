@@ -317,6 +317,7 @@
       srcFilter = path: type:
         (craneLib.filterCargoSources path type)
         || pkgs.lib.hasSuffix ".wgsl" path
+        || pkgs.lib.hasSuffix "crates/sorrel-io/src/nwb/imp/http_vfd.c" path
         # askama templates compiled into sorrel-data (`sorrel report`).
         || pkgs.lib.hasInfix "crates/sorrel-data/templates" path
         # Window icon (include_bytes!) and the Windows resources build.rs embeds.

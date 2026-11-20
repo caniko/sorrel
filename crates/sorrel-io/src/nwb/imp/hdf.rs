@@ -40,25 +40,19 @@ pub(super) fn sample_type(data: &hdf5::Dataset) -> Result<SampleType> {
     })
 }
 
-pub(super) fn identity(path: &Path) -> Vec<u8> {
+pub(super) fn identity(path: &Path, meta: &std::fs::Metadata) -> Result<Vec<u8>> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("missing UTF-8 NWB filename")?;
+    let modified = meta.modified()?.duration_since(std::time::UNIX_EPOCH)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"sorrel-provider-identity-v1/nwb");
-    hasher.update(
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("")
-            .as_bytes(),
-    );
-    if let Ok(meta) = std::fs::metadata(path) {
-        hasher.update(&meta.len().to_le_bytes());
-        if let Ok(modified) = meta.modified() {
-            if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
-                hasher.update(&duration.as_secs().to_le_bytes());
-                hasher.update(&duration.subsec_nanos().to_le_bytes());
-            }
-        }
-    }
-    hasher.finalize().as_bytes().to_vec()
+    hasher.update(name.as_bytes());
+    hasher.update(&meta.len().to_le_bytes());
+    hasher.update(&modified.as_secs().to_le_bytes());
+    hasher.update(&modified.subsec_nanos().to_le_bytes());
+    Ok(hasher.finalize().as_bytes().to_vec())
 }
 
 pub(super) fn read_str(data: &hdf5::Container) -> Result<String> {
@@ -84,6 +78,19 @@ pub(super) fn strings(data: &hdf5::Container) -> Result<Vec<String>> {
         }
         _ => Err(anyhow!("expected an HDF5 string datatype")),
     }
+}
+
+pub(super) fn optional_strings(data: &hdf5::Container) -> Result<Option<Vec<String>>> {
+    use hdf5_metno_sys::h5t::{H5Tget_class, H5T_NO_CLASS, H5T_STRING};
+
+    let dtype = data.dtype()?;
+    // Query the class, not a full descriptor (some non-string classes have none).
+    let class = hdf5::sync::sync(|| unsafe { H5Tget_class(dtype.id()) });
+    ensure!(
+        class != H5T_NO_CLASS,
+        "cannot determine HDF5 datatype class"
+    );
+    (class == H5T_STRING).then(|| strings(data)).transpose()
 }
 
 fn fixed_strings(

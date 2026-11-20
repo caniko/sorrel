@@ -30,6 +30,9 @@ pub trait Tab {
     fn session_key(&self) -> Option<&str> {
         None
     }
+    fn mcp_registry_key(&self) -> Option<&str> {
+        None
+    }
     fn dirty(&self) -> bool;
     fn window_title(&self) -> String;
     /// Close if clean, else ask: the answer shows in [`Self::close_state`].
@@ -195,6 +198,7 @@ impl Shell {
                         "pid": std::process::id(),
                         "tabs": self.tabs.iter().enumerate().map(|(i, t)| serde_json::json!({
                             "dataset": sorrel_io::fsutil::display_path(t.dataset()).to_string(),
+                            "mcp_registry_key": t.mcp_registry_key(),
                             "label": t.label(),
                             "dirty": t.dirty(),
                             "active": i == self.active,

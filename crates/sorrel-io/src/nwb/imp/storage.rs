@@ -4,6 +4,9 @@
 #[cfg(feature = "hdf5")]
 #[path = "hdf.rs"]
 mod hdf;
+#[cfg(all(feature = "dandi", feature = "hdf5"))]
+#[path = "http_vfd.rs"]
+mod http_vfd;
 #[cfg(feature = "zarr")]
 #[path = "zarr.rs"]
 mod zarr;
@@ -46,6 +49,17 @@ macro_rules! dispatch {
 }
 
 impl Group {
+    #[cfg(feature = "dandi")]
+    pub fn open_remote(store: crate::dandi::Store) -> Result<Self> {
+        match store {
+            #[cfg(feature = "hdf5")]
+            crate::dandi::Store::Blob(object) => {
+                Ok(Self::Hdf5(http_vfd::open(&object)?.group("/")?))
+            }
+            crate::dandi::Store::Zarr(store) => Ok(Self::Zarr(zarr::open_remote(store)?)),
+        }
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let open = || -> Result<Self> {
             if path.is_dir() {
@@ -193,10 +207,21 @@ impl Group {
             Ok(Some(_g.dataset(name)?.ndim()))
         }, { let _ = name; Ok(None) })
     }
+}
 
-    pub fn identity(&self, path: &Path) -> Result<Vec<u8>> {
-        dispatch!(self, Self, _g => Ok(hdf::identity(path)), zarr::identity(path))
+pub(super) fn local_identity(path: &Path) -> Result<Vec<u8>> {
+    let meta = path.metadata()?;
+    if meta.is_dir() {
+        #[cfg(feature = "zarr")]
+        return zarr::identity(path);
+        #[cfg(not(feature = "zarr"))]
+        bail!("NWB directory stores require building with --features zarr");
     }
+    anyhow::ensure!(meta.is_file(), "not a regular NWB file");
+    #[cfg(feature = "hdf5")]
+    return hdf::identity(path, &meta);
+    #[cfg(not(feature = "hdf5"))]
+    bail!("HDF5 NWB files require building with --features hdf5");
 }
 
 #[cfg(feature = "hdf5")]
@@ -311,6 +336,10 @@ impl Dataset {
 
     pub fn strings(&self) -> Result<Vec<String>> {
         dispatch!(self, Self, d => hdf::strings(d), d.strings())
+    }
+
+    pub fn optional_strings(&self) -> Result<Option<Vec<String>>> {
+        dispatch!(self, Self, d => hdf::optional_strings(d), d.optional_strings())
     }
 
     pub fn spec_text(&self, legacy: bool) -> Result<String> {
