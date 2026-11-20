@@ -155,7 +155,7 @@ fn fixed_strings(
 // following it: even a link that resolves back into this file can go via a sidecar.
 pub(super) fn hard_link_exists(group: &hdf5::Group, path: &str) -> Result<bool> {
     use hdf5_metno_sys::{
-        h5l::{self, H5L_info1_t, H5L_TYPE_EXTERNAL, H5L_TYPE_HARD, H5L_TYPE_SOFT},
+        h5l::{self, H5L_info2_t, H5L_TYPE_EXTERNAL, H5L_TYPE_HARD, H5L_TYPE_SOFT},
         h5p::H5P_DEFAULT,
     };
     use std::ffi::{c_int, CString};
@@ -174,7 +174,7 @@ pub(super) fn hard_link_exists(group: &hdf5::Group, path: &str) -> Result<bool> 
         prefix.push('/');
         prefix.push_str(component);
         let name = CString::new(prefix.as_str())?;
-        let mut info = MaybeUninit::<H5L_info1_t>::uninit();
+        let mut info = MaybeUninit::<H5L_info2_t>::uninit();
         let kind = hdf5::sync::sync(|| {
             // SAFETY: group and the NUL-terminated name are live, info points to
             // writable storage, and the HDF5 lock serializes the call. Read the
@@ -183,9 +183,8 @@ pub(super) fn hard_link_exists(group: &hdf5::Group, path: &str) -> Result<bool> 
                 if hdf5::h5check(h5l::H5Lexists(group.id(), name.as_ptr(), H5P_DEFAULT))? == 0 {
                     return Ok(None);
                 }
-                // Use the ABI available on both older and newer HDF5 releases.
-                #[allow(deprecated)]
-                hdf5::h5check(h5l::H5Lget_info1(
+                // HDF5 2.x no longer exports H5Lget_info1.
+                hdf5::h5check(h5l::H5Lget_info2(
                     group.id(),
                     name.as_ptr(),
                     info.as_mut_ptr(),
