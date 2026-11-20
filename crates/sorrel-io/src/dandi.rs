@@ -57,6 +57,7 @@ pub fn resolve(input: &str) -> Result<Resolved> {
 
 /// Resolve remote sorting and recording locators in one request. Local inputs are `None`.
 /// Versionless locators share one version lookup per Dandiset; equivalent locators share a store.
+/// Two distinct draft assets cannot be pinned to a common snapshot.
 pub fn resolve_pair(root: Option<&str>, dat: Option<&str>) -> Result<[Option<Resolved>; 2]> {
     if root.is_none() && dat.is_none() {
         return Ok([None, None]);
@@ -165,6 +166,28 @@ fn decode_asset_path(encoded: &str) -> Result<std::borrow::Cow<'_, str>> {
     Ok(path)
 }
 
+struct DownloadAsset<'a> {
+    location: Option<(&'a str, &'a str)>,
+    asset_id: &'a str,
+}
+
+fn download_asset(path: &str) -> Option<DownloadAsset<'_>> {
+    let segments: Vec<_> = path.split('/').collect();
+    match segments.as_slice() {
+        ["api", "assets", asset_id, "download"] => Some(DownloadAsset {
+            location: None,
+            asset_id,
+        }),
+        ["api", "dandisets", id, "versions", version, "assets", asset_id, "download"] => {
+            Some(DownloadAsset {
+                location: Some((id, version)),
+                asset_id,
+            })
+        }
+        _ => None,
+    }
+}
+
 impl Locator<'_> {
     fn state_path(&self) -> PathBuf {
         PathBuf::from(self.id)
@@ -252,6 +275,36 @@ impl Api {
         let recording_locator = locator(dat).context("resolve remote --dat")?;
         let same =
             root == dat || (sorting_locator.is_some() && sorting_locator == recording_locator);
+        if !same {
+            let [sorting_draft, recording_draft] = [
+                (root, sorting_locator.as_ref()),
+                (dat, recording_locator.as_ref()),
+            ]
+            .map(|(input, locator)| self.draft_input(input, locator));
+            if let (Some(a), Some(b)) = (sorting_draft?, recording_draft?) {
+                const DISTINCT_DRAFTS: &str = "cannot combine two different DANDI draft assets in one session: drafts have no immutable snapshot; use a published version or a local file";
+                let resolved = match (a, b) {
+                    (DraftInput::Path(_), DraftInput::Path(_)) => bail!(DISTINCT_DRAFTS),
+                    (DraftInput::Download(a, ad, ai), DraftInput::Download(_, bd, bi)) => {
+                        ensure!(ad == bd && ai == bi, DISTINCT_DRAFTS);
+                        self.resolve_input(a.as_str(), None)?
+                    }
+                    (DraftInput::Path(locator), DraftInput::Download(url, id, asset_id))
+                    | (DraftInput::Download(url, id, asset_id), DraftInput::Path(locator)) => {
+                        ensure!(locator.id == id, DISTINCT_DRAFTS);
+                        let asset = self.find_asset(locator)?;
+                        ensure!(asset.asset_id == asset_id, DISTINCT_DRAFTS);
+                        let state = if sorting_locator.is_some() {
+                            locator.state_path()
+                        } else {
+                            https_state_path(&url)
+                        };
+                        self.asset(asset, state, None)?
+                    }
+                };
+                return Ok([Some(resolved.clone()), Some(resolved)]);
+            }
+        }
         let sorting = root
             .map(|input| self.resolve_input(input, sorting_locator))
             .transpose()
@@ -266,27 +319,56 @@ impl Api {
         Ok([sorting, recording])
     }
 
+    fn draft_input<'a>(
+        &self,
+        input: Option<&str>,
+        locator: Option<&'a Locator<'a>>,
+    ) -> Result<Option<DraftInput<'a>>> {
+        if let Some(locator) = locator {
+            return Ok((locator.version == "draft").then_some(DraftInput::Path(locator)));
+        }
+        let Some(input) = input else { return Ok(None) };
+        let url = https_url(input)?;
+        if url.origin() != self.base.origin() {
+            return Ok(None);
+        }
+        let path = decode_asset_path(url.path().trim_matches('/'))?;
+        Ok(match download_asset(&path) {
+            Some(DownloadAsset {
+                location: Some((id, "draft")),
+                asset_id,
+            }) => Some(DraftInput::Download(
+                url,
+                component(id)?.to_owned(),
+                component(asset_id)?.to_owned(),
+            )),
+            _ => None,
+        })
+    }
+
+    fn find_asset(&self, locator: &Locator<'_>) -> Result<Asset> {
+        let Locator { id, version, path } = locator;
+        let mut list = self.endpoint(&format!("dandisets/{id}/versions/{version}/assets/"));
+        list.query_pairs_mut()
+            .append_pair("path", path)
+            .append_pair("metadata", "true");
+        let mut exact = None;
+        self.pages(list, |asset: Asset| {
+            if asset.path == path.as_ref() {
+                ensure!(
+                    exact.replace(asset).is_none(),
+                    "multiple DANDI assets have the exact path"
+                );
+            }
+            Ok(())
+        })
+        .with_context(|| format!("list Dandiset {id}@{version}"))?;
+        exact.with_context(|| format!("Dandiset {id}@{version} has no asset at {path}"))
+    }
+
     fn resolve_input(&self, input: &str, locator: Option<Locator<'_>>) -> Result<Resolved> {
         if let Some(locator) = locator {
-            let Locator { id, version, path } = &locator;
-            let mut list = self.endpoint(&format!("dandisets/{id}/versions/{version}/assets/"));
-            list.query_pairs_mut()
-                .append_pair("path", path)
-                .append_pair("metadata", "true");
-            let mut exact = None;
-            self.pages(list, |asset: Asset| {
-                if asset.path == path.as_ref() {
-                    ensure!(
-                        exact.replace(asset).is_none(),
-                        "multiple DANDI assets have the exact path"
-                    );
-                }
-                Ok(())
-            })
-            .with_context(|| format!("list Dandiset {id}@{version}"))?;
-            let asset =
-                exact.with_context(|| format!("Dandiset {id}@{version} has no asset at {path}"))?;
-            return self.asset(asset, locator.state_path(), None);
+            return self.asset(self.find_asset(&locator)?, locator.state_path(), None);
         }
 
         let url = https_url(input)?;
@@ -295,21 +377,20 @@ impl Api {
         // DANDI API download URLs can describe either kind of asset, including
         // Zarr assets whose download endpoint cannot return a single object.
         if url.origin() == self.base.origin() {
-            let segments: Vec<_> = url.path().trim_end_matches('/').split('/').collect();
-            let asset_id = match segments.as_slice() {
-                ["", "api", "assets", id, "download"] => Some(*id),
-                ["", "api", "dandisets", _, "versions", _, "assets", id, "download"] => Some(*id),
-                _ => None,
-            };
-            if let Some(id) = asset_id {
+            let path = decode_asset_path(url.path().trim_matches('/'))?;
+            if let Some(DownloadAsset {
+                location,
+                asset_id: id,
+            }) = download_asset(&path)
+            {
                 component(id)?;
-                let prefix = url
-                    .path()
-                    .trim_end_matches('/')
-                    .strip_suffix("download")
-                    .unwrap();
+                if let Some((dandiset, version)) = location {
+                    component(dandiset)?;
+                    component(version)?;
+                }
+                let prefix = path.strip_suffix("download").unwrap();
                 let info = url
-                    .join(&format!("{prefix}info/"))
+                    .join(&format!("/{prefix}info/"))
                     .map_err(|_| anyhow!("invalid DANDI asset endpoint"))?;
                 let asset: Asset = self.json(&info)?;
                 ensure!(asset.asset_id == id, "DANDI returned a different asset ID");
@@ -485,6 +566,11 @@ impl Api {
             })),
         }
     }
+}
+
+enum DraftInput<'a> {
+    Path(&'a Locator<'a>),
+    Download(Url, String, String),
 }
 
 #[cfg(test)]

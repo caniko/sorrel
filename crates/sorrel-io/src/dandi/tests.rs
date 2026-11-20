@@ -490,6 +490,59 @@ fn encoded_and_plain_draft_paths_share_one_pinned_store() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn distinct_draft_assets_are_refused_before_pinning() -> Result<()> {
+    let server = Server::new(|url, _, stream| match url.path() {
+        "/api/dandisets/000123/" => {
+            json_reply(stream, json!({"draft_version": {"version": "draft"}}));
+        }
+        _ => panic!("unexpected asset request: {url}"),
+    });
+    let api = server.api(Duration::from_secs(2));
+    let root = "dandi://dandi/000123/test/sorting.nwb";
+    let distinct = "dandi://dandi/000123@draft/test/recording.nwb";
+    let other = server
+        .base
+        .join("dandisets/000456/versions/%64raft/assets/asset-id/download/")?;
+    for distinct in [distinct, other.as_str()] {
+        let error = api.resolve_pair(Some(root), Some(distinct)).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("two different DANDI draft assets"),
+            "{error:#}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn draft_can_be_paired_with_a_published_or_local_input() -> Result<()> {
+    let (server, _) = remote_fixture("good.nwb", true);
+    let api = server.api(Duration::from_secs(2));
+    let root = "dandi://dandi/000123@draft/test/good.nwb";
+    let [draft, local] = api.resolve_pair(Some(root), None)?;
+    assert!(draft.is_some() && local.is_none());
+
+    let release = "dandi://dandi/000123@0.42.17/test/good.nwb";
+    let [draft, published] = api
+        .resolve_pair(Some(root), Some(release))?
+        .map(Option::unwrap);
+    assert_ne!(draft.state_path(), published.state_path());
+    let alias = server
+        .base
+        .join("dandisets/000123/versions/draft/assets/asset-id/download/")?;
+    let [a, b] = api
+        .resolve_pair(Some(root), Some(alias.as_str()))?
+        .map(Option::unwrap);
+    let (Store::Blob(a), Store::Blob(b)) = (a.store, b.store) else {
+        panic!("expected pinned blobs");
+    };
+    assert!(Arc::ptr_eq(&a, &b));
+    Ok(())
+}
+
 fn objects(path: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(root: &Path, path: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
         for entry in fs::read_dir(path).unwrap() {
@@ -618,9 +671,10 @@ fn remote_fixture_without(
                 );
             }
             path => {
-                assert_eq!(
-                    path,
-                    format!("/api/dandisets/000123/versions/{version}/assets/")
+                assert!(
+                    path == format!("/api/dandisets/000123/versions/{version}/assets/")
+                        || path == "/api/dandisets/000123/versions/0.42.17/assets/",
+                    "unexpected asset listing: {path}"
                 );
                 let requested = format!("test/{name}");
                 assert_eq!(query["path"], requested);
