@@ -13,7 +13,8 @@
 //! cluster sessions export in a few seconds.
 
 use crate::cache::correlograms::acg_or_compute;
-use crate::quality_ext::cluster_quality;
+use crate::quality_ext::cluster_quality_with;
+use crate::refractory::RefractoryWindows;
 use crate::session::Session;
 use anyhow::{Context, Result};
 use sorrel_io::{ClusterId, DataProvider};
@@ -315,15 +316,26 @@ pub fn collect_qc_rows_with<P: DataProvider>(
     session: &Session<P>,
     positions: Option<&[[f32; 2]]>,
 ) -> Vec<QcRow> {
+    collect_qc_rows_with_windows(
+        session,
+        positions,
+        RefractoryWindows::Session(session.refractory()),
+    )
+}
+
+pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
+    session: &Session<P>,
+    positions: Option<&[[f32; 2]]>,
+    windows: RefractoryWindows<'_>,
+) -> Vec<QcRow> {
     use sorrel_compute::{
         amplitude_drift_slope, burst_index, footprint, hartigan_dip, isi_violation_rate,
-        isi_violations, mean_amplitude, peak_channel, sliding_refractory_argmin,
-        waveform_landmarks,
+        isi_violations, mean_amplitude, peak_channel, waveform_landmarks,
     };
     let sr = session.provider.sample_rate().max(1.0);
     let total_samples = session.provider.n_samples();
     let total_seconds = total_samples.as_f32() / sr;
-    let refractory_samples = (sr * 0.0015).round() as u64;
+    let refractory_samples = windows.fixed_samples(sr);
     let (_, tpl_samples, tpl_channels) = session.template_shape();
     // ACG at 1 ms bins / 50 ms, the report's (and cache's) window.
     let acg_window = (0.050 * sr) as u32;
@@ -334,7 +346,7 @@ pub fn collect_qc_rows_with<P: DataProvider>(
     for c in (0..n).map(ClusterId) {
         let times = session.spike_times(c);
         let amps = session.spike_amplitudes(c);
-        let q = cluster_quality(session, c);
+        let q = cluster_quality_with(session, c, refractory_samples);
         let mean_amp = if amps.is_empty() {
             f32::NAN
         } else {
@@ -373,15 +385,8 @@ pub fn collect_qc_rows_with<P: DataProvider>(
             .zip(positions)
             .and_then(|(w, p)| footprint(w, tpl_samples, tpl_channels, p, sr));
         let nan = f32::NAN;
-        // 0.5-10 ms in 20 steps; (0, 0) means too few spikes to say.
-        let (rp_contam, rp) = sliding_refractory_argmin(
-            times,
-            (sr * 0.0005) as u64,
-            (sr * 0.010) as u64,
-            20,
-            total_samples.0,
-            sr,
-        );
+        // (0, 0) means there is no estimate.
+        let (rp_contam, rp) = windows.sweep(times, total_samples.0, sr);
         let acg = acg_or_compute(session, c, acg_bin, acg_window);
         // ponytail: evenly strided to <= 5000 points to bound the O(n log n)
         // sort per cluster; a rare second mode in a huge cluster can thin out.
@@ -535,6 +540,32 @@ pub(crate) mod tests {
         fn spike_amplitudes(&self, c: ClusterId) -> &[f32] {
             self.amps.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
         }
+    }
+
+    #[test]
+    fn session_refractory_changes_qc_and_evaluation() {
+        let dir = tempfile::tempdir().unwrap();
+        let prov = MockProvider {
+            spikes: vec![vec![SampleIndex(10), SampleIndex(11), SampleIndex(150)]],
+            amps: vec![vec![1.0; 3]],
+            n_samples: SampleIndex(1000),
+        };
+        let mut s = Session::new(prov, Journal::open(&dir.path().join("j")).unwrap());
+        let edit_version = s.version();
+        let metrics_version = s.metrics_version();
+        let before = &collect_qc_rows(&s)[0];
+        let mut params = *s.refractory();
+        params.fixed_ms = 0.5;
+        params.sweep_min_ms = 1.5;
+        s.set_refractory(params).unwrap();
+        let after = &collect_qc_rows(&s)[0];
+        assert_eq!((before.isi_violations, after.isi_violations), (1, 0));
+        assert_eq!(before.rp_contamination, 0.0);
+        assert!(after.rp_contamination > 0.0);
+        let ev = crate::evaluate::eval_merge(&s, &[ClusterId(0)]);
+        assert_eq!(ev.merged.rp_contamination, after.rp_contamination);
+        assert_eq!(s.version(), edit_version);
+        assert_ne!(s.metrics_version(), metrics_version);
     }
 
     #[test]

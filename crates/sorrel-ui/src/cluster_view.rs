@@ -456,7 +456,7 @@ impl ClusterRows {
         label_str: impl Fn(&P::Label) -> &'static str,
     ) {
         let key = (
-            session.version(),
+            session.metrics_version(),
             inputs.positions.len(),
             inputs.shanks.len(),
             inputs.metrics.len(),
@@ -469,8 +469,7 @@ impl ClusterRows {
         let sr = session.provider.sample_rate().max(1.0);
         let total = session.provider.n_samples().0;
         let duration_s = total as f64 / sr as f64;
-        let isi_window = (sr * 0.001).round() as u64;
-        let refractory = (sr * 0.0015).round() as u64;
+        let refractory = session.refractory().fixed_samples(sr);
         let n_channels = session.template_shape().2;
         // [ch, sh, depth, fr, amp, n_spikes, isi, qual, tags] per cluster.
         let rows: Vec<[f64; 9]> = (0..n as u32)
@@ -498,7 +497,7 @@ impl ClusterRows {
                     ptp_val = Some(ptp);
                 }
                 r[4] = amp_value(mean_amp, ptp_val);
-                r[6] = isi_violations(times, isi_window) as f64;
+                r[6] = isi_violations(times, refractory) as f64;
                 r[7] = quality_breakdown(times, amps, refractory, total, sr, 50).composite() as f64;
                 let tags = session.tags(c);
                 let review = tags.iter().filter(|t| t.starts_with("review:")).count();

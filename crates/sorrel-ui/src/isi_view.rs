@@ -30,9 +30,6 @@ struct IsiEntry {
     hists: Arc<Vec<Vec<u32>>>,
 }
 
-/// The shaded band's width and the violation legend's window.
-const REFRACTORY_MS: f32 = 1.0;
-
 /// Local indices of every spike that is part of an ISI below `refractory`
 /// samples (both members of each pair, ascending), and the pair count.
 pub(crate) fn isi_violators(times: &[SampleIndex], refractory: u64) -> (Vec<u32>, usize) {
@@ -72,7 +69,7 @@ pub(crate) fn split_target(
 
 type SplitMemo =
     std::sync::Arc<std::sync::Mutex<crate::jobs::Memo<SplitKey, std::sync::Arc<SplitPreview>>>>;
-type SplitKey = ((BrushSource, u64, usize, usize), ClusterId);
+type SplitKey = ((BrushSource, u64, usize, usize), ClusterId, u64);
 
 /// The what-if for the current brush, computed off the UI thread. Shared by
 /// the ISI and Quality panes (one memo in egui's temp memory, keyed by the
@@ -87,7 +84,7 @@ pub(crate) fn split_preview<P: DataProvider>(
     selection: &[ClusterId],
 ) -> Option<std::sync::Arc<SplitPreview>> {
     let (c, idx) = split_target(brushes, selection, |c| session.spike_times(c).len())?;
-    let key = (brushes.spikes.as_ref()?.key(), c);
+    let key = (brushes.spikes.as_ref()?.key(), c, session.metrics_version());
     let id = egui::Id::new("split_whatif_memo");
     let memo: SplitMemo = ui.data_mut(|d| {
         d.get_temp_mut_or_insert_with(id, SplitMemo::default)
@@ -225,8 +222,8 @@ pub fn isi_view<P: DataProvider>(
         }
     };
 
-    // Legend row: one chip per cluster with its <1 ms violations.
-    let refractory_samples = (sr * REFRACTORY_MS / 1e3).round() as u64;
+    let refractory_ms = session.refractory().fixed_ms;
+    let refractory_samples = session.refractory().fixed_samples(sr);
     let mut clicked: Vec<ClusterId> = Vec::new();
     ui.horizontal_wrapped(|ui| {
         for (slot, &c) in shown.iter().enumerate() {
@@ -239,7 +236,7 @@ pub fn isi_view<P: DataProvider>(
             };
             let (bg, text) = (
                 selection_colour(slot),
-                format!("c{c} <1 ms {viol}/{n} ({pct:.1}%)"),
+                format!("c{c} <{refractory_ms} ms {viol}/{n} ({pct:.1}%)"),
             );
             let fg = contrast_text(bg);
             let g = ui
@@ -302,9 +299,8 @@ pub fn isi_view<P: DataProvider>(
     let dp = painter.with_clip_rect(data);
     let x_of = |ms: f32| data.left() + (ms - p.x_min_ms) / (p.x_max_ms - p.x_min_ms) * data.width();
 
-    // Shade [0, 1 ms) over the full height (clipped to the visible range;
-    // empty once x_min >= 1), at least 3 px wide so it never reads as a line.
-    let band = (p.x_min_ms.max(0.0), 1.0_f32.min(p.x_max_ms));
+    // Shade the fixed refractory window, clipped to the visible range.
+    let band = (p.x_min_ms.max(0.0), refractory_ms.min(p.x_max_ms));
     if band.1 > band.0 {
         let (x0, x1) = (x_of(band.0), x_of(band.1).max(x_of(band.0) + 3.0));
         dp.rect_filled(
@@ -319,7 +315,7 @@ pub fn isi_view<P: DataProvider>(
         dp.text(
             egui::pos2(x1 + 4.0, data.top() + 2.0),
             egui::Align2::LEFT_TOP,
-            "1 ms",
+            format!("{refractory_ms} ms"),
             egui::FontId::proportional(TICK_PX),
             theme.danger,
         );

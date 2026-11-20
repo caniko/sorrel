@@ -2,8 +2,9 @@
 //! amplitude. Does not use feature-oracle thresholds or any human labels.
 
 use crate::proposers::cluster_feature_space;
+use crate::refractory::RefractoryWindows;
 use crate::session::Session;
-use sorrel_compute::{fit_diag_gmm, sliding_refractory_argmin, DiagGmm};
+use sorrel_compute::{fit_diag_gmm, DiagGmm};
 use sorrel_io::{ClusterId, DataProvider};
 
 const MAX_FIT: usize = 5000;
@@ -117,6 +118,20 @@ pub fn axis_candidates<P: DataProvider>(
     c: ClusterId,
     globals: &[u32],
 ) -> Vec<AxisCandidate> {
+    axis_candidates_with(
+        session,
+        c,
+        globals,
+        RefractoryWindows::Session(session.refractory()),
+    )
+}
+
+pub(crate) fn axis_candidates_with<P: DataProvider>(
+    session: &Session<P>,
+    c: ClusterId,
+    globals: &[u32],
+    windows: RefractoryWindows<'_>,
+) -> Vec<AxisCandidate> {
     if globals.len() < 2 * MIN_PART {
         return vec![];
     }
@@ -140,14 +155,7 @@ pub fn axis_candidates<P: DataProvider>(
     }
     let duration = session.provider.n_samples().0;
     let contamination = |t: &[_]| {
-        let (c, rp) = sliding_refractory_argmin(
-            t,
-            (sr * 0.0005) as u64,
-            (sr * 0.01) as u64,
-            20,
-            duration,
-            sr,
-        );
+        let (c, rp) = windows.sweep(t, duration, sr);
         if rp > 0 {
             c
         } else {

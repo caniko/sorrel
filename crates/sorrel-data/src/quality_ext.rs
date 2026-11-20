@@ -15,9 +15,6 @@ use sorrel_cache::{CacheKey, CacheStore};
 use sorrel_compute::{isolation_metrics, quality_breakdown, IsolationMetrics, QualityBreakdown};
 use sorrel_io::{ClusterId, DataProvider};
 
-/// Refractory window used by the quality computation: 1.5 ms. Matches the
-/// suggester default.
-const REFRACTORY_SECONDS: f32 = 0.0015;
 pub const DEFAULT_K_NN: usize = 8;
 
 /// Build a full per-cluster quality breakdown including PC-feature
@@ -28,7 +25,15 @@ pub fn cluster_quality<P: DataProvider>(
     cluster: ClusterId,
 ) -> QualityBreakdown {
     let sr = session.provider.sample_rate().max(1.0);
-    let refractory_samples = (sr * REFRACTORY_SECONDS).round() as u64;
+    cluster_quality_with(session, cluster, session.refractory().fixed_samples(sr))
+}
+
+pub(crate) fn cluster_quality_with<P: DataProvider>(
+    session: &Session<P>,
+    cluster: ClusterId,
+    refractory_samples: u64,
+) -> QualityBreakdown {
+    let sr = session.provider.sample_rate().max(1.0);
     let total_duration = session.provider.n_samples();
     let mut q = quality_breakdown(
         session.spike_times(cluster),

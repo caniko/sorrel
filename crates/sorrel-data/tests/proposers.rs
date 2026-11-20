@@ -185,6 +185,11 @@ fn build(tags: Vec<Vec<String>>) -> (Prov, Vec<u8>) {
 
 fn session(tags: Vec<Vec<String>>) -> (Session<Prov>, Vec<u8>, tempfile::TempDir) {
     let (p, truth) = build(tags);
+    let (s, dir) = seed_session(p);
+    (s, truth, dir)
+}
+
+fn seed_session(p: Prov) -> (Session<Prov>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let journal = Journal::open(&dir.path().join("j.sqlite")).unwrap();
     let mut s = Session::new(p, journal);
@@ -192,7 +197,7 @@ fn session(tags: Vec<Vec<String>>) -> (Session<Prov>, Vec<u8>, tempfile::TempDir
     s.seed_templates();
     s.seed_pc_features();
     s.seed_template_waveforms();
-    (s, truth, dir)
+    (s, dir)
 }
 
 #[test]
@@ -278,7 +283,13 @@ fn notsplit_tag_suppresses_split() {
 
 #[test]
 fn axis_probe_lists_bounded_distinct_read_only_handles() {
-    let (s, _, _d) = session(vec![]);
+    let (mut p, _) = build(vec![]);
+    // The two units co-fire, but each is refractory on its own. The old
+    // fixture's 20-sample period only looked clean below the new grid.
+    p.times[0] = (0..300)
+        .flat_map(|i| [400 * i, 400 * i + 7].map(SampleIndex))
+        .collect();
+    let (s, _d) = seed_session(p);
     let mut handles = sorrel_data::evaluate::Handles::default();
     let query = sorrel_data::probe::parse("split 0 by=axis").unwrap();
     let before = s.history_len();

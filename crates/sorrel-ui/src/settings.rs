@@ -3,6 +3,7 @@
 use crate::shortcuts::{Action, Chord, Keymap, Scope, COMMANDS};
 use egui::{Context, Event};
 use serde::{Deserialize, Serialize};
+use sorrel_compute::RefractoryParams;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -14,6 +15,7 @@ use std::{
 pub struct Settings {
     pub version: u32,
     pub appearance: Appearance,
+    pub refractory: RefractoryParams,
     pub recent_datasets: Vec<PathBuf>,
     pub keybindings: BTreeMap<String, Vec<String>>,
     /// Retain unrelated settings when this build edits shortcuts.
@@ -26,6 +28,7 @@ impl Default for Settings {
         Self {
             version: 1,
             appearance: Appearance::default(),
+            refractory: RefractoryParams::default(),
             recent_datasets: vec![],
             keybindings: BTreeMap::new(),
             extra: BTreeMap::new(),
@@ -74,6 +77,7 @@ impl Settings {
         {
             return Err("appearance.theme must be system, dark or light".into());
         }
+        self.refractory.validate()?;
         Keymap::compile(&self.keybindings)
     }
 
@@ -416,13 +420,19 @@ fn consume_keyboard(ctx: &Context) {
     });
 }
 
-pub fn show(ctx: &Context) {
+pub fn refractory(ctx: &Context) -> RefractoryParams {
+    shared(ctx).lock().unwrap().settings.refractory
+}
+
+/// `Some((before, after))` when a save changed the refractory settings.
+pub fn show(ctx: &Context) -> Option<(RefractoryParams, RefractoryParams)> {
     let shared = shared(ctx);
     let mut rt = shared.lock().unwrap();
     if !rt.open {
-        return;
+        return None;
     }
     let mut close = false;
+    let mut refractory = None;
     egui::Modal::new(egui::Id::new("sorrel-settings-dialog")).show(ctx, |ui| {
         ui.set_width(780.0_f32.min(ctx.content_rect().width() - 40.0));
         ui.heading("Settings");
@@ -436,6 +446,24 @@ pub fn show(ctx: &Context) {
                 .show_ui(ui, |ui| {
                     for name in ["system", "dark", "light"] { ui.selectable_value(theme, Some(name.into()), name); }
                 });
+        });
+        ui.separator();
+        ui.heading("Refractory-period settings");
+        ui.label("Saved as defaults for new sessions. Saving applies only the fields you changed to open sessions.");
+        let rp = &mut rt.draft.as_mut().unwrap().refractory;
+        ui.horizontal_wrapped(|ui| {
+            for (label, value) in [
+                ("Fixed", &mut rp.fixed_ms),
+                ("Min (exclusive)", &mut rp.sweep_min_ms),
+                ("Max", &mut rp.sweep_max_ms),
+                ("Step", &mut rp.sweep_step_ms),
+            ] {
+                let label = ui.label(label);
+                ui.add(egui::DragValue::new(value).speed(0.05).suffix(" ms")).labelled_by(label.id);
+            }
+            if ui.button("Reset to defaults").clicked() {
+                *rp = RefractoryParams::default();
+            }
         });
         ui.separator();
         ui.heading("Keyboard shortcuts");
@@ -489,6 +517,7 @@ pub fn show(ctx: &Context) {
                 draft.recent_datasets = rt.settings.recent_datasets.clone();
                 match location.ok_or_else(|| "No settings path".into()).and_then(|p| draft.save(&p).map(|()| p)) {
                     Ok(path) => {
+                        if rt.settings.refractory != draft.refractory { refractory = Some((rt.settings.refractory, draft.refractory)); }
                         rt.path = Some(path); rt.keymap = draft.validate().unwrap();
                         draft.apply_appearance(ctx); rt.settings = draft; rt.warning = None; close = true;
                     }
@@ -504,6 +533,7 @@ pub fn show(ctx: &Context) {
         rt.draft = None;
         ctx.request_repaint();
     }
+    refractory
 }
 
 #[cfg(test)]
@@ -515,11 +545,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.toml");
         let mut settings: Settings = toml::from_str("version = 1\n[other]\nvalue = 42\n").unwrap();
+        assert_eq!(settings.refractory, RefractoryParams::default());
+        settings.refractory.fixed_ms = 2.0;
         settings
             .keybindings
             .insert("curation.split".into(), vec!["F8".into()]);
         settings.save(&path).unwrap();
         let back = Settings::load(&path).unwrap();
+        assert_eq!(back.refractory, settings.refractory);
         assert_eq!(back.extra["other"]["value"].as_integer(), Some(42));
         assert_eq!(back.validate().unwrap().hint("curation.split"), "F8");
     }

@@ -2,9 +2,9 @@
 //! is fitted without timing/truth; the refractory checks only veto an offer.
 
 use crate::proposers::cluster_feature_space;
+use crate::refractory::RefractoryWindows;
 use crate::session::Session;
 use sorrel_compute::contaminated_gaussian::fit_contaminated_gaussian;
-use sorrel_compute::sliding_refractory_argmin;
 use sorrel_io::{ClusterId, DataProvider};
 
 const MAX_FIT: usize = 5000;
@@ -79,6 +79,20 @@ pub fn robust_cleanup<P: DataProvider>(
     c: ClusterId,
     globals: &[u32],
 ) -> Option<RobustCleanup> {
+    robust_cleanup_with(
+        session,
+        c,
+        globals,
+        RefractoryWindows::Session(session.refractory()),
+    )
+}
+
+pub(crate) fn robust_cleanup_with<P: DataProvider>(
+    session: &Session<P>,
+    c: ClusterId,
+    globals: &[u32],
+    windows: RefractoryWindows<'_>,
+) -> Option<RobustCleanup> {
     if globals.len() < 2 * MIN_PART {
         return None;
     }
@@ -91,14 +105,7 @@ pub fn robust_cleanup<P: DataProvider>(
     }
     let duration = session.provider.n_samples().0;
     let measure = |t: &[_]| {
-        let (cont, rp) = sliding_refractory_argmin(
-            t,
-            (sr * 0.0005) as u64,
-            (sr * 0.010) as u64,
-            20,
-            duration,
-            sr,
-        );
+        let (cont, rp) = windows.sweep(t, duration, sr);
         if rp > 0 {
             cont
         } else {

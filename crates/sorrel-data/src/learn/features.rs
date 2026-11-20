@@ -52,21 +52,21 @@ use anyhow::{ensure, Result};
 use rayon::prelude::*;
 use sorrel_compute::{
     auto_correlogram, bimodality_coefficient, fit_diag_gmm, ks_two_sample, mean_amplitude,
-    sliding_refractory_argmin,
 };
 use sorrel_io::kilosort::PhyLabel;
 use sorrel_io::{ClusterId, DataProvider, HasGeometry, SampleIndex};
 
-use crate::axis_split::axis_candidates;
-use crate::density_tree::density_candidates;
+use crate::axis_split::axis_candidates_with;
+use crate::density_tree::density_candidates_with;
 use crate::diff::{root_truths, Curation, SpikeDiffOpts};
-use crate::evaluate::{ccg_z, eval_trains, unit_stats};
+use crate::evaluate::{ccg_z, eval_split_trains_with, eval_trains_with, unit_stats_with};
 use crate::probe::compare_templates;
 use crate::proposers::{
-    all_cluster_globals, cluster_feature_space, core_split, kmeans_split, outlier_split,
+    all_cluster_globals, cluster_feature_space, core_split_with, kmeans_split_with, outlier_split,
 };
-use crate::qc_export::{collect_qc_rows_with, QcRow};
-use crate::robust_cleanup::robust_cleanup as run_robust_cleanup;
+use crate::qc_export::{collect_qc_rows_with_windows, QcRow};
+use crate::refractory::RefractoryWindows;
+use crate::robust_cleanup::robust_cleanup_with;
 use crate::session::Session;
 
 use super::table::Table;
@@ -85,8 +85,10 @@ pub const ACG_BINS: usize = 25;
 pub const AMP_TIME_BINS: usize = 10;
 /// k of the per-spike kNN density ratio.
 pub const KNN_K: usize = 10;
-/// Refractory window of the `f_refractory` flag: 1.5 ms.
-pub const REFRACTORY_MS: f32 = 1.5;
+// Model features are versioned and must not follow user refractory settings.
+const LEARN_WINDOWS: RefractoryWindows<'static> = RefractoryWindows::Learn;
+/// Frozen refractory window of the `f_refractory` flag: 1.5 ms.
+pub const REFRACTORY_MS: f32 = RefractoryWindows::LEARN_FIXED_MS;
 /// Amplitude drift correction is computed in this many equal time bins.
 const AMP_DRIFT_BINS: usize = 20;
 /// Stride-sampled rows for mixture/`hartigan_dip` fits.
@@ -554,7 +556,7 @@ pub fn extract<P: DataProvider + HasGeometry>(
     }
 
     let positions = session.provider.channel_positions().to_vec();
-    let qc = collect_qc_rows_with(session, Some(&positions));
+    let qc = collect_qc_rows_with_windows(session, Some(&positions), LEARN_WINDOWS);
     phase("root cards");
     let non_empty: Vec<usize> = (0..globals.len())
         .filter(|&r| !globals[r].is_empty())
@@ -571,12 +573,12 @@ pub fn extract<P: DataProvider + HasGeometry>(
         let feats = cluster_feature_space(session, c, g);
         root_center[r] = feats.as_ref().map(|(f, d)| robust_center_scale_dims(f, *d));
         let proposal = RootProposals {
-            core: core_split(session, c, g),
-            kmeans: kmeans_split(session, c, g),
+            core: core_split_with(session, c, g, LEARN_WINDOWS),
+            kmeans: kmeans_split_with(session, c, g, LEARN_WINDOWS),
             outlier: outlier_split(session, c, g),
-            robust: run_robust_cleanup(session, c, g),
-            density: density_candidates(session, c, g),
-            axis: axis_candidates(session, c, g),
+            robust: robust_cleanup_with(session, c, g, LEARN_WINDOWS),
+            density: density_candidates_with(session, c, g, LEARN_WINDOWS),
+            axis: axis_candidates_with(session, c, g, LEARN_WINDOWS),
         };
         root_data.push(RootData {
             root: r as u32,
@@ -884,7 +886,7 @@ pub fn extract<P: DataProvider + HasGeometry>(
             row.set("f_depth", depth as f32);
             row.set("f_size_frac", members.len() as f32 / rd.n as f32);
             row.set("f_log_n", (1.0 + members.len() as f32).log10());
-            let ev = crate::evaluate::eval_split_trains(times, amps, &members, sr, total);
+            let ev = eval_split_trains_with(times, amps, &members, sr, total, LEARN_WINDOWS);
             // `eval_split_trains` puts the representatives of `members` last:
             // parts[1] is the candidate, parts[0] its complement.
             let part = ev.parts[1];
@@ -962,7 +964,12 @@ pub fn extract<P: DataProvider + HasGeometry>(
                 },
             );
             let (cosine, peak_diff, dist_um, shared) = template_compare(session, lo, hi);
-            let merged = eval_trains(&[(times_a, amps_a), (times_b, amps_b)], sr, total);
+            let merged = eval_trains_with(
+                &[(times_a, amps_a), (times_b, amps_b)],
+                sr,
+                total,
+                LEARN_WINDOWS,
+            );
             let max_part_rpc =
                 merged
                     .parts
@@ -977,7 +984,7 @@ pub fn extract<P: DataProvider + HasGeometry>(
                             acc.max(v)
                         }
                     });
-            let (dip, sync) = ccg_z(times_a, times_b, sr);
+            let (dip, sync) = ccg_z(times_a, times_b, sr, LEARN_WINDOWS.ccg_dip_bins());
             let f = |v: f32| if v.is_finite() { v } else { f32::NAN };
             pair_rows.push([
                 cosine.unwrap_or_else(|| {
@@ -1677,7 +1684,7 @@ fn unit_feature_row<'a>(data: &ExtractData, names: &'a [String], globals: &[u32]
     } else {
         amps
     };
-    let stats = unit_stats(&times, &amps, data.sr, data.total_samples);
+    let stats = unit_stats_with(&times, &amps, data.sr, data.total_samples, LEARN_WINDOWS);
     row.set("f_n_spikes", stats.n as f32);
     row.set("f_log_n_spikes", (1.0 + stats.n as f32).log10());
     row.set("f_rpc", stats.rp_contamination);
@@ -1873,14 +1880,7 @@ fn template_compare<P: DataProvider + HasGeometry>(
 /// root-local indices; `NaN` when no refractory window fits.
 fn measure(times: &[SampleIndex], idx: &[u32], sr: f32, total: u64) -> f32 {
     let pick: Vec<SampleIndex> = idx.iter().map(|&i| times[i as usize]).collect();
-    let (c, rp) = sliding_refractory_argmin(
-        &pick,
-        (sr * 0.0005) as u64,
-        (sr * 0.010) as u64,
-        20,
-        total,
-        sr,
-    );
+    let (c, rp) = LEARN_WINDOWS.sweep(&pick, total, sr);
     if rp > 0 {
         c
     } else {

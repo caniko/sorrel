@@ -11,11 +11,12 @@ use crate::evaluate::{
     ccg_z, eval_merge, merge_edges, qm, qn, render_merge, unit_stats, Handles, UnitStats,
 };
 use crate::proposers::{cluster_feature_space, cluster_globals, core_split, kmeans_split};
+use crate::refractory::RefractoryWindows;
 use crate::session::Session;
 use crate::suggest::MergeCandidate;
 use sorrel_compute::{
     burst_index, gmm_split_proposal, log_bins, mean_amplitude, peak_channel, sax,
-    sliding_refractory_argmin, waveform_landmarks,
+    waveform_landmarks, RefractoryParams,
 };
 use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 
@@ -239,13 +240,21 @@ pub fn run<P: DataProvider>(
                 b as f32 * 1000.0 / sr,
                 *win,
                 &handles.extra,
+                session.refractory(),
             ))
         }
         Query::Ccg { a, b, win, bin } => {
             let (a, b) = (cl(session, *a)?, cl(session, *b)?);
             let (bs, w) = (samples(*bin).max(1), samples(*win));
             let h = ccg_or_compute(session, a, b, bs, w);
-            Ok(ccg_text((a.0, b.0), (times(a), times(b)), sr, &h, *win))
+            Ok(ccg_text(
+                (a.0, b.0),
+                (times(a), times(b)),
+                sr,
+                &h,
+                *win,
+                RefractoryWindows::Session(session.refractory()).ccg_dip_bins(),
+            ))
         }
         Query::Compare { a, b } => {
             let (a, b) = (cl(session, *a)?, cl(session, *b)?);
@@ -270,8 +279,8 @@ pub fn run<P: DataProvider>(
                 session.spike_amplitudes(c),
                 sr,
                 total,
-                *t0,
-                *t1,
+                (*t0, *t1),
+                session.refractory(),
             )
         }
         Query::Waveform { c } => {
@@ -372,15 +381,9 @@ pub fn acg_text(
     bin_ms: f32,
     win_ms: f32,
     extra: &[(String, f32)],
+    params: &RefractoryParams,
 ) -> String {
-    let (cont, rp) = sliding_refractory_argmin(
-        times,
-        (sr * 0.0005) as u64,
-        (sr * 0.010) as u64,
-        20,
-        total,
-        sr,
-    );
+    let (cont, rp) = params.sweep(times, total, sr);
     let rp = match rp {
         0 => "-".into(),
         r => format!("{:.1}ms", r as f32 * 1000.0 / sr),
@@ -414,8 +417,9 @@ pub fn ccg_text(
     sr: f32,
     h: &[u32],
     win_ms: f32,
+    dip_bins: usize,
 ) -> String {
-    let (dip, sync) = ccg_z(trains.0, trains.1, sr);
+    let (dip, sync) = ccg_z(trains.0, trains.1, sr, dip_bins);
     let half = h.len() / 2;
     let (neg, pos) = (
         h[..half].iter().map(|&x| u64::from(x)).sum::<u64>(),
@@ -436,8 +440,8 @@ pub fn window_text(
     amps: &[f32],
     sr: f32,
     total: u64,
-    t0: f32,
-    t1: f32,
+    (t0, t1): (f32, f32),
+    params: &RefractoryParams,
 ) -> Result<String, String> {
     let (lo, hi) = ((t0 * sr) as u64, ((t1 * sr) as u64).min(total));
     if lo >= hi {
@@ -454,8 +458,8 @@ pub fn window_text(
     let has = amps.len() == times.len();
     let part_amps = if has { &amps[a..b] } else { &[] };
     let (part, whole) = (
-        unit_stats(&shifted, part_amps, sr, hi - lo),
-        unit_stats(times, if has { amps } else { &[] }, sr, total),
+        unit_stats(&shifted, part_amps, sr, hi - lo, params),
+        unit_stats(times, if has { amps } else { &[] }, sr, total, params),
     );
     let mean = |v: &[f32]| {
         if v.is_empty() {
@@ -821,7 +825,17 @@ mod tests {
         let t = train(5_000);
         let total = t.last().unwrap().0 + 1000;
         let h = auto_correlogram(&t, 1500, 100);
-        let text = acg_text(3, &t, SR, total, &h, 1.0, 50.0, &[]);
+        let text = acg_text(
+            3,
+            &t,
+            SR,
+            total,
+            &h,
+            1.0,
+            50.0,
+            &[],
+            &RefractoryParams::default(),
+        );
         assert!(field(&text, "rpc") < 0.05, "{text}");
         assert!(
             text.contains("\nsax(log lag 0-50ms) ") && text.contains("\nrate Hz bins 0..6: "),
@@ -837,7 +851,7 @@ mod tests {
             t.iter().skip(1).step_by(2).copied().collect(),
         );
         let h = cross_correlogram(&a, &b, 1500, 100);
-        let text = ccg_text((1, 2), (&a, &b), SR, &h, 50.0);
+        let text = ccg_text((1, 2), (&a, &b), SR, &h, 50.0, 2);
         assert!(field(&text, "dip_z") < 0.0, "{text}");
     }
 
@@ -865,11 +879,12 @@ mod tests {
         let t = train(2_000);
         let total = t.last().unwrap().0 + 1000;
         let amps = vec![2.0; t.len()];
-        let text = window_text(1, &t, &amps, SR, total, 0.0, 10.0).unwrap();
+        let params = RefractoryParams::default();
+        let text = window_text(1, &t, &amps, SR, total, (0.0, 10.0), &params).unwrap();
         assert!(
             text.starts_with("window 1 [0,10]s (slice/whole): n "),
             "{text}"
         );
-        assert!(window_text(1, &t, &amps, SR, total, 1e6, 2e6).is_err());
+        assert!(window_text(1, &t, &amps, SR, total, (1e6, 2e6), &params).is_err());
     }
 }

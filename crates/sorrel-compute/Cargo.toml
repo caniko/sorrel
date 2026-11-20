@@ -9,3 +9,4 @@ description = "Generic CPU kernels for Sorrel spike-sorting analysis."
 [dependencies]
 sorrel-io.workspace = true
 rayon.workspace = true
+serde.workspace = true
