@@ -10,8 +10,23 @@
 
 Native, high-performance GUI for manual curation of spike-sorted electrophysiology data. More views in the [gallery](https://sorrel.tartanoglu.com/#gallery).
 
-Prebuilt releases cover Linux (x86_64 and aarch64), macOS (Apple silicon) and
-Windows (x64 and ARM64).
+## Released (`0.4.0`)
+
+[Download `0.4.0`](https://github.com/caniko/sorrel/releases/tag/0.4.0) for
+Kilosort / phy2 curation. Prebuilt binaries are available for Linux (x86_64 and
+aarch64), macOS (Apple silicon) and Windows (x64 only).
+
+## On `trunk` (unreleased)
+
+These changes are available when building from source, not in the `0.4.0` downloads:
+
+- Expanded NWB/HDF5 reader that preserves unit IDs, electrode mappings, signal scaling and the sample clock; also reads local NWB-Zarr v2 stores.
+- Read-only HTTPS streaming for DANDI NWB and NWB-Zarr assets, with trace windows fetched on demand and curation journals stored locally.
+- Curated NWB Units export through PyNWB or NeuroConv, plus round-trip tests for SpikeInterface `curation.json`.
+- Askama-based HTML reports via `sorrel report`.
+
+Default CLI builds bundle HDF5 and enable `hdf5`, `zarr`, `dandi` and
+`phy-export`. See the [integration guide](docs/src/usage/integrations.md).
 
 Sorrel is built around **zero-cost abstractions**: the entire core is generic over a `DataProvider` trait, monomorphised at compile time, so hot paths (downsampling, vertex generation, journaling) cross no dynamic-dispatch boundary.
 
@@ -41,7 +56,7 @@ sorrel open <KILOSORT_DIR> --dat recording.dat --sample-rate 30000 --channels 32
 
 ### Keyboard
 
-Defaults; `Ctrl` is `Cmd` on macOS. Rebind in **Settings → Keyboard shortcuts**.
+Defaults on `trunk`; `Ctrl` is `Cmd` on macOS. Rebind in **Settings → Keyboard shortcuts**.
 
 | Key                                   | Action                                                                                                  |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------- |
