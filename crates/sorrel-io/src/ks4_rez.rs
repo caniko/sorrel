@@ -1,25 +1,24 @@
-//! Kilosort 4 `rez.mat` backend.
+//! Legacy MATLAB `rez.mat` backend for Kilosort 2, 2.5, and 3.
 //!
-//! KS4 writes a MATLAB v7.3 file (= HDF5 under the hood) containing the
-//! preprocessed sorting state. Fields we read:
+//! This reader opens MATLAB v7.3 (HDF5) files with the fields below.
+//! Kilosort 4 instead writes native Phy-format `.npy` arrays; open those
+//! with Sorrel's [Phy reader](crate::KilosortProvider). The `ks4_rez` module
+//! and `Ks4Rez*` type names are retained for compatibility.
 //!
-//! - `rez/st3` — `(n_spikes, ≥3)` matrix; column 0 is sample index
-//!   (1-based, MATLAB convention), column 1 is template id, column 2 is
-//!   amplitude. We use columns 0 and 1.
+//! - `rez/st3` — MATLAB `(n_spikes, n_columns)` matrix. The first two columns
+//!   hold 1-based sample indices and template IDs. The reader converts both
+//!   to zero-based indices and uses template IDs as cluster IDs; it ignores
+//!   all remaining columns.
 //! - `rez/ops/fs` — sample rate.
-//! - `rez/ops/Nchan` — channel count of the *preprocessed* recording.
+//! - `rez/ops/Nchan` — channel count used to open the recording.
 //! - `rez/ops/fbinary` (or `fproc`) — path to the raw / preprocessed dat.
-//! - `rez/xc`, `rez/yc` — channel positions (µm), 1-D each.
+//! - `rez/xc`, `rez/yc` — channel positions (µm).
 //!
-//! The dat file is opened separately as a regular int16 mmap (KS4 writes
-//! the same flat layout phy expects); we mmap it via memmap2 like the
-//! Kilosort backend.
+//! If available, the binary is opened separately as headerless, interleaved
+//! `int16` samples.
 //!
-//! MATLAB stores arrays in column-major / Fortran order, but the HDF5
-//! library returns the on-disk shape as (cols, rows) — we transpose at
-//! load time so callers see row-major.
-//!
-//! Compiled out by default — enable with `--features hdf5`.
+//! The `hdf5` feature is optional in `sorrel-io` and enabled by default in
+//! the `sorrel` application.
 
 #[cfg(not(feature = "hdf5"))]
 mod stub {
@@ -28,9 +27,8 @@ mod stub {
 
     pub fn open_stub(_path: impl AsRef<Path>) -> Result<()> {
         bail!(
-            "KS4 rez.mat backend not built; rebuild sorrel-io with `--features hdf5` \
-             to enable the reader, or open the phy/ subdirectory that Kilosort \
-             writes alongside rez.mat"
+            "legacy MATLAB rez.mat requires HDF5; enable the `hdf5` feature or \
+             open a Phy export of the sorting instead"
         )
     }
 }
@@ -53,6 +51,7 @@ mod imp {
     use std::fs::File;
     use std::path::{Path, PathBuf};
 
+    /// Reader for legacy MATLAB v7.3 `rez.mat` files, not Kilosort 4 output.
     pub struct Ks4RezProvider {
         sample_rate: f64,
         n_channels: u32,
@@ -82,7 +81,8 @@ mod imp {
     impl Ks4RezProvider {
         pub fn open(path: impl AsRef<Path>, overrides: Ks4RezOpenParams) -> Result<Self> {
             let path = path.as_ref();
-            let f = H5File::open(path).with_context(|| format!("open {}", path.display()))?;
+            let f = H5File::open(path)
+                .with_context(|| format!("open legacy MATLAB v7.3 file {}", path.display()))?;
 
             let rez = f.group("rez").context("missing /rez group")?;
             let ops = rez.group("ops").context("missing /rez/ops")?;
@@ -90,16 +90,12 @@ mod imp {
             let sample_rate = read_number(&ops, "fs")?;
             let n_channels = read_number(&ops, "Nchan")? as u32;
 
-            // st3: shape stored as (cols, rows) by MATLAB. We want a contiguous
-            // (n_spikes, n_cols) flat array.
+            // MATLAB's column-major layout appears as (columns, spikes) in HDF5.
             let st3 = rez.dataset("st3").context("missing /rez/st3")?;
             let shape = st3.shape();
             if shape.len() != 2 {
                 bail!("rez/st3 expected 2-D, got shape {:?}", shape);
             }
-            // HDF5 reports MATLAB shape verbatim; rows along the first axis
-            // in MATLAB are the inner stride on disk, so the actual semantic
-            // shape is (shape[1], shape[0]).
             let (n_spikes, n_cols) = (shape[1], shape[0]);
             if n_cols < 2 {
                 bail!("rez/st3 has only {n_cols} columns; expected ≥2");
@@ -120,7 +116,7 @@ mod imp {
             }
 
             // Bucket spikes by template (column 1, 1-based template id).
-            let mut max_template: u32 = 0;
+            let mut n_clusters = 0;
             let mut tuples: Vec<(SampleIndex, u32)> = Vec::with_capacity(n_spikes);
             for r in 0..n_spikes {
                 let sample = row_major[r * n_cols] as i64;
@@ -131,10 +127,9 @@ mod imp {
                 // Convert to 0-based.
                 let sample = SampleIndex::new((sample - 1) as u64);
                 let tmpl = (tmpl - 1) as u32;
-                max_template = max_template.max(tmpl);
+                n_clusters = n_clusters.max(tmpl as usize + 1);
                 tuples.push((sample, tmpl));
             }
-            let n_clusters = (max_template as usize) + 1;
             let mut spikes_per_cluster: Vec<Vec<SampleIndex>> = vec![Vec::new(); n_clusters];
             let mut templates_per_cluster: Vec<Vec<u32>> = vec![Vec::new(); n_clusters];
             for (sample, tmpl) in tuples {
@@ -161,8 +156,6 @@ mod imp {
             let channel_positions: Vec<[f32; 2]> =
                 (0..np).map(|i| [xs[i] as f32, ys[i] as f32]).collect();
 
-            // Locate the dat file. KS4 writes it as a string dataset under
-            // ops; HDF5-rs returns those as `VarLenAscii` / `FixedAscii`.
             let dat_path = overrides
                 .dat_path
                 .or_else(|| read_string_dataset(&ops, "fbinary").map(PathBuf::from))
@@ -172,7 +165,6 @@ mod imp {
                 Some(p) => map_dat(p, n_channels)?,
                 None => (None, std::ptr::null(), 0usize, SampleIndex::new(0)),
             };
-            // KS4 binaries are int16 with no header.
             let raw = trace_mmap.as_ref().and(dat_path).map(|path| RawFile {
                 path,
                 dtype: TraceDtype::I16,
@@ -208,7 +200,6 @@ mod imp {
             let nc = self.n_channels as usize;
             let s = start.idx().saturating_mul(nc);
             let e = s + (len as usize) * nc;
-            // KS4 fbinary is always int16.
             let buf = unsafe { self.typed_slice::<i16>() };
             let e = e.min(buf.len());
             TraceSamples::I16(&buf[s.min(e)..e])
@@ -291,7 +282,7 @@ mod imp {
         if let Ok(v) = ds.read_scalar::<f64>() {
             return Ok(v);
         }
-        // KS4 stores most numeric scalars as 1-element arrays.
+        // MATLAB can store scalars as 1-element arrays.
         if let Ok(v) = ds.read_raw::<f64>() {
             if let Some(x) = v.first() {
                 return Ok(*x);
@@ -322,7 +313,7 @@ mod imp {
     fn map_dat(p: &Path, n_channels: u32) -> Result<(Option<Mmap>, *const u8, usize, SampleIndex)> {
         if !p.exists() {
             log::warn!(
-                "KS4 dat path {} does not exist; trace view disabled",
+                "rez.mat recording path {} does not exist; trace view disabled",
                 p.display()
             );
             return Ok((None, std::ptr::null(), 0, SampleIndex::new(0)));
@@ -332,7 +323,7 @@ mod imp {
         let total = mmap.len();
         let bps = n_channels as usize * 2; // i16
         if bps == 0 || total.checked_rem(bps) != Some(0) {
-            bail!("KS4 dat size {total} not divisible by frame size {bps}");
+            bail!("rez.mat recording size {total} not divisible by frame size {bps}");
         }
         let n_samples = (total / bps) as u64;
         let ptr = mmap.as_ptr();
@@ -341,6 +332,7 @@ mod imp {
 
     fn provider_identity_bytes(rez_path: &Path, dat_path: Option<&Path>) -> Vec<u8> {
         let mut hasher = blake3::Hasher::new();
+        // Preserve identities used by existing journals.
         hasher.update(b"sorrel-provider-identity-v1/ks4-rez");
         for path in [Some(rez_path), dat_path].into_iter().flatten() {
             hasher.update(

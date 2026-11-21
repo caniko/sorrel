@@ -18,7 +18,7 @@ flate2.workspace = true
 log.workspace = true
 dunce = "1"
 
-# Optional HDF5 backend for NWB and Kilosort 4 `rez.mat` (MATLAB v7.3 = HDF5).
+# Optional HDF5 support for NWB and legacy MATLAB v7.3 `rez.mat`.
 # Bundle HDF5 and the gzip/deflate and LZF filters used by NWB/h5py.
 hdf5-metno = { version = "0.12.4", features = [
   "static",

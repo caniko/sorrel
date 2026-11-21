@@ -124,7 +124,7 @@ statuses:
 
 | phy                                    | Sorrel                                                                 | Status                     |
 | -------------------------------------- | ---------------------------------------------------------------------- | -------------------------- |
-| `phy template-gui params.py`           | `sorrel open <DATA_DIR>` (Kilosort/phy, SortingAnalyzer, NWB, KS4 rez) | done                       |
+| `phy template-gui params.py`           | `sorrel open <DATA_DIR>` (Phy, SortingAnalyzer, NWB, MATLAB `rez.mat`) | done                       |
 | `phy template-describe params.py`      | `sorrel describe <DATA_DIR>`                                           | done                       |
 | `--clear-cache`                        | `sorrel clear-cache`                                                   | done                       |
 | `kwik-gui`, `trace-gui`, `alf-convert` | —                                                                      | excluded: not template-gui |

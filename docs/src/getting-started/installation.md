@@ -1,6 +1,6 @@
 # Installation
 
-Sorrel includes the NWB and Kilosort 4 `rez.mat` readers by default.
+Sorrel includes the NWB and legacy MATLAB `rez.mat` readers by default.
 Prebuilt binaries and the default Nix package bundle HDF5; you don't need
 to install HDF5 or CMake to use them.
 

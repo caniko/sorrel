@@ -194,7 +194,7 @@ with "Windows only". `sorrelw` is `sorrel` without a console window; see
 
 | Flag                | Description                                                                                                                                                                                    |
 | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--backend NAME`    | `kilosort` \| `sorting-analyzer` \| `nwb` \| `ks4-rez`. Auto-detected when omitted.                                                                                                            |
+| `--backend NAME`    | `kilosort` \| `sorting-analyzer` \| `nwb` \| `rez`. Auto-detected when omitted. `ks4-rez` is an alias for the legacy MATLAB `rez` backend, not for Kilosort 4 output.                          |
 | `--dat PATH`        | Raw recording. Overrides `params.py:dat_path`.                                                                                                                                                 |
 | `--sample-rate Hz`  | Overrides `params.py:sample_rate`.                                                                                                                                                             |
 | `--channels N`      | Overrides `params.py:n_channels_dat`.                                                                                                                                                          |

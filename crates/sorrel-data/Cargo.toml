@@ -29,7 +29,7 @@ rusqlite = { workspace = true, optional = true }
 default = ["phy-export"]
 # Write a complete phy template-gui directory from any backend (`export_phy`).
 phy-export = []
-# Forwarded to sorrel-io: enables HDF5-backed NWB and KS4 rez.mat readers.
+# Forwarded to sorrel-io: enables HDF5-backed NWB and legacy MATLAB rez.mat readers.
 hdf5 = ["sorrel-io/hdf5"]
 zarr = ["sorrel-io/zarr"]
 # Results DB for the double-blind bench (`devdb`); off by default so release builds carry no SQLite.

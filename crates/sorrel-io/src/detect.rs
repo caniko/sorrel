@@ -11,7 +11,8 @@ pub enum Backend {
     SortingAnalyzer,
     /// `*.nwb` file or NWB-Zarr directory (needs `hdf5` or `zarr`, respectively).
     Nwb,
-    /// Kilosort `rez.mat` / `rez2.mat` (needs the `hdf5` feature to open).
+    /// Legacy MATLAB v7.3 `rez.mat` / `rez2.mat` (requires `hdf5` to open).
+    /// The variant name is retained for compatibility; Kilosort 4 uses [`Self::Kilosort`].
     Ks4Rez,
 }
 

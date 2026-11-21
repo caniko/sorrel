@@ -9,7 +9,7 @@ monomorphised Rust core and a wgpu-backed renderer.
 ## Highlights
 
 - **Multiple backends.** Reads phy/Kilosort directories, SpikeInterface
-  `SortingAnalyzer` (binary folder), Kilosort 4 `rez.mat`, and NWB files.
+  `SortingAnalyzer` (binary folder), legacy MATLAB `rez.mat`, and NWB files.
   Recording-only formats (SpikeGLX, Open Ephys, Mountainsort MDA) are
   supported as raw trace sources.
 - **Native egui + wgpu UI.** Trace, raster, ISI, CCG, waveform, template,

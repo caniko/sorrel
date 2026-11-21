@@ -31,7 +31,7 @@ programmatically accessible without abandoning the phy workflow.
   the session host, and every edit is journaled with who made it so it can be
   undone and shows up in the History pane.
 - Many backends, one model. phy/Kilosort, SpikeInterface `SortingAnalyzer`,
-  Kilosort 4 `rez.mat`, and NWB are read through the same `Session<P>`; raw
+  legacy MATLAB `rez.mat`, and NWB are read through the same `Session<P>`; raw
   trace sources such as SpikeGLX, Open Ephys, and Mountainsort MDA plug in as
   recording-only inputs.
 - Derived data is rebuildable. The cache holds derived results under rkyv with
