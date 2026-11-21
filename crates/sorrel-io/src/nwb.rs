@@ -83,8 +83,10 @@ mod imp {
         channel_map: Vec<ChannelId>,
         identity_bytes: Vec<u8>,
         trace: Option<NwbTrace>,
+        #[cfg(any(feature = "hdf5", feature = "dandi"))]
+        source: Group,
         #[cfg(feature = "dandi")]
-        remote_root: Option<Group>,
+        remote: bool,
     }
 
     impl NwbProvider {
@@ -313,15 +315,53 @@ mod imp {
                 channel_map,
                 identity_bytes,
                 trace,
+                #[cfg(any(feature = "hdf5", feature = "dandi"))]
+                source: f,
                 #[cfg(feature = "dandi")]
-                remote_root: remote.then_some(f),
+                remote,
             })
         }
 
         /// Read trials from the same remote sorting file and revision already opened.
         #[cfg(feature = "dandi")]
         pub fn read_remote_trials(&self) -> Result<crate::Events> {
-            trials_from_group(self.remote_root.as_ref().context("not a remote NWB")?)
+            ensure!(self.remote, "not a remote NWB");
+            trials_from_group(&self.source)
+        }
+
+        /// Read export metadata from the same sorting file or pinned store as the units.
+        #[cfg(feature = "hdf5")]
+        pub fn export_metadata(&self) -> Result<crate::nwb_write::Metadata> {
+            let read = |name| self.source.stored_dataset(name)?.read_string();
+            let mut metadata = crate::nwb_write::Metadata::new(
+                read("/identifier")?,
+                read("/session_description")?,
+                read("/session_start_time")?,
+            )?;
+            if let Some(time) = self.export_reference_time()? {
+                metadata.timestamps_reference_time = time;
+            }
+            Ok(metadata)
+        }
+
+        #[cfg(feature = "hdf5")]
+        fn export_reference_time(&self) -> Result<Option<String>> {
+            self.source
+                .optional_stored_dataset("/timestamps_reference_time")?
+                .map(|ds| ds.read_string())
+                .transpose()
+        }
+
+        /// Time zero for appending exported units (legacy files use session start).
+        #[cfg(feature = "hdf5")]
+        pub fn export_timestamp_reference(&self) -> Result<String> {
+            match self.export_reference_time()? {
+                Some(time) => Ok(time),
+                None => self
+                    .source
+                    .stored_dataset("/session_start_time")?
+                    .read_string(),
+            }
         }
 
         /// First sample time in seconds on the NWB session clock.

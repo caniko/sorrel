@@ -73,6 +73,72 @@ fn native_export_round_trips_curated_units_without_electrodes() {
     }
 }
 
+#[cfg(feature = "zarr")]
+#[test]
+fn native_export_from_nwb_zarr_preserves_units_and_session_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = fixtures().join("units_only.nwb.zarr");
+    let output = temp.path().join("output.nwb");
+    let journal = temp.path().join("curation.journal");
+    export(&input, &output, &["--journal", journal.to_str().unwrap()]);
+
+    let units = |provider: &NwbProvider| -> Vec<_> {
+        (0..provider.n_clusters())
+            .map(ClusterId)
+            .map(|c| (provider.unit_id(c), provider.spike_times(c).to_vec()))
+            .collect()
+    };
+    let source = NwbProvider::open(&input).unwrap();
+    let reopened = NwbProvider::open(&output).unwrap();
+    assert_eq!(
+        units(&reopened),
+        units(&source)
+            .into_iter()
+            .filter(|(_, spikes)| !spikes.is_empty())
+            .collect::<Vec<_>>()
+    );
+    let src = source.export_metadata().unwrap();
+    let dst = reopened.export_metadata().unwrap();
+    assert_eq!(dst.identifier, src.identifier);
+    assert_eq!(dst.session_description, src.session_description);
+    assert_eq!(dst.session_start_time, src.session_start_time);
+    assert_eq!(dst.timestamps_reference_time, src.timestamps_reference_time);
+
+    let raw = temp.path().join("recording.nwb");
+    fs::copy(fixtures().join("raw_only.nwb"), &raw).unwrap();
+    let paired = NwbProvider::open_with(
+        &input,
+        NwbOpenParams {
+            raw_path: Some(&raw),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let expected: Vec<_> = units(&paired)
+        .into_iter()
+        .filter(|(_, spikes)| !spikes.is_empty())
+        .collect();
+    drop(paired);
+    let result = Command::new(env!("CARGO_BIN_EXE_sorrel"))
+        .arg("export-nwb")
+        .arg(input)
+        .arg("--dat")
+        .arg(&raw)
+        .arg("--into")
+        .arg(&raw)
+        .arg("--journal")
+        .arg(temp.path().join("paired.journal"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let appended = NwbProvider::open(&raw).unwrap();
+    assert_eq!(units(&appended), expected);
+}
+
 #[test]
 fn native_export_round_trips_reader_time_bases() {
     let temp = tempfile::tempdir().unwrap();

@@ -1,5 +1,6 @@
 use super::{
-    detect_backend, seeded, with_session, Backend, OpenArgs, OpenCtx, Seed, SessionVisitor,
+    detect_backend, is_remote, seeded, with_session, Backend, OpenArgs, OpenCtx, Seed,
+    SessionVisitor,
 };
 use anyhow::{ensure, Context, Result};
 use clap::Args;
@@ -38,39 +39,37 @@ impl ExportNwb {
             Some(b) => b,
             None => detect_backend(self.open.root())?,
         };
-        let source = (backend == Backend::Nwb).then(|| self.open.root().to_path_buf());
+        let source = (backend == Backend::Nwb).then(|| self.open.root());
         if let Some(journal) = &self.open.journal {
-            let raw = self.open.dat.iter().filter(|_| backend == Backend::Nwb);
+            let raw = self.open.dat.as_deref().filter(|_| source.is_some());
             for path in source
-                .iter()
+                .into_iter()
                 .chain(raw)
-                .chain(self.out.iter())
-                .chain(self.into.iter())
+                .filter(|p| !is_remote(p))
+                .chain(self.out.as_deref())
+                .chain(self.into.as_deref())
             {
                 reject_journal_alias(journal, path)?;
             }
         }
         let destination = if let Some(out) = self.out {
-            let metadata = if let Some(source) = &source {
+            let metadata = if source.is_some() {
                 ensure!(self.identifier.is_none() && self.session_description.is_none() && self.session_start_time.is_none(),
                     "metadata flags are only for non-NWB inputs; these fields are copied from the source NWB");
-                nwb_write::Metadata::read(source).context("reading source NWB session metadata")?
+                None
             } else {
-                nwb_write::Metadata::new(
+                Some(nwb_write::Metadata::new(
                     self.identifier
                         .context("--out requires --identifier for a non-NWB source")?,
                     self.session_description
                         .context("--out requires --session-description for a non-NWB source")?,
                     self.session_start_time
                         .context("--out requires --session-start-time for a non-NWB source")?,
-                )?
+                )?)
             };
             Destination::New(out, metadata)
         } else {
             let into = self.into.context("expected --out or --into")?;
-            if let Some(source) = source.filter(|_| self.starting_time.is_none()) {
-                nwb_write::check_timestamp_reference(&source, &into)?;
-            }
             Destination::Append(into)
         };
         with_session(
@@ -117,7 +116,7 @@ fn reject_journal_alias(journal: &Path, nwb: &Path) -> Result<()> {
 }
 
 enum Destination {
-    New(PathBuf, nwb_write::Metadata),
+    New(PathBuf, Option<nwb_write::Metadata>),
     Append(PathBuf),
 }
 
@@ -128,6 +127,26 @@ struct Export {
 }
 
 impl SessionVisitor for Export {
+    fn prepare_nwb(&mut self, provider: &sorrel_io::NwbProvider) -> Result<()> {
+        match &mut self.destination {
+            Destination::New(_, metadata) => {
+                *metadata = Some(
+                    provider
+                        .export_metadata()
+                        .context("reading source NWB session metadata")?,
+                );
+            }
+            Destination::Append(path) if self.starting_time.is_none() => {
+                let reference = provider
+                    .export_timestamp_reference()
+                    .context("reading source NWB timestamps_reference_time")?;
+                nwb_write::check_timestamp_reference(&reference, path)?;
+            }
+            Destination::Append(_) => {}
+        }
+        Ok(())
+    }
+
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
@@ -145,7 +164,7 @@ impl SessionVisitor for Export {
             Destination::New(path, metadata) => {
                 let r = nwb_write::write_new(
                     &path,
-                    &metadata,
+                    &metadata.context("missing source NWB session metadata")?,
                     p.channel_positions(),
                     p.channel_map(),
                     &units,
@@ -153,6 +172,9 @@ impl SessionVisitor for Export {
                 (path, r)
             }
             Destination::Append(path) => {
+                // The destination may also be --dat. Close that read handle
+                // before replacing the file, which Windows otherwise forbids.
+                drop(session);
                 let r = nwb_write::append(&path, &units);
                 (path, r)
             }

@@ -705,6 +705,11 @@ trait SessionVisitor {
     #[cfg(feature = "dandi")]
     fn read_remote_trials(&mut self, _: &sorrel_io::NwbProvider) {}
 
+    #[cfg(feature = "hdf5")]
+    fn prepare_nwb(&mut self, _: &sorrel_io::NwbProvider) -> Result<()> {
+        Ok(())
+    }
+
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry;
@@ -720,7 +725,7 @@ fn seeded<P: DataProvider>(mut session: Session<P>, seed: Seed<P>) -> Result<Ses
 /// journal, then hand the typed session to `v`.
 fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
     let inputs = RemoteInputs::resolve(open)?;
-    #[cfg(feature = "dandi")]
+    #[cfg(any(feature = "hdf5", feature = "dandi"))]
     let mut v = v;
     #[cfg(not(feature = "dandi"))]
     let _ = inputs;
@@ -806,6 +811,8 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
             };
             #[cfg(not(feature = "dandi"))]
             let provider = sorrel_io::NwbProvider::open_with(&path, params)?;
+            #[cfg(feature = "hdf5")]
+            v.prepare_nwb(&provider)?;
             let starting_time = provider.starting_time();
             let metrics = provider.quality_metrics().clone();
             let (session, mut ctx) =

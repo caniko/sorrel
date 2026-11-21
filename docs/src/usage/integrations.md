@@ -341,8 +341,8 @@ own NeuroConv interface for those.
 
 #### Native export
 
-Build Sorrel with `--features hdf5` to export the same Units table from the
-command line without Python:
+Sorrel exports the same Units table to local HDF5 NWB without Python. The
+command is built by default on trunk and requires the `hdf5` feature:
 
 ```sh
 sorrel export-nwb my_run/phy --out curated.nwb \
@@ -351,11 +351,12 @@ sorrel export-nwb my_run/phy --out curated.nwb \
 ```
 
 New files use NWB 2.11.0 and never overwrite an existing file. The three
-metadata flags are required for non-NWB inputs; with an NWB input, Sorrel
-copies them and the timestamps reference time from the source. The output
-contains the Units table and, when available, probe-relative electrode
-geometry, but no traces, waveforms or subject metadata. For DANDI, add real
-subject metadata or export into an NWB recording that already has it.
+metadata flags are required for non-NWB inputs. For HDF5 NWB and NWB-Zarr
+inputs, local or streamed, Sorrel copies them and the timestamps reference
+time from the source. The output contains the Units table and, when
+available, probe-relative electrode geometry, but no traces, waveforms or
+subject metadata. For DANDI, add real subject metadata or export into an NWB
+recording that already has it.
 
 Pass `--starting-time SECONDS` to set the first sample's time on the file's
 NWB time axis. By default, export uses the rate and offset Sorrel used to open
@@ -376,10 +377,11 @@ geometry is available, the new file contains Units but no electrodes table.
 sorrel export-nwb my_run/phy --into recording.nwb --starting-time 0.5
 ```
 
-`--into` adds root `/units` to an existing NWB file and refuses to replace an
-existing `/units` table. When the NWB source and destination have different
-`timestamps_reference_time` values, pass `--starting-time` explicitly on the
-destination's time axis; Sorrel does not rebase the times automatically.
+`--into` adds root `/units` to an existing local HDF5 NWB file and refuses
+to replace an existing `/units` table. When the NWB source and destination
+have different `timestamps_reference_time` values, pass `--starting-time`
+explicitly on the destination's time axis; Sorrel does not rebase the times
+automatically.
 If the destination's default ElectricalSeries has a rate more than one part
 per million from the exported Units clock, append refuses rather than
 writing a clock Sorrel would ignore on reopen. Use `--out` for a separate

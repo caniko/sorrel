@@ -42,24 +42,10 @@ impl Metadata {
             session_start_time,
         })
     }
-
-    pub fn read(path: &Path) -> Result<Self> {
-        let f = File::open(path)?;
-        let read = |name| read_str(&*f.dataset(name)?);
-        let mut metadata = Self::new(
-            read("identifier")?,
-            read("session_description")?,
-            read("session_start_time")?,
-        )?;
-        if f.link_exists("timestamps_reference_time") {
-            metadata.timestamps_reference_time = read("timestamps_reference_time")?;
-        }
-        Ok(metadata)
-    }
 }
 
 /// Require the two NWB time axes to have the same origin for implicit alignment.
-pub fn check_timestamp_reference(source: &Path, destination: &Path) -> Result<()> {
+pub fn check_timestamp_reference(src: &str, destination: &Path) -> Result<()> {
     fn read(path: &Path) -> Result<String> {
         let f = File::open(path)?;
         let name = if f.link_exists("timestamps_reference_time") {
@@ -69,18 +55,18 @@ pub fn check_timestamp_reference(source: &Path, destination: &Path) -> Result<()
         };
         read_str(&*f.dataset(name)?)
     }
-    let reference = |path: &Path| {
-        read(path)
-            .with_context(|| format!("reading timestamps_reference_time in {}", path.display()))
-    };
-    let src = reference(source)?;
-    let dst = reference(destination)?;
+    let dst = read(destination).with_context(|| {
+        format!(
+            "reading timestamps_reference_time in {}",
+            destination.display()
+        )
+    })?;
     let parse = |time: &str| {
         time.parse::<jiff::Timestamp>()
             .with_context(|| format!("invalid timestamps_reference_time {time:?}"))
     };
     ensure!(
-        parse(&src)? == parse(&dst)?,
+        parse(src)? == parse(&dst)?,
         "source timestamps_reference_time ({src}) differs from destination ({dst}); pass \
          --starting-time in seconds on the destination's time axis"
     );
