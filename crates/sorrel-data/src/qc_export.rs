@@ -258,11 +258,11 @@ impl QcRow {
         let prefix = if leading_comma { ",\n" } else { "\n" };
         write!(
             w,
-            r#"{prefix}  {{"cluster_id": {}, "n_spikes": {}, "firing_rate": {:.6}, "mean_amplitude": {:.6}, "presence_ratio": {:.6}, "isi_violations": {}, "isi_violation_ratio": {:.6}, "amplitude_cutoff": {:.6}, "amplitude_snr": {:.6}, "drift_correlation": {:.6}, "longest_silent_gap": {:.6}, "composite_quality": {:.6}, "isolation_distance_sq": {}, "l_ratio": {}, "nn_isolation": {}, "d_prime": {}, "silhouette": {}"#,
+            r#"{prefix}  {{"cluster_id": {}, "n_spikes": {}, "firing_rate": {:.6}, "mean_amplitude": {}, "presence_ratio": {:.6}, "isi_violations": {}, "isi_violation_ratio": {:.6}, "amplitude_cutoff": {:.6}, "amplitude_snr": {:.6}, "drift_correlation": {:.6}, "longest_silent_gap": {:.6}, "composite_quality": {:.6}, "isolation_distance_sq": {}, "l_ratio": {}, "nn_isolation": {}, "d_prime": {}, "silhouette": {}"#,
             self.cluster_id,
             self.n_spikes,
             self.firing_rate_hz,
-            self.mean_amplitude,
+            json_num(self.mean_amplitude),
             self.presence_ratio,
             self.isi_violations,
             self.isi_violation_ratio,
@@ -544,6 +544,8 @@ pub(crate) mod tests {
 
     #[test]
     fn session_refractory_changes_qc_and_evaluation() {
+        use crate::learn::features::{extract, ExtractOpts};
+
         let dir = tempfile::tempdir().unwrap();
         let prov = MockProvider {
             spikes: vec![vec![SampleIndex(10), SampleIndex(11), SampleIndex(150)]],
@@ -554,6 +556,7 @@ pub(crate) mod tests {
         let edit_version = s.version();
         let metrics_version = s.metrics_version();
         let before = &collect_qc_rows(&s)[0];
+        let learned_before = extract(&s, "fixture", &ExtractOpts::default()).unwrap();
         let mut params = *s.refractory();
         params.fixed_ms = 0.5;
         params.sweep_min_ms = 1.5;
@@ -566,6 +569,113 @@ pub(crate) mod tests {
         assert_eq!(ev.merged.rp_contamination, after.rp_contamination);
         assert_eq!(s.version(), edit_version);
         assert_ne!(s.metrics_version(), metrics_version);
+        let learned_after = extract(&s, "fixture", &ExtractOpts::default()).unwrap();
+        assert_eq!(
+            learned_before.tables.roots.get(0, "f_rp_contamination"),
+            0.0
+        );
+        assert_eq!(learned_before.tables.roots, learned_after.tables.roots);
+    }
+
+    #[test]
+    fn custom_refractory_survives_edits_but_does_not_change_journal_replay() {
+        use crate::command::{CurationCommand as Cmd, Method};
+        use crate::{evaluate, preview, quality_ext};
+
+        let dir = tempfile::tempdir().unwrap();
+        let open = || {
+            let prov = MockProvider {
+                spikes: vec![
+                    [0, 3, 30, 60, 90].map(SampleIndex).to_vec(),
+                    [5, 50].map(SampleIndex).to_vec(),
+                ],
+                amps: vec![vec![1.0; 5], vec![1.0; 2]],
+                n_samples: SampleIndex(100),
+            };
+            Session::new(prov, Journal::open(&dir.path().join("j")).unwrap())
+        };
+        let mut s = open();
+        let c = ClusterId(0);
+        let d = ClusterId(1);
+        let e = ClusterId(2);
+        let version = s.version();
+        let params: sorrel_compute::RefractoryParams =
+            serde_json::from_str(r#"{"fixed_ms":4.0,"sweep_min_ms":3.5}"#).unwrap();
+        assert_eq!(params.sweep_max_ms, 10.0);
+        assert_eq!(params.sweep_step_ms, 0.25);
+        assert_eq!(
+            serde_json::from_value::<sorrel_compute::RefractoryParams>(
+                serde_json::to_value(params).unwrap()
+            )
+            .unwrap(),
+            params
+        );
+        let before = preview::preview_merge(&s, &[d], c);
+        s.set_refractory(params).unwrap();
+        assert_eq!(s.version(), version);
+        assert_eq!(s.journal().n_records(), 0);
+
+        let after = preview::preview_merge(&s, &[d], c);
+        assert!(after.post.contamination_score < before.post.contamination_score);
+        let expected = evaluate::eval_merge(&s, &[c, d]).merged;
+        s.dispatch(Cmd::Merge {
+            sources: vec![d],
+            target: c,
+        })
+        .unwrap();
+        let merged_version = s.version();
+        assert_eq!(collect_qc_rows(&s)[0].isi_violations, 2);
+        assert_eq!(
+            collect_qc_rows(&s)[0].rp_contamination,
+            expected.rp_contamination
+        );
+        assert_eq!(
+            quality_ext::cluster_quality(&s, c).contamination_score,
+            after.post.contamination_score
+        );
+
+        let preview = preview::preview_split(&s, c, &[0, 1]);
+        let eval = evaluate::eval_split(&s, c, &[0, 1]);
+        assert!(preview.inside.contamination_score < preview.outside.contamination_score);
+        assert_eq!(eval.parts[1].isi_violation_ratio, 1_000.0 / 3.0);
+        s.dispatch(Cmd::Split {
+            cluster: c,
+            spike_idx: vec![0, 1],
+            new_cluster: c,
+            by: Method::Manual,
+        })
+        .unwrap();
+        let split_version = s.version();
+        let split_times = s.spike_times(e).to_vec();
+        assert_eq!(split_times, preview.inside_times);
+        let counts = |session: &Session<_>| {
+            collect_qc_rows(session)
+                .into_iter()
+                .filter(|row| row.n_spikes != 0)
+                .map(|row| (row.cluster_id, row.isi_violations))
+                .collect::<Vec<_>>()
+        };
+        let split = counts(&s);
+        assert_eq!(split, [(0, 0), (2, 1)]);
+        s.dispatch(Cmd::Undo).unwrap();
+        assert_eq!(s.version(), merged_version);
+        assert_eq!(counts(&s), [(0, 2)]);
+        s.dispatch(Cmd::Redo).unwrap();
+        assert_eq!(s.version(), split_version);
+        assert_eq!(counts(&s), split);
+        drop(s);
+
+        let mut reopened = open();
+        reopened.replay_journal().unwrap();
+        assert_eq!(
+            *reopened.refractory(),
+            sorrel_compute::RefractoryParams::default()
+        );
+        assert_eq!(reopened.version(), split_version);
+        assert_eq!(reopened.spike_times(e), split_times);
+        assert_eq!(counts(&reopened), [(0, 0), (2, 0)]);
+        reopened.set_refractory(params).unwrap();
+        assert_eq!(counts(&reopened), split);
     }
 
     #[test]

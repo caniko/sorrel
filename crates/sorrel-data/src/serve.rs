@@ -2324,11 +2324,17 @@ mod tests {
             replies[1]["result"]["tools"].as_array().unwrap().len(),
             23 + usize::from(cfg!(feature = "phy-export"))
         );
-        assert!(replies[1]["result"]["tools"]
+        let refractory = replies[1]["result"]["tools"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|t| t["name"] == "refractory"));
+            .find(|t| t["name"] == "refractory")
+            .unwrap();
+        let properties = refractory["inputSchema"]["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 4);
+        for field in ["fixed_ms", "sweep_min_ms", "sweep_max_ms", "sweep_step_ms"] {
+            assert_eq!(properties[field]["type"], "number");
+        }
         assert_eq!(replies[2]["id"], 3);
         assert_eq!(replies[2]["result"]["isError"], false);
         assert_eq!(h.read().label(ClusterId(0)), Some(1));
@@ -2483,6 +2489,88 @@ mod tests {
         );
         assert_eq!(invalid["result"]["isError"], true);
         assert_eq!(payload(&run("refractory", json!({}))), new);
+    }
+
+    #[test]
+    fn refractory_sweep_updates_the_warm_mcp_cache_one_field_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let make_session = |name: &str| {
+            Session::new(
+                MockProvider {
+                    spikes: vec![vec![0, 3, 30, 60, 90]
+                        .into_iter()
+                        .map(SampleIndex)
+                        .collect()],
+                    amps: vec![vec![1.0; 5]],
+                    n_samples: SampleIndex(100),
+                },
+                Journal::open(&dir.path().join(name)).unwrap(),
+            )
+        };
+        let h = SessionHost::new(make_session("active"));
+        let isolated = make_session("isolated");
+        let mut env = Env::new(dir.path(), false, label);
+        let mut run = |name, args| handle_line(&h, &mut env, &call(1, name, args)).unwrap();
+        let metrics = || json!({"cluster": 0});
+        assert_eq!(payload(&run("metrics", metrics()))["rp_contamination"], 0.0);
+        let original_version = h.read().metrics_version();
+
+        for (field, value, width) in [
+            ("sweep_min_ms", 3.5, 10),
+            ("sweep_step_ms", 1.1, 9),
+            ("sweep_max_ms", 8.0, 8),
+        ] {
+            let version = h.read().metrics_version();
+            let patch = json!({(field): value});
+            let updated = payload(&run("refractory", patch.clone()));
+            assert!((updated["current"][field].as_f64().unwrap() - value).abs() < 1e-6);
+            assert_ne!(h.read().metrics_version(), version);
+            let row = payload(&run("metrics", metrics()));
+            let contamination = row["rp_contamination"].as_f64().unwrap();
+            assert!(
+                (contamination - 2.0 / f64::from(width)).abs() < 1e-6,
+                "{row}"
+            );
+
+            let version = h.read().metrics_version();
+            _ = run("refractory", patch);
+            assert_eq!(h.read().metrics_version(), version, "identical patch");
+            assert_eq!(
+                run("refractory", json!({"sweep_max_ms": 3.0}))["result"]["isError"],
+                true
+            );
+            assert_eq!(h.read().metrics_version(), version, "invalid patch");
+            assert_eq!(payload(&run("metrics", metrics())), row);
+        }
+        assert_eq!(
+            *isolated.refractory(),
+            sorrel_compute::RefractoryParams::default()
+        );
+        assert_eq!(isolated.metrics_version(), original_version);
+        assert_eq!(
+            crate::qc_export::collect_qc_rows(&isolated)[0].rp_contamination,
+            0.0
+        );
+        let brief = run("brief", json!({"level": 2, "clusters": [0]}));
+        let brief = brief["result"]["content"][0]["text"].as_str().unwrap();
+        let (_, cards) = brief.split_once("\ncards:\n").unwrap();
+        let column = cards
+            .lines()
+            .next()
+            .unwrap()
+            .split('\t')
+            .position(|field| field == "rp_contamination")
+            .unwrap();
+        let row = cards.lines().find(|line| line.starts_with("0\t")).unwrap();
+        assert_eq!(row.split('\t').nth(column), Some("0.25"));
+        let acg = run("probe", json!({"q": "acg 0"}));
+        assert!(
+            acg["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("rp 8.0ms"),
+            "{acg}"
+        );
     }
 
     fn ui() -> (Arc<Ui>, std::sync::mpsc::Receiver<Vec<ClusterId>>) {

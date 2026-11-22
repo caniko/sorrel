@@ -486,6 +486,75 @@ pub fn fraction_below(amps: &[f32], threshold: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn custom_refractory_sweep_matches_brute_force_hill_minimum() {
+        let params = RefractoryParams {
+            fixed_ms: 2.25,
+            sweep_min_ms: 0.75,
+            sweep_max_ms: 4.2,
+            sweep_step_ms: 1.0,
+        };
+        // At 2 kHz the candidate widths are 4, 6, 8 samples. The
+        // final 4.2 ms endpoint is not a grid point.
+        for train in [[0, 2, 6, 40, 54], [0, 8, 16, 40, 54], [0, 0, 5, 9, 54]] {
+            let mut candidates = [4, 6, 8].map(|width| {
+                let violations = train.windows(2).filter(|p| p[1] - p[0] < width).count();
+                let hill = (violations as f32 * 60.0 / (2 * width * 25) as f32).min(1.0);
+                (hill, width)
+            });
+            candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+            assert_eq!(params.sweep(&si(train), 60, 2_000.0), candidates[0]);
+        }
+        assert_eq!(params.fixed_samples(2_000.0), 5);
+        let times = si([0, 2, 7, 20]);
+        assert_eq!(isi_violations(&times, 2), 0);
+        assert_eq!(isi_violations(&times, 5), 1);
+        assert_eq!(isi_violations(&times, 6), 2);
+        assert_eq!(isi_violation_rate(&times, 5, 2_000.0), 100.0);
+        assert_eq!(refractory_contamination(&times, 5, 40, 2_000.0), 0.25);
+    }
+
+    #[test]
+    fn grid_size_limits_and_coarse_sample_rounding() {
+        let mut params = RefractoryParams {
+            sweep_min_ms: 1.0,
+            sweep_max_ms: 1001.0,
+            sweep_step_ms: 1.0,
+            ..Default::default()
+        };
+        assert!(params.validate().is_ok());
+        assert_eq!(params.windows(1_000.0).last(), Some(1001));
+        for invalid_max in [1.5, 1002.0] {
+            params.sweep_max_ms = invalid_max;
+            assert!(params.validate().unwrap_err().contains("1 and 1000"));
+        }
+        params.sweep_max_ms = 6.9;
+        assert_eq!(params.windows(200.0).collect::<Vec<_>>(), [0, 1, 1, 1, 1]);
+        assert_eq!(params.sweep(&si([0, 1]), 10, 200.0), (0.0, 1));
+        assert_eq!(params.sweep(&si([0, 1]), 10, 50.0), (0.0, 0));
+    }
+
+    #[test]
+    fn default_refractory_grid_at_multiple_sample_rates() {
+        let params = RefractoryParams::default();
+        for (rate, fixed, final_width) in [
+            (1_000.0, 2, 10),
+            (12_500.0, 19, 125),
+            (20_000.0, 30, 200),
+            (44_100.0, 66, 441),
+        ] {
+            assert_eq!(params.fixed_samples(rate), fixed);
+            // Exact boundary never counts as an ISI violation. Every candidate
+            // is clean, so the last (longest) window must win.
+            let times = si([0, final_width, 2 * final_width]);
+            assert_eq!(
+                params.sweep(&times, 4 * final_width, rate),
+                (0.0, final_width)
+            );
+            assert_eq!(params.sweep(&times[..1], 4 * final_width, rate), (0.0, 0));
+        }
+    }
+
+    #[test]
     fn default_refractory_grid_at_30_khz() {
         let params = RefractoryParams::default();
         assert_eq!(params.fixed_samples(30_000.0), 45);

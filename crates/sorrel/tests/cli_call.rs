@@ -118,6 +118,86 @@ fn offline_commands_work() {
     assert!(String::from_utf8_lossy(&none.stderr).contains("no running sorrel host"));
 }
 
+#[test]
+fn refractory_flags_change_qc_and_html_report_on_the_real_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(ds) = fixture(tmp.path()) else {
+        return;
+    };
+    let ds = ds.to_str().unwrap();
+    for (fixed_ms, expected) in [("1", 0), ("4", 666)] {
+        let qc = tmp.path().join(format!("qc-{fixed_ms}"));
+        let html = tmp.path().join(format!("report-{fixed_ms}.html"));
+        for (cmd, out) in [("qc", &qc), ("report", &html)] {
+            let result = run(
+                tmp.path(),
+                &[
+                    cmd,
+                    ds,
+                    "--out",
+                    out.to_str().unwrap(),
+                    "--refractory-ms",
+                    fixed_ms,
+                    "--rp-min-ms",
+                    "1.5",
+                    "--rp-max-ms",
+                    "7.25",
+                    "--rp-step-ms",
+                    "0.5",
+                ],
+            );
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(qc.join("cluster_qc.json")).unwrap()).unwrap();
+        let row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["cluster_id"] == 0)
+            .unwrap();
+        // The 667-spike fixture unit has no gap <30 samples and every gap
+        // is <120 samples, at the declared 30 kHz.
+        assert_eq!(row["isi_violations"], expected);
+        assert!(row["mean_amplitude"].is_null());
+        assert!(row["rp_contamination"].as_f64().unwrap() > 0.0);
+        let rate = row["isi_violation_ratio"].as_f64().unwrap();
+        let html = std::fs::read_to_string(html).unwrap();
+        assert!(
+            html.contains(&format!("<dt>ISI viol.</dt><dd>{rate:.0}</dd>")),
+            "missing rendered rate {rate}"
+        );
+    }
+}
+
+#[test]
+fn invalid_refractory_flags_fail_with_an_actionable_diagnostic() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (args, diagnostic) in [
+        (&["--refractory-ms=0"][..], "fixed_ms"),
+        (&["--refractory-ms=NaN"][..], "finite"),
+        (
+            &["--rp-min-ms=9", "--rp-max-ms=8"][..],
+            "sweep_min_ms must be less",
+        ),
+        (&["--rp-step-ms=0.0001"][..], "1 and 1000 windows"),
+    ] {
+        let mut command = vec!["qc", "unused-when-validation-fails"];
+        command.extend(args);
+        let result = run(tmp.path(), &command);
+        assert!(!result.status.success());
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("Invalid refractory settings") && stderr.contains(diagnostic),
+            "{stderr}"
+        );
+    }
+}
+
 #[cfg(feature = "hdf5")]
 #[test]
 fn nwb_call_preserves_exported_parent_without_a_row() {

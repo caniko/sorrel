@@ -715,6 +715,74 @@ mod tests {
     }
 
     #[test]
+    fn refractory_settings_cancel_invalid_edits_and_publish_only_a_saved_change() {
+        use egui_kittest::kittest::Queryable;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let applied = std::cell::Cell::new(None);
+        let mut h = egui_kittest::Harness::new_ui(|ui| {
+            if let Some(change) = show(ui.ctx()) {
+                applied.set(Some(change));
+            }
+        });
+        install(&h.ctx, Ok(path.clone()), vec![]);
+        let defaults = RefractoryParams::default();
+        let runtime = shared(&h.ctx);
+        let draft = |params| {
+            runtime.lock().unwrap().draft.as_mut().unwrap().refractory = params;
+        };
+        let custom = RefractoryParams {
+            fixed_ms: 3.0,
+            sweep_min_ms: 2.5,
+            sweep_max_ms: 8.0,
+            sweep_step_ms: 0.5,
+        };
+        open(&h.ctx);
+        for (params, diagnostic) in [
+            (
+                RefractoryParams {
+                    sweep_min_ms: 8.0,
+                    ..custom
+                },
+                "sweep_min_ms must be less",
+            ),
+            (
+                RefractoryParams {
+                    fixed_ms: -1.0,
+                    ..custom
+                },
+                "fixed_ms must be finite",
+            ),
+        ] {
+            draft(params);
+            h.run_ok();
+            assert!(h.query_by_label_contains(diagnostic).is_some());
+            h.get_by_label("Save settings").click();
+            h.run_ok();
+            assert!(runtime.lock().unwrap().open);
+            assert_eq!(refractory(&h.ctx), defaults);
+            assert_eq!(applied.get(), None);
+            assert!(!path.exists());
+        }
+        draft(custom);
+        h.run_ok();
+        h.get_by_label("Cancel").click();
+        h.run_ok();
+        assert!(!runtime.lock().unwrap().open);
+        assert_eq!(applied.get(), None);
+        assert!(!path.exists());
+
+        open(&h.ctx);
+        draft(custom);
+        h.run_ok();
+        h.get_by_label("Save settings").click();
+        h.run_ok();
+        assert_eq!(applied.get(), Some((defaults, custom)));
+        assert_eq!(refractory(&h.ctx), custom);
+        assert_eq!(Settings::load(&path).unwrap().refractory, custom);
+    }
+
+    #[test]
     fn gui_can_rebind_save_and_reset_without_touching_home() {
         use egui_kittest::kittest::Queryable;
         let dir = tempfile::tempdir().unwrap();
