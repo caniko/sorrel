@@ -820,7 +820,7 @@ pub(crate) mod tests {
             serde_json::from_slice(&std::fs::read(json).unwrap()).unwrap();
         let mut lines = tsv.lines();
         let header: Vec<_> = lines.next().unwrap().split('\t').collect();
-        assert_eq!(header.len(), 38);
+        assert_eq!(header.len(), 41);
         let evidence = [
             "srp_contamination",
             "srp_rp_ms",
@@ -828,7 +828,7 @@ pub(crate) mod tests {
             "rpv_post_lo95",
             "rpv_post_hi95",
         ];
-        assert_eq!(&header[33..], evidence);
+        assert_eq!(&header[33..38], evidence);
         let records: Vec<_> = lines
             .map(|line| line.split('\t').collect::<Vec<_>>())
             .collect();
