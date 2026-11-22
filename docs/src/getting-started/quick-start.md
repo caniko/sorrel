@@ -12,12 +12,15 @@ The detector looks for, in order:
 2. `recording.json` (or `binary.json`) + `sorting/` → **SpikeInterface
    `SortingAnalyzer`**.
 3. A `.nwb` file path → **NWB**.
-4. A `rez.mat` / `rez2.mat` file path → **Kilosort 4 rez**.
+4. A `rez.mat` / `rez2.mat` file path → **legacy MATLAB v7.3 (HDF5)**.
 
 You can force the choice with `--backend kilosort | sorting-analyzer |
-nwb | ks4-rez`.
+nwb | rez`. The older `ks4-rez` name is still accepted as an alias for `rez`.
 
 ## Phy / Kilosort
+
+For Kilosort 4, open the results directory containing its native `.npy`
+arrays.
 
 ```bash
 sorrel open my_run/phy
@@ -52,9 +55,10 @@ The analyzer must be saved with `format='binary_folder'` and have a
 flattened sorting under `<root>/sorting/`. A Zarr analyzer converts with
 `analyzer.save_as(format="binary_folder", folder=...)`.
 
-## NWB and KS4 rez
+## NWB and legacy MATLAB `rez.mat`
 
-Both readers are included by default.
+Both readers are included by default. The `rez.mat` reader is for MATLAB
+v7.3 (HDF5) files from Kilosort 2, 2.5, and 3.
 
 ```bash
 sorrel open my_session.nwb

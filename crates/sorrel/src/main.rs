@@ -454,10 +454,10 @@ enum LlmBackend {
 /// and every headless subcommand.
 #[derive(Args, Debug, Clone, Default)]
 struct OpenArgs {
-    /// phy / Kilosort, SortingAnalyzer, NWB (local, DANDI or HTTPS), or rez.mat
+    /// phy / Kilosort, SortingAnalyzer, NWB (local, DANDI or HTTPS), or legacy MATLAB rez.mat
     #[arg(value_name = "DATA_DIR", required = true)]
     root: Option<PathBuf>,
-    /// kilosort | sorting-analyzer | nwb | ks4-rez (auto-detected by default)
+    /// kilosort | sorting-analyzer | nwb | rez (legacy alias: ks4-rez)
     #[arg(long, value_name = "NAME", value_parser = parse_backend)]
     backend: Option<Backend>,
     /// Raw recording (overrides params.py:dat_path, or pairs NWB units with a raw NWB)
@@ -559,7 +559,7 @@ fn parse_backend(s: &str) -> std::result::Result<Backend, String> {
         #[cfg(not(feature = "hdf5"))]
         "ks4-rez" | "rez" => {
             return Err(format!(
-                "backend {s} is unavailable in this build; rebuild with default features"
+                "backend {s} (legacy MATLAB rez.mat) requires HDF5; rebuild with default features"
             ));
         }
         other => return Err(format!("unknown backend {other}")),
@@ -632,7 +632,7 @@ fn detect_backend(root: &Path) -> Result<Backend> {
         #[cfg(not(feature = "hdf5"))]
         sorrel_io::Backend::Ks4Rez => {
             bail!(
-                "{} is unsupported in this build; rebuild with default features",
+                "{} needs the hdf5 feature; rebuild with default features",
                 root.display()
             )
         }

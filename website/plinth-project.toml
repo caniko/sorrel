@@ -255,8 +255,8 @@ html = '''
   <p>A SortingAnalyzer saved as <code>binary_folder</code>: <code>recording.json</code>, the flat sorting under <code>sorting/</code>, an optional <code>probe.json</code>, and the <code>quality_metrics</code> extension.</p>
 </details>
 <details>
-  <summary>NWB &amp; Kilosort 4 rez <span>*.nwb · rez.mat</span></summary>
-  <p><code>*.nwb</code> via <code>/units/spike_times</code> and the electrodes table; <code>rez.mat</code> via <code>rez/st3</code> and <code>rez/ops</code>. Both readers are included by default.</p>
+  <summary>NWB &amp; legacy MATLAB rez <span>*.nwb · rez.mat</span></summary>
+  <p><code>*.nwb</code> via <code>/units/spike_times</code> and the electrodes table; MATLAB v7.3 <code>rez.mat</code> from Kilosort 2, 2.5, and 3 via <code>rez/st3</code> and <code>rez/ops</code>. Both readers are included by default. Open Kilosort 4 results as a Phy directory.</p>
 </details>
 <details>
   <summary>Raw recording sources <span>SpikeGLX · Open Ephys · MDA</span></summary>

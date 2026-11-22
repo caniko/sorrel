@@ -1,7 +1,7 @@
 # sorrel for agents
 
 sorrel curates spike-sorted electrophysiology data (phy/Kilosort,
-SpikeInterface SortingAnalyzer, NWB, KS4 rez.mat). A dataset has one owner,
+SpikeInterface SortingAnalyzer, NWB, legacy MATLAB rez.mat). A dataset has one owner,
 its session host: the GUI tab or `sorrel run --headless`. Every edit, by a
 human or an agent, is journaled with its actor and is undoable.
 

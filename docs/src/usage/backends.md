@@ -8,12 +8,12 @@ Sorrel reads several sorting and recording formats. The general rule:
 
 | Kind      | Format                                                   | Notes                                                                                                                                                                                                         |
 | --------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Sorting   | phy / Kilosort directory                                 | First-class. Reads phy artefacts as-is.                                                                                                                                                                       |
+| Sorting   | phy / Kilosort directory                                 | Reads Phy arrays as-is, including Kilosort 4's native `.npy` output.                                                                                                                                          |
 | Sorting   | SpikeInterface `SortingAnalyzer` (binary folder)         | Reads `recording.json` (binary, or a channel- and sample-preserving preprocessing chain over binary), the flat sorting under `sorting/`, optional `probe.json`, and `extensions/quality_metrics/metrics.csv`. |
 | Sorting   | NWB (local HDF5)                                         | HDF5 is bundled by default. Reads `/units`, with or without a trace. `--nwb-series` selects an acquisition or processed series; `--dat` pairs a separate raw NWB. See [NWB](integrations.md#nwb).             |
 | Sorting   | NWB-Zarr (local Zarr v2 directory)                       | Default `zarr` feature. Same units and lazy trace reader as HDF5 NWB; `--dat` can mix storage formats. See [NWB](integrations.md#nwb).                                                                        |
 | Sorting   | DANDI NWB / NWB-Zarr (remote)                            | On by default. Read-only range streaming with local journals. See [DANDI streaming](integrations.md#dandi-streaming).                                                                                         |
-| Sorting   | Kilosort 4 `rez.mat`                                     | HDF5 is bundled by default. Reads `rez/st3`, `rez/ops/*`, `rez/xc`, `rez/yc`.                                                                                                                                 |
+| Sorting   | Legacy MATLAB `rez.mat` / `rez2.mat`                     | MATLAB v7.3 (HDF5) files from Kilosort 2, 2.5, and 3. See [Legacy MATLAB `rez.mat`](integrations.md#legacy-matlab-rezmat).                                                                                    |
 | Recording | SpikeGLX (`*.bin` + `*.meta`)                            | Use as `--dat`; pass `--spikeglx-meta` for sample rate / channels / dtype.                                                                                                                                    |
 | Recording | Open Ephys binary (`continuous.dat` + `structure.oebin`) | Use as `--dat`; pass `--oebin` to inherit metadata.                                                                                                                                                           |
 | Recording | Mountainsort MDA (`*.mda`)                               | Use as `--dat`. Reads the MDA header.                                                                                                                                                                         |
@@ -23,7 +23,7 @@ Sorrel reads several sorting and recording formats. The general rule:
 When `--backend` is not specified, the detector is run on the input path:
 
 1. File path `*.nwb` → NWB (HDF5).
-2. File path `rez.mat` / `rez2.mat` → KS4 rez (HDF5).
+2. File path `rez.mat` / `rez2.mat` → legacy MATLAB reader (HDF5).
 3. Directory containing `spike_times.npy` + `spike_clusters.npy` →
    phy / Kilosort.
 4. Directory ending in `.nwb.zarr` or with `nwb_version` in root `.zattrs` → NWB (Zarr).

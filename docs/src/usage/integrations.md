@@ -424,19 +424,28 @@ for three reasons:
 
 The interface does not link units to electrodes.
 
-## Kilosort 4 `rez.mat`
+## Legacy MATLAB `rez.mat`
 
 ```sh
 sorrel open rez.mat --dat path/to/recording.bin
 ```
 
-Reads `rez/st3` for sample/template tuples, `rez/ops/fs` and
-`rez/ops/Nchan` for recording params, `rez/xc`/`rez/yc` for channel
-positions, and `rez/ops/fbinary`/`fproc` for the dat path (overridable
-with `--dat`).
+This reader supports MATLAB v7.3 (HDF5) `rez.mat` and `rez2.mat` files
+from Kilosort 2, 2.5, and 3. It reads sample and template IDs from the
+first two columns of `rez/st3` and groups spikes by template, not by
+any later cluster assignments. It reads `rez/ops/fs` and `rez/ops/Nchan`
+for recording parameters, `rez/xc` and `rez/yc` for channel positions,
+and `rez/ops/fbinary` or `rez/ops/fproc` for the binary path (`--dat`
+overrides it).
 
-The `rez.mat` reader is included by default. If you build without it,
-open the phy export that KS4 writes under `<output>/phy/` instead.
+The reader is included by default. To select it explicitly, use
+`--backend rez`; `--backend ks4-rez` is an older spelling for the same
+reader. If the MAT file is not v7.3 or you built without HDF5, use a Phy
+export of the legacy run instead.
+
+Kilosort 4 writes [Phy-format `.npy` arrays](https://kilosort.readthedocs.io/en/latest/export_files.html)
+directly. Open the results directory with Sorrel's Phy reader
+(`--backend kilosort`), not the MAT file reader.
 
 ## Python (Jupyter)
 

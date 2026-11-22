@@ -5,6 +5,9 @@
 > same commit; the working tree now carries an uncommitted simit badge
 > block in `README.md`, this dossier plus its `SUMMARY.md` entry, and a
 > stray untracked `docs/.cargo/config.toml` (see Current Reality).
+>
+> This is a historical snapshot. Sorrel now includes NWB and legacy MATLAB
+> `rez.mat` readers by default. See [Backends & Inputs](../usage/backends.md).
 
 ## Goal And Trigger
 
@@ -114,7 +117,7 @@ without re-deriving the facts.
 | Invalidation tested            | `crates/sorrel-cache/src/tests.rs` (`add_journal_head`), `session.rs:194,231` (`invalidate_caches`)                                                                                                                                                     | Acceptance criterion met                                                                                      |
 | README staleness               | `README.md:39` "Undo (V1: stub)" vs `crates/sorrel-ui/src/app.rs:293-298`; workspace table vs `Cargo.toml` members                                                                                                                                      | Docs drift from implementation                                                                                |
 | Stray cargo config             | `diff .cargo/config.toml docs/.cargo/config.toml` → identical; untracked                                                                                                                                                                                | Accidental artifact; delete                                                                                   |
-| Stub backends                  | `crates/sorrel-io/src/nwb.rs:27`, `ks4_rez.rs:25`                                                                                                                                                                                                       | NWB / KS4 `.rez` ingest unimplemented                                                                         |
+| Stub backends                  | `crates/sorrel-io/src/nwb.rs:27`, `ks4_rez.rs:25`                                                                                                                                                                                                       | NWB / legacy MATLAB `rez.mat` ingest unimplemented at the time                                                |
 
 ## Existing Plan Status
 
@@ -250,7 +253,7 @@ forgejo --runner atlas --workspace`, add a `simit.toml` pinning the
    trivial. Also delete the stray untracked `docs/.cargo/config.toml`.
 6. **Wire cargo-deny into CI or flake checks** — `deny.toml` already
    exists; add a job/check so it actually gates. Small; independent.
-7. **Feature work: real NWB and KS4 `.rez` backends** — currently
+7. **Feature work: real NWB and legacy MATLAB `rez.mat` backends** — then
    stubs; the `DataProvider` trait boundary is the integration point.
    Larger design work; would warrant its own plan set.
 8. **Optional:** move `pages.yaml` to `atlas-nix-trusted`; grow
@@ -267,6 +270,6 @@ forgejo --runner atlas --workspace`, add a `simit.toml` pinning the
 - **Where should the Pages job run** — stay on `codeberg-small` (flaky
   but zero-config) or move to `atlas-nix-trusted` (faster, ToU
   considerations)? CI proper is already on atlas.
-- **NWB / KS4 `.rez` priority** — is backend expansion the next major
+- **NWB / legacy MATLAB `rez.mat` priority** — is backend expansion the next major
   feature, or does curation UX take precedence? This determines whether
   step (7) gets a plan set now.
