@@ -57,6 +57,7 @@ impl PhyLabel {
 pub struct KilosortProvider {
     root: PathBuf,
     sample_rate: f32,
+    exact_sample_rate: f64,
     n_channels: u32,
     n_samples: SampleIndex,
     dtype: TraceDtype,
@@ -138,7 +139,8 @@ unsafe impl Sync for KilosortProvider {}
 /// optional so callers can supply only what they want to override.
 #[derive(Clone, Default)]
 pub struct KilosortOpenParams {
-    pub sample_rate: Option<f32>,
+    /// Recording clock in Hz, before rounding for display and compute.
+    pub sample_rate: Option<f64>,
     pub n_channels: Option<u32>,
     pub dtype: Option<TraceDtype>,
     pub offset: Option<u64>,
@@ -185,10 +187,11 @@ impl KilosortProvider {
             PhyParams::default()
         };
 
-        let sample_rate = overrides
+        let exact_sample_rate = overrides
             .sample_rate
-            .or(params.sample_rate)
+            .or(params.exact_sample_rate)
             .context("sample_rate not in params.py and no override given")?;
+        let sample_rate = exact_sample_rate as f32;
         let n_channels = overrides
             .n_channels
             .or(params.n_channels_dat)
@@ -426,6 +429,7 @@ impl KilosortProvider {
         Ok(Self {
             root,
             sample_rate,
+            exact_sample_rate,
             n_channels,
             n_samples,
             dtype,
@@ -515,6 +519,9 @@ impl DataProvider for KilosortProvider {
     #[inline]
     fn sample_rate(&self) -> f32 {
         self.sample_rate
+    }
+    fn exact_sample_rate(&self) -> Result<f64> {
+        Ok(self.exact_sample_rate)
     }
     #[inline]
     fn n_channels(&self) -> u32 {

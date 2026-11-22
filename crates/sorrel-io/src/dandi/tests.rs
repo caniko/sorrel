@@ -745,6 +745,22 @@ fn parity(name: &'static str, draft: bool) -> Result<()> {
         return Ok(());
     }
     let (local, remote) = (local?, remote?);
+    #[cfg(feature = "hdf5")]
+    if matches!(name, "good.nwb" | "good.nwb.zarr") {
+        let expected = local.export_metadata()?;
+        let actual = remote.export_metadata()?;
+        assert_eq!(actual.identifier, expected.identifier);
+        assert_eq!(actual.session_description, expected.session_description);
+        assert_eq!(actual.session_start_time, expected.session_start_time);
+        assert_eq!(
+            actual.timestamps_reference_time,
+            expected.timestamps_reference_time
+        );
+        assert_eq!(
+            remote.export_timestamp_reference()?,
+            expected.timestamps_reference_time
+        );
+    }
     if name == "units_only.nwb.zarr" {
         let trials = remote.read_remote_trials()?;
         assert!(!trials.is_empty());

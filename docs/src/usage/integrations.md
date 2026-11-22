@@ -339,6 +339,56 @@ The function refuses an `NWBFile` that already has a units table. It does
 not write traces, the electrodes table or waveforms. Use the recording's
 own NeuroConv interface for those.
 
+#### Native export
+
+Sorrel exports the same Units table to local HDF5 NWB without Python. The
+command is built by default on trunk and requires the `hdf5` feature:
+
+```sh
+sorrel export-nwb my_run/phy --out curated.nwb \
+  --identifier my-run --session-description 'Curated spike sorting' \
+  --session-start-time '2026-01-01T10:00:00+00:00'
+```
+
+New files use NWB 2.11.0 and never overwrite an existing file. The three
+metadata flags are required for non-NWB inputs. For HDF5 NWB and NWB-Zarr
+inputs, local or streamed, Sorrel copies them and the timestamps reference
+time from the source. The output contains the Units table and, when
+available, probe-relative electrode geometry, but no traces, waveforms or
+subject metadata. For DANDI, add real subject metadata or export into an NWB
+recording that already has it.
+
+Pass `--starting-time SECONDS` to set the first sample's time on the file's
+NWB time axis. By default, export uses the rate and offset Sorrel used to open
+the session: from the selected ElectricalSeries (including regular timestamps
+or a paired raw file via `--dat`), or from the Units resolution or `--sample-rate`
+when there is no series. Reopening a Units-only export uses a zero offset for
+its relative sample indices; pair the raw NWB with `--dat` to recover the raw
+series' time base or to reopen a file with negative spike times.
+If the series and Units clocks map spikes to different samples, reopen with
+`--sample-rate` set to the exact Units clock listed in the error. The Units
+clock is recovered from the written resolution and may differ by one ULP
+from the export rate. Export checks that both rates map each written spike
+back to its original sample.
+Unlike `export-phy`, `export-nwb` does not need channels: if no electrode
+geometry is available, the new file contains Units but no electrodes table.
+
+```sh
+sorrel export-nwb my_run/phy --into recording.nwb --starting-time 0.5
+```
+
+`--into` adds root `/units` to an existing local HDF5 NWB file and refuses
+to replace an existing `/units` table. When the NWB source and destination
+have different `timestamps_reference_time` values, pass `--starting-time`
+explicitly on the destination's time axis; Sorrel does not rebase the times
+automatically.
+If the destination's default ElectricalSeries has a rate more than one part
+per million from the exported Units clock, append refuses rather than
+writing a clock Sorrel would ignore on reopen. Use `--out` for a separate
+Units file instead.
+Append needs space for a sibling copy of the entire destination and replaces
+the original only after a successful write. Do not edit the destination concurrently.
+
 ### NeuroConv
 
 `sorrel.neuroconv.SorrelSortingInterface` wraps the same function as a

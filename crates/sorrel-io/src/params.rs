@@ -20,6 +20,7 @@ pub struct PhyParams {
     pub dtype: Option<TraceDtype>,
     pub offset: Option<u64>,
     pub sample_rate: Option<f32>,
+    pub exact_sample_rate: Option<f64>,
     pub hp_filtered: Option<bool>,
 }
 
@@ -69,11 +70,10 @@ impl PhyParams {
                     );
                 }
                 "sample_rate" => {
-                    out.sample_rate = Some(
-                        parse_float(value)
-                            .with_context(|| format!("params.py:{}: sample_rate", lineno + 1))?
-                            as f32,
-                    );
+                    let rate = parse_float(value)
+                        .with_context(|| format!("params.py:{}: sample_rate", lineno + 1))?;
+                    out.sample_rate = Some(rate as f32);
+                    out.exact_sample_rate = Some(rate);
                 }
                 "hp_filtered" => {
                     out.hp_filtered = match value {

@@ -32,6 +32,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "dev")]
 mod dev;
+#[cfg(feature = "hdf5")]
+mod export_nwb;
 mod rescue;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -355,6 +357,9 @@ enum Cmd {
         #[arg(long)]
         copy_raw: bool,
     },
+    /// Write curated units to a new or existing NWB file
+    #[cfg(feature = "hdf5")]
+    ExportNwb(export_nwb::ExportNwb),
     /// Remove <DATA_DIR>/.sorrel/cache/
     ClearCache {
         /// Dataset directory (or an .nwb / rez.mat file inside it)
@@ -634,9 +639,17 @@ fn detect_backend(root: &Path) -> Result<Backend> {
     })
 }
 
-/// Apply SpikeGLX/Open Ephys metadata overrides to a `KilosortOpenParams`,
-/// preserving any explicit CLI overrides the user supplied.
-fn apply_recording_overrides(open: &OpenArgs, p: &mut KilosortOpenParams) -> Result<()> {
+/// Merge explicit CLI overrides with SpikeGLX/Open Ephys recording metadata.
+/// The provider fills any remaining defaults from `params.py`.
+fn kilosort_open_params(open: &OpenArgs) -> Result<KilosortOpenParams> {
+    let mut p = KilosortOpenParams {
+        sample_rate: open.sample_rate,
+        n_channels: open.n_channels,
+        dtype: open.dtype,
+        offset: open.offset,
+        dat_path: open.dat.clone(),
+        ..Default::default()
+    };
     if let Some(meta_path) = &open.spikeglx_meta {
         let meta = SpikeGlxMeta::read(meta_path)
             .with_context(|| format!("read spikeglx meta {}", meta_path.display()))?;
@@ -657,7 +670,7 @@ fn apply_recording_overrides(open: &OpenArgs, p: &mut KilosortOpenParams) -> Res
             p.dat_path = Some(stream.dat_path(oebin_path.parent().unwrap_or(Path::new("."))));
         }
     }
-    Ok(())
+    Ok(p)
 }
 
 /// Where a session's artifacts go, how its journal is treated on save, and
@@ -692,6 +705,11 @@ trait SessionVisitor {
     #[cfg(feature = "dandi")]
     fn read_remote_trials(&mut self, _: &sorrel_io::NwbProvider) {}
 
+    #[cfg(feature = "hdf5")]
+    fn prepare_nwb(&mut self, _: &sorrel_io::NwbProvider) -> Result<()> {
+        Ok(())
+    }
+
     fn visit<P>(self, session: Session<P>, seed: Seed<P>, ctx: OpenCtx<P>) -> Result<()>
     where
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry;
@@ -707,7 +725,7 @@ fn seeded<P: DataProvider>(mut session: Session<P>, seed: Seed<P>) -> Result<Ses
 /// journal, then hand the typed session to `v`.
 fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
     let inputs = RemoteInputs::resolve(open)?;
-    #[cfg(feature = "dandi")]
+    #[cfg(any(feature = "hdf5", feature = "dandi"))]
     let mut v = v;
     #[cfg(not(feature = "dandi"))]
     let _ = inputs;
@@ -730,16 +748,7 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
     );
     match backend {
         Backend::Kilosort => {
-            let mut params = KilosortOpenParams {
-                sample_rate: open.sample_rate.map(|r| r as f32),
-                n_channels: open.n_channels,
-                dtype: open.dtype,
-                offset: open.offset,
-                dat_path: open.dat.clone(),
-                ..Default::default()
-            };
-            apply_recording_overrides(open, &mut params)?;
-            let (session, ctx) = open_kilosort(open, params)?;
+            let (session, ctx) = open_kilosort(open, kilosort_open_params(open)?)?;
             v.visit(session, Box::new(seed_kilosort), ctx)
         }
         Backend::SortingAnalyzer => {
@@ -802,6 +811,8 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
             };
             #[cfg(not(feature = "dandi"))]
             let provider = sorrel_io::NwbProvider::open_with(&path, params)?;
+            #[cfg(feature = "hdf5")]
+            v.prepare_nwb(&provider)?;
             let starting_time = provider.starting_time();
             let metrics = provider.quality_metrics().clone();
             let (session, mut ctx) =
@@ -901,16 +912,7 @@ fn run_share(open: &OpenArgs, port: u16, relay: Option<sorrel_remote::Multiaddr>
         // into RAM); add them when someone needs to share one.
         bail!("remote share supports kilosort/phy datasets");
     }
-    let mut params = KilosortOpenParams {
-        sample_rate: open.sample_rate.map(|r| r as f32),
-        n_channels: open.n_channels,
-        dtype: open.dtype,
-        offset: open.offset,
-        dat_path: open.dat.clone(),
-        ..Default::default()
-    };
-    apply_recording_overrides(open, &mut params)?;
-    let (mut session, ctx) = open_kilosort(open, params)?;
+    let (mut session, ctx) = open_kilosort(open, kilosort_open_params(open)?)?;
     seed_kilosort(&mut session)?;
     let p = &session.provider;
     let dat = sorrel_remote::DatSource {
@@ -2952,6 +2954,8 @@ fn main() -> Result<()> {
             out,
             copy_raw,
         }) => with_session(&open, ExportPhy { out, copy_raw }),
+        #[cfg(feature = "hdf5")]
+        Some(Cmd::ExportNwb(args)) => args.run(),
         Some(Cmd::Share { open, port, relay }) => run_share(&open, port, relay),
         Some(Cmd::Join {
             code,
