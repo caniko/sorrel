@@ -155,6 +155,12 @@ where
     let tsv_path = root.join("cluster_group.tsv");
     let mut text = String::from("cluster_id\tgroup\n");
     for (i, lbl) in session.labels().iter().enumerate() {
+        if session
+            .spike_times(sorrel_io::ClusterId(i as u32))
+            .is_empty()
+        {
+            continue;
+        }
         let s = label_str(lbl);
         if !s.is_empty() && s != "unsorted" {
             text.push_str(&format!("{i}\t{s}\n"));
@@ -167,7 +173,11 @@ where
     let mut tags_text = String::from("cluster_id\tsorrel_tags\n");
     let mut any = false;
     for c in 0..session.n_clusters() {
-        let tags = session.tags(sorrel_io::ClusterId(c));
+        let cid = sorrel_io::ClusterId(c);
+        if session.spike_times(cid).is_empty() {
+            continue;
+        }
+        let tags = session.tags(cid);
         if !tags.is_empty() {
             any = true;
             tags_text.push_str(&format!("{c}\t{}\n", tags.join(",")));
@@ -184,6 +194,9 @@ where
     for key in &keys {
         let mut text = format!("cluster_id\t{key}\n");
         for c in (0..session.n_clusters()).map(sorrel_io::ClusterId) {
+            if session.spike_times(c).is_empty() {
+                continue;
+            }
             if let Some(v) = session.custom_label(c, key) {
                 text.push_str(&format!("{c}\t{v}\n"));
             }
@@ -1236,5 +1249,73 @@ mod tests {
         save_to_phy(&s, dir.path(), label_str).unwrap();
         let second = std::fs::read(dir.path().join("spike_clusters.npy")).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn save_after_merge_omits_emptied_sources_from_tsvs() {
+        let (mut s, dir) = fresh_session();
+        // Cut out a cluster, mark it noise (plus tag & custom label), then merge
+        // it into another noise unit — like grouping cutout noise in phy.
+        s.dispatch(CurationCommand::Split {
+            cluster: ClusterId(0),
+            spike_idx: vec![1],
+            new_cluster: ClusterId(u32::MAX),
+            by: crate::command::Method::Manual,
+        })
+        .unwrap();
+        let cutout = ClusterId(3);
+        s.dispatch(CurationCommand::Relabel {
+            cluster: cutout,
+            op: PhyLabelOp::SetNoise,
+        })
+        .unwrap();
+        s.dispatch(CurationCommand::Relabel {
+            cluster: ClusterId(1),
+            op: PhyLabelOp::SetNoise,
+        })
+        .unwrap();
+        s.dispatch(CurationCommand::Tag {
+            cluster: cutout,
+            tags: vec!["cutout".into()],
+        })
+        .unwrap();
+        let set_custom = s.set_label_command(cutout, "quality_note", "junk").unwrap();
+        s.dispatch(set_custom).unwrap();
+        s.dispatch(CurationCommand::Merge {
+            sources: vec![cutout],
+            target: ClusterId(1),
+        })
+        .unwrap();
+
+        save_to_phy(&s, dir.path(), label_str).unwrap();
+
+        let group_tsv = std::fs::read_to_string(dir.path().join("cluster_group.tsv")).unwrap();
+        assert_eq!(group_tsv, "cluster_id\tgroup\n1\tnoise\n");
+
+        let tags_tsv =
+            std::fs::read_to_string(dir.path().join(sorrel_io::kilosort::TAGS_TSV)).unwrap();
+        assert!(
+            !tags_tsv.lines().skip(1).any(|l| l.starts_with("3\t")),
+            "emptied cutout must not appear in tags TSV: {tags_tsv}"
+        );
+
+        let custom_tsv =
+            std::fs::read_to_string(dir.path().join("cluster_quality_note.tsv")).unwrap();
+        assert!(
+            !custom_tsv.lines().skip(1).any(|l| l.starts_with("3\t")),
+            "emptied cutout must not appear in custom label TSV: {custom_tsv}"
+        );
+
+        let info_tsv = std::fs::read_to_string(dir.path().join("cluster_info.tsv")).unwrap();
+        assert!(
+            !info_tsv.lines().skip(1).any(|l| l.starts_with("3\t")),
+            "emptied cutout must not appear in cluster_info.tsv: {info_tsv}"
+        );
+
+        // Undoing the merge restores the cutout cluster and its noise label.
+        s.dispatch(CurationCommand::Undo).unwrap();
+        save_to_phy(&s, dir.path(), label_str).unwrap();
+        let restored = std::fs::read_to_string(dir.path().join("cluster_group.tsv")).unwrap();
+        assert_eq!(restored, "cluster_id\tgroup\n1\tnoise\n3\tnoise\n");
     }
 }

@@ -1418,14 +1418,21 @@ pub fn cluster_statistics_view_for<P: DataProvider>(
     let mut mean_amps: Vec<f32> = Vec::with_capacity(n);
     let mut isi_viols: Vec<f32> = Vec::with_capacity(n);
     for c in (0..n as u32).map(ClusterId) {
-        spike_counts.push(session.spike_times(c).len() as f32);
+        let times = session.spike_times(c);
+        if times.is_empty() {
+            spike_counts.push(f32::NAN);
+            mean_amps.push(f32::NAN);
+            isi_viols.push(f32::NAN);
+            continue;
+        }
+        spike_counts.push(times.len() as f32);
         let amps = session.spike_amplitudes(c);
         mean_amps.push(if amps.is_empty() {
             f32::NAN
         } else {
             mean_amplitude(amps)
         });
-        isi_viols.push(isi_violations(session.spike_times(c), refractory_samples) as f32);
+        isi_viols.push(isi_violations(times, refractory_samples) as f32);
     }
 
     let marks = |vals: &[f32]| -> Vec<(usize, ClusterId, f32)> {

@@ -554,14 +554,19 @@ pub fn import_commands<P: DataProvider>(
     let mut out = Vec::new();
     for (uid, quality, tags) in &doc.labels {
         let c = cluster(uid)?;
+        if let Some(bad) = tags.iter().find(|t| !valid_tag(t)) {
+            bail!("unit {uid}: invalid tag {bad:?} (empty, or contains a comma/tab/newline)");
+        }
+        // Emptied units (e.g. sources of a merge already applied on an earlier
+        // import) are no longer live, so skip relabeling/retagging them.
+        if session.spike_times(c).is_empty() {
+            continue;
+        }
         if let Some(q) = quality {
             let op = label_op(q.as_str())?;
             if label_op(current(c))? != op {
                 out.push(CurationCommand::Relabel { cluster: c, op });
             }
-        }
-        if let Some(bad) = tags.iter().find(|t| !valid_tag(t)) {
-            bail!("unit {uid}: invalid tag {bad:?} (empty, or contains a comma/tab/newline)");
         }
         // Session markers are not review state: ignore them when comparing
         // (re-import stays a no-op), never take them from the file, and keep

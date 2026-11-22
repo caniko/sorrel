@@ -438,12 +438,18 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     /// Called once the session is seeded: initial selection, clean-state
     /// snapshot, and the per-dataset prefs.
     fn finish_loading(&mut self) {
-        let (n_clusters, sr) = {
+        let (n_clusters, sr, first_live) = {
             let s = read(&self.session);
-            (s.n_clusters(), s.provider.sample_rate())
+            let n = s.n_clusters();
+            let first = (0..n)
+                .map(ClusterId)
+                .find(|&c| !s.spike_times(c).is_empty());
+            (n, s.provider.sample_rate(), first)
         };
-        if n_clusters > 0 && self.selection.is_empty() {
-            self.selection = SelectionSet::single(ClusterId(0));
+        if self.selection.is_empty() {
+            if let Some(c) = first_live {
+                self.selection = SelectionSet::single(c);
+            }
         }
         if let Some(prefs) = self.pending_prefs.take() {
             self.apply_prefs(prefs, n_clusters, sr);
@@ -458,7 +464,6 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             self.table_state.sort_by = col;
             self.table_state.sort_descending = prefs.sort_descending;
         }
-        self.table_state.hide_empty = prefs.hide_empty;
         self.table_state.hide_noise = prefs.hide_noise;
         self.view_params = prefs.views;
         if let Some(ms) = prefs.window_ms {
@@ -466,7 +471,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         }
         let hp = prefs.hp.then_some(TracePreproc::HP_DEFAULT_HZ);
         self.trace_cfg = TracePreproc::from_flags(hp, prefs.cmr);
-        if let Some(anchor) = prefs.anchor.filter(|&a| a < n_clusters) {
+        let anchor = prefs.anchor.filter(|&a| {
+            a < n_clusters && !read(&self.session).spike_times(ClusterId(a)).is_empty()
+        });
+        if let Some(anchor) = anchor {
             self.selection = SelectionSet::single(ClusterId(anchor));
         }
     }
@@ -484,7 +492,6 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             tree: Some(self.tree.clone()),
             sort_by: Some(self.table_state.sort_by.clone()),
             sort_descending: self.table_state.sort_descending,
-            hide_empty: self.table_state.hide_empty,
             hide_noise: self.table_state.hide_noise,
             window_ms: Some(self.window_len as f32 * 1000.0 / sr),
             hp: self.trace_cfg.hp().is_some(),
@@ -602,12 +609,20 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             if let Some((&first, rest)) = live.split_first() {
                 self.selection.replace(first);
                 rest.iter().for_each(|&c| self.selection.toggle(c));
+            } else {
+                self.drop_missing_clusters();
             }
             self.highlight = Some((live, Instant::now()));
         }
         let Some(link) = &self.mcp else { return };
         for ids in link.select.try_iter() {
-            if let Some((&first, rest)) = ids.split_first() {
+            let live: Vec<ClusterId> = {
+                let s = read(&self.session);
+                ids.into_iter()
+                    .filter(|&c| c.0 < s.n_clusters() && !s.spike_times(c).is_empty())
+                    .collect()
+            };
+            if let Some((&first, rest)) = live.split_first() {
                 self.selection.replace(first);
                 rest.iter().for_each(|&c| self.selection.toggle(c));
             }
@@ -989,7 +1004,12 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             Snippet::Merge => self.dispatch_intent(Intent::MergeSelection),
             Snippet::Split => self.dispatch_intent(Intent::Split),
             Snippet::Select(ids) => {
-                let ids: Vec<ClusterId> = ids.into_iter().filter(|c| c.0 < n).collect();
+                let s = read(&self.session);
+                let ids: Vec<ClusterId> = ids
+                    .into_iter()
+                    .filter(|&c| c.0 < n && !s.spike_times(c).is_empty())
+                    .collect();
+                drop(s);
                 let Some((&first, rest)) = ids.split_first() else {
                     self.status = toast("no such cluster");
                     return;
@@ -1219,9 +1239,33 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     /// still naming it would make every view rebuild for a cluster that no
     /// longer exists (and would miss the cached pre-split feature set).
     fn drop_missing_clusters(&mut self) {
-        let n = read(&self.session).n_clusters() as usize;
-        if self.selection.as_slice().iter().any(|c| c.idx() >= n) {
-            self.selection.retain(|c| c.idx() < n);
+        let (n, first_live, has_dead) = {
+            let s = read(&self.session);
+            let n = s.n_clusters() as usize;
+            let dead = self
+                .selection
+                .as_slice()
+                .iter()
+                .any(|&c| c.idx() >= n || s.spike_times(c).is_empty());
+            let first = if dead {
+                (0..n as u32)
+                    .map(ClusterId)
+                    .find(|&c| !s.spike_times(c).is_empty())
+            } else {
+                None
+            };
+            (n, first, dead)
+        };
+        if has_dead {
+            let s = read(&self.session);
+            self.selection
+                .retain(|c| c.idx() < n && !s.spike_times(c).is_empty());
+            drop(s);
+            if self.selection.is_empty() {
+                if let Some(c) = first_live {
+                    self.selection = SelectionSet::single(c);
+                }
+            }
         }
     }
 
@@ -1525,12 +1569,15 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
     }
 
     fn dispatch_intent(&mut self, intent: Intent) {
-        let n = read(&self.session).n_clusters();
+        let is_live = |c: ClusterId| {
+            let s = read(&self.session);
+            c.0 < s.n_clusters() && !s.spike_times(c).is_empty()
+        };
         // phy merge mode: picks become merge candidates and labels wait.
         if self.merge_mode.is_some() {
             match intent {
                 Intent::SelectCluster(c) | Intent::ToggleCluster(c) | Intent::ExtendCluster(c) => {
-                    if c.0 < n && !self.selection.best().contains(&c) {
+                    if is_live(c) && !self.selection.best().contains(&c) {
                         self.selection.toggle_similar(c);
                     }
                     return;
@@ -1545,17 +1592,17 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         }
         match intent {
             Intent::SelectCluster(c) => {
-                if c.0 < n {
+                if is_live(c) {
                     self.selection.replace(c);
                 }
             }
             Intent::ToggleCluster(c) => {
-                if c.0 < n {
+                if is_live(c) {
                     self.selection.toggle(c);
                 }
             }
             Intent::ExtendCluster(c) => {
-                if c.0 < n {
+                if is_live(c) {
                     self.selection.extend_to(c, &self.table_state.visible);
                 }
             }
@@ -1690,7 +1737,15 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 }
             },
             Intent::MergeSelection => {
-                let sel = self.selection.as_slice();
+                let sel: Vec<ClusterId> = {
+                    let s = read(&self.session);
+                    self.selection
+                        .as_slice()
+                        .iter()
+                        .copied()
+                        .filter(|&c| c.0 < s.n_clusters() && !s.spike_times(c).is_empty())
+                        .collect()
+                };
                 if sel.len() < 2 {
                     self.status = toast("select two or more clusters to merge");
                     return;
@@ -1806,7 +1861,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             (
                 format!(
                     "{} clusters · {} channels · {:.1} kHz",
-                    s.n_clusters(),
+                    s.n_live_clusters(),
                     s.provider.n_channels(),
                     s.provider.sample_rate() / 1000.0
                 ),
@@ -2643,10 +2698,11 @@ impl<P: DataProvider + ApplyPhyLabel> eframe::App for SorrelApp<P> {
                     ui.add_space(12.0);
                     ui.heading("Clusters");
                     // `visible` is last frame's list; one frame of lag is invisible.
+                    let live = session.n_live_clusters();
                     ui.weak(format!(
                         "{} / {}",
-                        self.table_state.visible.len(),
-                        session.n_clusters()
+                        self.table_state.visible.len().min(live),
+                        live
                     ))
                     .on_hover_text("visible / total clusters");
                 });
@@ -3596,5 +3652,27 @@ mod tests {
         // Short paths are returned as-is.
         let s2 = short_path(&PathBuf::from("/a/b"));
         assert_eq!(s2, "/a/b");
+    }
+
+    #[test]
+    fn merged_empty_clusters_cannot_be_selected_and_undo_restores_them() {
+        let (mut app, _d) = make_app();
+        app.selection.replace(ClusterId(1));
+        app.selection.toggle(ClusterId(0));
+        app.dispatch_intent(Intent::MergeSelection);
+        assert_eq!(app.selection.as_slice(), &[ClusterId(1)]);
+        assert_eq!(read(&app.session).n_live_clusters(), 2);
+
+        // Attempting to select the emptied source is ignored.
+        app.dispatch_intent(Intent::SelectCluster(ClusterId(0)));
+        assert_eq!(app.selection.as_slice(), &[ClusterId(1)]);
+        app.run_snippet(crate::snippets::Snippet::Select(vec![ClusterId(0)]));
+        assert_eq!(app.selection.as_slice(), &[ClusterId(1)]);
+
+        // Undoing restores cluster 0 so it can be selected again.
+        app.dispatch_intent(Intent::Undo);
+        assert_eq!(read(&app.session).n_live_clusters(), 3);
+        app.dispatch_intent(Intent::SelectCluster(ClusterId(0)));
+        assert_eq!(app.selection.as_slice(), &[ClusterId(0)]);
     }
 }

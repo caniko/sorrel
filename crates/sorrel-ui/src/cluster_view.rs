@@ -515,7 +515,10 @@ impl ClusterRows {
         self.has_ch = rows.iter().any(|r| r[0].is_finite());
         self.has_sh = !inputs.shanks.is_empty() && rows.iter().any(|r| r[1].is_finite());
         self.has_depth = rows.iter().any(|r| r[2].is_finite());
-        self.has_tags = (0..n as u32).any(|c| !session.tags(ClusterId(c)).is_empty());
+        self.has_tags = (0..n as u32).any(|c| {
+            let cid = ClusterId(c);
+            !session.spike_times(cid).is_empty() && !session.tags(cid).is_empty()
+        });
         let ids = || (0..n as u32).map(ClusterId);
         self.origin = ids().map(|c| session.origin_label(c)).collect();
         self.origin_lc = self.origin.iter().map(|o| o.to_ascii_lowercase()).collect();
@@ -633,7 +636,6 @@ pub struct ClusterTableState {
     pub sort_by: ClusterColumn,
     pub sort_descending: bool,
     pub filter_text: String,
-    pub hide_empty: bool,
     pub hide_noise: bool,
     /// Only clusters carrying a `review:*` tag (the queue `sorrel auto` leaves).
     pub review_only: bool,
@@ -657,7 +659,6 @@ impl Default for ClusterTableState {
             sort_by: ClusterColumn::SpikeCount,
             sort_descending: true,
             filter_text: String::new(),
-            hide_empty: false,
             hide_noise: false,
             review_only: false,
             visible: Vec::new(),
@@ -924,7 +925,6 @@ pub fn cluster_table<P: DataProvider>(
                     ));
                 });
                 ui.horizontal_wrapped(|ui| {
-                    ui.checkbox(&mut state.hide_empty, "hide empty");
                     ui.checkbox(&mut state.hide_noise, "hide noise");
                     ui.checkbox(&mut state.review_only, "review").on_hover_text(
                         "Only clusters `sorrel auto` tagged review:*; any edit clears the tag",
@@ -965,7 +965,9 @@ pub fn cluster_table<P: DataProvider>(
     let mut visible: Vec<ClusterId> = ids
         .into_iter()
         .filter(|&i| {
-            if state.hide_empty && session.spike_times(i).is_empty() {
+            // Empty clusters (emptied merge sources or sparse ID gaps) are not
+            // active units, matching phy's ClusterView.
+            if session.spike_times(i).is_empty() {
                 return false;
             }
             if state.hide_noise && rows.group.get(i.idx()) == Some(&"noise") {
@@ -1492,7 +1494,7 @@ mod tests {
         let s = ClusterTableState::default();
         assert_eq!(s.sort_by, ClusterColumn::SpikeCount);
         assert!(s.sort_descending);
-        assert!(s.filter_text.is_empty() && !s.hide_empty && !s.hide_noise);
+        assert!(s.filter_text.is_empty() && !s.hide_noise);
         let sim = ClusterTableState::similarity();
         assert_eq!(sim.sort_by, ClusterColumn::Similarity);
         assert!(sim.sort_descending);
