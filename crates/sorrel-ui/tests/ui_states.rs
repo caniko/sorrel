@@ -4149,3 +4149,226 @@ fn xtalk_3d_positions() {
         h
     });
 }
+
+#[test]
+fn features_lasso_and_amplitudes_splits_preserve_original_labels_correctly() {
+    if no_gpu() {
+        return;
+    }
+    // Features lasso: selected (inside-lasso) spikes stay in their original
+    // cluster with its original label (e.g. Good / Noise), while the cut-away
+    // (outside) spikes move to a new Unsorted cluster.
+    let mut h = fixture("split-labels-features", 3, egui::Theme::Dark);
+    select_two_and_open_features(&mut h);
+    lasso_and_split(&mut h);
+    let brush = h
+        .state()
+        .brushes()
+        .spikes
+        .clone()
+        .expect("closed Features lasso writes the spike brush");
+    let before = {
+        let s = sorrel_ui::jobs::read(h.state().session());
+        let n_clusters = s.n_clusters();
+        let mut expected = Vec::new();
+        for &(cid, ref locals) in &brush.spikes {
+            let times = s.spike_times(cid);
+            if locals.is_empty() || locals.len() == times.len() {
+                continue;
+            }
+            let mut keep_mask = vec![false; times.len()];
+            for &i in locals.iter() {
+                keep_mask[i as usize] = true;
+            }
+            let selected_times: Vec<_> = times
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &t)| keep_mask[i].then_some(t))
+                .collect();
+            let cut_times: Vec<_> = times
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &t)| (!keep_mask[i]).then_some(t))
+                .collect();
+            expected.push((
+                cid,
+                s.label(cid).expect("existing cluster has a label"),
+                selected_times,
+                cut_times,
+            ));
+        }
+        (n_clusters, expected)
+    };
+    assert!(
+        !before.1.is_empty(),
+        "fixture lasso must partially enclose at least one cluster"
+    );
+
+    h.key_press(egui::Key::K);
+    settle(&mut h);
+    {
+        let s = sorrel_ui::jobs::read(h.state().session());
+        assert_eq!(s.history_len(), 1);
+        assert_eq!(s.n_clusters(), before.0 + before.1.len() as u32);
+        for (offset, (cid, orig_label, selected_times, cut_times)) in before.1.iter().enumerate() {
+            let new_cid = sorrel_io::ClusterId(before.0 + offset as u32);
+            assert_eq!(
+                s.spike_times(*cid),
+                selected_times.as_slice(),
+                "selected spikes stay in original cluster {cid:?}"
+            );
+            assert_eq!(
+                s.label(*cid),
+                Some(*orig_label),
+                "original cluster {cid:?} keeps its original label"
+            );
+            assert_eq!(
+                s.spike_times(new_cid),
+                cut_times.as_slice(),
+                "cut-away spikes move to new cluster {new_cid:?}"
+            );
+            assert_eq!(
+                s.label(new_cid),
+                Some(PhyLabel::Unsorted),
+                "cut-away cluster {new_cid:?} is labeled unsorted"
+            );
+        }
+    }
+
+    // Amplitudes threshold: spikes below the line move out as Unsorted, while
+    // spikes above the line stay in the original cluster with its original label.
+    let mut h = fixture("split-labels-amp-threshold", 3, egui::Theme::Dark);
+    h.key_press(egui::Key::ArrowDown);
+    settle(&mut h);
+    click_tab(&mut h, "Amplitudes");
+    let plot = h.get_by_label("amplitude plot").rect();
+    let (a, b) = (
+        egui::pos2(plot.center().x - 40.0, plot.top() + 14.0),
+        egui::pos2(plot.center().x + 40.0, plot.top() + 14.0),
+    );
+    h.input_mut().modifiers = egui::Modifiers::ALT;
+    h.hover_at(a);
+    for (pos, pressed) in [(a, true), (b, true), (b, false)] {
+        h.hover_at(pos);
+        if pressed && pos == b {
+            h.run_ok();
+            continue;
+        }
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::ALT,
+        });
+        h.run_ok();
+    }
+    h.input_mut().modifiers = egui::Modifiers::NONE;
+    settle(&mut h);
+    let (target_cid, below_locals) = h
+        .state()
+        .brushes()
+        .spikes
+        .as_ref()
+        .and_then(|b| b.spikes.first().cloned())
+        .expect("amplitude threshold brushes spikes below the line");
+    let (orig_label, orig_times, n_before) = {
+        let s = sorrel_ui::jobs::read(h.state().session());
+        (
+            s.label(target_cid).unwrap(),
+            s.spike_times(target_cid).to_vec(),
+            s.n_clusters(),
+        )
+    };
+    assert_ne!(orig_label, PhyLabel::Unsorted);
+    let expected_below: Vec<_> = below_locals
+        .iter()
+        .map(|&i| orig_times[i as usize])
+        .collect();
+    h.key_press(egui::Key::K);
+    settle(&mut h);
+    {
+        let s = sorrel_ui::jobs::read(h.state().session());
+        let new_cid = sorrel_io::ClusterId(n_before);
+        assert_eq!(s.label(target_cid), Some(orig_label));
+        assert_eq!(s.label(new_cid), Some(PhyLabel::Unsorted));
+        assert_eq!(
+            s.spike_times(new_cid),
+            expected_below.as_slice(),
+            "below-threshold spikes move out to the new unsorted cluster"
+        );
+    }
+
+    // Amplitudes lasso: selected (inside-lasso) spikes stay in the original
+    // cluster with its original label; outside spikes move to a new Unsorted cluster.
+    let mut h = fixture("split-labels-amp-lasso", 3, egui::Theme::Dark);
+    h.key_press(egui::Key::ArrowDown);
+    settle(&mut h);
+    click_tab(&mut h, "Amplitudes");
+    let plot = h.get_by_label("amplitude plot").rect();
+    // Cluster 0's template amplitudes sit near the top of the plot across the
+    // full time span; lasso the left half of that top band.
+    let (left, right, top, bottom) = (
+        plot.left() + 20.0,
+        plot.center().x,
+        plot.top() + 2.0,
+        plot.top() + 60.0,
+    );
+    for pos in [
+        egui::pos2(left, top),
+        egui::pos2(right, top),
+        egui::pos2(right, bottom),
+        egui::pos2(left, bottom),
+    ] {
+        h.hover_at(pos);
+        h.input_mut().modifiers = egui::Modifiers::COMMAND;
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::COMMAND,
+            });
+            h.step();
+        }
+        settle(&mut h);
+    }
+    h.input_mut().modifiers = egui::Modifiers::NONE;
+    settle(&mut h);
+    let (target_cid, inside_locals) = h
+        .state()
+        .brushes()
+        .spikes
+        .as_ref()
+        .and_then(|b| b.spikes.first().cloned())
+        .expect("amplitude lasso brushes spikes inside the polygon");
+    let (orig_label, orig_times, n_before) = {
+        let s = sorrel_ui::jobs::read(h.state().session());
+        (
+            s.label(target_cid).unwrap(),
+            s.spike_times(target_cid).to_vec(),
+            s.n_clusters(),
+        )
+    };
+    assert_ne!(orig_label, PhyLabel::Unsorted);
+    assert!(
+        !inside_locals.is_empty() && inside_locals.len() < orig_times.len(),
+        "amplitude lasso should select a proper subset"
+    );
+    let expected_kept: Vec<_> = inside_locals
+        .iter()
+        .map(|&i| orig_times[i as usize])
+        .collect();
+    h.key_press(egui::Key::K);
+    settle(&mut h);
+    {
+        let s = sorrel_ui::jobs::read(h.state().session());
+        let new_cid = sorrel_io::ClusterId(n_before);
+        assert_eq!(s.label(target_cid), Some(orig_label));
+        assert_eq!(s.spike_times(target_cid), expected_kept.as_slice());
+        assert_eq!(s.label(new_cid), Some(PhyLabel::Unsorted));
+        assert_eq!(
+            s.spike_times(new_cid).len(),
+            orig_times.len() - expected_kept.len()
+        );
+    }
+}

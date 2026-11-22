@@ -104,6 +104,33 @@ fn follow_split(cluster: ClusterId) -> Follow {
     Box::new(move |ev| [&[cluster][..], new_ids(ev, 1)].concat())
 }
 
+/// Local spike indices in `0..n_spikes` that are NOT in `keep` (sorted,
+/// deduplicated). Used when a lasso / k-means cut keeps the selected spikes
+/// in their original cluster (preserving its ID and label) and moves the
+/// cut-away remainder to a new `unsorted` cluster.
+///
+/// Returns `Ok(Vec::new())` when every spike is in `keep` (nothing to cut)
+/// and `Err` if any index in `keep` is out of range.
+fn complement_spike_idx(n_spikes: usize, keep: &[u32]) -> anyhow::Result<Vec<u32>> {
+    let mut kept = vec![false; n_spikes];
+    let mut kept_count = 0usize;
+    for &idx in keep {
+        let Some(slot) = kept.get_mut(idx as usize) else {
+            anyhow::bail!("spike index {idx} out of range for cluster of {n_spikes} spikes");
+        };
+        if !*slot {
+            *slot = true;
+            kept_count += 1;
+        }
+    }
+    if kept_count == n_spikes {
+        return Ok(Vec::new());
+    }
+    Ok((0..n_spikes as u32)
+        .filter(|&i| !kept[i as usize])
+        .collect())
+}
+
 /// Per-spike depth estimator a backend can plug in (see
 /// [`SorrelApp::set_depth_source`]).
 pub type DepthFn<P> = fn(&Session<P>) -> Option<SpikeDepths>;
@@ -1257,9 +1284,76 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         was_cutting
     }
 
-    /// Turn lasso hits into one journal entry (a batch when several
-    /// clusters were lassoed) and select source + new halves afterwards.
+    /// Turn lasso / k-means hits into one journal entry (a batch when several
+    /// clusters were cut), keeping the selected spikes in their original
+    /// cluster (with its ID and label) and moving the cut-away remainder to a
+    /// newly allocated `unsorted` cluster.
     fn apply_lasso_splits(&mut self, splits: Vec<(ClusterId, Vec<u32>)>) {
+        let non_empty: Vec<(ClusterId, Vec<u32>)> =
+            splits.into_iter().filter(|(_, s)| !s.is_empty()).collect();
+        if non_empty.is_empty() {
+            self.status = toast("no spikes inside the lasso; no split made");
+            return;
+        }
+        let sources = std::rc::Rc::new(std::cell::RefCell::new(Vec::<ClusterId>::new()));
+        let build_sources = std::rc::Rc::clone(&sources);
+        let mut all_inside = false;
+        let ok = self.commit_built(
+            "lasso split",
+            |session| {
+                let mut cmds = Vec::new();
+                let mut active_sources = Vec::new();
+                for (cluster, selected_idx) in non_empty {
+                    if cluster.0 >= session.n_clusters() {
+                        anyhow::bail!("cluster {} does not exist", cluster.0);
+                    }
+                    let n = session.spike_times(cluster).len();
+                    let cut_idx = complement_spike_idx(n, &selected_idx)?;
+                    if cut_idx.is_empty() {
+                        // Every spike of this cluster is selected; nothing to cut away.
+                        continue;
+                    }
+                    active_sources.push(cluster);
+                    cmds.push(CurationCommand::Split {
+                        cluster,
+                        spike_idx: cut_idx,
+                        new_cluster: ClusterId(0), // schema field; ClusterIndex auto-allocates
+                        by: sorrel_data::command::Method::Manual,
+                    });
+                }
+                if cmds.is_empty() {
+                    all_inside = true;
+                    return Ok(None);
+                }
+                *build_sources.borrow_mut() = active_sources;
+                let cmd = match cmds.len() {
+                    1 => cmds.remove(0),
+                    _ => CurationCommand::batch(cmds)
+                        .ok_or_else(|| anyhow::anyhow!("failed to build split batch"))?,
+                };
+                Ok(Some(cmd))
+            },
+            // The new halves are the tail of the event, in command order.
+            Box::new(move |ev| {
+                let sources = sources.borrow();
+                let new = new_ids(ev, sources.len());
+                sources
+                    .iter()
+                    .zip(new)
+                    .flat_map(|(&c, &n)| [c, n])
+                    .collect()
+            }),
+        );
+        if ok && all_inside {
+            self.status = toast("all spikes are inside the lasso; nothing to cut");
+        }
+    }
+
+    /// Turn threshold hits (spikes below the line) into one journal entry,
+    /// moving those cut-away spikes to a newly allocated `unsorted` cluster
+    /// while spikes above the line stay in their original cluster with its
+    /// original label.
+    fn apply_move_out_splits(&mut self, splits: Vec<(ClusterId, Vec<u32>)>) {
         let mut cmds = Vec::new();
         let mut sources = Vec::new();
         for (cluster, spike_idx) in splits.into_iter().filter(|(_, s)| !s.is_empty()) {
@@ -1273,7 +1367,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         }
         let cmd = match cmds.len() {
             0 => {
-                self.status = toast("no spikes inside the lasso; no split made");
+                self.status = toast("no spikes below the threshold; no split made");
                 return;
             }
             1 => cmds.remove(0),
@@ -2140,7 +2234,8 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     .saturating_sub(self.window_len as u64);
                 self.window_start = sample.min(max);
             }
-            ViewAction::Split(splits) => self.apply_lasso_splits(splits),
+            ViewAction::SplitKeepSelected(splits) => self.apply_lasso_splits(splits),
+            ViewAction::SplitMoveOut(splits) => self.apply_move_out_splits(splits),
             ViewAction::Suggest(act) => self.apply_suggest_action(act),
             ViewAction::SelectSimilar { cluster, add } => {
                 if add {
@@ -3596,5 +3691,137 @@ mod tests {
         // Short paths are returned as-is.
         let s2 = short_path(&PathBuf::from("/a/b"));
         assert_eq!(s2, "/a/b");
+    }
+
+    #[test]
+    fn lasso_split_keeps_selected_spikes_and_original_label_and_marks_cut_unsorted() {
+        for (op, expected_label) in [
+            (PhyLabelOp::SetGood, 1u8),
+            (PhyLabelOp::SetMua, 2u8),
+            (PhyLabelOp::SetNoise, 3u8),
+            (PhyLabelOp::SetUnsorted, 0u8),
+        ] {
+            let (mut app, _dir) = make_app();
+            assert!(app.commit(CurationCommand::Relabel {
+                cluster: ClusterId(0),
+                op,
+            }));
+            // Cluster 0 has spikes at SampleIndex(10) (local 0) and SampleIndex(30) (local 1).
+            // Selecting local 0 keeps SampleIndex(10) in cluster 0 with its original label
+            // and moves the cut-away SampleIndex(30) into new cluster 3 as unsorted (0).
+            app.apply_view_action(ViewAction::SplitKeepSelected(vec![(ClusterId(0), vec![0])]));
+            {
+                let s = read(&app.session);
+                assert_eq!(s.spike_times(ClusterId(0)), &[SampleIndex(10)]);
+                assert_eq!(s.label(ClusterId(0)), Some(expected_label));
+                assert_eq!(s.spike_times(ClusterId(3)), &[SampleIndex(30)]);
+                assert_eq!(s.label(ClusterId(3)), Some(0));
+            }
+            assert_eq!(app.selection.as_slice(), &[ClusterId(0), ClusterId(3)]);
+
+            // Undo restores all spikes to cluster 0 with its original label.
+            app.dispatch_intent(Intent::Undo);
+            {
+                let s = read(&app.session);
+                assert_eq!(s.n_clusters(), 3);
+                assert_eq!(
+                    s.spike_times(ClusterId(0)),
+                    &[SampleIndex(10), SampleIndex(30)]
+                );
+                assert_eq!(s.label(ClusterId(0)), Some(expected_label));
+            }
+
+            // Redo re-applies the split with the same spike ownership and labels.
+            app.dispatch_intent(Intent::Redo);
+            {
+                let s = read(&app.session);
+                assert_eq!(s.spike_times(ClusterId(0)), &[SampleIndex(10)]);
+                assert_eq!(s.label(ClusterId(0)), Some(expected_label));
+                assert_eq!(s.spike_times(ClusterId(3)), &[SampleIndex(30)]);
+                assert_eq!(s.label(ClusterId(3)), Some(0));
+            }
+        }
+    }
+
+    #[test]
+    fn lasso_split_all_spikes_inside_is_a_noop_and_skips_fully_enclosed_clusters_in_batch() {
+        let (mut app, _dir) = make_app();
+        assert!(app.commit(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetGood,
+        }));
+        assert!(app.commit(CurationCommand::Relabel {
+            cluster: ClusterId(1),
+            op: PhyLabelOp::SetNoise,
+        }));
+        let hist_before = history_len(&app);
+
+        // Selecting every spike of cluster 0 leaves nothing to cut away.
+        app.apply_lasso_splits(vec![(ClusterId(0), vec![0, 1])]);
+        assert_eq!(history_len(&app), hist_before);
+        assert!(app.error.is_none());
+        assert!(app
+            .status
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("all spikes are inside"));
+
+        // In a multi-cluster lasso, a fully enclosed cluster stays untouched
+        // while the partially enclosed cluster keeps its selected spikes and label.
+        app.apply_lasso_splits(vec![(ClusterId(0), vec![0, 1]), (ClusterId(1), vec![1])]);
+        assert_eq!(history_len(&app), hist_before + 1);
+        let s = read(&app.session);
+        assert_eq!(s.n_clusters(), 4);
+        assert_eq!(
+            s.spike_times(ClusterId(0)),
+            &[SampleIndex(10), SampleIndex(30)]
+        );
+        assert_eq!(s.label(ClusterId(0)), Some(1));
+        assert_eq!(s.spike_times(ClusterId(1)), &[SampleIndex(60)]);
+        assert_eq!(s.label(ClusterId(1)), Some(3));
+        assert_eq!(s.spike_times(ClusterId(3)), &[SampleIndex(40)]);
+        assert_eq!(s.label(ClusterId(3)), Some(0));
+        assert_eq!(app.selection.as_slice(), &[ClusterId(1), ClusterId(3)]);
+    }
+
+    #[test]
+    fn threshold_split_moves_below_line_spikes_out_as_unsorted_and_keeps_original_label() {
+        let (mut app, _dir) = make_app();
+        assert!(app.commit(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetGood,
+        }));
+        // Threshold split lists spikes below the line (local 0 -> SampleIndex(10))
+        // to cut away as unsorted, leaving above-line spikes in cluster 0 as good.
+        app.apply_view_action(ViewAction::SplitMoveOut(vec![(ClusterId(0), vec![0])]));
+        let s = read(&app.session);
+        assert_eq!(s.spike_times(ClusterId(0)), &[SampleIndex(30)]);
+        assert_eq!(s.label(ClusterId(0)), Some(1));
+        assert_eq!(s.spike_times(ClusterId(3)), &[SampleIndex(10)]);
+        assert_eq!(s.label(ClusterId(3)), Some(0));
+    }
+
+    #[test]
+    fn lasso_split_handles_duplicate_indices_and_rejects_out_of_range() {
+        let (mut app, _dir) = make_app();
+        assert!(app.commit(CurationCommand::Relabel {
+            cluster: ClusterId(0),
+            op: PhyLabelOp::SetGood,
+        }));
+        app.apply_lasso_splits(vec![(ClusterId(0), vec![0, 0])]);
+        assert!(app.error.is_none());
+        {
+            let s = read(&app.session);
+            assert_eq!(s.spike_times(ClusterId(0)), &[SampleIndex(10)]);
+            assert_eq!(s.label(ClusterId(0)), Some(1));
+            assert_eq!(s.spike_times(ClusterId(3)), &[SampleIndex(30)]);
+            assert_eq!(s.label(ClusterId(3)), Some(0));
+        }
+
+        let hist_before = history_len(&app);
+        app.apply_lasso_splits(vec![(ClusterId(1), vec![99])]);
+        assert_eq!(history_len(&app), hist_before);
+        assert!(app.error.is_some());
     }
 }

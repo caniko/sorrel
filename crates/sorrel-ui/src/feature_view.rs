@@ -2305,7 +2305,7 @@ fn take_ready_split(
         };
         state.split_requested = false;
         log::info!(
-            "lasso K: membership ready, moving {} spikes",
+            "lasso K: membership ready, keeping {} selected spikes",
             splits.iter().map(|(_, v)| v.len()).sum::<usize>()
         );
         state.cancel_lasso();

@@ -563,8 +563,13 @@ pub fn window_shortcuts(ctx: &egui::Context) {
 pub enum ViewAction {
     /// Seek the trace window to this sample (Raster click).
     Seek(u64),
-    /// Lasso split from the Features pane.
-    Split(Vec<(ClusterId, Vec<u32>)>),
+    /// Lasso or k-means part split: selected spikes stay in the original
+    /// cluster (keeping its ID and label); the cut-away remainder moves to a
+    /// newly allocated `unsorted` cluster.
+    SplitKeepSelected(Vec<(ClusterId, Vec<u32>)>),
+    /// Threshold split: the listed spikes move out to a newly allocated
+    /// `unsorted` cluster while the rest stays in the original cluster.
+    SplitMoveOut(Vec<(ClusterId, Vec<u32>)>),
     Suggest(SuggestAction),
     /// Similar-pane row click: make `cluster` the similar selection
     /// (`add == false`) or toggle it in the similar part (`add == true`).
@@ -995,7 +1000,7 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                     self.spike_reorder,
                     &mut *self.brushes,
                 ) {
-                    self.actions.push(ViewAction::Split(splits));
+                    self.actions.push(ViewAction::SplitKeepSelected(splits));
                 }
             }
             Pane::TraceImage => {
@@ -1048,7 +1053,12 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                     self.spike_reorder,
                     &mut *self.brushes,
                 ) {
-                    Some(AmpAction::Split(splits)) => self.actions.push(ViewAction::Split(splits)),
+                    Some(AmpAction::LassoSplit(splits)) => {
+                        self.actions.push(ViewAction::SplitKeepSelected(splits))
+                    }
+                    Some(AmpAction::ThresholdSplit(splits)) => {
+                        self.actions.push(ViewAction::SplitMoveOut(splits))
+                    }
                     Some(AmpAction::Seek(sample)) => self.actions.push(ViewAction::Seek(sample)),
                     None => {}
                 }
@@ -1087,7 +1097,7 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                     self.depths,
                     (*self.trace.window_start, *self.trace.window_len),
                 ) {
-                    self.actions.push(ViewAction::Split(splits));
+                    self.actions.push(ViewAction::SplitKeepSelected(splits));
                 }
                 if let Some(sample) = self.feature_state.seek.take() {
                     self.actions.push(ViewAction::Seek(sample));
@@ -1216,7 +1226,7 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                     self.jobs,
                     &mut *self.brushes,
                 ) {
-                    self.actions.push(ViewAction::Split(splits));
+                    self.actions.push(ViewAction::SplitKeepSelected(splits));
                 }
             }
             Pane::ClusterScatter => {
