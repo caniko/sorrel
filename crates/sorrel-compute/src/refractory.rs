@@ -75,7 +75,8 @@ pub fn contamination_posterior(
 }
 
 /// Compute [`sliding_rp`] and [`contamination_posterior`] together with a
-/// single pass over the pairs in the sorted spike train.
+/// single pass over the spike pairs. `times` must be sorted in ascending
+/// sample order; duplicate timestamps are allowed but zero lags do not count.
 pub fn refractory_evidence(
     times: &[SampleIndex],
     total_samples: u64,
@@ -458,6 +459,182 @@ mod tests {
             violation_counts(&times, &[1, 2, 3, 4, 5], 3),
             (vec![0, 3, 6, 7, 9], 6)
         );
+    }
+
+    #[test]
+    fn refractory_pair_counts_match_an_exhaustive_reference() {
+        for times in [
+            vec![],
+            vec![7],
+            vec![7, 7],
+            vec![0, 0, 1, 2, 4],
+            vec![u64::MAX - 8, u64::MAX - 6, u64::MAX - 1, u64::MAX],
+            (0..100).map(|i| i / 3 + (i / 5) * (i / 5)).collect(),
+        ] {
+            let spikes: Vec<_> = times.iter().copied().map(SampleIndex).collect();
+            let count = |edge| {
+                times
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        times[i + 1..]
+                            .iter()
+                            .filter(|&&u| u != *t && u - t < edge)
+                            .count() as u64
+                    })
+                    .sum::<u64>()
+            };
+            for edges in [&[][..], &[1, 2, 3], &[2, 4, 9, 20, 501]] {
+                for fixed in [0, 1, 2, 3, 25, 512] {
+                    assert_eq!(
+                        violation_counts(&spikes, edges, fixed),
+                        (
+                            edges.iter().map(|&edge| count(edge)).collect(),
+                            count(fixed)
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sliding_rp_coarse_grid_excludes_half_duration_and_reports_test_status() {
+        let params = RefractoryParams {
+            fixed_ms: 4.0,
+            sweep_max_ms: 4.0,
+            ..Default::default()
+        };
+        assert_eq!(sweep_edges(&params, 1_000.0), [2, 3, 4]);
+        let times = [0, 1, 2, 3, 4].map(SampleIndex);
+        for (n, duration, tested, posterior) in [
+            (0, 10, false, false),
+            (1, 10, false, false),
+            (2, 0, false, false),
+            (2, 3, false, false),
+            (2, 4, false, false),
+            (2, 5, true, false),
+            (5, 8, true, false),
+            (5, 9, true, true),
+        ] {
+            let (srp, post) = refractory_evidence(&times[..n], duration, 1_000.0, &params);
+            assert_eq!(srp.tested, tested, "n={n}, duration={duration}");
+            assert!(srp.min_contamination.is_nan() && srp.rp_ms.is_nan());
+            assert_eq!(post.mean.is_finite(), posterior);
+            assert_eq!(post.violations, if posterior { 9 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn sliding_rp_matches_independent_poisson_grid_including_upper_endpoint() {
+        // Finite-sum Poisson CDF seeded at P(X=0); unlike the implementation
+        // this reference never changes tails or selects a window by log CDF.
+        fn cdf(k: usize, mean: f64) -> f64 {
+            let mut p = (-mean).exp();
+            let mut s = p;
+            for v in 1..=k {
+                p *= mean / v as f64;
+                s += p;
+            }
+            s
+        }
+        for mean in [0.01, 0.5, 2.0, 5.0, 12.0, 40.0] {
+            for k in [0, 1, 2, 5, 20, 50] {
+                assert!((poisson_confidence(k as u64, mean) - (1.0 - cdf(k, mean))).abs() < 1e-12);
+            }
+        }
+        let boundary = std::f64::consts::LN_10;
+        assert!(poisson_confidence(0, boundary.next_down()) <= 0.9);
+        assert_eq!(poisson_confidence(0, boundary), 0.9);
+        assert!(poisson_confidence(0, boundary.next_up().next_up()) > 0.9);
+
+        let clean: Vec<_> = (0..100).map(|i| SampleIndex(i * 10)).collect();
+        let mut injected = clean.clone();
+        injected.extend((0..4).map(|i| SampleIndex(i * 210 + 1)));
+        injected.sort_unstable();
+        let sparse: Vec<_> = (0..10).map(|i| SampleIndex(i * 100)).collect();
+        let reference = |times: &[SampleIndex], duration, grid: &[u64]| {
+            let n = times.len() as f64;
+            (1..=70).find_map(|step| {
+                let c = f64::from(step) * 0.005;
+                grid.iter()
+                    .filter_map(|&w| {
+                        let k: usize = times
+                            .iter()
+                            .enumerate()
+                            .map(|(i, t)| {
+                                times[i + 1..]
+                                    .iter()
+                                    .filter(|u| (1..w).contains(&(u.0 - t.0)))
+                                    .count()
+                            })
+                            .sum();
+                        let mean = (w - 1) as f64 / duration as f64 * n * c * (n * (2.0 - c) - 1.0);
+                        let confidence = 1.0 - cdf(k, mean);
+                        (confidence > 0.9).then_some((confidence, w))
+                    })
+                    .max_by(|a, b| a.0.total_cmp(&b.0).then_with(|| b.1.cmp(&a.1)))
+                    .map(|(_, w)| (c as f32, w as f32))
+            })
+        };
+        let mut results = Vec::new();
+        for (times, total, max) in [
+            (&clean[..], 1000, 12),
+            (&injected, 1000, 12),
+            (&sparse, 1010, 44),
+            (&sparse, 1010, 43),
+        ] {
+            let params = RefractoryParams {
+                fixed_ms: 4.0,
+                sweep_min_ms: 1.0,
+                sweep_max_ms: max as f32,
+                sweep_step_ms: 1.0,
+            };
+            let srp = sliding_rp(times, total, 1_000.0, &params);
+            assert!(srp.tested);
+            let got = (!srp.rp_ms.is_nan()).then_some((srp.min_contamination, srp.rp_ms));
+            let expected = reference(times, total, &(2..=max).collect::<Vec<_>>());
+            assert_eq!(got, expected, "{srp:?}");
+            results.push(got);
+        }
+        assert!(results[0].unwrap().0 < results[1].unwrap().0);
+        assert_eq!(results[2], Some((0.35, 44.0)));
+        assert_eq!(results[3], None);
+    }
+
+    #[test]
+    fn posterior_matches_independent_normalization_and_credible_mass() {
+        let (n, exposure) = (25.0, 0.03);
+        for k in [0, 3, 30] {
+            let p = posterior_from_count(k, n, exposure);
+            assert!(
+                0.0 <= p.lo95 && p.lo95 <= p.mean && p.mean <= p.hi95 && p.hi95 <= 1.0,
+                "{p:?}"
+            );
+            // Independent midpoint quadrature with fixed bin width and a
+            // direct (unscaled) likelihood, including the omitted factorial.
+            let mut sum = 0.0;
+            let mut mass = 0.0;
+            let mut moment = 0.0;
+            let factorial = (1..=k).fold(1.0, |acc, j| acc * j as f64);
+            for i in 0..100_000 {
+                let c = (f64::from(i) + 0.5) / 100_000.0;
+                let lambda = exposure * n * c * (n * (2.0 - c) - 1.0);
+                let prob = (-lambda).exp() * lambda.powi(k as i32) / factorial;
+                sum += prob;
+                moment += c * prob;
+                if (f64::from(p.lo95)..=f64::from(p.hi95)).contains(&c) {
+                    mass += prob;
+                }
+            }
+            assert!((mass / sum - 0.95).abs() < 5e-4, "{p:?}");
+            assert!((moment / sum - f64::from(p.mean)).abs() < 5e-5, "{p:?}");
+            if k == 0 {
+                assert_eq!(p.lo95, 0.0);
+            } else if k == 30 {
+                assert_eq!(p.hi95, 1.0);
+            }
+        }
     }
 
     #[test]

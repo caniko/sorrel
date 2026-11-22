@@ -109,7 +109,8 @@ fn refractory_pct(times: &[SampleIndex], refractory: u64) -> f32 {
 fn refractory_tooltip<P: DataProvider>(ui: &Ui, session: &Session<P>, c: ClusterId) -> String {
     type Tooltip = ((ClusterId, u64), String);
     let key = (c, session.metrics_version());
-    let id = egui::Id::new("isi_refractory_tooltip");
+    // Metrics versions are session-local; different tabs can have the same one.
+    let id = egui::Id::new(("isi_refractory_tooltip", session.journal_path()));
     if let Some((_, text)) = ui
         .data(|d| d.get_temp::<Tooltip>(id))
         .filter(|(k, _)| *k == key)
@@ -505,6 +506,86 @@ fn brush_violators(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refractory_tooltip_refreshes_and_keeps_sessions_isolated() {
+        use sorrel_compute::RefractoryParams;
+        use sorrel_data::Journal;
+        use sorrel_io::{TraceSamples, TraceSlice};
+
+        struct Provider(Vec<SampleIndex>);
+        impl DataProvider for Provider {
+            type Label = u8;
+            fn sample_rate(&self) -> f32 {
+                1_000.0
+            }
+            fn n_samples(&self) -> SampleIndex {
+                SampleIndex(1_000)
+            }
+            fn n_channels(&self) -> u32 {
+                1
+            }
+            fn n_clusters(&self) -> u32 {
+                1
+            }
+            fn spike_times(&self, _: ClusterId) -> &[SampleIndex] {
+                &self.0
+            }
+            fn initial_labels(&self) -> Vec<u8> {
+                vec![0]
+            }
+            fn trace(&self, start: SampleIndex, _: u32) -> TraceSlice<'_> {
+                TraceSlice {
+                    start,
+                    n_channels: 1,
+                    samples: TraceSamples::I16(&[]),
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let make = |name, n: u64| {
+            Session::new(
+                Provider((0..n).map(|i| SampleIndex(i * 10)).collect()),
+                Journal::open(&dir.path().join(name)).unwrap(),
+            )
+        };
+        let mut clean = make("clean", 100);
+        let mut sparse = make("sparse", 2);
+        let params = RefractoryParams {
+            fixed_ms: 4.0,
+            ..Default::default()
+        };
+        clean.set_refractory(params).unwrap();
+        sparse.set_refractory(params).unwrap();
+        assert_eq!(clean.metrics_version(), sparse.metrics_version());
+        let ctx = egui::Context::default();
+        let c = ClusterId(0);
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            let confirmed = refractory_tooltip(ui, &clean, c);
+            assert!(
+                confirmed.contains("SRP ≤1.5% (90%) @ 10.00 ms"),
+                "{confirmed}"
+            );
+            assert!(confirmed.contains("4.00 ms posterior"), "{confirmed}");
+            let unconfirmed = refractory_tooltip(ui, &sparse, c);
+            assert!(
+                unconfirmed.starts_with("SRP unconfirmed ≤35%"),
+                "{unconfirmed}"
+            );
+            assert!(unconfirmed.contains("4.00 ms posterior"), "{unconfirmed}");
+        });
+        clean
+            .set_refractory(RefractoryParams {
+                fixed_ms: 1.0,
+                sweep_max_ms: 1.25,
+                ..params
+            })
+            .unwrap();
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            assert_eq!(refractory_tooltip(ui, &clean, c), "SRP n/a · posterior n/a");
+        });
+    }
 
     #[test]
     fn violators_include_both_members_once() {

@@ -2616,6 +2616,91 @@ mod tests {
         );
     }
 
+    #[test]
+    fn confirmed_sliding_rp_matches_brief_and_rules_until_reconfigured() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::new(
+            MockProvider {
+                spikes: vec![
+                    (0..100).map(|i| SampleIndex(i * 10)).collect(),
+                    [10, 90].map(SampleIndex).to_vec(),
+                ],
+                amps: vec![vec![], vec![]],
+                n_samples: SampleIndex(1000),
+            },
+            Journal::open(&dir.path().join("j")).unwrap(),
+        );
+        let host = SessionHost::new(session);
+        let mut env = Env::new(dir.path(), false, label);
+        let list = handle_line(&host, &mut env, &rpc(1, "tools/list", json!({}))).unwrap();
+        let schema = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "metrics")
+            .unwrap();
+        assert_eq!(schema["inputSchema"]["required"], json!(["cluster"]));
+        assert!(schema["description"]
+            .as_str()
+            .unwrap()
+            .contains("never treat null as clean"));
+        let mut run = |tool, args| handle_line(&host, &mut env, &call(1, tool, args)).unwrap();
+        let finite = payload(&run("metrics", json!({"cluster": 0})));
+        assert!((finite["srp_contamination"].as_f64().unwrap() - 0.015).abs() < 1e-8);
+        assert_eq!(finite["srp_rp_ms"], 10.0);
+        let low_power = payload(&run("metrics", json!({"cluster": 1})));
+        assert!(low_power["srp_contamination"].is_null());
+        assert!(low_power["rpv_post_mean"].as_f64().is_some());
+        let brief = texts(&run("brief", json!({"level": 2, "clusters": [0, 1]})));
+        let mut cards = brief.split_once("\ncards:\n").unwrap().1.lines();
+        let col = cards
+            .next()
+            .unwrap()
+            .split('\t')
+            .position(|h| h == "srp_contamination")
+            .unwrap();
+        assert_eq!(cards.next().unwrap().split('\t').nth(col), Some("0.015"));
+        assert_eq!(cards.next().unwrap().split('\t').nth(col), Some("-"));
+        let rules = json!({"rules": r#"
+            [[rule]]
+            name = "confirmed"
+            metric = "srp_contamination"
+            op = "<"
+            value = 0.02
+            label = "good"
+        "#});
+        let before = texts(&run("rules_eval", rules.clone()));
+        assert!(
+            before.contains("confirmed: srp_contamination<0.02 -> good: 1"),
+            "{before}"
+        );
+        let update = run("refractory", json!({"fixed_ms": 1.0, "sweep_max_ms": 1.25}));
+        assert_eq!(update["result"]["isError"], false, "{update}");
+        let after = payload(&run("metrics", json!({"cluster": 0})));
+        assert!(after["srp_contamination"].is_null() && after["rpv_post_mean"].is_null());
+        let after = texts(&run("rules_eval", rules));
+        assert!(
+            after.contains("confirmed: srp_contamination<0.02 -> good: 0"),
+            "{after}"
+        );
+
+        let update = run("refractory", json!({"fixed_ms": 4.0, "sweep_max_ms": 10.0}));
+        assert_eq!(update["result"]["isError"], false, "{update}");
+        let initial = payload(&run("metrics", json!({"cluster": 0})));
+        let split = run("split", json!({"cluster": 0, "spike_idx": [0]}));
+        assert_eq!(split["result"]["isError"], false, "{split}");
+        let edited = payload(&run("metrics", json!({"cluster": 0})));
+        assert!(
+            edited["rpv_post_mean"].as_f64().unwrap() > initial["rpv_post_mean"].as_f64().unwrap()
+        );
+        let moved = payload(&run("metrics", json!({"cluster": 2})));
+        assert!(moved["rpv_post_mean"].is_null());
+        assert_eq!(run("undo", json!({}))["result"]["isError"], false);
+        assert_eq!(payload(&run("metrics", json!({"cluster": 0}))), initial);
+        host.apply(Actor::Human, CurationCommand::Redo).unwrap();
+        assert_eq!(payload(&run("metrics", json!({"cluster": 0}))), edited);
+    }
+
     fn ui() -> (Arc<Ui>, std::sync::mpsc::Receiver<Vec<ClusterId>>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let ui = Ui {

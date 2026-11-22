@@ -405,6 +405,51 @@ mod tests {
     use crate::qc_export::tests::MockProvider;
 
     #[test]
+    fn report_distinguishes_confirmed_srp_and_unavailable_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Session::new(
+            MockProvider {
+                spikes: vec![
+                    (0..100).map(|i| SampleIndex(i * 10)).collect(),
+                    vec![SampleIndex(1)],
+                ],
+                amps: vec![vec![], vec![]],
+                n_samples: SampleIndex(1000),
+            },
+            Journal::open(&dir.path().join("j")).unwrap(),
+        );
+        let html = render_report(&s, |_| "unsorted", &ReportFilter::default()).unwrap();
+        let card = |id| {
+            html.split_once(&format!("<section id=\"cluster-{id}\""))
+                .unwrap()
+                .1
+                .split_once("</section>")
+                .unwrap()
+                .0
+        };
+        let confirmed = card(0);
+        assert!(
+            confirmed.contains("<th>srp_contamination</th><td>0.0150</td>"),
+            "{confirmed}"
+        );
+        assert!(confirmed.contains("<th>srp_rp_ms</th><td>10</td>"));
+        assert!(confirmed.contains("<th>rpv_post_lo95</th><td>0</td>"));
+        let sparse = card(1);
+        for name in [
+            "srp_contamination",
+            "srp_rp_ms",
+            "rpv_post_mean",
+            "rpv_post_lo95",
+            "rpv_post_hi95",
+        ] {
+            assert!(
+                sparse.contains(&format!("<th>{name}</th><td>–</td>")),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn report_has_one_section_per_cluster_with_svg_plots_and_honours_filters() {
         let prov = MockProvider {
             spikes: vec![

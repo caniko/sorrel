@@ -126,10 +126,6 @@ impl Default for QcRow {
 }
 
 impl QcRow {
-    /// Columns before the shape/footprint additions; the TSV and JSON
-    /// writers emit those by name from `METRICS[N_BASE..]`.
-    const N_BASE: usize = 16;
-
     /// Every metric column name, in TSV order. The single source of truth
     /// for names used by `get`, the rule engine, and the exports.
     pub const METRICS: [&'static str; 37] = [
@@ -236,76 +232,34 @@ impl QcRow {
     }
 
     fn tsv_header() -> String {
-        let mut h = "cluster_id\tn_spikes\tfiring_rate\tmean_amplitude\tpresence_ratio\t\
-         isi_violations\tisi_violation_ratio\tamplitude_cutoff\tamplitude_snr\t\
-         drift_correlation\tlongest_silent_gap\tcomposite_quality\t\
-         isolation_distance_sq\tl_ratio\tnn_isolation\td_prime\tsilhouette"
-            .to_string();
-        for name in &Self::METRICS[Self::N_BASE..] {
-            h.push('\t');
-            h.push_str(name);
+        format!("cluster_id\t{}\n", Self::METRICS.join("\t"))
+    }
+
+    fn export_value(&self, name: &str, missing: &str) -> String {
+        match name {
+            // Do not round integer counts through the f32 metric lookup.
+            "n_spikes" => self.n_spikes.to_string(),
+            "isi_violations" => self.isi_violations.to_string(),
+            _ => match self.get(name).filter(|v| v.is_finite()) {
+                Some(value) => num(value),
+                None => missing.to_owned(),
+            },
         }
-        h.push('\n');
-        h
     }
 
     fn write_tsv(&self, w: &mut impl Write) -> std::io::Result<()> {
-        write!(
-            w,
-            "{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}",
-            self.cluster_id,
-            self.n_spikes,
-            self.firing_rate_hz,
-            self.mean_amplitude,
-            self.presence_ratio,
-            self.isi_violations,
-            self.isi_violation_ratio,
-            self.amplitude_cutoff,
-            self.amplitude_snr,
-            self.drift_correlation,
-            self.longest_silent_gap,
-            self.composite_quality,
-            fmt_or_empty(self.isolation_distance_sq),
-            fmt_or_empty(self.l_ratio),
-            fmt_or_empty(self.nn_isolation),
-            fmt_or_empty(self.d_prime),
-            fmt_or_empty(self.silhouette),
-        )?;
-        for name in &Self::METRICS[Self::N_BASE..] {
-            write!(w, "\t{}", fmt_or_empty(self.get(name).unwrap_or(f32::NAN)))?;
+        write!(w, "{}", self.cluster_id)?;
+        for name in Self::METRICS {
+            write!(w, "\t{}", self.export_value(name, ""))?;
         }
         writeln!(w)
     }
 
     fn write_json(&self, w: &mut impl Write, leading_comma: bool) -> std::io::Result<()> {
         let prefix = if leading_comma { ",\n" } else { "\n" };
-        write!(
-            w,
-            r#"{prefix}  {{"cluster_id": {}, "n_spikes": {}, "firing_rate": {:.6}, "mean_amplitude": {}, "presence_ratio": {:.6}, "isi_violations": {}, "isi_violation_ratio": {:.6}, "amplitude_cutoff": {:.6}, "amplitude_snr": {:.6}, "drift_correlation": {:.6}, "longest_silent_gap": {:.6}, "composite_quality": {:.6}, "isolation_distance_sq": {}, "l_ratio": {}, "nn_isolation": {}, "d_prime": {}, "silhouette": {}"#,
-            self.cluster_id,
-            self.n_spikes,
-            self.firing_rate_hz,
-            json_num(self.mean_amplitude),
-            self.presence_ratio,
-            self.isi_violations,
-            self.isi_violation_ratio,
-            self.amplitude_cutoff,
-            self.amplitude_snr,
-            self.drift_correlation,
-            self.longest_silent_gap,
-            self.composite_quality,
-            json_num(self.isolation_distance_sq),
-            json_num(self.l_ratio),
-            json_num(self.nn_isolation),
-            json_num(self.d_prime),
-            json_num(self.silhouette),
-        )?;
-        for name in &Self::METRICS[Self::N_BASE..] {
-            write!(
-                w,
-                r#", "{name}": {}"#,
-                json_num(self.get(name).unwrap_or(f32::NAN))
-            )?;
+        write!(w, r#"{prefix}  {{"cluster_id": {}"#, self.cluster_id)?;
+        for name in Self::METRICS {
+            write!(w, r#", "{name}": {}"#, self.export_value(name, "null"))?;
         }
         write!(w, "}}")
     }
@@ -317,22 +271,6 @@ fn num(v: f32) -> String {
     match v != 0.0 && v.abs() < 1e-3 {
         true => format!("{v}"),
         false => format!("{v:.6}"),
-    }
-}
-
-fn fmt_or_empty(v: f32) -> String {
-    if v.is_finite() {
-        num(v)
-    } else {
-        String::new()
-    }
-}
-
-fn json_num(v: f32) -> String {
-    if v.is_finite() {
-        num(v)
-    } else {
-        "null".to_string()
     }
 }
 
@@ -791,6 +729,68 @@ pub(crate) mod tests {
             }
         }
         assert!(rows[0]["rpv_post_hi95"].as_f64().unwrap() > 0.1);
+    }
+
+    #[test]
+    fn refractory_evidence_tsv_and_json_agree_on_schema_values_and_missingness() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Session::new(
+            MockProvider {
+                spikes: vec![
+                    (0..100).map(|i| SampleIndex(i * 10)).collect(),
+                    vec![SampleIndex(10)],
+                ],
+                amps: vec![vec![], vec![]],
+                n_samples: SampleIndex(1000),
+            },
+            Journal::open(&dir.path().join("j")).unwrap(),
+        );
+        let mut rows = collect_qc_rows(&s);
+        assert_eq!(rows[0].srp_contamination, 0.015);
+        assert_eq!(rows[0].srp_rp_ms, 10.0);
+        let tiny = 2.5e-10;
+        rows[0].rpv_post_mean = tiny;
+        rows[0].n_spikes = (1 << 24) + 1;
+        rows[0].drift_correlation = f32::INFINITY;
+        let tsv = dir.path().join("qc.tsv");
+        let json = dir.path().join("qc.json");
+        write_qc_tsv(&rows, &tsv).unwrap();
+        write_qc_json(&rows, &json).unwrap();
+        let tsv = std::fs::read_to_string(tsv).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(json).unwrap()).unwrap();
+        let mut lines = tsv.lines();
+        let header: Vec<_> = lines.next().unwrap().split('\t').collect();
+        assert_eq!(header.len(), 38);
+        let evidence = [
+            "srp_contamination",
+            "srp_rp_ms",
+            "rpv_post_mean",
+            "rpv_post_lo95",
+            "rpv_post_hi95",
+        ];
+        assert_eq!(&header[33..], evidence);
+        let records: Vec<_> = lines
+            .map(|line| line.split('\t').collect::<Vec<_>>())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|row| row.len() == header.len()));
+        assert_eq!(records[0][1], "16777217");
+        assert_eq!(json[0]["n_spikes"], 16777217);
+        let drift = header
+            .iter()
+            .position(|&h| h == "drift_correlation")
+            .unwrap();
+        assert_eq!(records[0][drift], "");
+        assert!(json[0]["drift_correlation"].is_null());
+        for (i, name) in evidence.into_iter().enumerate() {
+            let col = i + 33;
+            let tsv_value = records[0][col].parse::<f64>().unwrap();
+            assert_eq!(json[0][name].as_f64(), Some(tsv_value), "{name}");
+            assert_eq!(records[1][col], "");
+            assert!(json[1][name].is_null(), "{name}");
+        }
+        assert_eq!(json[0]["rpv_post_mean"].as_f64().unwrap() as f32, tiny);
     }
 
     #[test]
