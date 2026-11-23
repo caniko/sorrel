@@ -963,4 +963,30 @@ mod tests {
         );
         assert!(window_text(1, &t, &amps, SR, total, (1e6, 2e6), &params).is_err());
     }
+
+    #[test]
+    fn time_split_index_roundtrips_non_dyadic_epoch_edges_and_parses_epochs() {
+        let sr = 30_000.0_f64;
+        let total = 100_003_u64;
+        let edge = (u128::from(total) * 37).div_ceil(100) as u64;
+        let times = [edge - 1, edge, edge + 1].map(SampleIndex);
+        let at_s = edge as f64 / sr;
+        assert_eq!(time_split_index(&times, at_s, sr), 1);
+        assert_eq!(time_split_index(&times, at_s.next_down(), sr), 1);
+        assert_eq!(time_split_index(&times, at_s.next_up(), sr), 2);
+        assert_eq!(time_split_index(&times, -1.0, sr), 0);
+
+        assert!(matches!(parse("epochs 4"), Ok(Query::Epochs { c: 4 })));
+        assert!(parse("epochs").is_err());
+        assert!(parse("epochs 4 extra=1").is_err());
+        let q = format!("split 4 by=time at={at_s}");
+        assert!(matches!(
+            parse(&q),
+            Ok(Query::Split {
+                c: 4,
+                by: By::Time,
+                at: Some(v)
+            }) if v == at_s
+        ));
+    }
 }

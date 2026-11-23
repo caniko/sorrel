@@ -298,10 +298,10 @@ pub fn amplitude_view<P: DataProvider>(
     let dark = ui.visuals().dark_mode;
     if current.is_some() && !reorder {
         let (version, cache) = &mut state.epochs;
-        let metrics_version = session.metrics_version();
-        if *version != Some(metrics_version) {
+        let cur_version = session.version();
+        if *version != Some(cur_version) {
             cache.clear();
-            *version = Some(metrics_version);
+            *version = Some(cur_version);
         }
         let ink = painter.with_clip_rect(data);
         for (slot, &cluster) in selection.iter().enumerate() {

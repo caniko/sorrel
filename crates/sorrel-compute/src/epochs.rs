@@ -174,7 +174,7 @@ fn rate_bin(c: f64, cap: f64) -> RateBin {
 fn insert_count(events: &mut Vec<CountEvent>, bin: &RateBin) {
     let clc = if bin.c > 0.0 { bin.c * bin.c.ln() } else { 0.0 };
     for ((at, ln_at), enter) in [(bin.lo, true), (bin.hi, false)] {
-        let i = events.partition_point(|x| x.at <= at);
+        let i = events.partition_point(|x| x.ln_at <= ln_at);
         events.insert(
             i,
             CountEvent {
@@ -252,16 +252,28 @@ fn median(mut v: Vec<f64>) -> f64 {
 /// means actually have.
 fn noise_scale(points: &[(f64, f64)], long_run: bool) -> f64 {
     let v = |lag: usize| {
-        let d: Vec<f64> = points
+        let mut d: Vec<f64> = points
             .iter()
             .zip(&points[lag..])
             .map(|(p, q)| (q.0 - p.0).abs() * (p.1 * q.1 / (p.1 + q.1)).sqrt())
             .collect();
-        let mean_abs = d.iter().sum::<f64>() / d.len() as f64;
-        let mad = MAD_TO_SD * median(d);
+        d.sort_unstable_by(f64::total_cmp);
+        let m = d.len() / 2;
+        let med = if d.len() % 2 == 1 {
+            d[m]
+        } else {
+            d[m - 1].midpoint(d[m])
+        };
+        let mad = MAD_TO_SD * med;
         let s = if mad > 0.0 {
             mad
         } else {
+            // Bound the zero-MAD fallback by winsorizing past the top ~8%
+            // (at least 2 diffs) so an isolated outlier or step boundary
+            // cannot blow up the noise scale and mask a real change.
+            let trim = (d.len() / 12).max(2).min(d.len().saturating_sub(1));
+            let cap = d[d.len() - 1 - trim];
+            let mean_abs = d.iter().map(|&x| x.min(cap)).sum::<f64>() / d.len() as f64;
             (std::f64::consts::PI / 2.0).sqrt() * mean_abs
         };
         s * s
@@ -308,7 +320,7 @@ pub fn stable_epochs(
         || u32::try_from(times.len()).is_err()
         || !sr.is_finite()
         || sr <= 0.0
-        || total_samples == 0
+        || total_samples < BINS as u64
         || !(duration as f32).is_finite()
     {
         return Vec::new();
@@ -330,33 +342,39 @@ pub fn stable_epochs(
 
     let anscombe = counts.map(|c| 2.0 * (f64::from(c) + 0.375).sqrt());
     // Poisson counts have unit variance on this scale, and discrete low
-    // counts often have a zero median difference. Bursts last milliseconds,
-    // so they do not correlate counts across bins. The deviance (not the
-    // transformed count) is what is fitted: near silence a single spike is
-    // strong evidence of firing, which a Gaussian on the transform misses.
-    let sigma_rate = noise_scale(&anscombe.map(|y| (y, 1.0)), false).max(1.0);
+    // counts often have a zero median difference. Allow for lag-1 correlation
+    // between neighbouring bins (e.g. bursts spanning short bins in a short
+    // recording). The deviance (not the transformed count) is what is fitted:
+    // near silence a single spike is strong evidence of firing, which a
+    // Gaussian on the transform misses.
+    let sigma_rate = noise_scale(&anscombe.map(|y| (y, 1.0)), true).max(1.0);
     // Estimate count dispersion from first differences winsorized past the
     // top ~8% of jumps so a few step boundaries or isolated bursts do not
-    // inflate φ, while recurrent bursts (whether sparse or dense) still
-    // reflect their true compound-Poisson overdispersion.
+    // inflate φ, while recurrent bursts (whether sparse, dense, or straddling
+    // adjacent short bins) reflect their compound-Poisson long-run dispersion.
     let count_phi = {
         let mean_c = counts.iter().map(|&c| f64::from(c)).sum::<f64>() / BINS as f64;
         if mean_c > 0.0 {
-            let mut diffs: Vec<f64> = counts
-                .windows(2)
-                .map(|w| (f64::from(w[1]) - f64::from(w[0])).abs())
-                .collect();
-            diffs.sort_unstable_by(f64::total_cmp);
-            let cap = diffs[diffs.len().saturating_sub(9)];
-            let var = diffs
-                .iter()
-                .map(|&d| {
-                    let w = d.min(cap);
-                    0.5 * w * w
-                })
-                .sum::<f64>()
-                / diffs.len() as f64;
-            var / mean_c
+            let win_var = |lag: usize| {
+                let mut diffs: Vec<f64> = counts
+                    .iter()
+                    .zip(&counts[lag..])
+                    .map(|(&a, &b)| (f64::from(b) - f64::from(a)).abs())
+                    .collect();
+                diffs.sort_unstable_by(f64::total_cmp);
+                let cap = diffs[diffs.len().saturating_sub(9)];
+                diffs
+                    .iter()
+                    .map(|&d| {
+                        let w = d.min(cap);
+                        0.5 * w * w
+                    })
+                    .sum::<f64>()
+                    / diffs.len() as f64
+            };
+            let v1 = win_var(1);
+            let v3 = win_var(3);
+            v1.max(3.0 * v3 - 2.0 * v1) / mean_c
         } else {
             1.0
         }
@@ -718,6 +736,101 @@ mod tests {
         assert!(
             detected >= 45,
             "burst-only silence detection: {detected}/50"
+        );
+    }
+
+    #[test]
+    fn short_recording_bursts_rarely_split_while_change_stays_detectable() {
+        // 2-second recording at 30 kHz -> 20 ms bins, shorter than a 28 ms
+        // 8-spike burst (4 ms spacing). Bursts correlate neighbouring bins.
+        let sr = 30_000.0_f32;
+        let total = 60_000_u64;
+        let mut splits = 0;
+        for seed in 0..200_u64 {
+            let mut onset = rng(seed + 40_000);
+            let mut times = Vec::new();
+            let mut t = 0.0;
+            loop {
+                t -= onset().ln() / 5.0;
+                if t >= 1.97 {
+                    break;
+                }
+                times.extend(
+                    (0..8).map(|i| SampleIndex(((t + 0.004 * i as f64) * f64::from(sr)) as u64)),
+                );
+            }
+            if times.len() >= MIN_SPIKES && stable_epochs(&times, &[], total, sr).len() > 1 {
+                splits += 1;
+            }
+        }
+        assert!(
+            splits <= 15,
+            "2 s short-bin burst false splits: {splits}/200"
+        );
+
+        // A sustained rate drop on the same 2 s recording stays detectable.
+        let mut times = Vec::new();
+        for b in 0..100_u64 {
+            let n = if b < 60 { 6 } else { 0 };
+            for i in 0..n {
+                times.push(SampleIndex(b * 600 + i * 100));
+            }
+        }
+        let e = stable_epochs(&times, &[], total, sr);
+        assert_eq!(e.len(), 2, "{e:?}");
+        assert_eq!(e[1].n, 0);
+    }
+
+    #[test]
+    fn single_outlier_cannot_mask_a_step_in_zero_mad_series() {
+        // Amplitude step 100 -> 98 with one spike per bin: adding a single
+        // outlier bin (300) must not blow up the zero-MAD noise fallback.
+        let times: Vec<_> = (0..100).map(|b| SampleIndex(b * 1000 + 500)).collect();
+        let clean_amps: Vec<f32> = (0..100)
+            .map(|b| if b < 50 { 100.0 } else { 98.0 })
+            .collect();
+        let mut outlier_amps = clean_amps.clone();
+        outlier_amps[20] = 300.0;
+        assert_eq!(stable_epochs(&times, &clean_amps, TOTAL, SR).len(), 2);
+        assert_eq!(stable_epochs(&times, &outlier_amps, TOTAL, SR).len(), 2);
+
+        // Rate dropout (5 silent bins amidst constant 3 spikes/bin): adding
+        // a single 1000-spike bin elsewhere must not erase the dropout.
+        let make_rate = |outlier: bool| {
+            (0..100_u64)
+                .flat_map(|b| {
+                    let n = if (40..45).contains(&b) {
+                        0
+                    } else if outlier && b == 20 {
+                        1000
+                    } else {
+                        3
+                    };
+                    (0..n).map(move |i| SampleIndex(b * 1000 + i * 1000 / n.max(1)))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(stable_epochs(&make_rate(false), &[], TOTAL, SR).len(), 3);
+        assert_eq!(stable_epochs(&make_rate(true), &[], TOTAL, SR).len(), 3);
+
+        // >50% silent bins with 3 massive isolated artifact bins (c=2000) must
+        // still detect the 70-bin silence (zero-MAD Anscombe fallback stays bounded).
+        let heavy_burst_silence: Vec<_> = (0..100_u64)
+            .flat_map(|b| {
+                let n = if b < 70 {
+                    0
+                } else if [75, 85, 95].contains(&b) {
+                    2000
+                } else {
+                    2
+                };
+                (0..n).map(move |i| SampleIndex(b * 1000 + i * 1000 / n.max(1)))
+            })
+            .collect();
+        let e = stable_epochs(&heavy_burst_silence, &[], TOTAL, SR);
+        assert!(
+            e.len() >= 2 && e[0].n == 0 && (e[0].end_s - 70.0).abs() <= 1.0,
+            "{e:?}"
         );
     }
 
