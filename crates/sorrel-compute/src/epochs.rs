@@ -67,7 +67,10 @@ fn insert(events: &mut Vec<Event>, p: Point) {
             w: -p.w,
         },
     ] {
-        let i = events.partition_point(|x| x.at <= e.at);
+        // Order entries (`w > 0`) before exits (`w < 0`) at tied positions so
+        // points whose intervals collapse onto one f64 still share an inlier set.
+        let i =
+            events.partition_point(|x| x.at < e.at || (x.at == e.at && (x.w > 0.0 || e.w < 0.0)));
         events.insert(i, e);
     }
 }
@@ -177,7 +180,8 @@ fn rate_bin(c: f64, cap: f64) -> RateBin {
 fn insert_count(events: &mut Vec<CountEvent>, bin: &RateBin) {
     let clc = if bin.c > 0.0 { bin.c * bin.c.ln() } else { 0.0 };
     for ((at, ln_at), enter) in [(bin.lo, true), (bin.hi, false)] {
-        let i = events.partition_point(|x| x.ln_at <= ln_at);
+        let i = events
+            .partition_point(|x| x.ln_at < ln_at || (x.ln_at == ln_at && (x.enter || !enter)));
         events.insert(
             i,
             CountEvent {
@@ -869,6 +873,14 @@ mod tests {
         assert_eq!(stable_epochs(&times, &outlier_amps, TOTAL, SR).len(), 2);
         outlier_amps[20] = 1e8;
         assert_eq!(stable_epochs(&times, &outlier_amps, TOTAL, SR).len(), 2);
+
+        // Mostly-zero amplitudes (95 bins at 0, 5 bins at 100) collapse the
+        // floor to subnormal scale so y ± h ties on identical f64 coordinates;
+        // processing tied entries before exits still fits the 5-bin step.
+        let tail_amps: Vec<f32> = (0..100).map(|b| if b < 95 { 0.0 } else { 100.0 }).collect();
+        let e = stable_epochs(&times, &tail_amps, TOTAL, SR);
+        assert_eq!(e.len(), 2, "{e:?}");
+        assert_eq!(e[1].start_s, 95.0);
 
         // Rate dropout (5 silent bins amidst constant 3 spikes/bin): adding
         // a single 1000-spike bin elsewhere must not erase the dropout.
