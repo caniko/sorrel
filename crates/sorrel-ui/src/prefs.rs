@@ -14,7 +14,6 @@ pub struct UiPrefs {
     pub tree: Option<egui_tiles::Tree<Pane>>,
     pub sort_by: Option<ClusterColumn>,
     pub sort_descending: bool,
-    pub hide_empty: bool,
     pub hide_noise: bool,
     pub window_ms: Option<f32>,
     pub hp: bool,
@@ -331,6 +330,15 @@ mod tests {
         std::fs::write(UiPrefs::path(dir.path()), b"{ not json").unwrap();
         let fallback = UiPrefs::load(dir.path());
         assert!(fallback.tree.is_none());
+        // Legacy prefs containing the removed `hide_empty` field still deserialize.
+        std::fs::write(
+            UiPrefs::path(dir.path()),
+            br#"{"hide_empty": true, "hide_noise": true, "anchor": 3}"#,
+        )
+        .unwrap();
+        let legacy = UiPrefs::load(dir.path());
+        assert!(legacy.hide_noise);
+        assert_eq!(legacy.anchor, Some(3));
         assert!(UiPrefs::load(Path::new("/nonexistent/sorrel"))
             .anchor
             .is_none());

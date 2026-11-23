@@ -634,9 +634,13 @@ fn curation_keys_g_merges_membership_into_first_cluster_and_one_undo_restores_it
             assert_eq!(s.spike_times(ClusterId(2)), times);
             assert!(s.spike_times(ClusterId(0)).is_empty());
             assert!(s.spike_times(ClusterId(1)).is_empty());
+            assert_eq!(s.n_live_clusters(), 1);
             assert_eq!(s.history_len(), 1);
         }
         assert_eq!(h.state().selected_clusters(), [ClusterId(2)]);
+        // Emptied merge sources vanish from the Clusters table and counts, like phy.
+        h.get_by_label("1 / 1");
+        h.get_by_label_contains("1 clusters · 16 channels");
         assert!(
             h.state().brushes().spikes.is_none(),
             "old lasso cannot follow renumbered buckets"
@@ -652,6 +656,8 @@ fn curation_keys_g_merges_membership_into_first_cluster_and_one_undo_restores_it
             sorrel_ui::jobs::read(h.state().session()).spike_clusters_global(),
             before
         );
+        h.get_by_label("3 / 3");
+        h.get_by_label_contains("3 clusters · 16 channels");
     }
 }
 

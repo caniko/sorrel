@@ -870,10 +870,22 @@ impl<P: DataProvider> Session<P> {
     }
 
     /// Number of clusters currently addressable. Grows when a split allocates
-    /// a fresh id; never shrinks (use the `is_empty` helper to filter).
+    /// a fresh id; never shrinks (use [`Self::n_live_clusters`] or check
+    /// `spike_times(c).is_empty()` to exclude emptied slots).
     #[inline]
     pub fn n_clusters(&self) -> u32 {
         self.cluster_index.n_clusters()
+    }
+
+    /// Number of clusters currently owning at least one spike.
+    ///
+    /// Matches phy's active cluster list (`np.unique(spike_clusters)`):
+    /// emptied merge sources and sparse ID gaps keep their dense slot in
+    /// `0..n_clusters()` for stable IDs and undo, but are not live units.
+    pub fn n_live_clusters(&self) -> usize {
+        (0..self.n_clusters())
+            .filter(|&c| !self.spike_times(ClusterId(c)).is_empty())
+            .count()
     }
 
     #[inline]
@@ -1554,11 +1566,18 @@ impl<P: DataProvider> Session<P> {
                 let sources: Vec<ClusterId> =
                     sources.iter().copied().filter(|s| s != target).collect();
                 let sources = &sources[..];
-                // Capture pre-merge labels so undo can restore them.
+                // Capture pre-merge labels so undo can restore them, then clear
+                // the emptied sources so they do not keep stale labels (e.g.
+                // `noise` or `good`) after being merged away.
                 let labels: Vec<(ClusterId, P::Label)> = sources
                     .iter()
                     .map(|&s| (s, self.label(s).unwrap_or_default()))
                     .collect();
+                for &s in sources {
+                    if let Some(slot) = self.labels.get_mut(s.idx()) {
+                        *slot = P::Label::default();
+                    }
+                }
                 // The merged unit carries every source's provenance.
                 let mut union = self.tags(*target).to_vec();
                 for &s in sources {
@@ -2062,8 +2081,7 @@ mod tests {
                 SampleIndex(200)
             ]
         );
-        // Labels are NOT changed by merge anymore — phy keeps source labels
-        // alongside the empty bucket and lets the user filter "no spikes".
+        assert_eq!(s.n_live_clusters(), 1);
         assert_eq!(s.label(ClusterId(0)), Some(MockLabel::Unsorted));
     }
 
@@ -2081,13 +2099,25 @@ mod tests {
         })
         .unwrap();
         assert!(s.spike_times(ClusterId(0)).is_empty());
+        assert_eq!(s.n_live_clusters(), 2);
+        assert_eq!(
+            s.label(ClusterId(0)),
+            Some(MockLabel::Unsorted),
+            "emptied merge source clears its stale label"
+        );
 
         s.dispatch(CurationCommand::Undo).unwrap();
         assert_eq!(
             s.spike_times(ClusterId(0)),
             &[SampleIndex(10), SampleIndex(30), SampleIndex(150)]
         );
+        assert_eq!(s.n_live_clusters(), 3);
         assert_eq!(s.label(ClusterId(0)), Some(MockLabel::Good));
+
+        s.dispatch(CurationCommand::Redo).unwrap();
+        assert!(s.spike_times(ClusterId(0)).is_empty());
+        assert_eq!(s.n_live_clusters(), 2);
+        assert_eq!(s.label(ClusterId(0)), Some(MockLabel::Unsorted));
     }
 
     #[test]
@@ -2095,7 +2125,7 @@ mod tests {
         let (mut s, _d) = fresh_session();
         let batch = CurationCommand::batch(vec![
             CurationCommand::Relabel {
-                cluster: ClusterId(0),
+                cluster: ClusterId(2),
                 op: PhyLabelOp::SetGood,
             },
             CurationCommand::Relabel {
@@ -2110,27 +2140,30 @@ mod tests {
         .unwrap();
         s.dispatch(batch).unwrap();
         // All three children took effect.
-        assert_eq!(s.label(ClusterId(0)), Some(MockLabel::Good));
+        assert_eq!(s.label(ClusterId(2)), Some(MockLabel::Good));
         assert_eq!(s.label(ClusterId(1)), Some(MockLabel::Mua));
         assert!(s.spike_times(ClusterId(0)).is_empty());
+        assert_eq!(s.n_live_clusters(), 2);
         assert_eq!(s.history_len(), 1, "batch counts as one history entry");
 
         // One undo reverts the entire batch.
         s.dispatch(CurationCommand::Undo).unwrap();
-        assert_eq!(s.label(ClusterId(0)), Some(MockLabel::Unsorted));
+        assert_eq!(s.label(ClusterId(2)), Some(MockLabel::Unsorted));
         assert_eq!(s.label(ClusterId(1)), Some(MockLabel::Unsorted));
         assert_eq!(
             s.spike_times(ClusterId(0)),
             &[SampleIndex(10), SampleIndex(30), SampleIndex(150)]
         );
+        assert_eq!(s.n_live_clusters(), 3);
         assert_eq!(s.history_len(), 0);
         assert_eq!(s.redo_len(), 1);
 
         // Redo re-applies the entire batch.
         s.dispatch(CurationCommand::Redo).unwrap();
-        assert_eq!(s.label(ClusterId(0)), Some(MockLabel::Good));
+        assert_eq!(s.label(ClusterId(2)), Some(MockLabel::Good));
         assert_eq!(s.label(ClusterId(1)), Some(MockLabel::Mua));
         assert!(s.spike_times(ClusterId(0)).is_empty());
+        assert_eq!(s.n_live_clusters(), 2);
     }
 
     #[test]
