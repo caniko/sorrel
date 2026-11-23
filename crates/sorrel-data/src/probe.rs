@@ -968,9 +968,12 @@ mod tests {
     fn time_split_index_roundtrips_non_dyadic_epoch_edges_and_parses_epochs() {
         let sr = 30_000.0_f64;
         let total = 100_003_u64;
-        let edge = (u128::from(total) * 37).div_ceil(100) as u64;
+        // Edge 1 (sample 1001) rounds slightly above 1001 after `at_s * sr`,
+        // catching naïve `ceil(at * sr)` off-by-one splits.
+        let edge = total.div_ceil(100);
         let times = [edge - 1, edge, edge + 1].map(SampleIndex);
         let at_s = edge as f64 / sr;
+        assert!(at_s * sr > edge as f64);
         assert_eq!(time_split_index(&times, at_s, sr), 1);
         assert_eq!(time_split_index(&times, at_s.next_down(), sr), 1);
         assert_eq!(time_split_index(&times, at_s.next_up(), sr), 2);

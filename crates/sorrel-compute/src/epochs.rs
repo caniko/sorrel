@@ -26,6 +26,9 @@ pub struct Epoch {
 const BINS: usize = 100;
 const MIN_BINS: usize = 5;
 const MIN_SPIKES: usize = 2 * MIN_BINS;
+/// Minimum recording duration in seconds (200 ms per bin), well above burst
+/// durations so short-bin bursts do not correlate across several bins.
+const MIN_DURATION_S: f64 = 20.0;
 /// Consecutive nonempty bin pairs needed to estimate the amplitude noise.
 const MIN_AMP_PAIRS: usize = 20;
 /// Squared biweight threshold, K = 3 noise standard deviations as in
@@ -244,13 +247,13 @@ fn median(mut v: Vec<f64>) -> f64 {
 /// zero), or of their mean absolute value if the median is zero. Isolated
 /// outliers and a few steps barely move either.
 ///
-/// For independent bins v(1) = σ². With `long_run`, allow for a lag-one
-/// correlation r between bins (spike amplitudes correlated across a bin
-/// edge), which shrinks v(1) to σ²(1 − r) while v(3) ≈ σ² once the
-/// correlation has died out: return the larger of v(1) and the lag-one
-/// long-run variance σ²(1 + 2r) = 3 v(3) − 2 v(1), the spread that segment
-/// means actually have.
-fn noise_scale(points: &[(f64, f64)], long_run: bool) -> f64 {
+/// For independent bins v(1) = σ². Allow for a lag-one correlation r between
+/// neighbouring bins (amplitudes correlated across a bin edge, or bursts
+/// straddling a bin boundary), which shrinks v(1) to σ²(1 − r) while v(3) ≈ σ²
+/// once the correlation has died out: return the larger of v(1) and the
+/// lag-one long-run variance σ²(1 + 2r) = 3 v(3) − 2 v(1), the spread that
+/// segment means actually have.
+fn noise_scale(points: &[(f64, f64)]) -> f64 {
     let v = |lag: usize| {
         let mut d: Vec<f64> = points
             .iter()
@@ -279,11 +282,7 @@ fn noise_scale(points: &[(f64, f64)], long_run: bool) -> f64 {
         s * s
     };
     let v1 = v(1);
-    if long_run {
-        v1.max(3.0 * v(3) - 2.0 * v1).sqrt()
-    } else {
-        v1.sqrt()
-    }
+    v1.max(3.0 * v(3) - 2.0 * v1).sqrt()
 }
 
 /// Fit a constant firing rate and (if available) amplitude level over 100
@@ -305,7 +304,8 @@ fn noise_scale(points: &[(f64, f64)], long_run: bool) -> f64 {
 /// search over the 91 possible interior edges. The optimum is exact.
 ///
 /// Returns empty with fewer than ten spikes (twice the minimum bin count),
-/// invalid duration/sample rate, or times outside `[0, total_samples)`.
+/// recording shorter than 20 s (200 ms bins), invalid duration/sample rate,
+/// or times outside `[0, total_samples)`.
 /// Missing/invalid amplitudes, or fewer than 20 consecutive pairs of
 /// nonempty bins, reduce the fit to rates only. Observed amplitude means are
 /// still reported if the amplitude data are valid.
@@ -321,6 +321,7 @@ pub fn stable_epochs(
         || !sr.is_finite()
         || sr <= 0.0
         || total_samples < BINS as u64
+        || duration < MIN_DURATION_S
         || !(duration as f32).is_finite()
     {
         return Vec::new();
@@ -347,7 +348,7 @@ pub fn stable_epochs(
     // recording). The deviance (not the transformed count) is what is fitted:
     // near silence a single spike is strong evidence of firing, which a
     // Gaussian on the transform misses.
-    let sigma_rate = noise_scale(&anscombe.map(|y| (y, 1.0)), true).max(1.0);
+    let sigma_rate = noise_scale(&anscombe.map(|y| (y, 1.0))).max(1.0);
     // Estimate count dispersion from first differences winsorized past the
     // top ~8% of jumps so a few step boundaries or isolated bursts do not
     // inflate φ, while recurrent bursts (whether sparse, dense, or straddling
@@ -391,8 +392,8 @@ pub fn stable_epochs(
             .iter()
             .map(|&(m, _)| m.abs())
             .fold(f64::from(f32::MIN_POSITIVE), f64::max);
-    let sigma_amp = (has_amp && nonempty.len() > MIN_AMP_PAIRS)
-        .then(|| noise_scale(&nonempty, true).max(floor));
+    let sigma_amp =
+        (has_amp && nonempty.len() > MIN_AMP_PAIRS).then(|| noise_scale(&nonempty).max(floor));
     let amp: [Option<Point>; BINS] = match sigma_amp {
         Some(sigma) => {
             // Centre before scaling so a tiny noise scale keeps precision.
@@ -741,22 +742,29 @@ mod tests {
 
     #[test]
     fn short_recording_bursts_rarely_split_while_change_stays_detectable() {
-        // 2-second recording at 30 kHz -> 20 ms bins, shorter than a 28 ms
-        // 8-spike burst (4 ms spacing). Bursts correlate neighbouring bins.
         let sr = 30_000.0_f32;
-        let total = 60_000_u64;
+        // Recordings shorter than MIN_DURATION_S (e.g. 2 s / 20 ms bins) are
+        // unavailable so burst timescales cannot masquerade as epochs.
+        let short_times: Vec<_> = (0..100).map(|i| SampleIndex(i * 600)).collect();
+        assert!(stable_epochs(&short_times, &[], 60_000, sr).is_empty());
+
+        // At the shortest supported duration (20 s -> 200 ms bins), steady
+        // 8-spike bursts with 12 ms spacing (84 ms duration) span at most two
+        // adjacent bins and rarely split, while a sustained dropout in that
+        // same burst train stays detectable.
+        let total = 600_000_u64; // 20 s at 30 kHz
         let mut splits = 0;
         for seed in 0..200_u64 {
             let mut onset = rng(seed + 40_000);
             let mut times = Vec::new();
             let mut t = 0.0;
             loop {
-                t -= onset().ln() / 5.0;
-                if t >= 1.97 {
+                t -= onset().ln() / 1.5;
+                if t >= 19.85 {
                     break;
                 }
                 times.extend(
-                    (0..8).map(|i| SampleIndex(((t + 0.004 * i as f64) * f64::from(sr)) as u64)),
+                    (0..8).map(|i| SampleIndex(((t + 0.012 * i as f64) * f64::from(sr)) as u64)),
                 );
             }
             if times.len() >= MIN_SPIKES && stable_epochs(&times, &[], total, sr).len() > 1 {
@@ -764,21 +772,37 @@ mod tests {
             }
         }
         assert!(
-            splits <= 15,
-            "2 s short-bin burst false splits: {splits}/200"
+            splits <= 12,
+            "20 s shortest-duration 12 ms-burst false splits: {splits}/200"
         );
 
-        // A sustained rate drop on the same 2 s recording stays detectable.
-        let mut times = Vec::new();
-        for b in 0..100_u64 {
-            let n = if b < 60 { 6 } else { 0 };
-            for i in 0..n {
-                times.push(SampleIndex(b * 600 + i * 100));
+        let mut detected = 0;
+        for seed in 0..50_u64 {
+            let mut onset = rng(seed + 50_000);
+            let mut times = Vec::new();
+            let mut t = 0.0;
+            loop {
+                t -= onset().ln() / 2.0;
+                if t >= 12.0 {
+                    break;
+                }
+                times.extend(
+                    (0..8).map(|i| SampleIndex(((t + 0.012 * i as f64) * f64::from(sr)) as u64)),
+                );
+            }
+            let last_s = times.last().unwrap().0 as f64 / f64::from(sr);
+            let e = stable_epochs(&times, &[], total, sr);
+            if e.len() >= 2
+                && e.last()
+                    .is_some_and(|last| last.n == 0 && (last.start_s - last_s).abs() <= 0.6)
+            {
+                detected += 1;
             }
         }
-        let e = stable_epochs(&times, &[], total, sr);
-        assert_eq!(e.len(), 2, "{e:?}");
-        assert_eq!(e[1].n, 0);
+        assert!(
+            detected >= 45,
+            "20 s 12 ms-burst dropout detection: {detected}/50"
+        );
     }
 
     #[test]
@@ -873,11 +897,11 @@ mod tests {
 
     #[test]
     fn rates_use_integer_edge_exposure() {
-        // 1003 samples: bins hold 10 or 11 samples, so nominal widths would be wrong.
-        let times: Vec<_> = (0..1003).step_by(3).map(SampleIndex).collect();
-        let e = stable_epochs(&times, &[], 1003, SR);
+        // 20_003 samples: bins hold 200 or 201 samples, so nominal widths would be wrong.
+        let times: Vec<_> = (0..20_003).step_by(3).map(SampleIndex).collect();
+        let e = stable_epochs(&times, &[], 20_003, SR);
         assert_eq!(e.len(), 1, "{e:?}");
-        assert_eq!(e[0].rate_hz, (times.len() as f64 / 1.003) as f32);
+        assert_eq!(e[0].rate_hz, (times.len() as f64 / 20.003) as f32);
     }
 
     #[test]
