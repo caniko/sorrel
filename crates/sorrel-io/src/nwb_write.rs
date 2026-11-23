@@ -4,12 +4,12 @@
 use crate::nwb::{check_append_rate, read_str, strings};
 use crate::nwb_units::{Units, Values};
 use crate::ChannelId;
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use hdf5_metno::types::VarLenUnicode;
 use hdf5_metno::{Dataset, File, Group, H5Type, Location, ObjectReference1};
-use std::fs;
 use std::path::Path;
-use tempfile::NamedTempFile;
+use std::{fs, io};
+use tempfile::{NamedTempFile, TempPath};
 
 const NWB_VERSION: &str = "2.11.0";
 const HDMF: &str = "hdmf-common";
@@ -81,13 +81,17 @@ pub fn write_new(
     channels: &[ChannelId],
     units: &Units,
 ) -> Result<()> {
-    ensure!(
-        path.symlink_metadata().is_err(),
-        "{} already exists",
-        path.display()
-    );
-    let tmp = sibling_temp(path)?;
-    let f = File::create(tmp.path())?;
+    match path.symlink_metadata() {
+        Ok(info) if info.is_dir() => {
+            bail!("{} is a directory; choose a new file path", path.display())
+        }
+        Ok(_) => bail!("{} already exists", path.display()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("inspect {}", path.display())),
+    }
+    // Close tempfile's OS handle before HDF5 opens the staged path.
+    let tmp = sibling_temp(path)?.into_temp_path();
+    let f = File::create(&tmp)?;
     typed(&f, "core", "NWBFile")?;
     text_attr(&f, "nwb_version", NWB_VERSION)?;
     for name in [
@@ -123,8 +127,9 @@ pub fn write_new(
     write_units(&f, units)?;
     add_generated_by(&f.group("general")?, units.generated_by)?;
     f.close()?;
-    tmp.as_file().sync_all()?;
+    fs::OpenOptions::new().write(true).open(&tmp)?.sync_all()?;
     tmp.persist_noclobber(path)
+        .map_err(|err| err.error)
         .with_context(|| format!("create {}", path.display()))?;
     Ok(())
 }
@@ -133,6 +138,11 @@ pub fn write_new(
 /// The caller must not let another process edit the destination concurrently.
 pub fn append(path: &Path, units: &Units) -> Result<()> {
     let path = fs::canonicalize(path)?;
+    ensure!(
+        !path.is_dir(),
+        "{} is a directory; choose an existing NWB file",
+        path.display()
+    );
     let mut original = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -154,8 +164,9 @@ pub fn append(path: &Path, units: &Units) -> Result<()> {
     );
     check_append_rate(&source, units.resolution.recip())?;
     let mut tmp = sibling_temp(&path)?;
-    std::io::copy(&mut original, tmp.as_file_mut())?;
-    let f = File::open_rw(tmp.path())?;
+    io::copy(&mut original, tmp.as_file_mut())?;
+    let tmp = tmp.into_temp_path();
+    let f = File::open_rw(&tmp)?;
     let general = if f.link_exists("general") {
         f.group("general")?
     } else {
@@ -179,8 +190,10 @@ pub fn append(path: &Path, units: &Units) -> Result<()> {
     drop(dates);
     drop(general);
     f.close()?;
-    tmp.as_file().set_permissions(before.permissions())?;
-    tmp.as_file().sync_all()?;
+    let staged = fs::OpenOptions::new().write(true).open(&tmp)?;
+    staged.set_permissions(before.permissions())?;
+    staged.sync_all()?;
+    drop(staged);
     let after = fs::metadata(&path)?;
     ensure!(
         after.len() == before.len() && after.modified()? == before.modified()?,
@@ -189,9 +202,32 @@ pub fn append(path: &Path, units: &Units) -> Result<()> {
     );
     source.close()?;
     drop(original);
-    tmp.persist(&path)
-        .with_context(|| format!("replace {}", path.display()))?;
+    persist_replacement(tmp, &path).with_context(|| format!("replace {}", path.display()))?;
     Ok(())
+}
+
+fn persist_replacement(tmp: TempPath, path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    let tmp = {
+        let mut tmp = tmp;
+        // A scanner can briefly hold either file even after our handles close.
+        for delay_ms in [10, 20, 40, 80, 160] {
+            match tmp.persist(path) {
+                Err(err) if windows_persist_busy(err.error.raw_os_error()) => tmp = err.path,
+                result => return result.map_err(|err| err.error),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        tmp
+    };
+    // Keep the I/O error, not the TempPath that owns cleanup of the staging file.
+    tmp.persist(path).map_err(|err| err.error)
+}
+
+#[cfg(any(windows, test))]
+fn windows_persist_busy(code: Option<i32>) -> bool {
+    // ERROR_ACCESS_DENIED or ERROR_SHARING_VIOLATION.
+    matches!(code, Some(5 | 32))
 }
 
 fn sibling_temp(path: &Path) -> Result<NamedTempFile> {
@@ -454,6 +490,37 @@ mod tests {
     use crate::{ClusterId, DataProvider, NwbProvider, SampleIndex};
 
     #[test]
+    fn windows_persist_retries_only_access_denied_and_sharing_violations() {
+        assert!(windows_persist_busy(Some(5)));
+        assert!(windows_persist_busy(Some(32)));
+        assert!(!windows_persist_busy(Some(2)));
+        assert!(!windows_persist_busy(None));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn blocked_replacement_preserves_destination_and_cleans_up() -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let destination = dir.path().join("recording.nwb");
+        fs::write(&destination, b"original")?;
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2) // FILE_SHARE_READ | FILE_SHARE_WRITE, not FILE_SHARE_DELETE.
+            .open(&destination)?;
+        let staged = sibling_temp(&destination)?.into_temp_path();
+        fs::write(&staged, b"replacement")?;
+
+        let err = persist_replacement(staged, &destination).unwrap_err();
+        assert!(windows_persist_busy(err.raw_os_error()), "{err}");
+        assert_eq!(fs::read_dir(dir.path())?.count(), 1);
+        drop(lock);
+        assert_eq!(fs::read(&destination)?, b"original");
+        Ok(())
+    }
+
+    #[test]
     fn appended_units_round_trip_with_local_storage() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let recording = tmp.path().join("recording.nwb");
@@ -484,11 +551,13 @@ mod tests {
         let before = fs::read(&recording)?;
         assert!(append(&recording, &units).is_err());
         assert_eq!(fs::read(&recording)?, before);
+        assert_eq!(fs::read_dir(tmp.path())?.count(), 1);
         let f = File::open_rw(&recording)?;
         f.unlink("/general/was_generated_by")?;
         f.close()?;
 
         append(&recording, &units)?;
+        assert_eq!(fs::read_dir(tmp.path())?.count(), 1);
         let r = NwbProvider::open(&recording)?;
         assert_eq!(r.n_clusters(), 2);
         assert_eq!(r.unit_id(ClusterId(0)), 5);

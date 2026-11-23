@@ -28,6 +28,50 @@ fn export(source: &Path, dest: &Path, options: &[&str]) {
     );
 }
 
+#[test]
+fn native_export_out_refuses_existing_paths_without_leaving_a_staged_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = fixtures().join("curated_units.nwb");
+    let file = temp.path().join("existing.nwb");
+    fs::copy(&source, &file).unwrap();
+    let before = fs::read(&file).unwrap();
+    let dir = temp.path().join("directory.nwb");
+    fs::create_dir(&dir).unwrap();
+    let marker = dir.join("keep");
+    fs::write(&marker, b"keep").unwrap();
+
+    for (dest, message) in [
+        (&dir, "is a directory; choose a new file path"),
+        (&file, "already exists"),
+    ] {
+        let result = Command::new(env!("CARGO_BIN_EXE_sorrel"))
+            .arg("export-nwb")
+            .arg(&source)
+            .arg("--out")
+            .arg(dest)
+            .arg("--journal")
+            .arg(temp.path().join("curation.journal"))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success());
+        assert!(stderr.contains(message), "{stderr}");
+    }
+    assert_eq!(fs::read(&file).unwrap(), before);
+    assert_eq!(fs::read(&marker).unwrap(), b"keep");
+    assert_no_staged_nwb(temp.path());
+}
+
+fn assert_no_staged_nwb(dir: &Path) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let name = entry.unwrap().file_name();
+        assert!(
+            !name.to_string_lossy().starts_with(".sorrel-nwb-"),
+            "orphaned staging file: {name:?}"
+        );
+    }
+}
+
 fn spike_seconds(provider: &NwbProvider, unit: ClusterId) -> Vec<f64> {
     let rate = provider.exact_sample_rate().unwrap();
     provider
@@ -137,6 +181,7 @@ fn native_export_from_nwb_zarr_preserves_units_and_session_metadata() {
     );
     let appended = NwbProvider::open(&raw).unwrap();
     assert_eq!(units(&appended), expected);
+    assert_no_staged_nwb(temp.path());
 }
 
 #[test]
