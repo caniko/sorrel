@@ -198,6 +198,78 @@ fn invalid_refractory_flags_fail_with_an_actionable_diagnostic() {
     }
 }
 
+#[test]
+fn qc_cli_distinguishes_confirmed_contamination_from_no_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(ds) = fixture(tmp.path()) else {
+        return;
+    };
+    let ds = ds.to_str().unwrap();
+    let merge = run(
+        tmp.path(),
+        &["call", ds, "merge", r#"{"sources":[1],"target":2}"#],
+    );
+    assert!(
+        merge.status.success(),
+        "{}",
+        String::from_utf8_lossy(&merge.stderr)
+    );
+    for (out, custom) in [
+        ("default", &[][..]),
+        (
+            "unavailable",
+            &[
+                "--refractory-ms=0.03",
+                "--rp-min-ms=0.015",
+                "--rp-max-ms=0.035",
+                "--rp-step-ms=0.02",
+            ][..],
+        ),
+    ] {
+        let qc = tmp.path().join(out);
+        let mut args = vec!["qc", ds, "--out", qc.to_str().unwrap()];
+        args.extend(custom);
+        let result = run(tmp.path(), &args);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let rows: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(qc.join("cluster_qc.json")).unwrap()).unwrap();
+        let row = |id| {
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["cluster_id"] == id)
+                .unwrap()
+        };
+        let clean = row(0);
+        let merged = row(2);
+        assert!(merged["amplitude_snr"].is_null() && merged["drift_correlation"].is_null());
+        if custom.is_empty() {
+            assert_eq!(clean["srp_contamination"], 0.005);
+            assert_eq!(clean["srp_rp_ms"], 1.0);
+            assert!(
+                merged["rpv_post_mean"].as_f64().unwrap()
+                    > clean["rpv_post_mean"].as_f64().unwrap()
+            );
+            assert_eq!(merged["srp_contamination"], 0.275);
+            assert_eq!(merged["srp_rp_ms"], 1.5);
+        } else {
+            for name in [
+                "srp_contamination",
+                "srp_rp_ms",
+                "rpv_post_mean",
+                "rpv_post_lo95",
+                "rpv_post_hi95",
+            ] {
+                assert!(clean[name].is_null() && merged[name].is_null(), "{name}");
+            }
+        }
+    }
+}
+
 #[cfg(feature = "hdf5")]
 #[test]
 fn nwb_call_preserves_exported_parent_without_a_row() {

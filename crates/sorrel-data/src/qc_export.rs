@@ -68,6 +68,14 @@ pub struct QcRow {
     pub amplitude_dip: f32,
     /// Amplitude change per second (least squares).
     pub drift_slope: f32,
+    /// Minimum contamination fraction confirmed by sliding-RP, or `NaN`.
+    pub srp_contamination: f32,
+    /// Highest-confidence window at that fraction (ms, first on ties), or `NaN`.
+    pub srp_rp_ms: f32,
+    /// Fixed-window contamination posterior mean and shortest 95% interval.
+    pub rpv_post_mean: f32,
+    pub rpv_post_lo95: f32,
+    pub rpv_post_hi95: f32,
 }
 
 impl Default for QcRow {
@@ -108,18 +116,19 @@ impl Default for QcRow {
             rp_contamination: n,
             amplitude_dip: n,
             drift_slope: n,
+            srp_contamination: n,
+            srp_rp_ms: n,
+            rpv_post_mean: n,
+            rpv_post_lo95: n,
+            rpv_post_hi95: n,
         }
     }
 }
 
 impl QcRow {
-    /// Columns before the shape/footprint additions; the TSV and JSON
-    /// writers emit those by name from `METRICS[N_BASE..]`.
-    const N_BASE: usize = 16;
-
     /// Every metric column name, in TSV order. The single source of truth
     /// for names used by `get`, the rule engine, and the exports.
-    pub const METRICS: [&'static str; 32] = [
+    pub const METRICS: [&'static str; 37] = [
         "n_spikes",
         "firing_rate",
         "mean_amplitude",
@@ -152,6 +161,11 @@ impl QcRow {
         "rp_contamination",
         "amplitude_dip",
         "drift_slope",
+        "srp_contamination",
+        "srp_rp_ms",
+        "rpv_post_mean",
+        "rpv_post_lo95",
+        "rpv_post_hi95",
     ];
 
     /// `{"cluster_id": .., "<metric>": number | null, ...}` — NaN becomes
@@ -208,99 +222,55 @@ impl QcRow {
             "rp_contamination" => self.rp_contamination,
             "amplitude_dip" => self.amplitude_dip,
             "drift_slope" => self.drift_slope,
+            "srp_contamination" => self.srp_contamination,
+            "srp_rp_ms" => self.srp_rp_ms,
+            "rpv_post_mean" => self.rpv_post_mean,
+            "rpv_post_lo95" => self.rpv_post_lo95,
+            "rpv_post_hi95" => self.rpv_post_hi95,
             _ => return None,
         })
     }
 
     fn tsv_header() -> String {
-        let mut h = "cluster_id\tn_spikes\tfiring_rate\tmean_amplitude\tpresence_ratio\t\
-         isi_violations\tisi_violation_ratio\tamplitude_cutoff\tamplitude_snr\t\
-         drift_correlation\tlongest_silent_gap\tcomposite_quality\t\
-         isolation_distance_sq\tl_ratio\tnn_isolation\td_prime\tsilhouette"
-            .to_string();
-        for name in &Self::METRICS[Self::N_BASE..] {
-            h.push('\t');
-            h.push_str(name);
+        format!("cluster_id\t{}\n", Self::METRICS.join("\t"))
+    }
+
+    fn export_value(&self, name: &str, missing: &str) -> String {
+        match name {
+            // Do not round integer counts through the f32 metric lookup.
+            "n_spikes" => self.n_spikes.to_string(),
+            "isi_violations" => self.isi_violations.to_string(),
+            _ => match self.get(name).filter(|v| v.is_finite()) {
+                Some(value) => num(value),
+                None => missing.to_owned(),
+            },
         }
-        h.push('\n');
-        h
     }
 
     fn write_tsv(&self, w: &mut impl Write) -> std::io::Result<()> {
-        write!(
-            w,
-            "{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}",
-            self.cluster_id,
-            self.n_spikes,
-            self.firing_rate_hz,
-            self.mean_amplitude,
-            self.presence_ratio,
-            self.isi_violations,
-            self.isi_violation_ratio,
-            self.amplitude_cutoff,
-            self.amplitude_snr,
-            self.drift_correlation,
-            self.longest_silent_gap,
-            self.composite_quality,
-            fmt_or_empty(self.isolation_distance_sq),
-            fmt_or_empty(self.l_ratio),
-            fmt_or_empty(self.nn_isolation),
-            fmt_or_empty(self.d_prime),
-            fmt_or_empty(self.silhouette),
-        )?;
-        for name in &Self::METRICS[Self::N_BASE..] {
-            write!(w, "\t{}", fmt_or_empty(self.get(name).unwrap_or(f32::NAN)))?;
+        write!(w, "{}", self.cluster_id)?;
+        for name in Self::METRICS {
+            write!(w, "\t{}", self.export_value(name, ""))?;
         }
         writeln!(w)
     }
 
     fn write_json(&self, w: &mut impl Write, leading_comma: bool) -> std::io::Result<()> {
         let prefix = if leading_comma { ",\n" } else { "\n" };
-        write!(
-            w,
-            r#"{prefix}  {{"cluster_id": {}, "n_spikes": {}, "firing_rate": {:.6}, "mean_amplitude": {}, "presence_ratio": {:.6}, "isi_violations": {}, "isi_violation_ratio": {:.6}, "amplitude_cutoff": {:.6}, "amplitude_snr": {:.6}, "drift_correlation": {:.6}, "longest_silent_gap": {:.6}, "composite_quality": {:.6}, "isolation_distance_sq": {}, "l_ratio": {}, "nn_isolation": {}, "d_prime": {}, "silhouette": {}"#,
-            self.cluster_id,
-            self.n_spikes,
-            self.firing_rate_hz,
-            json_num(self.mean_amplitude),
-            self.presence_ratio,
-            self.isi_violations,
-            self.isi_violation_ratio,
-            self.amplitude_cutoff,
-            self.amplitude_snr,
-            self.drift_correlation,
-            self.longest_silent_gap,
-            self.composite_quality,
-            json_num(self.isolation_distance_sq),
-            json_num(self.l_ratio),
-            json_num(self.nn_isolation),
-            json_num(self.d_prime),
-            json_num(self.silhouette),
-        )?;
-        for name in &Self::METRICS[Self::N_BASE..] {
-            write!(
-                w,
-                r#", "{name}": {}"#,
-                json_num(self.get(name).unwrap_or(f32::NAN))
-            )?;
+        write!(w, r#"{prefix}  {{"cluster_id": {}"#, self.cluster_id)?;
+        for name in Self::METRICS {
+            write!(w, r#", "{name}": {}"#, self.export_value(name, "null"))?;
         }
         write!(w, "}}")
     }
 }
 
-fn fmt_or_empty(v: f32) -> String {
-    if v.is_finite() {
-        format!("{v:.6}")
-    } else {
-        String::new()
-    }
-}
-
-fn json_num(v: f32) -> String {
-    if v.is_finite() {
-        format!("{v:.6}")
-    } else {
-        "null".to_string()
+/// Six decimals, except tiny non-zero values (posterior bounds of long clean
+/// units) print in full so they do not round to 0.
+fn num(v: f32) -> String {
+    match v != 0.0 && v.abs() < 1e-3 {
+        true => format!("{v}"),
+        false => format!("{v:.6}"),
     }
 }
 
@@ -330,9 +300,10 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
 ) -> Vec<QcRow> {
     use sorrel_compute::{
         amplitude_drift_slope, burst_index, footprint, hartigan_dip, isi_violation_rate,
-        isi_violations, mean_amplitude, peak_channel, waveform_landmarks,
+        isi_violations, mean_amplitude, peak_channel, refractory_evidence, waveform_landmarks,
     };
-    let sr = session.provider.sample_rate().max(1.0);
+    let sample_rate = session.provider.sample_rate();
+    let sr = sample_rate.max(1.0);
     let total_samples = session.provider.n_samples();
     let total_seconds = total_samples.as_f32() / sr;
     let refractory_samples = windows.fixed_samples(sr);
@@ -387,6 +358,22 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
         let nan = f32::NAN;
         // (0, 0) means there is no estimate.
         let (rp_contam, rp) = windows.sweep(times, total_samples.0, sr);
+        let (srp_contamination, srp_rp_ms, rpv_post_mean, rpv_post_lo95, rpv_post_hi95) =
+            match windows {
+                RefractoryWindows::Session(params) => {
+                    let (srp, post) =
+                        refractory_evidence(times, total_samples.0, sample_rate, params);
+                    (
+                        srp.min_contamination,
+                        srp.rp_ms,
+                        post.mean,
+                        post.lo95,
+                        post.hi95,
+                    )
+                }
+                // These are public QC metrics, not versioned model features.
+                RefractoryWindows::Learn => (nan, nan, nan, nan, nan),
+            };
         let acg = acg_or_compute(session, c, acg_bin, acg_window);
         // ponytail: evenly strided to <= 5000 points to bound the O(n log n)
         // sort per cluster; a rare second mode in a huge cluster can thin out.
@@ -437,6 +424,11 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
             } else {
                 nan
             },
+            srp_contamination,
+            srp_rp_ms,
+            rpv_post_mean,
+            rpv_post_lo95,
+            rpv_post_hi95,
         });
     }
     rows
@@ -685,8 +677,9 @@ pub(crate) mod tests {
                 vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
                 vec![SampleIndex(20), SampleIndex(200)],
                 vec![SampleIndex(100)],
+                vec![],
             ],
-            amps: vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0], vec![6.0]],
+            amps: vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0], vec![6.0], vec![]],
             n_samples: SampleIndex(1000),
         };
         let dir = tempfile::tempdir().unwrap();
@@ -696,12 +689,12 @@ pub(crate) mod tests {
 
         let outdir = dir.path().join("export");
         let n = export_qc(&s, &outdir, None).unwrap();
-        assert_eq!(n, 3);
+        assert_eq!(n, 4);
 
         let tsv = std::fs::read_to_string(outdir.join("cluster_qc.tsv")).unwrap();
         let lines: Vec<&str> = tsv.lines().collect();
-        // 1 header + 3 rows.
-        assert_eq!(lines.len(), 4);
+        // 1 header + 4 rows.
+        assert_eq!(lines.len(), 5);
         assert!(lines[0].starts_with("cluster_id\t"));
         assert!(lines[1].starts_with("0\t"));
 
@@ -721,6 +714,83 @@ pub(crate) mod tests {
             .unwrap();
         let json_keys: Vec<&str> = first_row.split('"').skip(1).step_by(2).collect();
         assert_eq!(tsv_keys, json_keys);
+        let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for name in [
+            "srp_contamination",
+            "srp_rp_ms",
+            "rpv_post_mean",
+            "rpv_post_lo95",
+            "rpv_post_hi95",
+        ] {
+            let i = tsv_keys.iter().position(|&k| k == name).unwrap();
+            for row in [2, 3] {
+                assert!(rows[row].get(name).unwrap().is_null(), "{name}");
+                assert_eq!(lines[row + 1].split('\t').nth(i), Some(""), "{name}");
+            }
+        }
+        assert!(rows[0]["rpv_post_hi95"].as_f64().unwrap() > 0.1);
+    }
+
+    #[test]
+    fn refractory_evidence_tsv_and_json_agree_on_schema_values_and_missingness() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Session::new(
+            MockProvider {
+                spikes: vec![
+                    (0..100).map(|i| SampleIndex(i * 10)).collect(),
+                    vec![SampleIndex(10)],
+                ],
+                amps: vec![vec![], vec![]],
+                n_samples: SampleIndex(1000),
+            },
+            Journal::open(&dir.path().join("j")).unwrap(),
+        );
+        let mut rows = collect_qc_rows(&s);
+        assert_eq!(rows[0].srp_contamination, 0.015);
+        assert_eq!(rows[0].srp_rp_ms, 10.0);
+        let tiny = 2.5e-10;
+        rows[0].rpv_post_mean = tiny;
+        rows[0].n_spikes = (1 << 24) + 1;
+        rows[0].drift_correlation = f32::INFINITY;
+        let tsv = dir.path().join("qc.tsv");
+        let json = dir.path().join("qc.json");
+        write_qc_tsv(&rows, &tsv).unwrap();
+        write_qc_json(&rows, &json).unwrap();
+        let tsv = std::fs::read_to_string(tsv).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(json).unwrap()).unwrap();
+        let mut lines = tsv.lines();
+        let header: Vec<_> = lines.next().unwrap().split('\t').collect();
+        assert_eq!(header.len(), 38);
+        let evidence = [
+            "srp_contamination",
+            "srp_rp_ms",
+            "rpv_post_mean",
+            "rpv_post_lo95",
+            "rpv_post_hi95",
+        ];
+        assert_eq!(&header[33..], evidence);
+        let records: Vec<_> = lines
+            .map(|line| line.split('\t').collect::<Vec<_>>())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|row| row.len() == header.len()));
+        assert_eq!(records[0][1], "16777217");
+        assert_eq!(json[0]["n_spikes"], 16777217);
+        let drift = header
+            .iter()
+            .position(|&h| h == "drift_correlation")
+            .unwrap();
+        assert_eq!(records[0][drift], "");
+        assert!(json[0]["drift_correlation"].is_null());
+        for (i, name) in evidence.into_iter().enumerate() {
+            let col = i + 33;
+            let tsv_value = records[0][col].parse::<f64>().unwrap();
+            assert_eq!(json[0][name].as_f64(), Some(tsv_value), "{name}");
+            assert_eq!(records[1][col], "");
+            assert!(json[1][name].is_null(), "{name}");
+        }
+        assert_eq!(json[0]["rpv_post_mean"].as_f64().unwrap() as f32, tiny);
     }
 
     #[test]

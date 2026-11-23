@@ -326,7 +326,7 @@ fn gamma_q_cf(a: f64, x: f64) -> f64 {
 
 /// `ln(Γ(z))` — Lanczos approximation. Plenty accurate (≈1e-12) for our
 /// degrees-of-freedom range (small integers up to a few hundred).
-fn ln_gamma(z: f64) -> f64 {
+pub(crate) fn ln_gamma(z: f64) -> f64 {
     let g = 7.0;
     const COEFF: [f64; 9] = [
         0.999_999_999_999_809_9,

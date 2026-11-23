@@ -130,6 +130,43 @@ def test_label_only_session(tmp_path: Path) -> None:
     assert all(len(p) == 0 for p in df["parent_unit_ids"])
 
 
+def test_refractory_qc_round_trips_finite_and_missing_values(curated: Path, tmp_path: Path) -> None:
+    session = sorrel.Session.open(curated)
+    single = session.split(3, [0], by="manual")
+    session.save()
+    live = {row["cluster_id"]: row for row in session.qc()}
+    del session
+    out = tmp_path / "refractory.nwb"
+    write_direct(curated, out)
+    with NWBHDF5IO(out, "r") as io:
+        units = io.read().units
+        df = units.to_dataframe()
+        for column, unit in [
+            ("srp_contamination", "fraction"),
+            ("srp_rp_ms", "(ms)"),
+            ("rpv_post_mean", "fraction"),
+            ("rpv_post_lo95", "fraction"),
+            ("rpv_post_hi95", "fraction"),
+        ]:
+            assert unit in units[column].description
+            assert df[column].dtype.kind == "f"
+            assert live[single][column] is None
+            assert np.isnan(df.loc[single, column])
+            np.testing.assert_allclose(
+                df[column], [np.nan if live[uid][column] is None else live[uid][column]
+                             for uid in df.index],
+                rtol=1e-6, atol=0, equal_nan=True,
+            )
+    # Unit 0 has no positive lags <30 samples and enough exposure to
+    # confirm the very first contamination grid point at that sample edge.
+    assert df.loc[0, "srp_contamination"] == pytest.approx(0.005)
+    assert df.loc[0, "srp_rp_ms"] == pytest.approx(30_000.0 / RATE)
+    assert live[3]["srp_contamination"] is None
+    assert np.isnan(df.loc[3, "srp_rp_ms"])
+    assert df.loc[3, "rpv_post_hi95"] > df.loc[0, "rpv_post_hi95"]
+    assert df.loc[2, "rpv_post_mean"] > df.loc[0, "rpv_post_mean"]
+
+
 def test_refuses_existing_units(curated: Path) -> None:
     nwb = NWBFile("x", "x", datetime(2026, 1, 1, tzinfo=timezone.utc))
     nwb.add_unit(spike_times=[0.1])
