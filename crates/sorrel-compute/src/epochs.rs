@@ -335,12 +335,11 @@ pub fn stable_epochs(
     // transformed count) is what is fitted: near silence a single spike is
     // strong evidence of firing, which a Gaussian on the transform misses.
     let sigma_rate = noise_scale(&anscombe.map(|y| (y, 1.0)), false).max(1.0);
-    // When most consecutive count differences are zero (sparse burst-only
-    // units), the Anscombe MAD is 0 and its Gaussian mean-absolute fallback
-    // underestimates compound-Poisson dispersion. Estimate count dispersion
-    // from first differences winsorized past the top ~8% of jumps so a few
-    // step boundaries or isolated bursts do not inflate φ.
-    let sparse_phi = {
+    // Estimate count dispersion from first differences winsorized past the
+    // top ~8% of jumps so a few step boundaries or isolated bursts do not
+    // inflate φ, while recurrent bursts (whether sparse or dense) still
+    // reflect their true compound-Poisson overdispersion.
+    let count_phi = {
         let mean_c = counts.iter().map(|&c| f64::from(c)).sum::<f64>() / BINS as f64;
         if mean_c > 0.0 {
             let mut diffs: Vec<f64> = counts
@@ -348,25 +347,21 @@ pub fn stable_epochs(
                 .map(|w| (f64::from(w[1]) - f64::from(w[0])).abs())
                 .collect();
             diffs.sort_unstable_by(f64::total_cmp);
-            if diffs[diffs.len() / 2] == 0.0 {
-                let cap = diffs[diffs.len().saturating_sub(9)];
-                let var = diffs
-                    .iter()
-                    .map(|&d| {
-                        let w = d.min(cap);
-                        0.5 * w * w
-                    })
-                    .sum::<f64>()
-                    / diffs.len() as f64;
-                var / mean_c
-            } else {
-                1.0
-            }
+            let cap = diffs[diffs.len().saturating_sub(9)];
+            let var = diffs
+                .iter()
+                .map(|&d| {
+                    let w = d.min(cap);
+                    0.5 * w * w
+                })
+                .sum::<f64>()
+                / diffs.len() as f64;
+            var / mean_c
         } else {
             1.0
         }
     };
-    let phi = (sigma_rate * sigma_rate).max(sparse_phi);
+    let phi = (sigma_rate * sigma_rate).max(count_phi);
     let rate = counts.map(|c| rate_bin(f64::from(c), K2 * phi));
     let nonempty: Vec<_> = (0..BINS)
         .filter(|&b| counts[b] > 0)
@@ -656,40 +651,45 @@ mod tests {
 
     #[test]
     fn burst_only_units_rarely_split_while_silence_stays_detectable() {
-        // 200 stationary 100 s recordings with 0.2 Hz Poisson burst onsets
-        // (8 spikes, 4 ms apart) and no tonic background.
-        let mut splits_rate = 0;
-        let mut splits_amp = 0;
-        for seed in 0..200_u64 {
-            let mut onset = rng(seed + 10_000);
-            let mut times = Vec::new();
-            let mut t = 0.0;
-            loop {
-                t -= onset().ln() / 0.2;
-                if t >= 99.9 {
-                    break;
+        // Stationary 100 s recordings with 0.2 Hz (mostly-zero bin diffs) and
+        // 0.4 Hz (nonzero median bin diff) Poisson burst onsets (8 spikes,
+        // 4 ms apart) and no tonic background.
+        for (rate_hz, seed_base) in [(0.2, 10_000_u64), (0.4, 30_000_u64)] {
+            let mut splits_rate = 0;
+            let mut splits_amp = 0;
+            for seed in 0..200_u64 {
+                let mut onset = rng(seed + seed_base);
+                let mut times = Vec::new();
+                let mut t = 0.0;
+                loop {
+                    t -= onset().ln() / rate_hz;
+                    if t >= 99.9 {
+                        break;
+                    }
+                    times.extend(
+                        (0..8).map(|i| SampleIndex(((t + 0.004 * i as f64) * 1000.0) as u64)),
+                    );
                 }
-                times.extend((0..8).map(|i| SampleIndex(((t + 0.004 * i as f64) * 1000.0) as u64)));
+                if times.len() < MIN_SPIKES {
+                    continue;
+                }
+                if stable_epochs(&times, &[], TOTAL, SR).len() > 1 {
+                    splits_rate += 1;
+                }
+                let amps = vec![100.0; times.len()];
+                if stable_epochs(&times, &amps, TOTAL, SR).len() > 1 {
+                    splits_amp += 1;
+                }
             }
-            if times.len() < MIN_SPIKES {
-                continue;
-            }
-            if stable_epochs(&times, &[], TOTAL, SR).len() > 1 {
-                splits_rate += 1;
-            }
-            let amps = vec![100.0; times.len()];
-            if stable_epochs(&times, &amps, TOTAL, SR).len() > 1 {
-                splits_amp += 1;
-            }
+            assert!(
+                splits_rate <= 12,
+                "burst-only ({rate_hz} Hz) rate false splits: {splits_rate}/200"
+            );
+            assert!(
+                splits_amp <= 12,
+                "burst-only ({rate_hz} Hz) amp false splits: {splits_amp}/200"
+            );
         }
-        assert!(
-            splits_rate <= 10,
-            "burst-only rate false splits: {splits_rate}/200"
-        );
-        assert!(
-            splits_amp <= 10,
-            "burst-only amp false splits: {splits_amp}/200"
-        );
 
         // Sustained silence on a burst-only train remains detectable:
         // 0.35 Hz bursts for 60 s, then 40 s of silence. Check that the
