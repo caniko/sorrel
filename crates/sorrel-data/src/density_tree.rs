@@ -3,9 +3,9 @@
 //! Nodes are feature hypotheses; neither compactness nor rpc assigns a label.
 
 use crate::proposers::cluster_feature_space;
+use crate::refractory::RefractoryWindows;
 use crate::robust_cleanup::robust_boundary_proposal;
 use crate::session::Session;
-use sorrel_compute::sliding_refractory_argmin;
 use sorrel_io::{ClusterId, DataProvider};
 use std::collections::VecDeque;
 
@@ -78,6 +78,20 @@ pub fn density_candidates<P: DataProvider>(
     c: ClusterId,
     globals: &[u32],
 ) -> Vec<DensityNode> {
+    density_candidates_with(
+        session,
+        c,
+        globals,
+        RefractoryWindows::Session(session.refractory()),
+    )
+}
+
+pub(crate) fn density_candidates_with<P: DataProvider>(
+    session: &Session<P>,
+    c: ClusterId,
+    globals: &[u32],
+    windows: RefractoryWindows<'_>,
+) -> Vec<DensityNode> {
     if globals.len() < 200 {
         return vec![];
     }
@@ -92,14 +106,7 @@ pub fn density_candidates<P: DataProvider>(
     }
     let duration = session.provider.n_samples().0;
     let measure = |t: &[_]| {
-        let (cont, rp) = sliding_refractory_argmin(
-            t,
-            (sr * 0.0005) as u64,
-            (sr * 0.010) as u64,
-            20,
-            duration,
-            sr,
-        );
+        let (cont, rp) = windows.sweep(t, duration, sr);
         if rp > 0 {
             cont
         } else {

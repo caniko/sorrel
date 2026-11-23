@@ -319,7 +319,7 @@ fn untrainable_competitor_is_reported_and_its_spikes_are_not_added() {
     let out = run(&s, &args(&["--cpu"]), &[]).unwrap();
     assert_eq!(out.unmodelled, vec![2]);
     // Cluster 2's spikes look like unit 0's; none may be added to anyone.
-    let refr = (0.0015 * s.provider.sample_rate()).ceil() as u64;
+    let refr = s.refractory().fixed_samples(s.provider.sample_rate());
     for t2 in s.spike_times(ClusterId::new(2)) {
         for (u, ts) in &out.added_times {
             assert!(

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use egui::{Sense, Shape, Stroke, Ui};
-use sorrel_compute::{isi_histogram_range, isi_violations};
+use sorrel_compute::{isi_histogram_range, isi_violations, refractory_evidence};
 use sorrel_data::{preview_split, Session, SplitPreview};
 use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 
@@ -29,9 +29,6 @@ struct IsiEntry {
     key: IsiKey,
     hists: Arc<Vec<Vec<u32>>>,
 }
-
-/// The shaded band's width and the violation legend's window.
-const REFRACTORY_MS: f32 = 1.0;
 
 /// Local indices of every spike that is part of an ISI below `refractory`
 /// samples (both members of each pair, ascending), and the pair count.
@@ -72,7 +69,7 @@ pub(crate) fn split_target(
 
 type SplitMemo =
     std::sync::Arc<std::sync::Mutex<crate::jobs::Memo<SplitKey, std::sync::Arc<SplitPreview>>>>;
-type SplitKey = ((BrushSource, u64, usize, usize), ClusterId);
+type SplitKey = ((BrushSource, u64, usize, usize), ClusterId, u64);
 
 /// The what-if for the current brush, computed off the UI thread. Shared by
 /// the ISI and Quality panes (one memo in egui's temp memory, keyed by the
@@ -87,7 +84,7 @@ pub(crate) fn split_preview<P: DataProvider>(
     selection: &[ClusterId],
 ) -> Option<std::sync::Arc<SplitPreview>> {
     let (c, idx) = split_target(brushes, selection, |c| session.spike_times(c).len())?;
-    let key = (brushes.spikes.as_ref()?.key(), c);
+    let key = (brushes.spikes.as_ref()?.key(), c, session.metrics_version());
     let id = egui::Id::new("split_whatif_memo");
     let memo: SplitMemo = ui.data_mut(|d| {
         d.get_temp_mut_or_insert_with(id, SplitMemo::default)
@@ -107,6 +104,62 @@ fn refractory_pct(times: &[SampleIndex], refractory: u64) -> f32 {
     } else {
         isi_violations(times, refractory) as f32 / times.len() as f32 * 100.0
     }
+}
+
+fn refractory_tooltip<P: DataProvider>(ui: &Ui, session: &Session<P>, c: ClusterId) -> String {
+    type Tooltip = ((ClusterId, u64), String);
+    let key = (c, session.metrics_version());
+    // Metrics versions are session-local; different tabs can have the same one.
+    let id = egui::Id::new(("isi_refractory_tooltip", session.journal_path()));
+    if let Some((_, text)) = ui
+        .data(|d| d.get_temp::<Tooltip>(id))
+        .filter(|(k, _)| *k == key)
+    {
+        return text;
+    }
+    let (srp, post) = refractory_evidence(
+        session.spike_times(c),
+        session.provider.n_samples().0,
+        session.provider.sample_rate(),
+        session.refractory(),
+    );
+    // Two significant digits, so a tiny but non-zero bound does not print as 0.
+    let pct = |f: f32| {
+        let p = 100.0 * f;
+        let decimals = match p > 0.0 && p < 1.0 {
+            true => (1 - p.log10().floor() as i32) as usize,
+            false => 1,
+        };
+        format!("{p:.decimals$}%")
+    };
+    let srp = match (srp.min_contamination.is_nan(), srp.tested) {
+        (true, false) => "SRP n/a".to_owned(),
+        // Tested but nothing passed: too few spikes or heavy contamination.
+        (true, true) => "SRP unconfirmed ≤35%".to_owned(),
+        (false, _) => format!(
+            "SRP ≤{} (90%) @ {:.2} ms",
+            pct(srp.min_contamination),
+            srp.rp_ms
+        ),
+    };
+    // The posterior uses the fixed window, not the SRP one; disagreement can
+    // mean the fixed window is longer than this unit's refractory period.
+    // Shown as the sample edge actually used, like the SRP window.
+    let sr = session.provider.sample_rate();
+    let fixed = session.refractory().fixed_samples(sr) as f32 * 1000.0 / sr;
+    let text = if post.mean.is_nan() {
+        // No window: it may not exist (e.g. a zero sample rate gives NaN ms).
+        format!("{srp} · posterior n/a")
+    } else {
+        format!(
+            "{srp} · {fixed:.2} ms posterior {} (95% CrI {}–{})",
+            pct(post.mean),
+            pct(post.lo95),
+            pct(post.hi95)
+        )
+    };
+    ui.data_mut(|d| d.insert_temp(id, (key, text.clone())));
+    text
 }
 
 /// phy status text: `[x_min ms, x_max ms]`.
@@ -225,8 +278,8 @@ pub fn isi_view<P: DataProvider>(
         }
     };
 
-    // Legend row: one chip per cluster with its <1 ms violations.
-    let refractory_samples = (sr * REFRACTORY_MS / 1e3).round() as u64;
+    let refractory_ms = session.refractory().fixed_ms;
+    let refractory_samples = session.refractory().fixed_samples(sr);
     let mut clicked: Vec<ClusterId> = Vec::new();
     ui.horizontal_wrapped(|ui| {
         for (slot, &c) in shown.iter().enumerate() {
@@ -239,7 +292,7 @@ pub fn isi_view<P: DataProvider>(
             };
             let (bg, text) = (
                 selection_colour(slot),
-                format!("c{c} <1 ms {viol}/{n} ({pct:.1}%)"),
+                format!("c{c} <{refractory_ms} ms {viol}/{n} ({pct:.1}%)"),
             );
             let fg = contrast_text(bg);
             let g = ui
@@ -257,7 +310,10 @@ pub fn isi_view<P: DataProvider>(
                 )
             });
             if resp
-                .on_hover_text("Click to brush this cluster's violating spikes")
+                .on_hover_ui(|ui| {
+                    ui.label("Click to brush this cluster's violating spikes");
+                    ui.label(refractory_tooltip(ui, session, c));
+                })
                 .clicked()
             {
                 clicked.push(c);
@@ -302,9 +358,8 @@ pub fn isi_view<P: DataProvider>(
     let dp = painter.with_clip_rect(data);
     let x_of = |ms: f32| data.left() + (ms - p.x_min_ms) / (p.x_max_ms - p.x_min_ms) * data.width();
 
-    // Shade [0, 1 ms) over the full height (clipped to the visible range;
-    // empty once x_min >= 1), at least 3 px wide so it never reads as a line.
-    let band = (p.x_min_ms.max(0.0), 1.0_f32.min(p.x_max_ms));
+    // Shade the fixed refractory window, clipped to the visible range.
+    let band = (p.x_min_ms.max(0.0), refractory_ms.min(p.x_max_ms));
     if band.1 > band.0 {
         let (x0, x1) = (x_of(band.0), x_of(band.1).max(x_of(band.0) + 3.0));
         dp.rect_filled(
@@ -319,7 +374,7 @@ pub fn isi_view<P: DataProvider>(
         dp.text(
             egui::pos2(x1 + 4.0, data.top() + 2.0),
             egui::Align2::LEFT_TOP,
-            "1 ms",
+            format!("{refractory_ms} ms"),
             egui::FontId::proportional(TICK_PX),
             theme.danger,
         );
@@ -451,6 +506,86 @@ fn brush_violators(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refractory_tooltip_refreshes_and_keeps_sessions_isolated() {
+        use sorrel_compute::RefractoryParams;
+        use sorrel_data::Journal;
+        use sorrel_io::{TraceSamples, TraceSlice};
+
+        struct Provider(Vec<SampleIndex>);
+        impl DataProvider for Provider {
+            type Label = u8;
+            fn sample_rate(&self) -> f32 {
+                1_000.0
+            }
+            fn n_samples(&self) -> SampleIndex {
+                SampleIndex(1_000)
+            }
+            fn n_channels(&self) -> u32 {
+                1
+            }
+            fn n_clusters(&self) -> u32 {
+                1
+            }
+            fn spike_times(&self, _: ClusterId) -> &[SampleIndex] {
+                &self.0
+            }
+            fn initial_labels(&self) -> Vec<u8> {
+                vec![0]
+            }
+            fn trace(&self, start: SampleIndex, _: u32) -> TraceSlice<'_> {
+                TraceSlice {
+                    start,
+                    n_channels: 1,
+                    samples: TraceSamples::I16(&[]),
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let make = |name, n: u64| {
+            Session::new(
+                Provider((0..n).map(|i| SampleIndex(i * 10)).collect()),
+                Journal::open(&dir.path().join(name)).unwrap(),
+            )
+        };
+        let mut clean = make("clean", 100);
+        let mut sparse = make("sparse", 2);
+        let params = RefractoryParams {
+            fixed_ms: 4.0,
+            ..Default::default()
+        };
+        clean.set_refractory(params).unwrap();
+        sparse.set_refractory(params).unwrap();
+        assert_eq!(clean.metrics_version(), sparse.metrics_version());
+        let ctx = egui::Context::default();
+        let c = ClusterId(0);
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            let confirmed = refractory_tooltip(ui, &clean, c);
+            assert!(
+                confirmed.contains("SRP ≤1.5% (90%) @ 10.00 ms"),
+                "{confirmed}"
+            );
+            assert!(confirmed.contains("4.00 ms posterior"), "{confirmed}");
+            let unconfirmed = refractory_tooltip(ui, &sparse, c);
+            assert!(
+                unconfirmed.starts_with("SRP unconfirmed ≤35%"),
+                "{unconfirmed}"
+            );
+            assert!(unconfirmed.contains("4.00 ms posterior"), "{unconfirmed}");
+        });
+        clean
+            .set_refractory(RefractoryParams {
+                fixed_ms: 1.0,
+                sweep_max_ms: 1.25,
+                ..params
+            })
+            .unwrap();
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            assert_eq!(refractory_tooltip(ui, &clean, c), "SRP n/a · posterior n/a");
+        });
+    }
 
     #[test]
     fn violators_include_both_members_once() {

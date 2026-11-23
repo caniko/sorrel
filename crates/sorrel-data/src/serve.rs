@@ -252,7 +252,11 @@ fn read_tools() -> Vec<Value> {
     vec![
         json!({"name": "list_clusters", "description": "Compact TSV of clusters (id n label tags origin parents note; - = empty); optional label filter and tag-prefix filter (\"review:\" = the review queue). For evidence use brief",
          "inputSchema": {"type": "object", "properties": {"label": {"type": "string"}, "tag": {"type": "string"}}}}),
-        json!({"name": "metrics", "description": "Quality metrics of one cluster as JSON (same columns as cluster_qc.tsv). brief level 2 gives the same numbers for many units at once, quantised",
+        json!({"name": "refractory", "description": "Get current and default refractory periods in milliseconds, or set any supplied values. Changes what metrics, brief, suggest, eval and probe use for the whole session, including the human's GUI when attached. Not persisted.",
+            "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
+                "fixed_ms": {"type": "number"}, "sweep_min_ms": {"type": "number", "description": "Exclusive lower bound"},
+                "sweep_max_ms": {"type": "number", "description": "Inclusive upper bound"}, "sweep_step_ms": {"type": "number"}}}}),
+        json!({"name": "metrics", "description": "Quality metrics of one cluster as JSON (same columns as cluster_qc.tsv, plus refractory settings). srp_contamination is a nominal 90% upper limit on contamination from the sliding-RP test; null means not confirmed at or below 35% (too few spikes or heavier contamination), so never treat null as clean. rpv_post_* is a contamination posterior at the fixed window (flat prior): read [lo95, hi95], not the mean alone; lo95 > x is evidence of contamination if contaminating spikes are diffuse (Poisson) and the fixed window is no longer than the unit's refractory period; a wide interval from near 0 is too little data. brief level 2 gives the same numbers for many units at once, quantised",
          "inputSchema": cluster}),
         json!({"name": "suggest", "description": "Merge components and split candidates for the current curation, each with a handle (m<k>, s<cluster>.<k>) and a one-line counterfactual; pass the handle as candidate to split/propose/eval",
          "inputSchema": {"type": "object", "properties": {}}}),
@@ -550,6 +554,39 @@ where
         }
     }
     Ok(match name {
+        "refractory" => {
+            let Some(args) = args.as_object() else {
+                return fail("refractory arguments must be an object");
+            };
+            let default = sorrel_compute::RefractoryParams::default();
+            let current = if args.is_empty() {
+                *host.read().refractory()
+            } else {
+                let mut s = host.write();
+                let mut p = *s.refractory();
+                for (key, value) in args {
+                    let field = match key.as_str() {
+                        "fixed_ms" => &mut p.fixed_ms,
+                        "sweep_min_ms" => &mut p.sweep_min_ms,
+                        "sweep_max_ms" => &mut p.sweep_max_ms,
+                        "sweep_step_ms" => &mut p.sweep_step_ms,
+                        _ => return fail(format!("unknown refractory parameter {key:?}")),
+                    };
+                    *field = value
+                        .as_f64()
+                        .ok_or_else(|| ToolError::Failed(format!("{key} must be a number")))?
+                        as f32;
+                }
+                let changed = *s.refractory() != p;
+                s.set_refractory(p).map_err(ToolError::Failed)?;
+                drop(s);
+                if let Some(ui) = env.ui.as_ref().filter(|_| changed) {
+                    (ui.wake)();
+                }
+                p
+            };
+            text(json!({"current": current, "default": default}))
+        }
         "tag" => {
             let cluster = check(&host.read(), arg_u32(args, "cluster")?)?;
             let mut tags: Vec<String> = args
@@ -847,7 +884,7 @@ fn suggestions<'a, P: DataProvider, F>(
     session: &Session<P>,
     env: &'a mut Env<F>,
 ) -> (&'a [MergeCandidate], &'a [SplitCandidate]) {
-    let version = session.version();
+    let version = session.metrics_version();
     if env.suggest.as_ref().is_none_or(|(v, ..)| *v != version) {
         let cfg = SuggestConfig {
             top_merges: usize::MAX,
@@ -993,13 +1030,13 @@ fn resolve_rules(
     Ok((text, set))
 }
 
-/// QC rows for the session's current version, recomputed only after an edit.
+/// QC rows for the current curation state and refractory settings.
 fn cached_qc<'a, P: DataProvider>(
     session: &Session<P>,
     qc: &'a mut Option<(u64, Vec<QcRow>)>,
     positions: Option<&[[f32; 2]]>,
 ) -> &'a [QcRow] {
-    let version = session.version();
+    let version = session.metrics_version();
     if qc.as_ref().is_none_or(|(v, _)| *v != version) {
         *qc = Some((version, collect_qc_rows_with(session, positions)));
     }
@@ -1413,7 +1450,7 @@ where
                     .unwrap_or_default(),
             };
             refresh_handles(session, env);
-            let version = session.version();
+            let version = session.metrics_version();
             if env.qc.as_ref().is_none_or(|(v, _)| *v != version) {
                 env.qc = Some((version, collect_qc_rows_with(session, positions)));
             }
@@ -1463,16 +1500,13 @@ where
         }
         "metrics" => {
             let c = check(session, arg_u32(args, "cluster")?)?;
-            let version = session.version();
-            if env.qc.as_ref().is_none_or(|(v, _)| *v != version) {
-                env.qc = Some((version, collect_qc_rows_with(session, positions)));
-            }
-            let row = env
-                .qc
-                .as_ref()
-                .and_then(|(_, rows)| rows.iter().find(|r| r.cluster_id == c.0))
+            let row = cached_qc(session, &mut env.qc, positions)
+                .iter()
+                .find(|r| r.cluster_id == c.0)
                 .ok_or_else(|| ToolError::Failed(format!("no metrics for cluster {}", c.0)))?;
-            text(row.to_json())
+            let mut value = row.to_json();
+            value["refractory"] = json!(session.refractory());
+            text(value)
         }
         "suggest" => {
             refresh_handles(session, env);
@@ -1488,8 +1522,8 @@ where
             }))
         }
         "eval" => {
-            sync_thresholds(env);
-            let _ = suggestions(session, env);
+            // Handles carry RP-dependent scores, so refresh them too.
+            refresh_handles(session, env);
             let Some((_, merges, _)) = &env.suggest else {
                 return fail("suggest cache missing");
             };
@@ -2156,9 +2190,35 @@ pub fn call_once_for_session(
     discard_journal: bool,
     request: &Value,
 ) -> Result<Option<Value>> {
+    call_once_at(save_dir, None, session_key, discard_journal, request)
+}
+
+/// Send one JSON-RPC request to the exact registry entry selected by bare `sorrel mcp`.
+pub fn call_once_registered(
+    save_dir: &Path,
+    registry_key: Option<&str>,
+    request: &Value,
+) -> Result<Option<Value>> {
+    call_once_at(save_dir, registry_key, None, false, request)
+}
+
+fn call_once_at(
+    save_dir: &Path,
+    registry_key: Option<&str>,
+    session_key: Option<&str>,
+    discard_journal: bool,
+    request: &Value,
+) -> Result<Option<Value>> {
     let mut out = Vec::new();
     let input = std::io::Cursor::new(format!("{request}\n"));
-    if !attach_for_session(save_dir, session_key, discard_journal, input, &mut out)? {
+    if !attach_at(
+        save_dir,
+        registry_key,
+        session_key,
+        discard_journal,
+        input,
+        &mut out,
+    )? {
         return Ok(None);
     }
     let line = out.split(|&b| b == b'\n').next().unwrap_or_default();
@@ -2262,8 +2322,19 @@ mod tests {
         assert_eq!(replies[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(
             replies[1]["result"]["tools"].as_array().unwrap().len(),
-            22 + usize::from(cfg!(feature = "phy-export"))
+            23 + usize::from(cfg!(feature = "phy-export"))
         );
+        let refractory = replies[1]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "refractory")
+            .unwrap();
+        let properties = refractory["inputSchema"]["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 4);
+        for field in ["fixed_ms", "sweep_min_ms", "sweep_max_ms", "sweep_step_ms"] {
+            assert_eq!(properties[field]["type"], "number");
+        }
         assert_eq!(replies[2]["id"], 3);
         assert_eq!(replies[2]["result"]["isError"], false);
         assert_eq!(h.read().label(ClusterId(0)), Some(1));
@@ -2394,6 +2465,240 @@ mod tests {
 
     fn payload(reply: &Value) -> Value {
         serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn refractory_tool_updates_live_metrics_and_rejects_invalid_patches() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SessionHost::new(mock_session(dir.path()));
+        let mut env = Env::new(dir.path(), false, label);
+        let mut run = |name, args| handle_line(&h, &mut env, &call(1, name, args)).unwrap();
+        let defaults = payload(&run("refractory", json!({})));
+        assert_eq!(defaults["current"], defaults["default"]);
+        let before = payload(&run("metrics", json!({"cluster": 0})));
+        let new = payload(&run("refractory", json!({"fixed_ms": 30.0})));
+        assert_eq!(new["current"]["fixed_ms"], 30.0);
+        assert_eq!(new["current"]["sweep_max_ms"], 10.0);
+        let after = payload(&run("metrics", json!({"cluster": 0})));
+        assert_eq!(after["refractory"], new["current"]);
+        assert_eq!(before["isi_violations"].as_f64(), Some(0.0));
+        assert_eq!(after["isi_violations"].as_f64(), Some(1.0));
+        assert!(
+            after["rpv_post_mean"].as_f64().unwrap() > before["rpv_post_mean"].as_f64().unwrap()
+        );
+        let invalid = run(
+            "refractory",
+            json!({"sweep_step_ms": 0.0, "fixed_ms": 50.0}),
+        );
+        assert_eq!(invalid["result"]["isError"], true);
+        assert_eq!(payload(&run("refractory", json!({}))), new);
+    }
+
+    #[test]
+    fn refractory_sweep_updates_the_warm_mcp_cache_one_field_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let make_session = |name: &str| {
+            Session::new(
+                MockProvider {
+                    spikes: vec![vec![0, 3, 30, 60, 90]
+                        .into_iter()
+                        .map(SampleIndex)
+                        .collect()],
+                    amps: vec![vec![1.0; 5]],
+                    n_samples: SampleIndex(100),
+                },
+                Journal::open(&dir.path().join(name)).unwrap(),
+            )
+        };
+        let h = SessionHost::new(make_session("active"));
+        let isolated = make_session("isolated");
+        let mut env = Env::new(dir.path(), false, label);
+        let mut run = |name, args| handle_line(&h, &mut env, &call(1, name, args)).unwrap();
+        let metrics = || json!({"cluster": 0});
+        assert_eq!(payload(&run("metrics", metrics()))["rp_contamination"], 0.0);
+        let original_version = h.read().metrics_version();
+
+        for (field, value, width) in [
+            ("sweep_min_ms", 3.5, 10),
+            ("sweep_step_ms", 1.1, 9),
+            ("sweep_max_ms", 8.0, 8),
+        ] {
+            let version = h.read().metrics_version();
+            let patch = json!({(field): value});
+            let updated = payload(&run("refractory", patch.clone()));
+            assert!((updated["current"][field].as_f64().unwrap() - value).abs() < 1e-6);
+            assert_ne!(h.read().metrics_version(), version);
+            let row = payload(&run("metrics", metrics()));
+            let contamination = row["rp_contamination"].as_f64().unwrap();
+            assert!(
+                (contamination - 2.0 / f64::from(width)).abs() < 1e-6,
+                "{row}"
+            );
+
+            let version = h.read().metrics_version();
+            _ = run("refractory", patch);
+            assert_eq!(h.read().metrics_version(), version, "identical patch");
+            assert_eq!(
+                run("refractory", json!({"sweep_max_ms": 3.0}))["result"]["isError"],
+                true
+            );
+            assert_eq!(h.read().metrics_version(), version, "invalid patch");
+            assert_eq!(payload(&run("metrics", metrics())), row);
+        }
+        assert_eq!(
+            *isolated.refractory(),
+            sorrel_compute::RefractoryParams::default()
+        );
+        assert_eq!(isolated.metrics_version(), original_version);
+        assert_eq!(
+            crate::qc_export::collect_qc_rows(&isolated)[0].rp_contamination,
+            0.0
+        );
+        let brief = run("brief", json!({"level": 2, "clusters": [0]}));
+        let brief = brief["result"]["content"][0]["text"].as_str().unwrap();
+        let (_, cards) = brief.split_once("\ncards:\n").unwrap();
+        let column = cards
+            .lines()
+            .next()
+            .unwrap()
+            .split('\t')
+            .position(|field| field == "rp_contamination")
+            .unwrap();
+        let row = cards.lines().find(|line| line.starts_with("0\t")).unwrap();
+        assert_eq!(row.split('\t').nth(column), Some("0.25"));
+        let acg = run("probe", json!({"q": "acg 0"}));
+        assert!(
+            acg["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("rp 8.0ms"),
+            "{acg}"
+        );
+    }
+
+    #[test]
+    fn refractory_evidence_in_metrics_json_and_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SessionHost::new(mock_session(dir.path()));
+        let mut env = Env::new(dir.path(), false, label);
+        let r = handle_line(&h, &mut env, &call(1, "metrics", json!({"cluster": 0}))).unwrap();
+        let row = payload(&r);
+        for name in ["srp_contamination", "srp_rp_ms"] {
+            assert!(
+                row.get(name).unwrap().is_null(),
+                "not enough spikes to confirm {name}"
+            );
+        }
+        let lo = row["rpv_post_lo95"].as_f64().unwrap();
+        let mean = row["rpv_post_mean"].as_f64().unwrap();
+        let hi = row["rpv_post_hi95"].as_f64().unwrap();
+        assert!(lo < mean && mean < hi && hi > 0.1);
+
+        let rules = r#"
+            [[rule]]
+            name = "review refractory evidence"
+            metric = "rpv_post_hi95"
+            op = ">"
+            value = 0.1
+            label = "mua"
+        "#;
+        let r = handle_line(
+            &h,
+            &mut env,
+            &call(2, "rules_eval", json!({"rules": rules})),
+        )
+        .unwrap();
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let t = texts(&r);
+        assert!(
+            t.contains("review refractory evidence: rpv_post_hi95>0.1 -> mua: 2"),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn confirmed_sliding_rp_matches_brief_and_rules_until_reconfigured() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::new(
+            MockProvider {
+                spikes: vec![
+                    (0..100).map(|i| SampleIndex(i * 10)).collect(),
+                    [10, 90].map(SampleIndex).to_vec(),
+                ],
+                amps: vec![vec![], vec![]],
+                n_samples: SampleIndex(1000),
+            },
+            Journal::open(&dir.path().join("j")).unwrap(),
+        );
+        let host = SessionHost::new(session);
+        let mut env = Env::new(dir.path(), false, label);
+        let list = handle_line(&host, &mut env, &rpc(1, "tools/list", json!({}))).unwrap();
+        let schema = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "metrics")
+            .unwrap();
+        assert_eq!(schema["inputSchema"]["required"], json!(["cluster"]));
+        assert!(schema["description"]
+            .as_str()
+            .unwrap()
+            .contains("never treat null as clean"));
+        let mut run = |tool, args| handle_line(&host, &mut env, &call(1, tool, args)).unwrap();
+        let finite = payload(&run("metrics", json!({"cluster": 0})));
+        assert!((finite["srp_contamination"].as_f64().unwrap() - 0.015).abs() < 1e-8);
+        assert_eq!(finite["srp_rp_ms"], 10.0);
+        let low_power = payload(&run("metrics", json!({"cluster": 1})));
+        assert!(low_power["srp_contamination"].is_null());
+        assert!(low_power["rpv_post_mean"].as_f64().is_some());
+        let brief = texts(&run("brief", json!({"level": 2, "clusters": [0, 1]})));
+        let mut cards = brief.split_once("\ncards:\n").unwrap().1.lines();
+        let col = cards
+            .next()
+            .unwrap()
+            .split('\t')
+            .position(|h| h == "srp_contamination")
+            .unwrap();
+        assert_eq!(cards.next().unwrap().split('\t').nth(col), Some("0.015"));
+        assert_eq!(cards.next().unwrap().split('\t').nth(col), Some("-"));
+        let rules = json!({"rules": r#"
+            [[rule]]
+            name = "confirmed"
+            metric = "srp_contamination"
+            op = "<"
+            value = 0.02
+            label = "good"
+        "#});
+        let before = texts(&run("rules_eval", rules.clone()));
+        assert!(
+            before.contains("confirmed: srp_contamination<0.02 -> good: 1"),
+            "{before}"
+        );
+        let update = run("refractory", json!({"fixed_ms": 1.0, "sweep_max_ms": 1.25}));
+        assert_eq!(update["result"]["isError"], false, "{update}");
+        let after = payload(&run("metrics", json!({"cluster": 0})));
+        assert!(after["srp_contamination"].is_null() && after["rpv_post_mean"].is_null());
+        let after = texts(&run("rules_eval", rules));
+        assert!(
+            after.contains("confirmed: srp_contamination<0.02 -> good: 0"),
+            "{after}"
+        );
+
+        let update = run("refractory", json!({"fixed_ms": 4.0, "sweep_max_ms": 10.0}));
+        assert_eq!(update["result"]["isError"], false, "{update}");
+        let initial = payload(&run("metrics", json!({"cluster": 0})));
+        let split = run("split", json!({"cluster": 0, "spike_idx": [0]}));
+        assert_eq!(split["result"]["isError"], false, "{split}");
+        let edited = payload(&run("metrics", json!({"cluster": 0})));
+        assert!(
+            edited["rpv_post_mean"].as_f64().unwrap() > initial["rpv_post_mean"].as_f64().unwrap()
+        );
+        let moved = payload(&run("metrics", json!({"cluster": 2})));
+        assert!(moved["rpv_post_mean"].is_null());
+        assert_eq!(run("undo", json!({}))["result"]["isError"], false);
+        assert_eq!(payload(&run("metrics", json!({"cluster": 0}))), initial);
+        host.apply(Actor::Human, CurationCommand::Redo).unwrap();
+        assert_eq!(payload(&run("metrics", json!({"cluster": 0}))), edited);
     }
 
     fn ui() -> (Arc<Ui>, std::sync::mpsc::Receiver<Vec<ClusterId>>) {

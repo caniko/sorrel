@@ -19,6 +19,7 @@ pub mod lttb;
 pub mod metrics;
 pub mod metrics_iso;
 pub mod quality;
+pub mod refractory;
 pub mod rescue;
 pub mod shape;
 pub mod snippets;
@@ -44,12 +45,16 @@ pub use metrics::{
     amplitude_snr, auto_correlogram, ccg_baseline, correlograms, cross_correlogram, fraction_below,
     isi_violation_rate, isi_violations, mean_amplitude, min_contamination_sliding_refractory,
     presence_ratio, refractory_contamination, sliding_refractory_argmin, std_amplitude,
+    RefractoryParams,
 };
 pub use metrics_iso::{
     isolation_metrics, lda_d_prime, nn_isolation_metric, simplified_silhouette, IsolationMetrics,
     MIN_CLUSTER_SPIKES,
 };
 pub use quality::{quality_breakdown, QualityBreakdown};
+pub use refractory::{
+    contamination_posterior, refractory_evidence, sliding_rp, ContaminationPosterior, SlidingRp,
+};
 pub use shape::{
     burst_index, footprint, log_bins, peak_channel, sax, waveform_landmarks, Footprint,
     WaveformLandmarks,

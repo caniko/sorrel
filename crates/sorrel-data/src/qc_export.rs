@@ -13,7 +13,8 @@
 //! cluster sessions export in a few seconds.
 
 use crate::cache::correlograms::acg_or_compute;
-use crate::quality_ext::cluster_quality;
+use crate::quality_ext::cluster_quality_with;
+use crate::refractory::RefractoryWindows;
 use crate::session::Session;
 use anyhow::{Context, Result};
 use sorrel_io::{ClusterId, DataProvider};
@@ -67,6 +68,14 @@ pub struct QcRow {
     pub amplitude_dip: f32,
     /// Amplitude change per second (least squares).
     pub drift_slope: f32,
+    /// Minimum contamination fraction confirmed by sliding-RP, or `NaN`.
+    pub srp_contamination: f32,
+    /// Highest-confidence window at that fraction (ms, first on ties), or `NaN`.
+    pub srp_rp_ms: f32,
+    /// Fixed-window contamination posterior mean and shortest 95% interval.
+    pub rpv_post_mean: f32,
+    pub rpv_post_lo95: f32,
+    pub rpv_post_hi95: f32,
 }
 
 impl Default for QcRow {
@@ -107,18 +116,19 @@ impl Default for QcRow {
             rp_contamination: n,
             amplitude_dip: n,
             drift_slope: n,
+            srp_contamination: n,
+            srp_rp_ms: n,
+            rpv_post_mean: n,
+            rpv_post_lo95: n,
+            rpv_post_hi95: n,
         }
     }
 }
 
 impl QcRow {
-    /// Columns before the shape/footprint additions; the TSV and JSON
-    /// writers emit those by name from `METRICS[N_BASE..]`.
-    const N_BASE: usize = 16;
-
     /// Every metric column name, in TSV order. The single source of truth
     /// for names used by `get`, the rule engine, and the exports.
-    pub const METRICS: [&'static str; 32] = [
+    pub const METRICS: [&'static str; 37] = [
         "n_spikes",
         "firing_rate",
         "mean_amplitude",
@@ -151,6 +161,11 @@ impl QcRow {
         "rp_contamination",
         "amplitude_dip",
         "drift_slope",
+        "srp_contamination",
+        "srp_rp_ms",
+        "rpv_post_mean",
+        "rpv_post_lo95",
+        "rpv_post_hi95",
     ];
 
     /// `{"cluster_id": .., "<metric>": number | null, ...}` — NaN becomes
@@ -207,99 +222,55 @@ impl QcRow {
             "rp_contamination" => self.rp_contamination,
             "amplitude_dip" => self.amplitude_dip,
             "drift_slope" => self.drift_slope,
+            "srp_contamination" => self.srp_contamination,
+            "srp_rp_ms" => self.srp_rp_ms,
+            "rpv_post_mean" => self.rpv_post_mean,
+            "rpv_post_lo95" => self.rpv_post_lo95,
+            "rpv_post_hi95" => self.rpv_post_hi95,
             _ => return None,
         })
     }
 
     fn tsv_header() -> String {
-        let mut h = "cluster_id\tn_spikes\tfiring_rate\tmean_amplitude\tpresence_ratio\t\
-         isi_violations\tisi_violation_ratio\tamplitude_cutoff\tamplitude_snr\t\
-         drift_correlation\tlongest_silent_gap\tcomposite_quality\t\
-         isolation_distance_sq\tl_ratio\tnn_isolation\td_prime\tsilhouette"
-            .to_string();
-        for name in &Self::METRICS[Self::N_BASE..] {
-            h.push('\t');
-            h.push_str(name);
+        format!("cluster_id\t{}\n", Self::METRICS.join("\t"))
+    }
+
+    fn export_value(&self, name: &str, missing: &str) -> String {
+        match name {
+            // Do not round integer counts through the f32 metric lookup.
+            "n_spikes" => self.n_spikes.to_string(),
+            "isi_violations" => self.isi_violations.to_string(),
+            _ => match self.get(name).filter(|v| v.is_finite()) {
+                Some(value) => num(value),
+                None => missing.to_owned(),
+            },
         }
-        h.push('\n');
-        h
     }
 
     fn write_tsv(&self, w: &mut impl Write) -> std::io::Result<()> {
-        write!(
-            w,
-            "{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}",
-            self.cluster_id,
-            self.n_spikes,
-            self.firing_rate_hz,
-            self.mean_amplitude,
-            self.presence_ratio,
-            self.isi_violations,
-            self.isi_violation_ratio,
-            self.amplitude_cutoff,
-            self.amplitude_snr,
-            self.drift_correlation,
-            self.longest_silent_gap,
-            self.composite_quality,
-            fmt_or_empty(self.isolation_distance_sq),
-            fmt_or_empty(self.l_ratio),
-            fmt_or_empty(self.nn_isolation),
-            fmt_or_empty(self.d_prime),
-            fmt_or_empty(self.silhouette),
-        )?;
-        for name in &Self::METRICS[Self::N_BASE..] {
-            write!(w, "\t{}", fmt_or_empty(self.get(name).unwrap_or(f32::NAN)))?;
+        write!(w, "{}", self.cluster_id)?;
+        for name in Self::METRICS {
+            write!(w, "\t{}", self.export_value(name, ""))?;
         }
         writeln!(w)
     }
 
     fn write_json(&self, w: &mut impl Write, leading_comma: bool) -> std::io::Result<()> {
         let prefix = if leading_comma { ",\n" } else { "\n" };
-        write!(
-            w,
-            r#"{prefix}  {{"cluster_id": {}, "n_spikes": {}, "firing_rate": {:.6}, "mean_amplitude": {:.6}, "presence_ratio": {:.6}, "isi_violations": {}, "isi_violation_ratio": {:.6}, "amplitude_cutoff": {:.6}, "amplitude_snr": {:.6}, "drift_correlation": {:.6}, "longest_silent_gap": {:.6}, "composite_quality": {:.6}, "isolation_distance_sq": {}, "l_ratio": {}, "nn_isolation": {}, "d_prime": {}, "silhouette": {}"#,
-            self.cluster_id,
-            self.n_spikes,
-            self.firing_rate_hz,
-            self.mean_amplitude,
-            self.presence_ratio,
-            self.isi_violations,
-            self.isi_violation_ratio,
-            self.amplitude_cutoff,
-            self.amplitude_snr,
-            self.drift_correlation,
-            self.longest_silent_gap,
-            self.composite_quality,
-            json_num(self.isolation_distance_sq),
-            json_num(self.l_ratio),
-            json_num(self.nn_isolation),
-            json_num(self.d_prime),
-            json_num(self.silhouette),
-        )?;
-        for name in &Self::METRICS[Self::N_BASE..] {
-            write!(
-                w,
-                r#", "{name}": {}"#,
-                json_num(self.get(name).unwrap_or(f32::NAN))
-            )?;
+        write!(w, r#"{prefix}  {{"cluster_id": {}"#, self.cluster_id)?;
+        for name in Self::METRICS {
+            write!(w, r#", "{name}": {}"#, self.export_value(name, "null"))?;
         }
         write!(w, "}}")
     }
 }
 
-fn fmt_or_empty(v: f32) -> String {
-    if v.is_finite() {
-        format!("{v:.6}")
-    } else {
-        String::new()
-    }
-}
-
-fn json_num(v: f32) -> String {
-    if v.is_finite() {
-        format!("{v:.6}")
-    } else {
-        "null".to_string()
+/// Six decimals, except tiny non-zero values (posterior bounds of long clean
+/// units) print in full so they do not round to 0.
+fn num(v: f32) -> String {
+    match v != 0.0 && v.abs() < 1e-3 {
+        true => format!("{v}"),
+        false => format!("{v:.6}"),
     }
 }
 
@@ -315,15 +286,27 @@ pub fn collect_qc_rows_with<P: DataProvider>(
     session: &Session<P>,
     positions: Option<&[[f32; 2]]>,
 ) -> Vec<QcRow> {
+    collect_qc_rows_with_windows(
+        session,
+        positions,
+        RefractoryWindows::Session(session.refractory()),
+    )
+}
+
+pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
+    session: &Session<P>,
+    positions: Option<&[[f32; 2]]>,
+    windows: RefractoryWindows<'_>,
+) -> Vec<QcRow> {
     use sorrel_compute::{
         amplitude_drift_slope, burst_index, footprint, hartigan_dip, isi_violation_rate,
-        isi_violations, mean_amplitude, peak_channel, sliding_refractory_argmin,
-        waveform_landmarks,
+        isi_violations, mean_amplitude, peak_channel, refractory_evidence, waveform_landmarks,
     };
-    let sr = session.provider.sample_rate().max(1.0);
+    let sample_rate = session.provider.sample_rate();
+    let sr = sample_rate.max(1.0);
     let total_samples = session.provider.n_samples();
     let total_seconds = total_samples.as_f32() / sr;
-    let refractory_samples = (sr * 0.0015).round() as u64;
+    let refractory_samples = windows.fixed_samples(sr);
     let (_, tpl_samples, tpl_channels) = session.template_shape();
     // ACG at 1 ms bins / 50 ms, the report's (and cache's) window.
     let acg_window = (0.050 * sr) as u32;
@@ -334,7 +317,7 @@ pub fn collect_qc_rows_with<P: DataProvider>(
     for c in (0..n).map(ClusterId) {
         let times = session.spike_times(c);
         let amps = session.spike_amplitudes(c);
-        let q = cluster_quality(session, c);
+        let q = cluster_quality_with(session, c, refractory_samples);
         let mean_amp = if amps.is_empty() {
             f32::NAN
         } else {
@@ -373,15 +356,24 @@ pub fn collect_qc_rows_with<P: DataProvider>(
             .zip(positions)
             .and_then(|(w, p)| footprint(w, tpl_samples, tpl_channels, p, sr));
         let nan = f32::NAN;
-        // 0.5-10 ms in 20 steps; (0, 0) means too few spikes to say.
-        let (rp_contam, rp) = sliding_refractory_argmin(
-            times,
-            (sr * 0.0005) as u64,
-            (sr * 0.010) as u64,
-            20,
-            total_samples.0,
-            sr,
-        );
+        // (0, 0) means there is no estimate.
+        let (rp_contam, rp) = windows.sweep(times, total_samples.0, sr);
+        let (srp_contamination, srp_rp_ms, rpv_post_mean, rpv_post_lo95, rpv_post_hi95) =
+            match windows {
+                RefractoryWindows::Session(params) => {
+                    let (srp, post) =
+                        refractory_evidence(times, total_samples.0, sample_rate, params);
+                    (
+                        srp.min_contamination,
+                        srp.rp_ms,
+                        post.mean,
+                        post.lo95,
+                        post.hi95,
+                    )
+                }
+                // These are public QC metrics, not versioned model features.
+                RefractoryWindows::Learn => (nan, nan, nan, nan, nan),
+            };
         let acg = acg_or_compute(session, c, acg_bin, acg_window);
         // ponytail: evenly strided to <= 5000 points to bound the O(n log n)
         // sort per cluster; a rare second mode in a huge cluster can thin out.
@@ -432,6 +424,11 @@ pub fn collect_qc_rows_with<P: DataProvider>(
             } else {
                 nan
             },
+            srp_contamination,
+            srp_rp_ms,
+            rpv_post_mean,
+            rpv_post_lo95,
+            rpv_post_hi95,
         });
     }
     rows
@@ -538,14 +535,151 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn session_refractory_changes_qc_and_evaluation() {
+        use crate::learn::features::{extract, ExtractOpts};
+
+        let dir = tempfile::tempdir().unwrap();
+        let prov = MockProvider {
+            spikes: vec![vec![SampleIndex(10), SampleIndex(11), SampleIndex(150)]],
+            amps: vec![vec![1.0; 3]],
+            n_samples: SampleIndex(1000),
+        };
+        let mut s = Session::new(prov, Journal::open(&dir.path().join("j")).unwrap());
+        let edit_version = s.version();
+        let metrics_version = s.metrics_version();
+        let before = &collect_qc_rows(&s)[0];
+        let learned_before = extract(&s, "fixture", &ExtractOpts::default()).unwrap();
+        let mut params = *s.refractory();
+        params.fixed_ms = 0.5;
+        params.sweep_min_ms = 1.5;
+        s.set_refractory(params).unwrap();
+        let after = &collect_qc_rows(&s)[0];
+        assert_eq!((before.isi_violations, after.isi_violations), (1, 0));
+        assert_eq!(before.rp_contamination, 0.0);
+        assert!(after.rp_contamination > 0.0);
+        let ev = crate::evaluate::eval_merge(&s, &[ClusterId(0)]);
+        assert_eq!(ev.merged.rp_contamination, after.rp_contamination);
+        assert_eq!(s.version(), edit_version);
+        assert_ne!(s.metrics_version(), metrics_version);
+        let learned_after = extract(&s, "fixture", &ExtractOpts::default()).unwrap();
+        assert_eq!(
+            learned_before.tables.roots.get(0, "f_rp_contamination"),
+            0.0
+        );
+        assert_eq!(learned_before.tables.roots, learned_after.tables.roots);
+    }
+
+    #[test]
+    fn custom_refractory_survives_edits_but_does_not_change_journal_replay() {
+        use crate::command::{CurationCommand as Cmd, Method};
+        use crate::{evaluate, preview, quality_ext};
+
+        let dir = tempfile::tempdir().unwrap();
+        let open = || {
+            let prov = MockProvider {
+                spikes: vec![
+                    [0, 3, 30, 60, 90].map(SampleIndex).to_vec(),
+                    [5, 50].map(SampleIndex).to_vec(),
+                ],
+                amps: vec![vec![1.0; 5], vec![1.0; 2]],
+                n_samples: SampleIndex(100),
+            };
+            Session::new(prov, Journal::open(&dir.path().join("j")).unwrap())
+        };
+        let mut s = open();
+        let c = ClusterId(0);
+        let d = ClusterId(1);
+        let e = ClusterId(2);
+        let version = s.version();
+        let params: sorrel_compute::RefractoryParams =
+            serde_json::from_str(r#"{"fixed_ms":4.0,"sweep_min_ms":3.5}"#).unwrap();
+        assert_eq!(params.sweep_max_ms, 10.0);
+        assert_eq!(params.sweep_step_ms, 0.25);
+        assert_eq!(
+            serde_json::from_value::<sorrel_compute::RefractoryParams>(
+                serde_json::to_value(params).unwrap()
+            )
+            .unwrap(),
+            params
+        );
+        let before = preview::preview_merge(&s, &[d], c);
+        s.set_refractory(params).unwrap();
+        assert_eq!(s.version(), version);
+        assert_eq!(s.journal().n_records(), 0);
+
+        let after = preview::preview_merge(&s, &[d], c);
+        assert!(after.post.contamination_score < before.post.contamination_score);
+        let expected = evaluate::eval_merge(&s, &[c, d]).merged;
+        s.dispatch(Cmd::Merge {
+            sources: vec![d],
+            target: c,
+        })
+        .unwrap();
+        let merged_version = s.version();
+        assert_eq!(collect_qc_rows(&s)[0].isi_violations, 2);
+        assert_eq!(
+            collect_qc_rows(&s)[0].rp_contamination,
+            expected.rp_contamination
+        );
+        assert_eq!(
+            quality_ext::cluster_quality(&s, c).contamination_score,
+            after.post.contamination_score
+        );
+
+        let preview = preview::preview_split(&s, c, &[0, 1]);
+        let eval = evaluate::eval_split(&s, c, &[0, 1]);
+        assert!(preview.inside.contamination_score < preview.outside.contamination_score);
+        assert_eq!(eval.parts[1].isi_violation_ratio, 1_000.0 / 3.0);
+        s.dispatch(Cmd::Split {
+            cluster: c,
+            spike_idx: vec![0, 1],
+            new_cluster: c,
+            by: Method::Manual,
+        })
+        .unwrap();
+        let split_version = s.version();
+        let split_times = s.spike_times(e).to_vec();
+        assert_eq!(split_times, preview.inside_times);
+        let counts = |session: &Session<_>| {
+            collect_qc_rows(session)
+                .into_iter()
+                .filter(|row| row.n_spikes != 0)
+                .map(|row| (row.cluster_id, row.isi_violations))
+                .collect::<Vec<_>>()
+        };
+        let split = counts(&s);
+        assert_eq!(split, [(0, 0), (2, 1)]);
+        s.dispatch(Cmd::Undo).unwrap();
+        assert_eq!(s.version(), merged_version);
+        assert_eq!(counts(&s), [(0, 2)]);
+        s.dispatch(Cmd::Redo).unwrap();
+        assert_eq!(s.version(), split_version);
+        assert_eq!(counts(&s), split);
+        drop(s);
+
+        let mut reopened = open();
+        reopened.replay_journal().unwrap();
+        assert_eq!(
+            *reopened.refractory(),
+            sorrel_compute::RefractoryParams::default()
+        );
+        assert_eq!(reopened.version(), split_version);
+        assert_eq!(reopened.spike_times(e), split_times);
+        assert_eq!(counts(&reopened), [(0, 0), (2, 0)]);
+        reopened.set_refractory(params).unwrap();
+        assert_eq!(counts(&reopened), split);
+    }
+
+    #[test]
     fn export_writes_both_formats_with_one_row_per_cluster() {
         let prov = MockProvider {
             spikes: vec![
                 vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
                 vec![SampleIndex(20), SampleIndex(200)],
                 vec![SampleIndex(100)],
+                vec![],
             ],
-            amps: vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0], vec![6.0]],
+            amps: vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0], vec![6.0], vec![]],
             n_samples: SampleIndex(1000),
         };
         let dir = tempfile::tempdir().unwrap();
@@ -555,12 +689,12 @@ pub(crate) mod tests {
 
         let outdir = dir.path().join("export");
         let n = export_qc(&s, &outdir, None).unwrap();
-        assert_eq!(n, 3);
+        assert_eq!(n, 4);
 
         let tsv = std::fs::read_to_string(outdir.join("cluster_qc.tsv")).unwrap();
         let lines: Vec<&str> = tsv.lines().collect();
-        // 1 header + 3 rows.
-        assert_eq!(lines.len(), 4);
+        // 1 header + 4 rows.
+        assert_eq!(lines.len(), 5);
         assert!(lines[0].starts_with("cluster_id\t"));
         assert!(lines[1].starts_with("0\t"));
 
@@ -580,6 +714,83 @@ pub(crate) mod tests {
             .unwrap();
         let json_keys: Vec<&str> = first_row.split('"').skip(1).step_by(2).collect();
         assert_eq!(tsv_keys, json_keys);
+        let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for name in [
+            "srp_contamination",
+            "srp_rp_ms",
+            "rpv_post_mean",
+            "rpv_post_lo95",
+            "rpv_post_hi95",
+        ] {
+            let i = tsv_keys.iter().position(|&k| k == name).unwrap();
+            for row in [2, 3] {
+                assert!(rows[row].get(name).unwrap().is_null(), "{name}");
+                assert_eq!(lines[row + 1].split('\t').nth(i), Some(""), "{name}");
+            }
+        }
+        assert!(rows[0]["rpv_post_hi95"].as_f64().unwrap() > 0.1);
+    }
+
+    #[test]
+    fn refractory_evidence_tsv_and_json_agree_on_schema_values_and_missingness() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Session::new(
+            MockProvider {
+                spikes: vec![
+                    (0..100).map(|i| SampleIndex(i * 10)).collect(),
+                    vec![SampleIndex(10)],
+                ],
+                amps: vec![vec![], vec![]],
+                n_samples: SampleIndex(1000),
+            },
+            Journal::open(&dir.path().join("j")).unwrap(),
+        );
+        let mut rows = collect_qc_rows(&s);
+        assert_eq!(rows[0].srp_contamination, 0.015);
+        assert_eq!(rows[0].srp_rp_ms, 10.0);
+        let tiny = 2.5e-10;
+        rows[0].rpv_post_mean = tiny;
+        rows[0].n_spikes = (1 << 24) + 1;
+        rows[0].drift_correlation = f32::INFINITY;
+        let tsv = dir.path().join("qc.tsv");
+        let json = dir.path().join("qc.json");
+        write_qc_tsv(&rows, &tsv).unwrap();
+        write_qc_json(&rows, &json).unwrap();
+        let tsv = std::fs::read_to_string(tsv).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(json).unwrap()).unwrap();
+        let mut lines = tsv.lines();
+        let header: Vec<_> = lines.next().unwrap().split('\t').collect();
+        assert_eq!(header.len(), 38);
+        let evidence = [
+            "srp_contamination",
+            "srp_rp_ms",
+            "rpv_post_mean",
+            "rpv_post_lo95",
+            "rpv_post_hi95",
+        ];
+        assert_eq!(&header[33..], evidence);
+        let records: Vec<_> = lines
+            .map(|line| line.split('\t').collect::<Vec<_>>())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|row| row.len() == header.len()));
+        assert_eq!(records[0][1], "16777217");
+        assert_eq!(json[0]["n_spikes"], 16777217);
+        let drift = header
+            .iter()
+            .position(|&h| h == "drift_correlation")
+            .unwrap();
+        assert_eq!(records[0][drift], "");
+        assert!(json[0]["drift_correlation"].is_null());
+        for (i, name) in evidence.into_iter().enumerate() {
+            let col = i + 33;
+            let tsv_value = records[0][col].parse::<f64>().unwrap();
+            assert_eq!(json[0][name].as_f64(), Some(tsv_value), "{name}");
+            assert_eq!(records[1][col], "");
+            assert!(json[1][name].is_null(), "{name}");
+        }
+        assert_eq!(json[0]["rpv_post_mean"].as_f64().unwrap() as f32, tiny);
     }
 
     #[test]

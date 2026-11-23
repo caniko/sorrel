@@ -117,6 +117,75 @@ fn native_export_round_trips_curated_units_without_electrodes() {
     }
 }
 
+#[test]
+fn native_export_updates_refractory_metrics_after_a_split() {
+    let temp = tempfile::tempdir().unwrap();
+    let src = fixtures().join("../tiny-phy");
+    if !src.is_dir() {
+        return; // Cargo packages omit workspace fixtures.
+    }
+    let data = temp.path().join("phy");
+    fs::create_dir(&data).unwrap();
+    for e in fs::read_dir(src).unwrap() {
+        let e = e.unwrap();
+        fs::copy(e.path(), data.join(e.file_name())).unwrap();
+    }
+    let metadata = [
+        "--identifier",
+        "refractory-qc",
+        "--session-description",
+        "Refractory QC before and after a split",
+        "--session-start-time",
+        "2026-01-01T00:00:00Z",
+    ];
+    let before = temp.path().join("before.nwb");
+    export(&data, &before, &metadata);
+    let before = NwbProvider::open(&before).unwrap();
+    let original = before.quality_metrics();
+    let split = Command::new(env!("CARGO_BIN_EXE_sorrel"))
+        .arg("call")
+        .arg(&data)
+        .args(["split", r#"{"cluster":0,"spike_idx":[0]}"#])
+        .env("SORREL_USER_DIR", temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        split.status.success(),
+        "{}",
+        String::from_utf8_lossy(&split.stderr)
+    );
+
+    let after = temp.path().join("after.nwb");
+    export(&data, &after, &metadata);
+    let after = NwbProvider::open(&after).unwrap();
+    let updated = after.quality_metrics();
+    assert_eq!(after.spike_times(ClusterId(3)).len(), 1);
+    for name in [
+        "srp_contamination",
+        "srp_rp_ms",
+        "rpv_post_mean",
+        "rpv_post_lo95",
+        "rpv_post_hi95",
+    ] {
+        let values = updated.get(name).unwrap();
+        assert!(
+            values[0].is_finite() && values[3].is_nan(),
+            "{name}: {values:?}"
+        );
+        assert_eq!(
+            values[1],
+            original.get(name).unwrap()[1],
+            "{name}: untouched unit"
+        );
+    }
+    assert_eq!(updated.get("srp_contamination").unwrap()[0], 0.005);
+    assert_eq!(updated.get("srp_rp_ms").unwrap()[0], 1.0);
+    assert_ne!(
+        updated.get("rpv_post_mean").unwrap()[0],
+        original.get("rpv_post_mean").unwrap()[0]
+    );
+}
+
 #[cfg(feature = "zarr")]
 #[test]
 fn native_export_from_nwb_zarr_preserves_units_and_session_metadata() {

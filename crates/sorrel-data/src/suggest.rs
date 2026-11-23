@@ -103,9 +103,6 @@ pub struct SplitCandidate {
 /// data — callers can override per recording if needed.
 #[derive(Clone, Copy, Debug)]
 pub struct SuggestConfig {
-    /// Refractory window in seconds — the centre of the CCG that should be
-    /// empty for the same-unit hypothesis.
-    pub refractory_seconds: f32,
     /// Half-width of the CCG analysis window in seconds.
     pub ccg_max_lag_seconds: f32,
     /// Number of CCG bins (must be even — the histogram is centred).
@@ -127,7 +124,6 @@ pub struct SuggestConfig {
 impl Default for SuggestConfig {
     fn default() -> Self {
         Self {
-            refractory_seconds: 0.0015, // 1.5 ms — slightly conservative
             ccg_max_lag_seconds: 0.050,
             ccg_bins: 100,
             min_spikes: 30,
@@ -174,7 +170,7 @@ pub struct SuggestMemo {
     gen: u64,
     pair_sig: [u64; 4],
     pairs: HashMap<([u8; 32], [u8; 32]), (PairScore, u64)>,
-    split_sig: [u64; 4],
+    split_sig: [u64; 7],
     splits: HashMap<[u8; 32], (SplitCandidate, u64)>,
 }
 
@@ -292,10 +288,14 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
     // `[half-r, half+r)` is symmetric around it. Round up to even so a
     // user-configured odd `ccg_bins` can't silently mis-center the dip.
     let bins = (cfg.ccg_bins.max(2) + 1) & !1;
-    let bin_width = (2.0 * cfg.ccg_max_lag_seconds) / bins as f32;
-    let refractory_bins = (cfg.refractory_seconds / bin_width.max(1e-9)).round() as usize;
-    let refractory_bins = refractory_bins.max(1);
-    let shoulder_bins = (refractory_bins * 4).max(4);
+    // The session's fixed window is the CCG centre that should be empty for
+    // the same-unit hypothesis.
+    let refractory_seconds = session.refractory().fixed_ms / 1000.0;
+    let refractory_bins = crate::refractory::ccg_refractory_bins(
+        session.refractory().fixed_ms,
+        2000.0 * f64::from(cfg.ccg_max_lag_seconds) / bins as f64,
+    );
+    let shoulder_bins = refractory_bins.saturating_mul(4).max(4);
 
     // Pre-compute per-cluster summaries so the inner loop is cheap.
     let mut summaries: Vec<Option<ClusterSummary>> = Vec::with_capacity(n as usize);
@@ -430,7 +430,7 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
 
     // Resolve pair scores from the memo; score only the misses.
     let sig = [
-        cfg.refractory_seconds.to_bits() as u64,
+        refractory_seconds.to_bits() as u64,
         cfg.ccg_max_lag_seconds.to_bits() as u64,
         bins as u64,
         sr.to_bits() as u64,
@@ -706,15 +706,19 @@ pub fn rank_split_candidates_memo<P: DataProvider>(
         return Vec::new();
     }
     let sr = session.provider.sample_rate().max(1.0);
-    let refractory_samples = (sr * cfg.refractory_seconds).round() as u64;
+    let rp = session.refractory();
+    let refractory_samples = rp.fixed_samples(sr);
     let globals = session
         .has_pc_features()
         .then(|| crate::proposers::all_cluster_globals(session));
     let sig = [
-        cfg.refractory_seconds.to_bits() as u64,
         sr.to_bits() as u64,
         session.provider.n_samples().0,
         globals.is_some() as u64,
+        rp.fixed_ms.to_bits() as u64,
+        rp.sweep_min_ms.to_bits() as u64,
+        rp.sweep_max_ms.to_bits() as u64,
+        rp.sweep_step_ms.to_bits() as u64,
     ];
     if memo.split_sig != sig {
         memo.splits.clear();

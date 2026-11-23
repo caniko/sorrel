@@ -21,7 +21,7 @@ For each target unit:
    subtracted.
 4. **Accept.** Keep a detection only if it:
    - beats the best competing unit by `--margin`;
-   - is more than 1.5 ms from the unit's existing spikes;
+   - is outside the fixed refractory window of the unit's existing spikes (1.5 ms by default; `--refractory-ms` overrides it);
    - clears the unit's threshold. The threshold comes from a
      channel-shifted null, set to control the false discovery rate at `--q`.
 5. **ISI check.** If the unit's ISI-violation fraction more than doubles,

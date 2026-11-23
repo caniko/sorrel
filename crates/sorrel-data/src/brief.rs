@@ -51,7 +51,7 @@ const fn flag(
 
 /// Default thresholds, declared in every header so the reader sees them.
 /// `isi_violation_ratio` is violations per second of spike-train span (not a
-/// fraction), so 0.5/s is a unit that breaks its 1.5 ms refractory period
+/// fraction), so 0.5/s is a unit that breaks the configured refractory period
 /// about every other second. `amplitude_dip` is Hartigan's dip in [0, 0.25]
 /// on <= 5000 subsampled amplitudes: noise sits near 0.01, 0.05 is a clear
 /// second mode. `amplitude_snr` is the mean/sd of per-spike amplitude

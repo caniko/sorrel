@@ -454,6 +454,8 @@ enum LlmBackend {
 /// and every headless subcommand.
 #[derive(Args, Debug, Clone, Default)]
 struct OpenArgs {
+    #[command(flatten)]
+    refractory: RefractoryArgs,
     /// phy / Kilosort, SortingAnalyzer, NWB (local, DANDI or HTTPS), or legacy MATLAB rez.mat
     #[arg(value_name = "DATA_DIR", required = true)]
     root: Option<PathBuf>,
@@ -502,6 +504,86 @@ struct OpenArgs {
     /// <DATA_DIR>/events.csv|npy, else the opened NWB file's trials
     #[arg(long, value_name = "FILE")]
     events: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Clone, Copy, Debug, Default)]
+struct RefractoryArgs {
+    /// Fixed refractory window (ms).
+    #[arg(long)]
+    refractory_ms: Option<f32>,
+    /// Exclusive lower bound of the refractory sweep (ms).
+    #[arg(long)]
+    rp_min_ms: Option<f32>,
+    /// Inclusive upper bound of the refractory sweep (ms).
+    #[arg(long)]
+    rp_max_ms: Option<f32>,
+    /// Refractory sweep step (ms).
+    #[arg(long)]
+    rp_step_ms: Option<f32>,
+}
+
+impl RefractoryArgs {
+    fn resolve(
+        self,
+        base: sorrel_compute::RefractoryParams,
+    ) -> Result<sorrel_compute::RefractoryParams> {
+        let params = sorrel_compute::RefractoryParams {
+            fixed_ms: self.refractory_ms.unwrap_or(base.fixed_ms),
+            sweep_min_ms: self.rp_min_ms.unwrap_or(base.sweep_min_ms),
+            sweep_max_ms: self.rp_max_ms.unwrap_or(base.sweep_max_ms),
+            sweep_step_ms: self.rp_step_ms.unwrap_or(base.sweep_step_ms),
+        };
+        params
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Invalid refractory settings: {e}"))?;
+        Ok(params)
+    }
+
+    fn overrides(self) -> [bool; 4] {
+        [
+            self.refractory_ms.is_some(),
+            self.rp_min_ms.is_some(),
+            self.rp_max_ms.is_some(),
+            self.rp_step_ms.is_some(),
+        ]
+    }
+
+    /// When attaching, patch only flags that were supplied, not the host's defaults.
+    fn configure_host(
+        self,
+        call: impl FnOnce(&serde_json::Value) -> Result<Option<serde_json::Value>>,
+    ) -> Result<bool> {
+        let mut arguments = serde_json::Map::new();
+        for (key, value) in [
+            ("fixed_ms", self.refractory_ms),
+            ("sweep_min_ms", self.rp_min_ms),
+            ("sweep_max_ms", self.rp_max_ms),
+            ("sweep_step_ms", self.rp_step_ms),
+        ] {
+            if let Some(value) = value {
+                anyhow::ensure!(
+                    value.is_finite() && value > 0.0,
+                    "Invalid refractory settings: {key} must be finite and greater than zero"
+                );
+                arguments.insert(key.into(), serde_json::json!(value));
+            }
+        }
+        if arguments.is_empty() {
+            return Ok(false);
+        }
+        let request = serde_json::json!({"jsonrpc":"2.0", "id":0, "method":"tools/call", "params":{"name":"refractory", "arguments":arguments}});
+        if let Some(reply) = call(&request)? {
+            if reply.get("error").is_some() || reply["result"]["isError"] != false {
+                let message = reply["error"]["message"]
+                    .as_str()
+                    .or_else(|| reply["result"]["content"][0]["text"].as_str())
+                    .unwrap_or("host rejected the request");
+                bail!("Invalid refractory settings: {message}");
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
 }
 
 impl OpenArgs {
@@ -724,6 +806,15 @@ fn seeded<P: DataProvider>(mut session: Session<P>, seed: Seed<P>) -> Result<Ses
 /// Open the backend named (or detected) by `open`, seal and replay its
 /// journal, then hand the typed session to `v`.
 fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
+    with_session_refractory(open, Default::default(), v)
+}
+
+fn with_session_refractory<V: SessionVisitor>(
+    open: &OpenArgs,
+    base: sorrel_compute::RefractoryParams,
+    v: V,
+) -> Result<()> {
+    let refractory = open.refractory.resolve(base)?;
     let inputs = RemoteInputs::resolve(open)?;
     #[cfg(any(feature = "hdf5", feature = "dandi"))]
     let mut v = v;
@@ -748,7 +839,10 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
     );
     match backend {
         Backend::Kilosort => {
-            let (session, ctx) = open_kilosort(open, kilosort_open_params(open)?)?;
+            let (mut session, ctx) = open_kilosort(open, kilosort_open_params(open)?)?;
+            session
+                .set_refractory(refractory)
+                .map_err(anyhow::Error::msg)?;
             v.visit(session, Box::new(seed_kilosort), ctx)
         }
         Backend::SortingAnalyzer => {
@@ -756,6 +850,9 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
             // The analyzer's own sorting is reloaded on every open, so the
             // journal stays the source of truth and is never sealed.
             let mut session = sorrel_data::open_sorting_analyzer(&root, &journal_opts(open))?;
+            session
+                .set_refractory(refractory)
+                .map_err(anyhow::Error::msg)?;
             if let Some(flag) = &open.sorter {
                 session.set_sorter(flag.clone());
             }
@@ -815,11 +912,14 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
             v.prepare_nwb(&provider)?;
             let starting_time = provider.starting_time();
             let metrics = provider.quality_metrics().clone();
-            let (session, mut ctx) =
+            let (mut session, mut ctx) =
                 open_file_backed(open, provider, &path, "nwb", sorrel_io::Backend::Nwb)?;
             ctx.nwb_start_time = starting_time;
             ctx.remote = is_remote(open.root());
             ctx.metrics = metrics;
+            session
+                .set_refractory(refractory)
+                .map_err(anyhow::Error::msg)?;
             v.visit(session, Box::new(|s| s.replay_journal()), ctx)
         }
         #[cfg(feature = "hdf5")]
@@ -831,8 +931,11 @@ fn with_session<V: SessionVisitor>(open: &OpenArgs, v: V) -> Result<()> {
                     dat_path: open.dat.clone(),
                 },
             )?;
-            let (session, ctx) =
+            let (mut session, ctx) =
                 open_file_backed(open, provider, &path, "rez", sorrel_io::Backend::Ks4Rez)?;
+            session
+                .set_refractory(refractory)
+                .map_err(anyhow::Error::msg)?;
             v.visit(
                 session,
                 Box::new(|s| {
@@ -903,6 +1006,7 @@ fn seed_kilosort(session: &mut Session<KilosortProvider>) -> Result<()> {
 
 /// `sorrel share <DIR> [--port N | --relay ADDR]`: headless host.
 fn run_share(open: &OpenArgs, port: u16, relay: Option<sorrel_remote::Multiaddr>) -> Result<()> {
+    let refractory = open.refractory.resolve(Default::default())?;
     let backend = match open.backend {
         Some(b) => b,
         None => detect_backend(open.root())?,
@@ -913,6 +1017,9 @@ fn run_share(open: &OpenArgs, port: u16, relay: Option<sorrel_remote::Multiaddr>
         bail!("remote share supports kilosort/phy datasets");
     }
     let (mut session, ctx) = open_kilosort(open, kilosort_open_params(open)?)?;
+    session
+        .set_refractory(refractory)
+        .map_err(anyhow::Error::msg)?;
     seed_kilosort(&mut session)?;
     let p = &session.provider;
     let dat = sorrel_remote::DatSource {
@@ -973,15 +1080,18 @@ fn run_join(
     // The network state lives in this process, so the window is standalone
     // and its one tab is the session just joined (`joined` stays alive until
     // the window closes).
-    let session = joined.session;
-    let mut once = Some(move |rs: Option<&RenderState>| {
-        let app = build_tab(session, Box::new(|_| Ok(())), ctx, None, rs, None, None);
-        Opened::Tab(Box::new(app) as Box<dyn Tab>, root)
-    });
-    let opener: Opener = Box::new(move |_, _, rs| {
-        once.take()
-            .map(|f| f(rs))
-            .ok_or_else(|| anyhow::anyhow!("a joined session is a single window"))
+    let mut session = joined.session;
+    let mut once = Some(
+        move |rs: Option<&RenderState>, refractory| -> Result<Opened> {
+            session
+                .set_refractory(refractory)
+                .map_err(anyhow::Error::msg)?;
+            let app = build_tab(session, Box::new(|_| Ok(())), ctx, None, rs, None, None);
+            Ok(Opened::Tab(Box::new(app), root))
+        },
+    );
+    let opener: Opener = Box::new(move |_, _, rs, refractory| {
+        once.take().context("a joined session is a single window")?(rs, refractory)
     });
     run_shell(
         opener,
@@ -1331,7 +1441,8 @@ fn tag_split_candidates<P: DataProvider>(
         .flatten()
         .copied()
         .collect();
-    for cand in rank_split_candidates(session, &SuggestConfig::default()) {
+    let cfg = SuggestConfig::default();
+    for cand in rank_split_candidates(session, &cfg) {
         if cand.bipartition_minor_idx.is_empty() || merged.contains(&cand.cluster) {
             continue;
         }
@@ -1720,6 +1831,8 @@ fn session_key(open: &OpenArgs) -> Result<Option<String>> {
     args.rebase(&std::env::current_dir()?);
     // Discard is a one-shot action, not a property of the live session.
     args.discard_journal = false;
+    // Refractory flags patch a matching live session; they don't identify it.
+    args.refractory = Default::default();
     // A file's name matters even through a symlink: it names its journal.
     args.root = Some(if is_dataset_directory(args.root()) {
         session_path(args.root())
@@ -1762,6 +1875,7 @@ fn remote_registry_key(open: &OpenArgs) -> Result<Option<String>> {
     let mut args = open.clone();
     args.rebase(&std::env::current_dir()?);
     args.discard_journal = false;
+    args.refractory = Default::default();
     Ok(Some(
         blake3::hash(format!("{args:?}").as_bytes())
             .to_hex()
@@ -1777,8 +1891,17 @@ fn remote_registry_key(_: &OpenArgs) -> Result<Option<String>> {
 /// `sorrel mcp`: bridge stdio to a running host, else serve in-process.
 fn run_mcp(open: &OpenArgs) -> Result<()> {
     if let Some(key) = session_key(open)? {
+        let dir = host_dir(open);
+        open.refractory.configure_host(|request| {
+            sorrel_data::serve::call_once_for_session(
+                &dir,
+                Some(&key),
+                open.discard_journal,
+                request,
+            )
+        })?;
         if sorrel_data::serve::attach_for_session(
-            &host_dir(open),
+            &dir,
             Some(&key),
             open.discard_journal,
             std::io::stdin(),
@@ -2126,7 +2249,7 @@ fn tab_target<'a>(
 /// The shell's opener: a forwarded `sorrel open`'s args become a tab, or the
 /// index of the tab that already shows the dataset.
 fn tab_opener() -> Opener {
-    Box::new(|req, open_tabs, rs| {
+    Box::new(|req, open_tabs, rs, refractory| {
         let args = std::iter::once("sorrel").chain(req.args.iter().map(String::as_str));
         let mut open = TabCli::try_parse_from(args)?.open;
         open.rebase(&req.cwd);
@@ -2141,11 +2264,23 @@ fn tab_opener() -> Opener {
             .map(|tab| (tab.dataset(), tab.session_key()));
         let key = session_key(&open)?;
         if let Some(i) = tab_target(&open, key.as_deref(), tabs)? {
+            if open.refractory.overrides().into_iter().any(|flag| flag) {
+                let configured = open.refractory.configure_host(|request| {
+                    sorrel_data::serve::call_once_for_session(
+                        &host_dir(&open),
+                        key.as_deref(),
+                        open.discard_journal,
+                        request,
+                    )
+                })?;
+                anyhow::ensure!(configured, "The session is already open and its MCP listener is not ready; retry once it has loaded");
+            }
             return Ok(Opened::Existing(i));
         }
         let mut tab = None;
-        with_session(
+        with_session_refractory(
             &open,
+            refractory,
             TabBuilder {
                 remote_trials: None,
                 out: &mut tab,
@@ -2331,7 +2466,13 @@ fn run_gui(open: &OpenArgs, standalone: bool) -> Result<()> {
             require_exists(open)?;
             Some(open_request()?)
         }
-        None => None,
+        None => {
+            anyhow::ensure!(
+                !open.refractory.overrides().into_iter().any(|flag| flag),
+                "Refractory launch flags require a dataset"
+            );
+            None
+        }
     };
     if !standalone {
         let req = match &first {
@@ -2387,12 +2528,15 @@ fn mcp_target(
 }
 
 /// `sorrel mcp` without DATA_DIR: bridge stdio to the target's host.
-fn run_mcp_active() -> Result<()> {
+fn run_mcp_active(refractory: RefractoryArgs) -> Result<()> {
     // A hung GUI is skipped: its hosts may still appear in the registry.
     let gui = sorrel_data::send_instance(&InstanceRequest::List)
         .ok()
         .flatten();
     let (dir, key) = mcp_target(gui.as_ref(), sorrel_data::list_hosts)?;
+    refractory.configure_host(|request| {
+        sorrel_data::serve::call_once_registered(&dir, key.as_deref(), request)
+    })?;
     if !sorrel_data::serve::attach_registered(
         &dir,
         key.as_deref(),
@@ -2501,12 +2645,17 @@ fn run_call(open: &OpenArgs, tool: &str, args: Option<&str>, raw: bool) -> Resul
         "params": {"name": tool, "arguments": args},
     });
     let running_reply = if let Some(key) = session_key(open)? {
-        sorrel_data::serve::call_once_for_session(
-            &host_dir(open),
-            Some(&key),
-            open.discard_journal,
-            &request,
-        )?
+        let dir = host_dir(open);
+        let call = |request: &serde_json::Value| {
+            sorrel_data::serve::call_once_for_session(
+                &dir,
+                Some(&key),
+                open.discard_journal,
+                request,
+            )
+        };
+        open.refractory.configure_host(call)?;
+        call(&request)?
     } else {
         None
     };
@@ -2922,7 +3071,7 @@ fn main() -> Result<()> {
             (Some(McpCmd::Tools { json }), _) => mcp_tools(json),
             (Some(McpCmd::Config { client, dir }), _) => mcp_config(client, dir),
             (None, true) => run_mcp(&open),
-            (None, false) => run_mcp_active(),
+            (None, false) => run_mcp_active(open.refractory),
         },
         Some(Cmd::Describe { open, json }) => with_session(&open, Describe { json }),
         Some(Cmd::Report {
@@ -3239,6 +3388,48 @@ mod tests {
     }
 
     #[test]
+    fn refractory_flags_override_only_supplied_values() {
+        let Some(Cmd::Qc { open, .. }) = parse(&[
+            "qc",
+            "/x",
+            "--out",
+            "o",
+            "--refractory-ms",
+            "2",
+            "--rp-min-ms",
+            "0.75",
+            "--rp-step-ms",
+            "0.25",
+        ])
+        .unwrap()
+        .cmd
+        else {
+            panic!("expected qc");
+        };
+        let mut base = sorrel_compute::RefractoryParams {
+            sweep_max_ms: 5.0,
+            ..Default::default()
+        };
+        let params = open.refractory.resolve(base).unwrap();
+        assert_eq!(
+            (
+                params.fixed_ms,
+                params.sweep_min_ms,
+                params.sweep_max_ms,
+                params.sweep_step_ms
+            ),
+            (2.0, 0.75, 5.0, 0.25)
+        );
+        base.sweep_max_ms = 0.75;
+        assert!(open
+            .refractory
+            .resolve(base)
+            .unwrap_err()
+            .to_string()
+            .contains("sweep_min_ms"));
+    }
+
+    #[test]
     fn host_dir_of_a_missing_path_is_its_parent() {
         let open = OpenArgs {
             root: Some("/x".into()),
@@ -3330,6 +3521,12 @@ mod tests {
         let key = session_key(&open)?.unwrap();
         let tabs = || [(local.path(), Some(key.as_str()))].into_iter();
         assert_eq!(tab_target(&open, Some(&key), tabs())?, Some(0));
+        open.refractory.refractory_ms = Some(2.0);
+        assert_eq!(session_key(&open)?.as_deref(), Some(key.as_str()));
+        assert_eq!(
+            tab_target(&open, session_key(&open)?.as_deref(), tabs())?,
+            Some(0)
+        );
         open.dat = Some("https://example.org/raw.nwb".into());
         assert_eq!(session_key(&open)?, None);
         assert_eq!(

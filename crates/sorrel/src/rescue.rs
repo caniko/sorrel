@@ -640,7 +640,7 @@ pub fn run<P: DataProvider<Label = PhyLabel>>(
     let c = a.channels_per_unit.clamp(1, nc);
     let block = ((a.block_seconds * sr) as usize).max(NT * 4);
     let chunk = ((a.chunk_seconds * sr) as usize).clamp(NT * 4, block);
-    let refr = (0.0015 * sr).ceil() as u64;
+    let refr = s.refractory().fixed_samples(sr);
     let mut rng = Rng::new(a.seed);
 
     let usable: Vec<ClusterId> = (0..s.n_clusters())

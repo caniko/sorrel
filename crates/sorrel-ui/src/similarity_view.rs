@@ -226,11 +226,15 @@ pub fn similarity_view<P: DataProvider>(
     pane.state.drawn = pane.state.key.clone();
     // Hovering a row ghosts that cluster as a merge into the first selected one.
     match (pane.state.table.hovered, selected.first()) {
-        (Some(c), Some(&target)) => {
-            pane.state
-                .tips
-                .hover(ui, jobs, session.version(), c, target, Some(c), brushes)
-        }
+        (Some(c), Some(&target)) => pane.state.tips.hover(
+            ui,
+            jobs,
+            session.metrics_version(),
+            c,
+            target,
+            Some(c),
+            brushes,
+        ),
         _ => pane.state.tips.clear(),
     }
     match click? {

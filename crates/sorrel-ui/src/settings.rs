@@ -3,6 +3,7 @@
 use crate::shortcuts::{Action, Chord, Keymap, Scope, COMMANDS};
 use egui::{Context, Event};
 use serde::{Deserialize, Serialize};
+use sorrel_compute::RefractoryParams;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -14,6 +15,7 @@ use std::{
 pub struct Settings {
     pub version: u32,
     pub appearance: Appearance,
+    pub refractory: RefractoryParams,
     pub recent_datasets: Vec<PathBuf>,
     pub keybindings: BTreeMap<String, Vec<String>>,
     /// Retain unrelated settings when this build edits shortcuts.
@@ -26,6 +28,7 @@ impl Default for Settings {
         Self {
             version: 1,
             appearance: Appearance::default(),
+            refractory: RefractoryParams::default(),
             recent_datasets: vec![],
             keybindings: BTreeMap::new(),
             extra: BTreeMap::new(),
@@ -74,6 +77,7 @@ impl Settings {
         {
             return Err("appearance.theme must be system, dark or light".into());
         }
+        self.refractory.validate()?;
         Keymap::compile(&self.keybindings)
     }
 
@@ -416,13 +420,19 @@ fn consume_keyboard(ctx: &Context) {
     });
 }
 
-pub fn show(ctx: &Context) {
+pub fn refractory(ctx: &Context) -> RefractoryParams {
+    shared(ctx).lock().unwrap().settings.refractory
+}
+
+/// `Some((before, after))` when a save changed the refractory settings.
+pub fn show(ctx: &Context) -> Option<(RefractoryParams, RefractoryParams)> {
     let shared = shared(ctx);
     let mut rt = shared.lock().unwrap();
     if !rt.open {
-        return;
+        return None;
     }
     let mut close = false;
+    let mut refractory = None;
     egui::Modal::new(egui::Id::new("sorrel-settings-dialog")).show(ctx, |ui| {
         ui.set_width(780.0_f32.min(ctx.content_rect().width() - 40.0));
         ui.heading("Settings");
@@ -436,6 +446,24 @@ pub fn show(ctx: &Context) {
                 .show_ui(ui, |ui| {
                     for name in ["system", "dark", "light"] { ui.selectable_value(theme, Some(name.into()), name); }
                 });
+        });
+        ui.separator();
+        ui.heading("Refractory-period settings");
+        ui.label("Saved as defaults for new sessions. Saving applies only the fields you changed to open sessions.");
+        let rp = &mut rt.draft.as_mut().unwrap().refractory;
+        ui.horizontal_wrapped(|ui| {
+            for (label, value) in [
+                ("Fixed", &mut rp.fixed_ms),
+                ("Min (exclusive)", &mut rp.sweep_min_ms),
+                ("Max", &mut rp.sweep_max_ms),
+                ("Step", &mut rp.sweep_step_ms),
+            ] {
+                let label = ui.label(label);
+                ui.add(egui::DragValue::new(value).speed(0.05).suffix(" ms")).labelled_by(label.id);
+            }
+            if ui.button("Reset to defaults").clicked() {
+                *rp = RefractoryParams::default();
+            }
         });
         ui.separator();
         ui.heading("Keyboard shortcuts");
@@ -489,6 +517,7 @@ pub fn show(ctx: &Context) {
                 draft.recent_datasets = rt.settings.recent_datasets.clone();
                 match location.ok_or_else(|| "No settings path".into()).and_then(|p| draft.save(&p).map(|()| p)) {
                     Ok(path) => {
+                        if rt.settings.refractory != draft.refractory { refractory = Some((rt.settings.refractory, draft.refractory)); }
                         rt.path = Some(path); rt.keymap = draft.validate().unwrap();
                         draft.apply_appearance(ctx); rt.settings = draft; rt.warning = None; close = true;
                     }
@@ -504,6 +533,7 @@ pub fn show(ctx: &Context) {
         rt.draft = None;
         ctx.request_repaint();
     }
+    refractory
 }
 
 #[cfg(test)]
@@ -515,11 +545,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.toml");
         let mut settings: Settings = toml::from_str("version = 1\n[other]\nvalue = 42\n").unwrap();
+        assert_eq!(settings.refractory, RefractoryParams::default());
+        settings.refractory.fixed_ms = 2.0;
         settings
             .keybindings
             .insert("curation.split".into(), vec!["F8".into()]);
         settings.save(&path).unwrap();
         let back = Settings::load(&path).unwrap();
+        assert_eq!(back.refractory, settings.refractory);
         assert_eq!(back.extra["other"]["value"].as_integer(), Some(42));
         assert_eq!(back.validate().unwrap().hint("curation.split"), "F8");
     }
@@ -679,6 +712,74 @@ mod tests {
             .insert("curation.split".into(), vec!["G".into()]);
         assert!(settings.save(&path).is_err());
         assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn refractory_settings_cancel_invalid_edits_and_publish_only_a_saved_change() {
+        use egui_kittest::kittest::Queryable;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let applied = std::cell::Cell::new(None);
+        let mut h = egui_kittest::Harness::new_ui(|ui| {
+            if let Some(change) = show(ui.ctx()) {
+                applied.set(Some(change));
+            }
+        });
+        install(&h.ctx, Ok(path.clone()), vec![]);
+        let defaults = RefractoryParams::default();
+        let runtime = shared(&h.ctx);
+        let draft = |params| {
+            runtime.lock().unwrap().draft.as_mut().unwrap().refractory = params;
+        };
+        let custom = RefractoryParams {
+            fixed_ms: 3.0,
+            sweep_min_ms: 2.5,
+            sweep_max_ms: 8.0,
+            sweep_step_ms: 0.5,
+        };
+        open(&h.ctx);
+        for (params, diagnostic) in [
+            (
+                RefractoryParams {
+                    sweep_min_ms: 8.0,
+                    ..custom
+                },
+                "sweep_min_ms must be less",
+            ),
+            (
+                RefractoryParams {
+                    fixed_ms: -1.0,
+                    ..custom
+                },
+                "fixed_ms must be finite",
+            ),
+        ] {
+            draft(params);
+            h.run_ok();
+            assert!(h.query_by_label_contains(diagnostic).is_some());
+            h.get_by_label("Save settings").click();
+            h.run_ok();
+            assert!(runtime.lock().unwrap().open);
+            assert_eq!(refractory(&h.ctx), defaults);
+            assert_eq!(applied.get(), None);
+            assert!(!path.exists());
+        }
+        draft(custom);
+        h.run_ok();
+        h.get_by_label("Cancel").click();
+        h.run_ok();
+        assert!(!runtime.lock().unwrap().open);
+        assert_eq!(applied.get(), None);
+        assert!(!path.exists());
+
+        open(&h.ctx);
+        draft(custom);
+        h.run_ok();
+        h.get_by_label("Save settings").click();
+        h.run_ok();
+        assert_eq!(applied.get(), Some((defaults, custom)));
+        assert_eq!(refractory(&h.ctx), custom);
+        assert_eq!(Settings::load(&path).unwrap().refractory, custom);
     }
 
     #[test]

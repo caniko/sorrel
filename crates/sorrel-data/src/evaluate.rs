@@ -14,12 +14,13 @@
 
 use crate::brief::{quantise, thresholds_with};
 use crate::proposals::{basis_of, spike_basis};
+use crate::refractory::RefractoryWindows;
 use crate::session::Session;
 use crate::suggest::{MergeCandidate, SplitCandidate};
 use serde::Serialize;
 use sorrel_compute::{
     analyse_refractory_dip, cross_correlogram, isi_violation_rate, ks_two_sample, mean_amplitude,
-    quality_breakdown, sliding_refractory_argmin,
+    quality_breakdown, RefractoryParams,
 };
 use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 use std::collections::{BTreeMap, BTreeSet};
@@ -70,17 +71,26 @@ pub struct SplitEval {
     pub sync_z: f32,
 }
 
-pub fn unit_stats(times: &[SampleIndex], amps: &[f32], sr: f32, total: u64) -> UnitStats {
+pub fn unit_stats(
+    times: &[SampleIndex],
+    amps: &[f32],
+    sr: f32,
+    total: u64,
+    params: &RefractoryParams,
+) -> UnitStats {
+    unit_stats_with(times, amps, sr, total, RefractoryWindows::Session(params))
+}
+
+pub(crate) fn unit_stats_with(
+    times: &[SampleIndex],
+    amps: &[f32],
+    sr: f32,
+    total: u64,
+    windows: RefractoryWindows<'_>,
+) -> UnitStats {
     let has = !amps.is_empty() && amps.len() == times.len();
-    let (c, rp) = sliding_refractory_argmin(
-        times,
-        (sr * 0.0005) as u64,
-        (sr * 0.010) as u64,
-        20,
-        total,
-        sr,
-    );
-    let refractory = (sr * 0.0015).round() as u64;
+    let (c, rp) = windows.sweep(times, total, sr);
+    let refractory = windows.fixed_samples(sr);
     let q = quality_breakdown(
         times,
         if has { amps } else { &[] },
@@ -104,7 +114,8 @@ pub fn unit_stats(times: &[SampleIndex], amps: &[f32], sr: f32, total: u64) -> U
 const MIN_SHOULDER: f32 = 2.0;
 
 /// `(dip_z, sync_z)` of the CCG of `a` against `b` (see the module doc).
-pub fn ccg_z(a: &[SampleIndex], b: &[SampleIndex], sr: f32) -> (f32, f32) {
+/// `dip_bins` = refractory half-width in 1 ms bins; shoulders are 4x that.
+pub fn ccg_z(a: &[SampleIndex], b: &[SampleIndex], sr: f32, dip_bins: usize) -> (f32, f32) {
     let max_lag = (sr * 0.050).round() as u64;
     if a.is_empty() || b.is_empty() || max_lag == 0 {
         return (f32::NAN, f32::NAN);
@@ -118,7 +129,7 @@ pub fn ccg_z(a: &[SampleIndex], b: &[SampleIndex], sr: f32) -> (f32, f32) {
             false => -a.z,
         }
     };
-    let (dip, sync) = (z(2, 8), z(3, 12));
+    let (dip, sync) = (z(dip_bins, dip_bins * 4), z(3, 12));
     // f32::max(NaN, 0) is 0: keep NaN a NaN
     let sync = if sync.is_nan() { sync } else { sync.max(0.0) };
     (dip.clamp(-99.0, 99.0), sync.clamp(-99.0, 99.0))
@@ -126,10 +137,24 @@ pub fn ccg_z(a: &[SampleIndex], b: &[SampleIndex], sr: f32) -> (f32, f32) {
 
 /// Merge of `parts` (time-sorted trains with their amplitudes) evaluated
 /// without ids; [`eval_merge`] fills them in.
-pub fn eval_trains(parts: &[(&[SampleIndex], &[f32])], sr: f32, total: u64) -> MergeEval {
+pub fn eval_trains(
+    parts: &[(&[SampleIndex], &[f32])],
+    sr: f32,
+    total: u64,
+    params: &RefractoryParams,
+) -> MergeEval {
+    eval_trains_with(parts, sr, total, RefractoryWindows::Session(params))
+}
+
+pub(crate) fn eval_trains_with(
+    parts: &[(&[SampleIndex], &[f32])],
+    sr: f32,
+    total: u64,
+    windows: RefractoryWindows<'_>,
+) -> MergeEval {
     let stats: Vec<UnitStats> = parts
         .iter()
-        .map(|&(t, a)| unit_stats(t, a, sr, total))
+        .map(|&(t, a)| unit_stats_with(t, a, sr, total, windows))
         .collect();
     // ponytail: concat + stable sort, O(n log n); a k-way heap merge only
     // matters past ~10^7 spikes.
@@ -152,7 +177,7 @@ pub fn eval_trains(parts: &[(&[SampleIndex], &[f32])], sr: f32, total: u64) -> M
     if parts.len() <= MAX_PAIR_PARTS {
         for i in 0..parts.len() {
             for j in i + 1..parts.len() {
-                let (dip_z, sync_z) = ccg_z(parts[i].0, parts[j].0, sr);
+                let (dip_z, sync_z) = ccg_z(parts[i].0, parts[j].0, sr, windows.ccg_dip_bins());
                 let (a, b) = (parts[i].1, parts[j].1);
                 let amp_ks = match a.is_empty() || b.is_empty() {
                     true => f32::NAN,
@@ -170,7 +195,7 @@ pub fn eval_trains(parts: &[(&[SampleIndex], &[f32])], sr: f32, total: u64) -> M
     }
     MergeEval {
         ids: Vec::new(),
-        merged: unit_stats(&times, &amps, sr, total),
+        merged: unit_stats_with(&times, &amps, sr, total, windows),
         parts: stats,
         pairs,
     }
@@ -185,6 +210,7 @@ pub fn eval_merge<P: DataProvider>(session: &Session<P>, ids: &[ClusterId]) -> M
         &parts,
         session.provider.sample_rate().max(1.0),
         session.provider.n_samples().0,
+        session.refractory(),
     );
     ev.ids = ids.iter().map(|c| c.0).collect();
     ev
@@ -197,6 +223,25 @@ pub fn eval_split_trains(
     minor: &[u32],
     sr: f32,
     total: u64,
+    params: &RefractoryParams,
+) -> SplitEval {
+    eval_split_trains_with(
+        times,
+        amps,
+        minor,
+        sr,
+        total,
+        RefractoryWindows::Session(params),
+    )
+}
+
+pub(crate) fn eval_split_trains_with(
+    times: &[SampleIndex],
+    amps: &[f32],
+    minor: &[u32],
+    sr: f32,
+    total: u64,
+    windows: RefractoryWindows<'_>,
 ) -> SplitEval {
     let is_minor: BTreeSet<usize> = minor.iter().map(|&i| i as usize).collect();
     let pick = |want: bool| -> (Vec<SampleIndex>, Vec<f32>) {
@@ -213,12 +258,12 @@ pub fn eval_split_trains(
         true => f32::NAN,
         false => mean_amplitude(a),
     };
-    let (dip_z, sync_z) = ccg_z(&major.0, &minor.0, sr);
+    let (dip_z, sync_z) = ccg_z(&major.0, &minor.0, sr, windows.ccg_dip_bins());
     SplitEval {
         cluster: 0,
         parts: [
-            unit_stats(&major.0, &major.1, sr, total),
-            unit_stats(&minor.0, &minor.1, sr, total),
+            unit_stats_with(&major.0, &major.1, sr, total, windows),
+            unit_stats_with(&minor.0, &minor.1, sr, total, windows),
         ],
         mean_amp: [mean(&major.1), mean(&minor.1)],
         dip_z,
@@ -237,6 +282,7 @@ pub fn eval_split<P: DataProvider>(
         minor_idx,
         session.provider.sample_rate().max(1.0),
         session.provider.n_samples().0,
+        session.refractory(),
     );
     ev.cluster = cluster.0;
     ev
@@ -448,10 +494,10 @@ impl Handles {
         merges: &[MergeCandidate],
         splits: &[SplitCandidate],
     ) {
-        if self.version == Some(session.version()) {
+        if self.version == Some(session.metrics_version()) {
             return;
         }
-        self.version = Some(session.version());
+        self.version = Some(session.metrics_version());
         // One pass over the spikes for every basis this rebuild needs.
         let globals = crate::proposers::all_cluster_globals(session);
         let basis = |c: ClusterId| basis_of(&globals[c.idx()]);
@@ -695,7 +741,12 @@ mod tests {
         let (t, a) = train(0x9e37_79b9_7f4a_7c15, 11_000);
         let total = t.last().unwrap().0 + 1000;
         let (h0, h1) = (halves(&t, &a, 0), halves(&t, &a, 1));
-        let ev = eval_trains(&[(&h0.0, &h0.1), (&h1.0, &h1.1)], SR, total);
+        let ev = eval_trains(
+            &[(&h0.0, &h0.1), (&h1.0, &h1.1)],
+            SR,
+            total,
+            &RefractoryParams::default(),
+        );
         assert!(ev.merged.rp_contamination < 0.05, "{ev:?}");
         assert!(ev.pairs[0].dip_z < -5.0, "{ev:?}");
         assert_eq!(ev.pairs[0].sync_z, 0.0);
@@ -727,7 +778,7 @@ mod tests {
     fn sparse_ccg_gives_nan_not_99() {
         let a: Vec<SampleIndex> = (0..20).map(|i| SampleIndex(i * 90_000)).collect();
         let b: Vec<SampleIndex> = (0..20).map(|i| SampleIndex(i * 90_000 + 50_000)).collect();
-        let (d, s) = ccg_z(&a, &b, SR);
+        let (d, s) = ccg_z(&a, &b, SR, 2);
         assert!(d.is_nan() && s.is_nan(), "{d} {s}");
     }
 
@@ -736,7 +787,12 @@ mod tests {
         let (t0, a0) = train(0x1234_5678_9abc_def1, 11_000);
         let (t1, a1) = train(0xdead_beef_cafe_f00d, 11_000);
         let total = t0.last().unwrap().0.max(t1.last().unwrap().0) + 1000;
-        let ev = eval_trains(&[(&t0, &a0), (&t1, &a1)], SR, total);
+        let ev = eval_trains(
+            &[(&t0, &a0), (&t1, &a1)],
+            SR,
+            total,
+            &RefractoryParams::default(),
+        );
         assert!(ev.pairs[0].dip_z > -3.0, "{ev:?}");
         let line = render_merge(
             "merge",
@@ -758,7 +814,7 @@ mod tests {
         let (t, a) = train(0x0bad_cafe_1234_5678, 11_000);
         let total = t.last().unwrap().0 + 1000;
         let minor: Vec<u32> = (0..t.len() as u32).filter(|i| i % 2 == 1).collect();
-        let ev = eval_split_trains(&t, &a, &minor, SR, total);
+        let ev = eval_split_trains(&t, &a, &minor, SR, total, &RefractoryParams::default());
         assert!(ev.dip_z < -5.0, "{ev:?}");
         assert_eq!((ev.parts[0].n, ev.parts[1].n), (5500, 5500));
         assert!(render_split("s1.1", "gmm", 0.62, 12.0, &ev, &[])
