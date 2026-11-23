@@ -772,7 +772,7 @@ mod tests {
             }
         }
         assert!(
-            splits <= 12,
+            splits <= 8,
             "20 s shortest-duration 12 ms-burst false splits: {splits}/200"
         );
 

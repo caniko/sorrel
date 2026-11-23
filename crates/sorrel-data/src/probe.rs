@@ -320,7 +320,7 @@ pub fn run<P: DataProvider>(
             );
             if epochs.is_empty() {
                 return Ok(
-                    "epochs unavailable (need at least 10 spikes and valid recording timing)"
+                    "epochs unavailable (need at least 10 spikes, at least 20 s of recording, and valid timing)"
                         .into(),
                 );
             }
