@@ -70,6 +70,9 @@
           provider = "actions";
           runtime = "nix";
           runner = "ubuntu-24.04";
+          # Evaluate here; the coverage-checked Nix group realizes every check
+          # once without running multiple Crane builds on the same runner.
+          components = ["flake-evaluation"];
           workspace = true;
           workspace_strategy = "aggregate";
           # PRs qualify branches; push CI runs on trunk only. A branch push run
@@ -169,6 +172,8 @@
             check_systems = ["x86_64-linux"];
             groups.checks = qualification;
             capture_results = true;
+            max_jobs = 1;
+            cores = 2;
             push_branches = ["trunk"];
             timeout_minutes = 120;
             # The simit that generated the workflows; vars.SIMIT_CI_ENGINE_REVISION overrides.

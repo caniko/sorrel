@@ -64,7 +64,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/simit-engine-cache
-          key: simit-engine-v1-${{ (vars.SIMIT_CI_ENGINE_REVISION || 'bb75df673d9397e31e1fe8eb9108934364458ae1') }}-${{ runner.os }}-${{ runner.arch }}
+          key: simit-engine-v2-${{ (vars.SIMIT_CI_ENGINE_REVISION || 'bb75df673d9397e31e1fe8eb9108934364458ae1') }}-${{ runner.os }}-${{ runner.arch }}
       - name: Import grouped-build engine
         shell: bash
         env:
@@ -78,7 +78,14 @@ jobs:
           set -euo pipefail
           [ "$SIMIT_ENGINE_CACHE_HIT" = true ] || exit 0
           cache_root="$RUNNER_TEMP/simit-engine-cache"
-          env -u GH_TOKEN -u GITHUB_TOKEN -u GITHUB_OAUTH_TOKEN -u ATTIC_TOKEN -u CACHIX_AUTH_TOKEN -u CACHIX_SIGNING_KEY nix copy --no-check-sigs --all --from "file://$cache_root" || echo '::warning::Cached grouped-build engine failed to import; building it normally'
+          # Copy from the recorded root: `--all` lists a file cache under placeholder
+          # names, so the daemon rejects paths whose references are not yet valid.
+          root=$(cat "$cache_root/root" 2>/dev/null || true)
+          if [[ "$root" =~ ^/nix/store/[0-9a-z]{32}-[A-Za-z0-9+._?=-]+$ ]]; then
+            env -u GH_TOKEN -u GITHUB_TOKEN -u GITHUB_OAUTH_TOKEN -u ATTIC_TOKEN -u CACHIX_AUTH_TOKEN -u CACHIX_SIGNING_KEY nix copy --no-check-sigs --from "file://$cache_root" "$root" || echo '::warning::Cached grouped-build engine failed to import; building it normally'
+          else
+            echo '::warning::Cached grouped-build engine has no valid root; building it normally'
+          fi
           rm -rf "$cache_root"
       - name: Provision grouped-build Rust engine
         shell: bash
@@ -119,6 +126,7 @@ jobs:
           cache_root="$RUNNER_TEMP/simit-engine-cache"
           rm -rf "$cache_root"
           if nix copy --to "file://$cache_root?compression=zstd" "${SIMIT_CI_ENGINE%/bin/simit}"; then
+            printf '%s\n' "${SIMIT_CI_ENGINE%/bin/simit}" > "$cache_root/root"
             printf 'save=true\n' >> "$GITHUB_OUTPUT"
           else
             echo '::warning::Grouped-build engine failed to export; not saving it'
@@ -128,7 +136,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/simit-engine-cache
-          key: simit-engine-v1-${{ (vars.SIMIT_CI_ENGINE_REVISION || 'bb75df673d9397e31e1fe8eb9108934364458ae1') }}-${{ runner.os }}-${{ runner.arch }}
+          key: simit-engine-v2-${{ (vars.SIMIT_CI_ENGINE_REVISION || 'bb75df673d9397e31e1fe8eb9108934364458ae1') }}-${{ runner.os }}-${{ runner.arch }}
       - name: Build Nix group
         shell: bash
         env:
@@ -136,7 +144,7 @@ jobs:
         run: |
           case "$SIMIT_NIX_GROUP" in
             checks)
-              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.default",".#checks.x86_64-linux.formatting",".#checks.x86_64-linux.hm-module",".#checks.x86_64-linux.workspace-tests",".#checks.x86_64-linux.dev-tests",".#checks.x86_64-linux.nwb-export-assets",".#checks.x86_64-linux.binstall-metadata",".#checks.x86_64-linux.binstall-metadata-sorrel-remote"],"plan":[".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.default",".#checks.x86_64-linux.formatting",".#checks.x86_64-linux.hm-module",".#checks.x86_64-linux.workspace-tests",".#checks.x86_64-linux.dev-tests",".#checks.x86_64-linux.nwb-export-assets",".#checks.x86_64-linux.binstall-metadata",".#checks.x86_64-linux.binstall-metadata-sorrel-remote"],"check_systems":["x86_64-linux"],"limits":[],"post_build":[],"post_build_always":[],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
+              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.default",".#checks.x86_64-linux.formatting",".#checks.x86_64-linux.hm-module",".#checks.x86_64-linux.workspace-tests",".#checks.x86_64-linux.dev-tests",".#checks.x86_64-linux.nwb-export-assets",".#checks.x86_64-linux.binstall-metadata",".#checks.x86_64-linux.binstall-metadata-sorrel-remote"],"plan":[".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.default",".#checks.x86_64-linux.formatting",".#checks.x86_64-linux.hm-module",".#checks.x86_64-linux.workspace-tests",".#checks.x86_64-linux.dev-tests",".#checks.x86_64-linux.nwb-export-assets",".#checks.x86_64-linux.binstall-metadata",".#checks.x86_64-linux.binstall-metadata-sorrel-remote"],"check_systems":["x86_64-linux"],"limits":["--max-jobs","1","--cores","2"],"post_build":[],"post_build_always":[],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
               ;;
             *) echo 'Unknown Nix execution group' >&2; exit 1 ;;
           esac
