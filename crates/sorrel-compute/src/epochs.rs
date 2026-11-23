@@ -289,9 +289,11 @@ fn noise_scale(points: &[(f64, f64)]) -> f64 {
 /// equal recording bins, with at least five bins per segment.
 ///
 /// Rate: each bin costs `min(D(c, μ) / φ, 9)`, its Poisson deviance from the
-/// segment's mean count μ divided by the dispersion φ, the squared
-/// first-difference noise scale of the Anscombe-transformed counts
-/// `2 sqrt(c + 3/8)` (at least one, the Poisson value). Amplitude: the bin
+/// segment's mean count μ divided by the dispersion φ: the maximum of 1 (the
+/// Poisson value), the squared first-difference noise scale of the
+/// Anscombe-transformed counts `2 sqrt(c + 3/8)`, and the winsorized
+/// raw-count dispersion (`var / mean`), both widened to their lag-1/lag-3
+/// long-run scale when neighbouring bins are correlated. Amplitude: the bin
 /// mean amplitudes of nonempty bins, weighted by spike count and divided by
 /// the per-spike noise scale from first differences, widened to the
 /// long-run scale when neighbouring bins are correlated (see `noise_scale`);
@@ -349,21 +351,28 @@ pub fn stable_epochs(
     // near silence a single spike is strong evidence of firing, which a
     // Gaussian on the transform misses.
     let sigma_rate = noise_scale(&anscombe.map(|y| (y, 1.0))).max(1.0);
-    // Estimate count dispersion from first differences winsorized past the
-    // top ~8% of jumps so a few step boundaries or isolated bursts do not
-    // inflate φ, while recurrent bursts (whether sparse, dense, or straddling
-    // adjacent short bins) reflect their compound-Poisson long-run dispersion.
+    // Estimate count dispersion from bin counts capped at 2x the ~96th
+    // percentile (leaving normal burst-tail bins intact while bounding up to
+    // four extreme artifact bins identically in numerator and denominator) and
+    // first differences winsorized past the top ~8% of jumps (so step
+    // boundaries do not inflate φ).
     let count_phi = {
-        let mean_c = counts.iter().map(|&c| f64::from(c)).sum::<f64>() / BINS as f64;
+        let mut sorted_counts: [f64; BINS] = counts.map(f64::from);
+        sorted_counts.sort_unstable_by(f64::total_cmp);
+        let count_trim = (BINS / 24).clamp(2, BINS - 1);
+        let count_cap = 2.0 * sorted_counts[BINS - 1 - count_trim];
+        let capped: [f64; BINS] = counts.map(|c| f64::from(c).min(count_cap));
+        let mean_c = capped.iter().sum::<f64>() / BINS as f64;
         if mean_c > 0.0 {
             let win_var = |lag: usize| {
-                let mut diffs: Vec<f64> = counts
+                let mut diffs: Vec<f64> = capped
                     .iter()
-                    .zip(&counts[lag..])
-                    .map(|(&a, &b)| (f64::from(b) - f64::from(a)).abs())
+                    .zip(&capped[lag..])
+                    .map(|(&a, &b)| (b - a).abs())
                     .collect();
                 diffs.sort_unstable_by(f64::total_cmp);
-                let cap = diffs[diffs.len().saturating_sub(9)];
+                let trim = (diffs.len() / 12).max(2).min(diffs.len().saturating_sub(1));
+                let cap = diffs[diffs.len() - 1 - trim];
                 diffs
                     .iter()
                     .map(|&d| {
@@ -386,12 +395,20 @@ pub fn stable_epochs(
         .filter(|&b| counts[b] > 0)
         .map(|b| (sums[b] / f64::from(counts[b]), f64::from(counts[b])))
         .collect();
-    // Never below one f32 epsilon at the amplitude scale (identical bins).
-    let floor = f64::from(f32::EPSILON)
-        * nonempty
-            .iter()
-            .map(|&(m, _)| m.abs())
-            .fold(f64::from(f32::MIN_POSITIVE), f64::max);
+    // Never below one f32 epsilon at the typical (winsorized) amplitude scale,
+    // so identical bins do not split on rounding noise while a single extreme
+    // outlier cannot inflate the floor and mask a real step.
+    let floor = {
+        let mut mags: Vec<f64> = nonempty.iter().map(|&(m, _)| m.abs()).collect();
+        mags.sort_unstable_by(f64::total_cmp);
+        let trim = (mags.len() / 12).max(2).min(mags.len().saturating_sub(1));
+        let typical = mags
+            .get(mags.len().saturating_sub(1 + trim))
+            .copied()
+            .unwrap_or(0.0)
+            .max(f64::from(f32::MIN_POSITIVE));
+        f64::from(f32::EPSILON) * typical
+    };
     let sigma_amp =
         (has_amp && nonempty.len() > MIN_AMP_PAIRS).then(|| noise_scale(&nonempty).max(floor));
     let amp: [Option<Point>; BINS] = match sigma_amp {
@@ -710,6 +727,39 @@ mod tests {
             );
         }
 
+        // Combined burst-plus-artifact check: adding a single 200-spike artifact
+        // bin to a stationary 0.2 Hz burst train must not inflate the dispersion
+        // denominator and trigger false splits elsewhere.
+        let mut splits_artifact = 0;
+        for seed in 0..200_u64 {
+            let mut onset = rng(seed + 10_000);
+            let mut times = Vec::new();
+            let mut t = 0.0;
+            loop {
+                t -= onset().ln() / 0.2;
+                if t >= 99.9 {
+                    break;
+                }
+                times.extend((0..8).map(|i| SampleIndex(((t + 0.004 * i as f64) * 1000.0) as u64)));
+            }
+            if times.len() < MIN_SPIKES {
+                continue;
+            }
+            times.extend((0..200_u64).map(|i| SampleIndex(50_000 + i * 4)));
+            times.sort_unstable_by_key(|s| s.0);
+            let e = stable_epochs(&times, &[], TOTAL, SR);
+            if seed == 1 {
+                assert_eq!(e.len(), 1, "seed 10001 burst+artifact split: {e:?}");
+            }
+            if e.len() > 1 {
+                splits_artifact += 1;
+            }
+        }
+        assert!(
+            splits_artifact <= 12,
+            "burst-only (0.2 Hz) + 200-spike artifact false splits: {splits_artifact}/200"
+        );
+
         // Sustained silence on a burst-only train remains detectable:
         // 0.35 Hz bursts for 60 s, then 40 s of silence. Check that the
         // silent tail is found and starts near the last burst.
@@ -816,6 +866,8 @@ mod tests {
         let mut outlier_amps = clean_amps.clone();
         outlier_amps[20] = 300.0;
         assert_eq!(stable_epochs(&times, &clean_amps, TOTAL, SR).len(), 2);
+        assert_eq!(stable_epochs(&times, &outlier_amps, TOTAL, SR).len(), 2);
+        outlier_amps[20] = 1e8;
         assert_eq!(stable_epochs(&times, &outlier_amps, TOTAL, SR).len(), 2);
 
         // Rate dropout (5 silent bins amidst constant 3 spikes/bin): adding
