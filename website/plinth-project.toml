@@ -378,6 +378,7 @@ label = "Windows · Winget pending"
 audience = "Not yet available"
 href = "https://github.com/microsoft/winget-pkgs/pull/469698"
 link_label = "Track the submission"
+note = "Use Chocolatey or the Windows ZIP for now."
 platforms = ["windows"]
 
 [[pages.sections.secondary_routes]]

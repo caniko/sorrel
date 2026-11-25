@@ -27,7 +27,8 @@
 
   const reported = `${navigator.platform || ""} ${ua}`;
   const arm64 = /\b(aarch64|arm64)\b/i.test(reported);
-  const x64 = /\b(x86_64|amd64|x64)\b/i.test(reported);
+  // Chromium's reduced Linux UA/platform can report x86_64 even on ARM64.
+  const x64 = !hints && /\b(x86_64|amd64|x64)\b/i.test(reported);
   let arch = arm64 === x64 ? "" : arm64 ? "ARM64" : "x86_64";
   if (hints && typeof hints.getHighEntropyValues === "function") {
     const { architecture, bitness } = await hints.getHighEntropyValues(["architecture", "bitness"])

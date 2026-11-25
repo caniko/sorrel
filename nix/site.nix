@@ -16,11 +16,19 @@
     else if builtins.isList value
     then lib.concatMap releaseUrls value
     else if builtins.isString value
-    then
-      if isRelease value && builtins.match "[[:space:]]*(https?://|//).*" (lib.toLower value) != null
-      then [value]
-      # Also inspect quoted URLs inside inline HTML.
-      else builtins.filter (part: builtins.isString part && isRelease part) (builtins.split ''["'<>]+'' value)
+    then let
+      text =
+        builtins.replaceStrings
+        ["&#47;" "&#x2f;" "&#x2F;" "&#58;" "&#x3a;" "&#x3A;"]
+        ["/" "/" "/" ":" ":" ":"]
+        value;
+      # Inspect both quoted and unquoted URLs inside inline HTML.
+      tokens = builtins.filter builtins.isString (builtins.split ''[[:space:]"'<>]+'' text);
+      urls = map (token: lib.removePrefix "href=" (lib.removePrefix "src=" token)) tokens;
+    in
+      if isRelease text && builtins.match "[[:space:]]*(https?://|//).*" (lib.toLower text) != null
+      then [text]
+      else builtins.filter isRelease urls
     else [];
   versionParts = v:
     builtins.match "(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)(-(alpha|beta|rc)[.](0|[1-9][0-9]*))?" v;
@@ -49,11 +57,12 @@
       else lib.concatStringsSep "." (lib.take 3 parts ++ [rank number]);
   in
     builtins.compareVersions (key a) (key b);
-  # Archive/wheel names come from nix/release.nix and nix/wheel.nix; uploads
-  # and signing sidecars are enumerated in .github/workflows/release.yml.
+  # The baseline is the published 0.4.0 asset list; newer names follow
+  # nix/release.nix and the uploads in .github/workflows/release.yml.
   releaseAssets = v: let
     native =
-      map (suffix: "sorrel-${v}-${suffix}")
+      ["sorrel-${v}.tar.gz"]
+      ++ map (suffix: "sorrel-${v}-${suffix}")
       ([
           "x86_64.AppImage"
           "x86_64-linux.tar.gz"
@@ -86,6 +95,8 @@
   in
     if match == null || versionParts v == null || (kind == "tag") != (filename == null)
     then releaseError "Invalid Sorrel release URL: ${url}"
+    else if compareReleaseVersions v "0.4.0" < 0
+    then releaseError "Sorrel release links target ${v}, older than the supported baseline 0.4.0."
     else if filename != null && !builtins.elem filename (releaseAssets v)
     then releaseError "Unexpected asset for Sorrel ${v}: ${filename}"
     else v;

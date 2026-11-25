@@ -55,6 +55,7 @@ const hint = (architecture, bitness) => ({
   platform: "Linux",
   async getHighEntropyValues() { return { architecture, bitness }; },
 });
+const reducedLinux = { platform: "Linux x86_64", userAgent: "X11; Linux x86_64" };
 const cases = [
   [{ userAgentData: { platform: "Windows" }, platform: "Linux x86_64" }, { windows: true }],
   [{ platform: "Win32" }, { windows: true }],
@@ -65,7 +66,10 @@ const cases = [
   [{ userAgentData: hint("arm", "64"), platform: "Linux x86_64" }, { arch: "ARM64" }],
   [{ userAgentData: hint("x86", "64"), platform: "Linux" }, { arch: "x86_64" }],
   [{ userAgentData: hint("x86", "32"), platform: "Linux x86_64" }, {}],
-  [{ userAgentData: { platform: "Linux", async getHighEntropyValues() { throw new Error("denied"); } }, platform: "Linux AMD64" }, { arch: "x86_64" }],
+  [{ ...reducedLinux, userAgentData: { platform: "Linux" } }, {}],
+  [{ ...reducedLinux, userAgentData: { platform: "Linux", async getHighEntropyValues() { throw new Error("denied"); } } }, {}],
+  [{ ...reducedLinux, userAgentData: hint("", "64") }, {}],
+  [{ ...reducedLinux, platform: "Linux aarch64", userAgentData: hint("", "") }, { arch: "ARM64" }],
   [{ platform: "Linux" }, {}],
   [{ platform: "Linux armv7l" }, {}],
   [{ platform: "Linux aarch64", userAgent: "X11; Linux x86_64" }, {}],
