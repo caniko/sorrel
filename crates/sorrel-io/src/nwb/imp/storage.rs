@@ -85,15 +85,16 @@ impl Group {
 
     pub fn optional_group(&self, path: &str) -> Result<Option<Self>> {
         dispatch!(self, Self, g => {
-            if !hdf::hard_link_exists(g, path)? { return Ok(None); }
-            Ok(Some(Self::Hdf5(g.group(path).with_context(|| format!("open HDF5 group {path}"))?)))
+            let Some(resolved) = hdf::resolve_local_path(g, path, true)? else { return Ok(None); };
+            Ok(Some(Self::Hdf5(g.group(&resolved).with_context(|| format!("open HDF5 group {path}"))?)))
         }, g.local_path(path)?.map(|path| g.open_group(&path).map(Self::Zarr)).transpose())
     }
 
     pub fn child_group(&self, name: &str) -> Result<Option<Self>> {
         dispatch!(self, Self, g => {
-            if hdf::hard_link_exists(g, name)? && g.loc_type_by_name(name)? == h5::LocationType::Group {
-                Ok(Some(Self::Hdf5(g.group(name)?)))
+            let Some(path) = hdf::resolve_local_path(g, name, false)? else { return Ok(None); };
+            if g.loc_type_by_name(&path)? == h5::LocationType::Group {
+                Ok(Some(Self::Hdf5(g.group(&path)?)))
             } else {
                 Ok(None)
             }
@@ -155,7 +156,7 @@ impl Group {
     }
 
     pub fn local_member_exists(&self, path: &str) -> Result<bool> {
-        dispatch!(self, Self, g => hdf::hard_link_exists(g, path), Ok(g.local_path(path)?.is_some()))
+        dispatch!(self, Self, g => Ok(hdf::resolve_local_path(g, path, true)?.is_some()), Ok(g.local_path(path)?.is_some()))
     }
 
     pub fn dataset(&self, path: &str) -> Result<Dataset> {
@@ -166,8 +167,8 @@ impl Group {
     /// `None` means absent, not a broken link, wrong node type, or open error.
     pub fn optional_dataset(&self, path: &str) -> Result<Option<Dataset>> {
         dispatch!(self, Self, g => {
-            if !hdf::hard_link_exists(g, path)? { return Ok(None); }
-            hdf::local_dataset(g, path).map(Dataset::Hdf5).map(Some)
+            let Some(resolved) = hdf::resolve_local_path(g, path, true)? else { return Ok(None); };
+            hdf::local_dataset(g, &resolved).map(Dataset::Hdf5).map(Some)
         }, g.local_path(path)?.map(|path| g.open_dataset(&path, false).map(|d| Dataset::Zarr(Box::new(d)))
             .with_context(|| format!("open Zarr dataset {path}"))).transpose())
     }

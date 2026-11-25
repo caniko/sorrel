@@ -693,7 +693,7 @@ mod imp {
                 },
             )
         };
-        let available = || {
+        let available = |found: &[(String, Group)]| {
             if found.is_empty() {
                 "none".to_string()
             } else {
@@ -705,21 +705,26 @@ mod imp {
             }
         };
         let index = if let Some(path) = &requested_path {
-            if let Some(index) = found.iter().position(|(name, _)| name == path) {
-                index
-            } else {
-                // A selected path outside the discovery walk can still contain a link.
+            let mut index = found.iter().position(|(name, _)| name == path);
+            if index.is_none() {
+                // Discovery does not walk soft-linked groups, but an explicit
+                // path can select one once the storage layer resolves it.
                 if let Some(group) = f.optional_group(path)? {
                     if let Some(ty) = group.optional_attr("neurodata_type")? {
-                        is_series(&ty.string()?, path)?;
+                        if is_series(&ty.string()?, path)? {
+                            index = Some(found.len());
+                            found.push((path.clone(), group));
+                        }
                     }
                 }
-                let requested = requested.unwrap_or(path);
-                anyhow::bail!(
-                    "no ElectricalSeries matching {requested:?}; available series: {}",
-                    available()
-                );
             }
+            index.with_context(|| {
+                let requested = requested.unwrap_or(path);
+                format!(
+                    "no ElectricalSeries matching {requested:?}; available series: {}",
+                    available(&found)
+                )
+            })?
         } else if found.is_empty() {
             ensure!(
                 !required,
@@ -741,12 +746,12 @@ mod imp {
         ensure!(
             data_rank(group).with_context(|| format!("ElectricalSeries {path}: invalid data"))? != 0,
             "ElectricalSeries {path} requires 1-D data (one channel) or 2-D data (time × channels); available series: {}",
-            available()
+            available(&found)
         );
         if requested.is_none() && found.len() > 1 {
             log::warn!(
                 "NWB: reading ElectricalSeries {path}; available series: {} (choose with --nwb-series)",
-                available()
+                available(&found)
             );
         }
         Ok(Some(found.swap_remove(index)))
@@ -837,7 +842,7 @@ mod imp {
     fn read_channels(f: &Group, series: &Group, name: &str, n_channels: usize) -> Result<Channels> {
         let region = series
             .dataset("electrodes")
-            .with_context(|| format!("ElectricalSeries {name}: no electrodes region"))?;
+            .with_context(|| format!("ElectricalSeries {name}: cannot open electrodes region"))?;
         let rows: Vec<i64> = region.read_raw()?;
         ensure!(
             rows.len() == n_channels,

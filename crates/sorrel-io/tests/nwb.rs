@@ -501,70 +501,203 @@ fn refuses_spikes_that_disagree_with_recorded_timestamps() {
 
 #[cfg(feature = "hdf5")]
 #[test]
+fn spike_mapping_accepts_same_file_soft_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recording.nwb");
+    for component in [
+        "/acquisition/ElectricalSeriesRaw/starting_time",
+        "/acquisition",
+    ] {
+        let original = fixture("good.nwb");
+        std::fs::copy(&original, &path).unwrap();
+        {
+            let file = hdf5_metno::File::open_rw(&path).unwrap();
+            file.relink(component, "/local_target").unwrap();
+            file.link_soft("/local_target", component).unwrap();
+        }
+        for paired in [false, true] {
+            let open = |raw: &std::path::Path| {
+                let units = if paired {
+                    fixture("units_only.nwb")
+                } else {
+                    raw.to_owned()
+                };
+                NwbProvider::open_with(
+                    units,
+                    NwbOpenParams {
+                        raw_path: paired.then_some(raw),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_or_else(|err| panic!("{component} (paired: {paired}): {err:#}"))
+            };
+            let (actual, expected) = (open(&path), open(&original));
+            assert_eq!(actual.sample_rate(), expected.sample_rate());
+            assert_eq!(actual.starting_time(), expected.starting_time());
+            assert_eq!(
+                actual.spike_times(ClusterId(0)),
+                expected.spike_times(ClusterId(0))
+            );
+            assert_eq!(frame(&actual, 7), frame(&expected, 7));
+        }
+    }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
 fn spike_mapping_datasets_must_be_stored_in_the_opened_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("recording.nwb");
     let clock = "/acquisition/ElectricalSeriesRaw/starting_time";
-    for (kind, component) in [
-        ("soft link", clock),
-        ("soft link", "/acquisition"),
-        ("external raw storage", clock),
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        let external = dir.path().join("clock.bin");
+        file.unlink(clock).unwrap();
+        let st = file
+            .new_dataset::<f64>()
+            .external(external.to_str().unwrap(), 0, 8)
+            .shape(())
+            .create(clock)
+            .unwrap();
+        assert_eq!(st.dcpl().unwrap().get_external().unwrap().len(), 1);
+        st.write_scalar(&0.5).unwrap();
+        st.new_attr::<f64>()
+            .create("rate")
+            .unwrap()
+            .write_scalar(&1000.0)
+            .unwrap();
+    }
+    for (units, raw_path) in [
+        (path.clone(), None),
+        (fixture("units_only.nwb"), Some(path.as_path())),
     ] {
-        std::fs::copy(fixture("good.nwb"), &path).unwrap();
+        let err = NwbProvider::open_with(
+            units,
+            NwbOpenParams {
+                raw_path,
+                ..Default::default()
+            },
+        )
+        .err()
+        .expect("external raw storage");
+        let err = format!("{err:#}");
+        assert!(
+            err.contains(clock) && err.contains("external raw storage") && err.contains("--dat"),
+            "{err}"
+        );
+    }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn soft_links_refuse_external_hops_cycles_and_dangling_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recording.nwb");
+    let source = fixture("good.nwb");
+    let clock = "/acquisition/ElectricalSeriesRaw/starting_time";
+    std::fs::copy(&source, &path).unwrap();
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.unlink(clock).unwrap();
+        file.link_external(
+            source.to_str().unwrap(),
+            "/acquisition/ElectricalSeriesRaw",
+            "/sidecar",
+        )
+        .unwrap();
+        file.link_soft(clock, "/loop").unwrap();
+    }
+    for (target, expected) in [
+        (
+            "/sidecar/starting_time",
+            "/sidecar is an HDF5 external link",
+        ),
+        (
+            "/loop",
+            "soft link cycle at /acquisition/ElectricalSeriesRaw/starting_time",
+        ),
+        (
+            "/acquisition/missing",
+            "dangling HDF5 soft link /acquisition/ElectricalSeriesRaw/starting_time",
+        ),
+    ] {
         {
             let file = hdf5_metno::File::open_rw(&path).unwrap();
-            if kind == "soft link" {
-                file.relink(component, "/local_target").unwrap();
-                file.link_soft("/local_target", component).unwrap();
-            } else {
-                let external = dir.path().join("clock.bin");
-                file.unlink(clock).unwrap();
-                let st = file
-                    .new_dataset::<f64>()
-                    .external(external.to_str().unwrap(), 0, 8)
-                    .shape(())
-                    .create(clock)
-                    .unwrap();
-                assert_eq!(st.dcpl().unwrap().get_external().unwrap().len(), 1);
-                st.write_scalar(&0.5).unwrap();
-                st.new_attr::<f64>()
-                    .create("rate")
-                    .unwrap()
-                    .write_scalar(&1000.0)
-                    .unwrap();
-            }
+            file.link_soft(target, clock).unwrap();
         }
-        // Exercise the same check for the units file and the --dat file.
-        for paired in [false, true] {
-            let (units, raw_path) = if paired {
-                (fixture("units_only.nwb"), Some(path.as_path()))
-            } else {
-                (path.clone(), None)
-            };
-            let err = NwbProvider::open_with(
-                units,
-                NwbOpenParams {
-                    raw_path,
-                    ..Default::default()
-                },
-            )
-            .err()
-            .unwrap_or_else(|| panic!("must reject {kind} at {component} (paired: {paired})"));
-            let err = format!("{err:#}");
-            if component == clock {
-                assert!(
-                    err.contains(clock) && err.contains(kind) && err.contains("--dat"),
-                    "{err}"
-                );
-            }
-            if kind == "soft link" {
-                assert!(
-                    err.contains(&format!("{component} is an HDF5 soft link")),
-                    "{err}"
-                );
-            }
-        }
+        let err = NwbProvider::open(&path).err().expect(target);
+        let err = format!("{err:#}");
+        assert!(err.contains(clock) && err.contains(expected), "{err}");
+        hdf5_metno::File::open_rw(&path)
+            .unwrap()
+            .unlink(clock)
+            .unwrap();
     }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn discovery_ignores_soft_linked_datasets_and_does_not_walk_group_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recording.nwb");
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.create_group("/processing/behavior/Source")
+            .unwrap()
+            .new_dataset_builder()
+            .with_data(&[0.0, 1.0])
+            .create("timestamps")
+            .unwrap();
+        file.create_group("/processing/behavior/Acceleration")
+            .unwrap()
+            .link_soft("/processing/behavior/Source/timestamps", "timestamps")
+            .unwrap();
+        file.link_soft("/acquisition", "/processing/alias").unwrap();
+    }
+    assert_eq!(NwbProvider::open(&path).unwrap().n_channels(), 4);
+    let selected = |series| {
+        NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                series: Some(series),
+                ..Default::default()
+            },
+        )
+    };
+    let alias =
+        selected("/processing/alias/ElectricalSeriesRaw").unwrap_or_else(|err| panic!("{err:#}"));
+    assert_eq!(
+        frame(&alias, 7),
+        frame(&NwbProvider::open(&path).unwrap(), 7)
+    );
+    let err = selected("missing")
+        .err()
+        .expect("missing series")
+        .to_string();
+    assert!(
+        err.ends_with("available series: /acquisition/ElectricalSeriesRaw"),
+        "{err}"
+    );
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn electrodes_region_accepts_a_relative_soft_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recording.nwb");
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        let series = file.group("/acquisition/ElectricalSeriesRaw").unwrap();
+        series.relink("electrodes", "region").unwrap();
+        series.link_soft("./region", "electrodes").unwrap();
+    }
+    let p = NwbProvider::open(&path).unwrap_or_else(|err| panic!("{err:#}"));
+    let original = NwbProvider::open(fixture("good.nwb")).unwrap();
+    assert_eq!(p.channel_map(), original.channel_map());
+    assert_eq!(p.channel_positions(), original.channel_positions());
 }
 
 #[test]
