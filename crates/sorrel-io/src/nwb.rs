@@ -839,32 +839,66 @@ mod imp {
         let limit = 1e-3 + 4.0 * ulp * rate;
         let grid_error = |sample, t| (t - t0) / period - sample as f64;
         let stride = (n - 1).div_ceil(63);
+        let mut last_in_grid = (0, t0);
         for sample in (stride..n - 1).step_by(stride) {
             let time = time_at(sample)?;
             let drift = grid_error(sample, time);
             if drift.abs() <= limit {
+                last_in_grid = (sample, time);
                 continue;
             }
-            // A jump skews the endpoint mean, so the first failed probe may
-            // be before the jump. Take the side with the longer mean interval.
-            let (mut left, mut right) = if drift > 0.0 {
-                ((0, t0), (sample, time))
+            let probe = (sample, time);
+            let before = ((0, t0), probe);
+            let after = (probe, (n - 1, last));
+            let (longer, shorter) = if drift > 0.0 {
+                (before, after)
             } else {
-                ((sample, time), (n - 1, last))
+                (after, before)
             };
-            while right.0 - left.0 > 1 {
-                let mid = left.0.midpoint(right.0);
-                let t = time_at(mid)?;
-                if (t - left.1) / (mid - left.0) as f64 >= (right.1 - t) / (right.0 - mid) as f64 {
-                    right = (mid, t);
-                } else {
-                    left = (mid, t);
+            // First bracket an in-grid to out-of-grid transition. A lasting
+            // offset skews the mean, so this crossing may be on an ordinary
+            // interval. Also look for a short step and a long gap on the
+            // sides where each could account for the signed probe error.
+            let mut largest_error = 2.0 * limit;
+            let mut gap = None;
+            for ((mut left, mut right), direction) in [
+                ((last_in_grid, probe), None),
+                (shorter, Some(-1.0)),
+                (longer, Some(1.0)),
+            ] {
+                while right.0 - left.0 > 1 {
+                    let mid = left.0.midpoint(right.0);
+                    let t = time_at(mid)?;
+                    let take_left = if let Some(sign) = direction {
+                        let left_mean = (t - left.1) / (mid - left.0) as f64;
+                        let right_mean = (right.1 - t) / (right.0 - mid) as f64;
+                        sign * left_mean >= sign * right_mean
+                    } else {
+                        grid_error(mid, t).abs() > limit
+                    };
+                    if take_left {
+                        right = (mid, t);
+                    } else {
+                        left = (mid, t);
+                    }
+                }
+                let step = right.1 - left.1;
+                let back = -step;
+                ensure!(
+                    step.is_finite() && step > 0.0,
+                    "timestamps must strictly increase: they step back by {back:.6} s between samples {} and {} \
+                     (t={} s to {} s); choose another series with --nwb-series",
+                    left.0, right.0, left.1, right.1
+                );
+                // Adjacent grid errors differ by the interval error in samples.
+                let error = (step * rate - 1.0).abs();
+                if error > largest_error {
+                    largest_error = error;
+                    gap = Some((left, right, step));
                 }
             }
-            let jump = right.1 - left.1;
-            let jump_samples = jump * rate;
-            // Adjacent grid errors differ by the interval error in samples.
-            if (jump_samples - 1.0).abs() > 2.0 * limit {
+            if let Some((left, right, jump)) = gap {
+                let jump_samples = jump * rate;
                 anyhow::bail!(
                     "timestamps are not a regular grid: they jump by {jump:.6} s \
                      ({jump_samples:.3} samples at the mean rate {rate} Hz) between samples {} and {} \
@@ -873,8 +907,8 @@ mod imp {
                     left.0, right.0, left.1, right.1
                 );
             }
-            // ponytail: one candidate jump; use the full scan when a gap is
-            // not clear, preserving the small-jitter and nonmonotonic errors.
+            // ponytail: localize only from the first failed probe; use the
+            // full scan when none of its candidates explains the failure.
             break;
         }
         let (mut max_drift, mut worst_sample) = (0.0, 0);
@@ -1569,6 +1603,43 @@ mod imp {
             );
             assert!(
                 err.contains(&format!("between samples {} and {gap}", gap - 1)),
+                "{err}"
+            );
+            assert!(err.contains("--nwb-series"), "{err}");
+        }
+    }
+
+    #[cfg(all(test, feature = "hdf5"))]
+    #[test]
+    fn timestamp_validation_reports_backward_step_at_the_adjacent_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5_metno::File::create(dir.path().join("backward.h5")).unwrap();
+        let name = "/acquisition/e-series";
+        let series = file.create_group(name).unwrap();
+        let root = Group::Hdf5(file.group("/").unwrap());
+        let n = 100_001;
+        let ds = series
+            .new_dataset::<f64>()
+            .shape(n)
+            .create("timestamps")
+            .unwrap();
+        // Test a temporary offset detected by a later probe and a permanent
+        // offset that skews the endpoint mean before the step.
+        for end in [74_847, n] {
+            let times: Vec<_> = (0..n)
+                .map(|i| {
+                    i as f64 / 1000.0
+                        - if (73_259..end).contains(&i) {
+                            0.029
+                        } else {
+                            0.0
+                        }
+                })
+                .collect();
+            ds.write(&times).unwrap();
+            let err = format!("{:#}", read_time_base(&root, name, n).err().unwrap());
+            assert!(
+                err.contains("invalid time base: timestamps must strictly increase: they step back by 0.028000 s between samples 73258 and 73259"),
                 "{err}"
             );
             assert!(err.contains("--nwb-series"), "{err}");
