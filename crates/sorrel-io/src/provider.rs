@@ -74,6 +74,70 @@ impl std::fmt::Display for SampleIndex {
     }
 }
 
+/// Provenance of the exposure used for session-wide spike statistics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpanSource {
+    Trace,
+    Declared(&'static str),
+    SpikeExtent { rejected: Option<&'static str> },
+    Unavailable,
+}
+
+impl std::fmt::Display for SpanSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Trace => f.write_str("trace"),
+            Self::Declared(path) => write!(f, "declared: {path}"),
+            Self::SpikeExtent { rejected: None } => f.write_str("estimate: spike extent"),
+            Self::SpikeExtent {
+                rejected: Some(path),
+            } => {
+                write!(
+                    f,
+                    "estimate: spike extent ({path} does not cover all spikes)"
+                )
+            }
+            Self::Unavailable => f.write_str("unavailable"),
+        }
+    }
+}
+
+/// Half-open session exposure `[start, end)` on the spike sample grid.
+/// It does not imply that any raw samples can be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionSpan {
+    pub start: SampleIndex,
+    pub end: SampleIndex,
+    pub source: SpanSource,
+}
+
+impl SessionSpan {
+    pub fn duration_samples(self) -> u64 {
+        self.end.0.saturating_sub(self.start.0)
+    }
+
+    /// Spikes in the exposure. Trace-backed statistics retain their legacy
+    /// handling of sorter-supplied spikes outside the raw recording.
+    pub fn metric_spikes(self, times: &[SampleIndex]) -> &[SampleIndex] {
+        if self.source == SpanSource::Trace {
+            return times;
+        }
+        let start = times.partition_point(|&t| t < self.start);
+        let len = times[start..].partition_point(|&t| t < self.end);
+        &times[start..start + len]
+    }
+}
+
+impl From<u64> for SessionSpan {
+    fn from(trace_samples: u64) -> Self {
+        Self {
+            start: SampleIndex(0),
+            end: SampleIndex(trace_samples),
+            source: SpanSource::Trace,
+        }
+    }
+}
+
 #[repr(transparent)]
 #[derive(
     Copy,
@@ -441,7 +505,12 @@ pub trait DataProvider: Send + Sync + 'static {
         Ok(f64::from(self.sample_rate()))
     }
     fn n_channels(&self) -> u32;
+    /// Length of the readable raw trace, not the session exposure.
     fn n_samples(&self) -> SampleIndex;
+    /// Exposure for session-wide spike statistics, independent of raw reads.
+    fn session_span(&self) -> SessionSpan {
+        self.n_samples().0.into()
+    }
     fn n_clusters(&self) -> u32;
 
     /// Spike sample indices for a single cluster, sorted ascending.

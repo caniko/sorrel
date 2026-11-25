@@ -47,8 +47,8 @@ mod imp {
     use crate::kilosort::{pinned_sorter, valid_tag, PhyLabel};
     use crate::nwb_units::exact_sample;
     use crate::provider::{
-        appended_unit_id, ChannelId, ClusterId, DataProvider, SampleIndex, TraceSamples,
-        TraceSlice, UnitAnnotation,
+        appended_unit_id, ChannelId, ClusterId, DataProvider, SampleIndex, SessionSpan, SpanSource,
+        TraceSamples, TraceSlice, UnitAnnotation,
     };
     use anyhow::{anyhow, ensure, Context, Result};
     use specs::{legacy_is_series, legacy_type_parents, TypeSpecs};
@@ -76,6 +76,7 @@ mod imp {
         t0: f64,
         n_channels: u32,
         n_samples: SampleIndex,
+        span: SessionSpan,
         spikes_per_cluster: Vec<Vec<SampleIndex>>,
         unit_ids: Vec<u32>,
         metadata: UnitMetadata,
@@ -285,6 +286,11 @@ mod imp {
                 comparison_rate.map(|other_rate| (other_rate, require_agreement)),
             )
             .context("load /units")?;
+            let span = if trace.is_some() {
+                (n_samples as u64).into()
+            } else {
+                units_span(&f, &spikes_per_cluster, rate, t0)
+            };
             if raw.is_some() {
                 ensure!(spikes_per_cluster.iter().filter_map(|s| s.last()).all(|s| s.0 < n_samples as u64),
                     "spike times extend past the paired ElectricalSeries (starting time {t0} s, {n_samples} samples at {rate} Hz)");
@@ -314,6 +320,7 @@ mod imp {
                 t0,
                 n_channels: u32::try_from(channel_map.len()).context("too many NWB channels")?,
                 n_samples: SampleIndex(n_samples as u64),
+                span,
                 metadata,
                 spikes_per_cluster,
                 unit_ids,
@@ -390,6 +397,10 @@ mod imp {
         }
         fn n_samples(&self) -> SampleIndex {
             self.n_samples
+        }
+
+        fn session_span(&self) -> SessionSpan {
+            self.span
         }
         fn n_clusters(&self) -> u32 {
             self.spikes_per_cluster.len() as u32
@@ -552,6 +563,131 @@ mod imp {
         fn quality_metrics(&self) -> &QualityMetrics {
             &self.metadata.metrics
         }
+    }
+
+    fn units_span(f: &Group, spikes: &[Vec<SampleIndex>], rate: f64, t0: f64) -> SessionSpan {
+        let first = spikes.iter().filter_map(|row| row.first().copied()).min();
+        let last = spikes.iter().filter_map(|row| row.last().copied()).max();
+        let mut rejected = None;
+        for path in [
+            "/intervals/epochs",
+            "/units/obs_intervals",
+            "/intervals/trials",
+        ] {
+            let (start, end) = match interval_extent(f, path, spikes.len()) {
+                Ok(Some((start, end))) => {
+                    (exact_sample(start, t0, rate), exact_sample(end, t0, rate))
+                }
+                Ok(None) => continue,
+                Err(err) => {
+                    log::warn!("ignoring NWB session extent at {path}: {err:#}");
+                    continue;
+                }
+            };
+            if !(0.0..u64::MAX as f64).contains(&start)
+                || !(start..u64::MAX as f64).contains(&end)
+                || start == end
+            {
+                log::warn!(
+                    "ignoring NWB session extent at {path}: not a positive span on the sample grid"
+                );
+                continue;
+            }
+            let (start, end) = (SampleIndex(start as u64), SampleIndex(end as u64));
+            if first.is_some_and(|t| t < start) || last.is_some_and(|t| t >= end) {
+                rejected = Some(path);
+                break;
+            }
+            return SessionSpan {
+                start,
+                end,
+                source: SpanSource::Declared(path),
+            };
+        }
+        match first.zip(last) {
+            Some((start, last)) => SessionSpan {
+                start,
+                end: SampleIndex(last.0 + 1),
+                source: SpanSource::SpikeExtent { rejected },
+            },
+            None => SessionSpan {
+                source: SpanSource::Unavailable,
+                ..SessionSpan::from(0)
+            },
+        }
+    }
+
+    fn interval_extent(f: &Group, path: &str, n_units: usize) -> Result<Option<(f64, f64)>> {
+        // Only read time columns and the Units ragged index, never the rest of
+        // the DynamicTable. Bound temporary buffers for remote and local files.
+        const BATCH: usize = 8192;
+        let (mut first, mut last) = (f64::INFINITY, f64::NEG_INFINITY);
+        let mut add = |start: f64, stop: f64| -> Result<()> {
+            check_time(start, "interval start")?;
+            check_time(stop, "interval stop")?;
+            ensure!(start <= stop, "interval stop precedes start");
+            first = first.min(start);
+            last = last.max(stop);
+            Ok(())
+        };
+        if path == "/units/obs_intervals" {
+            let Some(ds) = f.optional_dataset(path)? else {
+                return Ok(None);
+            };
+            let shape = ds.shape();
+            let &[n, 2] = shape.as_slice() else {
+                anyhow::bail!("expected an N×2 observation interval table");
+            };
+            if n == 0 {
+                return Ok(None);
+            }
+            let index = f.dataset("/units/obs_intervals_index")?;
+            ensure!(
+                index.shape() == [n_units],
+                "expected one observation index per unit"
+            );
+            let mut prev = 0;
+            for i in (0..n_units).step_by(BATCH) {
+                for end in index.read_rows::<u64>(i..n_units.min(i + BATCH))? {
+                    ensure!(end >= prev, "observation interval index is not monotonic");
+                    prev = end;
+                }
+            }
+            ensure!(
+                prev == n as u64,
+                "observation interval index does not account for every interval"
+            );
+            for i in (0..n).step_by(BATCH) {
+                let rows = ds.read_rows::<f64>(i..n.min(i + BATCH))?;
+                for &[start, stop] in rows.as_chunks::<2>().0 {
+                    add(start, stop)?;
+                }
+            }
+        } else {
+            let Some(g) = f.optional_group(path)? else {
+                return Ok(None);
+            };
+            let (starts, stops) = (g.dataset("start_time")?, g.dataset("stop_time")?);
+            let shape = starts.shape();
+            let &[n] = shape.as_slice() else {
+                anyhow::bail!("expected one-dimensional start_time");
+            };
+            ensure!(
+                stops.shape() == shape,
+                "start_time and stop_time shapes differ"
+            );
+            for i in (0..n).step_by(BATCH) {
+                let range = i..n.min(i + BATCH);
+                for (start, stop) in starts
+                    .read_rows::<f64>(range.clone())?
+                    .into_iter()
+                    .zip(stops.read_rows::<f64>(range)?)
+                {
+                    add(start, stop)?;
+                }
+            }
+        }
+        Ok(first.is_finite().then_some((first, last)))
     }
 
     pub(crate) fn read_trials(path: &Path) -> Result<crate::Events> {

@@ -39,8 +39,8 @@ pub use open_ephys::{OebinMeta, OebinStream};
 pub use params::PhyParams;
 pub use probeinterface::ProbeGeometry;
 pub use provider::{
-    ChannelId, ClusterId, DataProvider, OptionalRow, RawFile, SampleIndex, TraceDtype,
-    TraceSamples, TraceSlice, UnitAnnotation,
+    ChannelId, ClusterId, DataProvider, OptionalRow, RawFile, SampleIndex, SessionSpan, SpanSource,
+    TraceDtype, TraceSamples, TraceSlice, UnitAnnotation,
 };
 pub use sorting_analyzer::SortingAnalyzerProvider;
 pub use spikeglx::SpikeGlxMeta;

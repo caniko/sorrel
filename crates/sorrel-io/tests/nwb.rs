@@ -5,7 +5,7 @@
 use sorrel_io::kilosort::PhyLabel;
 use sorrel_io::{
     ChannelId, ClusterId, DataProvider, HasGeometry, HasQualityMetrics, NwbOpenParams, NwbProvider,
-    SampleIndex,
+    SampleIndex, SessionSpan, SpanSource,
 };
 use std::path::PathBuf;
 
@@ -815,6 +815,16 @@ fn units_only_have_no_trace_and_use_resolution_or_sample_rate() {
         let p = format.open("units_only.nwb").unwrap();
         assert_eq!(p.sample_rate(), 1000.0);
         assert_eq!(p.n_samples(), SampleIndex(0));
+        assert_eq!(
+            p.session_span(),
+            SessionSpan {
+                start: SampleIndex(550),
+                end: SampleIndex(791),
+                source: SpanSource::SpikeExtent {
+                    rejected: Some("/intervals/trials"),
+                },
+            }
+        );
         assert_eq!(p.channel_map(), (10..16).map(ChannelId).collect::<Vec<_>>());
         assert_eq!(p.channel_positions()[3], [16.0, 20.0]);
         assert_eq!(p.spike_times(ClusterId(0))[0], SampleIndex(600));
@@ -847,6 +857,101 @@ fn units_only_have_no_trace_and_use_resolution_or_sample_rate() {
         let err = with_resolution(1000.00000001).err().unwrap();
         assert_eq!(err.to_string(), "--sample-rate 1000.00000001 Hz is not a clock this NWB declares; pass one of: 1000 Hz (/units/spike_times resolution)");
     }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn units_only_span_prefers_epochs_then_observations_then_trials() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("units.nwb");
+    std::fs::copy(fixture("units_only.nwb"), &path).unwrap();
+    let span = || NwbProvider::open(&path).unwrap().session_span();
+    let table = |file: &hdf5_metno::File, path: &str, starts: &[f64], stops: &[f64]| {
+        let group = file.create_group(path).unwrap();
+        group
+            .new_dataset_builder()
+            .with_data(starts)
+            .create("start_time")
+            .unwrap();
+        group
+            .new_dataset_builder()
+            .with_data(stops)
+            .create("stop_time")
+            .unwrap();
+    };
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.unlink("/intervals/trials").unwrap();
+    }
+    let estimate = SessionSpan {
+        start: SampleIndex(550),
+        end: SampleIndex(791),
+        source: SpanSource::SpikeExtent { rejected: None },
+    };
+    assert_eq!(span(), estimate);
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        table(&file, "/intervals/trials", &[0.35], &[1.3]);
+    }
+    assert_eq!(
+        span(),
+        SessionSpan {
+            start: SampleIndex(350),
+            end: SampleIndex(1300),
+            source: SpanSource::Declared("/intervals/trials"),
+        }
+    );
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        let obs = file
+            .new_dataset::<f64>()
+            .shape((2, 2))
+            .create("/units/obs_intervals")
+            .unwrap();
+        obs.write_raw(&[0.5, 0.8, 0.4, 1.1]).unwrap();
+        file.new_dataset_builder()
+            .with_data(&[1_u64, 1, 2])
+            .create("/units/obs_intervals_index")
+            .unwrap();
+        table(&file, "/intervals/epochs", &[], &[]);
+    }
+    assert_eq!(
+        span(),
+        SessionSpan {
+            start: SampleIndex(400),
+            end: SampleIndex(1100),
+            source: SpanSource::Declared("/units/obs_intervals"),
+        }
+    );
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.unlink("/intervals/epochs").unwrap();
+        table(&file, "/intervals/epochs", &[0.45, 0.35], &[1.0, 0.9]);
+    }
+    assert_eq!(
+        span(),
+        SessionSpan {
+            start: SampleIndex(350),
+            end: SampleIndex(1000),
+            source: SpanSource::Declared("/intervals/epochs"),
+        }
+    );
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.dataset("/intervals/epochs/stop_time")
+            .unwrap()
+            .write_raw(&[0.79, 0.7])
+            .unwrap();
+    }
+    assert_eq!(
+        span(),
+        SessionSpan {
+            source: SpanSource::SpikeExtent {
+                rejected: Some("/intervals/epochs")
+            },
+            ..estimate
+        }
+    );
 }
 
 #[cfg(feature = "hdf5")]
