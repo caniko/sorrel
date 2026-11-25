@@ -4,18 +4,24 @@ Every channel publishes from simit-generated GitHub Actions when a signed
 `<version>` tag (for example `0.2.1`) is pushed on trunk. Nothing is
 published by hand.
 
-1. Bump `[workspace.package] version`, move `[Unreleased]` to
+1. Bump the workspace version in `Cargo.toml` and match it in
+   `crates/sorrel-py/Cargo.toml` and `crates/sorrel-py/pyproject.toml`
+   (`nix/wheel.nix` checks all three). Move `[Unreleased]` to
    `## [<version>] - YYYY-MM-DD` in `CHANGELOG.md`, set `version` and
    `date-released` in `CITATION.cff` to match, and regenerate the BibTeX in
-   `docs/src/project/citing.md` (commands there). Bump the version in the
-   download URLs in `website/plinth-project.toml` (tag and asset filenames).
-   Add or remove rows when release assets change (for example, when Windows
-   ARM64 first ships) and update the installation guide to match. Plinth allows
-   four primary routes; put additional routes under `secondary_routes` until
-   that limit changes. Land it on trunk with green CI, prebuild and both Target
-   smokes (`windows-2025` for x64, `windows-11-arm` for ARM64).
+   `docs/src/project/citing.md` (commands there). Leave website download links
+   unchanged: GitHub Pages deploys on trunk pushes, before the release assets
+   are uploaded. Land the release commit on trunk with green CI, prebuild and
+   both Target smokes (`windows-2025` for x64, `windows-11-arm` for ARM64).
 2. Push a signed annotated tag on that commit. Release validation needs
    the CHANGELOG heading and `nix eval .#sorrel.version` to match the tag.
+3. After the GitHub Release workflow finishes and all expected assets exist,
+   update the tag and asset filenames in the download URLs in
+   `website/plinth-project.toml` in a short follow-up commit. Check the links
+   against the published release, then run
+   `nix eval .#site.drvPath --no-update-lock-file`. If assets change, update the
+   download rows and installation guide together. Plinth allows four primary
+   routes; put additional routes under `secondary_routes`.
 
 The tag starts:
 
@@ -37,8 +43,8 @@ The ARM64 Target smoke runs `release/smoke-windows.ps1 -SkipWheel`. It covers
 DX12 but not Vulkan, because the pinned lavapipe is x64-only; the x64 run
 covers both.
 
-The CLI in every archive, installer and wheel bundles static HDF5 with
-gzip/deflate and LZF. It does not need a system HDF5 library. See the
+The CLI built from trunk for archives, installers and wheels bundles static
+HDF5 with gzip/deflate and LZF. It does not need a system HDF5 library. See the
 [bundled library notices](crates/sorrel/THIRD-PARTY-HDF5.txt). The wheel's
 Python `Session.open()` still supports phy and SortingAnalyzer only.
 
