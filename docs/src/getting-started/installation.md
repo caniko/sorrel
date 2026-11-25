@@ -1,9 +1,9 @@
 # Installation
 
 Desktop users should [download the native build for their OS](/download/).
-The current stable release ships these builds:
+The stable 0.4.0 release ships these builds:
 
-| OS      | Architecture  | Download                          |
+| OS      | CPU           | Download                          |
 | ------- | ------------- | --------------------------------- |
 | Linux   | x86_64        | AppImage or `.tar.gz`             |
 | Linux   | ARM64         | `.tar.gz`                         |
@@ -11,9 +11,9 @@ The current stable release ships these builds:
 | Windows | x64           | `.zip` or standalone `.exe` files |
 
 Release binaries follow the [code signing policy](../project/code-signing.md).
-They include the NWB and legacy MATLAB `rez.mat` readers by default and bundle
-HDF5, as does the default Nix package. You don't need to install HDF5 or CMake
-to use them.
+The 0.4.0 binaries include phy export but not HDF5, so they cannot read NWB
+or legacy MATLAB `rez.mat`. For those readers, build from `trunk`
+[with Cargo](#with-cargo) or [with Nix](#with-nix).
 
 ## Python
 
@@ -39,20 +39,15 @@ wheel.
 
 ### Windows package managers
 
-Stable releases go to winget and Chocolatey, which put `sorrel` (and
-`sorrelw`) on your `PATH`:
+Chocolatey puts `sorrel` and `sorrelw` on your `PATH`:
 
 ```powershell
-winget install Caniko.Sorrel
 choco install sorrel
 ```
 
-Both ship the x64 zip, `sorrel-<VERSION>-x86_64-windows.zip`. The current
-stable release has no native Windows ARM64 build.
-
-Microsoft reviews winget submissions by hand, so a package can take a few
-days to appear. If `winget` reports that no package matches, use Chocolatey
-or the release zip until it is listed.
+Alternatively, [download the Windows x64 ZIP](/download/#downloads). The
+0.4.0 release has no native Windows ARM64 build. Winget is not yet available;
+track the [pending submission](https://github.com/microsoft/winget-pkgs/pull/469698).
 
 ### Windows launchers and shortcuts
 
@@ -61,7 +56,7 @@ console window: it starts `sorrel.exe` with the same arguments (bare, it opens
 the launcher) and exits. Use it from shortcuts, Win+R and Explorer.
 
 **Start menu.** The Chocolatey package adds a _Sorrel_ entry that runs
-`sorrelw.exe`. With winget, or the zip unpacked by hand, run this once:
+`sorrelw.exe`. If you unpacked the ZIP by hand, run this once:
 
 ```powershell
 sorrel install-shortcut            # creates the Start-menu entry
@@ -69,16 +64,15 @@ sorrel install-shortcut --remove   # deletes it
 ```
 
 It writes `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Sorrel.lnk`, pointing at
-the `sorrelw.exe` next to `sorrel.exe`. Run `--remove` before you uninstall:
-neither winget nor Chocolatey knows about a shortcut this command made.
+the `sorrelw.exe` next to `sorrel.exe`. Run `--remove` before deleting a
+manually unpacked copy.
 
-Both packages also install [uv](https://docs.astral.sh/uv/), which
+Chocolatey also installs [uv](https://docs.astral.sh/uv/), which
 `sorrel auto` uses to run its SpikeInterface pipeline. `sorrel mcp` works
 from the same `PATH`, so an agent can launch it by name (see
 [Agents](../usage/agents.md#connecting-an-agent)).
 
-New versions show up once the winget-pkgs PR is merged and Chocolatey
-moderation passes, which can take a few days after the GitHub release.
+Chocolatey moderation can delay new versions after the GitHub release.
 
 **Completions.** Add this line to your `$PROFILE` (`notepad $PROFILE`) to get
 PowerShell completion in every session:
@@ -112,10 +106,10 @@ cosign verify-blob --bundle sorrel-<VERSION>-x86_64-windows.zip.cosign.bundle `
   sorrel-<VERSION>-x86_64-windows.zip
 ```
 
-**Uninstall.** `winget uninstall Caniko.Sorrel` or `choco uninstall sorrel`
-removes the programs. Sorrel's per-user state (the GUI instance file, the
-host registry, `gui.log`, `sorrelw.log`) stays in `%LOCALAPPDATA%\sorrel`, and
-the derived-data cache and your curation journals stay next to your data.
+**Uninstall.** `choco uninstall sorrel` removes the Chocolatey package.
+Sorrel's per-user state (the GUI instance file, host registry, `gui.log`,
+`sorrelw.log`) stays in `%LOCALAPPDATA%\sorrel`. The derived-data cache and
+your curation journals stay next to your data.
 Delete the folder when you no longer need it:
 
 ```powershell
@@ -135,8 +129,12 @@ to the CPU on its own when a backend rejects the compute kernels.
 
 ## With Cargo
 
-Build from a source checkout with a C compiler and CMake 3.26 or newer for
-the bundled HDF5 library. These are also required for `cargo install`.
+`cargo install sorrel` at version 0.4.0 enables `phy-export` by default,
+not `hdf5`, just like the 0.4.0 release binaries.
+
+A source build from `trunk` enables both `phy-export` and `hdf5` by default.
+It reads NWB and MATLAB v7.3 `rez.mat` and bundles HDF5 at build time. Use a
+C compiler and CMake 3.26 or newer; no system HDF5 library is needed.
 
 ```bash
 cargo build --release -p sorrel
@@ -162,7 +160,8 @@ cargo build --release -p sorrel --no-default-features
 nix build .#sorrel        # includes HDF5
 ```
 
-`nix build` builds the default `sorrel` package. The flake also exposes:
+From `trunk`, `nix build` builds the default `sorrel` package with HDF5
+bundled. The flake also exposes:
 
 - `.#website` — the Plinth landing and download pages.
 - `.#docs` — this mdBook documentation.

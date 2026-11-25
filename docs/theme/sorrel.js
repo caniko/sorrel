@@ -1,20 +1,26 @@
 (() => {
     const title = document.querySelector(".menu-title");
-    const home = document.createElement("a");
-    home.href = "/";
-    home.textContent = title.textContent;
-    title.replaceChildren(home);
+    if (title) {
+        const home = document.createElement("a");
+        home.href = "/";
+        home.textContent = "Sorrel website";
+        title.replaceChildren(home);
+    }
 
-    const download = document.createElement("a");
-    download.className = "docs-download";
-    download.href = "/download/";
-    download.textContent = "Download";
-    document.querySelector(".menu-bar .right-buttons").prepend(download);
+    const buttons = document.querySelector(".menu-bar .right-buttons");
+    if (buttons) {
+        const download = document.createElement("a");
+        download.className = "docs-download";
+        download.href = "/download/";
+        download.textContent = "Download";
+        buttons.prepend(download);
+    }
 
+    const hints = new Map();
     const scrollHints = new ResizeObserver((entries) => {
         for (const { target } of entries) {
             const overflow = target.scrollWidth > target.clientWidth;
-            (target.closest("pre") ?? target).previousElementSibling.hidden = !overflow;
+            hints.get(target).hidden = !overflow;
             target.tabIndex = overflow ? 0 : -1;
         }
     });
@@ -24,6 +30,7 @@
         hint.textContent = "Scroll horizontally to see more →";
         hint.hidden = true;
         (area.closest("pre") ?? area).before(hint);
+        hints.set(area, hint);
         scrollHints.observe(area);
     }
 })();
