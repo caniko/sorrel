@@ -217,7 +217,7 @@ fn with_space(set: &FeatureSet, selection: &[ClusterId], depths: &SpikeDepths) -
         set.full,
         set.points.clone(),
         feats,
-        set.duration,
+        set.time_range,
     )
 }
 
@@ -1647,7 +1647,7 @@ mod tests {
             true,
             points,
             feats,
-            10.0,
+            (0.0, 10.0),
         );
         set.bounds = vec![(0.0, 1.0); 2 * n];
         set

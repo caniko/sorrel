@@ -170,7 +170,7 @@ pub struct SuggestMemo {
     gen: u64,
     pair_sig: [u64; 4],
     pairs: HashMap<([u8; 32], [u8; 32]), (PairScore, u64)>,
-    split_sig: [u64; 7],
+    split_sig: [u64; 8],
     splits: HashMap<[u8; 32], (SplitCandidate, u64)>,
 }
 
@@ -193,11 +193,11 @@ fn content_key(times: &[SampleIndex], amps: &[f32]) -> blake3::Hasher {
 }
 
 /// Firing counts of `times` in [`PRESENCE_BINS`] equal slices of the recording.
-fn presence_counts(times: &[SampleIndex], total: u64) -> Vec<f32> {
-    let width = (total as f64 / PRESENCE_BINS as f64).max(1.0);
+fn presence_counts(times: &[SampleIndex], span: sorrel_io::SessionSpan) -> Vec<f32> {
+    let width = (span.duration_samples() as f64 / PRESENCE_BINS as f64).max(1.0);
     let mut c = vec![0.0f32; PRESENCE_BINS];
-    for t in times {
-        c[((t.0 as f64 / width) as usize).min(PRESENCE_BINS - 1)] += 1.0;
+    for t in span.metric_spikes(times) {
+        c[(((t.0 - span.start.0) as f64 / width) as usize).min(PRESENCE_BINS - 1)] += 1.0;
     }
     c
 }
@@ -330,13 +330,13 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
 
     // Drift source inputs: peak-channel position and presence histogram per
     // cluster (both `None` without positions / templates).
-    let total = session.provider.n_samples().0;
+    let span = session.provider.session_span();
     let drift: Vec<Option<([f32; 2], Vec<f32>)>> = (0..n)
         .map(|c| {
             summaries[c as usize].as_ref()?;
             let c = ClusterId(c);
             let pos = *memo.positions.get(peak_channel(session, c)?)?;
-            Some((pos, presence_counts(session.spike_times(c), total)))
+            Some((pos, presence_counts(session.spike_times(c), span)))
         })
         .collect();
 
@@ -582,7 +582,7 @@ fn score_split<P: DataProvider>(
     refractory_samples: u64,
 ) -> SplitCandidate {
     let sr = session.provider.sample_rate().max(1.0);
-    let total_duration = session.provider.n_samples();
+    let span = session.provider.session_span();
     let times = session.spike_times(c);
     let amps = session.spike_amplitudes(c);
     let bc = if amps.len() >= 8 {
@@ -619,7 +619,12 @@ fn score_split<P: DataProvider>(
             }
         }
     }
-    let contamination = refractory_contamination(times, refractory_samples, total_duration.0, sr);
+    let contamination = refractory_contamination(
+        span.metric_spikes(times),
+        refractory_samples,
+        span.duration_samples(),
+        sr,
+    );
     let cont_score = (contamination * 2.0).clamp(0.0, 1.0);
     let drift = amplitude_drift_correlation(times, amps).abs();
     let drift_score = ((drift - 0.3) / 0.5).clamp(0.0, 1.0);
@@ -711,9 +716,11 @@ pub fn rank_split_candidates_memo<P: DataProvider>(
     let globals = session
         .has_pc_features()
         .then(|| crate::proposers::all_cluster_globals(session));
+    let span = session.provider.session_span();
     let sig = [
         sr.to_bits() as u64,
-        session.provider.n_samples().0,
+        span.start.0,
+        span.end.0,
         globals.is_some() as u64,
         rp.fixed_ms.to_bits() as u64,
         rp.sweep_min_ms.to_bits() as u64,

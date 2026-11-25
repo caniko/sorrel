@@ -111,7 +111,7 @@ pub fn render_cluster_svgs<P: DataProvider>(
         log_isi: svg_bars(&log_isi_histogram(spikes, sr), W, H),
         acg: svg_bars(&acg, W, H),
         amplitude: (!amps.is_empty())
-            .then(|| svg_dots(spikes, amps, session.provider.n_samples().0.max(1))),
+            .then(|| svg_dots(spikes, amps, session.provider.session_span())),
     }
 }
 
@@ -212,10 +212,22 @@ pub fn svg_bars(counts: &[u32], w: f32, h: f32) -> String {
 /// zero-length segments), at most `MAX_DOTS` dots. y runs from zero to a
 /// little above the drawn dots' 99th percentile, so a few outliers pin to
 /// the top edge instead of flattening everything else.
-pub fn svg_dots(times: &[SampleIndex], amps: &[f32], n_samples: u64) -> String {
+pub fn svg_dots(
+    times: &[SampleIndex],
+    amps: &[f32],
+    span: impl Into<sorrel_io::SessionSpan>,
+) -> String {
+    let span = span.into();
+    let width = span.duration_samples().max(1) as f32;
     let n = times.len().min(amps.len());
     let stride = n.div_ceil(MAX_DOTS).max(1);
-    let drawn: Vec<usize> = (0..n).step_by(stride).collect();
+    let drawn: Vec<usize> = (0..n)
+        .step_by(stride)
+        .filter(|&i| {
+            span.source == sorrel_io::SpanSource::Trace
+                || (span.start..span.end).contains(&times[i])
+        })
+        .collect();
     let mut sorted: Vec<f32> = drawn.iter().map(|&i| amps[i].abs()).collect();
     sorted.sort_unstable_by(f32::total_cmp);
     let top = sorted
@@ -227,7 +239,7 @@ pub fn svg_dots(times: &[SampleIndex], amps: &[f32], n_samples: u64) -> String {
         .map(|&i| {
             format!(
                 "M{:.1} {:.1}h0",
-                times[i].0 as f32 / n_samples as f32 * STRIP_W,
+                (times[i].0 - span.start.0) as f32 / width * STRIP_W,
                 STRIP_H - (amps[i].abs() / top).min(1.0) * (STRIP_H - 2.0) - 1.0
             )
         })
@@ -374,7 +386,7 @@ where
         kpis: &KPIS,
         counts,
         sample_rate_khz: num(sr / 1000.0),
-        duration_min: num(session.provider.n_samples().0 as f32 / sr / 60.0),
+        duration_min: num(session.provider.session_span().duration_samples() as f32 / sr / 60.0),
         cards,
         version: env!("CARGO_PKG_VERSION"),
     }

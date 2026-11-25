@@ -311,16 +311,18 @@ fn noise_scale(points: &[(f64, f64)]) -> f64 {
 ///
 /// Returns empty with fewer than ten spikes (twice the minimum bin count),
 /// recording shorter than 20 s (200 ms bins), invalid duration/sample rate,
-/// or times outside `[0, total_samples)`.
+/// or times outside the half-open session span.
 /// Missing/invalid amplitudes, or fewer than 20 consecutive pairs of
 /// nonempty bins, reduce the fit to rates only. Observed amplitude means are
 /// still reported if the amplitude data are valid.
 pub fn stable_epochs(
     times: &[SampleIndex],
     amps: &[f32],
-    total_samples: u64,
+    span: impl Into<sorrel_io::SessionSpan>,
     sr: f32,
 ) -> Vec<Epoch> {
+    let span = span.into();
+    let total_samples = span.duration_samples();
     let duration = total_samples as f64 / f64::from(sr);
     if times.len() < MIN_SPIKES
         || u32::try_from(times.len()).is_err()
@@ -336,11 +338,12 @@ pub fn stable_epochs(
     let mut counts = [0_u32; BINS];
     let mut sums = [0.0_f64; BINS];
     for (i, &t) in times.iter().enumerate() {
-        if t.0 >= total_samples {
+        if t < span.start || t >= span.end {
             return Vec::new();
         }
         // Exact edges, including for recordings not divisible by 100 samples.
-        let b = (u128::from(t.0) * BINS as u128 / u128::from(total_samples)) as usize;
+        let b =
+            (u128::from(t.0 - span.start.0) * BINS as u128 / u128::from(total_samples)) as usize;
         counts[b] += 1;
         if has_amp {
             sums[b] += f64::from(amps[i]);
@@ -477,8 +480,8 @@ pub fn stable_epochs(
             return Vec::new();
         }
         epochs.push(Epoch {
-            start_s: edge(start) as f64 / f64::from(sr),
-            end_s: edge(end) as f64 / f64::from(sr),
+            start_s: (span.start.0 + edge(start)) as f64 / f64::from(sr),
+            end_s: (span.start.0 + edge(end)) as f64 / f64::from(sr),
             n,
             rate_hz,
             amp_mean: if has_amp && n > 0 {

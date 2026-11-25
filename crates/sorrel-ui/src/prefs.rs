@@ -63,15 +63,15 @@ impl Default for RateParams {
 }
 
 impl RateParams {
-    /// The `:frmin`/`:frmax` range within a `total_s` recording, or all of
-    /// it when the range is empty.
-    pub fn x_range(&self, total_s: f32) -> (f32, f32) {
-        let lo = self.x_min.unwrap_or(0.0).clamp(0.0, total_s);
-        let hi = self.x_max.unwrap_or(total_s).clamp(0.0, total_s);
+    /// The `:frmin`/`:frmax` range within the session, or all of it when
+    /// the range is empty.
+    pub fn x_range(&self, (start, end): (f32, f32)) -> (f32, f32) {
+        let lo = self.x_min.unwrap_or(start).clamp(start, end);
+        let hi = self.x_max.unwrap_or(end).clamp(start, end);
         if hi > lo {
             (lo, hi)
         } else {
-            (0.0, total_s)
+            (start, end)
         }
     }
 }
@@ -289,11 +289,11 @@ mod tests {
     #[test]
     fn rate_x_range_clamps_and_falls_back_to_the_recording() {
         let mut p = RateParams::default();
-        assert_eq!(p.x_range(100.0), (0.0, 100.0));
+        assert_eq!(p.x_range((0.0, 100.0)), (0.0, 100.0));
         (p.x_min, p.x_max) = (Some(10.0), Some(500.0));
-        assert_eq!(p.x_range(100.0), (10.0, 100.0));
+        assert_eq!(p.x_range((0.0, 100.0)), (10.0, 100.0));
         p.x_max = Some(5.0);
-        assert_eq!(p.x_range(100.0), (0.0, 100.0));
+        assert_eq!(p.x_range((0.0, 100.0)), (0.0, 100.0));
     }
 
     #[test]

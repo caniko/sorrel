@@ -154,7 +154,7 @@ fn refractory_flags_change_qc_and_html_report_on_the_real_binary() {
         }
         let rows: serde_json::Value =
             serde_json::from_slice(&std::fs::read(qc.join("cluster_qc.json")).unwrap()).unwrap();
-        let row = rows
+        let row = rows["clusters"]
             .as_array()
             .unwrap()
             .iter()
@@ -238,7 +238,8 @@ fn qc_cli_distinguishes_confirmed_contamination_from_no_evidence() {
         let rows: serde_json::Value =
             serde_json::from_slice(&std::fs::read(qc.join("cluster_qc.json")).unwrap()).unwrap();
         let row = |id| {
-            rows.as_array()
+            rows["clusters"]
+                .as_array()
                 .unwrap()
                 .iter()
                 .find(|r| r["cluster_id"] == id)

@@ -239,7 +239,8 @@ pub fn run<P: DataProvider>(
     q: &Query,
 ) -> Result<String, String> {
     let sr = session.provider.sample_rate().max(1.0);
-    let total = session.provider.n_samples().0.max(1);
+    let span = session.provider.session_span();
+    let total = span.duration_samples().max(1);
     let times = |c| session.spike_times(c);
     let samples = |ms: f32| (ms * sr / 1000.0).round() as u32;
     match q {
@@ -249,7 +250,7 @@ pub fn run<P: DataProvider>(
             let h = acg_or_compute(session, c, b, w);
             Ok(acg_text(
                 c.0,
-                times(c),
+                span.metric_spikes(times(c)),
                 sr,
                 total,
                 &h,
@@ -315,7 +316,7 @@ pub fn run<P: DataProvider>(
             let epochs = stable_epochs(
                 times(c),
                 session.spike_amplitudes(c),
-                session.provider.n_samples().0,
+                span,
                 session.provider.sample_rate(),
             );
             if epochs.is_empty() {

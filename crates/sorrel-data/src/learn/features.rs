@@ -54,7 +54,7 @@ use sorrel_compute::{
     auto_correlogram, bimodality_coefficient, fit_diag_gmm, ks_two_sample, mean_amplitude,
 };
 use sorrel_io::kilosort::PhyLabel;
-use sorrel_io::{ClusterId, DataProvider, HasGeometry, SampleIndex};
+use sorrel_io::{ClusterId, DataProvider, HasGeometry, SampleIndex, SpanSource};
 
 use crate::axis_split::axis_candidates_with;
 use crate::density_tree::density_candidates_with;
@@ -510,7 +510,14 @@ pub fn extract<P: DataProvider + HasGeometry>(
     opts: &ExtractOpts,
 ) -> Result<ExtractData> {
     let sr = session.provider.sample_rate().max(1.0);
-    let total = session.provider.n_samples().0;
+    // The learn CLI only opens Kilosort inputs; its versioned shards store
+    // a trace-relative length, not an offset exposure.
+    let span = session.provider.session_span();
+    ensure!(
+        span.source == SpanSource::Trace,
+        "learn features require a trace span"
+    );
+    let total = span.duration_samples();
     let phase_start = std::time::Instant::now();
     let phase = |name: &str| {
         if std::env::var_os("SORREL_LEARN_TRACE").is_some() {

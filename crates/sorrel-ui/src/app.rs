@@ -1106,8 +1106,12 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             Snippet::RateBins(n) => self.view_params.rate.n_bins = n,
             Snippet::RateBinSize(secs) => {
                 let s = read(&self.session);
-                let duration = s.provider.n_samples().0 as f32 / s.provider.sample_rate().max(1.0);
-                let (lo, hi) = self.view_params.rate.x_range(duration);
+                let sr = s.provider.sample_rate().max(1.0);
+                let span = s.provider.session_span();
+                let (lo, hi) = self
+                    .view_params
+                    .rate
+                    .x_range((span.start.as_f32() / sr, span.end.as_f32() / sr));
                 self.view_params.rate.n_bins =
                     (((hi - lo) / secs.max(1e-3)).round() as usize).clamp(2, 5000);
             }
@@ -2389,7 +2393,8 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 .is_none_or(|(k, ..)| *k != scheme_key)
             {
                 let n = session.n_clusters();
-                let duration = (session.provider.n_samples().0 as f32
+                let span = session.provider.session_span();
+                let duration = (span.duration_samples() as f32
                     / session.provider.sample_rate().max(1.0))
                 .max(1e-3);
                 let ids = (0..n).map(ClusterId);
@@ -2399,7 +2404,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     .collect();
                 let fr: Vec<f32> = ids
                     .clone()
-                    .map(|c| session.spike_times(c).len() as f32 / duration)
+                    .map(|c| span.metric_spikes(session.spike_times(c)).len() as f32 / duration)
                     .collect();
                 let depth: Vec<f32> = ids
                     .map(|c| depths.and_then(|d| d.cluster_mean(c)).unwrap_or(f32::NAN))

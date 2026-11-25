@@ -11,7 +11,7 @@ use crate::distribution::amplitude_cutoff;
 use crate::drift::{amplitude_drift_correlation, longest_silent_gap_frac, presence_cv};
 use crate::metrics::{amplitude_snr, isi_violations, presence_ratio, refractory_contamination};
 use crate::metrics_iso::IsolationMetrics;
-use sorrel_io::SampleIndex;
+use sorrel_io::{SampleIndex, SessionSpan};
 
 /// Per-cluster quality breakdown. All fields are bounded to `[0, 1]`
 /// where 1.0 = best and 0.0 = worst, except the raw inputs noted below.
@@ -88,24 +88,29 @@ pub fn quality_breakdown(
     spike_times: &[SampleIndex],
     spike_amplitudes: &[f32],
     refractory_samples: u64,
-    total_duration_samples: u64,
+    span: impl Into<SessionSpan>,
     sample_rate: f32,
     presence_bins: usize,
 ) -> QualityBreakdown {
+    let span = span.into();
     let n = spike_times.len();
     let raw_contamination = refractory_contamination(
-        spike_times,
+        span.metric_spikes(spike_times),
         refractory_samples,
-        total_duration_samples,
+        span.duration_samples(),
         sample_rate,
     );
-    let raw_presence = presence_ratio(spike_times, total_duration_samples, presence_bins);
-    let raw_gap = longest_silent_gap_frac(spike_times, total_duration_samples);
+    let raw_presence = if span.duration_samples() == 0 {
+        f32::NAN
+    } else {
+        presence_ratio(spike_times, span, presence_bins)
+    };
+    let raw_gap = longest_silent_gap_frac(spike_times, span);
     let raw_snr = amplitude_snr(spike_amplitudes);
     let raw_cutoff = amplitude_cutoff(spike_amplitudes, 30);
     let raw_drift = amplitude_drift_correlation(spike_times, spike_amplitudes);
     let raw_isi_violations = isi_violations(spike_times, refractory_samples) as u32;
-    let raw_presence_cv = presence_cv(spike_times, total_duration_samples, presence_bins);
+    let raw_presence_cv = presence_cv(spike_times, span, presence_bins);
 
     QualityBreakdown {
         contamination_score: (1.0 - raw_contamination).clamp(0.0, 1.0),

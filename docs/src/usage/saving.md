@@ -175,8 +175,25 @@ both:
 
 - `out/qc/cluster_qc.tsv` — one row per cluster, header columns are
   metric names.
-- `out/qc/cluster_qc.json` — same data, JSON shape for programmatic
-  consumption.
+- `out/qc/cluster_qc.json` — a versioned object: `schema_version: 2`,
+  `session_span`, and `clusters`. The `clusters` array is the previous
+  top-level array, with the same row fields. To read either version, use
+  `doc if isinstance(doc, list) else doc["clusters"]` in Python.
+
+`session_span` gives `start_s`, `end_s` (exclusive), and `duration_s` in
+seconds on the spike sample grid, plus `source`. A trace gives the span
+`[0, trace length)`. Without a trace, NWB uses the first non-empty declared
+extent from epochs, Units observation intervals, or trials, in that order.
+If none is usable or the selected interval does not cover every spike,
+Sorrel uses the first spike through one sample past the last spike and
+labels that span as an estimate. `sorrel describe` shows the duration and
+its source as well.
+
+Firing rate and presence use the reported span, including when it is
+derived; neither is available when there is no span (`null` in JSON,
+blank in TSV). `isi_violation_ratio` is unchanged: it counts violations
+per second of that unit's own first-to-last spike span, not a fraction of
+spikes or a rate over the session.
 
 …and exits without spawning a window. The journal is replayed first, so
 the export reflects current curation.

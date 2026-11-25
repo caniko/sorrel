@@ -22,7 +22,7 @@ use sorrel_compute::{
     analyse_refractory_dip, cross_correlogram, isi_violation_rate, ks_two_sample, mean_amplitude,
     quality_breakdown, RefractoryParams,
 };
-use sorrel_io::{ClusterId, DataProvider, SampleIndex};
+use sorrel_io::{ClusterId, DataProvider, SampleIndex, SessionSpan};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
@@ -85,17 +85,18 @@ pub(crate) fn unit_stats_with(
     times: &[SampleIndex],
     amps: &[f32],
     sr: f32,
-    total: u64,
+    span: impl Into<SessionSpan>,
     windows: RefractoryWindows<'_>,
 ) -> UnitStats {
     let has = !amps.is_empty() && amps.len() == times.len();
-    let (c, rp) = windows.sweep(times, total, sr);
+    let span = span.into();
+    let (c, rp) = windows.sweep(span.metric_spikes(times), span.duration_samples(), sr);
     let refractory = windows.fixed_samples(sr);
     let q = quality_breakdown(
         times,
         if has { amps } else { &[] },
         refractory,
-        total,
+        span,
         sr,
         PRESENCE_BINS,
     );
@@ -149,12 +150,13 @@ pub fn eval_trains(
 pub(crate) fn eval_trains_with(
     parts: &[(&[SampleIndex], &[f32])],
     sr: f32,
-    total: u64,
+    span: impl Into<SessionSpan>,
     windows: RefractoryWindows<'_>,
 ) -> MergeEval {
+    let span = span.into();
     let stats: Vec<UnitStats> = parts
         .iter()
-        .map(|&(t, a)| unit_stats_with(t, a, sr, total, windows))
+        .map(|&(t, a)| unit_stats_with(t, a, sr, span, windows))
         .collect();
     // ponytail: concat + stable sort, O(n log n); a k-way heap merge only
     // matters past ~10^7 spikes.
@@ -195,7 +197,7 @@ pub(crate) fn eval_trains_with(
     }
     MergeEval {
         ids: Vec::new(),
-        merged: unit_stats_with(&times, &amps, sr, total, windows),
+        merged: unit_stats_with(&times, &amps, sr, span, windows),
         parts: stats,
         pairs,
     }
@@ -206,11 +208,11 @@ pub fn eval_merge<P: DataProvider>(session: &Session<P>, ids: &[ClusterId]) -> M
         .iter()
         .map(|&c| (session.spike_times(c), session.spike_amplitudes(c)))
         .collect();
-    let mut ev = eval_trains(
+    let mut ev = eval_trains_with(
         &parts,
         session.provider.sample_rate().max(1.0),
-        session.provider.n_samples().0,
-        session.refractory(),
+        session.provider.session_span(),
+        RefractoryWindows::Session(session.refractory()),
     );
     ev.ids = ids.iter().map(|c| c.0).collect();
     ev
@@ -240,9 +242,10 @@ pub(crate) fn eval_split_trains_with(
     amps: &[f32],
     minor: &[u32],
     sr: f32,
-    total: u64,
+    span: impl Into<SessionSpan>,
     windows: RefractoryWindows<'_>,
 ) -> SplitEval {
+    let span = span.into();
     let is_minor: BTreeSet<usize> = minor.iter().map(|&i| i as usize).collect();
     let pick = |want: bool| -> (Vec<SampleIndex>, Vec<f32>) {
         let keep = |i: &usize| is_minor.contains(i) == want;
@@ -262,8 +265,8 @@ pub(crate) fn eval_split_trains_with(
     SplitEval {
         cluster: 0,
         parts: [
-            unit_stats_with(&major.0, &major.1, sr, total, windows),
-            unit_stats_with(&minor.0, &minor.1, sr, total, windows),
+            unit_stats_with(&major.0, &major.1, sr, span, windows),
+            unit_stats_with(&minor.0, &minor.1, sr, span, windows),
         ],
         mean_amp: [mean(&major.1), mean(&minor.1)],
         dip_z,
@@ -276,13 +279,13 @@ pub fn eval_split<P: DataProvider>(
     cluster: ClusterId,
     minor_idx: &[u32],
 ) -> SplitEval {
-    let mut ev = eval_split_trains(
+    let mut ev = eval_split_trains_with(
         session.spike_times(cluster),
         session.spike_amplitudes(cluster),
         minor_idx,
         session.provider.sample_rate().max(1.0),
-        session.provider.n_samples().0,
-        session.refractory(),
+        session.provider.session_span(),
+        RefractoryWindows::Session(session.refractory()),
     );
     ev.cluster = cluster.0;
     ev

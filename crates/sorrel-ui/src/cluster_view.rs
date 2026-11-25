@@ -468,8 +468,8 @@ impl ClusterRows {
         use rayon::prelude::*;
         let n = session.n_clusters() as usize;
         let sr = session.provider.sample_rate().max(1.0);
-        let total = session.provider.n_samples().0;
-        let duration_s = total as f64 / sr as f64;
+        let span = session.provider.session_span();
+        let duration_s = span.duration_samples() as f64 / sr as f64;
         let refractory = session.refractory().fixed_samples(sr);
         let n_channels = session.template_shape().2;
         // [ch, sh, depth, fr, amp, n_spikes, isi, qual, tags] per cluster.
@@ -484,7 +484,9 @@ impl ClusterRows {
                     return r;
                 }
                 let amps = session.spike_amplitudes(c);
-                r[3] = times.len() as f64 / duration_s.max(f64::MIN_POSITIVE);
+                if duration_s > 0.0 {
+                    r[3] = span.metric_spikes(times).len() as f64 / duration_s;
+                }
                 let mean_amp = (!amps.is_empty()).then(|| mean_amplitude(amps) as f64);
                 let mut ptp_val = None;
                 if let Some((ch, ptp)) = session
@@ -499,7 +501,7 @@ impl ClusterRows {
                 }
                 r[4] = amp_value(mean_amp, ptp_val);
                 r[6] = isi_violations(times, refractory) as f64;
-                r[7] = quality_breakdown(times, amps, refractory, total, sr, 50).composite() as f64;
+                r[7] = quality_breakdown(times, amps, refractory, span, sr, 50).composite() as f64;
                 let tags = session.tags(c);
                 let review = tags.iter().filter(|t| t.starts_with("review:")).count();
                 r[8] = (review * 1000 + tags.len()) as f64;

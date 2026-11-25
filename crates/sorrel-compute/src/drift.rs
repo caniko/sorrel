@@ -12,7 +12,7 @@
 //! the cross-correlation-of-depth-histogram registration that Kilosort2.5 /
 //! dredge perform; do not treat their output as a drift-correction signal.
 
-use sorrel_io::SampleIndex;
+use sorrel_io::{SampleIndex, SessionSpan, SpanSource};
 
 /// Sums needed to compute Pearson correlation or least-squares slope of a
 /// (time, amplitude) cloud. Returns `None` for fewer than 3 paired samples.
@@ -78,14 +78,17 @@ pub fn amplitude_drift_slope(times: &[SampleIndex], amps: &[f32], sample_rate: f
 /// Coefficient of variation (std / |mean|) of bin counts in a presence-bin
 /// histogram. Higher = more bursty / patchy presence. Drops to 0 for fewer
 /// than 2 non-empty bins.
-pub fn presence_cv(times: &[SampleIndex], total_duration_samples: u64, n_bins: usize) -> f32 {
+pub fn presence_cv(times: &[SampleIndex], span: impl Into<SessionSpan>, n_bins: usize) -> f32 {
+    let span = span.into();
+    let total_duration_samples = span.duration_samples();
+    let times = span.metric_spikes(times);
     if times.is_empty() || n_bins == 0 || total_duration_samples == 0 {
         return 0.0;
     }
     let bin_width = (total_duration_samples as f64 / n_bins as f64).max(1.0);
     let mut counts = vec![0u32; n_bins];
     for &t in times {
-        let idx = ((t.as_f64()) / bin_width) as usize;
+        let idx = ((t.0 - span.start.0) as f64 / bin_width) as usize;
         if idx < n_bins {
             counts[idx] += 1;
         }
@@ -108,22 +111,39 @@ pub fn presence_cv(times: &[SampleIndex], total_duration_samples: u64, n_bins: u
 pub fn sliding_refractory_contamination(
     times: &[SampleIndex],
     refractory_samples: u64,
-    total_duration_samples: u64,
+    span: impl Into<SessionSpan>,
     sample_rate: f32,
     n_windows: usize,
     min_spikes_per_window: usize,
 ) -> Vec<(f32, f32)> {
     use crate::metrics::refractory_contamination;
+    let span = span.into();
+    let total_duration_samples = span.duration_samples();
     if times.is_empty() || n_windows == 0 || total_duration_samples == 0 || sample_rate <= 0.0 {
         return Vec::new();
     }
-    let win_samples = (total_duration_samples / n_windows as u64).max(1);
+    let legacy = span.source == SpanSource::Trace;
+    let n_windows = if legacy {
+        n_windows
+    } else {
+        (n_windows as u64).min(total_duration_samples) as usize
+    };
+    let legacy_width = (total_duration_samples / n_windows as u64).max(1);
+    let edge = |i: usize| {
+        span.start.0
+            + if legacy {
+                i as u64 * legacy_width
+            } else {
+                (i as u128 * total_duration_samples as u128 / n_windows as u128) as u64
+            }
+    };
     let inv_sr = 1.0_f32 / sample_rate;
     let mut out = Vec::with_capacity(n_windows);
     let mut idx = 0usize;
     for w in 0..n_windows {
-        let lo = w as u64 * win_samples;
-        let hi = lo + win_samples;
+        let lo = edge(w);
+        let hi = edge(w + 1);
+        let win_samples = hi - lo;
         // Advance to the first spike inside this window.
         while idx < times.len() && times[idx].0 < lo {
             idx += 1;
@@ -152,14 +172,17 @@ pub fn sliding_refractory_contamination(
 /// Largest "gap" in the recording where this cluster is silent, expressed as
 /// a fraction of the total recording length. Useful to flag electrode drop:
 /// 0.05 = a 5%-of-recording silent stretch.
-pub fn longest_silent_gap_frac(times: &[SampleIndex], total_duration_samples: u64) -> f32 {
+pub fn longest_silent_gap_frac(times: &[SampleIndex], span: impl Into<SessionSpan>) -> f32 {
+    let span = span.into();
+    let times = span.metric_spikes(times);
+    let total_duration_samples = span.duration_samples();
     if times.is_empty() || total_duration_samples == 0 {
         return 1.0;
     }
     let total = total_duration_samples;
-    let first = times[0].0;
+    let first = times[0].0 - span.start.0;
     let last = times.last().unwrap().0;
-    let mut max_gap = first.max(total.saturating_sub(last));
+    let mut max_gap = first.max(span.end.0.saturating_sub(last));
     for w in times.windows(2) {
         let g = w[1].0.saturating_sub(w[0].0);
         if g > max_gap {

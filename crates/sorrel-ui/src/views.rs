@@ -504,7 +504,7 @@ pub fn selection_summary<P, F>(
             let theme = Theme::from_ui(ui);
             ui.heading(format!("{n} clusters selected"));
             let sr = session.provider.sample_rate().max(1.0);
-            let total_samples = session.provider.n_samples().0;
+            let span = session.provider.session_span();
             let refractory = session.refractory().fixed_samples(sr);
             egui::Grid::new("summary-grid")
                 .num_columns(6)
@@ -531,12 +531,7 @@ pub fn selection_summary<P, F>(
                         };
                         num_cell(ui, amp, None);
                         let q = sorrel_compute::quality_breakdown(
-                            times,
-                            amps,
-                            refractory,
-                            total_samples,
-                            sr,
-                            50,
+                            times, amps, refractory, span, sr, 50,
                         )
                         .composite();
                         num_cell(ui, format!("{q:.2}"), Some(theme.quality_colour(q)));
@@ -994,12 +989,12 @@ pub fn firing_rate_view<P: DataProvider>(
         return;
     }
     let sr = session.provider.sample_rate().max(1.0);
-    let total_samples = session.provider.n_samples().0;
-    if total_samples == 0 {
+    let span = session.provider.session_span();
+    let (start_s, end_s) = (span.start.as_f32() / sr, span.end.as_f32() / sr);
+    if start_s >= end_s {
         ui.label("recording has zero length");
         return;
     }
-    let total_s = total_samples as f32 / sr;
 
     // phy FiringRateView: `n_bins` over the recording (`:frn`, default
     // 200), x in the chosen unit (v2.1).
@@ -1015,7 +1010,9 @@ pub fn firing_rate_view<P: DataProvider>(
     });
     // `n_bins` over the visible span: the `:frmin`/`:frmax` range, then pan/zoom.
     let bins = params.n_bins.clamp(2, 5000);
-    let ((x0, x1), _) = params.pz.apply(params.x_range(total_s), (0.0, 1.0));
+    let ((x0, x1), _) = params
+        .pz
+        .apply(params.x_range((start_s, end_s)), (0.0, 1.0));
     let bin_s = (x1 - x0) / bins as f32;
     let unit = params.unit;
 
@@ -1023,7 +1020,7 @@ pub fn firing_rate_view<P: DataProvider>(
     let mut histograms: Vec<Vec<u32>> = Vec::with_capacity(selection.len());
     let mut max_count = 1u32;
     for &c in selection {
-        let times = session.spike_times(c);
+        let times = span.metric_spikes(session.spike_times(c));
         let h = rate_counts(times, sr, x0, bin_s, bins, brushes.time);
         if let Some(&m) = h.iter().max() {
             if m > max_count {
@@ -2642,12 +2639,14 @@ pub fn contamination_over_time_view<P: DataProvider>(
         return;
     }
     let sr = session.provider.sample_rate().max(1.0);
-    let total_samples = session.provider.n_samples().0;
+    let span = session.provider.session_span();
+    let total_samples = span.duration_samples();
     if total_samples == 0 {
         ui.label("recording has zero length");
         return;
     }
     let total_s = total_samples as f32 / sr;
+    let start_s = span.start.as_f32() / sr;
     let refractory_samples = session.refractory().fixed_samples(sr);
     const N_WINDOWS: usize = 60;
     const MIN_SPIKES_PER_WINDOW: usize = 20;
@@ -2660,7 +2659,7 @@ pub fn contamination_over_time_view<P: DataProvider>(
             let s = sliding_refractory_contamination(
                 times,
                 refractory_samples,
-                total_samples,
+                span,
                 sr,
                 N_WINDOWS,
                 MIN_SPIKES_PER_WINDOW,
@@ -2713,7 +2712,7 @@ pub fn contamination_over_time_view<P: DataProvider>(
     draw_axes_grid(
         &painter,
         rect,
-        (0.0, total_s),
+        (start_s, span.end.as_f32() / sr),
         (y_lo, y_max),
         "time (s)",
         "contam",
@@ -2751,7 +2750,7 @@ pub fn contamination_over_time_view<P: DataProvider>(
                 prev = None;
                 continue;
             }
-            let x = data.left() + (t / total_s).clamp(0.0, 1.0) * data.width();
+            let x = data.left() + ((t - start_s) / total_s).clamp(0.0, 1.0) * data.width();
             let p = egui::pos2(x, y_of(y.min(y_max)));
             if let Some(pp) = prev {
                 dp.line_segment([pp, p], stroke);

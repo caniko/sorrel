@@ -340,7 +340,7 @@ fn header<P: DataProvider>(
     let mut h = format!(
         "# sorrel brief v1\nrec: {:.1} s, {} Hz, {} ch, {} live clusters\n\
          amp: template units (uV only if the input says so); a missing key is NaN\n",
-        session.provider.n_samples().0 as f32 / sr.max(1.0),
+        session.provider.session_span().duration_samples() as f32 / sr.max(1.0),
         sr,
         session.provider.n_channels(),
         units.len()
@@ -481,12 +481,18 @@ fn card<P: DataProvider>(
         )
     );
     let (times, amps) = (session.spike_times(c), session.spike_amplitudes(c));
-    let total = session.provider.n_samples().0.max(1);
+    let span = session.provider.session_span();
+    let total = span.duration_samples().max(1);
     let mut amp_t = "-".to_string();
     if amps.len() == times.len() && !times.is_empty() {
         let mut acc = [(0.0f32, 0u32); AMP_BINS];
         for (t, &a) in times.iter().zip(amps) {
-            let b = ((t.0 as u128 * AMP_BINS as u128 / total as u128) as usize).min(AMP_BINS - 1);
+            if span.source != sorrel_io::SpanSource::Trace && !(span.start..span.end).contains(t) {
+                continue;
+            }
+            let offset = t.0 - span.start.0;
+            let b =
+                ((offset as u128 * AMP_BINS as u128 / total as u128) as usize).min(AMP_BINS - 1);
             acc[b] = (acc[b].0 + a, acc[b].1 + 1);
         }
         let mean = amps.iter().sum::<f32>() / amps.len() as f32;

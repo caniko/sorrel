@@ -76,10 +76,14 @@ impl CcgCache {
                 // seconds at 100k spikes can hold the read lock for a while.
                 // Upgrade path: a cancel parameter in the pairing loop.
                 let sr = s.provider.sample_rate().max(1.0);
-                let n_samples = s.provider.n_samples().0;
+                let span = s.provider.session_span();
+                let n_samples = span.duration_samples();
                 let window = (window_ms as f64 / 1e3 * sr as f64).ceil() as u64;
-                let all: Vec<&[SampleIndex]> = cl.iter().map(|&c| s.spike_times(c)).collect();
-                let (chunks, trains) = sample_trains(&all, n_samples, MAX_SPIKES, window);
+                let all: Vec<&[SampleIndex]> = cl
+                    .iter()
+                    .map(|&c| span.metric_spikes(s.spike_times(c)))
+                    .collect();
+                let (chunks, trains) = sample_trains(&all, span, MAX_SPIKES, window);
                 let refs: Vec<&[SampleIndex]> = trains.iter().map(Vec::as_slice).collect();
                 let covered = chunks
                     .as_ref()
@@ -146,14 +150,23 @@ type Chunks = Vec<(u64, u64)>;
 /// than `max` spikes inside them the kept time shrinks by the overshoot.
 pub(crate) fn sample_trains(
     trains: &[&[SampleIndex]],
-    n_samples: u64,
+    span: impl Into<sorrel_io::SessionSpan>,
     max: usize,
     window_samples: u64,
 ) -> (Option<Chunks>, Vec<Vec<SampleIndex>>) {
+    let span = span.into();
     let total: usize = trains.iter().map(|t| t.len()).sum();
     let mut budget = max;
     loop {
-        let chunks = time_chunks(n_samples, total, budget, window_samples);
+        let chunks = time_chunks(span.duration_samples(), total, budget, window_samples).map(
+            |mut chunks| {
+                for (start, end) in &mut chunks {
+                    *start += span.start.0;
+                    *end += span.start.0;
+                }
+                chunks
+            },
+        );
         // Count by binary search; copy only the accepted chunks.
         let n: usize = match chunks.as_deref() {
             None => total,

@@ -1622,6 +1622,12 @@ impl SessionVisitor for Describe {
 fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> Vec<(&'static str, String)> {
     let p = &s.provider;
     let sr = p.sample_rate();
+    let span = p.session_span();
+    let duration_rate = if span.source == sorrel_io::SpanSource::Trace {
+        f64::from(sr.max(1.0))
+    } else {
+        p.exact_sample_rate().unwrap_or(f64::from(sr))
+    };
     let n_spikes: usize = (0..s.n_clusters())
         .map(|c| s.spike_times(sorrel_io::ClusterId(c)).len())
         .sum();
@@ -1653,8 +1659,9 @@ fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> Vec<(&'static 
         ("sample rate", format!("{:.1} kHz", sr / 1000.0)),
         (
             "duration",
-            format!("{:.1} s", p.n_samples().0 as f64 / sr.max(1.0) as f64),
+            format!("{:.1} s", span.duration_samples() as f64 / duration_rate),
         ),
+        ("duration source", span.source.to_string()),
         ("# channels", p.n_channels().to_string()),
         ("# spikes", n_spikes.to_string()),
         (
@@ -3122,6 +3129,22 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "hdf5")]
+    #[test]
+    fn describe_units_only_shows_estimated_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../release/fixtures/nwb/units_only.nwb");
+        let provider = sorrel_io::NwbProvider::open(path).unwrap();
+        let journal = Journal::open(&dir.path().join("j.sqlite")).unwrap();
+        let rows = describe(&Session::new(provider, journal));
+        assert!(rows.contains(&("duration", "0.2 s".into())));
+        assert!(rows
+            .iter()
+            .any(|(key, value)| *key == "duration source"
+                && value.starts_with("estimate: spike extent")));
+    }
 
     /// The crate-local icon decodes, and still equals the canonical asset
     /// (absent in a packaged crate).

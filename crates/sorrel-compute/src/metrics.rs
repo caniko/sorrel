@@ -419,18 +419,20 @@ fn refractory_argmin(
 /// the recording (often drift / electrode contact loss).
 pub fn presence_ratio(
     spike_times: &[SampleIndex],
-    total_duration_samples: u64,
+    span: impl Into<sorrel_io::SessionSpan>,
     n_bins: usize,
 ) -> f32 {
+    let span = span.into();
+    let total_duration_samples = span.duration_samples();
+    let spike_times = span.metric_spikes(spike_times);
     if spike_times.is_empty() || n_bins == 0 || total_duration_samples == 0 {
         return 0.0;
     }
     let bin_width = (total_duration_samples as f64 / n_bins as f64).max(1.0);
     let mut filled = vec![false; n_bins];
     for &t in spike_times {
-        // Clamp the final bin so a spike landing exactly at the recording end
-        // (idx == n_bins) is counted in the last bin rather than dropped.
-        let idx = ((t.as_f64() / bin_width) as usize).min(n_bins - 1);
+        // Preserve final-bin clamping for legacy trace-backed inputs.
+        let idx = (((t.0 - span.start.0) as f64 / bin_width) as usize).min(n_bins - 1);
         filled[idx] = true;
     }
     let count = filled.iter().filter(|&&b| b).count();
@@ -738,6 +740,19 @@ mod tests {
         // 4 bins of width 100. Put spikes only in the first 2.
         let times = si([10u64, 50, 110, 150]);
         assert!((presence_ratio(&times, 400, 4) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn presence_ratio_uses_half_open_offset_span() {
+        let span = sorrel_io::SessionSpan {
+            start: SampleIndex(1_000),
+            end: SampleIndex(1_100),
+            source: sorrel_io::SpanSource::Declared("/intervals/epochs"),
+        };
+        assert_eq!(
+            presence_ratio(&si([999, 1_000, 1_024, 1_100]), span, 4),
+            0.25
+        );
     }
 
     #[test]
