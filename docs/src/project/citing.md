@@ -13,7 +13,7 @@ key):
 author = {Tartanoglu, Can H.},
 month = {11},
 title = {Sorrel},
-url = {https://sorrel.tartanoglu.com/},
+url = {https://sorrel.beloda.co/},
 year = {2026}
 }
 ```

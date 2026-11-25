@@ -17,7 +17,7 @@ license:
   - MIT
   - Apache-2.0
 repository-code: "https://github.com/caniko/sorrel"
-url: "https://sorrel.tartanoglu.com/"
+url: "https://sorrel.beloda.co/"
 keywords:
   - electrophysiology
   - spike sorting

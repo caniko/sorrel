@@ -2,7 +2,7 @@
 title = "Sorrel"
 description = "Native spike-sorting curation: a high-performance GUI for manual curation of spike-sorted electrophysiology data."
 base_url = "/"
-canonical_domain = "sorrel.tartanoglu.com"
+canonical_domain = "sorrel.beloda.co"
 footer_note = "Sorrel is open-source software licensed under MIT OR Apache-2.0."
 stylesheets = ["/site.css"]
 favicon = "/sorrel.svg"
