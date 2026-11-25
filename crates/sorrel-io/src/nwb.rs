@@ -815,8 +815,10 @@ mod imp {
             ds.shape() == [n] && n >= 2,
             "timestamps must contain one time per sample and at least two times to infer a rate"
         );
-        let t0 = read_timestamp_block(ds, 0..1)?[0];
-        let last = read_timestamp_block(ds, n - 1..n)?[0];
+        let time_at =
+            |sample| -> Result<_> { Ok(read_timestamp_block(ds, sample..sample + 1)?[0]) };
+        let t0 = time_at(0)?;
+        let last = time_at(n - 1)?;
         // Use the end-to-end mean period, so a tiny bias from one rounded
         // interval cannot accumulate over a long recording.
         let period = (last - t0) / (n - 1) as f64;
@@ -831,6 +833,46 @@ mod imp {
         // The grid interpolates two rounded endpoints. Allow a few ulps
         // for their error, each rounded timestamp, and the arithmetic.
         let limit = 1e-3 + 4.0 * ulp * rate;
+        let grid_error = |sample, t| (t - t0) / period - sample as f64;
+        let stride = (n - 1).div_ceil(63);
+        for sample in (stride..n - 1).step_by(stride) {
+            let time = time_at(sample)?;
+            let drift = grid_error(sample, time);
+            if drift.abs() <= limit {
+                continue;
+            }
+            // A jump skews the endpoint mean, so the first failed probe may
+            // be before the jump. Take the side with the longer mean interval.
+            let (mut left, mut right) = if drift > 0.0 {
+                ((0, t0), (sample, time))
+            } else {
+                ((sample, time), (n - 1, last))
+            };
+            while right.0 - left.0 > 1 {
+                let mid = left.0.midpoint(right.0);
+                let t = time_at(mid)?;
+                if (t - left.1) / (mid - left.0) as f64 >= (right.1 - t) / (right.0 - mid) as f64 {
+                    right = (mid, t);
+                } else {
+                    left = (mid, t);
+                }
+            }
+            let jump = right.1 - left.1;
+            let jump_samples = jump * rate;
+            // Classify large intervals separately from the grid tolerance.
+            if jump_samples > 2.0 {
+                anyhow::bail!(
+                    "timestamps are not a regular grid: they jump by {jump:.6} s \
+                     ({jump_samples:.3} samples at the mean rate {rate} Hz) between samples {} and {} \
+                     (t={} s to {} s); Sorrel needs a regular sample grid for the trace; \
+                     choose another series with --nwb-series",
+                    left.0, right.0, left.1, right.1
+                );
+            }
+            // ponytail: one candidate jump; use the full scan when a gap is
+            // not clear, preserving the small-jitter and nonmonotonic errors.
+            break;
+        }
         let (mut max_drift, mut worst_sample) = (0.0, 0);
         let mut prev = t0;
         for start in (1..n).step_by(TIMESTAMP_BLOCK) {
@@ -841,7 +883,7 @@ mod imp {
                 let step = t - prev;
                 ensure!(step.is_finite() && step > 0.0,
                     "irregular timestamps at sample {sample}: interval {step} s; timestamps must strictly increase");
-                let drift = ((t - t0) / period - sample as f64).abs();
+                let drift = grid_error(sample, t).abs();
                 if drift > max_drift {
                     (max_drift, worst_sample) = (drift, sample);
                 }
@@ -1454,6 +1496,44 @@ mod imp {
             .unwrap();
         let err = regular_timestamps(&Dataset::Hdf5(ds.clone()), times.len()).unwrap_err();
         assert!(err.to_string().contains("max deviation 0.200000 samples"));
+    }
+
+    #[cfg(all(test, feature = "hdf5"))]
+    #[test]
+    fn timestamp_validation_reports_large_gap_at_the_adjacent_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5_metno::File::create(dir.path().join("gapped.h5")).unwrap();
+        let name = "/acquisition/e-series";
+        let series = file.create_group(name).unwrap();
+        let root = Group::Hdf5(file.group("/").unwrap());
+        let n = 100_001;
+        let ds = series
+            .new_dataset::<f64>()
+            .shape(n)
+            .create("timestamps")
+            .unwrap();
+        for gap in [1, 73_259, n - 1] {
+            let times: Vec<_> = (0..n)
+                .map(|i| i as f64 / 1000.0 + if i >= gap { 25.0 } else { 0.0 })
+                .collect();
+            ds.write(&times).unwrap();
+            let err = read_time_base(&root, name, n).err().unwrap();
+            assert_eq!(
+                err.to_string(),
+                format!("ElectricalSeries {name}: invalid time base")
+            );
+            let err = format!("{err:#}");
+            assert!(err.contains("jump by 25.001000 s"), "{err}");
+            assert!(
+                err.contains("20000.800 samples at the mean rate 800"),
+                "{err}"
+            );
+            assert!(
+                err.contains(&format!("between samples {} and {gap}", gap - 1)),
+                "{err}"
+            );
+            assert!(err.contains("--nwb-series"), "{err}");
+        }
     }
 
     #[cfg(all(test, feature = "hdf5"))]
