@@ -235,16 +235,16 @@ notes and signed URLs **before** packing. If you redact an artifact, rerun
 
 ## Frozen v1 defaults
 
-| Threshold key | Value | Candidate rule |
-| --- | ---: | --- |
-| `rp_contamination_lo95_max` | 0.10 | `rpv_post_lo95` above: lower credible bound exceeds the cutoff (`qc.refractory_contamination`) |
-| `srp_contamination_upper_max` | 0.10 | `srp_contamination` above: upper confidence limit, screening only (`qc.refractory_screening`) |
-| `isi_violation_rate_max_hz` | 0.50 Hz | `isi_violation_ratio` above: a rate, not a proportion; emit a screening finding only if both estimates are absent |
-| `presence_ratio_min` | 0.70 | `presence_ratio` below |
-| `amplitude_cutoff_max` | 0.10 | `amplitude_cutoff` above |
-| `epoch_rate_ratio_min` | 0.25 | `epoch_rate_ratio` below |
-| `epoch_amp_ratio_min` | 0.50 | `epoch_amp_ratio` below |
-| `drift_correlation_max` | 0.50 | Absolute `drift_correlation` above |
+| Threshold key                 |   Value | Candidate rule                                                                                                    |
+| ----------------------------- | ------: | ----------------------------------------------------------------------------------------------------------------- |
+| `rp_contamination_lo95_max`   |    0.10 | `rpv_post_lo95` above: lower credible bound exceeds the cutoff (`qc.refractory_contamination`)                    |
+| `srp_contamination_upper_max` |    0.10 | `srp_contamination` above: upper confidence limit, screening only (`qc.refractory_screening`)                     |
+| `isi_violation_rate_max_hz`   | 0.50 Hz | `isi_violation_ratio` above: a rate, not a proportion; emit a screening finding only if both estimates are absent |
+| `presence_ratio_min`          |    0.70 | `presence_ratio` below                                                                                            |
+| `amplitude_cutoff_max`        |    0.10 | `amplitude_cutoff` above                                                                                          |
+| `epoch_rate_ratio_min`        |    0.25 | `epoch_rate_ratio` below                                                                                          |
+| `epoch_amp_ratio_min`         |    0.50 | `epoch_amp_ratio` below                                                                                           |
+| `drift_correlation_max`       |    0.50 | Absolute `drift_correlation` above                                                                                |
 
 Store the exact threshold values used; `--thresholds` takes an inline JSON
 object or `@file`. The three refractory counts are separate; a screening
@@ -305,8 +305,8 @@ which decides and runs anything sealed. Name the agents in the skill args,
 e.g. `flash=<agent> worker=<agent>`. A role without a named agent is done by
 the lead inline. Delegated agents get only what their task row lists.
 
-| Task | Tier | Gets | Returns |
-| --- | --- | --- | --- |
-| Pin public metadata, collect exports, run `summarize-asset` | flash | Pinned public locators, read-only commands, artifact directory | Exact artifacts, rows, and any refusal |
-| Review screening flags and draft an evidence-linked report | worker | Sanitized artifacts, guide, fixed thresholds | Draft findings and suggestions, unverified |
-| Confirm evidence level, human verification, bundle contents and disclosure | lead | Review draft and authorized source evidence | Validated bundle and human-approved next step |
+| Task                                                                       | Tier   | Gets                                                           | Returns                                       |
+| -------------------------------------------------------------------------- | ------ | -------------------------------------------------------------- | --------------------------------------------- |
+| Pin public metadata, collect exports, run `summarize-asset`                | flash  | Pinned public locators, read-only commands, artifact directory | Exact artifacts, rows, and any refusal        |
+| Review screening flags and draft an evidence-linked report                 | worker | Sanitized artifacts, guide, fixed thresholds                   | Draft findings and suggestions, unverified    |
+| Confirm evidence level, human verification, bundle contents and disclosure | lead   | Review draft and authorized source evidence                    | Validated bundle and human-approved next step |
