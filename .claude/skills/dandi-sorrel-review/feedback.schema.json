@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nexus.beloda.co/sorrel/schema/feedback-1.json",
+  "title": "Sorrel DANDI feedback v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "feedback_id", "dandiset_id", "review_ids", "quoted_finding_ids", "channel", "status", "events"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "feedback_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"},
+    "dandiset_id": {"type": "string", "pattern": "^[0-9]{6}$", "minLength": 6, "maxLength": 6},
+    "review_ids": {"$ref": "#/$defs/review_ids"},
+    "quoted_finding_ids": {"$ref": "#/$defs/quoted_finding_ids"},
+    "channel": {"$ref": "#/$defs/channel"},
+    "recipient": {"type": "string"},
+    "url": {"type": "string"},
+    "status": {"$ref": "#/$defs/status"},
+    "disclosure_days": {"type": "integer", "default": 30, "minimum": 14, "maximum": 90},
+    "reminder_after_days": {"type": "integer", "default": 14, "minimum": 7, "maximum": 9223372036854775807},
+    "first_notified_at": {"$ref": "#/$defs/date_time"},
+    "reminder_sent_at": {"$ref": "#/$defs/date_time"},
+    "publish_eligible_at": {"$ref": "#/$defs/date_time"},
+    "extension_until": {"$ref": "#/$defs/date_time"},
+    "extension_reason": {"$ref": "#/$defs/text"},
+    "published_at": {"$ref": "#/$defs/date_time"},
+    "resulting_version": {"type": "string", "pattern": "^0\\.[0-9]{6}\\.[0-9]{4}$"},
+    "resulting_doi": {"type": "string"},
+    "units_corrected": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+    "response_summary": {"type": "string"},
+    "events": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["at", "status", "actor"],
+        "properties": {
+          "at": {"$ref": "#/$defs/date_time"},
+          "status": {"$ref": "#/$defs/status"},
+          "actor": {"$ref": "#/$defs/text"},
+          "evidence_url": {"type": "string"},
+          "note": {"type": "string"},
+          "subject": {"$ref": "#/$defs/subject"},
+          "recipient": {"type": ["string", "null"]},
+          "channel": {"$ref": "#/$defs/channel"},
+          "early_followup": {"const": true}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"status": {"enum": ["sent", "reminded"]}}},
+            "then": {"required": ["subject", "recipient", "channel"]}
+          },
+          {
+            "if": {"required": ["early_followup"]},
+            "then": {"properties": {"status": {"const": "sent"}}}
+          }
+        ]
+      }
+    }
+  },
+  "if": {"required": ["extension_until"]},
+  "then": {"required": ["extension_reason"]},
+  "$defs": {
+    "channel": {"enum": ["email", "github_issue", "github_pr", "dandi_discussion", "other"]},
+    "text": {"type": "string", "minLength": 1},
+    "date_time": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt](?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:[Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "minLength": 64, "maxLength": 64},
+    "review_ids": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sha256"}},
+    "quoted_finding_ids": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["review_id", "finding_id"],
+        "properties": {
+          "review_id": {"$ref": "#/$defs/sha256"},
+          "finding_id": {"type": "string", "pattern": "^f[0-9]{2,4}$"}
+        }
+      }
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["review_ids", "quoted_finding_ids"],
+      "properties": {
+        "review_ids": {"$ref": "#/$defs/review_ids"},
+        "quoted_finding_ids": {"$ref": "#/$defs/quoted_finding_ids"}
+      }
+    },
+    "status": {"enum": ["drafted", "sent", "reminded", "acknowledged", "accepted", "republished", "declined", "no_response_published"]}
+  }
+}
