@@ -20,6 +20,7 @@ aarch64), macOS (Apple silicon) and Windows (x64 only).
 
 These changes are available when building from source, not in the `0.4.0` downloads:
 
+- [Neuralynx `.ntt` tetrodes](docs/src/usage/backends.md#neuralynx-tetrode-files): run `sorrel open TT1.ntt` or drop the file onto Sorrel. Select cluster `0`, lasso spikes in Features and press `K` to cut a unit from the unsorted pool.
 - Expanded NWB/HDF5 reader that preserves unit IDs, electrode mappings, signal scaling and the sample clock; also reads local NWB-Zarr v2 stores.
 - Read-only HTTPS streaming for DANDI NWB and NWB-Zarr assets, with trace windows fetched on demand and curation journals stored locally.
 - Curated NWB Units export through PyNWB or NeuroConv, plus round-trip tests for SpikeInterface `curation.json`.

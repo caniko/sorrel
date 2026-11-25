@@ -8,7 +8,7 @@ sorrel <SUBCOMMAND> ...                # headless tools on the same data
 ```
 
 `<DATA_DIR>` is either a directory (phy / Kilosort or SortingAnalyzer)
-or a single file (`*.nwb`, `rez.mat`).
+or a single file (`*.nwb`, `rez.mat`, `*.ntt`).
 
 ## Subcommands
 
@@ -66,6 +66,11 @@ logs go to it, and Ctrl-C stops it. If a window is already running, `run`
 hands the dataset over as a tab and returns. `--standalone` always starts a
 separate window. `sorrel run --headless <DATA_DIR>` runs the session host and
 MCP listener with no window, until Ctrl-C.
+
+For Neuralynx, pass the file itself (`sorrel open TT1.ntt`), not the
+recording folder. Even `sorrel describe TT1.ntt` creates the per-file
+artifact directory and journal. See [Neuralynx tetrode files](../usage/backends.md#neuralynx-tetrode-files)
+for the manual cutting workflow, event times, and export limitations.
 
 ## Status
 
@@ -192,20 +197,20 @@ with "Windows only". `sorrelw` is `sorrel` without a console window; see
 
 ## Open options
 
-| Flag                | Description                                                                                                                                                                                    |
-| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--backend NAME`    | `kilosort` \| `sorting-analyzer` \| `nwb` \| `rez`. Auto-detected when omitted. `ks4-rez` is an alias for the legacy MATLAB `rez` backend, not for Kilosort 4 output.                          |
-| `--dat PATH`        | Raw recording. Overrides `params.py:dat_path`.                                                                                                                                                 |
-| `--sample-rate Hz`  | Overrides `params.py:sample_rate`.                                                                                                                                                             |
-| `--channels N`      | Overrides `params.py:n_channels_dat`.                                                                                                                                                          |
-| `--dtype DTYPE`     | `int16` \| `uint16` \| `int32` \| `float32`. Overrides `params.py:dtype`.                                                                                                                      |
-| `--offset BYTES`    | Header bytes to skip in the `.dat`.                                                                                                                                                            |
-| `--journal PATH`    | Curation journal. Default: `<root>/sorrel.journal`.                                                                                                                                            |
-| `--discard-journal` | Set the existing journal aside before opening: renamed to `<journal>.<unix seconds>`, not deleted. On a phy directory, `sorrel_original/` is set aside too (see [Saving](../usage/saving.md)). |
-| `--spikeglx-meta P` | Populate sample-rate / channels / dtype from a SpikeGLX `.meta`.                                                                                                                               |
-| `--oebin PATH`      | Populate sample-rate / channels / dat path from an Open Ephys `structure.oebin`.                                                                                                               |
-| `--events FILE`     | PSTH events: `events.csv`, `events.npy`, or an `.nwb` trials table (GUI only).                                                                                                                 |
-| `-h`, `--help`      | Print usage.                                                                                                                                                                                   |
+| Flag                | Description                                                                                                                                                                                                             |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--backend NAME`    | `kilosort` \| `sorting-analyzer` \| `neuralynx` \| `nwb` \| `rez`. Auto-detected when omitted. `ntt` is an alias for `neuralynx`; `ks4-rez` is an alias for the legacy MATLAB `rez` backend, not for Kilosort 4 output. |
+| `--dat PATH`        | Raw recording. Overrides `params.py:dat_path`.                                                                                                                                                                          |
+| `--sample-rate Hz`  | Overrides `params.py:sample_rate`.                                                                                                                                                                                      |
+| `--channels N`      | Overrides `params.py:n_channels_dat`.                                                                                                                                                                                   |
+| `--dtype DTYPE`     | `int16` \| `uint16` \| `int32` \| `float32`. Overrides `params.py:dtype`.                                                                                                                                               |
+| `--offset BYTES`    | Header bytes to skip in the `.dat`.                                                                                                                                                                                     |
+| `--journal PATH`    | Curation journal. Default: `<root>/sorrel.journal`.                                                                                                                                                                     |
+| `--discard-journal` | Set the existing journal aside before opening: renamed to `<journal>.<unix seconds>`, not deleted. On a phy directory, `sorrel_original/` is set aside too (see [Saving](../usage/saving.md)).                          |
+| `--spikeglx-meta P` | Populate sample-rate / channels / dtype from a SpikeGLX `.meta`.                                                                                                                                                        |
+| `--oebin PATH`      | Populate sample-rate / channels / dat path from an Open Ephys `structure.oebin`.                                                                                                                                        |
+| `--events FILE`     | PSTH events: `events.csv`, `events.npy`, or an `.nwb` trials table (GUI only).                                                                                                                                          |
+| `-h`, `--help`      | Print usage.                                                                                                                                                                                                            |
 
 When `params.py` is present, sample-rate, channels, dtype, offset, and
 dat-path all default from it. CLI flags override per-field.
