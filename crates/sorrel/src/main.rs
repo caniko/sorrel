@@ -689,6 +689,7 @@ fn detect_backend(root: &Path) -> Result<Backend> {
         bail!("remote NWB datasets require building with --features dandi");
     }
     Ok(match sorrel_io::detect_backend(root)? {
+        sorrel_io::Backend::Neuralynx => bail!("Neuralynx is not supported by this command"),
         sorrel_io::Backend::Kilosort => Backend::Kilosort,
         sorrel_io::Backend::SortingAnalyzer => Backend::SortingAnalyzer,
         sorrel_io::Backend::Nwb => {

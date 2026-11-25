@@ -450,6 +450,19 @@ pub trait DataProvider: Send + Sync + 'static {
     /// Read a window of the raw trace; memory-mapped backends lend a slice.
     fn trace(&self, start: SampleIndex, len: u32) -> TraceSlice<'_>;
 
+    /// `(pre, post)` of stored per-spike snippets, or `None` when snippets
+    /// are cut from continuous data.
+    fn stored_snippet_window(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// Write the stored spike at exact sample `t` into an exactly sized
+    /// sample-major buffer (`sample * n_channels + channel`). Returns false
+    /// if there is no such spike or the buffer does not fit the window.
+    fn stored_snippet(&self, _t: SampleIndex, _out: &mut [f32]) -> bool {
+        false
+    }
+
     /// Fallible trace read for callers that must report a failed window.
     fn read_trace(&self, start: SampleIndex, len: u32) -> anyhow::Result<TraceSlice<'_>> {
         Ok(self.trace(start, len))
