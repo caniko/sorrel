@@ -17,7 +17,7 @@ use crate::refractory::RefractoryWindows;
 use crate::session::Session;
 use anyhow::{Context, Result};
 use sorrel_compute::epochs::{stable_epochs, Epoch};
-use sorrel_io::{ClusterId, DataProvider, SpanSource};
+use sorrel_io::{ClusterId, DataProvider};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -323,12 +323,7 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
     let sr = sample_rate.max(1.0);
     let span = session.provider.session_span();
     let total_samples = span.duration_samples();
-    let duration_rate = if span.source == SpanSource::Trace {
-        sr
-    } else {
-        sample_rate
-    };
-    let total_seconds = total_samples as f32 / duration_rate;
+    let total_seconds = span.duration_seconds(sample_rate);
     let refractory_samples = windows.fixed_samples(sr);
     let (_, tpl_samples, tpl_channels) = session.template_shape();
     // ACG at 1 ms bins / 50 ms, the report's (and cache's) window.
@@ -347,11 +342,7 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
         } else {
             mean_amplitude(amps)
         };
-        let firing_rate = if total_seconds > 0.0 {
-            exposed.len() as f32 / total_seconds
-        } else {
-            f32::NAN
-        };
+        let firing_rate = exposed.len() as f32 / total_seconds;
         let isi_v = isi_violations(times, refractory_samples) as u32;
         let isi_ratio = if !times.is_empty() {
             isi_violation_rate(times, refractory_samples, sr)
@@ -578,7 +569,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::journal::Journal;
     use sorrel_io::{
-        ClusterId, DataProvider, HasAmplitudes, SampleIndex, SessionSpan, TraceSamples, TraceSlice,
+        ClusterId, DataProvider, HasAmplitudes, SampleIndex, SessionSpan, SpanSource, TraceSamples,
+        TraceSlice,
     };
 
     /// Shared with `report::tests`.

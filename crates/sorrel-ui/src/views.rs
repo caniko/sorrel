@@ -949,11 +949,12 @@ pub enum RasterClick {
 
 // ---- FiringRateView -----------------------------------------------------
 
-/// Spike counts of `bins` bins of `bin_s` seconds from `x0`. With an
-/// `only` time brush, spikes outside it are not counted.
+/// Spike counts of `bins` bins of `bin_s` seconds from `x0`, relative to
+/// `start`. With an `only` time brush, spikes outside it are not counted.
 fn rate_counts(
     times: &[SampleIndex],
     sr: f32,
+    start: SampleIndex,
     x0: f32,
     bin_s: f32,
     bins: usize,
@@ -961,10 +962,13 @@ fn rate_counts(
 ) -> Vec<u32> {
     let mut h = vec![0u32; bins];
     for &t in times {
-        let ts = t.0 as f64 / sr as f64;
-        if time.is_some_and(|b| b.only && !b.contains(ts as f32)) {
+        if time.is_some_and(|b| b.only && !b.contains((t.as_f64() / f64::from(sr)) as f32)) {
             continue;
         }
+        let Some(sample) = t.0.checked_sub(start.0) else {
+            continue;
+        };
+        let ts = sample as f64 / f64::from(sr);
         let u = (ts - x0 as f64) / bin_s as f64;
         if u >= 0.0 && (u as usize) < bins {
             h[u as usize] += 1;
@@ -990,8 +994,8 @@ pub fn firing_rate_view<P: DataProvider>(
     }
     let sr = session.provider.sample_rate().max(1.0);
     let span = session.provider.session_span();
-    let (start_s, end_s) = (span.start.as_f32() / sr, span.end.as_f32() / sr);
-    if start_s >= end_s {
+    let duration = span.duration_samples() as f32 / sr;
+    if duration <= 0.0 {
         ui.label("recording has zero length");
         return;
     }
@@ -1010,9 +1014,10 @@ pub fn firing_rate_view<P: DataProvider>(
     });
     // `n_bins` over the visible span: the `:frmin`/`:frmax` range, then pan/zoom.
     let bins = params.n_bins.clamp(2, 5000);
+    let origin = span.start.as_f64() / f64::from(sr);
     let ((x0, x1), _) = params
         .pz
-        .apply(params.x_range((start_s, end_s)), (0.0, 1.0));
+        .apply(params.relative_x_range(origin, duration), (0.0, 1.0));
     let bin_s = (x1 - x0) / bins as f32;
     let unit = params.unit;
 
@@ -1021,7 +1026,7 @@ pub fn firing_rate_view<P: DataProvider>(
     let mut max_count = 1u32;
     for &c in selection {
         let times = span.metric_spikes(session.spike_times(c));
-        let h = rate_counts(times, sr, x0, bin_s, bins, brushes.time);
+        let h = rate_counts(times, sr, span.start, x0, bin_s, bins, brushes.time);
         if let Some(&m) = h.iter().max() {
             if m > max_count {
                 max_count = m;
@@ -1054,16 +1059,25 @@ pub fn firing_rate_view<P: DataProvider>(
     let data = axes_data_rect(rect, true);
     // Only time pans and zooms; y always fits the visible bins.
     params.pz.interact(&resp, data);
-    crate::widgets::time_brush_gesture(&resp, brushes, data, (x0, x1), true);
+    let absolute_x = (
+        (origin + f64::from(x0)) as f32,
+        (origin + f64::from(x1)) as f32,
+    );
+    crate::widgets::time_brush_gesture(&resp, brushes, data, absolute_x, true);
 
     // 15% headroom above the tallest bin.
     let y_top = max_count as f32 / bin_s * 1.15;
+    let x_label = if origin == 0.0 {
+        format!("time ({})", unit.label())
+    } else {
+        format!("time since {origin:.9} s ({})", unit.label())
+    };
     draw_axes_grid(
         &painter,
         rect,
         (x0 / unit.seconds(), x1 / unit.seconds()),
         (0.0, y_top),
-        &format!("time ({})", unit.label()),
+        &x_label,
         "Hz",
         &theme,
     );
@@ -1076,7 +1090,10 @@ pub fn firing_rate_view<P: DataProvider>(
     // Time brush: fade the bins outside the range (with `only` they were
     // never counted).
     if let Some(tb) = brushes.time.filter(|tb| !tb.only) {
-        let px = |t: f32| data.left() + (t - x0) / (x1 - x0).max(1e-9) * data.width();
+        let px = |t: f32| {
+            let relative = (f64::from(t) - origin) as f32;
+            data.left() + (relative - x0) / (x1 - x0).max(1e-9) * data.width()
+        };
         let (a, b) = (
             px(tb.start).clamp(data.left(), data.right()),
             px(tb.end).clamp(data.left(), data.right()),
@@ -1089,7 +1106,7 @@ pub fn firing_rate_view<P: DataProvider>(
             );
         }
     }
-    crate::widgets::time_overlays(ui, &dp, data, (x0, x1), brushes, sr);
+    crate::widgets::time_overlays(ui, &dp, data, absolute_x, brushes, sr);
 }
 
 // ---- ProbeView ----------------------------------------------------------
@@ -1322,19 +1339,47 @@ mod rate_tests {
     use sorrel_io::SampleIndex;
 
     #[test]
+    fn counts_first_spike_in_short_offset_spans() {
+        let params = crate::prefs::RateParams::default();
+        for (start, duration, sr) in [(100, 20, 1_000.0), (30_720_000, 1, 30_000.0)] {
+            let origin = start as f64 / f64::from(sr);
+            let (x0, x1) = params.relative_x_range(origin, duration as f32 / sr);
+            assert!(x1 > x0);
+            assert_eq!(
+                rate_counts(
+                    &[SampleIndex(start - 1), SampleIndex(start)],
+                    sr,
+                    SampleIndex(start),
+                    x0,
+                    (x1 - x0) / 2.0,
+                    2,
+                    None,
+                ),
+                [1, 0]
+            );
+        }
+    }
+
+    #[test]
     fn only_counts_in_range_spikes() {
         // 10 Hz sampling: spikes at 0.5 s, 1.5 s, 2.5 s; 3 bins of 1 s.
         let t = [5, 15, 25].map(SampleIndex);
-        let all = rate_counts(&t[..], 10.0, 0.0, 1.0, 3, None);
+        let all = rate_counts(&t[..], 10.0, SampleIndex(0), 0.0, 1.0, 3, None);
         assert_eq!(all, [1, 1, 1]);
         let tb = TimeBrush {
             start: 1.0,
             end: 2.0,
             only: true,
         };
-        assert_eq!(rate_counts(&t, 10.0, 0.0, 1.0, 3, Some(tb)), [0, 1, 0]);
+        assert_eq!(
+            rate_counts(&t, 10.0, SampleIndex(0), 0.0, 1.0, 3, Some(tb)),
+            [0, 1, 0]
+        );
         let fade = TimeBrush { only: false, ..tb };
-        assert_eq!(rate_counts(&t, 10.0, 0.0, 1.0, 3, Some(fade)), all);
+        assert_eq!(
+            rate_counts(&t, 10.0, SampleIndex(0), 0.0, 1.0, 3, Some(fade)),
+            all
+        );
     }
 }
 

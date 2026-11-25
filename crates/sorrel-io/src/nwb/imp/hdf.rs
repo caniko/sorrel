@@ -321,14 +321,23 @@ pub(super) fn local_trace_dataset(group: &hdf5::Group, path: &str) -> Result<hdf
         .saturating_mul(channel_chunks)
         .min(256 * 1024 * 1024);
     let default = ds.dapl()?.get_chunk_cache()?;
-    if tile_bytes <= default.nbytes {
+    // HDF5 recommends at least ten hash slots per cached chunk. Keep prime
+    // sizes to limit collisions and bound the table for very wide traces.
+    let target_slots = channel_chunks.saturating_mul(10).min(262_147);
+    if tile_bytes <= default.nbytes && target_slots <= default.nslots {
         return Ok(ds);
     }
-
-    // Use a prime slot count to limit collisions without scaling memory
-    // with the number of small chunks in a time tile.
+    let slots = if target_slots <= 12_421 {
+        12_421
+    } else {
+        262_147
+    };
     let dapl = DatasetAccess::build()
-        .chunk_cache(12_421, tile_bytes, default.w0)
+        .chunk_cache(
+            slots.max(default.nslots),
+            tile_bytes.max(default.nbytes),
+            default.w0,
+        )
         .finish()?;
     let name = CString::new(path)?;
     hdf5::sync::sync(|| {

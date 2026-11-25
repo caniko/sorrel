@@ -192,12 +192,17 @@ fn content_key(times: &[SampleIndex], amps: &[f32]) -> blake3::Hasher {
     h
 }
 
-/// Firing counts of `times` in [`PRESENCE_BINS`] equal slices of the recording.
+/// Firing counts of `times` in up to [`PRESENCE_BINS`] equal slices of the recording.
 fn presence_counts(times: &[SampleIndex], span: sorrel_io::SessionSpan) -> Vec<f32> {
-    let width = (span.duration_samples() as f64 / PRESENCE_BINS as f64).max(1.0);
-    let mut c = vec![0.0f32; PRESENCE_BINS];
+    let duration = span.duration_samples();
+    let bins = duration.min(PRESENCE_BINS as u64) as usize;
+    if bins == 0 {
+        return Vec::new();
+    }
+    let width = duration as f64 / bins as f64;
+    let mut c = vec![0.0f32; bins];
     for t in span.metric_spikes(times) {
-        c[(((t.0 - span.start.0) as f64 / width) as usize).min(PRESENCE_BINS - 1)] += 1.0;
+        c[(((t.0 - span.start.0) as f64 / width) as usize).min(bins - 1)] += 1.0;
     }
     c
 }
@@ -208,6 +213,9 @@ fn presence_counts(times: &[SampleIndex], span: sorrel_io::SessionSpan) -> Vec<f
 /// bin). A unit split in two by a drift event fires in one fragment or the
 /// other, so this is near 1; independent stationary units score near 0.
 fn presence_complement(a: &[f32], b: &[f32]) -> f32 {
+    if a.is_empty() {
+        return 0.0;
+    }
     let n = a.len() as f32;
     let (ma, mb) = (a.iter().sum::<f32>() / n, b.iter().sum::<f32>() / n);
     let (mut cov, mut va, mut vb) = (0.0, 0.0, 0.0);
@@ -823,6 +831,17 @@ mod tests {
     use sorrel_io::{
         ClusterId, DataProvider, HasAmplitudes, SampleIndex, TraceSamples, TraceSlice,
     };
+
+    #[test]
+    fn merge_presence_counts_only_bins_with_exposure() {
+        let span = sorrel_io::SessionSpan {
+            start: SampleIndex(100),
+            end: SampleIndex(110),
+            source: sorrel_io::SpanSource::Declared("/intervals/epochs"),
+        };
+        let spikes: Vec<_> = (99..=110).map(SampleIndex).collect();
+        assert_eq!(presence_counts(&spikes, span), [1.0; 10]);
+    }
 
     /// In-memory provider backed by per-cluster spike times + amplitudes.
     struct MockProvider {

@@ -257,6 +257,12 @@ fn trace_chunk_cache_holds_one_time_tile() {
         .shape((4, 5))
         .create("data")
         .unwrap();
+    let wide = file.create_group("wide").unwrap();
+    wide.new_dataset::<i8>()
+        .shape((64, 16_384))
+        .chunk((64, 1))
+        .create("data")
+        .unwrap();
 
     let cache = |group: h5::Group| {
         let data = match Group::Hdf5(group).trace_data().unwrap() {
@@ -266,10 +272,11 @@ fn trace_chunk_cache_holds_one_time_tile() {
         };
         data.dapl().unwrap().get_chunk_cache().unwrap()
     };
-    assert_eq!(
-        cache(contiguous),
-        file.fapl().unwrap().get_chunk_cache().unwrap()
-    );
+    let default = file.fapl().unwrap().get_chunk_cache().unwrap();
+    assert_eq!(cache(contiguous), default);
+    let wide = cache(wide);
+    assert_eq!(wide.nbytes, default.nbytes);
+    assert!(wide.nslots >= 10 * 16_384);
     let cache = cache(chunked);
     assert_eq!(cache.nbytes, 12 * MIB); // Three 4 MiB chunks, including the partial channel chunk.
     assert!(cache.nslots > 300);

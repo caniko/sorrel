@@ -686,10 +686,30 @@ mod imp {
                 index.shape() == [n_units],
                 "expected one observation index per unit"
             );
+            let signed = match index.sample_type()? {
+                SampleType::I8 | SampleType::I16 | SampleType::I32 | SampleType::I64 => true,
+                SampleType::U8 | SampleType::U16 | SampleType::U32 | SampleType::U64 => false,
+                _ => anyhow::bail!("expected an integer observation interval index"),
+            };
             let mut prev = 0;
             for i in (0..n_units).step_by(BATCH) {
-                for end in index.read_rows::<u64>(i..n_units.min(i + BATCH))? {
+                let range = i..n_units.min(i + BATCH);
+                let ends = if signed {
+                    index
+                        .read_rows::<i64>(range)?
+                        .into_iter()
+                        .map(u64::try_from)
+                        .collect::<Result<Vec<_>, _>>()
+                        .context("negative observation interval index")?
+                } else {
+                    index.read_rows::<u64>(range)?
+                };
+                for end in ends {
                     ensure!(end >= prev, "observation interval index is not monotonic");
+                    ensure!(
+                        end <= n as u64,
+                        "observation interval index is out of bounds"
+                    );
                     prev = end;
                 }
             }

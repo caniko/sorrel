@@ -105,7 +105,7 @@ fn rows<P: DataProvider>(
     depths: Option<&SpikeDepths>,
 ) -> Vec<(ClusterId, [f32; 5])> {
     let span = s.provider.session_span();
-    let duration = (span.duration_samples() as f32 / s.provider.sample_rate().max(1.0)).max(1e-3);
+    let duration = span.duration_seconds(s.provider.sample_rate());
     let (_, ns, nc) = s.template_shape();
     (0..s.n_clusters())
         .map(ClusterId)
@@ -197,8 +197,9 @@ pub fn cluster_scatter_view<P: DataProvider>(
         .map(|r| r.2.as_slice())
         .unwrap_or_default();
     let value = |r: &[f32; 5], axis: usize| {
-        let v = r[col_index(state.axes[axis])];
-        if state.log[axis] {
+        let col = state.axes[axis];
+        let v = r[col_index(col)];
+        if state.log[axis] && (col != Column::FiringRate || v.is_finite()) {
             v.max(1e-6).log10()
         } else {
             v

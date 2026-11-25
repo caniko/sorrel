@@ -1097,6 +1097,41 @@ fn units_only_span_prefers_epochs_then_observations_then_trials() {
             ..estimate
         }
     );
+    let replace_index = |set_index: &dyn Fn(&hdf5_metno::File)| {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.unlink("/units/obs_intervals_index").unwrap();
+        set_index(&file);
+    };
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.unlink("/intervals/epochs").unwrap();
+    }
+    replace_index(&|file| {
+        file.new_dataset_builder()
+            .with_data(&[0_i64, 0, 2])
+            .create("/units/obs_intervals_index")
+            .unwrap();
+    });
+    assert_eq!(span().source, SpanSource::Declared("/units/obs_intervals"));
+    hdf5_metno::File::open_rw(&path)
+        .unwrap()
+        .dataset("/units/obs_intervals_index")
+        .unwrap()
+        .write_raw(&[-1_i64, 0, 2])
+        .unwrap();
+    assert_eq!(span().source, SpanSource::Declared("/intervals/trials"));
+    hdf5_metno::File::open_rw(&path)
+        .unwrap()
+        .unlink("/intervals/trials")
+        .unwrap();
+    assert_eq!(span(), estimate);
+    replace_index(&|file| {
+        file.new_dataset_builder()
+            .with_data(&[0.0_f64, 0.0, 2.0])
+            .create("/units/obs_intervals_index")
+            .unwrap();
+    });
+    assert_eq!(span(), estimate);
 }
 
 #[cfg(feature = "hdf5")]

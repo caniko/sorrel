@@ -81,11 +81,12 @@ pub fn amplitude_drift_slope(times: &[SampleIndex], amps: &[f32], sample_rate: f
 pub fn presence_cv(times: &[SampleIndex], span: impl Into<SessionSpan>, n_bins: usize) -> f32 {
     let span = span.into();
     let total_duration_samples = span.duration_samples();
+    let n_bins = n_bins.min(usize::try_from(total_duration_samples).unwrap_or(usize::MAX));
     let times = span.metric_spikes(times);
-    if times.is_empty() || n_bins == 0 || total_duration_samples == 0 {
+    if times.is_empty() || n_bins == 0 {
         return 0.0;
     }
-    let bin_width = (total_duration_samples as f64 / n_bins as f64).max(1.0);
+    let bin_width = total_duration_samples as f64 / n_bins as f64;
     let mut counts = vec![0u32; n_bins];
     for &t in times {
         let idx = ((t.0 - span.start.0) as f64 / bin_width) as usize;
@@ -254,6 +255,16 @@ mod tests {
         // All spikes packed into 1 bin out of 10.
         let times = si(0..100);
         assert!(presence_cv(&times, 1000, 10) > 1.0);
+    }
+
+    #[test]
+    fn presence_cv_uses_only_bins_with_exposure() {
+        let span = SessionSpan {
+            start: SampleIndex(100),
+            end: SampleIndex(110),
+            source: sorrel_io::SpanSource::Declared("/intervals/epochs"),
+        };
+        assert_eq!(presence_cv(&si(100..110), span, 50), 0.0);
     }
 
     #[test]

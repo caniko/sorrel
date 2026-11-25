@@ -116,6 +116,21 @@ impl SessionSpan {
         self.end.0.saturating_sub(self.start.0)
     }
 
+    /// Exposure for firing-rate metrics, or NaN if there is no usable exposure.
+    pub fn duration_seconds(self, sample_rate: f32) -> f32 {
+        let rate = if self.source == SpanSource::Trace {
+            sample_rate.max(1.0)
+        } else {
+            sample_rate
+        };
+        let duration = self.duration_samples() as f32 / rate;
+        if rate.is_finite() && rate > 0.0 && duration.is_finite() && duration > 0.0 {
+            duration
+        } else {
+            f32::NAN
+        }
+    }
+
     /// Spikes in the exposure. Trace-backed statistics retain their legacy
     /// handling of sorter-supplied spikes outside the raw recording.
     pub fn metric_spikes(self, times: &[SampleIndex]) -> &[SampleIndex] {
@@ -136,6 +151,23 @@ impl From<u64> for SessionSpan {
             source: SpanSource::Trace,
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn firing_rate_uses_exact_span_exposure() {
+    let span = SessionSpan {
+        start: SampleIndex(30_720_000),
+        end: SampleIndex(30_720_001),
+        source: SpanSource::SpikeExtent { rejected: None },
+    };
+    assert_eq!(1.0 / span.duration_seconds(30_000.0), 30_000.0);
+    assert!(span.duration_seconds(f32::NAN).is_nan());
+    let empty = SessionSpan {
+        end: span.start,
+        ..span
+    };
+    assert!(empty.duration_seconds(30_000.0).is_nan());
 }
 
 #[repr(transparent)]

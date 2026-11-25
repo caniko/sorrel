@@ -413,7 +413,7 @@ fn refractory_argmin(
     }
 }
 
-/// Fraction of `n_bins` evenly-sized time bins that contain at least one
+/// Fraction of up to `n_bins` evenly-sized time bins that contain at least one
 /// spike. Closer to 1.0 indicates a unit that fires across the whole
 /// recording (good); closer to 0.0 indicates a unit only present in part of
 /// the recording (often drift / electrode contact loss).
@@ -424,11 +424,12 @@ pub fn presence_ratio(
 ) -> f32 {
     let span = span.into();
     let total_duration_samples = span.duration_samples();
+    let n_bins = n_bins.min(usize::try_from(total_duration_samples).unwrap_or(usize::MAX));
     let spike_times = span.metric_spikes(spike_times);
-    if spike_times.is_empty() || n_bins == 0 || total_duration_samples == 0 {
+    if spike_times.is_empty() || n_bins == 0 {
         return 0.0;
     }
-    let bin_width = (total_duration_samples as f64 / n_bins as f64).max(1.0);
+    let bin_width = total_duration_samples as f64 / n_bins as f64;
     let mut filled = vec![false; n_bins];
     for &t in spike_times {
         // Preserve final-bin clamping for legacy trace-backed inputs.
@@ -753,6 +754,16 @@ mod tests {
             presence_ratio(&si([999, 1_000, 1_024, 1_100]), span, 4),
             0.25
         );
+    }
+
+    #[test]
+    fn presence_ratio_uses_only_bins_with_exposure() {
+        let span = sorrel_io::SessionSpan {
+            start: SampleIndex(100),
+            end: SampleIndex(110),
+            source: sorrel_io::SpanSource::Declared("/intervals/epochs"),
+        };
+        assert_eq!(presence_ratio(&siv(100..110), span, 50), 1.0);
     }
 
     #[test]

@@ -74,6 +74,21 @@ impl RateParams {
             (start, end)
         }
     }
+
+    /// As above, but returns seconds relative to the origin so a short
+    /// exposure at a large offset retains its width in plot coordinates.
+    pub(crate) fn relative_x_range(&self, origin: f64, duration: f32) -> (f32, f32) {
+        if origin == 0.0 {
+            return self.x_range((0.0, duration));
+        }
+        let relative = |t: f32| (f64::from(t) - origin) as f32;
+        Self {
+            x_min: self.x_min.map(relative),
+            x_max: self.x_max.map(relative),
+            ..self.clone()
+        }
+        .x_range((0.0, duration))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

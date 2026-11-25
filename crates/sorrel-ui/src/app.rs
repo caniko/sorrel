@@ -1108,10 +1108,10 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 let s = read(&self.session);
                 let sr = s.provider.sample_rate().max(1.0);
                 let span = s.provider.session_span();
-                let (lo, hi) = self
-                    .view_params
-                    .rate
-                    .x_range((span.start.as_f32() / sr, span.end.as_f32() / sr));
+                let (lo, hi) = self.view_params.rate.relative_x_range(
+                    span.start.as_f64() / f64::from(sr),
+                    span.duration_samples() as f32 / sr,
+                );
                 self.view_params.rate.n_bins =
                     (((hi - lo) / secs.max(1e-3)).round() as usize).clamp(2, 5000);
             }
@@ -2394,9 +2394,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             {
                 let n = session.n_clusters();
                 let span = session.provider.session_span();
-                let duration = (span.duration_samples() as f32
-                    / session.provider.sample_rate().max(1.0))
-                .max(1e-3);
+                let duration = span.duration_seconds(session.provider.sample_rate());
                 let ids = (0..n).map(ClusterId);
                 let groups: Vec<&str> = ids
                     .clone()
