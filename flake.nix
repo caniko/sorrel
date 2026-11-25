@@ -25,6 +25,8 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
+    spikeinterface.url = "github:caniko/spikeinterface/feat/nix-flake-harbor-py-lupin";
+
     # Static project-site generator for the landing page (built via crane below).
     plinth = {
       url = "git+https://github.com/caniko/plinth.git?ref=trunk&rev=fa783dda2f2fd339e2bc3daa8b5436f4e787f9e3";
@@ -43,6 +45,7 @@
     treefmt-nix,
     git-hooks,
     plinth,
+    spikeinterface,
     ...
   }:
     {
@@ -508,6 +511,7 @@
         root = ./.;
       };
       inherit (siteOutputs) website docs site;
+      lupin = import ./nix/lupin.nix {inherit pkgs system spikeinterface;};
     in {
       packages =
         {
@@ -519,6 +523,7 @@
         }
         // crossSorrelPackages
         // crossSorrelPyPackages
+        // lupin.packages
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux portable
         # Compatibility alias for configs that selected the former HDF5 build.
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {sorrelHdf5 = sorrel;}
@@ -585,12 +590,14 @@
           };
         };
 
-      devShells = import ./nix/devshell.nix {
-        inherit pkgs harbor-rs craneLib cross cargoConfig deps plinthProject;
-        checks = self.checks.${system};
-        preCommitEnabledPackages = pre-commit-check.enabledPackages;
-        inherit (pre-commit-check) shellHook;
-      };
+      devShells =
+        (import ./nix/devshell.nix {
+          inherit pkgs harbor-rs craneLib cross cargoConfig deps plinthProject;
+          checks = self.checks.${system};
+          preCommitEnabledPackages = pre-commit-check.enabledPackages;
+          inherit (pre-commit-check) shellHook;
+        })
+        // lupin.devShells;
 
       formatter = treefmtEval.config.build.wrapper;
 
