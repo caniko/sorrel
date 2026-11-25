@@ -1,0 +1,36 @@
+.coal,
+.navy {
+    --links: #64b5e4;
+}
+
+main a:not(.header) {
+    text-decoration: underline;
+    text-underline-offset: .12em;
+}
+
+.menu-bar .menu-title {
+    color: var(--fg);
+    cursor: auto;
+    font-weight: 500;
+}
+
+.menu-title a { color: inherit; }
+.menu-title a:focus-visible { outline-offset: -2px; }
+
+.docs-download {
+    color: var(--links);
+    display: inline-block;
+    line-height: var(--menu-bar-height);
+}
+
+@media (max-width: 480px) {
+    .menu-bar .menu-title { font-size: 1.8rem; }
+    .docs-download { font-size: 1.3rem; }
+}
+
+.docs-scroll-hint {
+    font-size: .875em;
+    margin-block: 1em .25em;
+}
+
+.docs-scroll-hint:not([hidden]) + pre { margin-top: 0; }
