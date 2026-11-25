@@ -158,6 +158,10 @@ What Sorrel reads:
   Conflicting cached type definitions that affect series selection are refused.
   By default it selects only from `/acquisition`, preferring 2-D series and
   breaking ties by path, and logs the available paths when there is more than one.
+  On an automatic single-file open, if the selected series and
+  `/units/electrodes` reference the same table but the series omits any of the
+  Units' electrodes, Sorrel opens without a trace. Pass `--nwb-series PATH`
+  to force that series.
   A `/processing` series supplies a trace and clock only when explicitly selected
   with `--nwb-series`. The reader follows same-file HDF5 soft links, with a
   bounded hop count and cycle checks; literal `..` path components are not
@@ -209,9 +213,10 @@ or waveform extraction. Session span comes from epochs, unit observation
 intervals, or trials (in that order), or is estimated from the spike extent;
 it is never a trace duration.
 
-By default, Sorrel refuses a selected series with gaps or backward steps in its
-timestamps. Pass `--nwb-series none` to open the units without that trace. The
-same option works with `open`, `describe`, `qc`, `report`, `call`, and `mcp`.
+Sorrel refuses a selected series with an invalid time base, including gaps or
+backward steps in its timestamps. Pass `--nwb-series none` to open the units
+without that trace. The same option works with `open`, `describe`, `qc`,
+`report`, `call`, and `mcp`.
 Do not combine it with `--dat`; select a series literally named `none` with
 `--nwb-series /acquisition/none`. Use a separate `--journal` when switching
 between units-only and trace-backed opens of the same recording.
@@ -221,6 +226,7 @@ between units-only and trace-backed opens of the same recording.
 `provenance.skipped_series` for explicit skips. The latter records the
 default acquisition series path (`series`), `status`, and `message`. Sorrel
 checks shape and type and probes timestamps without scanning them end to end.
+It does not read trace samples or the skipped series' electrodes region.
 `regular (probe)` only means the sampled timestamps fit; an unprobed gap can
 still be present. `not fully checked` means the probe was inconclusive or there
 were no per-sample timestamps. A `refused` result names the failing `check`;

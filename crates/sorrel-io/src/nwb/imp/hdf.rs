@@ -411,7 +411,7 @@ pub(super) fn spec_object(group: &hdf5::Group, path: &str) -> Result<hdf5::Locat
     .with_context(|| format!("cannot open same-file HDF5 spec object {path:?}"))
 }
 
-pub(super) fn spec_reference(root: &hdf5::Group, attr: &hdf5::Attribute) -> Result<hdf5::Group> {
+pub(super) fn group_reference(root: &hdf5::Group, attr: &hdf5::Attribute) -> Result<hdf5::Group> {
     use hdf5_metno_sys::{
         h5a::H5Aread,
         h5p::H5P_DEFAULT,
@@ -419,7 +419,7 @@ pub(super) fn spec_reference(root: &hdf5::Group, attr: &hdf5::Attribute) -> Resu
         h5t::{H5Tequal, H5T_STD_REF_OBJ},
     };
 
-    ensure!(attr.ndim() == 0, "HDF5 .specloc must be scalar");
+    ensure!(attr.ndim() == 0, "HDF5 {} must be scalar", attr.name());
     let dtype = attr.dtype()?;
     hdf5::sync::sync(|| {
         // SAFETY: the scalar old-style object reference has exactly the
@@ -427,7 +427,8 @@ pub(super) fn spec_reference(root: &hdf5::Group, attr: &hdf5::Attribute) -> Resu
         unsafe {
             ensure!(
                 H5Tequal(dtype.id(), *H5T_STD_REF_OBJ) > 0,
-                "HDF5 .specloc must be an object reference"
+                "HDF5 {} must be an object reference",
+                attr.name()
             );
             let mut reference: hobj_ref_t = 0;
             hdf5::h5check(H5Aread(

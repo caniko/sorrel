@@ -219,11 +219,20 @@ mod imp {
                 })
                 .transpose()?;
             let recording = raw.as_ref().map_or(&f, |(group, _)| group);
-            let (series, processed) = if params.units_only() {
+            let (mut series, processed) = if params.units_only() {
                 (None, None)
             } else {
                 find_electrical_series(recording, params.series, raw.is_some(), false)?
             };
+            let mut skipped_for_electrodes = None;
+            if params.series.is_none() && raw.is_none() {
+                if let Some((name, candidate)) = &series {
+                    if misses_units_electrodes(&f, &units, &ids, candidate).unwrap_or(false) {
+                        log::warn!("NWB: skipping ElectricalSeries {name} because it does not record the Units' electrodes");
+                        skipped_for_electrodes = series.take().map(|(name, _)| name);
+                    }
+                }
+            }
             // In a single file with a series, an invalid resolution value is
             // not a clock statement; its storage type must still be exact.
             let units_rate = read_units_rate(&spike_times, raw.is_some() || series.is_none())?;
@@ -238,7 +247,13 @@ mod imp {
                 let data = series.trace_data()?;
                 let shape = data.shape();
                 let (n_samples, n_channels) = (shape[0], shape.get(1).copied().unwrap_or(1));
-                let (stored_rate, t0, timestamps) = read_time_base(recording, name, n_samples)?;
+                let hint = match (params.series, raw.is_some()) {
+                    (None, false) => "; to open the Units without this trace, pass --nwb-series none (with --sample-rate HZ if /units/spike_times declares no resolution)",
+                    (None, true) => "; to open the Units without this trace, omit --dat and pass --nwb-series none (with --sample-rate HZ if /units/spike_times declares no resolution)",
+                    (Some(_), _) => "",
+                };
+                let (stored_rate, t0, timestamps) =
+                    read_time_base_with(recording, name, n_samples, regular_timestamps, hint)?;
                 let units_clock = if let Some(declared) = units_rate {
                     // The one-ppm gate decides whether resolution declares a clock,
                     // not whether an explicit value matches that clock.
@@ -282,6 +297,9 @@ mod imp {
                 let rate = units_rate.or(params.sample_rate).with_context(|| {
                     if params.units_only() {
                         return "units-only NWB has no /units/spike_times resolution; pass --sample-rate HZ as the analysis grid".into();
+                    }
+                    if let Some(name) = &skipped_for_electrodes {
+                        return format!("skipped acquisition ElectricalSeries {name} because it does not record the Units' electrodes, and /units/spike_times has no resolution; pass --sample-rate HZ as the analysis grid, or --nwb-series PATH to force a series");
                     }
                     let missing = "no /acquisition ElectricalSeries and no /units/spike_times resolution";
                     match processed {
@@ -552,7 +570,8 @@ mod imp {
         let file = Group::Hdf5(file.group("/")?);
         if let (Some((name, series)), _) = find_electrical_series(&file, None, false, false)? {
             let samples = series.dataset("data")?.shape()[0];
-            let (series_rate, _, _) = read_time_base(&file, &name, samples)?;
+            let (series_rate, _, _) =
+                read_time_base_with(&file, &name, samples, regular_timestamps, "")?;
             // A single-file open ignores out-of-gate resolutions. Refuse to
             // append here so reopening cannot silently use the wrong clock.
             ensure!(is_units_clock(units_rate, series_rate),
@@ -996,6 +1015,47 @@ mod imp {
         Ok((Some(found.swap_remove(index)), None))
     }
 
+    fn misses_units_electrodes(
+        f: &Group,
+        units: &Group,
+        ids: &Dataset,
+        series: &Group,
+    ) -> Result<bool> {
+        let Some(unit_region) = units.optional_dataset("electrodes")? else {
+            return Ok(false);
+        };
+        let series_region = series.dataset("electrodes")?;
+        let Some(table) = unit_region.shared_table(&series_region, f)? else {
+            return Ok(false);
+        };
+        let rows = |ds: &Dataset| -> Result<Vec<i64>> {
+            ensure!(
+                ds.shape().len() == 1
+                    && !matches!(ds.sample_type()?, SampleType::F32 | SampleType::F64)
+            );
+            ds.read_raw()
+        };
+        let referenced = rows(&unit_region)?;
+        let ends = rows(&units.dataset("electrodes_index")?)?;
+        ensure!(
+            ids.shape() == [ends.len()]
+                && ends.iter().is_sorted()
+                && ends.first().is_none_or(|&end| end >= 0)
+                && ends.last().copied().unwrap_or(0) == referenced.len() as i64
+        );
+        let recorded = rows(&series_region)?;
+        let shape = table.dataset("id")?.shape();
+        ensure!(
+            shape.len() == 1
+                && referenced
+                    .iter()
+                    .chain(&recorded)
+                    .all(|&r| { usize::try_from(r).is_ok_and(|r| r < shape[0]) })
+        );
+        let recorded: std::collections::HashSet<_> = recorded.into_iter().collect();
+        Ok(referenced.iter().any(|row| !recorded.contains(row)))
+    }
+
     fn inspect_skipped_series(file: &Group) -> Value {
         let (name, series) = match find_electrical_series(file, None, false, true) {
             Ok((Some(series), _)) => series,
@@ -1016,7 +1076,7 @@ mod imp {
                 return skipped;
             }
         };
-        let data = series.trace_data().and_then(|data| {
+        let data = series.dataset("data").and_then(|data| {
             trace_sample_type(&data, &name)?;
             Ok(data)
         });
@@ -1029,11 +1089,17 @@ mod imp {
             }
         };
         let mut timestamps_fit = None;
-        let result = read_time_base_with(file, &name, data.shape()[0], |ds, n| {
-            let grid = probe_timestamps(ds, n, true)?;
-            timestamps_fit = Some(grid.probe_regular);
-            Ok((grid.rate, grid.t0))
-        });
+        let result = read_time_base_with(
+            file,
+            &name,
+            data.shape()[0],
+            |ds, n| {
+                let grid = probe_timestamps(ds, n, true)?;
+                timestamps_fit = Some(grid.probe_regular);
+                Ok((grid.rate, grid.t0))
+            },
+            "",
+        );
         if let Err(err) = result {
             let mut skipped = json!({
                 "series": name, "status": "refused", "check": "time base", "message": format!("{err:#}"),
@@ -1059,19 +1125,12 @@ mod imp {
     }
 
     /// `(rate Hz, starting_time s, recorded timestamps)`.
-    fn read_time_base(
-        file: &Group,
-        name: &str,
-        n_samples: usize,
-    ) -> Result<(f64, f64, Option<Dataset>)> {
-        read_time_base_with(file, name, n_samples, regular_timestamps)
-    }
-
     fn read_time_base_with(
         file: &Group,
         name: &str,
         n_samples: usize,
         check_timestamps: impl FnOnce(&Dataset, usize) -> Result<(f64, f64)>,
+        hint: &str,
     ) -> Result<(f64, f64, Option<Dataset>)> {
         let read = || -> Result<_> {
             if let Some(ds) = file.optional_stored_dataset(&format!("{name}/timestamps"))? {
@@ -1089,7 +1148,7 @@ mod imp {
             check_time(t0, "starting_time")?;
             Ok((rate, t0, None))
         };
-        read().with_context(|| format!("ElectricalSeries {name}: invalid time base"))
+        read().with_context(|| format!("ElectricalSeries {name}: invalid time base{hint}"))
     }
 
     const TIMESTAMP_BLOCK: usize = 65_536;
@@ -1978,7 +2037,9 @@ mod imp {
                 .map(|i| i as f64 / 1000.0 + if i >= gap { 25.0 } else { 0.0 })
                 .collect();
             ds.write(&times).unwrap();
-            let err = read_time_base(&root, name, n).err().unwrap();
+            let err = read_time_base_with(&root, name, n, regular_timestamps, "")
+                .err()
+                .unwrap();
             assert_eq!(
                 err.to_string(),
                 format!("ElectricalSeries {name}: invalid time base")
@@ -2025,7 +2086,12 @@ mod imp {
                 })
                 .collect();
             ds.write(&times).unwrap();
-            let err = format!("{:#}", read_time_base(&root, name, n).err().unwrap());
+            let err = format!(
+                "{:#}",
+                read_time_base_with(&root, name, n, regular_timestamps, "")
+                    .err()
+                    .unwrap()
+            );
             assert!(
                 err.contains("invalid time base: timestamps must strictly increase: they step back by 0.028000 s between samples 73258 and 73259"),
                 "{err}"

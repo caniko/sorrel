@@ -115,7 +115,7 @@ impl Group {
     pub fn spec_group(&self, legacy: bool) -> Result<Option<Self>> {
         dispatch!(self, Self, g => {
             if let Some(Attr::Hdf5(attr)) = if legacy { None } else { hdf_attr(g, ".specloc")? } {
-                return Ok(Some(Self::Hdf5(hdf::spec_reference(g, &attr)?)));
+                return Ok(Some(Self::Hdf5(hdf::group_reference(g, &attr)?)));
             }
             if !g.link_exists("/specifications") { return Ok(None); }
             Ok(Some(Self::Hdf5(hdf::spec_object(g, "/specifications")?.as_group()?)))
@@ -431,6 +431,37 @@ impl Dataset {
             let _ = attribute;
             Ok(None)
         }, _d.reference_path(attribute))
+    }
+
+    // Unlike the historical channel mapping, this check requires two actual
+    // references to the same table; missing references cannot imply a match.
+    pub fn shared_table(&self, other: &Self, root: &Group) -> Result<Option<Group>> {
+        match (self, other, root) {
+            #[cfg(feature = "hdf5")]
+            (Self::Hdf5(left), Self::Hdf5(right), Group::Hdf5(root)) => {
+                let has_table = |d: &h5::Dataset| -> Result<_> {
+                    Ok(d.attr_names()?.iter().any(|name| name == "table"))
+                };
+                if !has_table(left)? || !has_table(right)? {
+                    return Ok(None);
+                }
+                let left = hdf::group_reference(root, &left.attr("table")?)?;
+                let right = hdf::group_reference(root, &right.attr("table")?)?;
+                let (a, b) = (left.loc_info()?, right.loc_info()?);
+                Ok((a.fileno == b.fileno && a.token == b.token).then_some(Group::Hdf5(left)))
+            }
+            #[cfg(feature = "zarr")]
+            (Self::Zarr(left), Self::Zarr(right), root @ Group::Zarr(_)) => {
+                let left = left.reference_path("table")?;
+                let right = right.reference_path("table")?;
+                match left {
+                    Some(path) if Some(&path) == right.as_ref() => root.optional_group(&path),
+                    _ => Ok(None),
+                }
+            }
+            #[cfg(all(feature = "hdf5", feature = "zarr"))]
+            _ => Ok(None),
+        }
     }
 }
 

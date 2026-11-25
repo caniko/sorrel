@@ -103,6 +103,10 @@ fn opt_in_units_only_records_gaps_and_backward_steps() {
             "{err}"
         );
         assert!(err.contains("between samples 73258 and 73259"), "{err}");
+        assert!(
+            err.contains("--nwb-series none") && err.contains("--sample-rate HZ"),
+            "{err}"
+        );
         let p = NwbProvider::open_with(
             &path,
             NwbOpenParams {
@@ -126,8 +130,221 @@ fn opt_in_units_only_records_gaps_and_backward_steps() {
         assert_eq!(skipped["next_sample"], next);
         assert!((skipped["jump_s"].as_f64().unwrap() - (offset + 0.001)).abs() < 1e-12);
         assert_eq!(skipped["t_s"], serde_json::json!(times[next - 1..=next]));
-        assert_eq!(skipped["message"], err);
+        let explicit = NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                series: Some(series),
+                ..Default::default()
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(!format!("{explicit:#}").contains("--nwb-series none"));
+        assert_eq!(skipped["message"], format!("{explicit:#}"));
     }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn opt_in_units_only_does_not_scan_timestamps_or_load_trace() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sorting.nwb");
+    std::fs::copy(fixture("timestamps.nwb"), &path).unwrap();
+    let series = "/acquisition/ElectricalSeriesRaw";
+    {
+        let f = hdf5_metno::File::open_rw(&path).unwrap();
+        let g = f.group(series).unwrap();
+        let timestamps = g.dataset("timestamps").unwrap();
+        let mut times: Vec<_> = (0..timestamps.size()).map(|i| i as f64 / 1000.0).collect();
+        // 197 is between the probe's five-sample strides.
+        times[197] += 0.0005;
+        timestamps.write(&times).unwrap();
+        g.dataset("electrodes")
+            .unwrap()
+            .write(&[0_i64, 1, 2, 99])
+            .unwrap();
+        let data = g.dataset("data").unwrap();
+        data.delete_attr("conversion").unwrap();
+        data.new_attr::<i64>()
+            .shape(2)
+            .create("conversion")
+            .unwrap();
+    }
+    let err = format!("{:#}", NwbProvider::open(&path).err().unwrap());
+    assert!(
+        err.contains("invalid time base") && err.contains("max deviation") && err.contains("197"),
+        "{err}"
+    );
+    assert!(
+        err.contains("--nwb-series none") && err.contains("--sample-rate HZ"),
+        "{err}"
+    );
+    let p = NwbProvider::open_with(
+        &path,
+        NwbOpenParams {
+            series: Some("none"),
+            sample_rate: Some(1000.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(p.n_samples(), SampleIndex(0));
+    assert_eq!(p.spike_times(ClusterId(0))[0], SampleIndex(600));
+    let provenance = p.trace_provenance();
+    assert_eq!(provenance["skipped_series"]["series"], series);
+    assert_eq!(provenance["skipped_series"]["status"], "regular (probe)");
+    assert!(provenance["skipped_series"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("full scan was skipped"));
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn auto_series_requires_units_electrode_coverage_in_the_same_table() {
+    fn table_ref(region: &hdf5_metno::Dataset, table: &std::ffi::CStr) {
+        use hdf5_metno_sys::{
+            h5a::{H5Aclose, H5Acreate2, H5Awrite},
+            h5p::H5P_DEFAULT,
+            h5r::{hobj_ref_t, H5R_type_t::H5R_OBJECT1, H5Rcreate},
+            h5s::{H5S_class_t::H5S_SCALAR, H5Sclose, H5Screate},
+            h5t::H5T_STD_REF_OBJ,
+        };
+        hdf5_metno::sync::sync(|| {
+            // SAFETY: live dataset ID, NUL-terminated names and one scalar reference.
+            unsafe {
+                let mut reference: hobj_ref_t = 0;
+                let reference = (&mut reference as *mut hobj_ref_t).cast();
+                assert!(H5Rcreate(reference, region.id(), table.as_ptr(), H5R_OBJECT1, -1) >= 0);
+                let space = H5Screate(H5S_SCALAR);
+                assert!(space >= 0);
+                let attr = H5Acreate2(
+                    region.id(),
+                    c"table".as_ptr(),
+                    *H5T_STD_REF_OBJ,
+                    space,
+                    H5P_DEFAULT,
+                    H5P_DEFAULT,
+                );
+                assert!(attr >= 0);
+                assert!(H5Awrite(attr, *H5T_STD_REF_OBJ, reference) >= 0);
+                assert!(H5Aclose(attr) >= 0);
+                assert!(H5Sclose(space) >= 0);
+            }
+        });
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sorting.nwb");
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    let series = "/acquisition/ElectricalSeriesEEG";
+    let table = c"/general/extracellular_ephys/electrodes";
+    {
+        let f = hdf5_metno::File::open_rw(&path).unwrap();
+        f.relink("/acquisition/ElectricalSeriesRaw", series)
+            .unwrap();
+        let g = f.group(series).unwrap();
+        g.unlink("data").unwrap();
+        g.new_dataset::<i16>()
+            .shape((300, 2))
+            .create("data")
+            .unwrap();
+        g.unlink("channel_conversion").unwrap();
+        g.unlink("electrodes").unwrap();
+        let region = g
+            .new_dataset_builder()
+            .with_data(&[0_i64, 1])
+            .create("electrodes")
+            .unwrap();
+        table_ref(&region, table);
+        let units = f.group("/units").unwrap();
+        let ids = units.dataset("id").unwrap();
+        let ends: Vec<_> = (1..=ids.size()).map(|i| i.min(2) as i64).collect();
+        units
+            .new_dataset_builder()
+            .with_data(&ends)
+            .create("electrodes_index")
+            .unwrap();
+        let region = units
+            .new_dataset_builder()
+            .with_data(&[0_i64, 1])
+            .create("electrodes")
+            .unwrap();
+        table_ref(&region, table);
+        let spikes = units.dataset("spike_times").unwrap();
+        spikes
+            .new_attr::<f64>()
+            .create("resolution")
+            .unwrap()
+            .write_scalar(&0.001)
+            .unwrap();
+    }
+    let forced = || {
+        NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                series: Some(series),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let covered = NwbProvider::open(&path).unwrap();
+    assert_eq!(covered.n_samples(), SampleIndex(300));
+    assert_eq!(covered.identity_bytes(), forced().identity_bytes());
+    drop(covered);
+    {
+        let f = hdf5_metno::File::open_rw(&path).unwrap();
+        f.dataset("/units/electrodes")
+            .unwrap()
+            .write(&[2_i64, 3])
+            .unwrap();
+    }
+    let p = NwbProvider::open(&path).unwrap();
+    assert_eq!(p.n_samples(), SampleIndex(0));
+    assert_eq!(p.exact_sample_rate().unwrap(), 1000.0);
+    assert_eq!(p.spike_times(ClusterId(0))[0], SampleIndex(600));
+    drop(p);
+    assert_eq!(forced().n_samples(), SampleIndex(300));
+    {
+        let f = hdf5_metno::File::open_rw(&path).unwrap();
+        f.dataset("/units/spike_times")
+            .unwrap()
+            .delete_attr("resolution")
+            .unwrap();
+    }
+    let err = NwbProvider::open(&path).err().unwrap().to_string();
+    for expected in [
+        series,
+        "does not record the Units' electrodes",
+        "--sample-rate HZ",
+        "--nwb-series PATH",
+    ] {
+        assert!(err.contains(expected), "{err}");
+    }
+    let p = NwbProvider::open_with(
+        &path,
+        NwbOpenParams {
+            sample_rate: Some(2000.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(p.n_samples(), SampleIndex(0));
+    assert_eq!(p.exact_sample_rate().unwrap(), 2000.0);
+    drop(p);
+    {
+        let f = hdf5_metno::File::open_rw(&path).unwrap();
+        let other = f.create_group("/other_electrodes").unwrap();
+        other.new_dataset::<i64>().shape(6).create("id").unwrap();
+        let region = f.dataset("/units/electrodes").unwrap();
+        region.delete_attr("table").unwrap();
+        table_ref(&region, c"/other_electrodes");
+    }
+    assert_eq!(
+        NwbProvider::open(&path).unwrap().n_samples(),
+        SampleIndex(300)
+    );
 }
 
 #[test]
