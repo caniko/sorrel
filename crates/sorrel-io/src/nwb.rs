@@ -659,7 +659,7 @@ mod imp {
                 };
                 if is_series_node {
                     found.push((path, child));
-                } else if depth > 0 && !child.is_alias(&path) {
+                } else if depth > 0 && !child.is_alias(group, &name) {
                     // Never walk into soft aliases; also bound recursion for hard links.
                     collect(&child, &path, depth - 1, is_series, found)?;
                 }
@@ -814,6 +814,18 @@ mod imp {
         Ok(times)
     }
 
+    fn checked_timestamp_step(left: (usize, f64), right: (usize, f64)) -> Result<f64> {
+        let step = right.1 - left.1;
+        let back = -step;
+        ensure!(
+            step.is_finite() && step > 0.0,
+            "timestamps must strictly increase: they step back by {back:.6} s between samples {} and {} \
+             (t={} s to {} s); choose another series with --nwb-series",
+            left.0, right.0, left.1, right.1
+        );
+        Ok(step)
+    }
+
     fn regular_timestamps(ds: &Dataset, n: usize) -> Result<(f64, f64)> {
         ensure!(
             ds.shape() == [n] && n >= 2,
@@ -823,6 +835,20 @@ mod imp {
             |sample| -> Result<_> { Ok(read_timestamp_block(ds, sample..sample + 1)?[0]) };
         let t0 = time_at(0)?;
         let last = time_at(n - 1)?;
+        if last <= t0 {
+            // At least one half must retain the non-increasing endpoints.
+            let (mut left, mut right) = ((0, t0), (n - 1, last));
+            while right.0 - left.0 > 1 {
+                let mid = left.0.midpoint(right.0);
+                let t = time_at(mid)?;
+                if t <= left.1 {
+                    right = (mid, t);
+                } else {
+                    left = (mid, t);
+                }
+            }
+            checked_timestamp_step(left, right)?;
+        }
         // Use the end-to-end mean period, so a tiny bias from one rounded
         // interval cannot accumulate over a long recording.
         let period = (last - t0) / (n - 1) as f64;
@@ -838,7 +864,15 @@ mod imp {
         // for their error, each rounded timestamp, and the arithmetic.
         let limit = 1e-3 + 4.0 * ulp * rate;
         let grid_error = |sample, t| (t - t0) / period - sample as f64;
-        let stride = (n - 1).div_ceil(63);
+        // Don't probe if the full scan fits in one block.
+        let stride = if n <= TIMESTAMP_BLOCK {
+            n - 1
+        } else {
+            (n - 1).div_ceil(63)
+        };
+        // ponytail: fast refusal is best-effort and only localizes the first
+        // failed probe. The full scan still refuses discontinuities that return
+        // to the grid between probes or that the probe can't explain.
         let mut last_in_grid = (0, t0);
         for sample in (stride..n - 1).step_by(stride) {
             let time = time_at(sample)?;
@@ -882,14 +916,7 @@ mod imp {
                         left = (mid, t);
                     }
                 }
-                let step = right.1 - left.1;
-                let back = -step;
-                ensure!(
-                    step.is_finite() && step > 0.0,
-                    "timestamps must strictly increase: they step back by {back:.6} s between samples {} and {} \
-                     (t={} s to {} s); choose another series with --nwb-series",
-                    left.0, right.0, left.1, right.1
-                );
+                let step = checked_timestamp_step(left, right)?;
                 // Adjacent grid errors differ by the interval error in samples.
                 let error = (step * rate - 1.0).abs();
                 if error > largest_error {
@@ -907,8 +934,6 @@ mod imp {
                     left.0, right.0, left.1, right.1
                 );
             }
-            // ponytail: localize only from the first failed probe; use the
-            // full scan when none of its candidates explains the failure.
             break;
         }
         let (mut max_drift, mut worst_sample) = (0.0, 0);
@@ -1530,7 +1555,7 @@ mod imp {
     fn timestamp_validation_rejects_subsample_jitter() {
         let dir = tempfile::tempdir().unwrap();
         let file = hdf5_metno::File::create(dir.path().join("timestamps.h5")).unwrap();
-        // A short/long pair between probes on a nominal 1 kHz grid.
+        // A short/long pair on a nominal 1 kHz grid.
         let mut times: Vec<_> = (0..127).map(|i| 0.5 + f64::from(i) / 1000.0).collect();
         times[3] -= 0.0002;
         let ds = file
@@ -1543,6 +1568,26 @@ mod imp {
         assert!(err.contains("max deviation 0.200000 samples"), "{err}");
         assert!(
             err.contains("largest interval 0.001200 s between samples 3 and 4"),
+            "{err}"
+        );
+    }
+
+    #[cfg(all(test, feature = "hdf5"))]
+    #[test]
+    fn timestamp_validation_scans_one_block_without_probing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5_metno::File::create(dir.path().join("timestamps.h5")).unwrap();
+        let mut times: Vec<_> = (0..TIMESTAMP_BLOCK).map(|i| i as f64 / 1000.0).collect();
+        times[1041] -= 0.0002; // The first sparse probe would hit this sample.
+        let ds = file
+            .new_dataset_builder()
+            .with_data(&times)
+            .create("timestamps")
+            .unwrap();
+        let err = regular_timestamps(&Dataset::Hdf5(ds), times.len()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("at sample 1041: max deviation 0.200000 samples"),
             "{err}"
         );
     }
@@ -1644,6 +1689,26 @@ mod imp {
             );
             assert!(err.contains("--nwb-series"), "{err}");
         }
+    }
+
+    #[cfg(all(test, feature = "hdf5"))]
+    #[test]
+    fn timestamp_validation_locates_backward_step_with_nonincreasing_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5_metno::File::create(dir.path().join("timestamps.h5")).unwrap();
+        let times: Vec<_> = (0..100_001)
+            .map(|i| f64::from(i) / 1000.0 - if i >= 73_259 { 150.0 } else { 0.0 })
+            .collect();
+        let ds = file
+            .new_dataset_builder()
+            .with_data(&times)
+            .create("timestamps")
+            .unwrap();
+        let err = regular_timestamps(&Dataset::Hdf5(ds), times.len()).unwrap_err();
+        assert!(
+            err.to_string().contains("timestamps must strictly increase: they step back by 149.999000 s between samples 73258 and 73259"),
+            "{err}"
+        );
     }
 
     #[cfg(all(test, feature = "hdf5"))]

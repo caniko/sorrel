@@ -101,8 +101,15 @@ impl Group {
         }, Ok(g.child_group(name)?.map(Self::Zarr)))
     }
 
-    pub fn is_alias(&self, walked_path: &str) -> bool {
-        dispatch!(self, Self, _g => _g.name() != walked_path, { let _ = walked_path; false })
+    pub fn is_alias(&self, parent: &Self, name: &str) -> bool {
+        match (self, parent, name) {
+            #[cfg(feature = "hdf5")]
+            (Self::Hdf5(child), Self::Hdf5(parent), name) => {
+                child.name() != format!("{}/{name}", parent.name().trim_end_matches('/'))
+            }
+            #[cfg(feature = "zarr")]
+            _ => false,
+        }
     }
 
     pub fn spec_group(&self, legacy: bool) -> Result<Option<Self>> {

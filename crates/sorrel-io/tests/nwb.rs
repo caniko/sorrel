@@ -686,6 +686,37 @@ fn discovery_ignores_soft_linked_datasets_and_does_not_walk_group_aliases() {
 
 #[cfg(feature = "hdf5")]
 #[test]
+fn discovery_walks_a_soft_linked_processing_root_but_not_nested_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recording.nwb");
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.create_group("/shared/ecephys").unwrap();
+        file.relink("/acquisition/ElectricalSeriesRaw", "/shared/ecephys/Raw")
+            .unwrap();
+        file.unlink("/processing").unwrap();
+        file.link_soft("/shared", "/processing").unwrap();
+        file.link_soft("/shared/ecephys", "/shared/alias").unwrap();
+    }
+    let err = NwbProvider::open_with(
+        &path,
+        NwbOpenParams {
+            series: Some("missing"),
+            ..Default::default()
+        },
+    )
+    .err()
+    .expect("missing series")
+    .to_string();
+    assert!(
+        err.ends_with("available series: /processing/ecephys/Raw"),
+        "{err}"
+    );
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
 fn only_acquisition_series_can_be_a_soft_link_and_declares_its_clock() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("recording.nwb");
