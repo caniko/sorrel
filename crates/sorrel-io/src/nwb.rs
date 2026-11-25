@@ -39,6 +39,10 @@ pub use stub::open_stub;
 #[error("no /intervals/trials table")]
 pub struct NoTrials;
 
+/// The `--nwb-series` value that skips the trace; use an absolute path to select a series named `none`.
+#[cfg(any(feature = "hdf5", feature = "zarr"))]
+pub const UNITS_ONLY_SERIES: &str = "none";
+
 #[cfg(any(feature = "hdf5", feature = "zarr"))]
 mod imp {
     mod specs;
@@ -51,6 +55,7 @@ mod imp {
         TraceSamples, TraceSlice, UnitAnnotation,
     };
     use anyhow::{anyhow, ensure, Context, Result};
+    use serde_json::{json, Value};
     use specs::{legacy_is_series, legacy_type_parents, TypeSpecs};
     use std::cmp::Reverse;
     use std::collections::{BinaryHeap, HashMap, VecDeque};
@@ -63,12 +68,28 @@ mod imp {
 
     #[derive(Clone, Copy, Debug, Default)]
     pub struct NwbOpenParams<'a> {
-        /// Acquisition name or absolute NWB path, also applied to a paired file.
+        /// Acquisition name or absolute NWB path, also applied to a paired file;
+        /// `none` skips the trace and uses the Units clock or a supplied rate.
         pub series: Option<&'a str>,
         /// Read the ElectricalSeries from this file instead of the units file.
         pub raw_path: Option<&'a Path>,
         /// Exact declared clock (Hz), or a supplied rate for units without a time base.
         pub sample_rate: Option<f64>,
+    }
+
+    impl NwbOpenParams<'_> {
+        fn units_only(self) -> bool {
+            self.series == Some(super::UNITS_ONLY_SERIES)
+        }
+
+        /// Reject incompatible options before opening a local or remote source.
+        pub fn validate(self) -> Result<()> {
+            ensure!(
+                !self.units_only() || self.raw_path.is_none(),
+                "--nwb-series none (units-only) cannot be combined with --dat"
+            );
+            Ok(())
+        }
     }
 
     pub struct NwbProvider {
@@ -84,6 +105,7 @@ mod imp {
         channel_map: Vec<ChannelId>,
         identity_bytes: Vec<u8>,
         trace: Option<NwbTrace>,
+        skipped_series: Option<Value>,
         #[cfg(any(feature = "hdf5", feature = "dandi"))]
         source: Group,
         #[cfg(feature = "dandi")]
@@ -96,6 +118,7 @@ mod imp {
         }
 
         pub fn open_with(path: impl AsRef<Path>, params: NwbOpenParams<'_>) -> Result<Self> {
+            params.validate()?;
             let path = path.as_ref();
             #[cfg(feature = "dandi")]
             return Self::open_pinned(
@@ -116,6 +139,7 @@ mod imp {
             locator: &str,
             params: NwbOpenParams<'_>,
         ) -> Result<(Self, std::path::PathBuf)> {
+            params.validate()?;
             let [root, raw] =
                 crate::dandi::resolve_pair(Some(locator), Self::remote_raw_locator(params))?;
             let state = root
@@ -146,6 +170,7 @@ mod imp {
             root: Option<crate::dandi::Resolved>,
             raw: Option<crate::dandi::Resolved>,
         ) -> Result<Self> {
+            params.validate()?;
             ensure!(
                 root.is_some() || !crate::dandi::is_remote(path),
                 "missing resolved NWB dataset"
@@ -194,8 +219,11 @@ mod imp {
                 })
                 .transpose()?;
             let recording = raw.as_ref().map_or(&f, |(group, _)| group);
-            let (series, processed) =
-                find_electrical_series(recording, params.series, raw.is_some())?;
+            let (series, processed) = if params.units_only() {
+                (None, None)
+            } else {
+                find_electrical_series(recording, params.series, raw.is_some(), false)?
+            };
             // In a single file with a series, an invalid resolution value is
             // not a clock statement; its storage type must still be exact.
             let units_rate = read_units_rate(&spike_times, raw.is_some() || series.is_none())?;
@@ -252,6 +280,9 @@ mod imp {
                         "--sample-rate {explicit} Hz is not a clock this NWB declares; pass one of: {declared} Hz (/units/spike_times resolution)");
                 }
                 let rate = units_rate.or(params.sample_rate).with_context(|| {
+                    if params.units_only() {
+                        return "units-only NWB has no /units/spike_times resolution; pass --sample-rate HZ as the analysis grid".into();
+                    }
                     let missing = "no /acquisition ElectricalSeries and no /units/spike_times resolution";
                     match processed {
                         Some(paths) => format!("{missing}; /processing series ({paths}) are not a spike clock; pass --sample-rate HZ as the analysis grid, or --nwb-series PATH to use a processed series' clock"),
@@ -305,7 +336,8 @@ mod imp {
                 if let Some((name, _)) = &series {
                     identity_bytes.extend_from_slice(name.as_bytes());
                 }
-                identity_bytes.push(0); // Terminate the path (empty for units-only).
+                // An empty path seals units-only mode, explicit or by absence.
+                identity_bytes.push(0);
                 identity_bytes.extend(rate.to_le_bytes());
                 if let Some(((_, raw_identity), raw_path)) = raw.zip(params.raw_path) {
                     identity_bytes.extend(match raw_identity {
@@ -328,6 +360,7 @@ mod imp {
                 channel_map,
                 identity_bytes,
                 trace,
+                skipped_series: params.units_only().then(|| inspect_skipped_series(&f)),
                 #[cfg(any(feature = "hdf5", feature = "dandi"))]
                 source: f,
                 #[cfg(feature = "dandi")]
@@ -401,6 +434,13 @@ mod imp {
 
         fn session_span(&self) -> SessionSpan {
             self.span
+        }
+
+        fn trace_provenance(&self) -> Value {
+            if let Some(skipped) = &self.skipped_series {
+                return json!({ "mode": "units-only", "skipped_series": skipped });
+            }
+            json!({ "mode": if self.trace.is_some() { "trace" } else { "units-only" } })
         }
         fn n_clusters(&self) -> u32 {
             self.spikes_per_cluster.len() as u32
@@ -510,7 +550,7 @@ mod imp {
     pub(crate) fn check_append_rate(file: &hdf5_metno::File, units_rate: f64) -> Result<()> {
         let units_rate = checked_rate(units_rate)?;
         let file = Group::Hdf5(file.group("/")?);
-        if let (Some((name, series)), _) = find_electrical_series(&file, None, false)? {
+        if let (Some((name, series)), _) = find_electrical_series(&file, None, false, false)? {
             let samples = series.dataset("data")?.shape()[0];
             let (series_rate, _, _) = read_time_base(&file, &name, samples)?;
             // A single-file open ignores out-of-gate resolutions. Refuse to
@@ -767,10 +807,18 @@ mod imp {
 
     type ElectricalSeries = (String, Group);
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("{message}")]
+    struct SeriesDataError {
+        series: String,
+        message: String,
+    }
+
     fn find_electrical_series(
         f: &Group,
         requested: Option<&str>,
         required: bool,
+        skipping: bool,
     ) -> Result<(Option<ElectricalSeries>, Option<String>)> {
         fn collect(
             group: &Group,
@@ -827,6 +875,9 @@ mod imp {
         };
         let mut found = Vec::new();
         for (root, depth) in [("/acquisition", 0), ("/processing", 32)] {
+            if skipping && root == "/processing" {
+                continue;
+            }
             if let Some(group) = f.optional_group(root)? {
                 collect(&group, root, depth, &is_series, &mut found)?;
             }
@@ -840,6 +891,12 @@ mod imp {
                     _ => 0,
                 },
             )
+        };
+        let checked_rank = |path: &str, g: &Group| {
+            data_rank(g).with_context(|| SeriesDataError {
+                series: path.to_owned(),
+                message: format!("ElectricalSeries {path}: invalid data"),
+            })
         };
         let available = |found: &[(String, Group)]| {
             if found.is_empty() {
@@ -879,8 +936,7 @@ mod imp {
                 if !path.starts_with("/acquisition/") {
                     continue;
                 }
-                let rank = data_rank(group)
-                    .with_context(|| format!("ElectricalSeries {path}: invalid data"))?;
+                let rank = checked_rank(path, group)?;
                 if best.is_none_or(|(previous, _)| rank > previous) {
                     best = Some((rank, i));
                 }
@@ -902,11 +958,16 @@ mod imp {
         };
         let (path, group) = &found[index];
         ensure!(
-            data_rank(group).with_context(|| format!("ElectricalSeries {path}: invalid data"))? != 0,
-            "ElectricalSeries {path} requires 1-D data (one channel) or 2-D data (time × channels); available series: {}",
-            available(&found)
+            checked_rank(path, group)? != 0,
+            SeriesDataError {
+                series: path.clone(),
+                message: format!(
+                    "ElectricalSeries {path} requires 1-D data (one channel) or 2-D data (time × channels); available series: {}",
+                    available(&found)
+                ),
+            }
         );
-        if requested.is_none() && found.len() > 1 {
+        if !skipping && requested.is_none() && found.len() > 1 {
             log::warn!(
                 "NWB: reading ElectricalSeries {path}; available series: {} (choose with --nwb-series)",
                 available(&found)
@@ -915,16 +976,87 @@ mod imp {
         Ok((Some(found.swap_remove(index)), None))
     }
 
+    fn inspect_skipped_series(file: &Group) -> Value {
+        let (name, series) = match find_electrical_series(file, None, false, true) {
+            Ok((Some(series), _)) => series,
+            Ok((None, _)) => {
+                return json!({
+                    "status": "no acquisition series",
+                    "message": "No /acquisition ElectricalSeries was found.",
+                })
+            }
+            Err(err) => {
+                let mut skipped = json!({
+                    "status": "refused", "check": "series selection", "message": format!("{err:#}"),
+                });
+                if let Some(data) = err.downcast_ref::<SeriesDataError>() {
+                    skipped["series"] = json!(data.series);
+                    skipped["check"] = json!("data shape/type");
+                }
+                return skipped;
+            }
+        };
+        let data = series.trace_data().and_then(|data| {
+            trace_sample_type(&data, &name)?;
+            Ok(data)
+        });
+        let data = match data {
+            Ok(data) => data,
+            Err(err) => {
+                return json!({
+                    "series": name, "status": "refused", "check": "data shape/type", "message": format!("{err:#}"),
+                })
+            }
+        };
+        let mut timestamps_fit = None;
+        let result = read_time_base_with(file, &name, data.shape()[0], |ds, n| {
+            let grid = probe_timestamps(ds, n, true)?;
+            timestamps_fit = Some(grid.probe_regular);
+            Ok((grid.rate, grid.t0))
+        });
+        if let Err(err) = result {
+            let mut skipped = json!({
+                "series": name, "status": "refused", "check": "time base", "message": format!("{err:#}"),
+            });
+            if let Some(&TimestampDiscontinuity {
+                check, left, right, ..
+            }) = err.downcast_ref()
+            {
+                skipped["check"] = json!(check);
+                skipped["sample"] = json!(left.0);
+                skipped["next_sample"] = json!(right.0);
+                skipped["jump_s"] = json!(right.1 - left.1);
+                skipped["t_s"] = json!([left.1, right.1]);
+            }
+            return skipped;
+        }
+        let (status, message) = match timestamps_fit {
+            Some(true) => ("regular (probe)", "Sampled timestamps fit the inferred grid; the full scan was skipped."),
+            Some(false) => ("not fully checked", "Sampled timestamps deviate from the inferred grid; the probe did not locate a discontinuity and the full scan was skipped."),
+            None => ("not fully checked", "No per-sample timestamps; checked series metadata and the declared clock only."),
+        };
+        json!({ "series": name, "status": status, "message": message })
+    }
+
     /// `(rate Hz, starting_time s, recorded timestamps)`.
     fn read_time_base(
         file: &Group,
         name: &str,
         n_samples: usize,
     ) -> Result<(f64, f64, Option<Dataset>)> {
+        read_time_base_with(file, name, n_samples, regular_timestamps)
+    }
+
+    fn read_time_base_with(
+        file: &Group,
+        name: &str,
+        n_samples: usize,
+        check_timestamps: impl FnOnce(&Dataset, usize) -> Result<(f64, f64)>,
+    ) -> Result<(f64, f64, Option<Dataset>)> {
         let read = || -> Result<_> {
             if let Some(ds) = file.optional_stored_dataset(&format!("{name}/timestamps"))? {
                 ds.exact_float("timestamps")?;
-                let (rate, t0) = regular_timestamps(&ds, n_samples)?;
+                let (rate, t0) = check_timestamps(&ds, n_samples)?;
                 return Ok((rate, t0, Some(ds)));
             }
             let st = file
@@ -950,19 +1082,49 @@ mod imp {
         Ok(times)
     }
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("{message}")]
+    struct TimestampDiscontinuity {
+        check: &'static str,
+        left: (usize, f64),
+        right: (usize, f64),
+        message: String,
+    }
+
     fn checked_timestamp_step(left: (usize, f64), right: (usize, f64)) -> Result<f64> {
         let step = right.1 - left.1;
         let back = -step;
         ensure!(
             step.is_finite() && step > 0.0,
-            "timestamps must strictly increase: they step back by {back:.6} s between samples {} and {} \
-             (t={} s to {} s); choose another series with --nwb-series",
-            left.0, right.0, left.1, right.1
+            TimestampDiscontinuity {
+                check: "timestamp order",
+                left,
+                right,
+                message: format!(
+                    "timestamps must strictly increase: they step back by {back:.6} s between samples {} and {} \
+                     (t={} s to {} s); choose another series with --nwb-series",
+                    left.0, right.0, left.1, right.1
+                ),
+            }
         );
         Ok(step)
     }
 
-    fn regular_timestamps(ds: &Dataset, n: usize) -> Result<(f64, f64)> {
+    struct TimestampGrid {
+        rate: f64,
+        t0: f64,
+        period: f64,
+        limit: f64,
+        probe_regular: bool,
+    }
+
+    impl TimestampGrid {
+        fn error(&self, sample: usize, t: f64) -> f64 {
+            (t - self.t0) / self.period - sample as f64
+        }
+    }
+
+    fn probe_timestamps(ds: &Dataset, n: usize, probe_small: bool) -> Result<TimestampGrid> {
         ensure!(
             ds.shape() == [n] && n >= 2,
             "timestamps must contain one time per sample and at least two times to infer a rate"
@@ -999,9 +1161,15 @@ mod imp {
         // The grid interpolates two rounded endpoints. Allow a few ulps
         // for their error, each rounded timestamp, and the arithmetic.
         let limit = 1e-3 + 4.0 * ulp * rate;
-        let grid_error = |sample, t| (t - t0) / period - sample as f64;
-        // Don't probe if the full scan fits in one block.
-        let stride = if n <= TIMESTAMP_BLOCK {
+        let mut grid = TimestampGrid {
+            rate,
+            t0,
+            period,
+            limit,
+            probe_regular: true,
+        };
+        // Don't probe if a full scan is planned and fits in one block.
+        let stride = if !probe_small && n <= TIMESTAMP_BLOCK {
             n - 1
         } else {
             (n - 1).div_ceil(63)
@@ -1012,7 +1180,7 @@ mod imp {
         let mut last_in_grid = (0, t0);
         for sample in (stride..n - 1).step_by(stride) {
             let time = time_at(sample)?;
-            let drift = grid_error(sample, time);
+            let drift = grid.error(sample, time);
             if drift.abs() <= limit {
                 last_in_grid = (sample, time);
                 continue;
@@ -1044,7 +1212,7 @@ mod imp {
                         let right_mean = (right.1 - t) / (right.0 - mid) as f64;
                         sign * left_mean >= sign * right_mean
                     } else {
-                        grid_error(mid, t).abs() > limit
+                        grid.error(mid, t).abs() > limit
                     };
                     if take_left {
                         right = (mid, t);
@@ -1062,16 +1230,30 @@ mod imp {
             }
             if let Some((left, right, jump)) = gap {
                 let jump_samples = jump * rate;
-                anyhow::bail!(
-                    "timestamps are not a regular grid: they jump by {jump:.6} s \
-                     ({jump_samples:.3} samples at the mean rate {rate} Hz) between samples {} and {} \
-                     (t={} s to {} s); Sorrel needs a regular sample grid for the trace; \
-                     choose another series with --nwb-series",
-                    left.0, right.0, left.1, right.1
-                );
+                return Err(TimestampDiscontinuity {
+                    check: "timestamp grid",
+                    left,
+                    right,
+                    message: format!(
+                        "timestamps are not a regular grid: they jump by {jump:.6} s \
+                         ({jump_samples:.3} samples at the mean rate {rate} Hz) between samples {} and {} \
+                         (t={} s to {} s); Sorrel needs a regular sample grid for the trace; \
+                         choose another series with --nwb-series",
+                        left.0, right.0, left.1, right.1
+                    ),
+                }.into());
             }
+            grid.probe_regular = false;
             break;
         }
+        Ok(grid)
+    }
+
+    fn regular_timestamps(ds: &Dataset, n: usize) -> Result<(f64, f64)> {
+        let grid = probe_timestamps(ds, n, false)?;
+        let TimestampGrid {
+            t0, rate, limit, ..
+        } = grid;
         let (mut max_drift, mut worst_sample) = (0.0, 0);
         let (mut max_step, mut step_end) = (0.0, 1);
         let mut prev = t0;
@@ -1086,7 +1268,7 @@ mod imp {
                 if step > max_step {
                     (max_step, step_end) = (step, sample);
                 }
-                let drift = grid_error(sample, t).abs();
+                let drift = grid.error(sample, t).abs();
                 if drift > max_drift {
                     (max_drift, worst_sample) = (drift, sample);
                 }
@@ -1186,6 +1368,30 @@ mod imp {
         cache: Mutex<VecDeque<(usize, Vec<f32>)>>,
     }
 
+    fn trace_sample_type(data: &Dataset, name: &str) -> Result<SampleType> {
+        let dtype = data
+            .sample_type()
+            .with_context(|| format!("ElectricalSeries {name}: unsupported sample datatype"))?;
+        ensure!(
+            matches!(
+                dtype,
+                SampleType::I8
+                    | SampleType::U8
+                    | SampleType::I16
+                    | SampleType::U16
+                    | SampleType::I32
+                    | SampleType::U32
+                    | SampleType::I64
+                    | SampleType::F32
+                    | SampleType::F64
+            ),
+            "ElectricalSeries {name}: {} samples are not supported \
+             (expected int8, uint8, int16, uint16, int32, uint32, int64, float32 or float64)",
+            dtype.name()
+        );
+        Ok(dtype)
+    }
+
     impl NwbTrace {
         fn new(
             series: &Group,
@@ -1195,26 +1401,7 @@ mod imp {
             n_channels: usize,
         ) -> Result<Self> {
             ensure!(n_channels > 0, "ElectricalSeries {name}: no channels");
-            let dtype = data
-                .sample_type()
-                .with_context(|| format!("ElectricalSeries {name}: unsupported sample datatype"))?;
-            ensure!(
-                matches!(
-                    dtype,
-                    SampleType::I8
-                        | SampleType::U8
-                        | SampleType::I16
-                        | SampleType::U16
-                        | SampleType::I32
-                        | SampleType::U32
-                        | SampleType::I64
-                        | SampleType::F32
-                        | SampleType::F64
-                ),
-                "ElectricalSeries {name}: {} samples are not supported \
-                 (expected int8, uint8, int16, uint16, int32, uint32, int64, float32 or float64)",
-                dtype.name()
-            );
+            let dtype = trace_sample_type(&data, name)?;
             let (gain, offset_uv) = trace_scale(series, &data, name, n_channels)?;
             let max_frames = (TRACE_BLOCK_BYTES / 4 / n_channels).max(1);
             let block_frames = data

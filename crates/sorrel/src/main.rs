@@ -468,7 +468,7 @@ struct OpenArgs {
     /// Overrides params.py:sample_rate. For NWB, select an exact declared clock (copy a value from the error), or supply a rate if no clock is declared
     #[arg(long, value_name = "Hz")]
     sample_rate: Option<f64>,
-    /// NWB ElectricalSeries name under /acquisition or absolute NWB object path; /processing requires explicit selection
+    /// NWB ElectricalSeries name under /acquisition or absolute NWB path; use `none` to open units only
     #[cfg(any(feature = "hdf5", feature = "zarr"))]
     #[arg(long, value_name = "PATH|NAME")]
     nwb_series: Option<String>,
@@ -593,6 +593,17 @@ impl OpenArgs {
 
     fn has_remote_input(&self) -> bool {
         is_remote(self.root()) || self.dat.as_deref().is_some_and(is_remote)
+    }
+
+    #[cfg(any(feature = "hdf5", feature = "zarr"))]
+    fn nwb_params(&self) -> Result<sorrel_io::NwbOpenParams<'_>> {
+        let params = sorrel_io::NwbOpenParams {
+            series: self.nwb_series.as_deref(),
+            raw_path: self.dat.as_deref(),
+            sample_rate: self.sample_rate,
+        };
+        params.validate()?;
+        Ok(params)
     }
 
     /// Make the path fields absolute against `cwd`: the args came from a
@@ -815,6 +826,8 @@ fn with_session_refractory<V: SessionVisitor>(
     v: V,
 ) -> Result<()> {
     let refractory = open.refractory.resolve(base)?;
+    #[cfg(any(feature = "hdf5", feature = "zarr"))]
+    let nwb = open.nwb_params()?;
     let inputs = RemoteInputs::resolve(open)?;
     #[cfg(any(feature = "hdf5", feature = "dandi"))]
     let mut v = v;
@@ -832,6 +845,11 @@ fn with_session_refractory<V: SessionVisitor>(
         (Some(b), false) => b,
         (None, false) => detect_backend(open.root())?,
     };
+    #[cfg(any(feature = "hdf5", feature = "zarr"))]
+    anyhow::ensure!(
+        nwb.series != Some(sorrel_io::nwb::UNITS_ONLY_SERIES) || backend == Backend::Nwb,
+        "--nwb-series none requires the NWB backend"
+    );
     #[cfg(feature = "dandi")]
     anyhow::ensure!(
         inputs.dat.is_none() || backend == Backend::Nwb,
@@ -877,11 +895,6 @@ fn with_session_refractory<V: SessionVisitor>(
         #[cfg(any(feature = "hdf5", feature = "zarr"))]
         Backend::Nwb => {
             let path = open.root().to_path_buf();
-            let params = sorrel_io::NwbOpenParams {
-                series: open.nwb_series.as_deref(),
-                raw_path: open.dat.as_deref(),
-                sample_rate: open.sample_rate,
-            };
             #[cfg(feature = "dandi")]
             let (provider, path) = {
                 let dir = inputs
@@ -890,7 +903,7 @@ fn with_session_refractory<V: SessionVisitor>(
                     .map(|asset| Ok::<_, anyhow::Error>(dandi_data_dir()?.join(asset.state_path())))
                     .transpose()?;
                 let provider =
-                    sorrel_io::NwbProvider::open_pinned(&path, params, inputs.root, inputs.dat)?;
+                    sorrel_io::NwbProvider::open_pinned(&path, nwb, inputs.root, inputs.dat)?;
                 let path = if let Some(dir) = dir {
                     v.read_remote_trials(&provider);
                     let mut builder = std::fs::DirBuilder::new();
@@ -907,7 +920,7 @@ fn with_session_refractory<V: SessionVisitor>(
                 (provider, path)
             };
             #[cfg(not(feature = "dandi"))]
-            let provider = sorrel_io::NwbProvider::open_with(&path, params)?;
+            let provider = sorrel_io::NwbProvider::open_with(&path, nwb)?;
             #[cfg(feature = "hdf5")]
             v.prepare_nwb(&provider)?;
             let starting_time = provider.starting_time();
@@ -1599,18 +1612,32 @@ impl SessionVisitor for Describe {
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
         let s = seeded(session, seed)?;
-        let rows = describe(&s);
+        let mut rows = describe(&s);
+        let provenance = s.provider.trace_provenance();
+        let skipped = provenance.get("skipped_series");
+        if let Some(skipped) = skipped {
+            rows.push(("trace", "skipped (units-only)".into()));
+            let message = skipped["message"].as_str().unwrap_or_default();
+            let summary = match skipped["series"].as_str() {
+                Some(series) => format!("{series} — {message}"),
+                None => message.to_owned(),
+            };
+            rows.push(("skipped series", summary));
+        }
         if self.json {
-            let obj: serde_json::Map<String, serde_json::Value> = rows
+            let mut obj: serde_json::Map<String, serde_json::Value> = rows
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v.into()))
                 .collect();
+            if skipped.is_some() {
+                obj.insert("provenance".into(), provenance);
+            }
             println!("{}", serde_json::to_string_pretty(&obj)?);
         } else {
             print!(
                 "{}",
                 rows.iter()
-                    .map(|(k, v)| format!("{k:<14}{v}\n"))
+                    .map(|(k, v)| format!("{k:<14}{}{v}\n", if k.len() >= 14 { " " } else { "" }))
                     .collect::<String>()
             );
         }
@@ -1831,6 +1858,8 @@ fn session_path(path: &Path) -> PathBuf {
 /// Only local requests may attach to a running session. Remote and mixed
 /// requests always open fresh and let the journal lock arbitrate ownership.
 fn session_key(open: &OpenArgs) -> Result<Option<String>> {
+    #[cfg(any(feature = "hdf5", feature = "zarr"))]
+    open.nwb_params()?;
     if open.has_remote_input() {
         return Ok(None);
     }
@@ -1865,7 +1894,11 @@ fn session_key(open: &OpenArgs) -> Result<Option<String>> {
         *path = session_path(path);
     }
     #[cfg(any(feature = "hdf5", feature = "zarr"))]
-    if let Some(name) = args.nwb_series.as_mut().filter(|s| !s.starts_with('/')) {
+    if let Some(name) = args
+        .nwb_series
+        .as_mut()
+        .filter(|s| s.as_str() != sorrel_io::nwb::UNITS_ONLY_SERIES && !s.starts_with('/'))
+    {
         *name = format!("/acquisition/{name}");
     }
     // ponytail: compare normalized flags without opening a provider to resolve implicit defaults.
@@ -2442,6 +2475,8 @@ fn run_bare() -> Result<()> {
 }
 
 fn require_exists(open: &OpenArgs) -> Result<()> {
+    #[cfg(any(feature = "hdf5", feature = "zarr"))]
+    open.nwb_params()?;
     anyhow::ensure!(
         is_remote(open.root()) || open.root().exists(),
         "{} does not exist",
@@ -3562,6 +3597,34 @@ mod tests {
         assert_eq!(
             tab_target(&open, session_key(&open)?.as_deref(), tabs())?,
             None
+        );
+        Ok(())
+    }
+
+    #[cfg(any(feature = "hdf5", feature = "zarr"))]
+    #[test]
+    fn nwb_units_only_tab_and_host_keys_keep_none_distinct_from_a_path() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut open = OpenArgs {
+            root: Some(dir.path().join("sorting.nwb")),
+            nwb_series: Some("none".into()),
+            ..Default::default()
+        };
+        let key = session_key(&open)?.unwrap();
+        let tabs = || [(dir.path(), Some(key.as_str()))].into_iter();
+        assert!(mcp_open_args(&open)?.contains("--nwb-series none"));
+        assert_eq!(tab_target(&open, Some(&key), tabs())?, Some(0));
+        for series in [None, Some("/acquisition/none")] {
+            open.nwb_series = series.map(str::to_owned);
+            let err = tab_target(&open, session_key(&open)?.as_deref(), tabs()).unwrap_err();
+            assert!(err.to_string().contains("session conflict"), "{err}");
+        }
+        open.nwb_series = Some("none".into());
+        open.dat = Some("https://example.invalid/recording.nwb".into());
+        let err = session_key(&open).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be combined with --dat"),
+            "{err}"
         );
         Ok(())
     }

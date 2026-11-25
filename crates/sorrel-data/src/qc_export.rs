@@ -5,7 +5,7 @@
 //! * `cluster_qc.tsv`: one row per cluster, headed by phy-style column
 //!   names. Compatible with `pandas.read_csv(..., sep='\t')` and
 //!   `spikeinterface.curation.read_qm_csv`.
-//! * `cluster_qc.json`: a versioned object with session-span metadata and an
+//! * `cluster_qc.json`: a versioned object with session-span and trace provenance metadata and an
 //!   array of rows with the same fields as the TSV.
 //!
 //! Both run the rayon-parallel quality + isolation pipeline so even 1k+
@@ -515,21 +515,25 @@ pub fn write_qc_json<P: AsRef<Path>>(rows: &[QcRow], path: P) -> Result<()> {
 fn write_qc_json_document(
     rows: &[QcRow],
     path: &Path,
-    span: Option<serde_json::Value>,
+    metadata: Option<(serde_json::Value, serde_json::Value)>,
 ) -> Result<()> {
     let f = File::create(path).context("creating QC JSON file")?;
     let mut w = BufWriter::new(f);
-    if let Some(span) = &span {
+    if let Some((span, provenance)) = &metadata {
         write!(
             w,
-            "{{\"schema_version\":2,\"session_span\":{span},\"clusters\":"
+            "{{\"schema_version\":2,\"session_span\":{span},\"provenance\":{provenance},\"clusters\":"
         )?;
     }
     w.write_all(b"[")?;
     for (i, row) in rows.iter().enumerate() {
         row.write_json(&mut w, i > 0)?;
     }
-    w.write_all(if span.is_some() { b"\n]}\n" } else { b"\n]\n" })?;
+    w.write_all(if metadata.is_some() {
+        b"\n]}\n"
+    } else {
+        b"\n]\n"
+    })?;
     w.flush()?;
     Ok(())
 }
@@ -556,12 +560,15 @@ pub fn export_qc<P: DataProvider>(
     write_qc_json_document(
         &rows,
         &dir.join("cluster_qc.json"),
-        Some(serde_json::json!({
-            "start_s": seconds(span.start.0),
-            "end_s": seconds(span.end.0),
-            "duration_s": seconds(span.duration_samples()),
-            "source": span.source.to_string(),
-        })),
+        Some((
+            serde_json::json!({
+                "start_s": seconds(span.start.0),
+                "end_s": seconds(span.end.0),
+                "duration_s": seconds(span.duration_samples()),
+                "source": span.source.to_string(),
+            }),
+            p.trace_provenance(),
+        )),
     )?;
     Ok(rows.len())
 }
@@ -883,6 +890,7 @@ pub(crate) mod tests {
         let document: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(document["schema_version"], 2);
         assert_eq!(document["session_span"]["source"], "trace");
+        assert_eq!(document["provenance"]["mode"], "trace");
         // Each row contains its cluster id.
         assert!(json.contains("\"cluster_id\": 0"));
         assert!(json.contains("\"cluster_id\": 2"));

@@ -52,6 +52,151 @@ impl Format {
     }
 }
 
+#[cfg(feature = "hdf5")]
+#[test]
+fn opt_in_units_only_records_gaps_and_backward_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gapped.nwb");
+    let series = "/acquisition/ElectricalSeriesRaw";
+    let n = 100_001;
+    let next = 73_259;
+    std::fs::copy(fixture("timestamps.nwb"), &path).unwrap();
+    for (offset, check, reason) in [
+        (25.0, "timestamp grid", "they jump by 25.001000 s"),
+        (-0.029, "timestamp order", "they step back by 0.028000 s"),
+    ] {
+        let times: Vec<_> = (0..n)
+            .map(|i| i as f64 / 1000.0 + if i >= next { offset } else { 0.0 })
+            .collect();
+        {
+            let f = hdf5_metno::File::open_rw(&path).unwrap();
+            let g = f.group(series).unwrap();
+            g.unlink("data").unwrap();
+            g.new_dataset::<i16>().shape((n, 4)).create("data").unwrap();
+            g.unlink("timestamps").unwrap();
+            g.new_dataset_builder()
+                .with_data(&times)
+                .create("timestamps")
+                .unwrap();
+            let spikes = f.dataset("/units/spike_times").unwrap();
+            if spikes
+                .attr_names()
+                .unwrap()
+                .iter()
+                .any(|name| name == "resolution")
+            {
+                spikes.delete_attr("resolution").unwrap();
+            }
+            spikes
+                .new_attr::<f64>()
+                .create("resolution")
+                .unwrap()
+                .write_scalar(&0.001)
+                .unwrap();
+        }
+        let err = format!(
+            "{:#}",
+            NwbProvider::open(&path).err().expect("default must refuse")
+        );
+        assert!(
+            err.contains("invalid time base") && err.contains(reason),
+            "{err}"
+        );
+        assert!(err.contains("between samples 73258 and 73259"), "{err}");
+        let p = NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                series: Some("none"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(p.exact_sample_rate().unwrap(), 1000.0);
+        assert_eq!(p.spike_times(ClusterId(0))[0], SampleIndex(600));
+        assert_eq!(p.n_samples(), SampleIndex(0));
+        assert!(p.read_trace(SampleIndex(0), 10).unwrap().samples.is_empty());
+        assert_ne!(p.session_span().source, SpanSource::Trace);
+        assert!(p.session_span().duration_samples() > 0);
+        let provenance = p.trace_provenance();
+        let skipped = &provenance["skipped_series"];
+        assert_eq!(skipped["series"], series);
+        assert_eq!(skipped["status"], "refused");
+        assert_eq!(skipped["check"], check);
+        assert_eq!(skipped["sample"], next - 1);
+        assert_eq!(skipped["next_sample"], next);
+        assert!((skipped["jump_s"].as_f64().unwrap() - (offset + 0.001)).abs() < 1e-12);
+        assert_eq!(skipped["t_s"], serde_json::json!(times[next - 1..=next]));
+        assert_eq!(skipped["message"], err);
+    }
+}
+
+#[test]
+fn opt_in_units_only_preserves_identity_when_no_series_and_changes_it_when_skipping() {
+    let skip = NwbOpenParams {
+        series: Some("none"),
+        ..Default::default()
+    };
+    for format in FORMATS {
+        for (file, equal) in [("units_only.nwb", true), ("multiple_series.nwb", false)] {
+            let path = format.fixture(file);
+            let normal = NwbProvider::open(&path).unwrap();
+            let units = NwbProvider::open_with(&path, skip).unwrap();
+            assert_eq!(
+                normal.identity_bytes() == units.identity_bytes(),
+                equal,
+                "{file}"
+            );
+            let skipped = &units.trace_provenance()["skipped_series"];
+            if equal {
+                assert_eq!(skipped["status"], "no acquisition series");
+            } else {
+                assert_eq!(skipped["series"], "/acquisition/A_first");
+                assert_eq!(skipped["status"], "not fully checked");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn opt_in_units_only_keeps_a_series_named_none_selectable_by_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sorting.nwb");
+    std::fs::copy(fixture("multiple_series.nwb"), &path).unwrap();
+    hdf5_metno::File::open_rw(&path)
+        .unwrap()
+        .relink("/acquisition/A_first", "/acquisition/none")
+        .unwrap();
+    let open = |series| {
+        NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                series: Some(series),
+                ..Default::default()
+            },
+        )
+    };
+    assert_eq!(open("none").unwrap().n_samples(), SampleIndex(0));
+    assert_eq!(
+        open("/acquisition/none").unwrap().n_samples(),
+        SampleIndex(300)
+    );
+    let err = NwbProvider::open_with(
+        &path,
+        NwbOpenParams {
+            series: Some("none"),
+            raw_path: Some(&path),
+            ..Default::default()
+        },
+    )
+    .err()
+    .unwrap();
+    assert!(
+        err.to_string().contains("cannot be combined with --dat"),
+        "{err}"
+    );
+}
+
 /// The first frame of the trace, as f32.
 fn frame(p: &NwbProvider, t: u64) -> Vec<f32> {
     p.trace(SampleIndex(t), 1).samples.to_f32_centred()

@@ -511,6 +511,15 @@ pub trait DataProvider: Send + Sync + 'static {
     fn session_span(&self) -> SessionSpan {
         self.n_samples().0.into()
     }
+    /// Trace mode and, for an explicitly skipped NWB trace, its inspection result.
+    fn trace_provenance(&self) -> serde_json::Value {
+        let mode = if self.session_span().source == SpanSource::Trace {
+            "trace"
+        } else {
+            "units-only"
+        };
+        serde_json::json!({ "mode": mode })
+    }
     fn n_clusters(&self) -> u32;
 
     /// Spike sample indices for a single cluster, sorted ascending.

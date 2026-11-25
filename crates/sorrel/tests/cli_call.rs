@@ -39,6 +39,76 @@ fn fixture(into: &Path) -> Option<PathBuf> {
     Some(dst)
 }
 
+#[cfg(feature = "hdf5")]
+#[test]
+fn nwb_units_only_describe_and_qc_report_the_same_probe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../release/fixtures/nwb/irregular_timestamps.nwb");
+    if !src.is_file() {
+        return;
+    }
+    let ds = tmp.path().join("sorting.nwb");
+    std::fs::copy(src, &ds).unwrap();
+    let ds = ds.to_str().unwrap();
+    for (flags, error) in [
+        (&[][..], "invalid time base"),
+        (
+            &["--nwb-series", "none"][..],
+            "pass --sample-rate HZ as the analysis grid",
+        ),
+        (
+            &["--nwb-series", "none", "--dat", ds][..],
+            "cannot be combined with --dat",
+        ),
+    ] {
+        let mut args = vec!["describe", ds];
+        args.extend(flags);
+        let result = run(tmp.path(), &args);
+        assert!(!result.status.success());
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(error), "{stderr}");
+    }
+    let units = |args: &[&str]| {
+        let flags = ["--nwb-series", "none", "--sample-rate", "1000"];
+        let result = run(tmp.path(), &[args, &flags].concat());
+        assert!(
+            result.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        result.stdout
+    };
+    let description: serde_json::Value =
+        serde_json::from_slice(&units(&["describe", ds, "--json"])).unwrap();
+    assert_eq!(description["trace"], "skipped (units-only)");
+    assert_ne!(description["duration source"], "trace");
+    let provenance = &description["provenance"];
+    assert_eq!(provenance["mode"], "units-only");
+    assert_eq!(
+        provenance["skipped_series"]["series"],
+        "/acquisition/ElectricalSeriesRaw"
+    );
+    // This fixture deviates at one unprobed sample. The sparse probe must not
+    // read it or claim the full scan would pass.
+    assert_eq!(provenance["skipped_series"]["status"], "regular (probe)");
+    let text = String::from_utf8(units(&["describe", ds])).unwrap();
+    assert!(
+        text.contains("skipped (units-only)")
+            && text.contains("skipped series /acquisition/ElectricalSeriesRaw —"),
+        "{text}"
+    );
+    units(&["call", ds, "list_clusters"]);
+    units(&["mcp", ds]);
+    units(&["qc", ds, "--out", tmp.path().to_str().unwrap()]);
+    let qc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(tmp.path().join("cluster_qc.json")).unwrap())
+            .unwrap();
+    assert_eq!(qc["schema_version"], 2);
+    assert_eq!(qc["provenance"], *provenance);
+    assert_ne!(qc["session_span"]["source"], "trace");
+}
+
 #[test]
 fn call_runs_a_tool_in_process_and_prints_json() {
     let tmp = tempfile::tempdir().unwrap();

@@ -136,6 +136,7 @@ auto-detect — see [Backend detection](#backend-detection)).
 sorrel open my_session.nwb
 sorrel open my_session.nwb --nwb-series ElectricalSeriesRaw
 sorrel open my_session.nwb --nwb-series /processing/ecephys/FilteredEphys/Processed
+sorrel describe my_session.nwb --nwb-series none --json
 sorrel open sorted_units.nwb --dat recording.nwb
 sorrel open sorted_units.nwb --sample-rate 30000  # if no resolution is recorded
 ```
@@ -200,11 +201,35 @@ What Sorrel reads:
 
 **Units without a trace.** Without a selected ElectricalSeries, Sorrel takes the
 rate from `1 / spike_times.resolution`. If that resolution is unspecified
-and no raw NWB is paired, supply the rate with `--sample-rate HZ` instead.
+and no raw NWB is paired, you must supply `--sample-rate HZ` as an analysis grid.
 Spike times are relative to zero
 (`timestamps_reference_time`).
 The electrodes table supplies channels if present, but there is no raw trace
-or waveform extraction. With `--dat recording.nwb`, the raw file supplies
+or waveform extraction. Session span comes from epochs, unit observation
+intervals, or trials (in that order), or is estimated from the spike extent;
+it is never a trace duration.
+
+By default, Sorrel refuses a selected series with gaps or backward steps in its
+timestamps. Pass `--nwb-series none` to open the units without that trace. The
+same option works with `open`, `describe`, `qc`, `report`, `call`, and `mcp`.
+Do not combine it with `--dat`; select a series literally named `none` with
+`--nwb-series /acquisition/none`. Use a separate `--journal` when switching
+between units-only and trace-backed opens of the same recording.
+
+`describe` shows why the series was skipped. Its JSON output and
+`cluster_qc.json` (schema v2) include `provenance.mode: "units-only"` and
+`provenance.skipped_series` for explicit skips. The latter records the
+default acquisition series path (`series`), `status`, and `message`. Sorrel
+checks shape and type and probes timestamps without scanning them end to end.
+`regular (probe)` only means the sampled timestamps fit; an unprobed gap can
+still be present. `not fully checked` means the probe was inconclusive or there
+were no per-sample timestamps. A `refused` result names the failing `check`;
+when the probe locates a jump it also reports `sample`, `next_sample`, `jump_s`
+(signed seconds), and `t_s` (the two timestamps in seconds). If there is no
+acquisition series, the status says so. For trace-backed QC exports, the mode
+is `"trace"`.
+
+Without the opt-in, `--dat recording.nwb` lets the raw file supply
 the trace, channels and time base; use `--nwb-series` if that file has only processed series.
 If a Units rate is declared, it must be within one part per million of the
 raw series rate. The same exact clock choice and spike-index check apply.
