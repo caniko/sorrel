@@ -202,6 +202,7 @@ pub fn amplitude_view<P: DataProvider>(
         return None;
     }
     let raw = state.kind == AmpKind::Raw;
+    let preprocess = raw && session.provider.stored_snippet_window().is_none();
     let key = AmpKey {
         selection: selection.to_vec(),
         version: session.version(),
@@ -209,8 +210,16 @@ pub fn amplitude_view<P: DataProvider>(
         feature: (state.kind == AmpKind::Feature)
             .then_some(feature)
             .flatten(),
-        cfg: if raw { cfg } else { TracePreproc::default() },
-        shanks: if raw { shanks.to_vec() } else { Vec::new() },
+        cfg: if preprocess {
+            cfg
+        } else {
+            TracePreproc::default()
+        },
+        shanks: if preprocess {
+            shanks.to_vec()
+        } else {
+            Vec::new()
+        },
         reorder,
         full: if raw && state.want_full {
             state.memo.last().and_then(|s| s.channel)
@@ -764,13 +773,13 @@ fn raw_amplitudes<P: DataProvider>(
 ) -> (Vec<f32>, Option<u32>) {
     let p = &s.provider;
     let nc = p.n_channels() as usize;
-    let half = waveform_window_samples(p.sample_rate());
+    let (pre, post) = sorrel_render::spike_window(p, waveform_window_samples(p.sample_rate()));
     let times = s.cluster_index().all_spike_times();
     let ptp = |g: u32| -> Option<Vec<f32>> {
         if cancel.load(Ordering::Relaxed) {
             return None;
         }
-        let snip = extract_snippet(p, times[g as usize], half, half, key.cfg, &key.shanks)?;
+        let snip = extract_snippet(p, times[g as usize], pre, post, key.cfg, &key.shanks)?;
         let len = snip.len() / nc.max(1);
         Some(
             (0..nc)
@@ -810,6 +819,62 @@ fn raw_amplitudes<P: DataProvider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_amplitudes_use_the_stored_window_and_ignore_preprocessing() {
+        use std::sync::RwLock;
+        use std::time::{Duration, Instant};
+
+        let (session, _dir) = crate::waveform_view::stored_test::session(5);
+        let ctx = egui::Context::default();
+        let jobs = JobCtx {
+            session: Arc::new(RwLock::new(session)),
+            egui: ctx.clone(),
+        };
+        let mut state = AmplitudeViewState {
+            kind: AmpKind::Raw,
+            ..Default::default()
+        };
+        let mut brushes = Brushes::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.memo.last().is_none() {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                amplitude_view(
+                    ui,
+                    &crate::jobs::read(&jobs.session),
+                    &[ClusterId(0)],
+                    &mut state,
+                    &jobs,
+                    TracePreproc::HpAndCmr(300.0),
+                    &[0, 1],
+                    None,
+                    false,
+                    &mut brushes,
+                );
+            });
+            assert!(Instant::now() < deadline, "raw amplitudes did not finish");
+            std::thread::yield_now();
+        }
+        let key = state.memo.requested_key().unwrap();
+        assert_eq!(key.cfg, TracePreproc::Off);
+        assert!(key.shanks.is_empty());
+        let provider = &crate::jobs::read(&jobs.session).provider;
+        assert_eq!(
+            sorrel_render::spike_window(provider, waveform_window_samples(provider.sample_rate())),
+            (7, 24)
+        );
+        // The mock requires the stored snippet size and panics on trace access.
+        let set = state.memo.last().unwrap();
+        assert_eq!(set.channel, Some(0));
+        assert_eq!(
+            set.points
+                .iter()
+                .map(|p| (p.local, p.a))
+                .collect::<Vec<_>>(),
+            [(0, 1.), (1, 3.), (2, 5.), (3, 7.), (4, 5.)]
+        );
+        assert_eq!(provider.read_count(), 5);
+    }
 
     #[test]
     fn threshold_splits_spikes_below_and_lasso_wins_when_closed() {

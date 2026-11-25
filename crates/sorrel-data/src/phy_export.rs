@@ -65,7 +65,9 @@ where
     );
     std::fs::create_dir_all(out).with_context(|| format!("create {}", out.display()))?;
     let raw = provider.raw_file();
-    let stream = provider.n_samples().0 > 0 && (copy_raw || raw.is_none());
+    let stream = provider.stored_snippet_window().is_none()
+        && provider.n_samples().0 > 0
+        && (copy_raw || raw.is_none());
     let dat = out.join("recording.dat");
     // Copying a file onto itself truncates it.
     if provider.phy_dir().is_some_and(|src| same_file(src, out)) {
@@ -192,7 +194,7 @@ fn mean_templates<P: DataProvider>(session: &Session<P>) -> Result<(Vec<f32>, [u
     if out.is_empty() {
         return Ok((out, shape));
     }
-    if n_samples == 0 {
+    if n_samples == 0 || p.stored_snippet_window().is_some() {
         log::warn!("no raw samples: templates.npy is all zeros");
         return Ok((out, shape));
     }

@@ -2371,8 +2371,9 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     .cloned()
             });
             let depths: Option<&SpikeDepths> = depths_arc.as_deref().and_then(|d| d.as_ref());
-            // Waveforms follow the trace pane's HP/CMR toggles.
+            // Continuous waveforms follow the trace pane's HP/CMR toggles.
             self.waveform_cache.set_preproc(
+                &session.provider,
                 self.trace_cfg,
                 if self.per_shank_cmr {
                     &self.channel_shanks

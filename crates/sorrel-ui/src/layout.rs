@@ -16,8 +16,8 @@ use crate::trace_image::{trace_image_view, TraceImageCache};
 use crate::views::{
     cluster_statistics_view_for, contamination_over_time_view, correlogram_grid_view,
     drift_map_view, firing_rate_view, isi_view, probe_view, psth_view, quality_view, raster_view,
-    selection_summary, suggest_view, waveform_window_samples, CcgCache, PsthCache, PsthState,
-    QualityCache, RasterCache, RasterClick, SuggestAction, SuggestCache, WaveformCache,
+    selection_summary, suggest_view, CcgCache, PsthCache, PsthState, QualityCache, RasterCache,
+    RasterClick, SuggestAction, SuggestCache, WaveformCache,
 };
 use crate::widgets::{trace_view, TraceCache, TraceMarker};
 use egui::Ui;
@@ -835,8 +835,8 @@ impl<P: DataProvider> ViewBehavior<'_, P> {
 
         // Spike markers for the selection, on each cluster's peak channel.
         let selected = self.selection;
-        let pre = waveform_window_samples(sr);
-        self.waveform_cache.ensure(session, selected, pre, pre);
+        let (pre, post) = crate::waveform_view::waveform_window(&session.provider);
+        self.waveform_cache.ensure(session, selected, pre, post);
         let markers: Vec<TraceMarker<'_>> = selected
             .iter()
             .enumerate()

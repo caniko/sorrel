@@ -255,6 +255,14 @@ impl<K: PartialEq + Clone, T> Memo<K, T> {
         self.job.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn requested_key(&self) -> Option<&K> {
+        self.job
+            .as_ref()
+            .map(Job::key)
+            .or_else(|| self.value.as_ref().map(|(key, _)| key))
+    }
+
     /// Cancel the running job (before a curation write) and forget the
     /// values so the next `ensure` recomputes.
     pub fn invalidate(&mut self) {
