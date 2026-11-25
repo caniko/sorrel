@@ -561,10 +561,11 @@ pub(crate) fn kmeans_split_with<P: DataProvider>(
     let times = session.spike_times(cluster);
     let sr = session.provider.sample_rate().max(1.0);
     let refractory = windows.fixed_samples(sr);
-    let duration = session.provider.session_span().duration_samples();
+    let span = session.unit_span(cluster);
+    let duration = span.duration_samples();
     kmeans_split_proposal(&feats, d, |idx| {
         let t: Vec<_> = idx.iter().map(|&i| times[i as usize]).collect();
-        refractory_contamination(&t, refractory, duration, sr)
+        refractory_contamination(&span.metric_spikes(&t), refractory, duration, sr)
     })
 }
 
@@ -592,13 +593,14 @@ pub(crate) fn core_split_with<P: DataProvider>(
 ) -> Option<CoreSplit> {
     let times = session.spike_times(cluster);
     let sr = session.provider.sample_rate().max(1.0);
-    let duration = session.provider.session_span().duration_samples();
+    let span = session.unit_span(cluster);
+    let duration = span.duration_samples();
     let pick = |idx: &[u32]| -> Vec<_> { idx.iter().map(|&i| times[i as usize]).collect() };
     core_split_lazy(
         globals.len(),
         || feature_space(session, cluster, globals, CORE_CHANNELS),
         |idx| {
-            let (c, rp) = windows.sweep(&pick(idx), duration, sr);
+            let (c, rp) = windows.sweep(&span.metric_spikes(&pick(idx)), duration, sr);
             if rp > 0 {
                 c
             } else {
@@ -667,7 +669,7 @@ pub fn attention_with<P: DataProvider>(
         session.spike_times(cluster),
         session.spike_amplitudes(cluster),
         refractory,
-        session.provider.session_span(),
+        session.unit_span(cluster),
         sr,
         50,
     )

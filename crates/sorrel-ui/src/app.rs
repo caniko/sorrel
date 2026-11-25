@@ -2393,8 +2393,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 .is_none_or(|(k, ..)| *k != scheme_key)
             {
                 let n = session.n_clusters();
-                let span = session.provider.session_span();
-                let duration = span.duration_seconds(session.provider.sample_rate());
+                let rate = session.provider.sample_rate();
                 let ids = (0..n).map(ClusterId);
                 let groups: Vec<&str> = ids
                     .clone()
@@ -2402,7 +2401,11 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     .collect();
                 let fr: Vec<f32> = ids
                     .clone()
-                    .map(|c| span.metric_spikes(session.spike_times(c)).len() as f32 / duration)
+                    .map(|c| {
+                        let span = session.unit_span(c);
+                        span.metric_spikes(session.spike_times(c)).len() as f32
+                            / span.duration_seconds(rate)
+                    })
                     .collect();
                 let depth: Vec<f32> = ids
                     .map(|c| depths.and_then(|d| d.cluster_mean(c)).unwrap_or(f32::NAN))

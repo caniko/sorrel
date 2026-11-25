@@ -332,9 +332,6 @@ fn collect_qc<P: DataProvider>(
     };
     let sample_rate = session.provider.sample_rate();
     let sr = sample_rate.max(1.0);
-    let span = session.provider.session_span();
-    let total_samples = span.duration_samples();
-    let total_seconds = span.duration_seconds(sample_rate);
     let refractory_samples = windows.fixed_samples(sr);
     let (_, tpl_samples, tpl_channels) = session.template_shape();
     // ACG at 1 ms bins / 50 ms, the report's (and cache's) window.
@@ -345,13 +342,16 @@ fn collect_qc<P: DataProvider>(
     let mut rows = Vec::with_capacity(n as usize);
     for c in (0..n).map(ClusterId) {
         let times = session.spike_times(c);
+        let span = session.unit_span(c);
+        let total_samples = span.duration_samples();
+        let total_seconds = span.duration_seconds(sample_rate);
         let exposed = span.metric_spikes(times);
         let amps = session.spike_amplitudes(c);
         let q = cluster_quality_with(session, c, refractory_samples);
         record_terms(c, &q);
         let firing_rate = exposed.len() as f32 / total_seconds;
-        let isi_v = isi_violations(times, refractory_samples) as u32;
-        let isi_ratio = isi_violation_rate(times, refractory_samples, sr);
+        let isi_v = isi_violations(&exposed, refractory_samples) as u32;
+        let isi_ratio = isi_violation_rate(&exposed, refractory_samples, sr);
         let (iso2, l_ratio, nn, d_prime, silhouette) = match q.isolation {
             Some(iso) => (
                 iso.isolation_distance_sq,
@@ -375,12 +375,12 @@ fn collect_qc<P: DataProvider>(
             .and_then(|(w, p)| footprint(w, tpl_samples, tpl_channels, p, sr));
         let nan = f32::NAN;
         // (0, 0) means there is no estimate.
-        let (rp_contam, rp) = windows.sweep(exposed, total_samples, sr);
+        let (rp_contam, rp) = windows.sweep(&exposed, total_samples, sr);
         let (srp_contamination, srp_rp_ms, rpv_post_mean, rpv_post_lo95, rpv_post_hi95) =
             match windows {
                 RefractoryWindows::Session(params) => {
                     let (srp, post) =
-                        refractory_evidence(exposed, total_samples, sample_rate, params);
+                        refractory_evidence(&exposed, total_samples, sample_rate, params);
                     (
                         srp.min_contamination,
                         srp.rp_ms,
@@ -631,7 +631,7 @@ pub(crate) mod tests {
         }
     }
 
-    struct SpanProvider(MockProvider, SessionSpan);
+    struct SpanProvider(MockProvider, SessionSpan, Vec<SessionSpan>);
 
     impl DataProvider for SpanProvider {
         type Label = u8;
@@ -645,7 +645,10 @@ pub(crate) mod tests {
             self.0.n_samples()
         }
         fn session_span(&self) -> SessionSpan {
-            self.1
+            self.1.clone()
+        }
+        fn unit_span(&self, c: ClusterId) -> SessionSpan {
+            self.2.get(c.idx()).unwrap_or(&self.1).clone()
         }
         fn n_clusters(&self) -> u32 {
             self.0.n_clusters()
@@ -658,6 +661,12 @@ pub(crate) mod tests {
         }
         fn initial_labels(&self) -> Vec<u8> {
             self.0.initial_labels()
+        }
+    }
+
+    impl crate::session::ApplyPhyLabel for SpanProvider {
+        fn label_from_op(_: crate::command::PhyLabelOp) -> u8 {
+            0
         }
     }
 
@@ -674,11 +683,12 @@ pub(crate) mod tests {
         let units = Session::new(
             SpanProvider(
                 provider(5000, 0),
-                SessionSpan {
-                    start: SampleIndex(5000),
-                    end: SampleIndex(6000),
-                    source: SpanSource::SpikeExtent { rejected: None },
-                },
+                SessionSpan::contiguous(
+                    SampleIndex(5000),
+                    SampleIndex(6000),
+                    SpanSource::SpikeExtent { rejected: None },
+                ),
+                Vec::new(),
             ),
             journal("units"),
         );
@@ -746,6 +756,66 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn qc_uses_each_units_recorded_observation_intervals() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = SpanSource::Declared("/units/obs_intervals");
+        let first = SessionSpan::from_intervals(
+            vec![(1000.into(), 1470.into()), (10000.into(), 10530.into())],
+            source,
+        );
+        let second = SessionSpan::contiguous(20000.into(), 20500.into(), source);
+        let session_span = first.union_with([&second]);
+        let spikes = (0..first.recorded_samples())
+            .step_by(10)
+            .map(|i| first.sample_at_offset(i))
+            .collect();
+        let mut session = Session::new(
+            SpanProvider(
+                MockProvider {
+                    spikes: vec![
+                        spikes,
+                        (20000..20500).step_by(10).map(SampleIndex).collect(),
+                    ],
+                    amps: vec![],
+                    n_samples: SampleIndex(0),
+                },
+                session_span.clone(),
+                vec![first.clone(), second],
+            ),
+            Journal::open(&dir.path().join("j")).unwrap(),
+        );
+        let rows = collect_qc_rows(&session);
+        for (c, (row, gap)) in rows.iter().zip([0.01_f32, 0.02]).enumerate() {
+            assert_eq!(row.firing_rate_hz, 100.0);
+            assert_eq!(row.presence_ratio, 1.0);
+            assert_eq!(row.longest_silent_gap, gap);
+            let q = crate::quality_ext::cluster_quality(&session, ClusterId(c as u32));
+            assert_eq!(q.coverage_score, 1.0 - gap);
+            assert!((row.composite_quality - (1.0 - gap).cbrt()).abs() < 1e-6);
+        }
+        use crate::command::{CurationCommand, Method};
+        let target = ClusterId(0);
+        session
+            .dispatch(CurationCommand::Merge {
+                sources: vec![ClusterId(1)],
+                target,
+            })
+            .unwrap();
+        assert_eq!(session.unit_span(target), session_span);
+        session.dispatch(CurationCommand::Undo).unwrap();
+        assert_eq!(session.unit_span(target), first);
+        session
+            .dispatch(CurationCommand::Split {
+                cluster: target,
+                new_cluster: ClusterId(2),
+                spike_idx: vec![0],
+                by: Method::Manual,
+            })
+            .unwrap();
+        assert_eq!(session.unit_span(ClusterId(2)), first);
+    }
+
+    #[test]
     fn qc_missing_span_leaves_rate_and_presence_null() {
         let dir = tempfile::tempdir().unwrap();
         let session = Session::new(
@@ -755,10 +825,8 @@ pub(crate) mod tests {
                     amps: vec![],
                     n_samples: SampleIndex(0),
                 },
-                SessionSpan {
-                    source: SpanSource::Unavailable,
-                    ..0.into()
-                },
+                SessionSpan::contiguous(0.into(), 0.into(), SpanSource::Unavailable),
+                Vec::new(),
             ),
             Journal::open(&dir.path().join("j")).unwrap(),
         );

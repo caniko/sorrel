@@ -1179,13 +1179,13 @@ fn units_only_have_no_trace_and_use_resolution_or_sample_rate() {
         assert_eq!(p.n_samples(), SampleIndex(0));
         assert_eq!(
             p.session_span(),
-            SessionSpan {
-                start: SampleIndex(550),
-                end: SampleIndex(791),
-                source: SpanSource::SpikeExtent {
+            SessionSpan::contiguous(
+                SampleIndex(550),
+                SampleIndex(791),
+                SpanSource::SpikeExtent {
                     rejected: Some("/intervals/trials"),
                 },
-            }
+            )
         );
         assert_eq!(p.channel_map(), (10..16).map(ChannelId).collect::<Vec<_>>());
         assert_eq!(p.channel_positions()[3], [16.0, 20.0]);
@@ -1223,7 +1223,7 @@ fn units_only_have_no_trace_and_use_resolution_or_sample_rate() {
 
 #[cfg(feature = "hdf5")]
 #[test]
-fn units_only_span_prefers_epochs_then_observations_then_trials() {
+fn units_only_span_prefers_observations_then_epochs_then_trials() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("units.nwb");
     std::fs::copy(fixture("units_only.nwb"), &path).unwrap();
@@ -1245,11 +1245,11 @@ fn units_only_span_prefers_epochs_then_observations_then_trials() {
         let file = hdf5_metno::File::open_rw(&path).unwrap();
         file.unlink("/intervals/trials").unwrap();
     }
-    let estimate = SessionSpan {
-        start: SampleIndex(550),
-        end: SampleIndex(791),
-        source: SpanSource::SpikeExtent { rejected: None },
-    };
+    let estimate = SessionSpan::contiguous(
+        SampleIndex(550),
+        SampleIndex(791),
+        SpanSource::SpikeExtent { rejected: None },
+    );
     assert_eq!(span(), estimate);
     {
         let file = hdf5_metno::File::open_rw(&path).unwrap();
@@ -1257,63 +1257,87 @@ fn units_only_span_prefers_epochs_then_observations_then_trials() {
     }
     assert_eq!(
         span(),
-        SessionSpan {
-            start: SampleIndex(350),
-            end: SampleIndex(1300),
-            source: SpanSource::Declared("/intervals/trials"),
-        }
+        SessionSpan::contiguous(
+            SampleIndex(350),
+            SampleIndex(1300),
+            SpanSource::Declared("/intervals/trials"),
+        )
     );
     {
         let file = hdf5_metno::File::open_rw(&path).unwrap();
         let obs = file
             .new_dataset::<f64>()
-            .shape((2, 2))
+            .shape((4, 2))
             .create("/units/obs_intervals")
             .unwrap();
-        obs.write_raw(&[0.5, 0.8, 0.4, 1.1]).unwrap();
+        // The 0.75 s spike is before the stop, although both round to 750.
+        obs.write_raw(&[2.0, 2.05, 0.5, 0.7504, 0.49, 0.52, 0.4, 1.1])
+            .unwrap();
         file.new_dataset_builder()
-            .with_data(&[1_u64, 1, 2])
+            .with_data(&[3_u64, 3, 4])
             .create("/units/obs_intervals_index")
             .unwrap();
-        table(&file, "/intervals/epochs", &[], &[]);
+        table(
+            &file,
+            "/intervals/epochs",
+            &[2.0, 0.45, 0.35, 3.0, 5.0],
+            &[3.0, 1.0, 0.9, 4.0, 5.0],
+        );
     }
     assert_eq!(
         span(),
-        SessionSpan {
-            start: SampleIndex(400),
-            end: SampleIndex(1100),
-            source: SpanSource::Declared("/units/obs_intervals"),
-        }
+        SessionSpan::from_intervals(
+            vec![(400.into(), 1100.into()), (2000.into(), 2050.into())],
+            SpanSource::Declared("/units/obs_intervals"),
+        )
     );
-    {
-        let file = hdf5_metno::File::open_rw(&path).unwrap();
-        file.unlink("/intervals/epochs").unwrap();
-        table(&file, "/intervals/epochs", &[0.45, 0.35], &[1.0, 0.9]);
-    }
+    let p = NwbProvider::open(&path).unwrap();
+    let unit = p.unit_span(ClusterId(0));
+    assert_eq!(unit.source, SpanSource::Declared("/units/obs_intervals"));
     assert_eq!(
-        span(),
-        SessionSpan {
-            start: SampleIndex(350),
-            end: SampleIndex(1000),
-            source: SpanSource::Declared("/intervals/epochs"),
-        }
+        unit.intervals().collect::<Vec<_>>(),
+        [(490.into(), 751.into()), (2000.into(), 2050.into())],
     );
+    assert_eq!(p.unit_span(ClusterId(1)).duration_samples(), 0);
+    assert_eq!(p.unit_span(ClusterId(2)).duration_samples(), 700);
+    drop(p);
     {
         let file = hdf5_metno::File::open_rw(&path).unwrap();
-        file.dataset("/intervals/epochs/stop_time")
+        file.dataset("/units/obs_intervals")
             .unwrap()
-            .write_raw(&[0.79, 0.7])
+            .write_raw(&[2.0, 2.05, 0.5, 0.75, 0.49, 0.52, 0.4, 1.1])
             .unwrap();
     }
-    assert_eq!(
-        span(),
-        SessionSpan {
-            source: SpanSource::SpikeExtent {
-                rejected: Some("/intervals/epochs")
-            },
-            ..estimate
-        }
-    );
+    assert_eq!(span().source, SpanSource::Declared("/intervals/epochs"));
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.dataset("/units/obs_intervals")
+            .unwrap()
+            .write_raw(&[2.0, 2.05, 0.5, 0.7504, 0.49, 0.52, 0.4, 1.1])
+            .unwrap();
+        // Unit 0 still has spikes in the session union, but not in its own
+        // (now empty) observation row. Reject observations for all units.
+        file.dataset("/units/obs_intervals_index")
+            .unwrap()
+            .write_raw(&[0_u64, 0, 4])
+            .unwrap();
+    }
+    let epoch_span = span();
+    assert_eq!(epoch_span.start, SampleIndex(350));
+    assert_eq!(epoch_span.end, SampleIndex(4000));
+    assert_eq!(epoch_span.source, SpanSource::Declared("/intervals/epochs"));
+    assert_eq!(epoch_span.duration_samples(), 2650);
+    assert_eq!(epoch_span.extent_samples(), 3650);
+    assert_eq!(epoch_span.n_intervals(), 2);
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        // Now epochs have a gap around the spikes despite covering their extent.
+        file.dataset("/intervals/epochs/stop_time")
+            .unwrap()
+            .write_raw(&[3.0, 0.49, 0.44, 4.0, 5.0])
+            .unwrap();
+    }
+    assert_eq!(span().source, SpanSource::Declared("/intervals/trials"));
     let replace_index = |set_index: &dyn Fn(&hdf5_metno::File)| {
         let file = hdf5_metno::File::open_rw(&path).unwrap();
         file.unlink("/units/obs_intervals_index").unwrap();
@@ -1325,7 +1349,7 @@ fn units_only_span_prefers_epochs_then_observations_then_trials() {
     }
     replace_index(&|file| {
         file.new_dataset_builder()
-            .with_data(&[0_i64, 0, 2])
+            .with_data(&[3_i64, 3, 4])
             .create("/units/obs_intervals_index")
             .unwrap();
     });
@@ -1334,7 +1358,7 @@ fn units_only_span_prefers_epochs_then_observations_then_trials() {
         .unwrap()
         .dataset("/units/obs_intervals_index")
         .unwrap()
-        .write_raw(&[-1_i64, 0, 2])
+        .write_raw(&[-1_i64, 0, 4])
         .unwrap();
     assert_eq!(span().source, SpanSource::Declared("/intervals/trials"));
     hdf5_metno::File::open_rw(&path)
@@ -1344,7 +1368,7 @@ fn units_only_span_prefers_epochs_then_observations_then_trials() {
     assert_eq!(span(), estimate);
     replace_index(&|file| {
         file.new_dataset_builder()
-            .with_data(&[0.0_f64, 0.0, 2.0])
+            .with_data(&[0.0_f64, 0.0, 4.0])
             .create("/units/obs_intervals_index")
             .unwrap();
     });

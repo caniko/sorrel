@@ -468,8 +468,6 @@ impl ClusterRows {
         use rayon::prelude::*;
         let n = session.n_clusters() as usize;
         let sr = session.provider.sample_rate().max(1.0);
-        let span = session.provider.session_span();
-        let duration_s = span.duration_samples() as f64 / sr as f64;
         let refractory = session.refractory().fixed_samples(sr);
         let n_channels = session.template_shape().2;
         // [ch, sh, depth, fr, amp, n_spikes, isi, qual, tags] per cluster.
@@ -484,6 +482,8 @@ impl ClusterRows {
                     return r;
                 }
                 let amps = session.spike_amplitudes(c);
+                let span = session.unit_span(c);
+                let duration_s = span.duration_samples() as f64 / sr as f64;
                 if duration_s > 0.0 {
                     r[3] = span.metric_spikes(times).len() as f64 / duration_s;
                 }

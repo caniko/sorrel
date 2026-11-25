@@ -458,6 +458,15 @@ pub(crate) fn step_hist(
     let y_of = |v: f32| data.bottom() - (v / y_top).clamp(0.0, 1.0) * data.height();
     let mut pts = Vec::with_capacity(vals.len() * 2);
     for (i, &v) in vals.iter().enumerate() {
+        if !v.is_finite() {
+            if !pts.is_empty() {
+                painter.add(egui::Shape::line(
+                    std::mem::take(&mut pts),
+                    Stroke::new(1.25_f32, colour),
+                ));
+            }
+            continue;
+        }
         let x0 = data.left() + bw * i as f32;
         let y = y_of(v);
         if v > 0.0 {
@@ -470,7 +479,9 @@ pub(crate) fn step_hist(
         pts.push(egui::pos2(x0, y));
         pts.push(egui::pos2(x0 + bw, y));
     }
-    painter.add(egui::Shape::line(pts, Stroke::new(1.25_f32, colour)));
+    if !pts.is_empty() {
+        painter.add(egui::Shape::line(pts, Stroke::new(1.25_f32, colour)));
+    }
 }
 
 /// Integer y ticks, about `target` of them, from 0 to `max`.
@@ -512,7 +523,6 @@ pub fn selection_summary<P, F>(
             let theme = Theme::from_ui(ui);
             ui.heading(format!("{n} clusters selected"));
             let sr = session.provider.sample_rate().max(1.0);
-            let span = session.provider.session_span();
             let refractory = session.refractory().fixed_samples(sr);
             egui::Grid::new("summary-grid")
                 .num_columns(6)
@@ -539,7 +549,12 @@ pub fn selection_summary<P, F>(
                         };
                         num_cell(ui, amp, None);
                         let q = sorrel_compute::quality_breakdown(
-                            times, amps, refractory, span, sr, 50,
+                            times,
+                            amps,
+                            refractory,
+                            session.unit_span(c),
+                            sr,
+                            50,
                         )
                         .composite();
                         num_cell(
@@ -1006,7 +1021,7 @@ pub fn firing_rate_view<P: DataProvider>(
     }
     let sr = session.provider.sample_rate().max(1.0);
     let span = session.provider.session_span();
-    let duration = span.duration_samples() as f32 / sr;
+    let duration = span.extent_samples() as f32 / sr;
     if duration <= 0.0 {
         ui.label("recording has zero length");
         return;
@@ -1034,17 +1049,39 @@ pub fn firing_rate_view<P: DataProvider>(
     let unit = params.unit;
 
     // Bin every selected cluster's spike train into the same axis.
-    let mut histograms: Vec<Vec<u32>> = Vec::with_capacity(selection.len());
-    let mut max_count = 1u32;
+    let mut histograms: Vec<Vec<f32>> = Vec::with_capacity(selection.len());
+    let mut max_rate = 1.0 / bin_s;
     for &c in selection {
-        let times = span.metric_spikes(session.spike_times(c));
-        let h = rate_counts(times, sr, span.start, x0, bin_s, bins, brushes.time);
-        if let Some(&m) = h.iter().max() {
-            if m > max_count {
-                max_count = m;
-            }
-        }
-        histograms.push(h);
+        let unit_span = session.unit_span(c);
+        let times = unit_span.metric_spikes(session.spike_times(c));
+        let h = rate_counts(&times, sr, span.start, x0, bin_s, bins, brushes.time);
+        let width = f64::from(bin_s);
+        let rates = h
+            .iter()
+            .enumerate()
+            .map(|(i, &count)| {
+                if unit_span.source == sorrel_io::SpanSource::Trace {
+                    return count as f32 / bin_s;
+                }
+                let lo = f64::from(x0) + i as f64 * width;
+                let hi = lo + width;
+                let exposure: f64 = unit_span
+                    .intervals()
+                    .map(|(a, b)| {
+                        let a = (a.0 - span.start.0) as f64 / f64::from(sr);
+                        let b = (b.0 - span.start.0) as f64 / f64::from(sr);
+                        (hi.min(b) - lo.max(a)).max(0.0)
+                    })
+                    .sum();
+                if exposure > 0.0 {
+                    count as f32 / exposure as f32
+                } else {
+                    f32::NAN
+                }
+            })
+            .collect::<Vec<_>>();
+        max_rate = rates.iter().copied().fold(max_rate, f32::max);
+        histograms.push(rates);
     }
 
     let width = if bin_s >= 1.0 {
@@ -1078,7 +1115,7 @@ pub fn firing_rate_view<P: DataProvider>(
     crate::widgets::time_brush_gesture(&resp, brushes, data, absolute_x, true);
 
     // 15% headroom above the tallest bin.
-    let y_top = max_count as f32 / bin_s * 1.15;
+    let y_top = max_rate * 1.15;
     let x_label = if origin == 0.0 {
         format!("time ({})", unit.label())
     } else {
@@ -1095,9 +1132,8 @@ pub fn firing_rate_view<P: DataProvider>(
     );
     let dp = painter.with_clip_rect(data);
     let fill = if histograms.len() == 1 { 0.6 } else { 0.2 };
-    for (ci, hist) in histograms.iter().enumerate() {
-        let rates: Vec<f32> = hist.iter().map(|&c| c as f32 / bin_s).collect();
-        step_hist(&dp, data, &rates, y_top, selection_colour(ci), fill);
+    for (ci, rates) in histograms.iter().enumerate() {
+        step_hist(&dp, data, rates, y_top, selection_colour(ci), fill);
     }
     // Time brush: fade the bins outside the range (with `only` they were
     // never counted).
@@ -2727,6 +2763,7 @@ pub fn contamination_over_time_view<P: DataProvider>(
         return;
     }
     let total_s = total_samples as f32 / sr;
+    let extent_s = span.extent_samples() as f32 / sr;
     let start_s = span.start.as_f32() / sr;
     let refractory_samples = session.refractory().fixed_samples(sr);
     const N_WINDOWS: usize = 60;
@@ -2740,7 +2777,7 @@ pub fn contamination_over_time_view<P: DataProvider>(
             let s = sliding_refractory_contamination(
                 times,
                 refractory_samples,
-                span,
+                session.unit_span(c),
                 sr,
                 N_WINDOWS,
                 MIN_SPIKES_PER_WINDOW,
@@ -2775,13 +2812,17 @@ pub fn contamination_over_time_view<P: DataProvider>(
         return;
     }
     let all_zero = finite.iter().all(|&y| y <= 0.0);
+    let windows = if span.source == sorrel_io::SpanSource::Trace {
+        format!("{N_WINDOWS} windows × {:.1} s", total_s / N_WINDOWS as f32)
+    } else {
+        format!("up to {N_WINDOWS} recorded-time windows per unit")
+    };
     caption(
         ui,
         &theme,
         format!(
-            "refractory contamination · {N_WINDOWS} windows × {:.1} s · {}",
-            total_s / N_WINDOWS as f32,
-            legend(selection),
+            "refractory contamination · {windows} · {}",
+            legend(selection)
         ),
     );
     let (rect, _resp) = alloc_plot(ui, egui::vec2(160.0, 180.0), Sense::hover());
@@ -2831,7 +2872,7 @@ pub fn contamination_over_time_view<P: DataProvider>(
                 prev = None;
                 continue;
             }
-            let x = data.left() + ((t - start_s) / total_s).clamp(0.0, 1.0) * data.width();
+            let x = data.left() + ((t - start_s) / extent_s).clamp(0.0, 1.0) * data.width();
             let p = egui::pos2(x, y_of(y.min(y_max)));
             if let Some(pp) = prev {
                 dp.line_segment([pp, p], stroke);

@@ -57,8 +57,8 @@ mod imp {
     use anyhow::{anyhow, ensure, Context, Result};
     use serde_json::{json, Value};
     use specs::{legacy_is_series, legacy_type_parents, TypeSpecs};
-    use std::cmp::Reverse;
-    use std::collections::{BinaryHeap, HashMap, VecDeque};
+    use std::cmp::{Ordering, Reverse};
+    use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
     use std::ops::Range;
     use std::path::Path;
     use std::sync::Mutex;
@@ -98,6 +98,7 @@ mod imp {
         n_channels: u32,
         n_samples: SampleIndex,
         span: SessionSpan,
+        unit_spans: Vec<SessionSpan>,
         spikes_per_cluster: Vec<Vec<SampleIndex>>,
         unit_ids: Vec<u32>,
         metadata: UnitMetadata,
@@ -325,7 +326,12 @@ mod imp {
             }
             let n_samples = trace.as_ref().map_or(0, |t| t.n_samples);
             let require_agreement = params.sample_rate.is_none();
-            let (spikes_per_cluster, unit_ids, same_mapping) = load_units(
+            let LoadedUnits {
+                spikes: spikes_per_cluster,
+                ids: unit_ids,
+                same_mapping,
+                seconds,
+            } = load_units(
                 &ids,
                 &spike_times,
                 &spike_times_index,
@@ -335,11 +341,12 @@ mod imp {
                 comparison_rate.map(|other_rate| (other_rate, require_agreement)),
             )
             .context("load /units")?;
-            let span = if trace.is_some() {
-                (n_samples as u64).into()
+            let (span, unit_spans) = if trace.is_some() {
+                ((n_samples as u64).into(), Vec::new())
             } else {
-                units_span(&f, &spikes_per_cluster, rate, t0)
+                units_span(&f, &spikes_per_cluster, &seconds, rate, t0)
             };
+            drop(seconds);
             if raw.is_some() {
                 ensure!(spikes_per_cluster.iter().filter_map(|s| s.last()).all(|s| s.0 < n_samples as u64),
                     "spike times extend past the paired ElectricalSeries (starting time {t0} s, {n_samples} samples at {rate} Hz)");
@@ -371,6 +378,7 @@ mod imp {
                 n_channels: u32::try_from(channel_map.len()).context("too many NWB channels")?,
                 n_samples: SampleIndex(n_samples as u64),
                 span,
+                unit_spans,
                 metadata,
                 spikes_per_cluster,
                 unit_ids,
@@ -451,7 +459,14 @@ mod imp {
         }
 
         fn session_span(&self) -> SessionSpan {
-            self.span
+            self.span.clone()
+        }
+
+        fn unit_span(&self, cluster: ClusterId) -> SessionSpan {
+            self.unit_spans
+                .get(cluster.idx())
+                .unwrap_or(&self.span)
+                .clone()
         }
 
         fn trace_provenance(&self) -> Value {
@@ -624,149 +639,289 @@ mod imp {
         }
     }
 
-    fn units_span(f: &Group, spikes: &[Vec<SampleIndex>], rate: f64, t0: f64) -> SessionSpan {
+    const OBS_INTERVALS: &str = "/units/obs_intervals";
+    const INTERVAL_BATCH: usize = 8192;
+
+    fn units_span(
+        f: &Group,
+        spikes: &[Vec<SampleIndex>],
+        seconds: &[f64],
+        rate: f64,
+        t0: f64,
+    ) -> (SessionSpan, Vec<SessionSpan>) {
+        let mut rejected = None;
+        match observation_spans(f, spikes, seconds, rate, t0) {
+            Ok(Some(spans)) => {
+                let mut union = BTreeMap::new();
+                for (lo, hi) in spans.iter().flat_map(SessionSpan::intervals) {
+                    insert_interval(&mut union, lo, hi);
+                }
+                let union = SessionSpan::from_intervals(
+                    union.into_iter().collect(),
+                    SpanSource::Declared(OBS_INTERVALS),
+                );
+                if union.duration_samples() > 0 {
+                    return (union, spans);
+                }
+            }
+            Ok(None) => rejected = Some(OBS_INTERVALS),
+            Err(err) => log::warn!("ignoring NWB intervals at {OBS_INTERVALS}: {err:#}"),
+        }
+
+        for path in ["/intervals/epochs", "/intervals/trials"] {
+            match time_table_intervals(f, path, rate, t0) {
+                Ok(mut rows) => {
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    if !spike_rows(spikes, seconds)
+                        .all(|(samples, times)| cover_spikes(&mut rows, samples, times))
+                    {
+                        rejected.get_or_insert(path);
+                        continue;
+                    }
+                    let span = interval_span(rows, path);
+                    if span.duration_samples() > 0 {
+                        return (span, Vec::new());
+                    }
+                }
+                Err(err) => log::warn!("ignoring NWB intervals at {path}: {err:#}"),
+            }
+        }
         let first = spikes.iter().filter_map(|row| row.first().copied()).min();
         let last = spikes.iter().filter_map(|row| row.last().copied()).max();
-        let mut rejected = None;
-        for path in [
-            "/intervals/epochs",
-            "/units/obs_intervals",
-            "/intervals/trials",
-        ] {
-            let (start, end) = match interval_extent(f, path, spikes.len()) {
-                Ok(Some((start, end))) => {
-                    (exact_sample(start, t0, rate), exact_sample(end, t0, rate))
-                }
-                Ok(None) => continue,
-                Err(err) => {
-                    log::warn!("ignoring NWB session extent at {path}: {err:#}");
-                    continue;
-                }
-            };
-            if !(0.0..u64::MAX as f64).contains(&start)
-                || !(start..u64::MAX as f64).contains(&end)
-                || start == end
-            {
-                log::warn!(
-                    "ignoring NWB session extent at {path}: not a positive span on the sample grid"
-                );
-                continue;
-            }
-            let (start, end) = (SampleIndex(start as u64), SampleIndex(end as u64));
-            if first.is_some_and(|t| t < start) || last.is_some_and(|t| t >= end) {
-                rejected = Some(path);
-                break;
-            }
-            return SessionSpan {
+        let span = match first.zip(last) {
+            Some((start, last)) => SessionSpan::contiguous(
                 start,
-                end,
-                source: SpanSource::Declared(path),
-            };
-        }
-        match first.zip(last) {
-            Some((start, last)) => SessionSpan {
-                start,
-                end: SampleIndex(last.0 + 1),
-                source: SpanSource::SpikeExtent { rejected },
-            },
-            None => SessionSpan {
-                source: SpanSource::Unavailable,
-                ..SessionSpan::from(0)
-            },
-        }
+                SampleIndex(last.0 + 1),
+                SpanSource::SpikeExtent { rejected },
+            ),
+            None => {
+                SessionSpan::contiguous(SampleIndex(0), SampleIndex(0), SpanSource::Unavailable)
+            }
+        };
+        (span, Vec::new())
     }
 
-    fn interval_extent(f: &Group, path: &str, n_units: usize) -> Result<Option<(f64, f64)>> {
-        // Only read time columns and the Units ragged index, never the rest of
-        // the DynamicTable. Bound temporary buffers for remote and local files.
-        const BATCH: usize = 8192;
-        let (mut first, mut last) = (f64::INFINITY, f64::NEG_INFINITY);
-        let mut add = |start: f64, stop: f64| -> Result<()> {
-            check_time(start, "interval start")?;
-            check_time(stop, "interval stop")?;
-            ensure!(start <= stop, "interval stop precedes start");
-            first = first.min(start);
-            last = last.max(stop);
-            Ok(())
-        };
-        if path == "/units/obs_intervals" {
-            let Some(ds) = f.optional_dataset(path)? else {
-                return Ok(None);
-            };
-            let shape = ds.shape();
-            let &[n, 2] = shape.as_slice() else {
-                anyhow::bail!("expected an N×2 observation interval table");
-            };
-            if n == 0 {
-                return Ok(None);
-            }
-            let index = f.dataset("/units/obs_intervals_index")?;
-            ensure!(
-                index.shape() == [n_units],
-                "expected one observation index per unit"
-            );
-            let signed = match index.sample_type()? {
-                SampleType::I8 | SampleType::I16 | SampleType::I32 | SampleType::I64 => true,
-                SampleType::U8 | SampleType::U16 | SampleType::U32 | SampleType::U64 => false,
-                _ => anyhow::bail!("expected an integer observation interval index"),
-            };
-            let mut prev = 0;
-            for i in (0..n_units).step_by(BATCH) {
-                let range = i..n_units.min(i + BATCH);
-                let ends = if signed {
-                    index
-                        .read_rows::<i64>(range)?
-                        .into_iter()
-                        .map(u64::try_from)
-                        .collect::<Result<Vec<_>, _>>()
-                        .context("negative observation interval index")?
-                } else {
-                    index.read_rows::<u64>(range)?
-                };
-                for end in ends {
-                    ensure!(end >= prev, "observation interval index is not monotonic");
-                    ensure!(
-                        end <= n as u64,
-                        "observation interval index is out of bounds"
-                    );
-                    prev = end;
-                }
-            }
-            ensure!(
-                prev == n as u64,
-                "observation interval index does not account for every interval"
-            );
-            for i in (0..n).step_by(BATCH) {
-                let rows = ds.read_rows::<f64>(i..n.min(i + BATCH))?;
-                for &[start, stop] in rows.as_chunks::<2>().0 {
-                    add(start, stop)?;
-                }
-            }
-        } else {
-            let Some(g) = f.optional_group(path)? else {
-                return Ok(None);
-            };
-            let (starts, stops) = (g.dataset("start_time")?, g.dataset("stop_time")?);
-            let shape = starts.shape();
-            let &[n] = shape.as_slice() else {
-                anyhow::bail!("expected one-dimensional start_time");
-            };
-            ensure!(
-                stops.shape() == shape,
-                "start_time and stop_time shapes differ"
-            );
-            for i in (0..n).step_by(BATCH) {
-                let range = i..n.min(i + BATCH);
-                for (start, stop) in starts
-                    .read_rows::<f64>(range.clone())?
-                    .into_iter()
-                    .zip(stops.read_rows::<f64>(range)?)
-                {
-                    add(start, stop)?;
-                }
+    fn spike_rows<'a>(
+        spikes: &'a [Vec<SampleIndex>],
+        mut seconds: &'a [f64],
+    ) -> impl Iterator<Item = (&'a [SampleIndex], &'a [f64])> {
+        spikes.iter().map(move |samples| {
+            let (row, rest) = seconds.split_at(samples.len());
+            seconds = rest;
+            (samples.as_slice(), row)
+        })
+    }
+
+    struct GridInterval {
+        start_s: f64,
+        stop_s: f64,
+        start: SampleIndex,
+        end: SampleIndex,
+    }
+
+    fn insert_interval<T: Copy + Ord>(rows: &mut BTreeMap<T, T>, mut lo: T, mut hi: T) {
+        if let Some((&start, &stop)) = rows.range(..=lo).next_back() {
+            if stop >= lo {
+                rows.remove(&start);
+                lo = start;
+                hi = hi.max(stop);
             }
         }
-        Ok(first.is_finite().then_some((first, last)))
+        while let Some((&start, &stop)) = rows.range(lo..=hi).next() {
+            rows.remove(&start);
+            hi = hi.max(stop);
+        }
+        rows.insert(lo, hi);
+    }
+
+    #[derive(Clone, Copy)]
+    struct IntervalTime(f64);
+
+    impl Ord for IntervalTime {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.0.total_cmp(&other.0)
+        }
+    }
+    impl PartialOrd for IntervalTime {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl PartialEq for IntervalTime {
+        fn eq(&self, other: &Self) -> bool {
+            self.cmp(other).is_eq()
+        }
+    }
+    impl Eq for IntervalTime {}
+
+    type TimeIntervals = BTreeMap<IntervalTime, IntervalTime>;
+
+    fn add_interval(rows: &mut TimeIntervals, start: f64, stop: f64) -> Result<()> {
+        check_time(start, "interval start")?;
+        check_time(stop, "interval stop")?;
+        ensure!(start <= stop, "interval stop precedes start");
+        if start < stop {
+            // Normalize negative zero so touching rows merge at time zero.
+            insert_interval(rows, IntervalTime(start + 0.0), IntervalTime(stop + 0.0));
+        }
+        Ok(())
+    }
+
+    fn grid_intervals(rows: TimeIntervals, rate: f64, t0: f64) -> Result<Vec<GridInterval>> {
+        rows.into_iter()
+            .map(|(IntervalTime(start_s), IntervalTime(stop_s))| {
+                let start = exact_sample(start_s, t0, rate);
+                let end = exact_sample(stop_s, t0, rate);
+                ensure!(
+                    start.is_finite() && end.is_finite(),
+                    "interval boundary cannot be placed on the sample grid"
+                );
+                Ok(GridInterval {
+                    start_s,
+                    stop_s,
+                    start: SampleIndex(start as u64),
+                    end: SampleIndex(end as u64),
+                })
+            })
+            .collect()
+    }
+
+    fn cover_spikes(rows: &mut [GridInterval], samples: &[SampleIndex], times: &[f64]) -> bool {
+        let mut next = 0;
+        for row in rows {
+            if next == times.len() {
+                break;
+            }
+            if times[next] < row.start_s {
+                return false;
+            }
+            let n = times[next..].partition_point(|&t| t < row.stop_s);
+            if n != 0 {
+                next += n;
+                // A spike strictly before the stop can round to the same
+                // sample as the stop. Include that sample only when needed;
+                // checking continuous time first still rejects spikes at the stop.
+                row.end = row.end.max(SampleIndex(samples[next - 1].0 + 1));
+            }
+        }
+        next == times.len()
+    }
+
+    fn interval_span(rows: Vec<GridInterval>, path: &'static str) -> SessionSpan {
+        SessionSpan::from_intervals(
+            rows.into_iter().map(|r| (r.start, r.end)).collect(),
+            SpanSource::Declared(path),
+        )
+    }
+
+    fn observation_spans(
+        f: &Group,
+        spikes: &[Vec<SampleIndex>],
+        seconds: &[f64],
+        rate: f64,
+        t0: f64,
+    ) -> Result<Option<Vec<SessionSpan>>> {
+        let Some(ds) = f.optional_dataset(OBS_INTERVALS)? else {
+            return Ok(Some(Vec::new()));
+        };
+        let shape = ds.shape();
+        let &[n, 2] = shape.as_slice() else {
+            anyhow::bail!("expected an N×2 observation interval table");
+        };
+        ds.exact_float(OBS_INTERVALS)?;
+        let index = f.dataset("/units/obs_intervals_index")?;
+        ensure!(
+            index.shape() == [spikes.len()],
+            "expected one observation index per unit"
+        );
+        if let Some(target) = index.reference_path("target")? {
+            ensure!(
+                target == OBS_INTERVALS,
+                "invalid observation interval index target"
+            );
+        }
+        let signed = match index.sample_type()? {
+            SampleType::I8 | SampleType::I16 | SampleType::I32 | SampleType::I64 => true,
+            SampleType::U8 | SampleType::U16 | SampleType::U32 | SampleType::U64 => false,
+            _ => anyhow::bail!("expected an integer observation interval index"),
+        };
+        let mut units = spike_rows(spikes, seconds);
+        let mut spans = Vec::with_capacity(spikes.len());
+        let mut prev = 0;
+        let mut block = Vec::new();
+        let mut covered = true;
+        for i in (0..spikes.len()).step_by(INTERVAL_BATCH) {
+            let range = i..spikes.len().min(i + INTERVAL_BATCH);
+            let ends = if signed {
+                index
+                    .read_rows::<i64>(range)?
+                    .into_iter()
+                    .map(u64::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("negative observation interval index")?
+            } else {
+                index.read_rows::<u64>(range)?
+            };
+            for end in ends {
+                ensure!(
+                    (prev as u64..=n as u64).contains(&end),
+                    "observation interval index is not monotonic or is out of bounds"
+                );
+                let end = end as usize;
+                let mut rows = TimeIntervals::new();
+                for j in prev..end {
+                    if j % INTERVAL_BATCH == 0 {
+                        block = ds.read_rows::<f64>(j..n.min(j + INTERVAL_BATCH))?;
+                    }
+                    let k = 2 * (j % INTERVAL_BATCH);
+                    add_interval(&mut rows, block[k], block[k + 1])?;
+                }
+                let mut rows = grid_intervals(rows, rate, t0)?;
+                let (samples, times) = units.next().context("too many observation indices")?;
+                covered &= cover_spikes(&mut rows, samples, times);
+                spans.push(interval_span(rows, OBS_INTERVALS));
+                prev = end;
+            }
+        }
+        ensure!(
+            prev == n && spans.len() == spikes.len(),
+            "observation interval index does not account for every interval or unit"
+        );
+        Ok(covered.then_some(spans))
+    }
+
+    fn time_table_intervals(
+        f: &Group,
+        path: &str,
+        rate: f64,
+        t0: f64,
+    ) -> Result<Vec<GridInterval>> {
+        let Some(g) = f.optional_group(path)? else {
+            return Ok(Vec::new());
+        };
+        let (starts, stops) = (g.dataset("start_time")?, g.dataset("stop_time")?);
+        let shape = starts.shape();
+        let &[n] = shape.as_slice() else {
+            anyhow::bail!("expected one-dimensional start_time");
+        };
+        ensure!(
+            stops.shape() == shape,
+            "start_time and stop_time shapes differ"
+        );
+        let mut rows = TimeIntervals::new();
+        for i in (0..n).step_by(INTERVAL_BATCH) {
+            let range = i..n.min(i + INTERVAL_BATCH);
+            for (start, stop) in starts
+                .read_rows::<f64>(range.clone())?
+                .into_iter()
+                .zip(stops.read_rows::<f64>(range)?)
+            {
+                add_interval(&mut rows, start, stop)?;
+            }
+        }
+        grid_intervals(rows, rate, t0)
     }
 
     pub(crate) fn read_trials(path: &Path) -> Result<crate::Events> {
@@ -1593,6 +1748,14 @@ mod imp {
         Ok((gain, offset_uv))
     }
 
+    struct LoadedUnits {
+        spikes: Vec<Vec<SampleIndex>>,
+        ids: Vec<u32>,
+        same_mapping: bool,
+        // Only kept for validating units-only interval boundaries.
+        seconds: Vec<f64>,
+    }
+
     /// Spike sample indices per unit (relative to `t0`), unit ids, and
     /// whether the mapping agrees with the optional comparison rate. Any
     /// disagreement is an error when there is no explicit clock choice.
@@ -1604,7 +1767,7 @@ mod imp {
         t0: f64,
         series_clock: Option<(usize, Option<&Dataset>)>,
         mut comparison: Option<(f64, bool)>,
-    ) -> Result<(Vec<Vec<SampleIndex>>, Vec<u32>, bool)> {
+    ) -> Result<LoadedUnits> {
         let timestamps = series_clock.and_then(|(n_samples, ds)| ds.map(|ds| (ds, n_samples)));
         let ids: Vec<i64> = ids.read_raw()?;
         spike_times.exact_float("/units/spike_times")?;
@@ -1635,7 +1798,7 @@ mod imp {
                 .filter(|&e| e >= start && e <= all.len())
                 .ok_or_else(|| anyhow!("/units/spike_times_index is not a valid ragged index"))?;
             let times = &mut all[start..end];
-            if timestamps.is_some() && !times.is_sorted() {
+            if (series_clock.is_none() || timestamps.is_some()) && !times.is_sorted() {
                 times.sort_unstable_by(f64::total_cmp);
             }
             let mut bucket = times
@@ -1667,7 +1830,7 @@ mod imp {
                     Ok(SampleIndex::new(s as u64))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            if timestamps.is_none() {
+            if series_clock.is_some() && timestamps.is_none() {
                 bucket.sort_unstable();
             }
             out.push(bucket);
@@ -1682,7 +1845,16 @@ mod imp {
                 "Ambiguous NWB sample rate: stored series rate {rate} Hz and Units resolution rate {units_rate} Hz map {n_differing} {noun} to different samples (first: unit {id} spike {spike} at {t} s, sample indices {stored} vs {precise}, respectively); pass --sample-rate <Hz> to choose which clock applies"
             );
         }
-        Ok((out, unit_ids, n_differing == 0))
+        Ok(LoadedUnits {
+            spikes: out,
+            ids: unit_ids,
+            same_mapping: n_differing == 0,
+            seconds: if series_clock.is_none() {
+                all
+            } else {
+                Vec::new()
+            },
+        })
     }
 
     fn check_timestamp_spikes(

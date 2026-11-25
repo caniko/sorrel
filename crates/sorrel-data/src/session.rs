@@ -14,7 +14,7 @@ use sorrel_cache::{CacheKey, CacheStore, Fingerprint};
 use sorrel_compute::RefractoryParams;
 use sorrel_io::{
     ClusterId, DataProvider, HasAmplitudes, HasPcFeatures, HasSpikeTemplates, HasTemplateWaveforms,
-    SampleIndex,
+    SampleIndex, SessionSpan,
 };
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -62,6 +62,7 @@ enum InverseOp<L: Copy> {
         target_parents: Vec<ClusterId>,
         /// The target's note before the sources' notes were appended.
         target_note: String,
+        target_span: Option<SessionSpan>,
         /// Reversible record of the spike-table rewrite.
         record: MergeRecord,
     },
@@ -159,6 +160,8 @@ pub struct Session<P: DataProvider> {
     /// Sorter name rendered in `Auto[<sorter>]`; `"unknown"` until set.
     sorter: String,
     cluster_index: ClusterIndex,
+    /// Exposure overrides for curated units with distinct observation windows.
+    unit_spans: HashMap<ClusterId, SessionSpan>,
     journal: Journal,
     /// The action tree; state at a node = provider (the root) + the path.
     nodes: Vec<Node<P::Label>>,
@@ -221,6 +224,7 @@ impl<P: DataProvider> Session<P> {
             notes,
             sorter,
             cluster_index,
+            unit_spans: HashMap::new(),
             journal,
             nodes: Vec::new(),
             head: None,
@@ -906,6 +910,25 @@ impl<P: DataProvider> Session<P> {
     #[inline]
     pub fn spike_times(&self, cluster: ClusterId) -> &[SampleIndex] {
         self.cluster_index.spike_times(cluster)
+    }
+
+    pub fn unit_span(&self, cluster: ClusterId) -> SessionSpan {
+        self.unit_spans
+            .get(&cluster)
+            .cloned()
+            .unwrap_or_else(|| self.provider.unit_span(cluster))
+    }
+
+    pub(crate) fn combined_unit_span(
+        &self,
+        ids: impl IntoIterator<Item = ClusterId>,
+    ) -> SessionSpan {
+        let mut spans = ids.into_iter().map(|c| self.unit_span(c));
+        let Some(first) = spans.next() else {
+            return self.provider.session_span();
+        };
+        let others: Vec<_> = spans.filter(|s| s != &first).collect();
+        first.union_with(&others)
     }
 
     #[inline]
@@ -1620,12 +1643,20 @@ impl<P: DataProvider> Session<P> {
                     }
                 }
                 let target_note = set_slot(&mut self.notes, *target, note);
+                let span = self
+                    .combined_unit_span(std::iter::once(*target).chain(sources.iter().copied()));
+                let target_span = if span != self.unit_span(*target) {
+                    self.unit_spans.insert(*target, span)
+                } else {
+                    self.unit_spans.get(target).cloned()
+                };
                 let record = self.cluster_index.merge(sources, *target);
                 InverseOp::Merge {
                     labels,
                     target_tags,
                     target_parents,
                     target_note,
+                    target_span,
                     record,
                 }
             }
@@ -1650,6 +1681,10 @@ impl<P: DataProvider> Session<P> {
                     .cloned()
                     .collect();
                 let child = record.new_cluster;
+                let span = self.unit_span(*cluster);
+                if span != self.provider.unit_span(child) {
+                    self.unit_spans.insert(child, span);
+                }
                 self.swap_tags(child, inherited);
                 set_slot(&mut self.origins, child, UnitOrigin::Sorrel(by.clone()));
                 set_slot(&mut self.parents, child, vec![*cluster]);
@@ -1700,11 +1735,17 @@ impl<P: DataProvider> Session<P> {
                 target_tags,
                 target_parents,
                 target_note,
+                target_span,
                 record,
             } => {
                 self.swap_tags(target_tags.0, target_tags.1);
                 set_slot(&mut self.parents, target_tags.0, target_parents);
                 set_slot(&mut self.notes, target_tags.0, target_note);
+                if let Some(span) = target_span {
+                    self.unit_spans.insert(target_tags.0, span);
+                } else {
+                    self.unit_spans.remove(&target_tags.0);
+                }
                 self.cluster_index.unmerge(record);
                 for (c, l) in labels {
                     if let Some(slot) = self.labels.get_mut(c.idx()) {
@@ -1717,6 +1758,7 @@ impl<P: DataProvider> Session<P> {
                 parent_tags,
             } => {
                 let child = record.new_cluster;
+                self.unit_spans.remove(&child);
                 self.swap_tags(child, Vec::new());
                 set_slot(&mut self.origins, child, UnitOrigin::Auto);
                 set_slot(&mut self.parents, child, Vec::new());

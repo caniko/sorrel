@@ -133,18 +133,19 @@ pub fn quality_breakdown(
     } else {
         &[]
     };
+    let exposed = span.metric_spikes(spike_times);
     let raw_contamination = refractory_contamination(
-        span.metric_spikes(spike_times),
+        &exposed,
         refractory_samples,
         span.duration_samples(),
         sample_rate,
     );
-    let raw_presence = presence_ratio(spike_times, span, presence_bins);
-    let raw_gap = longest_silent_gap_frac(spike_times, span);
+    let raw_presence = presence_ratio(spike_times, span.clone(), presence_bins);
+    let raw_gap = longest_silent_gap_frac(spike_times, span.clone());
     let raw_snr = amplitude_snr(spike_amplitudes);
     let raw_cutoff = amplitude_cutoff(spike_amplitudes, 30);
     let raw_drift = amplitude_drift_correlation(spike_times, spike_amplitudes);
-    let raw_isi_violations = isi_violations(spike_times, refractory_samples) as u32;
+    let raw_isi_violations = isi_violations(&exposed, refractory_samples) as u32;
     let raw_presence_cv = presence_cv(spike_times, span, presence_bins);
 
     QualityBreakdown {
@@ -175,6 +176,24 @@ pub fn quality_breakdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_coverage_ignores_pauses_and_gap_spikes() {
+        let span = SessionSpan::from_intervals(
+            vec![(10.into(), 60.into()), (10_000.into(), 10_050.into())],
+            sorrel_io::SpanSource::Declared("/intervals/epochs"),
+        );
+        let times = [15, 35, 55, 500, 10_015, 10_035].map(SampleIndex);
+        assert_eq!(
+            span.metric_spikes(&times).len() as f32 / span.duration_seconds(100.0),
+            5.0
+        );
+        let q = quality_breakdown(&times, &[], 1, span, 100.0, 5);
+        assert_eq!(q.raw_presence_ratio, 1.0);
+        assert_eq!(q.raw_presence_cv, 0.0);
+        assert_eq!(q.raw_silent_gap, 0.2);
+        assert_eq!(q.coverage_score, 0.8);
+    }
 
     #[test]
     fn composite_is_geometric_mean() {

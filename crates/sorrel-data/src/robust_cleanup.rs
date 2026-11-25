@@ -103,9 +103,10 @@ pub(crate) fn robust_cleanup_with<P: DataProvider>(
     if !sr.is_finite() || sr <= 0.0 {
         return None;
     }
-    let duration = session.provider.session_span().duration_samples();
+    let span = session.unit_span(c);
+    let duration = span.duration_samples();
     let measure = |t: &[_]| {
-        let (cont, rp) = windows.sweep(t, duration, sr);
+        let (cont, rp) = windows.sweep(&span.metric_spikes(t), duration, sr);
         if rp > 0 {
             cont
         } else {

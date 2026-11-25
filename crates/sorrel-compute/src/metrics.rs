@@ -429,19 +429,23 @@ pub fn presence_ratio(
 ) -> f32 {
     let span = span.into();
     let total_duration_samples = span.duration_samples();
-    let n_bins = n_bins.min(usize::try_from(total_duration_samples).unwrap_or(usize::MAX));
-    let spike_times = span.metric_spikes(spike_times);
-    if n_bins == 0 {
+    let trace = span.source == sorrel_io::SpanSource::Trace;
+    let n_bins = if trace {
+        n_bins
+    } else {
+        n_bins.min(usize::try_from(total_duration_samples).unwrap_or(usize::MAX))
+    };
+    if n_bins == 0 || total_duration_samples == 0 {
         return f32::NAN;
     }
     if spike_times.is_empty() {
         return 0.0;
     }
-    let bin_width = total_duration_samples as f64 / n_bins as f64;
+    let bin_width = (total_duration_samples as f64 / n_bins as f64).max(1.0);
     let mut filled = vec![false; n_bins];
-    for &t in spike_times {
+    for (_, offset) in span.recorded_offsets(spike_times) {
         // Preserve final-bin clamping for legacy trace-backed inputs.
-        let idx = (((t.0 - span.start.0) as f64 / bin_width) as usize).min(n_bins - 1);
+        let idx = ((offset as f64 / bin_width) as usize).min(n_bins - 1);
         filled[idx] = true;
     }
     let count = filled.iter().filter(|&&b| b).count();
@@ -754,11 +758,11 @@ mod tests {
 
     #[test]
     fn presence_ratio_uses_half_open_offset_span() {
-        let span = sorrel_io::SessionSpan {
-            start: SampleIndex(1_000),
-            end: SampleIndex(1_100),
-            source: sorrel_io::SpanSource::Declared("/intervals/epochs"),
-        };
+        let span = sorrel_io::SessionSpan::contiguous(
+            SampleIndex(1_000),
+            SampleIndex(1_100),
+            sorrel_io::SpanSource::Declared("/intervals/epochs"),
+        );
         assert_eq!(
             presence_ratio(&si([999, 1_000, 1_024, 1_100]), span, 4),
             0.25
@@ -766,12 +770,18 @@ mod tests {
     }
 
     #[test]
+    fn short_trace_presence_preserves_requested_bins() {
+        assert_eq!(presence_ratio(&[SampleIndex(1)], 10, 50), 0.02);
+    }
+
+    #[test]
     fn presence_ratio_uses_only_bins_with_exposure() {
-        let span = sorrel_io::SessionSpan {
-            start: SampleIndex(100),
-            end: SampleIndex(110),
-            source: sorrel_io::SpanSource::Declared("/intervals/epochs"),
-        };
+        let span = sorrel_io::SessionSpan::contiguous(
+            SampleIndex(100),
+            SampleIndex(110),
+            sorrel_io::SpanSource::Declared("/intervals/epochs"),
+        );
+        assert_eq!(presence_ratio(&si([101]), span.clone(), 50), 0.10);
         assert_eq!(presence_ratio(&siv(100..110), span, 50), 1.0);
     }
 

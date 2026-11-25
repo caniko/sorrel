@@ -104,8 +104,6 @@ fn rows<P: DataProvider>(
     s: &Session<P>,
     depths: Option<&SpikeDepths>,
 ) -> Vec<(ClusterId, [f32; 5])> {
-    let span = s.provider.session_span();
-    let duration = span.duration_seconds(s.provider.sample_rate());
     let (_, ns, nc) = s.template_shape();
     (0..s.n_clusters())
         .map(ClusterId)
@@ -135,6 +133,8 @@ fn rows<P: DataProvider>(
                     })
                 })
                 .map_or(f32::NAN, |ch| ch as f32);
+            let span = s.unit_span(c);
+            let duration = span.duration_seconds(s.provider.sample_rate());
             let exposed = span.metric_spikes(s.spike_times(c)).len() as f32;
             (
                 c,

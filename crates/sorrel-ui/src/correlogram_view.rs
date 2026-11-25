@@ -79,15 +79,21 @@ impl CcgCache {
                 let span = s.provider.session_span();
                 let n_samples = span.duration_samples();
                 let window = (window_ms as f64 / 1e3 * sr as f64).ceil() as u64;
-                let all: Vec<&[SampleIndex]> = cl
+                let all: Vec<_> = cl
                     .iter()
-                    .map(|&c| span.metric_spikes(s.spike_times(c)))
+                    .map(|&c| s.unit_span(c).metric_spikes(s.spike_times(c)))
                     .collect();
-                let (chunks, trains) = sample_trains(&all, span, MAX_SPIKES, window);
+                let all: Vec<_> = all.iter().map(|t| t.as_ref()).collect();
+                let (chunks, trains) = sample_trains(&all, span.clone(), MAX_SPIKES, window);
                 let refs: Vec<&[SampleIndex]> = trains.iter().map(Vec::as_slice).collect();
-                let covered = chunks
-                    .as_ref()
-                    .map_or(n_samples, |ch| ch.iter().map(|(a, b)| b - a).sum());
+                let covered = chunks.as_ref().map_or(n_samples, |ch| {
+                    ch.iter()
+                        .flat_map(|&(a, b)| {
+                            span.intervals()
+                                .map(move |(lo, hi)| b.min(hi.0).saturating_sub(a.max(lo.0)))
+                        })
+                        .sum()
+                });
                 Arc::new(CcgData {
                     counts: correlograms(&refs, sr, bin_ms as f64 / 1e3, window_ms as f64 / 1e3),
                     n_used: trains.iter().map(Vec::len).collect(),
@@ -161,8 +167,8 @@ pub(crate) fn sample_trains(
         let chunks = time_chunks(span.duration_samples(), total, budget, window_samples).map(
             |mut chunks| {
                 for (start, end) in &mut chunks {
-                    *start += span.start.0;
-                    *end += span.start.0;
+                    *start = span.sample_at_offset(*start).0;
+                    *end = span.sample_at_offset(*end - 1).0 + 1;
                 }
                 chunks
             },

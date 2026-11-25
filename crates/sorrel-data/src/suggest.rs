@@ -193,7 +193,7 @@ fn content_key(times: &[SampleIndex], amps: &[f32]) -> blake3::Hasher {
 }
 
 /// Firing counts of `times` in up to [`PRESENCE_BINS`] equal slices of the recording.
-fn presence_counts(times: &[SampleIndex], span: sorrel_io::SessionSpan) -> Vec<f32> {
+fn presence_counts(times: &[SampleIndex], span: &sorrel_io::SessionSpan) -> Vec<f32> {
     let duration = span.duration_samples();
     let bins = duration.min(PRESENCE_BINS as u64) as usize;
     if bins == 0 {
@@ -201,8 +201,8 @@ fn presence_counts(times: &[SampleIndex], span: sorrel_io::SessionSpan) -> Vec<f
     }
     let width = duration as f64 / bins as f64;
     let mut c = vec![0.0f32; bins];
-    for t in span.metric_spikes(times) {
-        c[(((t.0 - span.start.0) as f64 / width) as usize).min(bins - 1)] += 1.0;
+    for (_, offset) in span.recorded_offsets(times) {
+        c[((offset as f64 / width) as usize).min(bins - 1)] += 1.0;
     }
     c
 }
@@ -339,7 +339,10 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
             summaries[c as usize].as_ref()?;
             let c = ClusterId(c);
             let pos = *memo.positions.get(peak_channel(session, c)?)?;
-            Some((pos, presence_counts(session.spike_times(c), span)))
+            // Complementarity compares the same recorded-time bins for both
+            // units, even when their observation windows differ.
+            let times = session.unit_span(c).metric_spikes(session.spike_times(c));
+            Some((pos, presence_counts(&times, &span)))
         })
         .collect();
 
@@ -580,7 +583,7 @@ fn score_split<P: DataProvider>(
     refractory_samples: u64,
 ) -> SplitCandidate {
     let sr = session.provider.sample_rate().max(1.0);
-    let span = session.provider.session_span();
+    let span = session.unit_span(c);
     let times = session.spike_times(c);
     let amps = session.spike_amplitudes(c);
     let bc = if amps.len() >= 8 {
@@ -618,7 +621,7 @@ fn score_split<P: DataProvider>(
         }
     }
     let contamination = refractory_contamination(
-        span.metric_spikes(times),
+        &span.metric_spikes(times),
         refractory_samples,
         span.duration_samples(),
         sr,
@@ -752,6 +755,13 @@ pub fn rank_split_candidates_memo<P: DataProvider>(
         })
         .map(|c| {
             let mut h = content_key(session.spike_times(c), session.spike_amplitudes(c));
+            let span = session.unit_span(c);
+            if span.source != sorrel_io::SpanSource::Trace {
+                for (lo, hi) in span.intervals() {
+                    h.update(&lo.0.to_le_bytes());
+                    h.update(&hi.0.to_le_bytes());
+                }
+            }
             if let Some(g) = &globals {
                 feed(&mut h, &g[c.idx()], u32::to_le_bytes);
             }
@@ -834,13 +844,13 @@ mod tests {
 
     #[test]
     fn merge_presence_counts_only_bins_with_exposure() {
-        let span = sorrel_io::SessionSpan {
-            start: SampleIndex(100),
-            end: SampleIndex(110),
-            source: sorrel_io::SpanSource::Declared("/intervals/epochs"),
-        };
+        let span = sorrel_io::SessionSpan::contiguous(
+            SampleIndex(100),
+            SampleIndex(110),
+            sorrel_io::SpanSource::Declared("/intervals/epochs"),
+        );
         let spikes: Vec<_> = (99..=110).map(SampleIndex).collect();
-        assert_eq!(presence_counts(&spikes, span), [1.0; 10]);
+        assert_eq!(presence_counts(&spikes, &span), [1.0; 10]);
     }
 
     /// In-memory provider backed by per-cluster spike times + amplitudes.

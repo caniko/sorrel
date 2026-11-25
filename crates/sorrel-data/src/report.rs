@@ -110,8 +110,7 @@ pub fn render_cluster_svgs<P: DataProvider>(
         isi: svg_bars(&isi, W, H),
         log_isi: svg_bars(&log_isi_histogram(spikes, sr), W, H),
         acg: svg_bars(&acg, W, H),
-        amplitude: (!amps.is_empty())
-            .then(|| svg_dots(spikes, amps, session.provider.session_span())),
+        amplitude: (!amps.is_empty()).then(|| svg_dots(spikes, amps, session.unit_span(cluster))),
     }
 }
 
@@ -218,15 +217,12 @@ pub fn svg_dots(
     span: impl Into<sorrel_io::SessionSpan>,
 ) -> String {
     let span = span.into();
-    let width = span.duration_samples().max(1) as f32;
+    let width = span.extent_samples().max(1) as f32;
     let n = times.len().min(amps.len());
     let stride = n.div_ceil(MAX_DOTS).max(1);
     let drawn: Vec<usize> = (0..n)
         .step_by(stride)
-        .filter(|&i| {
-            span.source == sorrel_io::SpanSource::Trace
-                || (span.start..span.end).contains(&times[i])
-        })
+        .filter(|&i| span.source == sorrel_io::SpanSource::Trace || span.contains(times[i]))
         .collect();
     let mut sorted: Vec<f32> = drawn.iter().map(|&i| amps[i].abs()).collect();
     sorted.sort_unstable_by(f32::total_cmp);

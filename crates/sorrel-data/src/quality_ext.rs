@@ -38,7 +38,7 @@ pub(crate) fn cluster_quality_with<P: DataProvider>(
         session.spike_times(cluster),
         session.spike_amplitudes(cluster),
         refractory_samples,
-        session.provider.session_span(),
+        session.unit_span(cluster),
         sr,
         50,
     );

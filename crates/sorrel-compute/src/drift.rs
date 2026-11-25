@@ -85,15 +85,18 @@ pub fn amplitude_drift_slope(times: &[SampleIndex], amps: &[f32], sample_rate: f
 pub fn presence_cv(times: &[SampleIndex], span: impl Into<SessionSpan>, n_bins: usize) -> f32 {
     let span = span.into();
     let total_duration_samples = span.duration_samples();
-    let n_bins = n_bins.min(usize::try_from(total_duration_samples).unwrap_or(usize::MAX));
-    let times = span.metric_spikes(times);
-    if times.is_empty() || n_bins == 0 {
+    let n_bins = if span.source == SpanSource::Trace {
+        n_bins
+    } else {
+        n_bins.min(usize::try_from(total_duration_samples).unwrap_or(usize::MAX))
+    };
+    if times.is_empty() || n_bins == 0 || total_duration_samples == 0 {
         return f32::NAN;
     }
-    let bin_width = total_duration_samples as f64 / n_bins as f64;
+    let bin_width = (total_duration_samples as f64 / n_bins as f64).max(1.0);
     let mut counts = vec![0u32; n_bins];
-    for &t in times {
-        let idx = ((t.0 - span.start.0) as f64 / bin_width) as usize;
+    for (_, offset) in span.recorded_offsets(times) {
+        let idx = (offset as f64 / bin_width) as usize;
         if idx < n_bins {
             counts[idx] += 1;
         }
@@ -135,20 +138,25 @@ pub fn sliding_refractory_contamination(
     };
     let legacy_width = (total_duration_samples / n_windows as u64).max(1);
     let edge = |i: usize| {
-        span.start.0
-            + if legacy {
-                i as u64 * legacy_width
-            } else {
-                (i as u128 * total_duration_samples as u128 / n_windows as u128) as u64
-            }
+        if legacy {
+            i as u64 * legacy_width
+        } else {
+            (i as u128 * total_duration_samples as u128 / n_windows as u128) as u64
+        }
     };
+    let times = span.metric_spikes(times);
     let inv_sr = 1.0_f32 / sample_rate;
     let mut out = Vec::with_capacity(n_windows);
     let mut idx = 0usize;
     for w in 0..n_windows {
-        let lo = edge(w);
-        let hi = edge(w + 1);
-        let win_samples = hi - lo;
+        let from = edge(w);
+        let to = edge(w + 1);
+        let win_samples = to - from;
+        let (lo, hi) = if legacy {
+            (span.start.0 + from, span.start.0 + to)
+        } else {
+            (span.sample_at_offset(from).0, span.sample_at_offset(to).0)
+        };
         // Advance to the first spike inside this window.
         while idx < times.len() && times[idx].0 < lo {
             idx += 1;
@@ -158,7 +166,12 @@ pub fn sliding_refractory_contamination(
         while end < times.len() && times[end].0 < hi {
             end += 1;
         }
-        let centre_s = (lo as f32 + win_samples as f32 * 0.5) * inv_sr;
+        let centre_s = if span.n_intervals() <= 1 {
+            (lo as f32 + win_samples as f32 * 0.5) * inv_sr
+        } else {
+            let mid = span.sample_at_offset(from + win_samples / 2);
+            (mid.as_f32() + (win_samples % 2) as f32 * 0.5) * inv_sr
+        };
         let contam = if end - start >= min_spikes_per_window {
             refractory_contamination(
                 &times[start..end],
@@ -179,25 +192,18 @@ pub fn sliding_refractory_contamination(
 /// 0.05 = a 5%-of-recording silent stretch. `NaN` without a recording span.
 pub fn longest_silent_gap_frac(times: &[SampleIndex], span: impl Into<SessionSpan>) -> f32 {
     let span = span.into();
-    let times = span.metric_spikes(times);
     let total_duration_samples = span.duration_samples();
     if total_duration_samples == 0 {
         return f32::NAN;
     }
-    if times.is_empty() {
-        return 1.0;
+    let mut previous = 0;
+    let mut max_gap = 0;
+    for (_, offset) in span.recorded_offsets(times) {
+        max_gap = max_gap.max(offset.saturating_sub(previous));
+        previous = offset;
     }
-    let total = total_duration_samples;
-    let first = times[0].0 - span.start.0;
-    let last = times.last().unwrap().0;
-    let mut max_gap = first.max(span.end.0.saturating_sub(last));
-    for w in times.windows(2) {
-        let g = w[1].0.saturating_sub(w[0].0);
-        if g > max_gap {
-            max_gap = g;
-        }
-    }
-    (max_gap as f64 / total as f64).clamp(0.0, 1.0) as f32
+    max_gap = max_gap.max(total_duration_samples.saturating_sub(previous));
+    (max_gap as f64 / total_duration_samples as f64).clamp(0.0, 1.0) as f32
 }
 
 #[cfg(test)]
@@ -266,12 +272,18 @@ mod tests {
     }
 
     #[test]
+    fn short_trace_presence_cv_preserves_requested_bins() {
+        assert_eq!(presence_cv(&si([1]), 10, 50), 7.0);
+    }
+
+    #[test]
     fn presence_cv_uses_only_bins_with_exposure() {
-        let span = SessionSpan {
-            start: SampleIndex(100),
-            end: SampleIndex(110),
-            source: sorrel_io::SpanSource::Declared("/intervals/epochs"),
-        };
+        let span = SessionSpan::contiguous(
+            SampleIndex(100),
+            SampleIndex(110),
+            SpanSource::Declared("/intervals/epochs"),
+        );
+        assert_eq!(presence_cv(&si([101]), span.clone(), 50), 3.0);
         assert_eq!(presence_cv(&si(100..110), span, 50), 0.0);
     }
 

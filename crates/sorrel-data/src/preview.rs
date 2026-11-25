@@ -32,7 +32,6 @@ pub fn preview_merge<P: DataProvider>(
 ) -> MergePreview {
     let sr = session.provider.sample_rate().max(1.0);
     let refractory_samples = session.refractory().fixed_samples(sr);
-    let span = session.provider.session_span();
 
     // Pre-merge target breakdown (session-level so isolation is included).
     let pre = crate::quality_ext::cluster_quality(session, target);
@@ -46,6 +45,7 @@ pub fn preview_merge<P: DataProvider>(
         }
     }
     let (times, amps) = merge_spike_data(session, &all);
+    let span = session.combined_unit_span(all.iter().copied());
 
     // Cheap baseline metrics from compute.
     let mut post = quality_breakdown(&times, &amps, refractory_samples, span, sr, PRESENCE_BINS);
@@ -86,7 +86,7 @@ pub fn preview_split<P: DataProvider>(
 ) -> SplitPreview {
     let sr = session.provider.sample_rate().max(1.0);
     let refractory_samples = session.refractory().fixed_samples(sr);
-    let span = session.provider.session_span();
+    let span = session.unit_span(cluster);
     let times = session.spike_times(cluster);
     let amps = session.spike_amplitudes(cluster);
     let has_amps = amps.len() == times.len();
@@ -122,7 +122,7 @@ pub fn preview_split<P: DataProvider>(
         }
     }
     let quality = |(t, a): &(Vec<SampleIndex>, Vec<f32>), parts: &[u8]| {
-        let mut q = quality_breakdown(t, a, refractory_samples, span, sr, PRESENCE_BINS);
+        let mut q = quality_breakdown(t, a, refractory_samples, span.clone(), sr, PRESENCE_BINS);
         q.isolation = preview_isolation(session, |g, _| parts.contains(&part[g]));
         q
     };

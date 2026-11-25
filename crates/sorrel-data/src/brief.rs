@@ -481,19 +481,15 @@ fn card<P: DataProvider>(
         )
     );
     let (times, amps) = (session.spike_times(c), session.spike_amplitudes(c));
-    let span = session.provider.session_span();
+    let span = session.unit_span(c);
     let total = span.duration_samples().max(1);
     let mut amp_t = "-".to_string();
     if amps.len() == times.len() && !times.is_empty() {
         let mut acc = [(0.0f32, 0u32); AMP_BINS];
-        for (t, &a) in times.iter().zip(amps) {
-            if span.source != sorrel_io::SpanSource::Trace && !(span.start..span.end).contains(t) {
-                continue;
-            }
-            let offset = t.0 - span.start.0;
+        for (i, offset) in span.recorded_offsets(times) {
             let b =
                 ((offset as u128 * AMP_BINS as u128 / total as u128) as usize).min(AMP_BINS - 1);
-            acc[b] = (acc[b].0 + a, acc[b].1 + 1);
+            acc[b] = (acc[b].0 + amps[i], acc[b].1 + 1);
         }
         let mean = amps.iter().sum::<f32>() / amps.len() as f32;
         let series: Vec<f32> = acc

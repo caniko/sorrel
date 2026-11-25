@@ -89,13 +89,14 @@ pub(crate) fn unit_stats_with(
     windows: RefractoryWindows<'_>,
 ) -> UnitStats {
     let span = span.into();
-    let (c, rp) = windows.sweep(span.metric_spikes(times), span.duration_samples(), sr);
+    let exposed = span.metric_spikes(times);
+    let (c, rp) = windows.sweep(&exposed, span.duration_samples(), sr);
     let refractory = windows.fixed_samples(sr);
     let q = quality_breakdown(times, amps, refractory, span, sr, PRESENCE_BINS);
     UnitStats {
         n: times.len(),
         rp_contamination: if rp > 0 { c } else { f32::NAN },
-        isi_violation_ratio: isi_violation_rate(times, refractory, sr),
+        isi_violation_ratio: isi_violation_rate(&exposed, refractory, sr),
         presence_ratio: q.raw_presence_ratio,
         amplitude_cutoff: q.raw_amp_cutoff,
         drift_correlation: q.raw_drift_corr,
@@ -144,10 +145,28 @@ pub(crate) fn eval_trains_with(
     span: impl Into<SessionSpan>,
     windows: RefractoryWindows<'_>,
 ) -> MergeEval {
-    let span = span.into();
+    eval_trains_with_spans(parts, sr, span.into(), &[], windows)
+}
+
+fn eval_trains_with_spans(
+    parts: &[(&[SampleIndex], &[f32])],
+    sr: f32,
+    span: SessionSpan,
+    part_spans: &[SessionSpan],
+    windows: RefractoryWindows<'_>,
+) -> MergeEval {
     let stats: Vec<UnitStats> = parts
         .iter()
-        .map(|&(t, a)| unit_stats_with(t, a, sr, span, windows))
+        .enumerate()
+        .map(|(i, &(t, a))| {
+            unit_stats_with(
+                t,
+                a,
+                sr,
+                part_spans.get(i).unwrap_or(&span).clone(),
+                windows,
+            )
+        })
         .collect();
     // ponytail: concat + stable sort, O(n log n); a k-way heap merge only
     // matters past ~10^7 spikes.
@@ -195,10 +214,16 @@ pub fn eval_merge<P: DataProvider>(session: &Session<P>, ids: &[ClusterId]) -> M
         .iter()
         .map(|&c| (session.spike_times(c), session.spike_amplitudes(c)))
         .collect();
-    let mut ev = eval_trains_with(
+    let part_spans: Vec<_> = ids.iter().map(|&c| session.unit_span(c)).collect();
+    let span = match part_spans.split_first() {
+        Some((first, rest)) => first.union_with(rest),
+        None => session.provider.session_span(),
+    };
+    let mut ev = eval_trains_with_spans(
         &parts,
         session.provider.sample_rate().max(1.0),
-        session.provider.session_span(),
+        span,
+        &part_spans,
         RefractoryWindows::Session(session.refractory()),
     );
     ev.ids = ids.iter().map(|c| c.0).collect();
@@ -252,7 +277,7 @@ pub(crate) fn eval_split_trains_with(
     SplitEval {
         cluster: 0,
         parts: [
-            unit_stats_with(&major.0, &major.1, sr, span, windows),
+            unit_stats_with(&major.0, &major.1, sr, span.clone(), windows),
             unit_stats_with(&minor.0, &minor.1, sr, span, windows),
         ],
         mean_amp: [mean(&major.1), mean(&minor.1)],
@@ -271,7 +296,7 @@ pub fn eval_split<P: DataProvider>(
         session.spike_amplitudes(cluster),
         minor_idx,
         session.provider.sample_rate().max(1.0),
-        session.provider.session_span(),
+        session.unit_span(cluster),
         RefractoryWindows::Session(session.refractory()),
     );
     ev.cluster = cluster.0;

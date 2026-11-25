@@ -243,8 +243,7 @@ where
     F: Fn(&P::Label) -> &'static str,
 {
     let keys = session.custom_label_keys();
-    let span = session.provider.session_span();
-    let duration = span.duration_samples() as f64 / session.provider.sample_rate().max(1.0) as f64;
+    let rate = session.provider.sample_rate().max(1.0) as f64;
     let mut text = String::from("cluster_id\tch\tfr\tamp\tn_spikes\tgroup");
     for k in &keys {
         text.push('\t');
@@ -284,6 +283,8 @@ where
             )
         };
         let group = session.label(c).map_or("", |l| label_str(&l));
+        let span = session.unit_span(c);
+        let duration = span.duration_samples() as f64 / rate;
         let fr = if duration > 0.0 {
             format!(
                 "{:.3}",

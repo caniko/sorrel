@@ -310,7 +310,7 @@ pub fn amplitude_view<P: DataProvider>(
                 stable_epochs(
                     session.spike_times(cluster),
                     session.spike_amplitudes(cluster),
-                    session.provider.session_span(),
+                    session.unit_span(cluster),
                     session.provider.sample_rate(),
                 )
             });
@@ -735,7 +735,7 @@ fn compute<P: DataProvider>(s: &Session<P>, key: &AmpKey, cancel: &AtomicBool) -
             (0.0, 1.0)
         },
         points,
-        duration: s.provider.session_span().duration_samples() as f32 / sr,
+        duration: s.provider.session_span().extent_samples() as f32 / sr,
         start_s: s.provider.session_span().start.as_f32() / sr,
         generation: GENERATION.fetch_add(1, Ordering::Relaxed),
     }

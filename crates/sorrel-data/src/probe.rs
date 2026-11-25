@@ -8,7 +8,7 @@
 use crate::brief::ACG_EDGES;
 use crate::cache::correlograms::{acg_or_compute, ccg_or_compute};
 use crate::evaluate::{
-    ccg_z, eval_merge, merge_edges, qm, qn, render_merge, unit_stats, Handles, UnitStats,
+    ccg_z, eval_merge, merge_edges, qm, qn, render_merge, unit_stats_with, Handles, UnitStats,
 };
 use crate::proposers::{cluster_feature_space, cluster_globals, core_split, kmeans_split};
 use crate::refractory::RefractoryWindows;
@@ -19,7 +19,7 @@ use sorrel_compute::{
     burst_index, gmm_split_proposal, log_bins, mean_amplitude, peak_channel, sax,
     waveform_landmarks, RefractoryParams,
 };
-use sorrel_io::{ClusterId, DataProvider, SampleIndex};
+use sorrel_io::{ClusterId, DataProvider, SampleIndex, SessionSpan, SpanSource};
 
 pub const GRAMMAR: &str = "probe grammar (ms for acg/ccg, seconds for window/epochs/split; [..] optional):
   acg C [win=50] [bin=1]
@@ -239,20 +239,19 @@ pub fn run<P: DataProvider>(
     q: &Query,
 ) -> Result<String, String> {
     let sr = session.provider.sample_rate().max(1.0);
-    let span = session.provider.session_span();
-    let total = span.duration_samples().max(1);
     let times = |c| session.spike_times(c);
     let samples = |ms: f32| (ms * sr / 1000.0).round() as u32;
     match q {
         Query::Acg { c, win, bin } => {
             let c = cl(session, *c)?;
+            let span = session.unit_span(c);
             let (b, w) = (samples(*bin).max(1), samples(*win));
             let h = acg_or_compute(session, c, b, w);
             Ok(acg_text(
                 c.0,
-                span.metric_spikes(times(c)),
+                &span.metric_spikes(times(c)),
                 sr,
-                total,
+                span.duration_samples().max(1),
                 &h,
                 b as f32 * 1000.0 / sr,
                 *win,
@@ -295,7 +294,7 @@ pub fn run<P: DataProvider>(
                 times(c),
                 session.spike_amplitudes(c),
                 sr,
-                total,
+                session.unit_span(c),
                 (*t0, *t1),
                 session.refractory(),
             )
@@ -316,7 +315,7 @@ pub fn run<P: DataProvider>(
             let epochs = stable_epochs(
                 times(c),
                 session.spike_amplitudes(c),
-                span,
+                session.unit_span(c),
                 session.provider.sample_rate(),
             );
             if epochs.is_empty() {
@@ -504,27 +503,43 @@ pub fn window_text(
     times: &[SampleIndex],
     amps: &[f32],
     sr: f32,
-    total: u64,
+    span: impl Into<SessionSpan>,
     (t0, t1): (f32, f32),
     params: &RefractoryParams,
 ) -> Result<String, String> {
-    let (lo, hi) = ((t0 * sr) as u64, ((t1 * sr) as u64).min(total));
-    if lo >= hi {
+    let span = span.into();
+    let lo = SampleIndex((t0 * sr) as u64).max(span.start);
+    let hi = SampleIndex((t1 * sr) as u64).min(span.end);
+    let window = if span.source == SpanSource::Trace {
+        SessionSpan::contiguous(lo, hi, SpanSource::Trace)
+    } else {
+        SessionSpan::from_intervals(
+            span.intervals()
+                .map(|(a, b)| (lo.max(a), hi.min(b)))
+                .collect(),
+            span.source,
+        )
+    };
+    if window.duration_samples() == 0 {
         return Err(format!(
             "window is outside the recording ({:.1}s)",
-            total as f32 / sr
+            span.end.as_f32() / sr
         ));
     }
     let (a, b) = (
-        times.partition_point(|t| t.0 < lo),
-        times.partition_point(|t| t.0 < hi),
+        times.partition_point(|&t| t < lo),
+        times.partition_point(|&t| t < hi),
     );
-    let shifted: Vec<SampleIndex> = times[a..b].iter().map(|t| SampleIndex(t.0 - lo)).collect();
     let has = amps.len() == times.len();
     let part_amps = if has { &amps[a..b] } else { &[] };
+    let part_count = window.metric_spikes(&times[a..b]).len();
+    let whole_count = span.metric_spikes(times).len();
+    let part_rate = part_count as f32 / window.duration_seconds(sr);
+    let whole_rate = whole_count as f32 / span.duration_seconds(sr);
+    let windows = RefractoryWindows::Session(params);
     let (part, whole) = (
-        unit_stats(&shifted, part_amps, sr, hi - lo, params),
-        unit_stats(times, if has { amps } else { &[] }, sr, total, params),
+        unit_stats_with(&times[a..b], part_amps, sr, window, windows),
+        unit_stats_with(times, if has { amps } else { &[] }, sr, span, windows),
     );
     let mean = |v: &[f32]| {
         if v.is_empty() {
@@ -539,12 +554,9 @@ pub fn window_text(
         "window {c} [{},{}]s (slice/whole): n {}/{} rate {} Hz rpc {} amp {} pres {}",
         qn(t0),
         qn(t1),
-        b - a,
-        times.len(),
-        pair(
-            (b - a) as f32 / ((hi - lo) as f32 / sr),
-            times.len() as f32 / (total as f32 / sr)
-        ),
+        part_count,
+        whole_count,
+        pair(part_rate, whole_rate),
         both(|s| s.rp_contamination),
         pair(mean(part_amps), mean(amps)),
         both(|s| s.presence_ratio),
