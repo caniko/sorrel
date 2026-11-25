@@ -176,7 +176,7 @@ both:
 - `out/qc/cluster_qc.tsv` — one row per cluster, header columns are
   metric names.
 - `out/qc/cluster_qc.json` — a versioned object: `schema_version: 2`,
-  `session_span`, and `clusters`. The `clusters` array is the previous
+  `session_span`, `provenance`, `composite_terms`, and `clusters`. The `clusters` array is the previous
   top-level array, with the same row fields. To read either version, use
   `doc if isinstance(doc, list) else doc["clusters"]` in Python.
 
@@ -191,9 +191,20 @@ its source as well.
 
 Firing rate and presence use the reported span, including when it is
 derived; neither is available when there is no span (`null` in JSON,
-blank in TSV). `isi_violation_ratio` is unchanged: it counts violations
+blank in TSV). `isi_violation_ratio` counts violations
 per second of that unit's own first-to-last spike span, not a fraction of
-spikes or a rate over the session.
+spikes or a rate over the session. It is missing when that unit has no
+positive spike span.
+
+Amplitude metrics require per-spike amplitudes, even if raw traces or
+waveform templates are available. Unmeasured metrics are `null` in JSON
+and blank in TSV, not zero. `composite_quality` is the equal-weight
+geometric mean of the measured subscores, with a floor of 0.001 per
+measured term. Missing terms are excluded from both the numerator (the
+sum of log scores) and the term count; with no measured terms the score
+is missing. The top-level JSON `composite_terms` map lists the terms used
+for each cluster ID: `isi` (refractory contamination), `presence`,
+`coverage`, `snr`, `completeness`, `stability`, and `isolation`.
 
 …and exits without spawning a window. The journal is replayed first, so
 the export reflects current curation.

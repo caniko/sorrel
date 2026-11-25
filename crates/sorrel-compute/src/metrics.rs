@@ -181,13 +181,18 @@ pub fn isi_violations(spike_times: &[SampleIndex], refractory_samples: u64) -> u
 
 /// ISI violations per second, useful as a noise indicator (legitimate
 /// neurons fire well below this rate after the refractory period).
+/// `NaN` without a usable spike-train span or refractory window.
 pub fn isi_violation_rate(
     spike_times: &[SampleIndex],
     refractory_samples: u64,
     sample_rate: f32,
 ) -> f32 {
-    if spike_times.len() < 2 || sample_rate <= 0.0 {
-        return 0.0;
+    if spike_times.len() < 2
+        || refractory_samples == 0
+        || !sample_rate.is_finite()
+        || sample_rate <= 0.0
+    {
+        return f32::NAN;
     }
     let n = isi_violations(spike_times, refractory_samples);
     let duration_s = (spike_times[spike_times.len() - 1]
@@ -195,7 +200,7 @@ pub fn isi_violation_rate(
         .saturating_sub(spike_times[0].0)) as f32
         / sample_rate;
     if duration_s <= 0.0 {
-        return 0.0;
+        return f32::NAN;
     }
     n as f32 / duration_s
 }
@@ -205,7 +210,7 @@ pub fn isi_violation_rate(
 /// positives (from other units), inferred from how many spike pairs fall
 /// inside the refractory window. `0.0` means no detectable contamination;
 /// values approach (and are clamped at) `1.0` for heavily contaminated units.
-/// Returns 0 when too few spikes to estimate.
+/// Returns `NaN` when too few spikes to estimate or exposure is unavailable.
 ///
 /// The estimator inverts the expected-violation relation
 /// `N_viol = 2·t_ref·N²·f_p·(1−f_p) / T` (Hill et al. 2011, J. Neurosci.
@@ -226,14 +231,14 @@ pub fn refractory_contamination(
     sample_rate: f32,
 ) -> f32 {
     if spike_times.len() < 2 || refractory_samples == 0 || total_duration_samples == 0 {
-        return 0.0;
+        return f32::NAN;
     }
     let n = spike_times.len() as f64;
     let viol = isi_violations(spike_times, refractory_samples) as f64;
     let total_s = total_duration_samples as f64 / sample_rate as f64;
     let rp_s = refractory_samples as f64 / sample_rate as f64;
-    if total_s <= 0.0 || rp_s <= 0.0 {
-        return 0.0;
+    if !total_s.is_finite() || total_s <= 0.0 || rp_s <= 0.0 {
+        return f32::NAN;
     }
     // Hill 2011 linearised false-positive fraction: N_viol·T / (2·t_ref·N²).
     let f_p = viol * total_s / (2.0 * rp_s * n * n);
@@ -416,7 +421,7 @@ fn refractory_argmin(
 /// Fraction of up to `n_bins` evenly-sized time bins that contain at least one
 /// spike. Closer to 1.0 indicates a unit that fires across the whole
 /// recording (good); closer to 0.0 indicates a unit only present in part of
-/// the recording (often drift / electrode contact loss).
+/// the recording (often drift / electrode contact loss). `NaN` without bins.
 pub fn presence_ratio(
     spike_times: &[SampleIndex],
     span: impl Into<sorrel_io::SessionSpan>,
@@ -426,7 +431,10 @@ pub fn presence_ratio(
     let total_duration_samples = span.duration_samples();
     let n_bins = n_bins.min(usize::try_from(total_duration_samples).unwrap_or(usize::MAX));
     let spike_times = span.metric_spikes(spike_times);
-    if spike_times.is_empty() || n_bins == 0 {
+    if n_bins == 0 {
+        return f32::NAN;
+    }
+    if spike_times.is_empty() {
         return 0.0;
     }
     let bin_width = total_duration_samples as f64 / n_bins as f64;
@@ -440,31 +448,31 @@ pub fn presence_ratio(
     count as f32 / n_bins as f32
 }
 
-/// Mean amplitude across the cluster's spikes. Returns 0 for an empty input.
+/// Mean amplitude across the cluster's spikes. Returns `NaN` for an empty input.
 pub fn mean_amplitude(amps: &[f32]) -> f32 {
     if amps.is_empty() {
-        return 0.0;
+        return f32::NAN;
     }
     amps.iter().sum::<f32>() / amps.len() as f32
 }
 
-/// Sample standard deviation of amplitudes (Bessel-corrected). Returns 0
+/// Sample standard deviation of amplitudes (Bessel-corrected). Returns `NaN`
 /// for fewer than 2 samples.
 pub fn std_amplitude(amps: &[f32]) -> f32 {
     if amps.len() < 2 {
-        return 0.0;
+        return f32::NAN;
     }
     let mean = mean_amplitude(amps);
     let var = amps.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / (amps.len() - 1) as f32;
     var.sqrt()
 }
 
-/// Crude amplitude SNR: |mean| / std. Returns 0 when std is 0 or input is
-/// empty. This is *not* the formal isolation SNR phylib computes from
-/// templates — that one needs full waveform extraction.
+/// Crude amplitude SNR: |mean| / std. Returns `NaN` for fewer than 2 samples
+/// and 0 for measured constant amplitudes. This is *not* phylib's formal
+/// isolation SNR — that one needs full waveform extraction.
 pub fn amplitude_snr(amps: &[f32]) -> f32 {
     if amps.len() < 2 {
-        return 0.0;
+        return f32::NAN;
     }
     let m = crate::distribution::Moments::from_f32(amps);
     let s = m.sample_std();
@@ -477,10 +485,10 @@ pub fn amplitude_snr(amps: &[f32]) -> f32 {
 /// Fraction of amplitudes below `threshold`. phylib's amplitude-cutoff
 /// metric estimates the fraction of *missed* spikes by looking at the
 /// shape of the amplitude distribution; this is a much cheaper proxy that's
-/// useful as a column in the cluster table.
+/// useful as a column in the cluster table. `NaN` without amplitudes.
 pub fn fraction_below(amps: &[f32], threshold: f32) -> f32 {
     if amps.is_empty() {
-        return 0.0;
+        return f32::NAN;
     }
     let n = amps.iter().filter(|&&a| a < threshold).count();
     n as f32 / amps.len() as f32
@@ -707,10 +715,11 @@ mod tests {
     }
 
     #[test]
-    fn isi_violation_rate_returns_zero_for_pathological_input() {
-        assert_eq!(isi_violation_rate(&[], 10, 1000.0), 0.0);
-        assert_eq!(isi_violation_rate(&si([5]), 10, 1000.0), 0.0);
-        assert_eq!(isi_violation_rate(&si([0, 5]), 10, 0.0), 0.0);
+    fn isi_violation_rate_is_missing_without_spike_span() {
+        assert!(isi_violation_rate(&[], 10, 1000.0).is_nan());
+        assert!(isi_violation_rate(&si([5]), 10, 1000.0).is_nan());
+        assert!(isi_violation_rate(&si([0, 5]), 10, 0.0).is_nan());
+        assert!(isi_violation_rate(&si([5, 5]), 10, 1000.0).is_nan());
     }
 
     #[test]
@@ -725,8 +734,8 @@ mod tests {
     #[test]
     fn presence_ratio_empty_returns_zero() {
         assert_eq!(presence_ratio(&[], 1000, 10), 0.0);
-        assert_eq!(presence_ratio(&si([1, 2, 3]), 0, 10), 0.0);
-        assert_eq!(presence_ratio(&si([1, 2, 3]), 100, 0), 0.0);
+        assert!(presence_ratio(&si([1, 2, 3]), 0, 10).is_nan());
+        assert!(presence_ratio(&si([1, 2, 3]), 100, 0).is_nan());
     }
 
     #[test]
@@ -768,13 +777,13 @@ mod tests {
 
     #[test]
     fn mean_amplitude_handles_empty() {
-        assert_eq!(mean_amplitude(&[]), 0.0);
+        assert!(mean_amplitude(&[]).is_nan());
     }
 
     #[test]
-    fn std_amplitude_returns_zero_for_short_inputs() {
-        assert_eq!(std_amplitude(&[]), 0.0);
-        assert_eq!(std_amplitude(&[5.0]), 0.0);
+    fn std_amplitude_is_missing_for_short_inputs() {
+        assert!(std_amplitude(&[]).is_nan());
+        assert!(std_amplitude(&[5.0]).is_nan());
     }
 
     #[test]
@@ -786,14 +795,14 @@ mod tests {
 
     #[test]
     fn amplitude_snr_zero_when_std_is_zero() {
-        assert_eq!(amplitude_snr(&[]), 0.0);
-        assert_eq!(amplitude_snr(&[5.0]), 0.0);
+        assert!(amplitude_snr(&[]).is_nan());
+        assert!(amplitude_snr(&[5.0]).is_nan());
         assert_eq!(amplitude_snr(&[5.0, 5.0, 5.0]), 0.0);
     }
 
     #[test]
     fn fraction_below_counts_strict_less_than() {
-        assert_eq!(fraction_below(&[], 1.0), 0.0);
+        assert!(fraction_below(&[], 1.0).is_nan());
         assert_eq!(fraction_below(&[0.5, 1.0, 2.0, 3.0], 1.0), 0.25);
         assert_eq!(fraction_below(&[0.5, 0.5, 0.5], 1.0), 1.0);
         assert_eq!(fraction_below(&[2.0, 3.0], 1.0), 0.0);

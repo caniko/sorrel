@@ -167,7 +167,7 @@ const EXTRA_FLAGS: [(&str, &str); 3] = [
     ("REV", "tagged review:* (waiting for a decision)"),
 ];
 
-/// Ledger shows units with a flag or composite quality below this.
+/// Ledger shows units with a flag, missing quality, or composite quality below this.
 const Q_CLEAN: f32 = 0.7;
 /// ACG lag edges (ms): whole ms (the ACG has 1 ms bins), finer near the
 /// refractory period; see the header for the reader's view.

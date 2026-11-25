@@ -179,6 +179,14 @@ pub(crate) fn num_cell(ui: &mut Ui, text: String, colour: Option<Color32>) {
     });
 }
 
+fn metric_text(value: f32, precision: usize) -> String {
+    if value.is_finite() {
+        format!("{value:.precision$}")
+    } else {
+        "—".into()
+    }
+}
+
 /// One-row parameter bar for plot panes: `primary` controls inline, the
 /// rest in a "⚙" popover, `caption` right-aligned and truncated (full
 /// text on hover). Keeps pane toolbars on one row at ~300 px.
@@ -534,7 +542,11 @@ pub fn selection_summary<P, F>(
                             times, amps, refractory, span, sr, 50,
                         )
                         .composite();
-                        num_cell(ui, format!("{q:.2}"), Some(theme.quality_colour(q)));
+                        num_cell(
+                            ui,
+                            metric_text(q, 2),
+                            q.is_finite().then(|| theme.quality_colour(q)),
+                        );
                         ui.end_row();
                     }
                 });
@@ -2001,13 +2013,18 @@ pub(crate) fn render_merge_table(
                         num_cell(ui, format!("{:+.1}", m.ccg_dip_z), None);
                     });
                     row.col(|ui| {
-                        num_cell(ui, format!("{:.2}", m.amp_ks), None);
+                        num_cell(ui, metric_text(m.amp_ks, 2), None);
                     });
                     row.col(|ui| {
-                        num_cell(ui, format!("{:.2}", m.amp_mean_delta), None);
+                        num_cell(ui, metric_text(m.amp_mean_delta, 2), None);
                     });
                     row.col(|ui| {
-                        let txt = format!("{:+.2}", preview.composite_delta);
+                        let d = preview.composite_delta;
+                        let txt = if d.is_finite() {
+                            format!("{d:+.2}")
+                        } else {
+                            "—".into()
+                        };
                         let colour = if preview.composite_delta < -0.05 {
                             theme.danger
                         } else if preview.composite_delta > 0.02 {
@@ -2018,7 +2035,12 @@ pub(crate) fn render_merge_table(
                         num_cell(ui, txt, Some(colour));
                     });
                     row.col(|ui| {
-                        let txt = format!("{:+.3}", preview.contamination_delta);
+                        let d = preview.contamination_delta;
+                        let txt = if d.is_finite() {
+                            format!("{d:+.3}")
+                        } else {
+                            "—".into()
+                        };
                         let colour = if preview.contamination_delta > 0.05 {
                             theme.danger
                         } else {
@@ -2129,16 +2151,16 @@ where
                         num_cell(ui, format!("{:.2}", s.score), None);
                     });
                     row.col(|ui| {
-                        num_cell(ui, format!("{:.2}", s.amp_bimodality), None);
+                        num_cell(ui, metric_text(s.amp_bimodality, 2), None);
                     });
                     row.col(|ui| {
-                        num_cell(ui, format!("{:.3}", s.amp_dip), None);
+                        num_cell(ui, metric_text(s.amp_dip, 3), None);
                     });
                     row.col(|ui| {
-                        num_cell(ui, format!("{:.3}", s.contamination), None);
+                        num_cell(ui, metric_text(s.contamination, 3), None);
                     });
                     row.col(|ui| {
-                        num_cell(ui, format!("{:.2}", s.drift_corr), None);
+                        num_cell(ui, metric_text(s.drift_corr, 2), None);
                     });
                     row.col(|ui| {
                         if s.gmm_bic_delta.is_finite() {
@@ -2373,8 +2395,8 @@ pub fn quality_view<P: DataProvider>(
                     row.col(|ui| {
                         num_cell(
                             ui,
-                            format!("{composite:.2}"),
-                            Some(theme.quality_colour(composite)),
+                            metric_text(composite, 2),
+                            composite.is_finite().then(|| theme.quality_colour(composite)),
                         );
                     });
                     for (s, tip) in &subs {
@@ -2392,7 +2414,13 @@ pub fn quality_view<P: DataProvider>(
                 if let Some(sp) = split.as_ref().filter(|sp| sp.cluster == c) {
                     for (name, part) in [("inside", &sp.inside), ("outside", &sp.outside)] {
                         let (score, d) = (part.composite(), part.composite() - composite);
-                        let tone = if d >= 0.0 { theme.good } else { theme.danger };
+                        let tone = if !d.is_finite() {
+                            theme.caption
+                        } else if d >= 0.0 {
+                            theme.good
+                        } else {
+                            theme.danger
+                        };
                         let fill = |ui: &mut Ui| {
                             ui.painter()
                                 .rect_filled(ui.max_rect(), 0.0, tone.gamma_multiply(0.14));
@@ -2414,7 +2442,11 @@ pub fn quality_view<P: DataProvider>(
                             // next column's header is a sub-score).
                             row.col(|ui| {
                                 fill(ui);
-                                num_cell(ui, format!("{score:.2} ({d:+.2})"), Some(tone));
+                                let mut text = metric_text(score, 2);
+                                if d.is_finite() {
+                                    text = format!("{text} ({d:+.2})");
+                                }
+                                num_cell(ui, text, Some(tone));
                             });
                             for _ in 1..n_cols {
                                 row.col(fill);
@@ -2430,6 +2462,10 @@ pub fn quality_view<P: DataProvider>(
 /// A coloured, right-aligned sub-score with its raw metric on hover.
 pub(crate) fn score_cell(ui: &mut Ui, theme: &Theme, s: f32, bold: bool, tip: String) {
     right_aligned(ui, |ui| {
+        if !s.is_finite() {
+            ui.label("—").on_hover_text("not measured");
+            return;
+        }
         let mut t = egui::RichText::new(format!("{s:.2}"))
             .monospace()
             .color(theme.quality_colour(s));

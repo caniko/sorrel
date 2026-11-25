@@ -158,13 +158,13 @@ impl RuleSet {
 }
 
 /// `v op threshold`, where an `op` starting with `|` compares `|v|`.
-/// `NaN` and unknown ops never hold. Shared by brief flags and rules.
+/// Missing/non-finite metrics and unknown ops never hold. Shared by brief flags and rules.
 pub fn cond_holds(op: &str, v: f32, threshold: f32) -> bool {
     let (op, v) = match op.strip_prefix('|') {
         Some(op) => (op, v.abs()),
         None => (op, v),
     };
-    !v.is_nan() && compare(op, v, threshold).unwrap_or(false)
+    v.is_finite() && compare(op, v, threshold).unwrap_or(false)
 }
 
 pub(crate) fn compare(op: &str, v: f32, threshold: f32) -> Result<bool> {

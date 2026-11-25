@@ -314,13 +314,8 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
             summaries.push(None);
             continue;
         }
-        let mean_amp = if amps.is_empty() {
-            f32::NAN
-        } else {
-            mean_amplitude(amps)
-        };
         summaries.push(Some(ClusterSummary {
-            mean_amp,
+            mean_amp: mean_amplitude(amps),
             n: times.len(),
         }));
     }
@@ -417,7 +412,7 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
                 let hi = sa.mean_amp.abs().max(sb.mean_amp.abs()).max(1e-6);
                 ((sa.mean_amp - sb.mean_amp).abs() / hi).min(1.0)
             } else {
-                0.0
+                f32::NAN
             };
             if amp_mean_delta > cfg.max_amp_mean_delta {
                 continue;
@@ -477,11 +472,7 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
             PairScore {
                 dip_score: refractory_dip_score(&analysis),
                 z: analysis.z,
-                amp_ks: if amps_a.is_empty() || amps_b.is_empty() {
-                    0.0
-                } else {
-                    ks_two_sample(amps_a, amps_b)
-                },
+                amp_ks: ks_two_sample(amps_a, amps_b),
             }
         })
         .collect();
@@ -500,16 +491,15 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
                 let s = s?;
                 // Missing amplitudes are absent evidence, not a perfect match:
                 // the amplitude terms contribute nothing.
-                let has_amps = !session.spike_amplitudes(a).is_empty()
-                    && !session.spike_amplitudes(b).is_empty();
-                let (amp_sim, amp_mean_sim) = if has_amps {
-                    (
-                        (1.0 - s.amp_ks).clamp(0.0, 1.0),
-                        (1.0 - amp_mean_delta).clamp(0.0, 1.0),
-                    )
-                } else {
-                    (0.0, 0.0)
+                let similarity = |distance: f32| {
+                    if distance.is_finite() {
+                        (1.0 - distance).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
                 };
+                let amp_sim = similarity(s.amp_ks);
+                let amp_mean_sim = similarity(amp_mean_delta);
 
                 // Weighted combination — refractory dip is the strongest single
                 // signal (0.6); amplitude evidence rounds it out (0.3 + 0.1).
@@ -596,7 +586,7 @@ fn score_split<P: DataProvider>(
     let bc = if amps.len() >= 8 {
         bimodality_coefficient(amps)
     } else {
-        0.0
+        f32::NAN
     };
     // Hartigan dip corroborates the moment-based BC. Blend via `max`
     // so the dip can only strengthen a detection the BC already
@@ -605,7 +595,7 @@ fn score_split<P: DataProvider>(
     let dip = if amps.len() >= 8 {
         hartigan_dip(amps)
     } else {
-        0.0
+        f32::NAN
     };
     // dip ≈ 0.02 is noise-level; ≳ 0.06 is a clear gap.
     let score_of = |bc: f32, dip: f32| {
@@ -654,9 +644,19 @@ fn score_split<P: DataProvider>(
         (gmm_delta.min(40.0) / 40.0 * 0.15).clamp(0.0, 0.15)
     };
 
-    let mut raw = ((0.6 * bc_score + 0.25 * cont_score + 0.15 * drift_score) * snr_gate
-        + gmm_bonus)
-        .clamp(0.0, 1.0);
+    // No SNR measurement means no amplitude-based score; the independent
+    // PC proposers below can still supply evidence.
+    let contribution = |score: f32| if score.is_finite() { score } else { 0.0 };
+    let mut raw = if snr_gate.is_finite() {
+        ((0.6 * contribution(bc_score)
+            + 0.25 * contribution(cont_score)
+            + 0.15 * contribution(drift_score))
+            * snr_gate
+            + gmm_bonus)
+            .clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     // PC-feature k-means is the stronger proposer: when it passes
     // its validation it replaces the GMM bipartition and lifts the
     // score to [0.5, 1] by silhouette.
@@ -891,6 +891,28 @@ mod tests {
         let mut s = Session::new(prov, journal);
         s.seed_amplitudes();
         (s, dir)
+    }
+
+    #[test]
+    fn suggestions_rank_without_treating_missing_amplitudes_as_a_match() {
+        let (session, _dir) = fresh_session(MockProvider {
+            spikes: [0, 5]
+                .iter()
+                .map(|&offset| (0..500).map(|i| SampleIndex(i * 10 + offset)).collect())
+                .collect(),
+            amps: vec![],
+            n_samples: SampleIndex(5000),
+        });
+        let cfg = SuggestConfig {
+            min_score: 0.0,
+            ..SuggestConfig::default()
+        };
+        let merges = rank_merge_candidates(&session, &cfg);
+        assert_eq!(merges.len(), 1);
+        let m = &merges[0];
+        assert!(m.amp_ks.is_nan() && m.amp_mean_delta.is_nan());
+        assert!(m.score.is_finite() && m.score <= 0.6);
+        assert!(rank_split_candidates(&session, &SuggestConfig::default()).is_empty());
     }
 
     #[test]

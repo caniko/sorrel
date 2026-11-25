@@ -22,8 +22,8 @@ fn time_amp_covariance(
     amps: &[f32],
     time_to_f64: impl Fn(SampleIndex) -> f64,
 ) -> Option<(f64, f64, f64)> {
-    let n = times.len().min(amps.len());
-    if n < 3 {
+    let n = times.len();
+    if n < 3 || n != amps.len() {
         return None;
     }
     let nf = n as f64;
@@ -46,12 +46,16 @@ fn time_amp_covariance(
 /// to `[-1, 1]`. Magnitude near 0 means amplitudes are stationary; large
 /// magnitude means a monotonic drift.
 ///
-/// Returns 0 for fewer than 3 spikes.
+/// Returns `NaN` without at least 3 paired samples spanning time; 0 for a
+/// measured constant amplitude across distinct times.
 pub fn amplitude_drift_correlation(times: &[SampleIndex], amps: &[f32]) -> f32 {
     let Some((num, denom_t, denom_a)) = time_amp_covariance(times, amps, |t| t.as_f64()) else {
-        return 0.0;
+        return f32::NAN;
     };
-    if denom_t <= 0.0 || denom_a <= 0.0 {
+    if denom_t <= 0.0 {
+        return f32::NAN;
+    }
+    if denom_a <= 0.0 {
         return 0.0;
     }
     (num / (denom_t * denom_a).sqrt()) as f32
@@ -60,31 +64,31 @@ pub fn amplitude_drift_correlation(times: &[SampleIndex], amps: &[f32]) -> f32 {
 /// Slope (Δamp / Δt, in amplitude-units per second) of a least-squares line
 /// fit through the (time, amplitude) cloud. Useful as an absolute drift
 /// magnitude rather than the unitless correlation. Sample rate is needed to
-/// convert from sample-indexed times to seconds.
+/// convert from sample-indexed times to seconds. `NaN` without at least 3
+/// paired samples spanning time or with an invalid sample rate.
 pub fn amplitude_drift_slope(times: &[SampleIndex], amps: &[f32], sample_rate: f32) -> f32 {
-    if sample_rate <= 0.0 {
-        return 0.0;
+    if !sample_rate.is_finite() || sample_rate <= 0.0 {
+        return f32::NAN;
     }
     let inv_sr = 1.0_f64 / sample_rate as f64;
     let Some((num, denom_t, _)) = time_amp_covariance(times, amps, |t| t.as_f64() * inv_sr) else {
-        return 0.0;
+        return f32::NAN;
     };
     if denom_t <= 0.0 {
-        return 0.0;
+        return f32::NAN;
     }
     (num / denom_t) as f32
 }
 
 /// Coefficient of variation (std / |mean|) of bin counts in a presence-bin
-/// histogram. Higher = more bursty / patchy presence. Drops to 0 for fewer
-/// than 2 non-empty bins.
+/// histogram. Higher = more bursty / patchy presence. `NaN` without counts.
 pub fn presence_cv(times: &[SampleIndex], span: impl Into<SessionSpan>, n_bins: usize) -> f32 {
     let span = span.into();
     let total_duration_samples = span.duration_samples();
     let n_bins = n_bins.min(usize::try_from(total_duration_samples).unwrap_or(usize::MAX));
     let times = span.metric_spikes(times);
     if times.is_empty() || n_bins == 0 {
-        return 0.0;
+        return f32::NAN;
     }
     let bin_width = total_duration_samples as f64 / n_bins as f64;
     let mut counts = vec![0u32; n_bins];
@@ -97,7 +101,7 @@ pub fn presence_cv(times: &[SampleIndex], span: impl Into<SessionSpan>, n_bins: 
     let counts_f32: Vec<f32> = counts.iter().map(|&c| c as f32).collect();
     let m = crate::distribution::Moments::from_f32(&counts_f32);
     if m.mean <= 0.0 {
-        return 0.0;
+        return f32::NAN;
     }
     (m.m2.sqrt() / m.mean) as f32
 }
@@ -172,12 +176,15 @@ pub fn sliding_refractory_contamination(
 
 /// Largest "gap" in the recording where this cluster is silent, expressed as
 /// a fraction of the total recording length. Useful to flag electrode drop:
-/// 0.05 = a 5%-of-recording silent stretch.
+/// 0.05 = a 5%-of-recording silent stretch. `NaN` without a recording span.
 pub fn longest_silent_gap_frac(times: &[SampleIndex], span: impl Into<SessionSpan>) -> f32 {
     let span = span.into();
     let times = span.metric_spikes(times);
     let total_duration_samples = span.duration_samples();
-    if times.is_empty() || total_duration_samples == 0 {
+    if total_duration_samples == 0 {
+        return f32::NAN;
+    }
+    if times.is_empty() {
         return 1.0;
     }
     let total = total_duration_samples;
@@ -217,8 +224,9 @@ mod tests {
 
     #[test]
     fn drift_correlation_handles_short_inputs() {
-        assert_eq!(amplitude_drift_correlation(&[], &[]), 0.0);
-        assert_eq!(amplitude_drift_correlation(&si([1, 2]), &[3.0, 4.0]), 0.0);
+        assert!(amplitude_drift_correlation(&[], &[]).is_nan());
+        assert!(amplitude_drift_correlation(&si([1, 2]), &[3.0, 4.0]).is_nan());
+        assert!(amplitude_drift_correlation(&si([1, 2, 3, 4]), &[3.0, 4.0, 5.0]).is_nan());
     }
 
     #[test]
@@ -322,7 +330,7 @@ mod tests {
         let times = vec![SampleIndex(100); 10];
         let amps = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0];
         let r = amplitude_drift_correlation(&times, &amps);
-        assert!(r.is_finite() && r.abs() < 1e-3);
+        assert!(r.is_nan());
     }
 
     #[test]
@@ -344,16 +352,16 @@ mod tests {
 
     #[test]
     fn drift_slope_handles_short_inputs() {
-        assert_eq!(amplitude_drift_slope(&[], &[], 1000.0), 0.0);
-        assert_eq!(amplitude_drift_slope(&si([100]), &[1.0], 1000.0), 0.0);
+        assert!(amplitude_drift_slope(&[], &[], 1000.0).is_nan());
+        assert!(amplitude_drift_slope(&si([100]), &[1.0], 1000.0).is_nan());
     }
 
     #[test]
     fn drift_slope_handles_zero_or_negative_sample_rate() {
         let times = si(0..10);
         let amps: Vec<f32> = (0..10).map(|i| i as f32).collect();
-        assert_eq!(amplitude_drift_slope(&times, &amps, 0.0), 0.0);
-        assert_eq!(amplitude_drift_slope(&times, &amps, -1.0), 0.0);
+        assert!(amplitude_drift_slope(&times, &amps, 0.0).is_nan());
+        assert!(amplitude_drift_slope(&times, &amps, -1.0).is_nan());
     }
 
     #[test]
@@ -365,16 +373,16 @@ mod tests {
     }
 
     #[test]
-    fn presence_cv_zero_inputs_return_finite() {
-        assert!(presence_cv(&[], 1000, 10).is_finite());
-        assert!(presence_cv(&si([1, 2, 3]), 0, 10).is_finite());
-        assert!(presence_cv(&si([1, 2, 3]), 1000, 0).is_finite());
+    fn presence_cv_is_missing_without_counts_or_bins() {
+        assert!(presence_cv(&[], 1000, 10).is_nan());
+        assert!(presence_cv(&si([1, 2, 3]), 0, 10).is_nan());
+        assert!(presence_cv(&si([1, 2, 3]), 1000, 0).is_nan());
     }
 
     #[test]
-    fn longest_silent_gap_zero_total_returns_finite() {
+    fn longest_silent_gap_is_missing_without_a_span() {
         let g = longest_silent_gap_frac(&si([100]), 0);
-        assert!(g.is_finite());
+        assert!(g.is_nan());
     }
 
     /// Property: longest gap is in [0, 1] for any valid input.

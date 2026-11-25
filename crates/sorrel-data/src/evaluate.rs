@@ -88,26 +88,17 @@ pub(crate) fn unit_stats_with(
     span: impl Into<SessionSpan>,
     windows: RefractoryWindows<'_>,
 ) -> UnitStats {
-    let has = !amps.is_empty() && amps.len() == times.len();
     let span = span.into();
     let (c, rp) = windows.sweep(span.metric_spikes(times), span.duration_samples(), sr);
     let refractory = windows.fixed_samples(sr);
-    let q = quality_breakdown(
-        times,
-        if has { amps } else { &[] },
-        refractory,
-        span,
-        sr,
-        PRESENCE_BINS,
-    );
-    let or_nan = |v: f32, ok: bool| if ok { v } else { f32::NAN };
+    let q = quality_breakdown(times, amps, refractory, span, sr, PRESENCE_BINS);
     UnitStats {
         n: times.len(),
-        rp_contamination: or_nan(c, rp > 0),
+        rp_contamination: if rp > 0 { c } else { f32::NAN },
         isi_violation_ratio: isi_violation_rate(times, refractory, sr),
         presence_ratio: q.raw_presence_ratio,
-        amplitude_cutoff: or_nan(q.raw_amp_cutoff, has),
-        drift_correlation: or_nan(q.raw_drift_corr, has),
+        amplitude_cutoff: q.raw_amp_cutoff,
+        drift_correlation: q.raw_drift_corr,
     }
 }
 
@@ -181,16 +172,12 @@ pub(crate) fn eval_trains_with(
             for j in i + 1..parts.len() {
                 let (dip_z, sync_z) = ccg_z(parts[i].0, parts[j].0, sr, windows.ccg_dip_bins());
                 let (a, b) = (parts[i].1, parts[j].1);
-                let amp_ks = match a.is_empty() || b.is_empty() {
-                    true => f32::NAN,
-                    false => ks_two_sample(a, b),
-                };
                 pairs.push(PairStats {
                     i,
                     j,
                     dip_z,
                     sync_z,
-                    amp_ks,
+                    amp_ks: ks_two_sample(a, b),
                 });
             }
         }

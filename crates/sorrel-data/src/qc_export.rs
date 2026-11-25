@@ -17,7 +17,9 @@ use crate::refractory::RefractoryWindows;
 use crate::session::Session;
 use anyhow::{Context, Result};
 use sorrel_compute::epochs::{stable_epochs, Epoch};
+use sorrel_compute::QualityBreakdown;
 use sorrel_io::{ClusterId, DataProvider};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -315,6 +317,15 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
     positions: Option<&[[f32; 2]]>,
     windows: RefractoryWindows<'_>,
 ) -> Vec<QcRow> {
+    collect_qc(session, positions, windows, |_, _| {})
+}
+
+fn collect_qc<P: DataProvider>(
+    session: &Session<P>,
+    positions: Option<&[[f32; 2]]>,
+    windows: RefractoryWindows<'_>,
+    mut record_terms: impl FnMut(ClusterId, &QualityBreakdown),
+) -> Vec<QcRow> {
     use sorrel_compute::{
         amplitude_drift_slope, burst_index, footprint, hartigan_dip, isi_violation_rate,
         isi_violations, mean_amplitude, peak_channel, refractory_evidence, waveform_landmarks,
@@ -337,18 +348,10 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
         let exposed = span.metric_spikes(times);
         let amps = session.spike_amplitudes(c);
         let q = cluster_quality_with(session, c, refractory_samples);
-        let mean_amp = if amps.is_empty() {
-            f32::NAN
-        } else {
-            mean_amplitude(amps)
-        };
+        record_terms(c, &q);
         let firing_rate = exposed.len() as f32 / total_seconds;
         let isi_v = isi_violations(times, refractory_samples) as u32;
-        let isi_ratio = if !times.is_empty() {
-            isi_violation_rate(times, refractory_samples, sr)
-        } else {
-            0.0
-        };
+        let isi_ratio = isi_violation_rate(times, refractory_samples, sr);
         let (iso2, l_ratio, nn, d_prime, silhouette) = match q.isolation {
             Some(iso) => (
                 iso.isolation_distance_sq,
@@ -404,7 +407,7 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
         rows.push(QcRow {
             cluster_id: c.0,
             n_spikes: times.len() as u32,
-            mean_amplitude: mean_amp,
+            mean_amplitude: mean_amplitude(amps),
             firing_rate_hz: firing_rate,
             presence_ratio: q.raw_presence_ratio,
             isi_violations: isi_v,
@@ -433,16 +436,8 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
             burst_index: burst_index(&acg, acg_bin as f32 * 1000.0 / sr),
             rp_estimate_ms: if rp > 0 { rp as f32 * 1000.0 / sr } else { nan },
             rp_contamination: if rp > 0 { rp_contam } else { nan },
-            amplitude_dip: if dip_amps.len() >= 4 {
-                hartigan_dip(&dip_amps)
-            } else {
-                nan
-            },
-            drift_slope: if amps.len() >= 2 && amps.len() == times.len() {
-                amplitude_drift_slope(times, amps, sr)
-            } else {
-                nan
-            },
+            amplitude_dip: hartigan_dip(&dip_amps),
+            drift_slope: amplitude_drift_slope(times, amps, sr),
             srp_contamination,
             srp_rp_ms,
             rpv_post_mean,
@@ -503,18 +498,22 @@ pub fn write_qc_json<P: AsRef<Path>>(rows: &[QcRow], path: P) -> Result<()> {
     write_qc_json_document(rows, path.as_ref(), None)
 }
 
+type CompositeTerms = BTreeMap<u32, Vec<&'static str>>;
+
 fn write_qc_json_document(
     rows: &[QcRow],
     path: &Path,
-    metadata: Option<(serde_json::Value, serde_json::Value)>,
+    metadata: Option<(serde_json::Value, serde_json::Value, CompositeTerms)>,
 ) -> Result<()> {
     let f = File::create(path).context("creating QC JSON file")?;
     let mut w = BufWriter::new(f);
-    if let Some((span, provenance)) = &metadata {
+    if let Some((span, provenance, terms)) = &metadata {
         write!(
             w,
-            "{{\"schema_version\":2,\"session_span\":{span},\"provenance\":{provenance},\"clusters\":"
+            "{{\"schema_version\":2,\"session_span\":{span},\"provenance\":{provenance},\"composite_terms\":"
         )?;
+        serde_json::to_writer(&mut w, terms)?;
+        w.write_all(b",\"clusters\":")?;
     }
     w.write_all(b"[")?;
     for (i, row) in rows.iter().enumerate() {
@@ -539,7 +538,15 @@ pub fn export_qc<P: DataProvider>(
 ) -> Result<usize> {
     let dir = out_dir.as_ref();
     std::fs::create_dir_all(dir).context("creating QC output dir")?;
-    let rows = collect_qc_rows_with(session, positions);
+    let mut terms = CompositeTerms::new();
+    let rows = collect_qc(
+        session,
+        positions,
+        RefractoryWindows::Session(session.refractory()),
+        |c, q| {
+            terms.insert(c.0, q.composite_terms().map(|(name, _)| name).collect());
+        },
+    );
     write_qc_tsv(&rows, dir.join("cluster_qc.tsv"))?;
     let p = &session.provider;
     let span = p.session_span();
@@ -559,6 +566,7 @@ pub fn export_qc<P: DataProvider>(
                 "source": span.source.to_string(),
             }),
             p.trace_provenance(),
+            terms,
         )),
     )?;
     Ok(rows.len())
@@ -654,7 +662,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn qc_uses_offset_spike_span_without_a_trace() {
+    fn qc_and_brief_use_offset_spike_span_without_amplitudes() {
         let dir = tempfile::tempdir().unwrap();
         let provider = |start: u64, trace_len| MockProvider {
             spikes: vec![(0..100).map(|i| SampleIndex(start + i * 10)).collect()],
@@ -674,7 +682,8 @@ pub(crate) mod tests {
             ),
             journal("units"),
         );
-        let row = collect_qc_rows(&units)[0].to_json();
+        let rows = collect_qc_rows(&units);
+        let row = rows[0].to_json();
         assert_eq!(row, collect_qc_rows(&trace)[0].to_json());
         assert_eq!(row["firing_rate"], 100.0);
         assert_eq!(row["presence_ratio"], 1.0);
@@ -685,6 +694,49 @@ pub(crate) mod tests {
         let qc: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("cluster_qc.json")).unwrap())
                 .unwrap();
+        let exported = &qc["clusters"][0];
+        for key in [
+            "mean_amplitude",
+            "amplitude_snr",
+            "amplitude_cutoff",
+            "drift_correlation",
+            "amplitude_dip",
+            "drift_slope",
+            "epoch_amp_ratio",
+        ] {
+            assert!(exported.get(key).unwrap().is_null(), "{key}");
+        }
+        let flags =
+            crate::brief::metric_flags(|key| exported[key].as_f64().unwrap_or(f64::NAN) as f32);
+        assert!(!flags
+            .iter()
+            .any(|f| ["LOWSNR", "CUT", "DRF", "BIMOD"].contains(f)));
+        let brief = crate::brief::render_brief(
+            &units,
+            &rows,
+            &[],
+            &[],
+            &[],
+            |_| "unsorted",
+            dir.path(),
+            &crate::brief::BriefOpts::default(),
+        );
+        assert!(!brief
+            .lines()
+            .any(|line| line.starts_with("mode:") && line.contains("LOWSNR")));
+        let q = crate::quality_ext::cluster_quality(&units, ClusterId(0));
+        let terms: Vec<_> = q.composite_terms().map(|(name, _)| name).collect();
+        assert_eq!(terms, ["isi", "presence", "coverage"]);
+        assert_eq!(qc["composite_terms"]["0"], serde_json::json!(terms));
+        assert!(
+            (q.composite() - (q.contamination_score * q.presence_score * q.coverage_score).cbrt())
+                .abs()
+                < 1e-6
+        );
+        assert!(
+            (exported["composite_quality"].as_f64().unwrap() - f64::from(q.composite())).abs()
+                < 1e-6
+        );
         assert_eq!(
             qc["session_span"],
             serde_json::json!({
@@ -711,7 +763,63 @@ pub(crate) mod tests {
             Journal::open(&dir.path().join("j")).unwrap(),
         );
         let row = collect_qc_rows(&session)[0].to_json();
-        assert!(row["firing_rate"].is_null() && row["presence_ratio"].is_null());
+        for key in [
+            "firing_rate",
+            "presence_ratio",
+            "longest_silent_gap",
+            "isi_violation_ratio",
+            "composite_quality",
+        ] {
+            assert!(row.get(key).unwrap().is_null(), "{key}");
+        }
+    }
+
+    #[test]
+    fn qc_with_amplitudes_preserves_the_six_term_composite() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new(
+            MockProvider {
+                spikes: vec![(0..100).map(|i| SampleIndex(i * 10)).collect()],
+                amps: vec![vec![3.0; 100]],
+                n_samples: SampleIndex(1000),
+            },
+            Journal::open(&dir.path().join("j")).unwrap(),
+        );
+        session.seed_amplitudes();
+        export_qc(&session, dir.path(), None).unwrap();
+        let qc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("cluster_qc.json")).unwrap())
+                .unwrap();
+        let row = &qc["clusters"][0];
+        for (name, value) in [
+            ("mean_amplitude", 3.0),
+            ("amplitude_cutoff", 0.0),
+            ("amplitude_snr", 0.0),
+            ("drift_correlation", 0.0),
+            ("drift_slope", 0.0),
+        ] {
+            assert_eq!(row[name].as_f64(), Some(value), "{name}");
+        }
+        let expected = ((0.99_f32.ln() + 0.001_f32.ln()) / 6.0).exp();
+        assert_eq!(
+            row["composite_quality"],
+            serde_json::json!(num(expected).parse::<f64>().unwrap())
+        );
+        let q = crate::quality_ext::cluster_quality(&session, ClusterId(0));
+        let terms: Vec<_> = q.composite_terms().map(|(name, _)| name).collect();
+        assert_eq!(
+            terms,
+            [
+                "isi",
+                "presence",
+                "coverage",
+                "snr",
+                "completeness",
+                "stability"
+            ]
+        );
+        assert_eq!(q.composite().to_bits(), expected.to_bits());
+        assert_eq!(qc["composite_terms"]["0"], serde_json::json!(terms));
     }
 
     #[test]

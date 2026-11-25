@@ -217,7 +217,8 @@ pub fn kmeans_split_proposal(
 
     let largest = (0..k).max_by_key(|&j| parts[j].len())?;
     let all: Vec<u32> = (0..n as u32).collect();
-    if contamination(&parts[largest]) > contamination(&all) {
+    let (part, whole) = (contamination(&parts[largest]), contamination(&all));
+    if !part.is_finite() || !whole.is_finite() || part > whole {
         return None;
     }
     let mut minor_idx: Vec<u32> = parts
