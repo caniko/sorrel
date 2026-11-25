@@ -1916,6 +1916,13 @@ impl ApplyPhyLabel for sorrel_io::SortingAnalyzerProvider {
     }
 }
 
+impl ApplyPhyLabel for sorrel_io::NttProvider {
+    #[inline]
+    fn label_from_op(op: PhyLabelOp) -> Self::Label {
+        sorrel_io::KilosortProvider::label_from_op(op)
+    }
+}
+
 #[cfg(any(feature = "hdf5", feature = "zarr"))]
 impl ApplyPhyLabel for sorrel_io::NwbProvider {
     #[inline]

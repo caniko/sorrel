@@ -185,6 +185,7 @@ pub struct SorrelApp<P: DataProvider + ApplyPhyLabel> {
     /// Directory to write `spike_clusters.npy` / `cluster_group.tsv` into
     /// when the user triggers a save. Cmd/Ctrl-S is a no-op when unset.
     save_dir: Option<PathBuf>,
+    stored_snippets: bool,
     session_key: Option<String>,
     mcp_registry_key: Option<String>,
     /// See [`SorrelApp::set_save_dir`].
@@ -358,6 +359,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             std::env::current_exe().map_or_else(|_| "unknown".into(), |p| p.display().to_string())
         );
         let window_len = (session.provider.sample_rate() as u32).max(1) / 10; // 100 ms
+        let stored_snippets = session.provider.stored_snippet_window().is_some();
         let host = Arc::new(SessionHost::new(session));
         let repaint = Arc::new(std::sync::OnceLock::<egui::Context>::new());
         let host_events = host.subscribe(waker(&repaint));
@@ -374,6 +376,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             target_points: 1024,
             error: None,
             save_dir: None,
+            stored_snippets,
             session_key: None,
             mcp_registry_key: None,
             reseal_on_save: false,
@@ -908,14 +911,20 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         });
     }
 
+    fn dataset_name(&self) -> Option<String> {
+        let name = self.save_dir.as_deref()?.file_name()?.to_string_lossy();
+        // Keep the source filename, not its artifact-directory suffix.
+        if let Some(source) = name.strip_suffix(".sorrel").filter(|source| {
+            self.stored_snippets && sorrel_io::detect::is_ntt_path(Path::new(source))
+        }) {
+            return Some(source.to_owned());
+        }
+        Some(name.into_owned())
+    }
+
     /// OS window title: dataset name + dirty marker.
     pub fn window_title(&self) -> String {
-        let dataset = self
-            .save_dir
-            .as_deref()
-            .and_then(Path::file_name)
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let dataset = self.dataset_name().unwrap_or_default();
         match (dataset.is_empty(), self.dirty()) {
             (true, false) => "Sorrel".to_string(),
             (true, true) => "Sorrel •".to_string(),
@@ -2774,10 +2783,7 @@ impl<P: DataProvider + ApplyPhyLabel> crate::shell::Tab for SorrelApp<P> {
         eframe::App::ui(self, ui, frame);
     }
     fn label(&self) -> String {
-        self.save_dir
-            .as_deref()
-            .and_then(Path::file_name)
-            .map_or_else(|| "Sorrel".into(), |s| s.to_string_lossy().into_owned())
+        self.dataset_name().unwrap_or_else(|| "Sorrel".into())
     }
     fn dataset(&self) -> &Path {
         self.save_dir.as_deref().unwrap_or(Path::new(""))

@@ -226,7 +226,7 @@ impl NttProvider {
         let mut amplitudes = Vec::with_capacity(count as usize);
         let mut next = 0;
         for &i in &order {
-            let delta = ((timestamp(i) - t0_us) as f64 * (sample_rate / 1e6)).round();
+            let delta = ((timestamp(i) - t0_us) as f64 * sample_rate / 1e6).round();
             ensure!(delta < u64::MAX as f64, "spike sample index overflows");
             let nominal = (delta as u64)
                 .checked_add(u64::from(pre))
@@ -645,6 +645,20 @@ mod tests {
         f.write_all(&[4]).unwrap();
         drop(f);
         assert_ne!(id, NttProvider::open(&copy).unwrap().identity_bytes());
+    }
+
+    #[test]
+    fn nominal_sample_midpoints_round_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("midpoint.ntt");
+        let fixture = NttFixture {
+            header: b"-SamplingFrequency 44000\n-ADBitVolts 1e-6".to_vec(),
+            spikes: vec![(1000, [[0; 4]; 32]), (1125, [[0; 4]; 32])],
+        };
+        write_ntt(&path, &fixture).unwrap();
+        let p = NttProvider::open(&path).unwrap();
+        // 125 µs at 44 kHz is 5.5 samples. Round before adding the alignment.
+        assert_eq!(p.spike_times(ClusterId(0)), [7, 13].map(SampleIndex));
     }
 
     #[test]
