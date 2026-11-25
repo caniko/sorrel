@@ -4,9 +4,20 @@
   root,
 }: let
   inherit ((builtins.fromTOML (builtins.readFile (root + "/Cargo.toml"))).workspace.package) version;
+  inherit (pkgs) lib;
+  project = builtins.fromTOML (builtins.readFile (root + "/website/plinth-project.toml"));
+  download = lib.findFirst (page: page.slug == "download") {} project.pages;
+  install = lib.findFirst (section: (section.id or "") == "downloads") {} download.sections;
+  releaseBase = "https://github.com/caniko/sorrel/releases/";
+  releaseLinks = builtins.filter (lib.hasPrefix releaseBase) (map (route: route.href) install.primary_routes);
+  pinnedToVersion = href: href == "${releaseBase}tag/${version}" || lib.hasPrefix "${releaseBase}download/${version}/" href;
+  websiteVersion =
+    if releaseLinks != [] && builtins.all pinnedToVersion releaseLinks
+    then version
+    else throw "Download links in website/plinth-project.toml must target Sorrel ${version} (workspace version in Cargo.toml).";
   website = pkgs.stdenv.mkDerivation {
     pname = "sorrel-website";
-    inherit version;
+    version = websiteVersion;
     src = pkgs.lib.fileset.toSource {
       inherit root;
       fileset = pkgs.lib.fileset.unions [
