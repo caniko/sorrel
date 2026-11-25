@@ -207,7 +207,7 @@ mod imp {
                 series,
             )) = &series
             {
-                let data = series.dataset("data")?;
+                let data = series.trace_data()?;
                 let shape = data.shape();
                 let (n_samples, n_channels) = (shape[0], shape.get(1).copied().unwrap_or(1));
                 let (stored_rate, t0, timestamps) = read_time_base(recording, name, n_samples)?;

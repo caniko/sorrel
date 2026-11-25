@@ -299,6 +299,48 @@ pub(super) fn local_dataset(file: &hdf5::Group, path: &str) -> Result<hdf5::Data
     Ok(ds)
 }
 
+pub(super) fn local_trace_dataset(group: &hdf5::Group, path: &str) -> Result<hdf5::Dataset> {
+    use hdf5::plist::DatasetAccess;
+    use hdf5_metno_sys::h5d::H5Dopen2;
+    use std::ffi::CString;
+
+    let ds = local_dataset(group, path)?;
+    let Some(chunk) = ds.dcpl()?.get_chunk()? else {
+        return Ok(ds);
+    };
+    let channel_chunks = match (chunk.as_slice(), ds.space()?.shape().as_slice()) {
+        ([_], [_]) => 1,
+        ([_, chunk_channels], [_, channels]) => channels.div_ceil(*chunk_channels),
+        _ => return Ok(ds),
+    };
+    // ponytail: cap at 256 MiB per open trace; use channel-subset reads if a
+    // complete time tile no longer fits.
+    let tile_bytes = chunk
+        .iter()
+        .fold(ds.dtype()?.size(), |bytes, &dim| bytes.saturating_mul(dim))
+        .saturating_mul(channel_chunks)
+        .min(256 * 1024 * 1024);
+    let default = ds.dapl()?.get_chunk_cache()?;
+    if tile_bytes <= default.nbytes {
+        return Ok(ds);
+    }
+
+    // Use a prime slot count to limit collisions without scaling memory
+    // with the number of small chunks in a time tile.
+    let dapl = DatasetAccess::build()
+        .chunk_cache(12_421, tile_bytes, default.w0)
+        .finish()?;
+    let name = CString::new(path)?;
+    hdf5::sync::sync(|| {
+        // HDF5 shares the cache across open handles. Close the probe first.
+        drop(ds);
+        // SAFETY: the group and DAPL are live under the HDF5 lock; the name
+        // is the same checked hard path, and from_id owns the returned ID.
+        unsafe { hdf5::from_id(H5Dopen2(group.id(), name.as_ptr(), dapl.id())) }
+    })
+    .with_context(|| format!("cannot reopen HDF5 trace dataset {path}"))
+}
+
 pub(super) fn check_dataset_storage(ds: &hdf5::Dataset) -> Result<()> {
     use hdf5::plist::dataset_create::Layout;
     use hdf5_metno_sys::h5p::H5Pget_external_count;

@@ -175,11 +175,21 @@ impl Group {
             .with_context(|| format!("missing NWB dataset {path}"))
     }
 
+    pub fn trace_data(&self) -> Result<Dataset> {
+        self.open_dataset("data", true)?
+            .context("missing NWB dataset data")
+    }
+
     /// `None` means absent, not a broken link, wrong node type, or open error.
     pub fn optional_dataset(&self, path: &str) -> Result<Option<Dataset>> {
+        self.open_dataset(path, false)
+    }
+
+    fn open_dataset(&self, path: &str, _trace: bool) -> Result<Option<Dataset>> {
         dispatch!(self, Self, g => {
             let Some(resolved) = hdf::resolve_local_path(g, path, true)? else { return Ok(None); };
-            hdf::local_dataset(g, &resolved).map(Dataset::Hdf5).map(Some)
+            let open = if _trace { hdf::local_trace_dataset } else { hdf::local_dataset };
+            open(g, &resolved).map(Dataset::Hdf5).map(Some)
         }, g.local_path(path)?.map(|path| g.open_dataset(&path, false).map(|d| Dataset::Zarr(Box::new(d)))
             .with_context(|| format!("open Zarr dataset {path}"))).transpose())
     }
@@ -226,6 +236,44 @@ impl Group {
             Ok(Some(_g.dataset(&path)?.ndim()))
         }, { let _ = name; Ok(None) })
     }
+}
+
+#[cfg(all(test, feature = "hdf5"))]
+#[test]
+fn trace_chunk_cache_holds_one_time_tile() {
+    const MIB: usize = 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let file = h5::File::create(dir.path().join("trace.nwb")).unwrap();
+    let chunked = file.create_group("chunked").unwrap();
+    chunked
+        .new_dataset::<i16>()
+        .shape((2 * MIB, 5))
+        .chunk((MIB, 2))
+        .create("data")
+        .unwrap();
+    let contiguous = file.create_group("contiguous").unwrap();
+    contiguous
+        .new_dataset::<i16>()
+        .shape((4, 5))
+        .create("data")
+        .unwrap();
+
+    let cache = |group: h5::Group| {
+        let data = match Group::Hdf5(group).trace_data().unwrap() {
+            Dataset::Hdf5(data) => data,
+            #[cfg(feature = "zarr")]
+            Dataset::Zarr(_) => unreachable!(),
+        };
+        data.dapl().unwrap().get_chunk_cache().unwrap()
+    };
+    assert_eq!(
+        cache(contiguous),
+        file.fapl().unwrap().get_chunk_cache().unwrap()
+    );
+    let cache = cache(chunked);
+    assert_eq!(cache.nbytes, 12 * MIB); // Three 4 MiB chunks, including the partial channel chunk.
+    assert!(cache.nslots > 300);
+    assert_eq!(cache.w0, 0.75);
 }
 
 pub(super) fn local_identity(path: &Path) -> Result<Vec<u8>> {
