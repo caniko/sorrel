@@ -27,7 +27,7 @@
 
     # Static project-site generator for the landing page (built via crane below).
     plinth = {
-      url = "git+https://github.com/caniko/plinth.git?ref=trunk&rev=fa783dda2f2fd339e2bc3daa8b5436f4e787f9e3";
+      url = "git+https://github.com/caniko/plinth.git?ref=fix/install-route-labels&rev=0e3a7d20bbae90459c74c9637a03ea80f61e83af";
       flake = false;
     };
   };
