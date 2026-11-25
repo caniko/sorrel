@@ -8,13 +8,17 @@ compute kernels are all statically dispatched.
 ## Open
 
 1. `detect_backend` inspects the path (file vs directory, marker files,
-   extension) and picks one of `Kilosort`, `SortingAnalyzer`, `Nwb`, or
-   `Ks4Rez`. `--backend` skips the detector.
+   extension) and picks one of `Kilosort`, `SortingAnalyzer`, `Neuralynx`,
+   `Nwb`, or `Ks4Rez`. `--backend` skips the detector.
 2. The chosen provider opens its inputs:
    - Kilosort / phy mmaps `spike_times.npy`, `spike_clusters.npy`, and
      the raw `.dat`; reads optional artefacts for templates, PC
      features, amplitudes, similarity, probe geometry, and quality
      metric sidecars.
+   - Neuralynx mmaps one `.ntt` and builds a time-sorted record index, a
+     strictly increasing sample time per spike and peak-to-peak
+     amplitudes in µV. Its content hash seals the journal; the unsorted
+     pool, like other backends' initial sorts, is rebuilt before replay.
    - Other backends do the equivalent for their formats.
 3. `Session::new` holds the provider and journal. `seed_*` calls bucket
    amplitudes, templates, PC features, and template waveforms once so
@@ -29,7 +33,9 @@ Derived artifacts that have cache support consult
 `<dataset>/.sorrel/cache/` first using the provider identity, current
 journal head, artifact algorithm version, parameters, and any
 per-cluster spike fingerprints. Misses fall through to the existing
-compute path and then write an archive for the next open.
+compute path and then write an archive for the next open. For `.ntt`,
+the cache root is beside the journal, not inside the tetrode's
+`<filename>.sorrel/` artifact directory.
 
 The journal head is the invalidation point. Applying a
 `CurationCommand` records the previous head and affected cluster
@@ -59,8 +65,9 @@ transition.
 ## Save
 
 `Cmd/Ctrl-S` writes `spike_clusters.npy` + `cluster_group.tsv` into the
-save directory and journals a seal. Replays still start from the original
-sort, kept in `sorrel_original/` for phy directories.
+save directory. A phy save also journals a seal; replay starts from the
+original sort in `sorrel_original/`. Neuralynx writes its assignments to
+`<filename>.sorrel/` in time order and replays from the untouched `.ntt`.
 
 ## Render
 
@@ -70,3 +77,10 @@ The trace view assembles a window of the raw trace, optionally runs CMR
   `TraceVertex` buffers consumed by the wgpu pipeline. Other views
   (raster, ISI, CCG, features, drift map…) build their geometry directly
   in egui from the per-cluster slice borrows the session exposes.
+
+A provider with no continuous recording can supply stored per-spike
+waveforms through `stored_snippet_window()` and `stored_snippet(t, out)`.
+Waveforms, computed PCs and raw amplitudes request the provider's exact
+window at the spike's immutable sample index; edits only change which
+cluster owns that spike. Stored snippets bypass trace CMR and high-pass
+filtering.

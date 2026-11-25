@@ -10,7 +10,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use eframe::egui_wgpu::RenderState;
-#[cfg(any(feature = "hdf5", feature = "zarr"))]
 use sorrel_data::baseline_hash;
 use sorrel_data::session::ApplyPhyLabel;
 use sorrel_data::InstanceRequest;
@@ -19,13 +18,12 @@ use sorrel_data::{
     rank_split_candidates, save_session as save_dir_session, save_to_phy, serve, write_report,
     Journal, ReportFilter, RuleSet, Session, SuggestConfig,
 };
-#[cfg(any(feature = "hdf5", feature = "zarr"))]
 use sorrel_io::detect_sorter;
 use sorrel_io::kilosort::{read_cluster_group_tsv, KilosortOpenParams, PhyLabel};
 use sorrel_io::open_ephys::OebinMeta;
 use sorrel_io::spikeglx::SpikeGlxMeta;
 use sorrel_io::{
-    DataProvider, Events, HasGeometry, HasQualityMetrics, KilosortProvider, TraceDtype,
+    DataProvider, Events, HasGeometry, HasQualityMetrics, KilosortProvider, NttProvider, TraceDtype,
 };
 use sorrel_ui::{OpenRequest, Opened, Opener, Shell, SorrelApp, Tab};
 use std::path::{Path, PathBuf};
@@ -40,6 +38,7 @@ mod rescue;
 enum Backend {
     Kilosort,
     SortingAnalyzer,
+    Neuralynx,
     #[cfg(any(feature = "hdf5", feature = "zarr"))]
     Nwb,
     #[cfg(feature = "hdf5")]
@@ -456,10 +455,10 @@ enum LlmBackend {
 struct OpenArgs {
     #[command(flatten)]
     refractory: RefractoryArgs,
-    /// phy / Kilosort, SortingAnalyzer, NWB (local, DANDI or HTTPS), or legacy MATLAB rez.mat
+    /// phy / Kilosort, SortingAnalyzer, Neuralynx .ntt, NWB (local, DANDI or HTTPS), or legacy MATLAB rez.mat
     #[arg(value_name = "DATA_DIR", required = true)]
     root: Option<PathBuf>,
-    /// kilosort | sorting-analyzer | nwb | rez (legacy alias: ks4-rez)
+    /// kilosort | sorting-analyzer | neuralynx | nwb | rez (legacy alias: ks4-rez)
     #[arg(long, value_name = "NAME", value_parser = parse_backend)]
     backend: Option<Backend>,
     /// Raw recording (overrides params.py:dat_path, or pairs NWB units with a raw NWB)
@@ -628,6 +627,7 @@ fn parse_backend(s: &str) -> std::result::Result<Backend, String> {
     Ok(match s {
         "kilosort" | "phy" => Backend::Kilosort,
         "sorting-analyzer" | "spikeinterface" | "si" => Backend::SortingAnalyzer,
+        "neuralynx" | "ntt" => Backend::Neuralynx,
         #[cfg(any(feature = "hdf5", feature = "zarr"))]
         "nwb" => Backend::Nwb,
         #[cfg(not(any(feature = "hdf5", feature = "zarr")))]
@@ -664,15 +664,25 @@ fn journal_opts(open: &OpenArgs) -> sorrel_data::JournalOpts {
 }
 
 /// `--journal`, else `<dir>/<stem>.journal` (see [`sorrel_data::journal_path`]).
-#[cfg(any(feature = "hdf5", feature = "zarr"))]
 fn journal_path(open: &OpenArgs, dir: &Path, stem: &str) -> PathBuf {
     sorrel_data::journal_path(&journal_opts(open), dir, stem)
 }
 
 /// Open the journal sealed against `baseline`, honouring `--discard-journal`.
-#[cfg(any(feature = "hdf5", feature = "zarr"))]
-fn open_journal(open: &OpenArgs, path: &Path, baseline: u64, n_clusters: u32) -> Result<Journal> {
-    sorrel_data::open_journal(&journal_opts(open), path, baseline, n_clusters).map_err(|e| {
+fn open_journal(
+    open: &OpenArgs,
+    path: &Path,
+    baseline: u64,
+    n_clusters: u32,
+    backend: sorrel_io::Backend,
+) -> Result<Journal> {
+    let opts = journal_opts(open);
+    let result = if backend == sorrel_io::Backend::Neuralynx {
+        sorrel_data::open::open_journal_with_source(&opts, path, baseline, n_clusters, ".ntt file")
+    } else {
+        sorrel_data::open_journal(&opts, path, baseline, n_clusters)
+    };
+    result.map_err(|e| {
         if open.has_remote_input() && e.is::<sorrel_data::journal::JournalBusy>() {
             anyhow::anyhow!("{e}: stop the running session or pass a different --journal")
         } else {
@@ -689,6 +699,7 @@ fn detect_backend(root: &Path) -> Result<Backend> {
         bail!("remote NWB datasets require building with --features dandi");
     }
     Ok(match sorrel_io::detect_backend(root)? {
+        sorrel_io::Backend::Neuralynx => Backend::Neuralynx,
         sorrel_io::Backend::Kilosort => Backend::Kilosort,
         sorrel_io::Backend::SortingAnalyzer => Backend::SortingAnalyzer,
         sorrel_io::Backend::Nwb => {
@@ -874,6 +885,60 @@ fn with_session_refractory<V: SessionVisitor>(
                 },
             )
         }
+        Backend::Neuralynx => {
+            let path = open.root();
+            anyhow::ensure!(
+                sorrel_io::detect::is_ntt_path(path) && !path.is_dir(),
+                "Neuralynx opens one .ntt tetrode file at a time"
+            );
+            anyhow::ensure!(
+                open.dat.is_none(),
+                ".ntt cannot be paired with a --dat recording"
+            );
+            let ignored: Vec<_> = [
+                (open.sample_rate.is_some(), "--sample-rate"),
+                (open.n_channels.is_some(), "--channels"),
+                (open.dtype.is_some(), "--dtype"),
+                (open.offset.is_some(), "--offset"),
+                (open.spikeglx_meta.is_some(), "--spikeglx-meta"),
+                (open.oebin.is_some(), "--oebin"),
+                #[cfg(any(feature = "hdf5", feature = "zarr"))]
+                (open.nwb_series.is_some(), "--nwb-series"),
+            ]
+            .into_iter()
+            .filter_map(|(given, flag)| given.then_some(flag))
+            .collect();
+            if !ignored.is_empty() {
+                log::warn!(
+                    "ignoring {} for Neuralynx: the .ntt header is authoritative",
+                    ignored.join(", ")
+                );
+            }
+            let provider = NttProvider::open(path)?;
+            let (mut session, mut ctx) =
+                open_file_backed(open, provider, path, "ntt", sorrel_io::Backend::Neuralynx)?;
+            session
+                .set_refractory(refractory)
+                .map_err(anyhow::Error::msg)?;
+            ctx.save_dir = file_artifact_dir(path);
+            let sidecar = ctx.save_dir.join("ntt_source.json");
+            let write_source = || -> Result<()> {
+                std::fs::create_dir_all(&ctx.save_dir)
+                    .with_context(|| format!("create {}", ctx.save_dir.display()))?;
+                session.provider.write_source(&sidecar)
+            };
+            if let Err(err) = write_source() {
+                log::warn!("could not update {}: {err:#}", sidecar.display());
+            }
+            v.visit(
+                session,
+                Box::new(|s| {
+                    s.seed_amplitudes();
+                    s.replay_journal()
+                }),
+                ctx,
+            )
+        }
         #[cfg(any(feature = "hdf5", feature = "zarr"))]
         Backend::Nwb => {
             let path = open.root().to_path_buf();
@@ -949,7 +1014,6 @@ fn with_session_refractory<V: SessionVisitor>(
 }
 
 /// Wrap `Session::new` and name the sorter: `--sorter`, else the saved pin, else detected from the data.
-#[cfg(any(feature = "hdf5", feature = "zarr"))]
 fn new_session<P: DataProvider>(
     provider: P,
     journal: Journal,
@@ -1103,8 +1167,7 @@ fn run_join(
     )
 }
 
-/// NWB and rez.mat journals and save artifacts live beside the file or store.
-#[cfg(any(feature = "hdf5", feature = "zarr"))]
+/// File-backed journals live beside the input file or store.
 fn open_file_backed<P>(
     open: &OpenArgs,
     provider: P,
@@ -1123,8 +1186,26 @@ where
             .unwrap_or(fallback_stem)
     );
     let journal_path = journal_path(open, &parent, &stem);
+    if backend == sorrel_io::Backend::Neuralynx
+        && journal_path
+            .canonicalize()
+            .ok()
+            .zip(path.canonicalize().ok())
+            .is_some_and(|(journal, source)| journal == source)
+    {
+        bail!(
+            "journal {} aliases the .ntt source file",
+            journal_path.display()
+        );
+    }
     let baseline = baseline_hash(&provider.identity_bytes());
-    let journal = open_journal(open, &journal_path, baseline, provider.n_clusters())?;
+    let journal = open_journal(
+        open,
+        &journal_path,
+        baseline,
+        provider.n_clusters(),
+        backend,
+    )?;
     let session = new_session(provider, journal, open, backend);
     let positions = session.provider.channel_positions().to_vec();
     let shanks = session.provider.channel_shanks().to_vec();
@@ -1698,13 +1779,27 @@ fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> Vec<(&'static 
     rows.to_vec()
 }
 
-/// The save directory a host for `open` registers under: the dataset
-/// directory or a single file's parent.
+/// Save artifacts go next to file-backed sources, except that each .ntt
+/// gets its own directory so tetrodes in the same folder cannot collide.
+fn file_artifact_dir(root: &Path) -> PathBuf {
+    let parent = root.parent().unwrap_or(Path::new("."));
+    if let Some(name) = root
+        .file_name()
+        .filter(|_| sorrel_io::detect::is_ntt_path(root))
+    {
+        let mut name = name.to_os_string();
+        name.push(".sorrel");
+        return parent.join(name);
+    }
+    parent.to_path_buf()
+}
+
+/// The save directory a host for `open` registers under.
 fn host_dir(open: &OpenArgs) -> PathBuf {
     let root = open.root();
     match is_dataset_directory(root) {
         true => root.to_path_buf(),
-        false => root.parent().unwrap_or(Path::new(".")).to_path_buf(),
+        false => file_artifact_dir(root),
     }
 }
 
@@ -1837,7 +1932,7 @@ fn session_key(open: &OpenArgs) -> Result<Option<String>> {
     args.root = Some(if is_dataset_directory(args.root()) {
         session_path(args.root())
     } else {
-        session_path(&host_dir(&args)).join(
+        session_path(args.root().parent().unwrap_or(Path::new("."))).join(
             args.root()
                 .file_name()
                 .context("missing dataset filename")?,
@@ -2004,6 +2099,7 @@ fn mcp_open_args(open: &OpenArgs) -> Result<String> {
             match b {
                 Backend::Kilosort => "kilosort",
                 Backend::SortingAnalyzer => "sorting-analyzer",
+                Backend::Neuralynx => "neuralynx",
                 #[cfg(any(feature = "hdf5", feature = "zarr"))]
                 Backend::Nwb => "nwb",
                 #[cfg(feature = "hdf5")]
@@ -3438,6 +3534,130 @@ mod tests {
         assert_eq!(host_dir(&open), PathBuf::from("/"));
     }
 
+    fn ntt_fixture(dir: &Path, name: &str) -> Result<OpenArgs> {
+        use sorrel_io::neuralynx::{write_ntt, NttFixture};
+        let path = dir.join(name);
+        let mut wave = [[0; 4]; 32];
+        wave[7][0] = 10;
+        write_ntt(
+            &path,
+            &NttFixture {
+                spikes: vec![(1_000_000, wave), (1_001_000, wave), (1_002_000, wave)],
+                ..Default::default()
+            },
+        )?;
+        Ok(OpenArgs {
+            root: Some(path),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn neuralynx_tabs_are_keyed_per_file_before_and_after_open() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let a = ntt_fixture(dir.path(), "TT1.NTT")?;
+        let b = ntt_fixture(dir.path(), "TT2.ntt")?;
+        let artifacts = dir.path().join("TT1.NTT.sorrel");
+        assert_eq!(host_dir(&a), artifacts);
+        assert_eq!(host_dir(&b), dir.path().join("TT2.ntt.sorrel"));
+        assert_eq!(parse_backend("ntt").unwrap(), Backend::Neuralynx);
+        assert_eq!(detect_backend(a.root())?, Backend::Neuralynx);
+
+        let key = session_key(&a)?.unwrap();
+        let tabs = || [(artifacts.as_path(), Some(key.as_str()))].into_iter();
+        assert!(!artifacts.exists());
+        assert_eq!(tab_target(&a, Some(&key), tabs())?, Some(0));
+        assert_eq!(tab_target(&b, session_key(&b)?.as_deref(), tabs())?, None);
+
+        with_session(&a, Describe { json: false })?;
+        assert_eq!(host_dir(&a), artifacts);
+        assert_eq!(session_key(&a)?.as_deref(), Some(key.as_str()));
+        assert_eq!(tab_target(&a, Some(&key), tabs())?, Some(0));
+        assert_eq!(tab_target(&b, session_key(&b)?.as_deref(), tabs())?, None);
+        assert!(dir.path().join("TT1.NTT.sorrel.journal").is_file());
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(artifacts.join("ntt_source.json"))?)?;
+        assert_eq!(json["source_file"], "TT1.NTT");
+        assert_eq!(json["record_count"], 3);
+        assert_eq!(json["t0_us"], 1_000_000);
+        assert_eq!(json["pre"], 7);
+        assert_eq!(json["post"], 24);
+        assert_eq!(json["units"], "uV");
+        assert_eq!(json["row_order"], "file");
+        assert_eq!(json["max_shift_samples"], 0);
+        assert_eq!(json["header"][0], serde_json::json!(["RecordSize", "304"]));
+        Ok(())
+    }
+
+    #[test]
+    fn neuralynx_opens_when_the_source_sidecar_cannot_be_written() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let open = ntt_fixture(dir.path(), "TT1.ntt")?;
+        let sidecar = file_artifact_dir(open.root()).join("ntt_source.json");
+        // A directory at the sidecar path is unwritable as a file on all platforms.
+        std::fs::create_dir_all(&sidecar)?;
+        with_session(&open, Describe { json: false })?;
+        assert!(sidecar.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn neuralynx_journal_seal_mismatch_names_the_ntt_source() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let open = ntt_fixture(dir.path(), "TT1.ntt")?;
+        with_session(&open, Describe { json: false })?;
+        let mut changed = std::fs::read(open.root())?;
+        *changed.last_mut().unwrap() ^= 1;
+        std::fs::write(open.root(), changed)?;
+        let err = with_session(&open, Describe { json: false }).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("restore the .ntt file the journal was recorded against"),
+            "{err:#}"
+        );
+        assert!(!message.contains("spike_clusters.npy"), "{err:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn neuralynx_cannot_use_its_source_as_a_journal() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut open = ntt_fixture(dir.path(), "TT1.ntt")?;
+        let original = std::fs::read(open.root())?;
+        open.journal = open.root.clone();
+        open.discard_journal = true;
+        let err = with_session(&open, Describe { json: false }).unwrap_err();
+        assert!(err.to_string().contains("aliases the .ntt source"), "{err}");
+        assert_eq!(std::fs::read(open.root())?, original);
+        Ok(())
+    }
+
+    #[cfg(feature = "phy-export")]
+    #[test]
+    fn neuralynx_phy_export_omits_the_raw_stream_and_zeros_the_templates() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let open = ntt_fixture(dir.path(), "TT1.ntt")?;
+        let out = dir.path().join("phy");
+        with_session(
+            &open,
+            ExportPhy {
+                out: Some(out.clone()),
+                copy_raw: true,
+            },
+        )?;
+        assert!(!out.join("recording.dat").exists());
+        let params = std::fs::read_to_string(out.join("params.py"))?;
+        assert!(params.contains("dat_path = []"));
+        assert_eq!(
+            sorrel_io::npy::read_1d_u32(&out.join("spike_clusters.npy"))?,
+            [0, 0, 0]
+        );
+        let (templates, shape) = sorrel_io::npy::read_npy_f32_flat(&out.join("templates.npy"))?;
+        assert_eq!(shape, [1, 96, 4]);
+        assert!(templates.iter().all(|&x| x == 0.0));
+        Ok(())
+    }
+
     #[test]
     #[cfg(feature = "dandi")]
     fn remote_session_paths_survive_rebasing() -> Result<()> {
@@ -3552,16 +3772,25 @@ mod tests {
             ..Default::default()
         };
         let path = journal_path(&open, dir.path(), "nwb.sorrel");
-        let owner = open_journal(&open, &path, 23, 1)?;
+        let owner = open_journal(&open, &path, 23, 1, sorrel_io::Backend::Nwb)?;
         open.discard_journal = true;
-        let err = open_journal(&open, &path, 23, 1).err().unwrap().to_string();
+        let err = open_journal(&open, &path, 23, 1, sorrel_io::Backend::Nwb)
+            .err()
+            .unwrap()
+            .to_string();
         assert!(err.contains("already open"), "{err}");
         assert!(
             err.contains("stop the running session or pass a different --journal"),
             "{err}"
         );
         open.journal = Some(dir.path().join("another.journal"));
-        let _other = open_journal(&open, &journal_path(&open, dir.path(), "nwb.sorrel"), 23, 1)?;
+        let _other = open_journal(
+            &open,
+            &journal_path(&open, dir.path(), "nwb.sorrel"),
+            23,
+            1,
+            sorrel_io::Backend::Nwb,
+        )?;
         drop(owner);
         Ok(())
     }

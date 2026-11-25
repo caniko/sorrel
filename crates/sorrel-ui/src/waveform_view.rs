@@ -8,7 +8,7 @@
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Ui};
 use sorrel_data::Session;
 use sorrel_io::{ClusterId, DataProvider, SampleIndex};
-use sorrel_render::{extract_snippet, snippet_window, TracePreproc};
+use sorrel_render::{extract_snippet, prefetch_snippets, spike_window, TracePreproc};
 
 use crate::feature_view::{ChannelEdit, FeatureLink};
 use crate::jobs::JobCtx;
@@ -36,6 +36,11 @@ const MAX_TEXTURE_UPLOADS_PER_FRAME: usize = 2;
 /// Window-around-spike used by `WaveformCache`. Picks ±1 ms by default.
 pub(crate) fn waveform_window_samples(sr: f32) -> u32 {
     (sr.max(1.0) * 0.001).round() as u32
+}
+
+/// Shared by the Waveforms, Trace and Probe callers of `WaveformCache::ensure`.
+pub(crate) fn waveform_window<P: DataProvider>(provider: &P) -> (u32, u32) {
+    spike_window(provider, waveform_window_samples(provider.sample_rate()))
 }
 
 /// phy v2.1 baseline: subtract each channel's median over the snippet
@@ -238,7 +243,17 @@ impl WaveformCache {
     }
 
     /// Preprocess snippets like the trace pane; re-extracts on change.
-    pub(crate) fn set_preproc(&mut self, cfg: TracePreproc, shanks: &[u32]) {
+    pub(crate) fn set_preproc<P: DataProvider>(
+        &mut self,
+        provider: &P,
+        cfg: TracePreproc,
+        shanks: &[u32],
+    ) {
+        let (cfg, shanks) = if provider.stored_snippet_window().is_some() {
+            (TracePreproc::Off, &[][..])
+        } else {
+            (cfg, shanks)
+        };
         let preproc_changed = self.cfg != cfg;
         if self.shanks != shanks || preproc_changed {
             self.shanks = shanks.to_vec();
@@ -537,16 +552,12 @@ impl WaveformCache {
                     .collect()
             })
             .collect();
-        let sr = session.provider.sample_rate();
-        let windows: Vec<(SampleIndex, u32)> = spikes
-            .iter()
-            .flatten()
-            .map(|&t| {
-                let (start, len, _) = snippet_window(sr, t, pre, post, key.cfg);
-                (start, len)
-            })
-            .collect();
-        session.provider.prefetch(&windows);
+        prefetch_snippets(
+            &session.provider,
+            spikes.iter().flatten().copied(),
+            (pre, post),
+            key.cfg,
+        );
 
         let mut snippets: Vec<Vec<Vec<f32>>> = Vec::with_capacity(selection.len());
         for cluster_spikes in &spikes {
@@ -694,15 +705,7 @@ impl WaveformCache {
                     .filter_map(move |i| bucket.get(i as usize).copied())
             })
             .collect();
-        let sr = session.provider.sample_rate();
-        let windows: Vec<(SampleIndex, u32)> = times
-            .iter()
-            .map(|&t| {
-                let (start, len, _) = snippet_window(sr, t, pre, post, cfg);
-                (start, len)
-            })
-            .collect();
-        session.provider.prefetch(&windows);
+        prefetch_snippets(&session.provider, times.iter().copied(), (pre, post), cfg);
         let snips = times
             .iter()
             .filter_map(|&t| {
@@ -1214,8 +1217,8 @@ fn waveform_view_impl<P: DataProvider>(
     }
 
     let sr = session.provider.sample_rate().max(1.0);
-    let pre = waveform_window_samples(sr);
-    let post = pre;
+    let (pre, post) = waveform_window(&session.provider);
+    let stored = session.provider.stored_snippet_window().is_some();
     let snippet_len = (pre + post + 1) as usize;
     let nc = session.provider.n_channels() as usize;
     if nc == 0 || snippet_len < 3 {
@@ -1360,8 +1363,14 @@ fn waveform_view_impl<P: DataProvider>(
         "raw"
     };
     let ms = pre as f32 / sr * 1000.0;
+    let window = if stored {
+        let after = post as f32 / sr * 1000.0;
+        format!("−{ms:.2}/+{after:.2} ms")
+    } else {
+        format!("±{ms:.1} ms")
+    };
     let head = format!(
-        "{} ch · ±{ms:.1} ms{}",
+        "{} ch · {window}{}",
         chans.len(),
         if geometry_available {
             ""
@@ -1418,7 +1427,11 @@ fn waveform_view_impl<P: DataProvider>(
             }
         },
         |ui| {
-            ui.weak(format!("source: {hp} (follows the trace pane)"));
+            if stored {
+                ui.weak("source: stored snippets");
+            } else {
+                ui.weak(format!("source: {hp} (follows the trace pane)"));
+            }
             if compact {
                 ui.checkbox(&mut overlap, "overlap");
                 ui.checkbox(&mut pc_shapes, "PC shapes");
@@ -1615,6 +1628,7 @@ fn waveform_view_impl<P: DataProvider>(
         accent: ui.visuals().hyperlink_color,
         mode,
         nc,
+        pre,
         snippet_len,
         sr,
     };
@@ -1646,6 +1660,7 @@ struct Ctx<'a, P: DataProvider> {
     accent: Color32,
     mode: WaveformMode,
     nc: usize,
+    pre: u32,
     snippet_len: usize,
     sr: f32,
 }
@@ -1937,7 +1952,7 @@ impl<P: DataProvider> Ctx<'_, P> {
         };
 
         // 1 ms ticks along the baseline of every slot.
-        let pre = self.snippet_len / 2;
+        let pre = self.pre;
         let per_ms = self.sr * 0.001;
         let last = (self.snippet_len as f32 - 1.0).max(1.0);
         for k in 0..n.max(1) {
@@ -2285,6 +2300,110 @@ fn all_signed_range(all: &AllResult, chans: &[usize], snips: bool) -> (f32, f32)
         }
     }
     pad_range(lo, hi, 0.08)
+}
+
+#[cfg(test)]
+pub(crate) mod stored_test {
+    use super::*;
+    use sorrel_data::Journal;
+    use sorrel_io::TraceSlice;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(crate) struct Stored {
+        times: Vec<SampleIndex>,
+        reads: AtomicUsize,
+    }
+
+    impl Stored {
+        pub(crate) fn read_count(&self) -> usize {
+            self.reads.load(Ordering::Relaxed)
+        }
+    }
+
+    impl DataProvider for Stored {
+        type Label = u8;
+        fn sample_rate(&self) -> f32 {
+            32_000.
+        }
+        fn n_channels(&self) -> u32 {
+            2
+        }
+        fn n_samples(&self) -> SampleIndex {
+            SampleIndex(self.times.last().unwrap().0 + 25)
+        }
+        fn n_clusters(&self) -> u32 {
+            1
+        }
+        fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
+            if c.0 == 0 {
+                &self.times
+            } else {
+                &[]
+            }
+        }
+        fn trace(&self, _: SampleIndex, _: u32) -> TraceSlice<'_> {
+            panic!("stored spikes must not read a trace")
+        }
+        fn prefetch(&self, _: &[(SampleIndex, u32)]) {
+            panic!("stored spikes must not prefetch a trace")
+        }
+        fn initial_labels(&self) -> Vec<u8> {
+            vec![0]
+        }
+        fn stored_snippet_window(&self) -> Option<(u32, u32)> {
+            Some((7, 24))
+        }
+        fn stored_snippet(&self, t: SampleIndex, out: &mut [f32]) -> bool {
+            assert_eq!(out.len(), 64);
+            let Ok(i) = self.times.binary_search(&t) else {
+                return false;
+            };
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            out.fill(0.0);
+            out[14] = -(i as f32 + 1.0);
+            out[16] = (i % 4) as f32;
+            true
+        }
+    }
+
+    pub(crate) fn session(n: usize) -> (Session<Stored>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open_or_create(&dir.path().join("journal"), 0, 1).unwrap();
+        let provider = Stored {
+            times: (0..n as u64).map(|i| SampleIndex(7 + 40 * i)).collect(),
+            reads: AtomicUsize::new(0),
+        };
+        (Session::new(provider, journal), dir)
+    }
+
+    #[test]
+    fn shared_waveform_cache_keeps_its_key_across_panes_and_trace_filters() {
+        let (session, _dir) = session(10);
+        let p = &session.provider;
+        let selection = [ClusterId(0)];
+        let mut cache = WaveformCache::new();
+        // Waveforms and Trace use this same window selector; Probe below
+        // drives its actual pane entry point, even with no geometry.
+        for cfg in [TracePreproc::Off, TracePreproc::HpAndCmr(300.0)] {
+            cache.set_preproc(p, cfg, &[0, 1]);
+            let (pre, post) = waveform_window(p);
+            assert_eq!((pre, post), (7, 24));
+            cache.ensure(&session, &selection, pre, post);
+        }
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            crate::views::probe_view(
+                ui,
+                &session,
+                &selection,
+                &[],
+                &mut cache,
+                &FeatureLink::default(),
+            );
+        });
+        assert_eq!(p.reads.load(Ordering::Relaxed), 10);
+        assert!(cache.cfg.is_off() && cache.shanks.is_empty());
+    }
 }
 
 #[cfg(test)]

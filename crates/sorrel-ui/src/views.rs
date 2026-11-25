@@ -1114,8 +1114,8 @@ pub fn probe_view<P: DataProvider>(
     link: &crate::feature_view::FeatureLink,
 ) -> Option<crate::feature_view::ChannelEdit> {
     let theme = Theme::from_ui(ui);
-    let pre = waveform_window_samples(session.provider.sample_rate());
-    waveforms.ensure(session, selection, pre, pre);
+    let (pre, post) = crate::waveform_view::waveform_window(&session.provider);
+    waveforms.ensure(session, selection, pre, post);
     if channel_positions.is_empty() {
         empty_plot(
             ui,

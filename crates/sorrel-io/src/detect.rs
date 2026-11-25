@@ -14,6 +14,13 @@ pub enum Backend {
     /// Legacy MATLAB v7.3 `rez.mat` / `rez2.mat` (requires `hdf5` to open).
     /// The variant name is retained for compatibility; Kilosort 4 uses [`Self::Kilosort`].
     Ks4Rez,
+    /// Neuralynx `.ntt` file containing stored tetrode spikes.
+    Neuralynx,
+}
+
+pub fn is_ntt_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ntt"))
 }
 
 /// Detect which backend a path looks like. Phy markers take precedence
@@ -21,6 +28,9 @@ pub enum Backend {
 /// (`.nwb` / `rez.mat`) so they trigger only when the path is a file.
 pub fn detect_backend(root: &Path) -> Result<Backend> {
     if root.is_file() {
+        if is_ntt_path(root) {
+            return Ok(Backend::Neuralynx);
+        }
         let name = root.file_name().and_then(|s| s.to_str()).unwrap_or("");
         let ext = root
             .extension()
@@ -55,6 +65,18 @@ pub fn detect_backend(root: &Path) -> Result<Backend> {
     {
         return Ok(Backend::SortingAnalyzer);
     }
+    if let Some(path) = root.read_dir().ok().and_then(|entries| {
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| is_ntt_path(path) && path.is_file())
+            .min()
+    }) {
+        bail!(
+            "open one tetrode file at a time, e.g. `sorrel run \"{}\"`",
+            path.display()
+        );
+    }
     bail!(
         "could not detect a supported backend in {} \
          (looked for kilosort outputs and a SortingAnalyzer folder)",
@@ -66,20 +88,18 @@ pub fn detect_backend(root: &Path) -> Result<Backend> {
 /// `sorters/basesorter.py` writes `sorter_name` to `spikeinterface_log.json`, and
 /// `core/core_tools.py` saves the same log as `__sorting_info__` in `sorting/annotations.json`.
 pub fn detect_sorter(root: &Path, backend: Backend) -> Option<String> {
-    let log_name = |dir: &Path| -> Option<String> {
-        let log = std::fs::read(dir.join("spikeinterface_log.json")).ok()?;
-        let v: serde_json::Value = serde_json::from_slice(&log).ok()?;
-        Some(v.get("sorter_name")?.as_str()?.to_ascii_lowercase())
+    let log_name = || {
+        [Some(root), root.parent()]
+            .into_iter()
+            .flatten()
+            .find_map(|dir| {
+                let log = std::fs::read(dir.join("spikeinterface_log.json")).ok()?;
+                let v: serde_json::Value = serde_json::from_slice(&log).ok()?;
+                Some(v.get("sorter_name")?.as_str()?.to_ascii_lowercase())
+            })
     };
-    if let Some(name) = [Some(root), root.parent()]
-        .into_iter()
-        .flatten()
-        .find_map(log_name)
-    {
-        return Some(name);
-    }
     match backend {
-        Backend::Kilosort => {
+        Backend::Kilosort => log_name().or_else(|| {
             if root.join("ops.npy").exists() {
                 Some("kilosort4".into())
             } else if root.join("rez.mat").exists() || root.join("cluster_KSLabel.tsv").exists() {
@@ -87,8 +107,8 @@ pub fn detect_sorter(root: &Path, backend: Backend) -> Option<String> {
             } else {
                 None
             }
-        }
-        Backend::SortingAnalyzer => {
+        }),
+        Backend::SortingAnalyzer => log_name().or_else(|| {
             let name = std::fs::read(root.join("sorting/annotations.json"))
                 .ok()
                 .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
@@ -98,15 +118,33 @@ pub fn detect_sorter(root: &Path, backend: Backend) -> Option<String> {
                         .map(str::to_ascii_lowercase)
                 });
             Some(name.unwrap_or_else(|| "spikeinterface".into()))
-        }
-        Backend::Ks4Rez => Some("kilosort".into()),
-        Backend::Nwb => Some("nwb".into()),
+        }),
+        Backend::Ks4Rez => log_name().or_else(|| Some("kilosort".into())),
+        Backend::Nwb => log_name().or_else(|| Some("nwb".into())),
+        Backend::Neuralynx => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn neuralynx_files_are_leaves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("TT5.ntt");
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(detect_backend(&path).unwrap(), Backend::Neuralynx);
+        let err = detect_backend(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("open one tetrode file at a time"), "{err}");
+        assert!(err.contains("TT5.ntt"), "{err}");
+
+        let path = dir.path().join("TT2.NTT");
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(detect_backend(&path).unwrap(), Backend::Neuralynx);
+        let err = detect_backend(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("TT2.NTT"), "{err}");
+    }
 
     #[test]
     fn detects_by_marker_files_and_extensions() {

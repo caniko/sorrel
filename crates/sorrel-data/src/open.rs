@@ -19,6 +19,8 @@ use sorrel_io::kilosort::{KilosortOpenParams, KilosortProvider, ROOT_DIR, ROOT_M
 use sorrel_io::{detect_sorter, Backend, DataProvider, RootView, SortingAnalyzerProvider};
 use std::path::{Path, PathBuf};
 
+const DEFAULT_JOURNAL_SOURCE: &str = "spike_clusters.npy";
+
 /// Where the journal lives and whether to throw an existing one away.
 #[derive(Debug, Clone, Default)]
 pub struct JournalOpts {
@@ -59,9 +61,20 @@ pub fn open_journal(
     baseline: u64,
     n_clusters: u32,
 ) -> Result<Journal> {
+    open_journal_with_source(opts, path, baseline, n_clusters, DEFAULT_JOURNAL_SOURCE)
+}
+
+/// Like [`open_journal`], with the source to name in recovery instructions.
+pub fn open_journal_with_source(
+    opts: &JournalOpts,
+    path: &Path,
+    baseline: u64,
+    n_clusters: u32,
+    source: &str,
+) -> Result<Journal> {
     // Locked first, so a live writer's journal is never set aside under it.
     let lock = lock_journal(path)?;
-    open_journal_locked(lock, opts, path, baseline, n_clusters)
+    open_journal_locked(lock, opts, path, baseline, n_clusters, source)
 }
 
 fn open_journal_locked(
@@ -70,13 +83,14 @@ fn open_journal_locked(
     path: &Path,
     baseline: u64,
     n_clusters: u32,
+    source: &str,
 ) -> Result<Journal> {
     discard_journal(opts, path)?;
     Journal::open_locked(lock, path, baseline, n_clusters).with_context(|| {
         format!(
             "journal {} was sealed against different data (or by an older sorrel without a \
              seal). If that curation is already saved, discard the journal (--discard-journal); to \
-             keep unsaved edits, restore the spike_clusters.npy the journal was recorded against.",
+             keep unsaved edits, restore the {source} the journal was recorded against.",
             path.display()
         )
     })
@@ -127,7 +141,14 @@ pub fn open_phy(
         &std::fs::read(&clusters_path)
             .with_context(|| format!("read {}", clusters_path.display()))?,
     );
-    let journal = open_journal_locked(lock, opts, &path, baseline, provider.n_clusters())?;
+    let journal = open_journal_locked(
+        lock,
+        opts,
+        &path,
+        baseline,
+        provider.n_clusters(),
+        DEFAULT_JOURNAL_SOURCE,
+    )?;
     // Every cluster_*.tsv counts: a phy edit to a custom label file is as
     // real as one to cluster_group.tsv.
     let names = artifact_names(root, &view, &[])?;
@@ -261,7 +282,14 @@ pub fn open_sorting_analyzer(
     let unsnapshotted = path.exists() && labels.is_none();
     let provider = SortingAnalyzerProvider::open_with_labels(root, labels)?;
     let baseline = baseline_hash(&provider.identity_bytes());
-    let journal = open_journal_locked(lock, opts, &path, baseline, provider.n_clusters())?;
+    let journal = open_journal_locked(
+        lock,
+        opts,
+        &path,
+        baseline,
+        provider.n_clusters(),
+        DEFAULT_JOURNAL_SOURCE,
+    )?;
     if unsnapshotted && journal.n_records() > 0 {
         log::warn!(
             "{} predates label snapshots: it replays onto the labels last saved \

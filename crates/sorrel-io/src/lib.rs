@@ -13,6 +13,7 @@ pub mod fsutil;
 pub mod kilosort;
 pub mod ks4_rez;
 pub mod mda;
+pub mod neuralynx;
 pub mod npy;
 pub mod nwb;
 pub mod nwb_units;
@@ -35,6 +36,7 @@ pub use extras::{
 };
 pub use kilosort::{KilosortProvider, RootView};
 pub use mda::MdaHeader;
+pub use neuralynx::NttProvider;
 pub use open_ephys::{OebinMeta, OebinStream};
 pub use params::PhyParams;
 pub use probeinterface::ProbeGeometry;

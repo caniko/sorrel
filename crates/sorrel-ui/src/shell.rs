@@ -362,13 +362,14 @@ impl Shell {
         }
     }
 
-    /// A dropped `.nwb` / `.mat` opens itself; any other file opens its folder.
+    /// A dropped `.nwb`, `.mat` or `.ntt` opens itself; other files open their folder.
     fn drops(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for path in dropped.into_iter().filter_map(|f| f.path) {
-            let leaf = path
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("nwb") || e.eq_ignore_ascii_case("mat"));
+            let leaf = sorrel_io::detect::is_ntt_path(&path)
+                || path.extension().is_some_and(|e| {
+                    e.eq_ignore_ascii_case("nwb") || e.eq_ignore_ascii_case("mat")
+                });
             let target = if path.is_file() && !leaf {
                 path.parent().map(Path::to_path_buf)
             } else {

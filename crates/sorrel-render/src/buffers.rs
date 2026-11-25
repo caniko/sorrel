@@ -291,9 +291,34 @@ pub fn snippet_window(
     )
 }
 
-/// One `pre + post + 1`-sample snippet around `t` (interleaved, centred
-/// f32), preprocessed like the trace view. `None` when the window runs off
-/// the recording or its bytes are not available yet.
+/// The provider's stored window, or a symmetric window for continuous data.
+pub fn spike_window<P: DataProvider>(provider: &P, half: u32) -> (u32, u32) {
+    provider.stored_snippet_window().unwrap_or((half, half))
+}
+
+/// Batch the continuous reads for a series of snippet extractions. Stored
+/// snippets do not need trace windows.
+pub fn prefetch_snippets<P: DataProvider>(
+    provider: &P,
+    times: impl Iterator<Item = SampleIndex>,
+    (pre, post): (u32, u32),
+    cfg: TracePreproc,
+) {
+    if provider.stored_snippet_window().is_none() {
+        let sr = provider.sample_rate();
+        let windows: Vec<_> = times
+            .map(|t| {
+                let (start, len, _) = snippet_window(sr, t, pre, post, cfg);
+                (start, len)
+            })
+            .collect();
+        provider.prefetch(&windows);
+    }
+}
+
+/// One `pre + post + 1`-sample snippet around `t` (interleaved f32).
+/// Continuous snippets are preprocessed like the trace view; stored ones
+/// are returned unchanged. `None` when the requested window is unavailable.
 pub fn extract_snippet<P: DataProvider>(
     provider: &P,
     t: SampleIndex,
@@ -303,6 +328,13 @@ pub fn extract_snippet<P: DataProvider>(
     shanks: &[u32],
 ) -> Option<Vec<f32>> {
     let nc = provider.n_channels() as usize;
+    if let Some(window) = provider.stored_snippet_window() {
+        if nc == 0 || window != (pre, post) {
+            return None;
+        }
+        let mut buf = vec![0.0; (pre as usize + post as usize + 1) * nc];
+        return provider.stored_snippet(t, &mut buf).then_some(buf);
+    }
     let sr = provider.sample_rate();
     let (start, len, margin) = snippet_window(sr, t, pre, post, cfg);
     let slice = provider.trace(start, len);

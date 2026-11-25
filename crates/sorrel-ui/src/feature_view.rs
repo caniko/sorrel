@@ -509,7 +509,7 @@ struct GhostCells {
 }
 
 /// Temporal PC basis fitted on raw snippets, reused across selections.
-type Basis = Arc<Mutex<Option<(TracePreproc, u32, Arc<[Vec<f32>; 2]>)>>>;
+type Basis = Arc<Mutex<Option<((TracePreproc, u32, u32), Arc<[Vec<f32>; 2]>)>>>;
 
 /// 2-D grid of PC projections, or the rotatable 3-D scene (feature_view3d).
 #[derive(Default, Copy, Clone, PartialEq, Eq, Debug)]
@@ -2010,12 +2010,18 @@ pub fn feature_view<P: DataProvider>(
         return None;
     }
     let computed = !session.has_pc_features();
-    if computed && state.split_requested {
+    let stored = session.provider.stored_snippet_window().is_some();
+    let (cfg, shanks) = if stored {
+        (TracePreproc::Off, &[][..])
+    } else {
+        (cfg, shanks)
+    };
+    let load_full = computed && !stored;
+    if load_full && state.split_requested {
         state.want_full = true;
     }
     // Loading every lassoed spike keeps the channels (and order) on screen.
-    let pinned = state
-        .want_full
+    let pinned = (load_full && state.want_full)
         .then(|| state.shown_channels.clone())
         .flatten();
     let key = FeatureKey {
@@ -2034,7 +2040,7 @@ pub fn feature_view<P: DataProvider>(
         } else {
             Vec::new()
         },
-        full: computed && state.want_full,
+        full: load_full && state.want_full,
         reorder,
     };
     let basis = Arc::clone(&state.basis);
@@ -2250,7 +2256,7 @@ pub fn feature_view<P: DataProvider>(
     // `cancel_lasso` or here) and the brush waits for the full set. A frozen
     // draft (tracking off) keeps the request: dropping it would reload the
     // sample mid-draft.
-    state.want_full = computed
+    state.want_full = load_full
         && (state.split_requested
             || if !state.live_tracking && state.lasso.is_drafting() {
                 state.want_full
@@ -2963,7 +2969,7 @@ fn refresh_link<P: DataProvider>(
     let mut basis = Vec::new();
     if set.computed {
         let fitted = state.basis.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((_, _, b)) = fitted.as_ref().filter(|(c, ..)| *c == cfg) {
+        if let Some((_, b)) = fitted.as_ref().filter(|((c, ..), _)| *c == cfg) {
             basis.extend(highlight.iter().map(|&ch| (ch, Arc::clone(b))));
         }
     } else {
@@ -4193,6 +4199,7 @@ pub(crate) fn compute<P: DataProvider>(
     cancel: &AtomicBool,
 ) -> FeatureSet {
     let computed = !s.has_pc_features();
+    let full = key.full || s.provider.stored_snippet_window().is_some();
     let sr = s.provider.sample_rate().max(1.0);
     // Cancelled jobs never publish. Return a well-formed empty set instead
     // of holding the session read lock through millions of obsolete rows.
@@ -4200,7 +4207,7 @@ pub(crate) fn compute<P: DataProvider>(
         FeatureSet::new(
             vec![0, 0],
             computed,
-            key.full,
+            full,
             Vec::new(),
             Vec::new(),
             s.provider.n_samples().0 as f32 / sr,
@@ -4217,7 +4224,7 @@ pub(crate) fn compute<P: DataProvider>(
     let keep_every: Vec<usize> = key
         .selection
         .iter()
-        .map(|&c| match (computed, key.full) {
+        .map(|&c| match (computed, full) {
             (true, false) => (s.spike_times(c).len() / N_COMPUTED).max(1),
             _ => 1,
         })
@@ -4294,7 +4301,7 @@ pub(crate) fn compute<P: DataProvider>(
     let set = FeatureSet::new_cancellable(
         channels,
         computed,
-        key.full || !computed,
+        full || !computed,
         points,
         feats,
         s.provider.n_samples().0 as f32 / sr,
@@ -4390,12 +4397,12 @@ fn computed_features<P: DataProvider>(
     let p = &s.provider;
     let sr = p.sample_rate().max(1.0);
     let nc = p.n_channels() as usize;
-    let half = waveform_window_samples(sr);
+    let (pre, post) = sorrel_render::spike_window(p, waveform_window_samples(sr));
     let times = s.cluster_index().all_spike_times();
-    let Some(b) = fitted_basis(s, key, basis, half, cancel) else {
+    let Some(b) = fitted_basis(s, key, basis, (pre, post), cancel) else {
         return (vec![0, 0], Vec::new(), Vec::new());
     };
-    let snippet = |g: u32| extract_snippet(p, times[g as usize], half, half, key.cfg, &key.shanks);
+    let snippet = |g: u32| extract_snippet(p, times[g as usize], pre, post, key.cfg, &key.shanks);
     let project = |snip: &[f32], pc: usize, ch: usize| -> f32 {
         b[pc]
             .iter()
@@ -4403,16 +4410,18 @@ fn computed_features<P: DataProvider>(
             .map(|(t, w)| w * snip[t * nc + ch])
             .sum()
     };
-    p.prefetch(
-        &picked
-            .iter()
-            .map(|&(g, ..)| {
-                let (start, len, _) =
-                    sorrel_render::snippet_window(sr, times[g as usize], half, half, key.cfg);
-                (start, len)
-            })
-            .collect::<Vec<_>>(),
-    );
+    if p.stored_snippet_window().is_none() {
+        p.prefetch(
+            &picked
+                .iter()
+                .map(|&(g, ..)| {
+                    let (start, len, _) =
+                        sorrel_render::snippet_window(sr, times[g as usize], pre, post, key.cfg);
+                    (start, len)
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
 
     // Automatic channels: the four with the largest mean |PC1| over the
     // first cluster's spikes (the temporal-PC analogue of peak amplitude).
@@ -4467,18 +4476,19 @@ fn fitted_basis<P: DataProvider>(
     s: &Session<P>,
     key: &FeatureKey,
     basis: &Basis,
-    half: u32,
+    (pre, post): (u32, u32),
     cancel: &AtomicBool,
 ) -> Option<Arc<[Vec<f32>; 2]>> {
     let mut guard = basis.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((cfg, h, b)) = guard.as_ref() {
-        if *cfg == key.cfg && *h == half {
+    let basis_key = (key.cfg, pre, post);
+    if let Some((k, b)) = guard.as_ref() {
+        if *k == basis_key {
             return Some(Arc::clone(b));
         }
     }
     let p = &s.provider;
     let nc = p.n_channels() as usize;
-    let len = 2 * half as usize + 1;
+    let len = pre as usize + post as usize + 1;
     let times = s.cluster_index().all_spike_times();
     let step = (times.len() / N_FIT).max(1);
     let rows: Vec<Vec<f64>> = times
@@ -4488,7 +4498,7 @@ fn fitted_basis<P: DataProvider>(
             if cancel.load(Ordering::Relaxed) {
                 return None;
             }
-            let snip = extract_snippet(p, t, half, half, key.cfg, &key.shanks)?;
+            let snip = extract_snippet(p, t, pre, post, key.cfg, &key.shanks)?;
             let ptp = |ch: usize| {
                 let col = (0..len).map(|i| snip[i * nc + ch]);
                 col.clone().fold(f32::MIN, f32::max) - col.fold(f32::MAX, f32::min)
@@ -4504,7 +4514,7 @@ fn fitted_basis<P: DataProvider>(
     let top = covariance(&flat, rows.len(), len).top_eigenvectors(2);
     let as_f32 = |v: &Vec<f64>| v.iter().map(|&x| x as f32).collect::<Vec<f32>>();
     let b = Arc::new([as_f32(top.first()?), as_f32(top.get(1)?)]);
-    *guard = Some((key.cfg, half, Arc::clone(&b)));
+    *guard = Some((basis_key, Arc::clone(&b)));
     Some(b)
 }
 
@@ -4540,6 +4550,36 @@ mod tests {
         }
         fn initial_labels(&self) -> Vec<u8> {
             vec![0; 3]
+        }
+    }
+
+    #[test]
+    fn stored_pcs_project_every_pool_spike_even_with_the_sample_request() {
+        let n = N_COMPUTED * 2 + 3;
+        let (s, _dir) = crate::waveform_view::stored_test::session(n);
+        let key = FeatureKey {
+            selection: vec![ClusterId(0)],
+            channels: None,
+            keep_order: false,
+            version: s.version(),
+            cfg: TracePreproc::Off,
+            shanks: Vec::new(),
+            full: false,
+            reorder: false,
+        };
+        let basis = Basis::default();
+        let set = compute(&s, &key, &basis, &AtomicBool::new(false));
+        assert!(set.full && set.computed);
+        assert_eq!(set.points.len(), n);
+        assert_eq!(set.points.last().unwrap().local as usize, n - 1);
+        assert_eq!(
+            basis.lock().unwrap().as_ref().unwrap().0,
+            (TracePreproc::Off, 7, 24)
+        );
+        let zero = set.channels.iter().position(|&ch| ch == 1).unwrap() as u8;
+        for i in 0..n {
+            assert_eq!(set.value(i, pc(zero, 0)), 0.0);
+            assert_eq!(set.value(i, pc(zero, 1)), 0.0);
         }
     }
 
@@ -4708,6 +4748,82 @@ mod tests {
             brushes.spikes.as_ref().unwrap().source,
             BrushSource::IsiViolators
         );
+    }
+
+    #[test]
+    fn stored_lasso_split_keeps_the_feature_request_and_projection() {
+        use std::sync::RwLock;
+        use std::time::{Duration, Instant};
+
+        let (session, _dir) = crate::waveform_view::stored_test::session(10);
+        let ctx = egui::Context::default();
+        let jobs = JobCtx {
+            session: Arc::new(RwLock::new(session)),
+            egui: ctx.clone(),
+        };
+        let selection = [ClusterId(0)];
+        let mut st = FeatureViewState::default();
+        let mut brushes = Brushes::default();
+        let mut frame = |st: &mut FeatureViewState| {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                feature_view(
+                    ui,
+                    &crate::jobs::read(&jobs.session),
+                    &selection,
+                    st,
+                    &jobs,
+                    TracePreproc::HpAndCmr(300.0),
+                    &[0, 1],
+                    false,
+                    &mut brushes,
+                    None,
+                    (0, 100),
+                );
+            });
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.memo.last().is_none() {
+            frame(&mut st);
+            assert!(
+                Instant::now() < deadline,
+                "feature projection did not finish"
+            );
+            std::thread::yield_now();
+        }
+        let set = Arc::clone(st.memo.last().unwrap());
+        let key = st.memo.requested_key().unwrap().clone();
+        let reads = crate::jobs::read(&jobs.session).provider.read_count();
+        assert!(reads > 0 && set.full && set.computed && !key.full);
+        let close_lasso = |st: &mut FeatureViewState| {
+            st.lasso = Lasso::new(1, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
+            st.stamp_lasso(&lasso_key(&key, &set.channels), true);
+            assert!(st.lasso.is_closed());
+        };
+        let mut check_frame = |st: &mut FeatureViewState| {
+            frame(st);
+            let requested = st.memo.requested_key().unwrap();
+            assert!(
+                !requested.full,
+                "stored snippets already project every spike"
+            );
+            assert!(
+                *requested == key,
+                "lasso must not pin or change the memo key"
+            );
+            assert!(!st.want_full && !st.memo.pending());
+            assert!(Arc::ptr_eq(st.memo.last().unwrap(), &set));
+            assert_eq!(
+                crate::jobs::read(&jobs.session).provider.read_count(),
+                reads
+            );
+        };
+        close_lasso(&mut st);
+        st.split_requested = true;
+        check_frame(&mut st);
+        check_frame(&mut st);
+        // Closing a lasso without K must not arm a full request either.
+        close_lasso(&mut st);
+        check_frame(&mut st);
     }
 
     #[test]

@@ -47,6 +47,12 @@ fn sample_indices(n: usize) -> Vec<usize> {
 
 pub fn measure<P: DataProvider>(session: &Session<P>, c: ClusterId) -> Result<RawWaveform, String> {
     let p = &session.provider;
+    if let Some((pre, post)) = p.stored_snippet_window() {
+        return Err(format!(
+            "waveform landmarks need continuous data; this dataset stores {}-sample per-spike snippets",
+            u64::from(pre) + u64::from(post) + 1
+        ));
+    }
     let sr = p.sample_rate();
     if !sr.is_finite() || !(1000.0..=1_000_000.0).contains(&sr) {
         return Err("raw waveform requires a finite sample rate in 1kHz..1MHz".into());

@@ -481,7 +481,8 @@ fn external_edit_to_numpysorting_unit_ids_invalidates_journal() {
         .expect("changed ids must invalidate the journal")
         .to_string();
     assert!(
-        msg.contains("sealed against different data"),
+        msg.contains("sealed against different data")
+            && msg.contains("restore the spike_clusters.npy the journal was recorded against"),
         "expected divergence error, got: {msg}",
     );
 }

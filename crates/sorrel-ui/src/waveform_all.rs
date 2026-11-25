@@ -475,6 +475,19 @@ impl SnipScratch {
         nc: usize,
         snippet_len: usize,
     ) -> bool {
+        if let Some(window) = provider.stored_snippet_window() {
+            if nc == 0 || window != (pre, post) {
+                self.buf.clear();
+                return false;
+            }
+            self.buf
+                .resize((pre as usize + post as usize + 1) * nc, 0.0);
+            if !provider.stored_snippet(t, &mut self.buf) {
+                self.buf.clear();
+                return false;
+            }
+            return true;
+        }
         let sr = provider.sample_rate();
         let (start, len, margin) = snippet_window(sr, t, pre, post, cfg);
         let slice = provider.trace(start, len);
@@ -607,14 +620,12 @@ fn extract_pass1_chunk<P: DataProvider>(
             out.cancelled = true;
             return out;
         }
-        let windows: Vec<(SampleIndex, u32)> = batch
-            .iter()
-            .map(|&t| {
-                let (start, len, _) = snippet_window(sr, t, key.pre, key.post, key.cfg);
-                (start, len)
-            })
-            .collect();
-        session.provider.prefetch(&windows);
+        sorrel_render::prefetch_snippets(
+            &session.provider,
+            batch.iter().copied(),
+            (key.pre, key.post),
+            key.cfg,
+        );
         // A window this batch cannot serve may be in flight right now; the
         // skip must not be final even if the fetch lands before the run ends.
         let fetching = session.provider.pending_fetches() > 0;
@@ -1148,14 +1159,12 @@ fn rasterize_batch_into<P: DataProvider>(
         if cancel.load(Ordering::Relaxed) {
             return drawn;
         }
-        let windows: Vec<(SampleIndex, u32)> = batch
-            .iter()
-            .map(|&t| {
-                let (start, len, _) = snippet_window(sr, t, key.pre, key.post, key.cfg);
-                (start, len)
-            })
-            .collect();
-        session.provider.prefetch(&windows);
+        sorrel_render::prefetch_snippets(
+            &session.provider,
+            batch.iter().copied(),
+            (key.pre, key.post),
+            key.cfg,
+        );
         for (offset, &t) in batch.iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 return drawn;
@@ -1430,6 +1439,34 @@ mod tests {
         key.n_channels = session.provider.n_channels();
         key.n_samples = session.provider.n_samples().0;
         key
+    }
+
+    #[test]
+    fn stored_snippet_extractors_agree_and_the_full_pass_includes_both_edges() {
+        let (session, _dir) = crate::waveform_view::stored_test::session(3);
+        let p = &session.provider;
+        let t = SampleIndex(7);
+        let cfg = TracePreproc::HpAndCmr(300.0);
+        let snip = sorrel_render::extract_snippet(p, t, 7, 24, cfg, &[0, 0]).unwrap();
+        assert_eq!(snip[14], -1.0);
+        assert!(snip.iter().skip(1).step_by(2).all(|&v| v == 0.0));
+        assert!(sorrel_render::extract_snippet(p, t, 8, 23, cfg, &[]).is_none());
+        assert!(sorrel_render::extract_snippet(p, SampleIndex(8), 7, 24, cfg, &[]).is_none());
+        let mut scratch = SnipScratch::new(2, 32);
+        assert!(scratch.extract(p, t, 7, 24, cfg, &[], 2, 32));
+        assert_eq!(scratch.buf, snip);
+        assert!(!scratch.extract(p, t, 8, 23, cfg, &[], 2, 32));
+        assert!(!scratch.extract(p, SampleIndex(8), 7, 24, cfg, &[], 2, 32));
+
+        let mut key = all_key(&session, &[ClusterId(0)]);
+        (key.pre, key.post) = crate::waveform_view::waveform_window(p);
+        let progress = AllProgress::new(3, 1);
+        let cancel = AtomicBool::new(false);
+        let result = run_all(&session, &key, &progress, &cancel, None);
+        let cluster = &result.clusters[0];
+        assert_eq!((cluster.valid, cluster.invalid, cluster.drawn), (3, 0, 3));
+        assert_eq!(cluster.mean[0][7], -2.0);
+        assert!(cluster.mean[1].iter().all(|&v| v == 0.0));
     }
 
     #[test]
