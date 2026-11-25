@@ -1700,6 +1700,75 @@ mod zarr_tests {
     }
 
     #[test]
+    fn units_only_limits_gzip_timestamp_chunk_reads_even_when_localizing_a_jump() {
+        use serde_json::{json, Value};
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("chunked.nwb.zarr");
+        copy_store(&Format::Zarr.fixture("timestamps.nwb"), &store);
+        let series = store.join("acquisition/ElectricalSeriesRaw");
+        let times = series.join("timestamps");
+        let array = series.join("data/.zarray");
+        let mut data: Value = serde_json::from_slice(&fs::read(&array).unwrap()).unwrap();
+        data["shape"][0] = json!(512);
+        fs::write(array, data.to_string()).unwrap();
+        fs::write(
+            times.join(".zarray"),
+            json!({
+                "zarr_format": 2, "shape": [512], "chunks": [8], "dtype": "<f8",
+                "compressor": {"id": "gzip", "level": 1}, "fill_value": 0.0,
+                "filters": null, "order": "C",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for (next, gap, sampled_jump) in [
+            (0, 0.0, false),
+            (35 * 8 + 4, 1.0, false),
+            (36 * 8 + 4, 1.0, true),
+        ] {
+            for chunk in 0..64 {
+                let key = times.join(chunk.to_string());
+                // Unselected chunks must never be decoded, including during
+                // binary search. A read of any of them would refuse the probe.
+                if chunk % 9 != 0 {
+                    fs::write(key, b"not a gzip chunk").unwrap();
+                    continue;
+                }
+                let mut codec = flate2::write::GzEncoder::new(
+                    fs::File::create(key).unwrap(),
+                    flate2::Compression::fast(),
+                );
+                for i in chunk * 8..(chunk + 1) * 8 {
+                    let time = i as f64 / 1000.0 + if i >= next { gap } else { 0.0 };
+                    codec.write_all(&time.to_le_bytes()).unwrap();
+                }
+                codec.finish().unwrap();
+            }
+            let units = NwbProvider::open_with(
+                &store,
+                NwbOpenParams {
+                    series: Some("none"),
+                    sample_rate: Some(1000.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let provenance = units.trace_provenance();
+            let skipped = &provenance["skipped_series"];
+            if !sampled_jump {
+                assert_eq!(skipped["status"], "not fully checked", "{skipped}");
+                assert!(skipped["message"].as_str().unwrap().contains("8-chunk"));
+            } else {
+                assert_eq!(skipped["check"], "timestamp grid", "{skipped}");
+                assert_eq!(skipped["sample"], next - 1);
+                assert_eq!(skipped["next_sample"], next);
+            }
+        }
+    }
+
+    #[test]
     fn zarr_clock_choice_is_exact_and_clock_arrays_require_little_endian_floats() {
         use serde_json::{json, Value};
 

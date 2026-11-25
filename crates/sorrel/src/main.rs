@@ -119,7 +119,7 @@ enum Cmd {
         #[arg(long)]
         remove: bool,
     },
-    /// Headless: run every metric and write cluster_qc.tsv + cluster_qc.json
+    /// Headless: run every metric and write QC TSV, JSON, and a provenance sidecar
     Qc {
         #[command(flatten)]
         open: OpenArgs,
@@ -1612,8 +1612,13 @@ impl SessionVisitor for Describe {
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
         let s = seeded(session, seed)?;
-        let mut rows = describe(&s);
-        let provenance = s.provider.trace_provenance();
+        let p = &s.provider;
+        let span = p.session_span();
+        let rate = p
+            .exact_sample_rate()
+            .unwrap_or_else(|_| f64::from(p.sample_rate()));
+        let mut rows = describe(&s, &span, rate);
+        let provenance = p.trace_provenance();
         let skipped = provenance.get("skipped_series");
         if let Some(skipped) = skipped {
             rows.push(("trace", "skipped (units-only)".into()));
@@ -1629,6 +1634,7 @@ impl SessionVisitor for Describe {
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v.into()))
                 .collect();
+            obj.insert("session_span".into(), span.to_json(rate));
             if skipped.is_some() {
                 obj.insert("provenance".into(), provenance);
             }
@@ -1646,14 +1652,17 @@ impl SessionVisitor for Describe {
 }
 
 /// phy `template-describe`: one `(name, value)` row per dataset fact.
-fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> Vec<(&'static str, String)> {
+fn describe<P: DataProvider<Label = PhyLabel>>(
+    s: &Session<P>,
+    span: &sorrel_io::SessionSpan,
+    rate: f64,
+) -> Vec<(&'static str, String)> {
     let p = &s.provider;
     let sr = p.sample_rate();
-    let span = p.session_span();
-    let duration_rate = if span.source == sorrel_io::SpanSource::Trace {
-        f64::from(sr.max(1.0))
+    let rate = if rate.is_finite() && rate > 0.0 {
+        rate
     } else {
-        p.exact_sample_rate().unwrap_or(f64::from(sr))
+        f64::NAN
     };
     let n_spikes: usize = (0..s.n_clusters())
         .map(|c| s.spike_times(sorrel_io::ClusterId(c)).len())
@@ -1672,7 +1681,7 @@ fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> Vec<(&'static 
             )
             .or_default() += 1;
     }
-    let rows = [
+    let mut rows = vec![
         (
             "data files",
             p.raw_file()
@@ -1686,9 +1695,23 @@ fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> Vec<(&'static 
         ("sample rate", format!("{:.1} kHz", sr / 1000.0)),
         (
             "duration",
-            format!("{:.1} s", span.duration_samples() as f64 / duration_rate),
+            format!("{:.1} s", span.recorded_samples() as f64 / rate),
         ),
         ("duration source", span.source.to_string()),
+    ];
+    let gaps = span.gap_samples();
+    if gaps > 0 {
+        rows.push((
+            "extent",
+            format!(
+                "{:.1} s ({} intervals, {:.1} s gaps)",
+                span.extent_samples() as f64 / rate,
+                span.n_intervals(),
+                gaps as f64 / rate
+            ),
+        ));
+    }
+    rows.extend([
         ("# channels", p.n_channels().to_string()),
         ("# spikes", n_spikes.to_string()),
         (
@@ -1728,8 +1751,8 @@ fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> Vec<(&'static 
             }
         }),
         ("undo history", s.history_len().to_string()),
-    ];
-    rows.to_vec()
+    ]);
+    rows
 }
 
 /// The save directory a host for `open` registers under: the dataset
@@ -3173,12 +3196,43 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../release/fixtures/nwb/units_only.nwb");
         let provider = sorrel_io::NwbProvider::open(path).unwrap();
         let journal = Journal::open(&dir.path().join("j.sqlite")).unwrap();
-        let rows = describe(&Session::new(provider, journal));
+        let s = Session::new(provider, journal);
+        let rate = s.provider.exact_sample_rate().unwrap();
+        let rows = describe(&s, &s.provider.session_span(), rate);
         assert!(rows.contains(&("duration", "0.2 s".into())));
         assert!(rows
             .iter()
             .any(|(key, value)| *key == "duration source"
                 && value.starts_with("estimate: spike extent")));
+        assert!(!rows.iter().any(|(key, _)| *key == "extent"));
+
+        let span = sorrel_io::SessionSpan::from_intervals(
+            vec![(1000.into(), 2000.into()), (5000.into(), 7000.into())],
+            sorrel_io::SpanSource::Declared("/units/obs_intervals"),
+        );
+        let rows = describe(&s, &span, 1000.0);
+        assert!(rows.contains(&("duration", "3.0 s".into())));
+        assert!(rows.contains(&("extent", "6.0 s (2 intervals, 3.0 s gaps)".into())));
+        assert_eq!(
+            span.to_json(1000.0),
+            serde_json::json!({
+                "kind": "declared", "source": "declared: /units/obs_intervals",
+                "interval_source": "/units/obs_intervals", "start_s": 1.0, "end_s": 7.0,
+                "extent_s": 6.0, "recorded_s": 3.0, "duration_s": 3.0, "gap_s": 3.0,
+                "n_intervals": 2,
+            })
+        );
+        let unknown = span.to_json(f64::NAN);
+        for key in [
+            "start_s",
+            "end_s",
+            "extent_s",
+            "recorded_s",
+            "duration_s",
+            "gap_s",
+        ] {
+            assert!(unknown.get(key).unwrap().is_null(), "{key}");
+        }
     }
 
     /// The crate-local icon decodes, and still equals the canonical asset

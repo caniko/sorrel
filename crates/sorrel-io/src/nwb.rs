@@ -473,7 +473,7 @@ mod imp {
             if let Some(skipped) = &self.skipped_series {
                 return json!({ "mode": "units-only", "skipped_series": skipped });
             }
-            json!({ "mode": if self.trace.is_some() { "trace" } else { "units-only" } })
+            json!({ "mode": if self.has_trace() { "trace" } else { "units-only" } })
         }
         fn n_clusters(&self) -> u32 {
             self.spikes_per_cluster.len() as u32
@@ -1250,7 +1250,7 @@ mod imp {
             data.shape()[0],
             |ds, n| {
                 let grid = probe_timestamps(ds, n, true)?;
-                timestamps_fit = Some(grid.probe_regular);
+                timestamps_fit = Some((grid.probe_regular, grid.chunk_limited));
                 Ok((grid.rate, grid.t0))
             },
             "",
@@ -1264,17 +1264,20 @@ mod imp {
             }) = err.downcast_ref()
             {
                 skipped["check"] = json!(check);
-                skipped["sample"] = json!(left.0);
-                skipped["next_sample"] = json!(right.0);
-                skipped["jump_s"] = json!(right.1 - left.1);
-                skipped["t_s"] = json!([left.1, right.1]);
+                if right.0 - left.0 == 1 {
+                    skipped["sample"] = json!(left.0);
+                    skipped["next_sample"] = json!(right.0);
+                    skipped["jump_s"] = json!(right.1 - left.1);
+                    skipped["t_s"] = json!([left.1, right.1]);
+                }
             }
             return skipped;
         }
         let (status, message) = match timestamps_fit {
-            Some(true) => ("regular (probe)", "Sampled timestamps fit the inferred grid; the full scan was skipped."),
-            Some(false) => ("not fully checked", "Sampled timestamps deviate from the inferred grid; the probe did not locate a discontinuity and the full scan was skipped."),
-            None => ("not fully checked", "No per-sample timestamps; checked series metadata and the declared clock only."),
+            Some((_, true)) => ("not fully checked", format!("The timestamp probe was limited to an {MAX_UNITS_ONLY_PROBE_CHUNKS}-chunk I/O budget; the full scan was skipped.")),
+            Some((true, false)) => ("regular (probe)", "Sampled timestamps fit the inferred grid; the full scan was skipped.".into()),
+            Some((false, false)) => ("not fully checked", "Sampled timestamps deviate from the inferred grid; the probe did not locate a discontinuity and the full scan was skipped.".into()),
+            None => ("not fully checked", "No per-sample timestamps; checked series metadata and the declared clock only.".into()),
         };
         json!({ "series": name, "status": status, "message": message })
     }
@@ -1307,6 +1310,7 @@ mod imp {
     }
 
     const TIMESTAMP_BLOCK: usize = 65_536;
+    const MAX_UNITS_ONLY_PROBE_CHUNKS: usize = 8;
 
     fn read_timestamp_block(ds: &Dataset, range: Range<usize>) -> Result<Vec<f64>> {
         let times = ds.read_rows(range)?;
@@ -1350,6 +1354,7 @@ mod imp {
         period: f64,
         limit: f64,
         probe_regular: bool,
+        chunk_limited: bool,
     }
 
     impl TimestampGrid {
@@ -1358,11 +1363,44 @@ mod imp {
         }
     }
 
-    fn probe_timestamps(ds: &Dataset, n: usize, probe_small: bool) -> Result<TimestampGrid> {
+    fn probe_timestamps(ds: &Dataset, n: usize, probe_only: bool) -> Result<TimestampGrid> {
         ensure!(
             ds.shape() == [n] && n >= 2,
             "timestamps must contain one time per sample and at least two times to infer a rate"
         );
+        let chunks: Option<[_; MAX_UNITS_ONLY_PROBE_CHUNKS]> = if probe_only {
+            ds.chunk_rows().and_then(|rows| {
+                let count = n.div_ceil(rows);
+                (count > MAX_UNITS_ONLY_PROBE_CHUNKS).then(|| {
+                    std::array::from_fn(|i| {
+                        // Include first and last chunks, even if the last is partial.
+                        let chunk = ((count - 1) as u128 * i as u128
+                            / (MAX_UNITS_ONLY_PROBE_CHUNKS - 1) as u128)
+                            as usize;
+                        let start = chunk * rows;
+                        start..start.saturating_add(rows).min(n)
+                    })
+                })
+            })
+        } else {
+            None
+        };
+        // Refinement may narrow within the selected chunks, but must not
+        // pull in additional chunks just to say where a jump happened.
+        let midpoint = |left: usize, right: usize| {
+            if right - left <= 1 {
+                return None;
+            }
+            let mid = left.midpoint(right);
+            match &chunks {
+                None => Some(mid),
+                Some(chunks) => chunks
+                    .iter()
+                    .map(|chunk| mid.clamp(chunk.start, chunk.end - 1))
+                    .filter(|&sample| left < sample && sample < right)
+                    .min_by_key(|&sample| sample.abs_diff(mid)),
+            }
+        };
         let time_at =
             |sample| -> Result<_> { Ok(read_timestamp_block(ds, sample..sample + 1)?[0]) };
         let t0 = time_at(0)?;
@@ -1370,8 +1408,7 @@ mod imp {
         if last <= t0 {
             // At least one half must retain the non-increasing endpoints.
             let (mut left, mut right) = ((0, t0), (n - 1, last));
-            while right.0 - left.0 > 1 {
-                let mid = left.0.midpoint(right.0);
+            while let Some(mid) = midpoint(left.0, right.0) {
                 let t = time_at(mid)?;
                 if t <= left.1 {
                     right = (mid, t);
@@ -1401,9 +1438,10 @@ mod imp {
             period,
             limit,
             probe_regular: true,
+            chunk_limited: chunks.is_some(),
         };
         // Don't probe if a full scan is planned and fits in one block.
-        let stride = if !probe_small && n <= TIMESTAMP_BLOCK {
+        let stride = if !probe_only && n <= TIMESTAMP_BLOCK {
             n - 1
         } else {
             (n - 1).div_ceil(63)
@@ -1411,8 +1449,16 @@ mod imp {
         // ponytail: fast refusal is best-effort and only localizes the first
         // failed probe. The full scan still refuses discontinuities that return
         // to the grid between probes or that the probe can't explain.
+        let samples: Vec<_> = match &chunks {
+            Some(chunks) => chunks
+                .iter()
+                .flat_map(|chunk| [chunk.start, chunk.end - 1].into_iter().take(chunk.len()))
+                .filter(|&i| i != 0 && i != n - 1)
+                .collect(),
+            None => (stride..n - 1).step_by(stride).collect(),
+        };
         let mut last_in_grid = (0, t0);
-        for sample in (stride..n - 1).step_by(stride) {
+        for sample in samples {
             let time = time_at(sample)?;
             let drift = grid.error(sample, time);
             if drift.abs() <= limit {
@@ -1438,8 +1484,7 @@ mod imp {
                 (shorter, Some(-1.0)),
                 (longer, Some(1.0)),
             ] {
-                while right.0 - left.0 > 1 {
-                    let mid = left.0.midpoint(right.0);
+                while let Some(mid) = midpoint(left.0, right.0) {
                     let t = time_at(mid)?;
                     let take_left = if let Some(sign) = direction {
                         let left_mean = (t - left.1) / (mid - left.0) as f64;
@@ -1455,11 +1500,41 @@ mod imp {
                     }
                 }
                 let step = checked_timestamp_step(left, right)?;
+                if right.0 - left.0 > 1 {
+                    continue; // The bracket crosses unprobed chunks, not one interval.
+                }
+                let mut candidate = (left, right, step);
+                if let Some(chunks) = &chunks {
+                    // A gap outside the sampled chunks can skew the mean.
+                    // Don't label an ordinary interval a jump without a
+                    // differing neighboring step in the sampled data.
+                    let Some((index, point)) =
+                        [(left.0.checked_sub(1), left), (Some(right.0 + 1), right)]
+                            .into_iter()
+                            .filter_map(|(i, point)| Some((i?, point)))
+                            .find(|(i, _)| chunks.iter().any(|chunk| chunk.contains(i)))
+                    else {
+                        continue;
+                    };
+                    let neighbor = (index, time_at(index)?);
+                    let (a, b) = if index < point.0 {
+                        (neighbor, point)
+                    } else {
+                        (point, neighbor)
+                    };
+                    let other = checked_timestamp_step(a, b)?;
+                    if ((other - step) * rate).abs() <= 2.0 * limit {
+                        continue;
+                    }
+                    if (other * rate - 1.0).abs() > (step * rate - 1.0).abs() {
+                        candidate = (a, b, other);
+                    }
+                }
                 // Adjacent grid errors differ by the interval error in samples.
-                let error = (step * rate - 1.0).abs();
+                let error = (candidate.2 * rate - 1.0).abs();
                 if error > largest_error {
                     largest_error = error;
-                    gap = Some((left, right, step));
+                    gap = Some(candidate);
                 }
             }
             if let Some((left, right, jump)) = gap {

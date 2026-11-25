@@ -370,6 +370,11 @@ impl Dataset {
         dispatch!(self, Self, d => d.chunk(), d.chunk())
     }
 
+    /// Axis-0 chunk length for a chunked array, `None` for contiguous storage.
+    pub fn chunk_rows(&self) -> Option<usize> {
+        self.chunk()?.first().copied().filter(|&rows| rows > 0)
+    }
+
     pub fn sample_type(&self) -> Result<SampleType> {
         dispatch!(self, Self, d => hdf::sample_type(d), d.sample_type())
     }

@@ -1,14 +1,14 @@
 //! QC export — write every cluster's quality metrics to a tab-separated
 //! file (SpikeInterface-compatible columns) and/or to a JSON snapshot.
 //!
-//! Two output formats:
+//! Outputs:
 //! * `cluster_qc.tsv`: one row per cluster, headed by phy-style column
 //!   names. Compatible with `pandas.read_csv(..., sep='\t')` and
 //!   `spikeinterface.curation.read_qm_csv`.
-//! * `cluster_qc.json`: a versioned object with session-span and trace provenance metadata and an
-//!   array of rows with the same fields as the TSV.
+//! * `cluster_qc.json`: an array of rows with the same fields as the TSV.
+//! * `cluster_qc.provenance.json`: versioned session span, trace provenance, and composite terms.
 //!
-//! Both run the rayon-parallel quality + isolation pipeline so even 1k+
+//! Both row formats use the same quality + isolation pipeline so even 1k+
 //! cluster sessions export in a few seconds.
 
 use crate::cache::correlograms::acg_or_compute;
@@ -495,42 +495,19 @@ pub fn write_qc_tsv<P: AsRef<Path>>(rows: &[QcRow], path: P) -> Result<()> {
 /// Write QC rows to a JSON file (`[{...}, {...}]`). Streaming so we don't
 /// build a giant in-memory string for large recordings.
 pub fn write_qc_json<P: AsRef<Path>>(rows: &[QcRow], path: P) -> Result<()> {
-    write_qc_json_document(rows, path.as_ref(), None)
-}
-
-type CompositeTerms = BTreeMap<u32, Vec<&'static str>>;
-
-fn write_qc_json_document(
-    rows: &[QcRow],
-    path: &Path,
-    metadata: Option<(serde_json::Value, serde_json::Value, CompositeTerms)>,
-) -> Result<()> {
     let f = File::create(path).context("creating QC JSON file")?;
     let mut w = BufWriter::new(f);
-    if let Some((span, provenance, terms)) = &metadata {
-        write!(
-            w,
-            "{{\"schema_version\":2,\"session_span\":{span},\"provenance\":{provenance},\"composite_terms\":"
-        )?;
-        serde_json::to_writer(&mut w, terms)?;
-        w.write_all(b",\"clusters\":")?;
-    }
     w.write_all(b"[")?;
     for (i, row) in rows.iter().enumerate() {
         row.write_json(&mut w, i > 0)?;
     }
-    w.write_all(if metadata.is_some() {
-        b"\n]}\n"
-    } else {
-        b"\n]\n"
-    })?;
+    w.write_all(b"\n]\n")?;
     w.flush()?;
     Ok(())
 }
 
-/// Convenience: compute all rows and write both formats into `out_dir`
-/// under `cluster_qc.tsv` / `cluster_qc.json`. `positions` as for
-/// [`collect_qc_rows_with`].
+/// Write `cluster_qc.tsv`, `cluster_qc.json`, and `cluster_qc.provenance.json`.
+/// `positions` as for [`collect_qc_rows_with`].
 pub fn export_qc<P: DataProvider>(
     session: &Session<P>,
     out_dir: impl AsRef<Path>,
@@ -538,37 +515,40 @@ pub fn export_qc<P: DataProvider>(
 ) -> Result<usize> {
     let dir = out_dir.as_ref();
     std::fs::create_dir_all(dir).context("creating QC output dir")?;
-    let mut terms = CompositeTerms::new();
+    let mut terms = BTreeMap::new();
     let rows = collect_qc(
         session,
         positions,
         RefractoryWindows::Session(session.refractory()),
         |c, q| {
-            terms.insert(c.0, q.composite_terms().map(|(name, _)| name).collect());
+            terms.insert(
+                c.0,
+                q.composite_terms()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+            );
         },
     );
     write_qc_tsv(&rows, dir.join("cluster_qc.tsv"))?;
+    write_qc_json(&rows, dir.join("cluster_qc.json"))?;
     let p = &session.provider;
     let span = p.session_span();
     let rate = p
         .exact_sample_rate()
         .unwrap_or_else(|_| f64::from(p.sample_rate()));
-    let known = span.duration_samples() > 0 && rate.is_finite() && rate > 0.0;
-    let seconds = |sample| known.then(|| sample as f64 / rate);
-    write_qc_json_document(
-        &rows,
-        &dir.join("cluster_qc.json"),
-        Some((
-            serde_json::json!({
-                "start_s": seconds(span.start.0),
-                "end_s": seconds(span.end.0),
-                "duration_s": seconds(span.duration_samples()),
-                "source": span.source.to_string(),
-            }),
-            p.trace_provenance(),
-            terms,
-        )),
-    )?;
+    let sidecar = serde_json::json!({
+        "schema_version": 1,
+        "session_span": span.to_json(rate),
+        "provenance": p.trace_provenance(),
+        "composite_terms": terms,
+    });
+    let mut w = BufWriter::new(
+        File::create(dir.join("cluster_qc.provenance.json"))
+            .context("creating QC provenance file")?,
+    );
+    serde_json::to_writer_pretty(&mut w, &sidecar)?;
+    writeln!(w)?;
+    w.flush()?;
     Ok(rows.len())
 }
 
@@ -704,7 +684,12 @@ pub(crate) mod tests {
         let qc: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("cluster_qc.json")).unwrap())
                 .unwrap();
-        let exported = &qc["clusters"][0];
+        assert!(qc.is_array());
+        let exported = &qc[0];
+        let sidecar: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("cluster_qc.provenance.json")).unwrap(),
+        )
+        .unwrap();
         for key in [
             "mean_amplitude",
             "amplitude_snr",
@@ -737,7 +722,7 @@ pub(crate) mod tests {
         let q = crate::quality_ext::cluster_quality(&units, ClusterId(0));
         let terms: Vec<_> = q.composite_terms().map(|(name, _)| name).collect();
         assert_eq!(terms, ["isi", "presence", "coverage"]);
-        assert_eq!(qc["composite_terms"]["0"], serde_json::json!(terms));
+        assert_eq!(sidecar["composite_terms"]["0"], serde_json::json!(terms));
         assert!(
             (q.composite() - (q.contamination_score * q.presence_score * q.coverage_score).cbrt())
                 .abs()
@@ -748,9 +733,11 @@ pub(crate) mod tests {
                 < 1e-6
         );
         assert_eq!(
-            qc["session_span"],
+            sidecar["session_span"],
             serde_json::json!({
-                "start_s": 5.0, "end_s": 6.0, "duration_s": 1.0, "source": "estimate: spike extent",
+                "kind": "derived", "source": "estimate: spike extent", "interval_source": null,
+                "start_s": 5.0, "end_s": 6.0, "extent_s": 1.0, "recorded_s": 1.0,
+                "duration_s": 1.0, "gap_s": 0.0, "n_intervals": 1,
             })
         );
     }
@@ -858,7 +845,7 @@ pub(crate) mod tests {
         let qc: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("cluster_qc.json")).unwrap())
                 .unwrap();
-        let row = &qc["clusters"][0];
+        let row = &qc[0];
         for (name, value) in [
             ("mean_amplitude", 3.0),
             ("amplitude_cutoff", 0.0),
@@ -887,7 +874,11 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(q.composite().to_bits(), expected.to_bits());
-        assert_eq!(qc["composite_terms"]["0"], serde_json::json!(terms));
+        let sidecar: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("cluster_qc.provenance.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sidecar["composite_terms"]["0"], serde_json::json!(terms));
     }
 
     #[test]
@@ -1027,7 +1018,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn export_writes_both_formats_with_one_row_per_cluster() {
+    fn export_writes_v1_rows_and_separate_provenance() {
         let prov = MockProvider {
             spikes: vec![
                 vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
@@ -1048,6 +1039,12 @@ pub(crate) mod tests {
         assert_eq!(n, 4);
 
         let tsv = std::fs::read_to_string(outdir.join("cluster_qc.tsv")).unwrap();
+        let rows = collect_qc_rows(&s);
+        let mut expected_tsv = QcRow::tsv_header().into_bytes();
+        for row in &rows {
+            row.write_tsv(&mut expected_tsv).unwrap();
+        }
+        assert_eq!(tsv.as_bytes(), expected_tsv);
         let lines: Vec<&str> = tsv.lines().collect();
         // 1 header + 4 rows.
         assert_eq!(lines.len(), 5);
@@ -1055,10 +1052,22 @@ pub(crate) mod tests {
         assert!(lines[1].starts_with("0\t"));
 
         let json = std::fs::read_to_string(outdir.join("cluster_qc.json")).unwrap();
-        let document: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(document["schema_version"], 2);
-        assert_eq!(document["session_span"]["source"], "trace");
-        assert_eq!(document["provenance"]["mode"], "trace");
+        let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(rows.is_array());
+        let sidecar: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(outdir.join("cluster_qc.provenance.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sidecar["schema_version"], 1);
+        assert_eq!(
+            sidecar["session_span"],
+            serde_json::json!({
+                "kind": "measured", "source": "trace", "interval_source": null,
+                "start_s": 0.0, "end_s": 1.0, "extent_s": 1.0, "recorded_s": 1.0,
+                "duration_s": 1.0, "gap_s": 0.0, "n_intervals": 1,
+            })
+        );
+        assert_eq!(sidecar["provenance"]["mode"], "trace");
         // Each row contains its cluster id.
         assert!(json.contains("\"cluster_id\": 0"));
         assert!(json.contains("\"cluster_id\": 2"));
@@ -1073,7 +1082,6 @@ pub(crate) mod tests {
         let json_keys: Vec<&str> = first_row.split('"').skip(1).step_by(2).collect();
         assert_eq!(tsv_keys, json_keys);
         assert!(tsv_keys.ends_with(&["n_epochs", "epoch_amp_ratio", "epoch_rate_ratio"]));
-        let rows = &document["clusters"];
         for name in [
             "srp_contamination",
             "srp_rp_ms",

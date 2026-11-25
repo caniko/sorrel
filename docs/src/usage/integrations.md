@@ -209,8 +209,8 @@ and no raw NWB is paired, you must supply `--sample-rate HZ` as an analysis grid
 Spike times are relative to zero
 (`timestamps_reference_time`).
 The electrodes table supplies channels if present, but there is no raw trace
-or waveform extraction. Session span comes from epochs, unit observation
-intervals, or trials (in that order), or is estimated from the spike extent;
+or waveform extraction. Session span comes from unit observation intervals,
+epochs, or trials (in that order), or is estimated from the spike extent;
 it is never a trace duration.
 
 Sorrel refuses a selected series with an invalid time base, including gaps or
@@ -222,14 +222,15 @@ Do not combine it with `--dat`; select a series literally named `none` with
 between units-only and trace-backed opens of the same recording.
 
 `describe` shows why the series was skipped. Its JSON output and
-`cluster_qc.json` (schema v2) include `provenance.mode: "units-only"` and
+`cluster_qc.provenance.json` include `provenance.mode: "units-only"` and
 `provenance.skipped_series` for explicit skips. The latter records the
 default acquisition series path (`series`), `status`, and `message`. Sorrel
 checks shape and type and probes timestamps without scanning them end to end.
 It does not read trace samples or the skipped series' electrodes region.
 `regular (probe)` only means the sampled timestamps fit; an unprobed gap can
-still be present. `not fully checked` means the probe was inconclusive or there
-were no per-sample timestamps. A `refused` result names the failing `check`;
+still be present. `not fully checked` means the probe hit the eight-chunk I/O
+budget, was otherwise inconclusive, or had no per-sample timestamps.
+A `refused` result names the failing `check`;
 when the probe locates a jump it also reports `sample`, `next_sample`, `jump_s`
 (signed seconds), and `t_s` (the two timestamps in seconds). If there is no
 acquisition series, the status says so. For trace-backed QC exports, the mode

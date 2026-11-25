@@ -170,24 +170,29 @@ sorrel qc <DATA_DIR> --out out/qc/
 
 Loads the data, runs the full metrics pipeline (firing rate, presence,
 refractory contamination, amplitude stats, ISI violations, isolation
-distance where PC features are available, composite quality), writes
-both:
+distance where PC features are available, composite quality), and writes:
 
 - `out/qc/cluster_qc.tsv` — one row per cluster, header columns are
   metric names.
-- `out/qc/cluster_qc.json` — a versioned object: `schema_version: 2`,
-  `session_span`, `provenance`, `composite_terms`, and `clusters`. The `clusters` array is the previous
-  top-level array, with the same row fields. To read either version, use
-  `doc if isinstance(doc, list) else doc["clusters"]` in Python.
+- `out/qc/cluster_qc.json` — the v1 top-level array, with the same row fields
+  as the TSV.
+- `out/qc/cluster_qc.provenance.json` — a separate object with `schema_version: 1`,
+  `session_span`, trace `provenance`, and `composite_terms` by cluster ID.
 
-`session_span` gives `start_s`, `end_s` (exclusive), and `duration_s` in
-seconds on the spike sample grid, plus `source`. A trace gives the span
-`[0, trace length)`. Without a trace, NWB uses the first non-empty declared
-extent from epochs, Units observation intervals, or trials, in that order.
-If none is usable or the selected interval does not cover every spike,
-Sorrel uses the first spike through one sample past the last spike and
-labels that span as an estimate. `sorrel describe` shows the duration and
-its source as well.
+The sidecar and `sorrel describe --json` share the same `session_span` object.
+`kind` is `measured`, `declared`, `derived`, or `unavailable`; `source` describes
+the origin, and `interval_source` is the declared NWB path or `null`.
+`start_s` and `end_s` are the outer bounds on the spike sample grid (end
+exclusive); `extent_s` is the time between them. `recorded_s` and its alias
+`duration_s` exclude gaps; `gap_s` is the difference and `n_intervals` counts
+the merged intervals. Times are `null` when unavailable. `sorrel describe`
+keeps `duration` as a string in seconds and also shows the extent when there
+are gaps.
+
+A trace gives the span `[0, trace length)`. Without a trace, NWB uses valid
+Units observation intervals (their union for the session), then epochs, then
+trials. If none covers the spikes, Sorrel estimates the span from the first
+spike through one sample past the last spike.
 
 Firing rate and presence use the reported span, including when it is
 derived; neither is available when there is no span (`null` in JSON,
@@ -202,7 +207,7 @@ and blank in TSV, not zero. `composite_quality` is the equal-weight
 geometric mean of the measured subscores, with a floor of 0.001 per
 measured term. Missing terms are excluded from both the numerator (the
 sum of log scores) and the term count; with no measured terms the score
-is missing. The top-level JSON `composite_terms` map lists the terms used
+is missing. The sidecar's `composite_terms` map lists the terms used
 for each cluster ID: `isi` (refractory contamination), `presence`,
 `coverage`, `snr`, `completeness`, `stability`, and `isolation`.
 

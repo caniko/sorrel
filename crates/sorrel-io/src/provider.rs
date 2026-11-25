@@ -200,6 +200,33 @@ impl SessionSpan {
         self.extent_samples() - self.recorded_samples()
     }
 
+    /// Exposure and its provenance on the spike sample grid, in seconds.
+    /// An empty span or an invalid rate has no time measurements.
+    pub fn to_json(&self, rate: f64) -> serde_json::Value {
+        let (kind, interval_source) = match self.source {
+            SpanSource::Trace => ("measured", None),
+            SpanSource::Declared(path) => ("declared", Some(path)),
+            SpanSource::SpikeExtent { .. } => ("derived", None),
+            SpanSource::Unavailable => ("unavailable", None),
+        };
+        let recorded = self.recorded_samples();
+        let known = recorded > 0 && rate.is_finite() && rate > 0.0;
+        let seconds = |samples: u64| known.then(|| samples as f64 / rate);
+        let recorded_s = seconds(recorded);
+        serde_json::json!({
+            "kind": kind,
+            "source": self.source.to_string(),
+            "interval_source": interval_source,
+            "start_s": seconds(self.start.0),
+            "end_s": seconds(self.end.0),
+            "extent_s": seconds(self.extent_samples()),
+            "recorded_s": recorded_s,
+            "duration_s": recorded_s,
+            "gap_s": seconds(self.gap_samples()),
+            "n_intervals": self.n_intervals(),
+        })
+    }
+
     pub fn contains(&self, sample: SampleIndex) -> bool {
         if let Some(rows) = &self.gapped {
             let i = rows.partition_point(|&(_, hi)| hi <= sample);
@@ -685,6 +712,10 @@ pub trait DataProvider: Send + Sync + 'static {
     fn n_channels(&self) -> u32;
     /// Length of the readable raw trace, not the session exposure.
     fn n_samples(&self) -> SampleIndex;
+    /// Whether any raw samples can be read, independent of exposure provenance.
+    fn has_trace(&self) -> bool {
+        self.n_samples().0 > 0
+    }
     /// Exposure for session-wide spike statistics, independent of raw reads.
     fn session_span(&self) -> SessionSpan {
         self.n_samples().0.into()
@@ -695,7 +726,7 @@ pub trait DataProvider: Send + Sync + 'static {
     }
     /// Trace mode and, for an explicitly skipped NWB trace, its inspection result.
     fn trace_provenance(&self) -> serde_json::Value {
-        let mode = if self.session_span().source == SpanSource::Trace {
+        let mode = if self.has_trace() {
             "trace"
         } else {
             "units-only"

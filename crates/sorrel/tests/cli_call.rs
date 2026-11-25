@@ -83,6 +83,18 @@ fn nwb_units_only_describe_and_qc_report_the_same_probe() {
         serde_json::from_slice(&units(&["describe", ds, "--json"])).unwrap();
     assert_eq!(description["trace"], "skipped (units-only)");
     assert_ne!(description["duration source"], "trace");
+    let span = &description["session_span"];
+    let recorded = span["recorded_s"].as_f64().unwrap();
+    assert_eq!(description["duration"], format!("{recorded:.1} s"),);
+    assert_eq!(
+        span,
+        &serde_json::json!({
+            "kind": "derived", "source": description["duration source"], "interval_source": null,
+            "start_s": span["start_s"].as_f64().unwrap(), "end_s": span["end_s"].as_f64().unwrap(),
+            "extent_s": recorded, "recorded_s": recorded, "duration_s": recorded,
+            "gap_s": 0.0, "n_intervals": 1,
+        })
+    );
     let provenance = &description["provenance"];
     assert_eq!(provenance["mode"], "units-only");
     assert_eq!(
@@ -104,9 +116,15 @@ fn nwb_units_only_describe_and_qc_report_the_same_probe() {
     let qc: serde_json::Value =
         serde_json::from_slice(&std::fs::read(tmp.path().join("cluster_qc.json")).unwrap())
             .unwrap();
-    assert_eq!(qc["schema_version"], 2);
-    assert_eq!(qc["provenance"], *provenance);
-    assert_ne!(qc["session_span"]["source"], "trace");
+    assert!(qc.is_array());
+    let sidecar: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(tmp.path().join("cluster_qc.provenance.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sidecar["schema_version"], 1);
+    assert_eq!(sidecar["provenance"], *provenance);
+    assert_eq!(sidecar["session_span"], *span);
+    assert!(sidecar["composite_terms"][qc[0]["cluster_id"].to_string()].is_array());
 }
 
 #[test]
@@ -224,7 +242,7 @@ fn refractory_flags_change_qc_and_html_report_on_the_real_binary() {
         }
         let rows: serde_json::Value =
             serde_json::from_slice(&std::fs::read(qc.join("cluster_qc.json")).unwrap()).unwrap();
-        let row = rows["clusters"]
+        let row = rows
             .as_array()
             .unwrap()
             .iter()
@@ -308,8 +326,7 @@ fn qc_cli_distinguishes_confirmed_contamination_from_no_evidence() {
         let rows: serde_json::Value =
             serde_json::from_slice(&std::fs::read(qc.join("cluster_qc.json")).unwrap()).unwrap();
         let row = |id| {
-            rows["clusters"]
-                .as_array()
+            rows.as_array()
                 .unwrap()
                 .iter()
                 .find(|r| r["cluster_id"] == id)

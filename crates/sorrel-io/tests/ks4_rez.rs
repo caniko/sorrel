@@ -43,6 +43,7 @@ fn reads_matlab_columns_as_sorted_zero_based_spike_trains() {
     });
 
     let p = Ks4RezProvider::open(&path, Ks4RezOpenParams::default()).unwrap();
+    assert_eq!(p.trace_provenance()["mode"], "units-only");
     assert_eq!(p.sample_rate(), 30_000.0);
     assert_eq!(p.n_channels(), 2);
     assert_eq!(p.n_clusters(), 3);
@@ -57,6 +58,18 @@ fn reads_matlab_columns_as_sorted_zero_based_spike_trains() {
     );
     assert_eq!(p.spike_templates(ClusterId(0)), [0, 0]);
     assert_eq!(p.spike_templates(ClusterId(2)), [2, 2]);
+
+    let dat = dir.path().join("trace.dat");
+    std::fs::write(&dat, [0_u8; 256]).unwrap();
+    let with_trace = Ks4RezProvider::open(
+        &path,
+        Ks4RezOpenParams {
+            dat_path: Some(dat),
+        },
+    )
+    .unwrap();
+    assert_eq!(with_trace.trace_provenance()["mode"], "trace");
+    assert!(!with_trace.trace(SampleIndex(0), 1).samples.is_empty());
 }
 
 #[test]
