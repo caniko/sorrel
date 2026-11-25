@@ -155,9 +155,10 @@ What Sorrel reads:
   extension subtype declared in `/specifications`) under `/acquisition` and
   `/processing`, with 2-D `data` (time × channels) or 1-D `data` (one channel).
   Conflicting cached type definitions that affect series selection are refused.
-  By default it prefers 2-D series, then takes the first series by path
-  (acquisitions before processed series), and logs the available paths when there is
-  more than one. Linked series and linked datasets used by the reader are
+  By default it selects only from `/acquisition`, preferring 2-D series and
+  breaking ties by path, and logs the available paths when there is more than one.
+  A `/processing` series supplies a trace and clock only when explicitly selected
+  with `--nwb-series`. Linked series and linked datasets used by the reader are
   refused; open the file or store that holds the data directly. `--nwb-series`
   takes an acquisition name or an absolute path in the NWB file, not a
   filesystem path. Use a separate `--journal` when
@@ -191,14 +192,14 @@ What Sorrel reads:
   and are not used as probe geometry; without `rel_x`/`rel_y` the session
   has no channel positions.
 
-**Units without a trace.** Without an ElectricalSeries, Sorrel takes the
+**Units without a trace.** Without a selected ElectricalSeries, Sorrel takes the
 rate from `1 / spike_times.resolution`. If that resolution is unspecified
 and no raw NWB is paired, supply the rate with `--sample-rate HZ` instead.
 Spike times are relative to zero
 (`timestamps_reference_time`).
 The electrodes table supplies channels if present, but there is no raw trace
 or waveform extraction. With `--dat recording.nwb`, the raw file supplies
-the trace, channels and time base; `--nwb-series` selects from that file.
+the trace, channels and time base; use `--nwb-series` if that file has only processed series.
 If a Units rate is declared, it must be within one part per million of the
 raw series rate. The same exact clock choice and spike-index check apply.
 Spike indices must fit

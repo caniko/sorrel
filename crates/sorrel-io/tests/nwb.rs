@@ -785,6 +785,96 @@ fn units_only_have_no_trace_and_use_resolution_or_sample_rate() {
 
 #[cfg(feature = "hdf5")]
 #[test]
+fn series_selection_processing_only_needs_an_explicit_clock() {
+    const LFP: &str = "/processing/ecephys/LFP/lfp";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lfp.nwb");
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.create_group("/processing/ecephys/LFP").unwrap();
+        file.relink("/acquisition/ElectricalSeriesRaw", LFP)
+            .unwrap();
+        file.dataset(&format!("{LFP}/starting_time"))
+            .unwrap()
+            .attr("rate")
+            .unwrap()
+            .write_scalar(&1250.0)
+            .unwrap();
+    }
+    let err = NwbProvider::open(&path).err().unwrap().to_string();
+    for text in [
+        "no /acquisition ElectricalSeries",
+        "no /units/spike_times resolution",
+        LFP,
+        "not a spike clock",
+        "--sample-rate HZ",
+        "--nwb-series",
+    ] {
+        assert!(err.contains(text), "{err}");
+    }
+    let open = |series, sample_rate| {
+        NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                series,
+                sample_rate,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let units = open(None, Some(20_000.0));
+    assert_eq!(units.sample_rate(), 20_000.0);
+    assert_eq!(units.spike_times(ClusterId(0))[0], SampleIndex(12_000));
+    assert_eq!(units.n_samples(), SampleIndex(0));
+    assert!(frame(&units, 0).is_empty());
+    let lfp = open(Some(LFP), None);
+    assert_eq!(lfp.sample_rate(), 1250.0);
+    assert_eq!(lfp.spike_times(ClusterId(0))[0], SampleIndex(125));
+    assert_eq!(lfp.n_samples(), SampleIndex(300));
+
+    let err = NwbProvider::open_with(
+        &path,
+        NwbOpenParams {
+            raw_path: Some(&path),
+            ..Default::default()
+        },
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(err.contains("--nwb-series") && err.contains(LFP), "{err}");
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn series_selection_prefers_rank_one_acquisition_over_rank_two_processing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.nwb");
+    std::fs::copy(fixture("one_channel.nwb"), &path).unwrap();
+    {
+        use hdf5_metno::types::VarLenUnicode;
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        let lfp = file.create_group("/processing/ecephys/LFP/lfp").unwrap();
+        lfp.new_attr::<VarLenUnicode>()
+            .create("neurodata_type")
+            .unwrap()
+            .write_scalar(&"ElectricalSeries".parse::<VarLenUnicode>().unwrap())
+            .unwrap();
+        lfp.new_dataset::<i16>()
+            .shape((300, 2))
+            .create("data")
+            .unwrap();
+    }
+    let p = NwbProvider::open(&path).unwrap();
+    assert_eq!(p.sample_rate(), 1000.0);
+    assert_eq!(frame(&p, 297), [297.0]);
+    assert_eq!(p.spike_times(ClusterId(0))[0], SampleIndex(100));
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
 fn later_series_never_inherits_a_linked_earlier_series_legacy_seal() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("legacy-linked.nwb");

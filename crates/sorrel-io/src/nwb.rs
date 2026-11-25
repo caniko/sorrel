@@ -193,7 +193,8 @@ mod imp {
                 })
                 .transpose()?;
             let recording = raw.as_ref().map_or(&f, |(group, _)| group);
-            let series = find_electrical_series(recording, params.series, raw.is_some())?;
+            let (series, processed) =
+                find_electrical_series(recording, params.series, raw.is_some())?;
             // In a single file with a series, an invalid resolution value is
             // not a clock statement; its storage type must still be exact.
             let units_rate = read_units_rate(&spike_times, raw.is_some() || series.is_none())?;
@@ -249,15 +250,20 @@ mod imp {
                     ensure!(explicit == declared,
                         "--sample-rate {explicit} Hz is not a clock this NWB declares; pass one of: {declared} Hz (/units/spike_times resolution)");
                 }
+                let rate = units_rate.or(params.sample_rate).with_context(|| {
+                    let missing = "no /acquisition ElectricalSeries and no /units/spike_times resolution";
+                    match processed {
+                        Some(paths) => format!("{missing}; /processing series ({paths}) are not a spike clock; pass --sample-rate HZ as the analysis grid, or --nwb-series PATH to use a processed series' clock"),
+                        None => format!("{missing}; pass --sample-rate HZ as the analysis grid"),
+                    }
+                })?;
                 (
-                        None,
-                        units_rate.or(params.sample_rate).map(checked_rate).transpose()?.context(
-                            "no ElectricalSeries time base in the sorting NWB and no /units/spike_times resolution; pass --sample-rate HZ",
-                        )?,
-                        0.0,
-                        read_units_only_channels(&f)?,
-                        None,
-                    )
+                    None,
+                    checked_rate(rate)?,
+                    0.0,
+                    read_units_only_channels(&f)?,
+                    None,
+                )
             };
             if let Some((raw, _)) = &raw {
                 let units_epoch =
@@ -493,7 +499,7 @@ mod imp {
     pub(crate) fn check_append_rate(file: &hdf5_metno::File, units_rate: f64) -> Result<()> {
         let units_rate = checked_rate(units_rate)?;
         let file = Group::Hdf5(file.group("/")?);
-        if let Some((name, series)) = find_electrical_series(&file, None, false)? {
+        if let (Some((name, series)), _) = find_electrical_series(&file, None, false)? {
             let samples = series.dataset("data")?.shape()[0];
             let (series_rate, _, _) = read_time_base(&file, &name, samples)?;
             // A single-file open ignores out-of-gate resolutions. Refuse to
@@ -619,11 +625,13 @@ mod imp {
         false
     }
 
+    type ElectricalSeries = (String, Group);
+
     fn find_electrical_series(
         f: &Group,
         requested: Option<&str>,
         required: bool,
-    ) -> Result<Option<(String, Group)>> {
+    ) -> Result<(Option<ElectricalSeries>, Option<String>)> {
         fn collect(
             group: &Group,
             path: &str,
@@ -671,10 +679,10 @@ mod imp {
             let specs = specs
                 .as_ref()
                 .map_err(|err| anyhow!("{}: {err:#}", unavailable()))?;
-            // Default selection ranks every discovered group (processing
-            // included), so any conflict there could change the pick; with
-            // --nwb-series only the requested group matters.
-            let refuse_conflicts = requested_path.as_deref().is_none_or(|p| p == path);
+            // Refuse type conflicts only where they can change the selection.
+            let refuse_conflicts = requested_path
+                .as_deref()
+                .map_or_else(|| path.starts_with("/acquisition/"), |p| p == path);
             specs.is_series(ty, refuse_conflicts)
         };
         let mut found = Vec::new();
@@ -725,22 +733,32 @@ mod imp {
                     available(&found)
                 )
             })?
-        } else if found.is_empty() {
-            ensure!(
-                !required,
-                "no ElectricalSeries in the raw NWB; available series: none"
-            );
-            return Ok(None);
         } else {
-            let mut best = (0, 0);
+            let mut best = None;
             for (i, (path, group)) in found.iter().enumerate() {
+                if !path.starts_with("/acquisition/") {
+                    continue;
+                }
                 let rank = data_rank(group)
                     .with_context(|| format!("ElectricalSeries {path}: invalid data"))?;
-                if rank > best.0 {
-                    best = (rank, i);
+                if best.is_none_or(|(previous, _)| rank > previous) {
+                    best = Some((rank, i));
                 }
             }
-            best.1
+            let Some((_, index)) = best else {
+                if required {
+                    ensure!(
+                        !found.is_empty(),
+                        "no ElectricalSeries in the raw NWB; available series: none"
+                    );
+                    anyhow::bail!(
+                        "no /acquisition ElectricalSeries in the raw NWB; available series: {}; pass --nwb-series PATH to use a processed series",
+                        available(&found)
+                    );
+                }
+                return Ok((None, (!found.is_empty()).then(|| available(&found))));
+            };
+            index
         };
         let (path, group) = &found[index];
         ensure!(
@@ -754,7 +772,7 @@ mod imp {
                 available(&found)
             );
         }
-        Ok(Some(found.swap_remove(index)))
+        Ok((Some(found.swap_remove(index)), None))
     }
 
     /// `(rate Hz, starting_time s, recorded timestamps)`.

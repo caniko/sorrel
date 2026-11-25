@@ -468,7 +468,7 @@ struct OpenArgs {
     /// Overrides params.py:sample_rate. For NWB, select an exact declared clock (copy a value from the error), or supply a rate if no clock is declared
     #[arg(long, value_name = "Hz")]
     sample_rate: Option<f64>,
-    /// NWB ElectricalSeries name under /acquisition or absolute NWB object path
+    /// NWB ElectricalSeries name under /acquisition or absolute NWB object path; /processing requires explicit selection
     #[cfg(any(feature = "hdf5", feature = "zarr"))]
     #[arg(long, value_name = "PATH|NAME")]
     nwb_series: Option<String>,
