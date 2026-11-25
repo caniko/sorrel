@@ -6,11 +6,14 @@ published by hand.
 
 1. Bump `[workspace.package] version`, move `[Unreleased]` to
    `## [<version>] - YYYY-MM-DD` in `CHANGELOG.md`, set `version` and
-   `date-released` in `CITATION.cff` to match, bump the release and asset
-   URLs in `website/plinth-project.toml` (tag and asset filenames), regenerate
-   the BibTeX in `docs/src/project/citing.md` (commands there), and land it on trunk
-   with green CI, prebuild and both Target smokes (`windows-2025` for x64,
-   `windows-11-arm` for ARM64).
+   `date-released` in `CITATION.cff` to match, and regenerate the BibTeX in
+   `docs/src/project/citing.md` (commands there). Bump the version in the
+   download URLs in `website/plinth-project.toml` (tag and asset filenames).
+   Add or remove rows when release assets change (for example, when Windows
+   ARM64 first ships) and update the installation guide to match. Plinth allows
+   four primary routes; put additional routes under `secondary_routes` until
+   that limit changes. Land it on trunk with green CI, prebuild and both Target
+   smokes (`windows-2025` for x64, `windows-11-arm` for ARM64).
 2. Push a signed annotated tag on that commit. Release validation needs
    the CHANGELOG heading and `nix eval .#sorrel.version` to match the tag.
 

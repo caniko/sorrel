@@ -9,10 +9,10 @@
   download = lib.findFirst (page: page.slug == "download") {} project.pages;
   install = lib.findFirst (section: (section.id or "") == "downloads") {} download.sections;
   releaseBase = "https://github.com/caniko/sorrel/releases/";
-  releaseLinks = builtins.filter (lib.hasPrefix releaseBase) (map (route: route.href) install.primary_routes);
-  pinnedToVersion = href: href == "${releaseBase}tag/${version}" || lib.hasPrefix "${releaseBase}download/${version}/" href;
+  alternativeAssets = builtins.filter (route: lib.hasPrefix releaseBase route.href) install.secondary_routes;
+  pinnedToVersion = route: lib.hasPrefix "${releaseBase}download/${version}/sorrel-${version}-" route.href;
   websiteVersion =
-    if releaseLinks != [] && builtins.all pinnedToVersion releaseLinks
+    if install.primary_routes != [] && builtins.all pinnedToVersion (install.primary_routes ++ alternativeAssets)
     then version
     else throw "Download links in website/plinth-project.toml must target Sorrel ${version} (workspace version in Cargo.toml).";
   website = pkgs.stdenv.mkDerivation {

@@ -5,30 +5,15 @@ const { runInNewContext } = require("node:vm");
 
 const script = readFileSync(`${__dirname}/platform.js`, "utf8");
 
-// Mirrors the DOM the site emits: the landing shortcut and the download page's
-// Windows route cards (their guide link ends in #windows), plus a Python card
-// that must stay visible everywhere.
-function filter(navigator) {
+function shortcutHidden(navigator) {
   const shortcut = { hidden: true };
-  const card = () => ({ hidden: false });
-  const winget = card();
-  const choco = card();
-  const python = card();
-  const windowsLinks = [
-    { closest: () => winget },
-    { closest: () => choco },
-  ];
   runInNewContext(script, {
     navigator,
     document: {
-      querySelectorAll: (selector) => {
-        if (selector === "[data-windows-downloads]") return [shortcut];
-        if (selector === '.route-link[href$="#windows"]') return windowsLinks;
-        return [];
-      },
+      querySelectorAll: (selector) => selector === "[data-windows-downloads]" ? [shortcut] : [],
     },
   });
-  return { shortcut: shortcut.hidden, winget: winget.hidden, choco: choco.hidden, python: python.hidden };
+  return shortcut.hidden;
 }
 
 for (const [navigator, expected] of [
@@ -43,24 +28,8 @@ for (const [navigator, expected] of [
   [{ platform: "Darwin" }, true],
   [{}, true],
 ]) {
-  const hidden = filter(navigator);
-  const label = JSON.stringify(navigator);
-  assert.deepEqual(hidden, { shortcut: expected, winget: expected, choco: expected, python: false }, label);
+  assert.equal(shortcutHidden(navigator), expected, JSON.stringify(navigator));
 }
-
-const homeDownload = { textContent: "Open guide" };
-const releaseDownload = { textContent: "Open guide" };
-runInNewContext(script, {
-  navigator: {},
-  document: {
-    querySelectorAll: (selector) => ({
-      "#install .recommended .route-link": [homeDownload],
-      "#downloads .recommended .route-link": [releaseDownload],
-    })[selector] ?? [],
-  },
-});
-assert.equal(homeDownload.textContent, "Choose a download");
-assert.equal(releaseDownload.textContent, "View release assets");
 
 runInNewContext(script, {
   navigator: {},

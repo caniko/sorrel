@@ -50,7 +50,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 
-- **Website and docs.** Installation starts with the native download, release formats are listed by architecture, and the docs have clearer links, navigation back to the site and cues for wide code blocks and tables.
+- **Website and docs.** Installation starts with direct native downloads for your OS, with other platforms one click away. The docs have clearer links, navigation back to the site and cues for wide code blocks and tables.
 - **`sorrel auto` on Windows ARM64.** SpikeInterface 0.106 needs zarr 3 and numcodecs 0.16.6 or newer, which has no Windows ARM64 wheel and fails to build from source there. The sidecar now keeps SpikeInterface 0.105 on Windows ARM64 only.
 - **NWB links no longer silently change scale or timing.** Both readers refuse linked series and linked datasets they need instead of substituting defaults. The Zarr reader rejects overlapping or duplicate Blosc blocks, and the published crate keeps the default Zarr backend free of `libz-sys`.
 - **Native NWB export.** Uses the reader's selected series and exact sample rate and writes the same spike timestamps as the Python export, without storing a separate sample offset. `--into` accepts fixed-length HDF5 root metadata, records a modification date, and requires `--starting-time` when the source and destination reference times differ. It refuses read-only destinations and protects NWB files from aliased journal paths.

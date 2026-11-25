@@ -37,6 +37,8 @@ wheel.
 
 ## Windows
 
+### Windows package managers
+
 Stable releases go to winget and Chocolatey, which put `sorrel` (and
 `sorrelw`) on your `PATH`:
 
@@ -51,6 +53,8 @@ stable release has no native Windows ARM64 build.
 Microsoft reviews winget submissions by hand, so a package can take a few
 days to appear. If `winget` reports that no package matches, use Chocolatey
 or the release zip until it is listed.
+
+### Windows launchers and shortcuts
 
 `sorrel.exe` is a console program. `sorrelw.exe` is the same program without a
 console window: it starts `sorrel.exe` with the same arguments (bare, it opens

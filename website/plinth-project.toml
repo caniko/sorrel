@@ -275,18 +275,21 @@ guide_href = "/docs/getting-started/installation.html"
 label = "Download the native build"
 audience = "Desktop app"
 href = "/download/#downloads"
+link_label = "Choose a download"
 recommended = true
 
 [[pages.sections.primary_routes]]
 label = "GUI + Python API"
 audience = "Linux x86_64 / ARM64, macOS ARM64, Windows x64 · Python 3.8+"
 href = "/docs/getting-started/installation.html#python"
+link_label = "Python setup"
 command = "pip install sorrel-ephys"
 
 [[pages.sections.secondary_routes]]
 label = "Build from source"
 audience = "Cargo, all platforms"
 href = "/docs/getting-started/installation.html#with-cargo"
+link_label = "Build instructions"
 command = "cargo build --release -p sorrel"
 
 [[pages]]
@@ -306,46 +309,104 @@ label = "Choose a download"
 href = "#downloads"
 primary = true
 
-[[pages.sections]]
-type = "content"
-id = "platform"
-html = '''
-<script src="/platform.js" defer></script>
-'''
+[[pages.sections.ctas]]
+label = "Release notes"
+href = "https://github.com/caniko/sorrel/releases"
 
 [[pages.sections]]
 type = "install"
 id = "downloads"
 heading = "Downloads and install options"
-intro = "Linux x86_64: AppImage or tar.gz. Linux ARM64 and macOS (Apple silicon): tar.gz. Windows x64: zip or standalone executables."
-guide_href = "/docs/getting-started/installation.html"
+intro = "Choose the build that matches your operating system and processor."
+guide_href = "/docs/project/code-signing.html#verify-downloads"
+guide_label = "Verify downloads"
+platforms = ["linux", "macos", "windows"]
 
 [[pages.sections.primary_routes]]
-label = "Download the native build"
-audience = "Desktop app"
-href = "https://github.com/caniko/sorrel/releases/tag/0.4.0"
+label = "Linux"
+audience = "x86_64"
+href = "https://github.com/caniko/sorrel/releases/download/0.4.0/sorrel-0.4.0-x86_64.AppImage"
+link_label = "Download AppImage"
+note = "Requires glibc 2.31 or newer."
+platforms = ["linux"]
 recommended = true
+
+[[pages.sections.primary_routes]]
+label = "Linux"
+audience = "ARM64"
+href = "https://github.com/caniko/sorrel/releases/download/0.4.0/sorrel-0.4.0-aarch64-linux.tar.gz"
+link_label = "Download Linux ARM64 .tar.gz"
+note = "Requires glibc 2.31 or newer."
+platforms = ["linux"]
+
+[[pages.sections.primary_routes]]
+label = "macOS"
+audience = "Apple silicon"
+href = "https://github.com/caniko/sorrel/releases/download/0.4.0/sorrel-0.4.0-aarch64-darwin.tar.gz"
+link_label = "Download macOS .tar.gz"
+note = "For Apple silicon only, not Intel Macs."
+platforms = ["macos"]
+
+[[pages.sections.primary_routes]]
+label = "Windows"
+audience = "x64"
+href = "https://github.com/caniko/sorrel/releases/download/0.4.0/sorrel-0.4.0-x86_64-windows.zip"
+link_label = "Download Windows .zip"
+note = "Includes both the CLI and GUI launcher."
+platforms = ["windows"]
+
+[[pages.sections.secondary_routes]]
+label = "Linux tarball"
+audience = "x86_64"
+href = "https://github.com/caniko/sorrel/releases/download/0.4.0/sorrel-0.4.0-x86_64-linux.tar.gz"
+link_label = "Download Linux x86_64 .tar.gz"
+note = "An alternative to the AppImage."
+platforms = ["linux"]
 
 [[pages.sections.secondary_routes]]
 label = "Windows · winget"
 audience = "PowerShell · x64"
-href = "/docs/getting-started/installation.html#windows"
+href = "/docs/getting-started/installation.html#windows-package-managers"
+link_label = "Package manager notes"
 command = "winget install Caniko.Sorrel"
+platforms = ["windows"]
 
 [[pages.sections.secondary_routes]]
 label = "Windows · Chocolatey"
 audience = "PowerShell · x64"
-href = "/docs/getting-started/installation.html#windows"
+href = "/docs/getting-started/installation.html#windows-package-managers"
+link_label = "Package manager notes"
 command = "choco install sorrel"
+platforms = ["windows"]
+
+[[pages.sections.secondary_routes]]
+label = "Windows CLI executable"
+audience = "x64 · Standalone"
+href = "https://github.com/caniko/sorrel/releases/download/0.4.0/sorrel-0.4.0-x86_64-windows.exe"
+link_label = "Download CLI .exe"
+note = "Rename to sorrel.exe to use with the GUI launcher."
+platforms = ["windows"]
+
+[[pages.sections.secondary_routes]]
+label = "Windows GUI launcher"
+audience = "x64 · Standalone"
+href = "https://github.com/caniko/sorrel/releases/download/0.4.0/sorrel-0.4.0-x86_64-windows-gui.exe"
+link_label = "Download GUI .exe"
+note = "Rename to sorrelw.exe and keep it beside sorrel.exe."
+platforms = ["windows"]
 
 [[pages.sections.secondary_routes]]
 label = "GUI + Python API"
 audience = "Linux x86_64 / ARM64, macOS ARM64, Windows x64 · Python 3.8+"
 href = "/docs/getting-started/installation.html#python"
+link_label = "Python setup"
 command = "pip install sorrel-ephys"
+platforms = ["linux", "macos", "windows"]
 
 [[pages.sections.secondary_routes]]
 label = "Build from source"
 audience = "Requires the Rust toolchain and a source checkout"
 href = "/docs/getting-started/installation.html#with-cargo"
+link_label = "Build instructions"
 command = "cargo build --release -p sorrel"
+platforms = ["linux", "macos", "windows"]
