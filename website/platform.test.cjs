@@ -48,6 +48,20 @@ for (const [navigator, expected] of [
   assert.deepEqual(hidden, { shortcut: expected, winget: expected, choco: expected, python: false }, label);
 }
 
+const homeDownload = { textContent: "Open guide" };
+const releaseDownload = { textContent: "Open guide" };
+runInNewContext(script, {
+  navigator: {},
+  document: {
+    querySelectorAll: (selector) => ({
+      "#install .recommended .route-link": [homeDownload],
+      "#downloads .recommended .route-link": [releaseDownload],
+    })[selector] ?? [],
+  },
+});
+assert.equal(homeDownload.textContent, "Choose a download");
+assert.equal(releaseDownload.textContent, "View release assets");
+
 runInNewContext(script, {
   navigator: {},
   document: { querySelectorAll: () => [] },

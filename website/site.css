@@ -26,7 +26,7 @@ body .nav-links a { font-size: 1rem; }
 body .nav-links .nav-primary { background: var(--sorrel-green); color: #0d1117; padding: .45rem 1rem; border-radius: .5rem; min-height: 2.75rem; font-weight: 650; }
 body .nav-links .nav-primary:hover { color: #0d1117; filter: brightness(1.08); }
 
-/* Hero: centred copy over the product at nearly full width (plinth's split layout, restacked). */
+/* Hero: copy over the product (plinth's split layout, restacked). */
 .hero.hero--split {
   position: relative;
   max-width: 1440px;
@@ -145,6 +145,15 @@ main h2 { text-wrap: balance; }
 .install-routes { grid-template-columns: minmax(0, 1fr); }
 /* Platform-filtered route cards (platform.js hides the Windows ones off Windows). */
 .install-routes article[hidden], .secondary-routes article[hidden] { display: none; }
+.install-section .command-row pre {
+  font-size: .875rem;
+  white-space: pre;
+  overflow-x: auto;
+}
+.install-section .command-row code { overflow-wrap: normal; word-break: normal; }
+.secondary-routes {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr));
+}
 .hero--split ~ .features .feature-card { padding: 1.25rem 0 0; border: 0; border-top: 1px solid var(--pp-line); border-radius: 0; background: none; }
 .hero--split ~ .features .features-grid { column-gap: 2rem; row-gap: 2.25rem; }
 .hero--split ~ .features .feature-card p { font-size: 1rem; line-height: 1.55; }
@@ -154,9 +163,14 @@ main h2 { text-wrap: balance; }
 
 footer { margin-top: clamp(4rem, 8vw, 7rem); }
 
-.hero:not(.hero--split) { max-width: var(--sorrel-wrap); margin-inline: auto; padding: 3rem var(--sorrel-gutter) 0; }
+.hero:not(.hero--split) { padding-block: clamp(1.75rem, 4vw, 3rem) 0; text-align: left; }
 .hero:not(.hero--split) h1 { font-size: clamp(2.5rem, 5vw, 4rem); max-width: 20ch; line-height: 1.08; letter-spacing: -.035em; }
 .hero:not(.hero--split) .tagline { max-width: 42rem; font-size: 1.125rem; color: var(--pp-ink-soft); }
+.hero:not(.hero--split) .hero-actions { justify-content: flex-start; }
+/* Plinth wraps raw HTML in a section; this one only loads the deferred script. */
+#platform { display: none; }
+main > #downloads { padding-block: clamp(1.5rem, 4vw, 3rem) 0; }
+#downloads .section-heading a { display: inline-block; }
 body:not(:has(.hero--split)) .install-routes { grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr)); }
 
 /* Wide screens: compact editorial band. Headline left; tagline, actions and note right.
@@ -170,7 +184,8 @@ body:not(:has(.hero--split)) .install-routes { grid-template-columns: repeat(aut
   }
   .hero--split .hero-copy {
     display: grid;
-    width: 100%;
+    width: min(100%, calc(var(--sorrel-wrap) - 2 * var(--sorrel-gutter)));
+    margin-inline: auto;
     max-width: none;
     grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
     grid-template-areas:
@@ -198,9 +213,6 @@ body:not(:has(.hero--split)) .install-routes { grid-template-columns: repeat(aut
 
 @media (max-width: 1100px) {
   .hero--split ~ .features .features-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-@media (max-width: 900px) {
-  .secondary-routes { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 700px) {
   body:not(:has(.nav-menu)) .nav-inner { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: .5rem 0; }

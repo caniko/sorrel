@@ -268,20 +268,20 @@ html = '''
 type = "install"
 id = "install"
 heading = "Install"
-intro = "Prebuilt binaries for Linux, macOS and Windows (x64 and ARM64) on every release, or one pip command for the GUI and Python API. Point Sorrel at a sorting directory (sorrel open my_run/phy) and it detects the backend."
+intro = "Download the native build for your OS. Then point Sorrel at a sorting directory and it detects the backend."
 guide_href = "/docs/getting-started/installation.html"
 
 [[pages.sections.primary_routes]]
-label = "Choose your download"
-audience = "Linux (AppImage, tar.gz), macOS (Apple silicon), Windows (x64, ARM64)"
+label = "Download the native build"
+audience = "Desktop app"
 href = "/download/#downloads"
+recommended = true
 
 [[pages.sections.primary_routes]]
-label = "Python"
+label = "GUI + Python API"
 audience = "Linux x86_64 / ARM64, macOS ARM64, Windows x64 · Python 3.8+"
 href = "/docs/getting-started/installation.html#python"
 command = "pip install sorrel-ephys"
-recommended = true
 
 [[pages.sections.secondary_routes]]
 label = "Build from source"
@@ -296,19 +296,15 @@ description = "Download Sorrel for Linux, macOS or Windows, or install through P
 
 [[pages.sections]]
 type = "hero"
-eyebrow = "Linux · macOS · Windows"
+eyebrow = "Stable release"
 title = "Download Sorrel"
-tagline = "Native builds for Linux (x86_64 and ARM64), macOS (Apple silicon) and Windows (x64 and ARM64). Package managers, Python wheels and build instructions are below."
+tagline = "Download the native build for your OS, or use one of the alternative install options below."
 subtitle = ""
 
 [[pages.sections.ctas]]
-label = "Latest release"
-href = "https://github.com/caniko/sorrel/releases/latest"
+label = "Choose a download"
+href = "#downloads"
 primary = true
-
-[[pages.sections.ctas]]
-label = "Installation guide"
-href = "/docs/getting-started/installation.html"
 
 [[pages.sections]]
 type = "content"
@@ -321,18 +317,18 @@ html = '''
 type = "install"
 id = "downloads"
 heading = "Downloads and install options"
-intro = "Choose your operating system and architecture from the release assets: Linux x86_64 or ARM64 (AppImage / tar.gz, glibc 2.31+), macOS Apple silicon, or Windows x64 / ARM64 (zip)."
+intro = "Linux x86_64: AppImage or tar.gz. Linux ARM64 and macOS (Apple silicon): tar.gz. Windows x64: zip or standalone executables."
 guide_href = "/docs/getting-started/installation.html"
 
 [[pages.sections.primary_routes]]
-label = "Download a release"
-audience = "Native builds for Linux, macOS and Windows"
-href = "https://github.com/caniko/sorrel/releases/latest"
+label = "Download the native build"
+audience = "Desktop app"
+href = "https://github.com/caniko/sorrel/releases/tag/0.4.0"
 recommended = true
 
 [[pages.sections.secondary_routes]]
 label = "Windows · winget"
-audience = "PowerShell · native x64 or ARM64"
+audience = "PowerShell · x64"
 href = "/docs/getting-started/installation.html#windows"
 command = "winget install Caniko.Sorrel"
 
@@ -343,8 +339,8 @@ href = "/docs/getting-started/installation.html#windows"
 command = "choco install sorrel"
 
 [[pages.sections.secondary_routes]]
-label = "Python"
-audience = "API and GUI · Linux x86_64 / ARM64, macOS ARM64, Windows x64 · Python 3.8+"
+label = "GUI + Python API"
+audience = "Linux x86_64 / ARM64, macOS ARM64, Windows x64 · Python 3.8+"
 href = "/docs/getting-started/installation.html#python"
 command = "pip install sorrel-ephys"
 
