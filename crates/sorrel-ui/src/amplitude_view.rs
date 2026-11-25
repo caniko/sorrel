@@ -178,7 +178,13 @@ impl AmplitudeViewState {
 
 /// What the Amplitudes pane asks the app to do.
 pub enum AmpAction {
-    Split(Vec<(ClusterId, Vec<u32>)>),
+    /// Polygon lasso split: keep the selected (inside) spikes in their
+    /// original cluster (preserving its ID and label) and move the cut-away
+    /// remainder to a new `unsorted` cluster.
+    LassoSplit(Vec<(ClusterId, Vec<u32>)>),
+    /// Threshold split: move spikes below the threshold line out to a new
+    /// `unsorted` cluster while spikes above stay in the original cluster.
+    ThresholdSplit(Vec<(ClusterId, Vec<u32>)>),
     /// Alt+click: move the trace to this sample.
     Seek(u64),
 }
@@ -498,10 +504,15 @@ pub fn amplitude_view<P: DataProvider>(
             Some(set) => {
                 state.split_requested = false;
                 state.want_full = false;
+                let is_lasso = state.lasso.is_closed();
                 let splits = split_hits(&set, &state.lasso, state.threshold, selection);
                 state.lasso.clear();
                 state.threshold = None;
-                return Some(AmpAction::Split(splits));
+                return Some(if is_lasso {
+                    AmpAction::LassoSplit(splits)
+                } else {
+                    AmpAction::ThresholdSplit(splits)
+                });
             }
             None => state.want_full = true,
         }
