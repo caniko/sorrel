@@ -169,6 +169,7 @@ pub(super) fn resolve_local_path(
         group: &hdf5::Group,
         path: &str,
         mut prefix: String,
+        include_soft_links: bool,
         active: &mut Vec<String>,
         hops: &mut usize,
     ) -> Result<Option<String>> {
@@ -181,6 +182,7 @@ pub(super) fn resolve_local_path(
                 None => return Ok(None),
                 Some(Link::Hard) => {}
                 Some(Link::Soft(target)) => {
+                    ensure!(include_soft_links, "{prefix} is an HDF5 soft link");
                     ensure!(
                         !active.contains(&prefix),
                         "HDF5 soft link cycle at {prefix}"
@@ -197,7 +199,7 @@ pub(super) fn resolve_local_path(
                     // Resolve the target before checking the remaining caller
                     // path: an optional child of a valid alias may be absent.
                     active.push(prefix);
-                    let resolved = walk(group, &target, parent, active, hops);
+                    let resolved = walk(group, &target, parent, include_soft_links, active, hops);
                     let link = active.pop().expect("active soft link");
                     prefix = resolved?
                         .with_context(|| format!("dangling HDF5 soft link {link} -> {target}"))?;
@@ -220,11 +222,15 @@ pub(super) fn resolve_local_path(
         group.name().trim_end_matches('/').to_owned()
     };
     let mut hops = 0;
-    let resolved = walk(group, path, prefix, &mut Vec::new(), &mut hops)?;
-    // Discovery validates links but never recurses into soft aliases.
-    Ok(resolved
-        .filter(|_| include_soft_links || hops == 0)
-        .map(|p| if p.is_empty() { "/".into() } else { p }))
+    let resolved = walk(
+        group,
+        path,
+        prefix,
+        include_soft_links,
+        &mut Vec::new(),
+        &mut hops,
+    )?;
+    Ok(resolved.map(|p| if p.is_empty() { "/".into() } else { p }))
 }
 
 enum Link {

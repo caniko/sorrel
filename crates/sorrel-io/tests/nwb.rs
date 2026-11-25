@@ -655,6 +655,8 @@ fn discovery_ignores_soft_linked_datasets_and_does_not_walk_group_aliases() {
             .link_soft("/processing/behavior/Source/timestamps", "timestamps")
             .unwrap();
         file.link_soft("/acquisition", "/processing/alias").unwrap();
+        file.link_soft("/acquisition/ElectricalSeriesRaw", "/processing/RawAlias")
+            .unwrap();
     }
     assert_eq!(NwbProvider::open(&path).unwrap().n_channels(), 4);
     let selected = |series| {
@@ -677,7 +679,40 @@ fn discovery_ignores_soft_linked_datasets_and_does_not_walk_group_aliases() {
         .expect("missing series")
         .to_string();
     assert!(
-        err.ends_with("available series: /acquisition/ElectricalSeriesRaw"),
+        err.ends_with("available series: /acquisition/ElectricalSeriesRaw, /processing/RawAlias"),
+        "{err}"
+    );
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn only_acquisition_series_can_be_a_soft_link_and_declares_its_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recording.nwb");
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.create_group("/shared").unwrap();
+        file.relink("/acquisition/ElectricalSeriesRaw", "/shared/Raw")
+            .unwrap();
+        file.link_soft("/shared/Raw", "/acquisition/Raw").unwrap();
+    }
+    let p = NwbProvider::open(&path).unwrap();
+    assert_eq!(p.sample_rate(), 1000.0);
+    assert_eq!(p.n_samples(), SampleIndex(300));
+    let err = NwbProvider::open_with(
+        &path,
+        NwbOpenParams {
+            sample_rate: Some(2000.0),
+            ..Default::default()
+        },
+    )
+    .err()
+    .expect("the aliased series declares a clock")
+    .to_string();
+    assert!(err.contains("not a clock this NWB declares"), "{err}");
+    assert!(
+        err.contains("series /acquisition/Raw starting_time.rate"),
         "{err}"
     );
 }
@@ -927,6 +962,38 @@ fn later_series_never_inherits_a_linked_earlier_series_legacy_seal() {
         assert_eq!(seal.get(32..32 + SELECTED.len()), Some(SELECTED.as_bytes()));
         earlier.unlink("data").unwrap();
     }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn legacy_seal_is_declined_for_later_soft_linked_members_or_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recording.nwb");
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    const SELECTED: &str = "/acquisition/ElectricalSeriesRaw";
+    let seal = || NwbProvider::open(&path).unwrap().identity_bytes();
+    assert_eq!(seal().len(), 32);
+
+    let file = hdf5_metno::File::open_rw(&path).unwrap();
+    file.create_group("/shared/Other").unwrap();
+    file.link_soft("/shared/Other", "/acquisition/ZOther")
+        .unwrap();
+    file.flush().unwrap();
+    assert_eq!(
+        seal().get(32..32 + SELECTED.len()),
+        Some(SELECTED.as_bytes())
+    );
+
+    file.unlink("/acquisition/ZOther").unwrap();
+    let later = file.create_group("/acquisition/ZOther").unwrap();
+    later
+        .link_soft("/acquisition/ElectricalSeriesRaw/data", "data")
+        .unwrap();
+    file.flush().unwrap();
+    assert_eq!(
+        seal().get(32..32 + SELECTED.len()),
+        Some(SELECTED.as_bytes())
+    );
 }
 
 #[test]

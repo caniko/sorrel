@@ -92,13 +92,17 @@ impl Group {
 
     pub fn child_group(&self, name: &str) -> Result<Option<Self>> {
         dispatch!(self, Self, g => {
-            let Some(path) = hdf::resolve_local_path(g, name, false)? else { return Ok(None); };
+            let Some(path) = hdf::resolve_local_path(g, name, true)? else { return Ok(None); };
             if g.loc_type_by_name(&path)? == h5::LocationType::Group {
                 Ok(Some(Self::Hdf5(g.group(&path)?)))
             } else {
                 Ok(None)
             }
         }, Ok(g.child_group(name)?.map(Self::Zarr)))
+    }
+
+    pub fn is_alias(&self, walked_path: &str) -> bool {
+        dispatch!(self, Self, _g => _g.name() != walked_path, { let _ = walked_path; false })
     }
 
     pub fn spec_group(&self, legacy: bool) -> Result<Option<Self>> {
@@ -195,19 +199,24 @@ impl Group {
     // Historical lookups only: never use these to choose or load current data.
     pub fn legacy_group(&self, name: &str) -> Result<Option<Self>> {
         dispatch!(self, Self, _g => {
-            if !_g.link_exists(name) || _g.loc_type_by_name(name)? != h5::LocationType::Group {
+            let Some(path) = hdf::resolve_local_path(_g, name, false)? else { return Ok(None); };
+            if _g.loc_type_by_name(&path)? != h5::LocationType::Group {
                 return Ok(None);
             }
-            Ok(Some(Self::Hdf5(_g.group(name)?)))
+            let group = _g.group(&path)?;
+            // Check even non-series groups and groups after the legacy pick.
+            hdf::resolve_local_path(&group, "data", false)?;
+            Ok(Some(Self::Hdf5(group)))
         }, { let _ = name; Ok(None) })
     }
 
     pub fn legacy_dataset_rank(&self, name: &str) -> Result<Option<usize>> {
         dispatch!(self, Self, _g => {
-            if !_g.link_exists(name) || _g.loc_type_by_name(name)? != h5::LocationType::Dataset {
+            let Some(path) = hdf::resolve_local_path(_g, name, false)? else { return Ok(None); };
+            if _g.loc_type_by_name(&path)? != h5::LocationType::Dataset {
                 return Ok(None);
             }
-            Ok(Some(_g.dataset(name)?.ndim()))
+            Ok(Some(_g.dataset(&path)?.ndim()))
         }, { let _ = name; Ok(None) })
     }
 }

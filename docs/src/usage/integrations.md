@@ -158,8 +158,13 @@ What Sorrel reads:
   By default it selects only from `/acquisition`, preferring 2-D series and
   breaking ties by path, and logs the available paths when there is more than one.
   A `/processing` series supplies a trace and clock only when explicitly selected
-  with `--nwb-series`. Linked series and linked datasets used by the reader are
-  refused; open the file or store that holds the data directly. `--nwb-series`
+  with `--nwb-series`. The reader follows same-file HDF5 soft links, with a
+  bounded hop count and cycle checks; literal `..` path components are not
+  supported. Discovery can recognize a soft-linked child as a series but
+  does not recurse into it. HDF5 external links, links that
+  reach through them, external raw storage, virtual datasets, and Zarr
+  `zarr_link` nodes are refused; open the file or store that holds the data
+  directly. `--nwb-series`
   takes an acquisition name or an absolute path in the NWB file, not a
   filesystem path. Use a separate `--journal` when
   curating against another series or a different paired recording. To reuse

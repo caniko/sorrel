@@ -604,25 +604,29 @@ mod imp {
             return false;
         };
         let parents = legacy_type_parents(f).unwrap_or_default();
+        let mut first = None;
         for candidate in names {
             let g = match acq.legacy_group(&candidate) {
                 Ok(Some(g)) => g,
                 Ok(None) => continue,
-                Err(_) => return false, // Can't rule out an earlier group.
+                Err(_) => return false, // A linked member cannot inherit the legacy seal.
             };
+            if first.is_some() {
+                continue;
+            }
             let ty = match g.optional_attr("neurodata_type") {
                 Ok(attr) => attr.and_then(|a| a.legacy_string().ok()),
                 Err(_) => return false,
             };
             if ty.is_some_and(|t| legacy_is_series(&t, &parents)) {
                 match g.legacy_dataset_rank("data") {
-                    Ok(Some(2)) => return candidate == name,
+                    Ok(Some(2)) => first = Some(candidate == name),
                     Ok(_) => (),
                     Err(_) => return false, // Might have been trunk's series.
                 }
             }
         }
-        false
+        first.unwrap_or(false)
     }
 
     type ElectricalSeries = (String, Group);
@@ -655,8 +659,8 @@ mod imp {
                 };
                 if is_series_node {
                     found.push((path, child));
-                } else if depth > 0 {
-                    // Bound the recursion in case of cyclic HDF5 links.
+                } else if depth > 0 && !child.is_alias(&path) {
+                    // Never walk into soft aliases; also bound recursion for hard links.
                     collect(&child, &path, depth - 1, is_series, found)?;
                 }
             }
@@ -859,8 +863,8 @@ mod imp {
             }
             let jump = right.1 - left.1;
             let jump_samples = jump * rate;
-            // Classify large intervals separately from the grid tolerance.
-            if jump_samples > 2.0 {
+            // Adjacent grid errors differ by the interval error in samples.
+            if (jump_samples - 1.0).abs() > 2.0 * limit {
                 anyhow::bail!(
                     "timestamps are not a regular grid: they jump by {jump:.6} s \
                      ({jump_samples:.3} samples at the mean rate {rate} Hz) between samples {} and {} \
@@ -874,6 +878,7 @@ mod imp {
             break;
         }
         let (mut max_drift, mut worst_sample) = (0.0, 0);
+        let (mut max_step, mut step_end) = (0.0, 1);
         let mut prev = t0;
         for start in (1..n).step_by(TIMESTAMP_BLOCK) {
             let times =
@@ -883,6 +888,9 @@ mod imp {
                 let step = t - prev;
                 ensure!(step.is_finite() && step > 0.0,
                     "irregular timestamps at sample {sample}: interval {step} s; timestamps must strictly increase");
+                if step > max_step {
+                    (max_step, step_end) = (step, sample);
+                }
                 let drift = grid_error(sample, t).abs();
                 if drift > max_drift {
                     (max_drift, worst_sample) = (drift, sample);
@@ -891,7 +899,8 @@ mod imp {
             }
         }
         ensure!(max_drift <= limit,
-            "irregular timestamps at sample {worst_sample}: max deviation {max_drift:.6} samples from the inferred grid (limit {limit:.6})");
+            "irregular timestamps at sample {worst_sample}: max deviation {max_drift:.6} samples from the inferred grid (limit {limit:.6}); largest interval {max_step:.6} s between samples {} and {step_end}",
+            step_end - 1);
         Ok((rate, t0))
     }
 
@@ -1487,15 +1496,45 @@ mod imp {
     fn timestamp_validation_rejects_subsample_jitter() {
         let dir = tempfile::tempdir().unwrap();
         let file = hdf5_metno::File::create(dir.path().join("timestamps.h5")).unwrap();
-        // Alternating 0.8/1.2 ms intervals on a nominal 1 kHz grid.
-        let times = [0.5, 0.5008, 0.502, 0.5028, 0.504];
+        // A short/long pair between probes on a nominal 1 kHz grid.
+        let mut times: Vec<_> = (0..127).map(|i| 0.5 + f64::from(i) / 1000.0).collect();
+        times[3] -= 0.0002;
         let ds = file
             .new_dataset_builder()
             .with_data(&times)
             .create("timestamps")
             .unwrap();
         let err = regular_timestamps(&Dataset::Hdf5(ds.clone()), times.len()).unwrap_err();
-        assert!(err.to_string().contains("max deviation 0.200000 samples"));
+        let err = err.to_string();
+        assert!(err.contains("max deviation 0.200000 samples"), "{err}");
+        assert!(
+            err.contains("largest interval 0.001200 s between samples 3 and 4"),
+            "{err}"
+        );
+    }
+
+    #[cfg(all(test, feature = "hdf5"))]
+    #[test]
+    fn timestamp_validation_locates_one_dropped_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5_metno::File::create(dir.path().join("timestamps.h5")).unwrap();
+        let times: Vec<_> = (0..=100_001)
+            .filter(|&i| i != 73_259)
+            .map(|i| f64::from(i) / 1000.0)
+            .collect();
+        let ds = file
+            .new_dataset_builder()
+            .with_data(&times)
+            .create("timestamps")
+            .unwrap();
+        let err = regular_timestamps(&Dataset::Hdf5(ds), times.len())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("timestamps are not a regular grid: they jump by 0.002000 s"),
+            "{err}"
+        );
+        assert!(err.contains("between samples 73258 and 73259"), "{err}");
     }
 
     #[cfg(all(test, feature = "hdf5"))]
