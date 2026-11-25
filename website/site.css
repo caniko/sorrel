@@ -145,10 +145,12 @@ main h2 { text-wrap: balance; }
 .hero--split ~ .install-section .install-routes { grid-template-columns: minmax(0, 1fr); }
 .install-section .command-row pre {
   font-size: .875rem;
+}
+#downloads .command-row pre {
   white-space: pre;
   overflow-x: auto;
 }
-.install-section .command-row code { overflow-wrap: normal; word-break: normal; }
+#downloads .command-row code { overflow-wrap: normal; word-break: normal; }
 .secondary-routes {
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
 }
@@ -165,11 +167,42 @@ footer { margin-top: clamp(4rem, 8vw, 7rem); }
 .hero:not(.hero--split) h1 { font-size: clamp(2.5rem, 5vw, 4rem); max-width: 20ch; line-height: 1.08; letter-spacing: -.035em; }
 .hero:not(.hero--split) .tagline { max-width: 42rem; font-size: 1.125rem; color: var(--pp-ink-soft); }
 .hero:not(.hero--split) .hero-actions { justify-content: flex-start; }
+main > #download-platform { padding-block: 1rem 0; }
+#download-platform:has([hidden]) { display: none; }
+#download-platform-notice { margin: 0; font-weight: 650; }
 main > #downloads { padding-block: clamp(1.5rem, 4vw, 3rem) 0; scroll-margin-top: 4.5rem; }
-#downloads .section-heading a { display: inline-block; }
+#downloads .section-heading { display: flex; flex-wrap: wrap; align-items: center; gap: .25rem 1.25rem; margin-bottom: .875rem; }
+#downloads .section-heading h2 { flex-basis: 100%; }
+#downloads .section-heading p:empty { display: none; }
+#downloads :is(.section-heading a, .show-all-platforms) {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2rem;
+  padding: 0;
+  border: 0;
+  color: var(--pp-ink-soft);
+  font-size: .875rem;
+  text-decoration: underline;
+  text-underline-offset: .15em;
+}
+#downloads :is(.section-heading a, .show-all-platforms):hover { color: var(--pp-ink); }
+#downloads .install-routes:not(:has(> article:not([hidden]) ~ article:not([hidden]))) { max-width: 32rem; }
 #downloads .install-route p { display: block; }
-#downloads .install-route .route-link { margin-top: auto; }
-#downloads .show-all-platforms { min-height: 2.75rem; }
+#downloads .secondary-routes article:not([hidden]) { display: flex; flex-direction: column; }
+#downloads .route-link {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  min-height: 2rem;
+  margin-top: auto;
+}
+#downloads .install-route .route-link {
+  padding: .25rem .75rem;
+  border-radius: .375rem;
+  background: var(--sorrel-green);
+  color: #0d1117;
+}
+#downloads .install-route .route-link:hover { filter: brightness(1.12); }
 
 /* Wide screens: compact editorial band. Headline left; tagline, actions and note right.
    The workspace stays full width underneath, so product evidence comes first. */
