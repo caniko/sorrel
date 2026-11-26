@@ -136,7 +136,7 @@ subtitle = ""
 preview_src = "/showcase/workspace.webp"
 preview_mobile_src = "/showcase/workspace-mobile.webp"
 preview_alt = "Sorrel's native curation workspace, with linked views for inspecting clusters, waveforms and spike timing."
-note = "phy · Kilosort · SpikeInterface · NWB"
+note = "phy · Kilosort · SpikeInterface · NWB (trunk)"
 
 [[pages.sections.ctas]]
 label = "Download"
@@ -153,7 +153,7 @@ id = "windows-downloads"
 html = '''
 <div class="windows-options" data-windows-downloads hidden>
   <a href="/download/#downloads">Install on Windows</a>
-  <code>winget install Caniko.Sorrel</code><span>or</span><code>choco install sorrel</code>
+  <code>choco install sorrel</code><a href="https://github.com/microsoft/winget-pkgs/pull/469698">Winget pending</a>
 </div>
 <script src="/platform.js" defer></script>
 '''
@@ -256,7 +256,7 @@ html = '''
 </details>
 <details>
   <summary>NWB &amp; legacy MATLAB rez <span>*.nwb · rez.mat</span></summary>
-  <p><code>*.nwb</code> via <code>/units/spike_times</code> and the electrodes table; MATLAB v7.3 <code>rez.mat</code> from Kilosort 2, 2.5, and 3 via <code>rez/st3</code> and <code>rez/ops</code>. Both readers are included by default. Open Kilosort 4 results as a Phy directory.</p>
+  <p><code>*.nwb</code> via <code>/units/spike_times</code> and the electrodes table; MATLAB v7.3 <code>rez.mat</code> from Kilosort 2, 2.5, and 3 via <code>rez/st3</code> and <code>rez/ops</code>. Both readers are enabled by default on trunk, but not in the stable 0.4.0 binaries. Open Kilosort 4 results as a Phy directory.</p>
 </details>
 <details>
   <summary>Raw recording sources <span>SpikeGLX · Open Ephys · MDA</span></summary>
@@ -268,88 +268,150 @@ html = '''
 type = "install"
 id = "install"
 heading = "Install"
-intro = "Prebuilt binaries for Linux, macOS and Windows (x64 and ARM64) on every release, or one pip command for the GUI and Python API. Point Sorrel at a sorting directory (sorrel open my_run/phy) and it detects the backend."
+intro = "Download the native build for your OS. Then point Sorrel at a sorting directory and it detects the backend."
 guide_href = "/docs/getting-started/installation.html"
 
 [[pages.sections.primary_routes]]
-label = "Choose your download"
-audience = "Linux (AppImage, tar.gz), macOS (Apple silicon), Windows (x64, ARM64)"
+label = "Download the native build"
+audience = "Desktop app"
 href = "/download/#downloads"
+link_label = "Choose a download"
+recommended = true
 
 [[pages.sections.primary_routes]]
-label = "Python"
+label = "GUI + Python API"
 audience = "Linux x86_64 / ARM64, macOS ARM64, Windows x64 · Python 3.8+"
 href = "/docs/getting-started/installation.html#python"
+link_label = "Python setup"
 command = "pip install sorrel-ephys"
-recommended = true
 
 [[pages.sections.secondary_routes]]
 label = "Build from source"
 audience = "Cargo, all platforms"
 href = "/docs/getting-started/installation.html#with-cargo"
+link_label = "Build instructions"
 command = "cargo build --release -p sorrel"
 
 [[pages]]
 slug = "download"
 title = "Download Sorrel"
-description = "Download Sorrel for Linux, macOS or Windows, or install through Python, winget and Chocolatey."
+description = "Download Sorrel for Linux, macOS or Windows, or install through Python or Chocolatey."
 
 [[pages.sections]]
 type = "hero"
-eyebrow = "Linux · macOS · Windows"
+eyebrow = "Stable release"
 title = "Download Sorrel"
-tagline = "Native builds for Linux (x86_64 and ARM64), macOS (Apple silicon) and Windows (x64 and ARM64). Package managers, Python wheels and build instructions are below."
+tagline = "Native spike-sorting curation for Linux, macOS, and Windows."
 subtitle = ""
 
 [[pages.sections.ctas]]
-label = "Latest release"
-href = "https://github.com/caniko/sorrel/releases/latest"
-primary = true
-
-[[pages.sections.ctas]]
-label = "Installation guide"
-href = "/docs/getting-started/installation.html"
+label = "Release notes"
+href = "https://github.com/caniko/sorrel/releases"
 
 [[pages.sections]]
 type = "content"
-id = "platform"
+id = "download-platform"
 html = '''
+<p id="download-platform-notice" hidden></p>
 <script src="/platform.js" defer></script>
 '''
 
 [[pages.sections]]
 type = "install"
 id = "downloads"
-heading = "Downloads and install options"
-intro = "Choose your operating system and architecture from the release assets: Linux x86_64 or ARM64 (AppImage / tar.gz, glibc 2.31+), macOS Apple silicon, or Windows x64 / ARM64 (zip)."
-guide_href = "/docs/getting-started/installation.html"
+heading = "Desktop builds"
+intro = ""
+guide_href = "/docs/project/code-signing.html#verify-downloads"
+guide_label = "Verification and checksums"
+platforms = ["linux", "macos", "windows"]
 
 [[pages.sections.primary_routes]]
-label = "Download a release"
-audience = "Native builds for Linux, macOS and Windows"
-href = "https://github.com/caniko/sorrel/releases/latest"
-recommended = true
+label = "Linux"
+audience = "x86_64"
+href = "https://github.com/caniko/sorrel/releases/download/0.4.0/sorrel-0.4.0-x86_64.AppImage"
+link_label = "Download AppImage"
+note = "Requires glibc 2.31 or newer."
+platforms = ["linux"]
+
+[[pages.sections.primary_routes]]
+label = "Linux"
+audience = "ARM64"
+href = "https://github.com/caniko/sorrel/releases/download/0.4.0/sorrel-0.4.0-aarch64-linux.tar.gz"
+link_label = "Download Linux ARM64 .tar.gz"
+note = "Requires glibc 2.31 or newer."
+platforms = ["linux"]
+
+[[pages.sections.primary_routes]]
+label = "macOS"
+audience = "Apple silicon"
+href = "https://github.com/caniko/sorrel/releases/download/0.4.0/sorrel-0.4.0-aarch64-darwin.tar.gz"
+link_label = "Download macOS .tar.gz"
+note = "For Apple silicon only, not Intel Macs."
+platforms = ["macos"]
+
+[[pages.sections.primary_routes]]
+label = "Windows"
+audience = "x64"
+href = "https://github.com/caniko/sorrel/releases/download/0.4.0/sorrel-0.4.0-x86_64-windows.zip"
+link_label = "Download Windows .zip"
+note = "Includes both the CLI and GUI launcher."
+platforms = ["windows"]
 
 [[pages.sections.secondary_routes]]
-label = "Windows · winget"
-audience = "PowerShell · native x64 or ARM64"
-href = "/docs/getting-started/installation.html#windows"
-command = "winget install Caniko.Sorrel"
+label = "Linux tarball"
+audience = "x86_64"
+href = "https://github.com/caniko/sorrel/releases/download/0.4.0/sorrel-0.4.0-x86_64-linux.tar.gz"
+link_label = "Download Linux x86_64 .tar.gz"
+note = "An alternative to the AppImage."
+platforms = ["linux"]
 
 [[pages.sections.secondary_routes]]
 label = "Windows · Chocolatey"
 audience = "PowerShell · x64"
-href = "/docs/getting-started/installation.html#windows"
+href = "/docs/getting-started/installation.html#windows-package-managers"
+link_label = "Package manager notes"
 command = "choco install sorrel"
+platforms = ["windows"]
 
 [[pages.sections.secondary_routes]]
-label = "Python"
-audience = "API and GUI · Linux x86_64 / ARM64, macOS ARM64, Windows x64 · Python 3.8+"
+label = "Windows · Winget pending"
+audience = "Not yet available"
+href = "https://github.com/microsoft/winget-pkgs/pull/469698"
+link_label = "Track the submission"
+note = "Use Chocolatey or the Windows ZIP for now."
+platforms = ["windows"]
+
+[[pages.sections.secondary_routes]]
+label = "Windows CLI executable"
+audience = "x64 · Standalone"
+href = "https://github.com/caniko/sorrel/releases/download/0.4.0/sorrel-0.4.0-x86_64-windows.exe"
+link_label = "Download CLI .exe"
+note = "Rename to sorrel.exe to use with the GUI launcher."
+platforms = ["windows"]
+
+[[pages.sections.secondary_routes]]
+label = "Windows GUI launcher"
+audience = "x64 · Standalone"
+href = "https://github.com/caniko/sorrel/releases/download/0.4.0/sorrel-0.4.0-x86_64-windows-gui.exe"
+link_label = "Download GUI .exe"
+note = "Rename to sorrelw.exe and keep it beside sorrel.exe."
+platforms = ["windows"]
+
+[[pages.sections.secondary_routes]]
+label = "GUI + Python API"
+audience = "Linux x86_64 / ARM64, macOS ARM64, Windows x64 · Python 3.8+"
 href = "/docs/getting-started/installation.html#python"
+link_label = "Python setup"
 command = "pip install sorrel-ephys"
+platforms = ["linux", "macos", "windows"]
+# This Plinth pin requires a static recommendation but only renders it on
+# primary routes. Keep native builds neutral until the browser knows the arch.
+recommended = true
 
 [[pages.sections.secondary_routes]]
 label = "Build from source"
 audience = "Requires the Rust toolchain and a source checkout"
 href = "/docs/getting-started/installation.html#with-cargo"
+link_label = "Build instructions"
 command = "cargo build --release -p sorrel"
+platforms = ["linux", "macos", "windows"]

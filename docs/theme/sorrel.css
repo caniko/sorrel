@@ -1,0 +1,87 @@
+.coal,
+.navy {
+    --links: #64b5e4;
+    --sidebar-active: var(--links);
+}
+
+:is(.coal, .navy, .ayu) {
+    --icons: #aab8c5;
+    --icons-hover: #e6edf3;
+}
+
+:is(.coal, .navy, .ayu) table thead th {
+    color: #e6edf3;
+}
+
+:is(.coal, .navy) .hljs :is(
+    .hljs-variable, .hljs-attribute, .hljs-attr, .hljs-tag, .hljs-regexp,
+    .ruby .hljs-constant, .xml .hljs-tag .hljs-title, .xml .hljs-pi,
+    .xml .hljs-doctype, .html .hljs-doctype, .css .hljs-id, .css .hljs-class,
+    .css .hljs-pseudo, .hljs-deletion
+) {
+    color: #ef9292;
+}
+
+:is(.coal, .navy) .hljs .hljs-addition { color: #a8c060; }
+
+:is(.coal, .navy) .hljs :is(
+    .coffeescript .javascript, .javascript .xml, .tex .hljs-formula,
+    .xml .javascript, .xml .vbscript, .xml .css, .xml .hljs-cdata
+) {
+    opacity: 1;
+}
+
+.ayu .hljs :is(.hljs-comment, .hljs-quote) { color: #9caab9; }
+.ayu .hljs .hljs-tag { color: #69b4df; }
+
+main a:not(.header) {
+    text-decoration: underline;
+    text-underline-offset: .12em;
+}
+
+.menu-bar .menu-title {
+    color: var(--fg);
+    cursor: auto;
+    font-weight: 500;
+}
+
+.menu-title a { color: inherit; }
+.menu-title a:focus-visible { outline-offset: -2px; }
+
+.menu-bar .right-buttons {
+    display: flex;
+    align-items: center;
+    gap: .4rem;
+}
+
+.menu-bar .right-buttons a {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 3.6rem;
+    min-height: var(--menu-bar-height);
+    padding-inline: .3rem;
+}
+
+.docs-download { color: var(--links); }
+
+@media (max-width: 480px) {
+    .menu-bar .menu-title { font-size: 1.4rem; }
+    .menu-bar .left-buttons, .menu-bar .right-buttons { margin-inline: .3rem; }
+    .docs-download { font-size: 1.3rem; }
+}
+
+@media (max-width: 600px) {
+    main table { width: 100%; }
+    main table :is(th, td) { padding: .4rem .6rem; }
+    main table th:first-child:nth-last-child(2) { width: 42%; }
+    main table th:first-child:nth-last-child(3) { width: 24%; }
+    main table td { overflow-wrap: anywhere; }
+}
+
+.docs-scroll-hint {
+    font-size: .875em;
+    margin-block: 1em .25em;
+}
+
+.docs-scroll-hint:not([hidden]) + pre { margin-top: 0; }

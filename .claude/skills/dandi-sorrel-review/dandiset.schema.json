@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nexus.beloda.co/sorrel/schema/dandiset-1.json",
+  "title": "Sorrel DANDI dataset metadata v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "dandiset_id", "name", "updated_at", "dandi_raw_metadata", "unique_metadata"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "dandiset_id": {"type": "string", "pattern": "^[0-9]{6}$", "minLength": 6, "maxLength": 6},
+    "name": {"$ref": "#/$defs/text"},
+    "updated_at": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", "minLength": 20, "maxLength": 20},
+    "dandi_raw_metadata": {"type": "object", "additionalProperties": true},
+    "unique_metadata": {"type": "object", "additionalProperties": true},
+    "pinned_version": {"type": "string", "pattern": "^(draft|0\\.[0-9]{6}\\.[0-9]{4})$"},
+    "versions_seen": {"$ref": "#/$defs/strings"},
+    "doi": {"type": "string"},
+    "url": {"type": "string"},
+    "description": {"type": "string"},
+    "license": {"type": "string"},
+    "citation": {"type": "string"},
+    "contact": {"type": "string"},
+    "embargo_status": {"type": "string"},
+    "dandi_created": {"type": "string"},
+    "dandi_modified": {"type": "string"},
+    "contributors": {"type": "array", "items": {"$ref": "#/$defs/contributor"}},
+    "species": {"$ref": "#/$defs/strings"},
+    "modality": {"$ref": "#/$defs/strings"},
+    "measurement_techniques": {"$ref": "#/$defs/strings"},
+    "anatomy": {"$ref": "#/$defs/strings"},
+    "probe": {"$ref": "#/$defs/strings"},
+    "sorter": {"$ref": "#/$defs/strings"},
+    "keywords": {"$ref": "#/$defs/strings"},
+    "related_dois": {"$ref": "#/$defs/strings"},
+    "related_resources": {"type": "array", "items": {"type": "object"}},
+    "assets_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["n_assets_total", "n_nwb_assets", "total_size_bytes", "encodings"],
+      "properties": {
+        "n_assets_total": {"$ref": "#/$defs/count"},
+        "n_nwb_assets": {"$ref": "#/$defs/count"},
+        "total_size_bytes": {"$ref": "#/$defs/count"},
+        "encodings": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "hdf5": {"$ref": "#/$defs/count"},
+            "zarr": {"$ref": "#/$defs/count"},
+            "other": {"$ref": "#/$defs/count"}
+          }
+        }
+      }
+    },
+    "assets": {"type": "array", "items": {"$ref": "#/$defs/asset"}}
+  },
+  "$defs": {
+    "text": {"type": "string", "minLength": 1},
+    "strings": {"type": "array", "items": {"type": "string"}},
+    "count": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+    "contributor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {"$ref": "#/$defs/text"},
+        "email": {"type": "string"},
+        "orcid": {"type": "string"},
+        "roles": {"$ref": "#/$defs/strings"},
+        "affiliations": {"$ref": "#/$defs/strings"}
+      }
+    },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset_id", "path", "size_bytes", "encoding"],
+      "properties": {
+        "asset_id": {"$ref": "#/$defs/text"},
+        "path": {"$ref": "#/$defs/text"},
+        "size_bytes": {"$ref": "#/$defs/count"},
+        "encoding": {"enum": ["hdf5", "zarr", "other"]},
+        "is_nwb": {"type": "boolean"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "minLength": 64, "maxLength": 64},
+        "zarr_checksum": {"type": "string"},
+        "locator": {"type": "string"},
+        "media_type": {"type": "string"},
+        "download_url": {"type": "string"},
+        "blob_id": {"type": "string"},
+        "zarr_id": {"type": "string"},
+        "pin_verification": {"enum": ["unverified", "published_version", "local_checksum", "api_postcheck"]}
+      }
+    }
+  }
+}

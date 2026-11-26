@@ -1,5 +1,5 @@
 [book]
-title = "Sorrel Documentation"
+title = "Sorrel docs"
 authors = ["caniko"]
 language = "en"
 src = "src"
@@ -12,3 +12,5 @@ site-url = "/docs/"
 default-theme = "coal"
 preferred-dark-theme = "coal"
 git-repository-url = "https://github.com/caniko/sorrel"
+additional-css = ["theme/sorrel.css"]
+additional-js = ["theme/sorrel.js"]

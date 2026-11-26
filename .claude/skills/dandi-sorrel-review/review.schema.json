@@ -1,0 +1,312 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nexus.beloda.co/sorrel/schema/review-1.json",
+  "title": "Sorrel DANDI review v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "dandiset", "created_at", "mode", "contributor", "sorrel", "skill_rev", "thresholds", "asset_selection", "models", "assets", "findings", "improvements", "files"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "unique_metadata": {"type": "object", "additionalProperties": true},
+    "dandiset": {"$ref": "#/$defs/dandiset"},
+    "created_at": {"$ref": "#/$defs/date_time"},
+    "mode": {"enum": ["human", "agent", "hybrid"]},
+    "contributor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {"$ref": "#/$defs/text"},
+        "orcid": {"type": "string"},
+        "affiliation": {"type": "string"},
+        "handle": {"type": "string"}
+      }
+    },
+    "sorrel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "rev"],
+      "properties": {
+        "version": {"$ref": "#/$defs/text"},
+        "rev": {"$ref": "#/$defs/text"},
+        "branch": {"type": "string"},
+        "dirty": {"type": "boolean"}
+      }
+    },
+    "skill_rev": {"$ref": "#/$defs/text"},
+    "thresholds": {"$ref": "#/$defs/thresholds"},
+    "asset_selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy", "n_assets_total"],
+      "properties": {
+        "policy": {"enum": ["all", "sample"]},
+        "scope": {"enum": ["archive", "nwb"], "default": "archive"},
+        "n_assets_total": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807},
+        "n_nwb_assets": {"$ref": "#/$defs/count"},
+        "rationale": {"type": "string"}
+      },
+      "if": {"required": ["scope"], "properties": {"scope": {"const": "nwb"}}},
+      "then": {"required": ["n_nwb_assets"]}
+    },
+    "models": {"type": "array", "items": {"$ref": "#/$defs/model"}},
+    "assets": {"type": "array", "minItems": 1, "items": {
+      "$ref": "#/$defs/asset", "required": ["pin_verification"]
+    }},
+    "findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "improvements": {"type": "array", "items": {"$ref": "#/$defs/improvement"}},
+    "files": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/artifact"}},
+    "supersedes": {"$ref": "#/$defs/sha256"},
+    "prompt_rev": {"type": "string"},
+    "learned_rev": {"type": "string"},
+    "timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "wall_s": {"$ref": "#/$defs/positive_number"},
+        "cost_usd": {"$ref": "#/$defs/positive_number"}
+      }
+    }
+  },
+  "if": {"required": ["mode"], "properties": {"mode": {"enum": ["agent", "hybrid"]}}},
+  "then": {"properties": {"models": {"minItems": 1}}},
+  "allOf": [
+    {
+      "if": {"required": ["dandiset"], "properties": {"dandiset": {"required": ["version"], "properties": {"version": {"const": "draft"}}}}},
+      "then": {"properties": {"assets": {"items": {
+        "required": ["pin_verification"],
+        "properties": {"pin_verification": {"enum": ["local_checksum", "api_postcheck"]}}
+      }}}}
+    }
+  ],
+  "$defs": {
+    "text": {"type": "string", "minLength": 1},
+    "date_time": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt](?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:[Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])$"},
+    "strings": {"type": "array", "items": {"type": "string"}},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "minLength": 64, "maxLength": 64},
+    "finding_id": {"type": "string", "pattern": "^f[0-9]{2,4}$"},
+    "count": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+    "nullable_count": {"type": ["integer", "null"], "minimum": 0, "maximum": 9223372036854775807},
+    "positive_number": {"type": "number", "minimum": 0},
+    "nullable_number": {"type": ["number", "null"]},
+    "dandiset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[0-9]{6}$", "minLength": 6, "maxLength": 6},
+        "version": {"type": "string", "pattern": "^(draft|0\\.[0-9]{6}\\.[0-9]{4})$"},
+        "name": {"type": "string"},
+        "doi": {"type": "string"},
+        "license": {"type": "string"},
+        "contact": {"type": "string"},
+        "draft_modified": {"$ref": "#/$defs/date_time"},
+        "species": {"$ref": "#/$defs/strings"},
+        "modality": {"$ref": "#/$defs/strings"},
+        "probe": {"$ref": "#/$defs/strings"},
+        "sorter": {"$ref": "#/$defs/strings"},
+        "related_dois": {"$ref": "#/$defs/strings"}
+      },
+      "if": {"required": ["version"], "properties": {"version": {"const": "draft"}}},
+      "then": {"required": ["draft_modified"]}
+    },
+    "thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rp_contamination_lo95_max", "srp_contamination_upper_max", "isi_violation_rate_max_hz", "presence_ratio_min", "amplitude_cutoff_max", "epoch_rate_ratio_min", "epoch_amp_ratio_min", "drift_correlation_max"],
+      "properties": {
+        "rp_contamination_lo95_max": {"type": "number", "default": 0.10},
+        "srp_contamination_upper_max": {"type": "number", "default": 0.10},
+        "isi_violation_rate_max_hz": {"type": "number", "default": 0.50},
+        "presence_ratio_min": {"type": "number", "default": 0.70},
+        "amplitude_cutoff_max": {"type": "number", "default": 0.10},
+        "epoch_rate_ratio_min": {"type": "number", "default": 0.25},
+        "epoch_amp_ratio_min": {"type": "number", "default": 0.50},
+        "drift_correlation_max": {"type": "number", "default": 0.50}
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "provider", "model_id"],
+      "properties": {
+        "role": {"enum": ["curation", "report", "verification"]},
+        "provider": {"$ref": "#/$defs/text"},
+        "model_id": {"$ref": "#/$defs/text"},
+        "harness": {"type": "string"},
+        "effort": {"type": "string"},
+        "turns": {"$ref": "#/$defs/count"},
+        "input_tokens": {"$ref": "#/$defs/count"},
+        "output_tokens": {"$ref": "#/$defs/count"},
+        "cost_usd": {"$ref": "#/$defs/positive_number"},
+        "usage": {"type": "object"}
+      }
+    },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset_id", "path", "size_bytes", "encoding", "open_status"],
+      "properties": {
+        "unique_metadata": {"type": "object", "additionalProperties": true},
+        "asset_id": {"$ref": "#/$defs/text"},
+        "path": {"$ref": "#/$defs/text"},
+        "size_bytes": {"$ref": "#/$defs/count"},
+        "encoding": {"enum": ["hdf5", "zarr", "other"]},
+        "is_nwb": {"type": "boolean"},
+        "open_status": {"enum": ["ok", "refused", "failed"]},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "zarr_checksum": {"$ref": "#/$defs/text"},
+        "locator": {"$ref": "#/$defs/text"},
+        "media_type": {"$ref": "#/$defs/text"},
+        "download_url": {"type": "string", "pattern": "^https://api\\.dandiarchive\\.org/api/assets/[A-Za-z0-9_-]+/download/$"},
+        "blob_id": {"$ref": "#/$defs/text"},
+        "zarr_id": {"$ref": "#/$defs/text"},
+        "pin_verification": {"enum": ["published_version", "local_checksum", "api_postcheck"]},
+        "refusal_reason": {"type": "string"},
+        "evidence_level": {"enum": ["spike_times", "waveforms", "raw", null]},
+        "sample_rate_hz": {"$ref": "#/$defs/nullable_number"},
+        "analysis_sample_rate_hz": {"$ref": "#/$defs/nullable_number"},
+        "duration_s": {"$ref": "#/$defs/nullable_number"},
+        "n_channels": {"$ref": "#/$defs/nullable_count"},
+        "author_label_source": {"type": ["string", "null"]},
+        "units_before": {"$ref": "#/$defs/nullable_count"},
+        "good_before": {"$ref": "#/$defs/nullable_count"},
+        "mua_before": {"$ref": "#/$defs/nullable_count"},
+        "noise_before": {"$ref": "#/$defs/nullable_count"},
+        "unlabeled_before": {"$ref": "#/$defs/nullable_count"},
+        "units_after": {"$ref": "#/$defs/nullable_count"},
+        "good_after": {"$ref": "#/$defs/nullable_count"},
+        "mua_after": {"$ref": "#/$defs/nullable_count"},
+        "noise_after": {"$ref": "#/$defs/nullable_count"},
+        "n_merges": {"$ref": "#/$defs/nullable_count"},
+        "n_splits": {"$ref": "#/$defs/nullable_count"},
+        "n_removed": {"$ref": "#/$defs/nullable_count"},
+        "n_relabelled": {"$ref": "#/$defs/nullable_count"},
+        "n_rp_contaminated": {"$ref": "#/$defs/nullable_count"},
+        "n_good_rp_contaminated": {"$ref": "#/$defs/nullable_count"},
+        "n_rp_screened": {"$ref": "#/$defs/nullable_count"},
+        "n_good_rp_screened": {"$ref": "#/$defs/nullable_count"},
+        "n_isi_rate_flagged": {"$ref": "#/$defs/nullable_count"},
+        "n_low_presence": {"$ref": "#/$defs/nullable_count"},
+        "n_unstable": {"$ref": "#/$defs/nullable_count"},
+        "n_amp_cutoff": {"$ref": "#/$defs/nullable_count"},
+        "n_noise_as_good": {"$ref": "#/$defs/nullable_count"},
+        "median_quality_before": {"$ref": "#/$defs/nullable_number"},
+        "median_quality_after": {"$ref": "#/$defs/nullable_number"},
+        "nwbi_critical": {"$ref": "#/$defs/nullable_count"},
+        "nwbi_violation": {"$ref": "#/$defs/nullable_count"},
+        "nwbi_suggestion": {"$ref": "#/$defs/nullable_count"}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["locator"], "properties": {"locator": {"pattern": "^dandi://dandi/.*$"}}},
+          "then": {"properties": {"locator": {
+            "pattern": "^dandi://dandi/[0-9]{6}@(draft|0\\.[0-9]{6}\\.[0-9]{4})/[^?#]+$"
+          }}}
+        },
+        {
+          "if": {"properties": {"open_status": {"const": "ok"}}},
+          "then": {"required": ["evidence_level"],
+                   "properties": {"evidence_level": {"type": "string"}}}
+        },
+        {
+          "if": {"anyOf": [
+            {"properties": {"open_status": {"enum": ["refused", "failed"]}}},
+            {"properties": {"evidence_level": {"type": "null"}}}
+          ]},
+          "then": {"properties": {
+            "duration_s": {"type": "null"}, "sample_rate_hz": {"type": "null"},
+            "n_low_presence": {"type": "null"}, "n_amp_cutoff": {"type": "null"}
+          }}
+        }
+      ]
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "code", "severity", "scope", "statement_md", "human_verified"],
+      "properties": {
+        "id": {"$ref": "#/$defs/finding_id"},
+        "code": {"enum": [
+          "qc.refractory_contamination", "qc.refractory_screening", "qc.low_presence", "qc.epoch_instability", "qc.drift",
+          "qc.amplitude_cutoff", "qc.noise_as_good", "qc.mua_as_good", "curation.oversplit",
+          "curation.overmerge", "curation.duplicate_unit", "meta.no_quality_labels",
+          "meta.no_sorter_provenance", "meta.no_waveforms", "meta.no_probe_geometry",
+          "nwb.inspector_critical", "nwb.dandi_profile_violation", "data.sorrel_refused"
+        ]},
+        "severity": {"enum": ["critical", "major", "minor", "info"]},
+        "scope": {"enum": ["dandiset", "asset", "unit"]},
+        "statement_md": {"$ref": "#/$defs/text"},
+        "human_verified": {"type": "boolean"},
+        "asset_id": {"type": ["string", "null"], "minLength": 1},
+        "unit_ids": {"type": "array", "items": {"type": ["integer", "string"], "minimum": -9223372036854775808, "maximum": 9223372036854775807}},
+        "unit_id_namespace": {"enum": ["nwb_unit_id", "sorrel_cluster_index"]},
+        "n_units": {"$ref": "#/$defs/nullable_count"},
+        "metric": {"type": "string"},
+        "value": {"$ref": "#/$defs/nullable_number"},
+        "threshold": {"$ref": "#/$defs/nullable_number"},
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["artifact_sha256", "pointer"],
+            "properties": {
+              "artifact_sha256": {"$ref": "#/$defs/sha256"},
+              "pointer": {"$ref": "#/$defs/text"}
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"scope": {"const": "dandiset"}}},
+          "then": {"properties": {"asset_id": {"type": "null"}}}
+        },
+        {
+          "if": {"properties": {"scope": {"enum": ["asset", "unit"]}}},
+          "then": {"required": ["asset_id"], "properties": {"asset_id": {"$ref": "#/$defs/text"}}}
+        },
+        {
+          "if": {"properties": {"scope": {"const": "unit"}}},
+          "then": {"anyOf": [
+            {"required": ["unit_ids"], "properties": {"unit_ids": {"minItems": 1}}},
+            {"required": ["n_units"], "properties": {"n_units": {"type": "integer", "minimum": 1}}}
+          ]}
+        },
+        {
+          "if": {"required": ["unit_ids"], "properties": {"unit_ids": {"minItems": 1}}},
+          "then": {"required": ["unit_id_namespace"]}
+        }
+      ]
+    },
+    "improvement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "addresses", "description_md"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^i[0-9]{2,4}$"},
+        "kind": {"enum": ["relabel", "merge", "split", "remove", "metadata_fix", "nwb_fix", "add_qc_columns"]},
+        "addresses": {"type": "array", "items": {"$ref": "#/$defs/finding_id"}},
+        "description_md": {"$ref": "#/$defs/text"},
+        "asset_id": {"$ref": "#/$defs/text"},
+        "n_units": {"$ref": "#/$defs/nullable_count"},
+        "metric": {"type": "string"},
+        "before": {"$ref": "#/$defs/nullable_number"},
+        "after": {"$ref": "#/$defs/nullable_number"},
+        "deliverable_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "kind", "sha256", "size_bytes"],
+      "properties": {
+        "path": {"$ref": "#/$defs/text"},
+        "kind": {"enum": ["report_md", "cluster_qc_before", "cluster_qc_after", "clusters_before", "clusters_after", "describe_json", "curation", "report_html", "nwb_inspector", "dandiset_metadata", "other"]},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "size_bytes": {"$ref": "#/$defs/count"}
+      }
+    }
+  }
+}

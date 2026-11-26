@@ -28,7 +28,5 @@ monomorphised Rust core and a wgpu-backed renderer.
 - **Python bridge.** The `sorrel-py` crate exposes `sorrel.open(recording,
 sorting)` for SpikeInterface users.
 
-Source code is hosted at
-[github.com/caniko/sorrel](https://github.com/caniko/sorrel). Release binaries
-cover Linux (x86_64 and aarch64), macOS (Apple silicon) and Windows (x64 and
-ARM64), and follow the [code signing policy](./project/code-signing.md).
+Visit the [Sorrel website](/) or [download the native build for your OS](/download/).
+Source code is hosted at [github.com/caniko/sorrel](https://github.com/caniko/sorrel).
