@@ -85,25 +85,37 @@ impl Group {
 
     pub fn optional_group(&self, path: &str) -> Result<Option<Self>> {
         dispatch!(self, Self, g => {
-            if !hdf::hard_link_exists(g, path)? { return Ok(None); }
-            Ok(Some(Self::Hdf5(g.group(path).with_context(|| format!("open HDF5 group {path}"))?)))
+            let Some(resolved) = hdf::resolve_local_path(g, path, true)? else { return Ok(None); };
+            Ok(Some(Self::Hdf5(g.group(&resolved).with_context(|| format!("open HDF5 group {path}"))?)))
         }, g.local_path(path)?.map(|path| g.open_group(&path).map(Self::Zarr)).transpose())
     }
 
     pub fn child_group(&self, name: &str) -> Result<Option<Self>> {
         dispatch!(self, Self, g => {
-            if hdf::hard_link_exists(g, name)? && g.loc_type_by_name(name)? == h5::LocationType::Group {
-                Ok(Some(Self::Hdf5(g.group(name)?)))
+            let Some(path) = hdf::resolve_local_path(g, name, true)? else { return Ok(None); };
+            if g.loc_type_by_name(&path)? == h5::LocationType::Group {
+                Ok(Some(Self::Hdf5(g.group(&path)?)))
             } else {
                 Ok(None)
             }
         }, Ok(g.child_group(name)?.map(Self::Zarr)))
     }
 
+    pub fn is_alias(&self, parent: &Self, name: &str) -> bool {
+        match (self, parent, name) {
+            #[cfg(feature = "hdf5")]
+            (Self::Hdf5(child), Self::Hdf5(parent), name) => {
+                child.name() != format!("{}/{name}", parent.name().trim_end_matches('/'))
+            }
+            #[cfg(feature = "zarr")]
+            _ => false,
+        }
+    }
+
     pub fn spec_group(&self, legacy: bool) -> Result<Option<Self>> {
         dispatch!(self, Self, g => {
             if let Some(Attr::Hdf5(attr)) = if legacy { None } else { hdf_attr(g, ".specloc")? } {
-                return Ok(Some(Self::Hdf5(hdf::spec_reference(g, &attr)?)));
+                return Ok(Some(Self::Hdf5(hdf::group_reference(g, &attr)?)));
             }
             if !g.link_exists("/specifications") { return Ok(None); }
             Ok(Some(Self::Hdf5(hdf::spec_object(g, "/specifications")?.as_group()?)))
@@ -155,7 +167,7 @@ impl Group {
     }
 
     pub fn local_member_exists(&self, path: &str) -> Result<bool> {
-        dispatch!(self, Self, g => hdf::hard_link_exists(g, path), Ok(g.local_path(path)?.is_some()))
+        dispatch!(self, Self, g => Ok(hdf::resolve_local_path(g, path, true)?.is_some()), Ok(g.local_path(path)?.is_some()))
     }
 
     pub fn dataset(&self, path: &str) -> Result<Dataset> {
@@ -163,11 +175,21 @@ impl Group {
             .with_context(|| format!("missing NWB dataset {path}"))
     }
 
+    pub fn trace_data(&self) -> Result<Dataset> {
+        self.open_dataset("data", true)?
+            .context("missing NWB dataset data")
+    }
+
     /// `None` means absent, not a broken link, wrong node type, or open error.
     pub fn optional_dataset(&self, path: &str) -> Result<Option<Dataset>> {
+        self.open_dataset(path, false)
+    }
+
+    fn open_dataset(&self, path: &str, _trace: bool) -> Result<Option<Dataset>> {
         dispatch!(self, Self, g => {
-            if !hdf::hard_link_exists(g, path)? { return Ok(None); }
-            hdf::local_dataset(g, path).map(Dataset::Hdf5).map(Some)
+            let Some(resolved) = hdf::resolve_local_path(g, path, true)? else { return Ok(None); };
+            let open = if _trace { hdf::local_trace_dataset } else { hdf::local_dataset };
+            open(g, &resolved).map(Dataset::Hdf5).map(Some)
         }, g.local_path(path)?.map(|path| g.open_dataset(&path, false).map(|d| Dataset::Zarr(Box::new(d)))
             .with_context(|| format!("open Zarr dataset {path}"))).transpose())
     }
@@ -194,21 +216,71 @@ impl Group {
     // Historical lookups only: never use these to choose or load current data.
     pub fn legacy_group(&self, name: &str) -> Result<Option<Self>> {
         dispatch!(self, Self, _g => {
-            if !_g.link_exists(name) || _g.loc_type_by_name(name)? != h5::LocationType::Group {
+            let Some(path) = hdf::resolve_local_path(_g, name, false)? else { return Ok(None); };
+            if _g.loc_type_by_name(&path)? != h5::LocationType::Group {
                 return Ok(None);
             }
-            Ok(Some(Self::Hdf5(_g.group(name)?)))
+            let group = _g.group(&path)?;
+            // Check even non-series groups and groups after the legacy pick.
+            hdf::resolve_local_path(&group, "data", false)?;
+            Ok(Some(Self::Hdf5(group)))
         }, { let _ = name; Ok(None) })
     }
 
     pub fn legacy_dataset_rank(&self, name: &str) -> Result<Option<usize>> {
         dispatch!(self, Self, _g => {
-            if !_g.link_exists(name) || _g.loc_type_by_name(name)? != h5::LocationType::Dataset {
+            let Some(path) = hdf::resolve_local_path(_g, name, false)? else { return Ok(None); };
+            if _g.loc_type_by_name(&path)? != h5::LocationType::Dataset {
                 return Ok(None);
             }
-            Ok(Some(_g.dataset(name)?.ndim()))
+            Ok(Some(_g.dataset(&path)?.ndim()))
         }, { let _ = name; Ok(None) })
     }
+}
+
+#[cfg(all(test, feature = "hdf5"))]
+#[test]
+fn trace_chunk_cache_holds_one_time_tile() {
+    const MIB: usize = 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let file = h5::File::create(dir.path().join("trace.nwb")).unwrap();
+    let chunked = file.create_group("chunked").unwrap();
+    chunked
+        .new_dataset::<i16>()
+        .shape((2 * MIB, 5))
+        .chunk((MIB, 2))
+        .create("data")
+        .unwrap();
+    let contiguous = file.create_group("contiguous").unwrap();
+    contiguous
+        .new_dataset::<i16>()
+        .shape((4, 5))
+        .create("data")
+        .unwrap();
+    let wide = file.create_group("wide").unwrap();
+    wide.new_dataset::<i8>()
+        .shape((64, 16_384))
+        .chunk((64, 1))
+        .create("data")
+        .unwrap();
+
+    let cache = |group: h5::Group| {
+        let data = match Group::Hdf5(group).trace_data().unwrap() {
+            Dataset::Hdf5(data) => data,
+            #[cfg(feature = "zarr")]
+            Dataset::Zarr(_) => unreachable!(),
+        };
+        data.dapl().unwrap().get_chunk_cache().unwrap()
+    };
+    let default = file.fapl().unwrap().get_chunk_cache().unwrap();
+    assert_eq!(cache(contiguous), default);
+    let wide = cache(wide);
+    assert_eq!(wide.nbytes, default.nbytes);
+    assert!(wide.nslots >= 10 * 16_384);
+    let cache = cache(chunked);
+    assert_eq!(cache.nbytes, 12 * MIB); // Three 4 MiB chunks, including the partial channel chunk.
+    assert!(cache.nslots > 300);
+    assert_eq!(cache.w0, 0.75);
 }
 
 pub(super) fn local_identity(path: &Path) -> Result<Vec<u8>> {
@@ -298,6 +370,11 @@ impl Dataset {
         dispatch!(self, Self, d => d.chunk(), d.chunk())
     }
 
+    /// Axis-0 chunk length for a chunked array, `None` for contiguous storage.
+    pub fn chunk_rows(&self) -> Option<usize> {
+        self.chunk()?.first().copied().filter(|&rows| rows > 0)
+    }
+
     pub fn sample_type(&self) -> Result<SampleType> {
         dispatch!(self, Self, d => hdf::sample_type(d), d.sample_type())
     }
@@ -359,6 +436,56 @@ impl Dataset {
             let _ = attribute;
             Ok(None)
         }, _d.reference_path(attribute))
+    }
+
+    /// A missing target is allowed, but a present target must resolve to this dataset.
+    pub fn target_matches(&self, root: &Group, expected: &Self, _path: &str) -> Result<bool> {
+        match (self, root, expected) {
+            #[cfg(feature = "hdf5")]
+            (Self::Hdf5(index), Group::Hdf5(root), Self::Hdf5(expected)) => {
+                let Some(Attr::Hdf5(attr)) = hdf_attr(index, "target")? else {
+                    return Ok(true);
+                };
+                let target = hdf::dataset_reference(root, index, &attr)?;
+                hdf::same_object(&target, expected)
+            }
+            #[cfg(feature = "zarr")]
+            (Self::Zarr(index), Group::Zarr(_), Self::Zarr(_)) => Ok(index
+                .reference_path("target")?
+                .is_none_or(|target| target == _path)),
+            #[cfg(all(feature = "hdf5", feature = "zarr"))]
+            _ => Ok(false),
+        }
+    }
+
+    // Unlike the historical channel mapping, this check requires two actual
+    // references to the same table; missing references cannot imply a match.
+    pub fn shared_table(&self, other: &Self, root: &Group) -> Result<Option<Group>> {
+        match (self, other, root) {
+            #[cfg(feature = "hdf5")]
+            (Self::Hdf5(left), Self::Hdf5(right), Group::Hdf5(root)) => {
+                let has_table = |d: &h5::Dataset| -> Result<_> {
+                    Ok(d.attr_names()?.iter().any(|name| name == "table"))
+                };
+                if !has_table(left)? || !has_table(right)? {
+                    return Ok(None);
+                }
+                let left = hdf::group_reference(root, &left.attr("table")?)?;
+                let right = hdf::group_reference(root, &right.attr("table")?)?;
+                Ok(hdf::same_object(&left, &right)?.then_some(Group::Hdf5(left)))
+            }
+            #[cfg(feature = "zarr")]
+            (Self::Zarr(left), Self::Zarr(right), root @ Group::Zarr(_)) => {
+                let left = left.reference_path("table")?;
+                let right = right.reference_path("table")?;
+                match left {
+                    Some(path) if Some(&path) == right.as_ref() => root.optional_group(&path),
+                    _ => Ok(None),
+                }
+            }
+            #[cfg(all(feature = "hdf5", feature = "zarr"))]
+            _ => Ok(None),
+        }
     }
 }
 

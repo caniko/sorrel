@@ -39,6 +39,10 @@ pub use stub::open_stub;
 #[error("no /intervals/trials table")]
 pub struct NoTrials;
 
+/// The `--nwb-series` value that skips the trace; use an absolute path to select a series named `none`.
+#[cfg(any(feature = "hdf5", feature = "zarr"))]
+pub const UNITS_ONLY_SERIES: &str = "none";
+
 #[cfg(any(feature = "hdf5", feature = "zarr"))]
 mod imp {
     mod specs;
@@ -47,13 +51,14 @@ mod imp {
     use crate::kilosort::{pinned_sorter, valid_tag, PhyLabel};
     use crate::nwb_units::exact_sample;
     use crate::provider::{
-        appended_unit_id, ChannelId, ClusterId, DataProvider, SampleIndex, TraceSamples,
-        TraceSlice, UnitAnnotation,
+        appended_unit_id, ChannelId, ClusterId, DataProvider, SampleIndex, SessionSpan, SpanSource,
+        TraceSamples, TraceSlice, UnitAnnotation,
     };
     use anyhow::{anyhow, ensure, Context, Result};
+    use serde_json::{json, Value};
     use specs::{legacy_is_series, legacy_type_parents, TypeSpecs};
-    use std::cmp::Reverse;
-    use std::collections::{BinaryHeap, HashMap, VecDeque};
+    use std::cmp::{Ordering, Reverse};
+    use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
     use std::ops::Range;
     use std::path::Path;
     use std::sync::Mutex;
@@ -63,7 +68,8 @@ mod imp {
 
     #[derive(Clone, Copy, Debug, Default)]
     pub struct NwbOpenParams<'a> {
-        /// Acquisition name or absolute NWB path, also applied to a paired file.
+        /// Acquisition name or absolute NWB path, also applied to a paired file;
+        /// `none` skips the trace and uses the Units clock or a supplied rate.
         pub series: Option<&'a str>,
         /// Read the ElectricalSeries from this file instead of the units file.
         pub raw_path: Option<&'a Path>,
@@ -71,11 +77,28 @@ mod imp {
         pub sample_rate: Option<f64>,
     }
 
+    impl NwbOpenParams<'_> {
+        fn units_only(self) -> bool {
+            self.series == Some(super::UNITS_ONLY_SERIES)
+        }
+
+        /// Reject incompatible options before opening a local or remote source.
+        pub fn validate(self) -> Result<()> {
+            ensure!(
+                !self.units_only() || self.raw_path.is_none(),
+                "--nwb-series none (units-only) cannot be combined with --dat"
+            );
+            Ok(())
+        }
+    }
+
     pub struct NwbProvider {
         rate: f64,
         t0: f64,
         n_channels: u32,
         n_samples: SampleIndex,
+        span: SessionSpan,
+        unit_spans: Vec<SessionSpan>,
         spikes_per_cluster: Vec<Vec<SampleIndex>>,
         unit_ids: Vec<u32>,
         metadata: UnitMetadata,
@@ -83,6 +106,7 @@ mod imp {
         channel_map: Vec<ChannelId>,
         identity_bytes: Vec<u8>,
         trace: Option<NwbTrace>,
+        skipped_series: Option<Value>,
         #[cfg(any(feature = "hdf5", feature = "dandi"))]
         source: Group,
         #[cfg(feature = "dandi")]
@@ -95,6 +119,7 @@ mod imp {
         }
 
         pub fn open_with(path: impl AsRef<Path>, params: NwbOpenParams<'_>) -> Result<Self> {
+            params.validate()?;
             let path = path.as_ref();
             #[cfg(feature = "dandi")]
             return Self::open_pinned(
@@ -115,6 +140,7 @@ mod imp {
             locator: &str,
             params: NwbOpenParams<'_>,
         ) -> Result<(Self, std::path::PathBuf)> {
+            params.validate()?;
             let [root, raw] =
                 crate::dandi::resolve_pair(Some(locator), Self::remote_raw_locator(params))?;
             let state = root
@@ -145,6 +171,7 @@ mod imp {
             root: Option<crate::dandi::Resolved>,
             raw: Option<crate::dandi::Resolved>,
         ) -> Result<Self> {
+            params.validate()?;
             ensure!(
                 root.is_some() || !crate::dandi::is_remote(path),
                 "missing resolved NWB dataset"
@@ -193,7 +220,20 @@ mod imp {
                 })
                 .transpose()?;
             let recording = raw.as_ref().map_or(&f, |(group, _)| group);
-            let series = find_electrical_series(recording, params.series, raw.is_some())?;
+            let (mut series, processed) = if params.units_only() {
+                (None, None)
+            } else {
+                find_electrical_series(recording, params.series, raw.is_some(), false)?
+            };
+            let mut skipped_for_electrodes = None;
+            if params.series.is_none() && raw.is_none() {
+                if let Some((name, candidate)) = &series {
+                    if misses_units_electrodes(&f, &units, &ids, candidate).unwrap_or(false) {
+                        log::warn!("NWB: skipping ElectricalSeries {name} because it does not record the Units' electrodes");
+                        skipped_for_electrodes = series.take().map(|(name, _)| name);
+                    }
+                }
+            }
             // In a single file with a series, an invalid resolution value is
             // not a clock statement; its storage type must still be exact.
             let units_rate = read_units_rate(&spike_times, raw.is_some() || series.is_none())?;
@@ -205,10 +245,16 @@ mod imp {
                 series,
             )) = &series
             {
-                let data = series.dataset("data")?;
+                let data = series.trace_data()?;
                 let shape = data.shape();
                 let (n_samples, n_channels) = (shape[0], shape.get(1).copied().unwrap_or(1));
-                let (stored_rate, t0, timestamps) = read_time_base(recording, name, n_samples)?;
+                let hint = match (params.series, raw.is_some()) {
+                    (None, false) => "; to open the Units without this trace, pass --nwb-series none (with --sample-rate HZ if /units/spike_times declares no resolution)",
+                    (None, true) => "; to open the Units without this trace, omit --dat and pass --nwb-series none (with --sample-rate HZ if /units/spike_times declares no resolution)",
+                    (Some(_), _) => "",
+                };
+                let (stored_rate, t0, timestamps) =
+                    read_time_base_with(recording, name, n_samples, regular_timestamps, hint)?;
                 let units_clock = if let Some(declared) = units_rate {
                     // The one-ppm gate decides whether resolution declares a clock,
                     // not whether an explicit value matches that clock.
@@ -249,15 +295,26 @@ mod imp {
                     ensure!(explicit == declared,
                         "--sample-rate {explicit} Hz is not a clock this NWB declares; pass one of: {declared} Hz (/units/spike_times resolution)");
                 }
+                let rate = units_rate.or(params.sample_rate).with_context(|| {
+                    if params.units_only() {
+                        return "units-only NWB has no /units/spike_times resolution; pass --sample-rate HZ as the analysis grid".into();
+                    }
+                    if let Some(name) = &skipped_for_electrodes {
+                        return format!("skipped acquisition ElectricalSeries {name} because it does not record the Units' electrodes, and /units/spike_times has no resolution; pass --sample-rate HZ as the analysis grid, or --nwb-series PATH to force a series");
+                    }
+                    let missing = "no /acquisition ElectricalSeries and no /units/spike_times resolution";
+                    match processed {
+                        Some(paths) => format!("{missing}; /processing series ({paths}) are not a spike clock; pass --sample-rate HZ as the analysis grid, or --nwb-series PATH to use a processed series' clock"),
+                        None => format!("{missing}; pass --sample-rate HZ as the analysis grid"),
+                    }
+                })?;
                 (
-                        None,
-                        units_rate.or(params.sample_rate).map(checked_rate).transpose()?.context(
-                            "no ElectricalSeries time base in the sorting NWB and no /units/spike_times resolution; pass --sample-rate HZ",
-                        )?,
-                        0.0,
-                        read_units_only_channels(&f)?,
-                        None,
-                    )
+                    None,
+                    checked_rate(rate)?,
+                    0.0,
+                    read_units_only_channels(&f)?,
+                    None,
+                )
             };
             if let Some((raw, _)) = &raw {
                 let units_epoch =
@@ -269,7 +326,12 @@ mod imp {
             }
             let n_samples = trace.as_ref().map_or(0, |t| t.n_samples);
             let require_agreement = params.sample_rate.is_none();
-            let (spikes_per_cluster, unit_ids, same_mapping) = load_units(
+            let LoadedUnits {
+                spikes: spikes_per_cluster,
+                ids: unit_ids,
+                same_mapping,
+                seconds,
+            } = load_units(
                 &ids,
                 &spike_times,
                 &spike_times_index,
@@ -279,6 +341,12 @@ mod imp {
                 comparison_rate.map(|other_rate| (other_rate, require_agreement)),
             )
             .context("load /units")?;
+            let (span, unit_spans) = if trace.is_some() {
+                ((n_samples as u64).into(), Vec::new())
+            } else {
+                units_span(&f, &spikes_per_cluster, &seconds, rate, t0)
+            };
+            drop(seconds);
             if raw.is_some() {
                 ensure!(spikes_per_cluster.iter().filter_map(|s| s.last()).all(|s| s.0 < n_samples as u64),
                     "spike times extend past the paired ElectricalSeries (starting time {t0} s, {n_samples} samples at {rate} Hz)");
@@ -293,7 +361,8 @@ mod imp {
                 if let Some((name, _)) = &series {
                     identity_bytes.extend_from_slice(name.as_bytes());
                 }
-                identity_bytes.push(0); // Terminate the path (empty for units-only).
+                // An empty path seals units-only mode, explicit or by absence.
+                identity_bytes.push(0);
                 identity_bytes.extend(rate.to_le_bytes());
                 if let Some(((_, raw_identity), raw_path)) = raw.zip(params.raw_path) {
                     identity_bytes.extend(match raw_identity {
@@ -308,6 +377,8 @@ mod imp {
                 t0,
                 n_channels: u32::try_from(channel_map.len()).context("too many NWB channels")?,
                 n_samples: SampleIndex(n_samples as u64),
+                span,
+                unit_spans,
                 metadata,
                 spikes_per_cluster,
                 unit_ids,
@@ -315,6 +386,7 @@ mod imp {
                 channel_map,
                 identity_bytes,
                 trace,
+                skipped_series: params.units_only().then(|| inspect_skipped_series(&f)),
                 #[cfg(any(feature = "hdf5", feature = "dandi"))]
                 source: f,
                 #[cfg(feature = "dandi")]
@@ -384,6 +456,24 @@ mod imp {
         }
         fn n_samples(&self) -> SampleIndex {
             self.n_samples
+        }
+
+        fn session_span(&self) -> SessionSpan {
+            self.span.clone()
+        }
+
+        fn unit_span(&self, cluster: ClusterId) -> SessionSpan {
+            self.unit_spans
+                .get(cluster.idx())
+                .unwrap_or(&self.span)
+                .clone()
+        }
+
+        fn trace_provenance(&self) -> Value {
+            if let Some(skipped) = &self.skipped_series {
+                return json!({ "mode": "units-only", "skipped_series": skipped });
+            }
+            json!({ "mode": if self.has_trace() { "trace" } else { "units-only" } })
         }
         fn n_clusters(&self) -> u32 {
             self.spikes_per_cluster.len() as u32
@@ -493,9 +583,10 @@ mod imp {
     pub(crate) fn check_append_rate(file: &hdf5_metno::File, units_rate: f64) -> Result<()> {
         let units_rate = checked_rate(units_rate)?;
         let file = Group::Hdf5(file.group("/")?);
-        if let Some((name, series)) = find_electrical_series(&file, None, false)? {
+        if let (Some((name, series)), _) = find_electrical_series(&file, None, false, false)? {
             let samples = series.dataset("data")?.shape()[0];
-            let (series_rate, _, _) = read_time_base(&file, &name, samples)?;
+            let (series_rate, _, _) =
+                read_time_base_with(&file, &name, samples, regular_timestamps, "")?;
             // A single-file open ignores out-of-gate resolutions. Refuse to
             // append here so reopening cannot silently use the wrong clock.
             ensure!(is_units_clock(units_rate, series_rate),
@@ -548,6 +639,291 @@ mod imp {
         }
     }
 
+    const OBS_INTERVALS: &str = "/units/obs_intervals";
+    const INTERVAL_BATCH: usize = 8192;
+
+    fn units_span(
+        f: &Group,
+        spikes: &[Vec<SampleIndex>],
+        seconds: &[f64],
+        rate: f64,
+        t0: f64,
+    ) -> (SessionSpan, Vec<SessionSpan>) {
+        let mut rejected = None;
+        match observation_spans(f, spikes, seconds, rate, t0) {
+            Ok(Some(spans)) => {
+                let mut union = BTreeMap::new();
+                for (lo, hi) in spans.iter().flat_map(SessionSpan::intervals) {
+                    insert_interval(&mut union, lo, hi);
+                }
+                let union = SessionSpan::from_intervals(
+                    union.into_iter().collect(),
+                    SpanSource::Declared(OBS_INTERVALS),
+                );
+                if union.duration_samples() > 0 {
+                    return (union, spans);
+                }
+            }
+            Ok(None) => rejected = Some(OBS_INTERVALS),
+            Err(err) => log::warn!("ignoring NWB intervals at {OBS_INTERVALS}: {err:#}"),
+        }
+
+        for path in ["/intervals/epochs", "/intervals/trials"] {
+            match time_table_intervals(f, path, rate, t0) {
+                Ok(mut rows) => {
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    if !spike_rows(spikes, seconds)
+                        .all(|(samples, times)| cover_spikes(&mut rows, samples, times))
+                    {
+                        rejected.get_or_insert(path);
+                        continue;
+                    }
+                    let span = interval_span(rows, path);
+                    if span.duration_samples() > 0 {
+                        return (span, Vec::new());
+                    }
+                }
+                Err(err) => log::warn!("ignoring NWB intervals at {path}: {err:#}"),
+            }
+        }
+        let first = spikes.iter().filter_map(|row| row.first().copied()).min();
+        let last = spikes.iter().filter_map(|row| row.last().copied()).max();
+        let span = match first.zip(last) {
+            Some((start, last)) => SessionSpan::contiguous(
+                start,
+                SampleIndex(last.0 + 1),
+                SpanSource::SpikeExtent { rejected },
+            ),
+            None => {
+                SessionSpan::contiguous(SampleIndex(0), SampleIndex(0), SpanSource::Unavailable)
+            }
+        };
+        (span, Vec::new())
+    }
+
+    fn spike_rows<'a>(
+        spikes: &'a [Vec<SampleIndex>],
+        mut seconds: &'a [f64],
+    ) -> impl Iterator<Item = (&'a [SampleIndex], &'a [f64])> {
+        spikes.iter().map(move |samples| {
+            let (row, rest) = seconds.split_at(samples.len());
+            seconds = rest;
+            (samples.as_slice(), row)
+        })
+    }
+
+    struct GridInterval {
+        start_s: f64,
+        stop_s: f64,
+        start: SampleIndex,
+        end: SampleIndex,
+    }
+
+    fn insert_interval<T: Copy + Ord>(rows: &mut BTreeMap<T, T>, mut lo: T, mut hi: T) {
+        if let Some((&start, &stop)) = rows.range(..=lo).next_back() {
+            if stop >= lo {
+                rows.remove(&start);
+                lo = start;
+                hi = hi.max(stop);
+            }
+        }
+        while let Some((&start, &stop)) = rows.range(lo..=hi).next() {
+            rows.remove(&start);
+            hi = hi.max(stop);
+        }
+        rows.insert(lo, hi);
+    }
+
+    #[derive(Clone, Copy)]
+    struct IntervalTime(f64);
+
+    impl Ord for IntervalTime {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.0.total_cmp(&other.0)
+        }
+    }
+    impl PartialOrd for IntervalTime {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl PartialEq for IntervalTime {
+        fn eq(&self, other: &Self) -> bool {
+            self.cmp(other).is_eq()
+        }
+    }
+    impl Eq for IntervalTime {}
+
+    type TimeIntervals = BTreeMap<IntervalTime, IntervalTime>;
+
+    fn add_interval(rows: &mut TimeIntervals, start: f64, stop: f64) -> Result<()> {
+        check_time(start, "interval start")?;
+        check_time(stop, "interval stop")?;
+        ensure!(start <= stop, "interval stop precedes start");
+        if start < stop {
+            // Normalize negative zero so touching rows merge at time zero.
+            insert_interval(rows, IntervalTime(start + 0.0), IntervalTime(stop + 0.0));
+        }
+        Ok(())
+    }
+
+    fn grid_intervals(rows: TimeIntervals, rate: f64, t0: f64) -> Result<Vec<GridInterval>> {
+        rows.into_iter()
+            .map(|(IntervalTime(start_s), IntervalTime(stop_s))| {
+                let start = exact_sample(start_s, t0, rate);
+                let end = exact_sample(stop_s, t0, rate);
+                ensure!(
+                    start.is_finite() && end.is_finite(),
+                    "interval boundary cannot be placed on the sample grid"
+                );
+                Ok(GridInterval {
+                    start_s,
+                    stop_s,
+                    start: SampleIndex(start as u64),
+                    end: SampleIndex(end as u64),
+                })
+            })
+            .collect()
+    }
+
+    fn cover_spikes(rows: &mut [GridInterval], samples: &[SampleIndex], times: &[f64]) -> bool {
+        let mut next = 0;
+        for row in rows {
+            if next == times.len() {
+                break;
+            }
+            if times[next] < row.start_s {
+                return false;
+            }
+            let n = times[next..].partition_point(|&t| t <= row.stop_s);
+            if n != 0 {
+                next += n;
+                // NWB intervals [start_time, stop_time] are closed (stop_time
+                // is often the exact timestamp of the last recorded sample),
+                // and a spike just before stop_time can also round to `end`.
+                // Extend the half-open grid interval by one sample when needed
+                // while still rejecting spikes strictly past `stop_s`.
+                row.end = row.end.max(SampleIndex(samples[next - 1].0 + 1));
+            }
+        }
+        next == times.len()
+    }
+
+    fn interval_span(rows: Vec<GridInterval>, path: &'static str) -> SessionSpan {
+        SessionSpan::from_intervals(
+            rows.into_iter().map(|r| (r.start, r.end)).collect(),
+            SpanSource::Declared(path),
+        )
+    }
+
+    fn observation_spans(
+        f: &Group,
+        spikes: &[Vec<SampleIndex>],
+        seconds: &[f64],
+        rate: f64,
+        t0: f64,
+    ) -> Result<Option<Vec<SessionSpan>>> {
+        let Some(ds) = f.optional_dataset(OBS_INTERVALS)? else {
+            return Ok(Some(Vec::new()));
+        };
+        let shape = ds.shape();
+        let &[n, 2] = shape.as_slice() else {
+            anyhow::bail!("expected an N×2 observation interval table");
+        };
+        ds.exact_float(OBS_INTERVALS)?;
+        let index = f.dataset("/units/obs_intervals_index")?;
+        ensure!(
+            index.shape() == [spikes.len()],
+            "expected one observation index per unit"
+        );
+        ensure!(
+            index.target_matches(f, &ds, OBS_INTERVALS)?,
+            "invalid observation interval index target"
+        );
+        let signed = match index.sample_type()? {
+            SampleType::I8 | SampleType::I16 | SampleType::I32 | SampleType::I64 => true,
+            SampleType::U8 | SampleType::U16 | SampleType::U32 | SampleType::U64 => false,
+            _ => anyhow::bail!("expected an integer observation interval index"),
+        };
+        let mut units = spike_rows(spikes, seconds);
+        let mut spans = Vec::with_capacity(spikes.len());
+        let mut prev = 0;
+        let mut block = Vec::new();
+        let mut covered = true;
+        for i in (0..spikes.len()).step_by(INTERVAL_BATCH) {
+            let range = i..spikes.len().min(i + INTERVAL_BATCH);
+            let ends = if signed {
+                index
+                    .read_rows::<i64>(range)?
+                    .into_iter()
+                    .map(u64::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("negative observation interval index")?
+            } else {
+                index.read_rows::<u64>(range)?
+            };
+            for end in ends {
+                ensure!(
+                    (prev as u64..=n as u64).contains(&end),
+                    "observation interval index is not monotonic or is out of bounds"
+                );
+                let end = end as usize;
+                let mut rows = TimeIntervals::new();
+                for j in prev..end {
+                    if j % INTERVAL_BATCH == 0 {
+                        block = ds.read_rows::<f64>(j..n.min(j + INTERVAL_BATCH))?;
+                    }
+                    let k = 2 * (j % INTERVAL_BATCH);
+                    add_interval(&mut rows, block[k], block[k + 1])?;
+                }
+                let mut rows = grid_intervals(rows, rate, t0)?;
+                let (samples, times) = units.next().context("too many observation indices")?;
+                covered &= cover_spikes(&mut rows, samples, times);
+                spans.push(interval_span(rows, OBS_INTERVALS));
+                prev = end;
+            }
+        }
+        ensure!(
+            prev == n && spans.len() == spikes.len(),
+            "observation interval index does not account for every interval or unit"
+        );
+        Ok(covered.then_some(spans))
+    }
+
+    fn time_table_intervals(
+        f: &Group,
+        path: &str,
+        rate: f64,
+        t0: f64,
+    ) -> Result<Vec<GridInterval>> {
+        let Some(g) = f.optional_group(path)? else {
+            return Ok(Vec::new());
+        };
+        let (starts, stops) = (g.dataset("start_time")?, g.dataset("stop_time")?);
+        let shape = starts.shape();
+        let &[n] = shape.as_slice() else {
+            anyhow::bail!("expected one-dimensional start_time");
+        };
+        ensure!(
+            stops.shape() == shape,
+            "start_time and stop_time shapes differ"
+        );
+        let mut rows = TimeIntervals::new();
+        for i in (0..n).step_by(INTERVAL_BATCH) {
+            let range = i..n.min(i + INTERVAL_BATCH);
+            for (start, stop) in starts
+                .read_rows::<f64>(range.clone())?
+                .into_iter()
+                .zip(stops.read_rows::<f64>(range)?)
+            {
+                add_interval(&mut rows, start, stop)?;
+            }
+        }
+        grid_intervals(rows, rate, t0)
+    }
+
     pub(crate) fn read_trials(path: &Path) -> Result<crate::Events> {
         let f = Group::open(path)?;
         trials_from_group(&f).with_context(|| format!("{}: read NWB trials", path.display()))
@@ -598,32 +974,46 @@ mod imp {
             return false;
         };
         let parents = legacy_type_parents(f).unwrap_or_default();
+        let mut first = None;
         for candidate in names {
             let g = match acq.legacy_group(&candidate) {
                 Ok(Some(g)) => g,
                 Ok(None) => continue,
-                Err(_) => return false, // Can't rule out an earlier group.
+                Err(_) => return false, // A linked member cannot inherit the legacy seal.
             };
+            if first.is_some() {
+                continue;
+            }
             let ty = match g.optional_attr("neurodata_type") {
                 Ok(attr) => attr.and_then(|a| a.legacy_string().ok()),
                 Err(_) => return false,
             };
             if ty.is_some_and(|t| legacy_is_series(&t, &parents)) {
                 match g.legacy_dataset_rank("data") {
-                    Ok(Some(2)) => return candidate == name,
+                    Ok(Some(2)) => first = Some(candidate == name),
                     Ok(_) => (),
                     Err(_) => return false, // Might have been trunk's series.
                 }
             }
         }
-        false
+        first.unwrap_or(false)
+    }
+
+    type ElectricalSeries = (String, Group);
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("{message}")]
+    struct SeriesDataError {
+        series: String,
+        message: String,
     }
 
     fn find_electrical_series(
         f: &Group,
         requested: Option<&str>,
         required: bool,
-    ) -> Result<Option<(String, Group)>> {
+        skipping: bool,
+    ) -> Result<(Option<ElectricalSeries>, Option<String>)> {
         fn collect(
             group: &Group,
             path: &str,
@@ -647,8 +1037,8 @@ mod imp {
                 };
                 if is_series_node {
                     found.push((path, child));
-                } else if depth > 0 {
-                    // Bound the recursion in case of cyclic HDF5 links.
+                } else if depth > 0 && !child.is_alias(group, &name) {
+                    // Never walk into soft aliases; also bound recursion for hard links.
                     collect(&child, &path, depth - 1, is_series, found)?;
                 }
             }
@@ -671,14 +1061,17 @@ mod imp {
             let specs = specs
                 .as_ref()
                 .map_err(|err| anyhow!("{}: {err:#}", unavailable()))?;
-            // Default selection ranks every discovered group (processing
-            // included), so any conflict there could change the pick; with
-            // --nwb-series only the requested group matters.
-            let refuse_conflicts = requested_path.as_deref().is_none_or(|p| p == path);
+            // Refuse type conflicts only where they can change the selection.
+            let refuse_conflicts = requested_path
+                .as_deref()
+                .map_or_else(|| path.starts_with("/acquisition/"), |p| p == path);
             specs.is_series(ty, refuse_conflicts)
         };
         let mut found = Vec::new();
         for (root, depth) in [("/acquisition", 0), ("/processing", 32)] {
+            if skipping && root == "/processing" {
+                continue;
+            }
             if let Some(group) = f.optional_group(root)? {
                 collect(&group, root, depth, &is_series, &mut found)?;
             }
@@ -693,7 +1086,13 @@ mod imp {
                 },
             )
         };
-        let available = || {
+        let checked_rank = |path: &str, g: &Group| {
+            data_rank(g).with_context(|| SeriesDataError {
+                series: path.to_owned(),
+                message: format!("ElectricalSeries {path}: invalid data"),
+            })
+        };
+        let available = |found: &[(String, Group)]| {
             if found.is_empty() {
                 "none".to_string()
             } else {
@@ -705,63 +1104,196 @@ mod imp {
             }
         };
         let index = if let Some(path) = &requested_path {
-            if let Some(index) = found.iter().position(|(name, _)| name == path) {
-                index
-            } else {
-                // A selected path outside the discovery walk can still contain a link.
+            let mut index = found.iter().position(|(name, _)| name == path);
+            if index.is_none() {
+                // Discovery does not walk soft-linked groups, but an explicit
+                // path can select one once the storage layer resolves it.
                 if let Some(group) = f.optional_group(path)? {
                     if let Some(ty) = group.optional_attr("neurodata_type")? {
-                        is_series(&ty.string()?, path)?;
+                        if is_series(&ty.string()?, path)? {
+                            index = Some(found.len());
+                            found.push((path.clone(), group));
+                        }
                     }
                 }
-                let requested = requested.unwrap_or(path);
-                anyhow::bail!(
-                    "no ElectricalSeries matching {requested:?}; available series: {}",
-                    available()
-                );
             }
-        } else if found.is_empty() {
-            ensure!(
-                !required,
-                "no ElectricalSeries in the raw NWB; available series: none"
-            );
-            return Ok(None);
+            index.with_context(|| {
+                let requested = requested.unwrap_or(path);
+                format!(
+                    "no ElectricalSeries matching {requested:?}; available series: {}",
+                    available(&found)
+                )
+            })?
         } else {
-            let mut best = (0, 0);
+            let mut best = None;
             for (i, (path, group)) in found.iter().enumerate() {
-                let rank = data_rank(group)
-                    .with_context(|| format!("ElectricalSeries {path}: invalid data"))?;
-                if rank > best.0 {
-                    best = (rank, i);
+                if !path.starts_with("/acquisition/") {
+                    continue;
+                }
+                let rank = checked_rank(path, group)?;
+                if best.is_none_or(|(previous, _)| rank > previous) {
+                    best = Some((rank, i));
                 }
             }
-            best.1
+            let Some((_, index)) = best else {
+                if required {
+                    ensure!(
+                        !found.is_empty(),
+                        "no ElectricalSeries in the raw NWB; available series: none"
+                    );
+                    anyhow::bail!(
+                        "no /acquisition ElectricalSeries in the raw NWB; available series: {}; pass --nwb-series PATH to use a processed series",
+                        available(&found)
+                    );
+                }
+                return Ok((None, (!found.is_empty()).then(|| available(&found))));
+            };
+            index
         };
         let (path, group) = &found[index];
         ensure!(
-            data_rank(group).with_context(|| format!("ElectricalSeries {path}: invalid data"))? != 0,
-            "ElectricalSeries {path} requires 1-D data (one channel) or 2-D data (time × channels); available series: {}",
-            available()
+            checked_rank(path, group)? != 0,
+            SeriesDataError {
+                series: path.clone(),
+                message: format!(
+                    "ElectricalSeries {path} requires 1-D data (one channel) or 2-D data (time × channels); available series: {}",
+                    available(&found)
+                ),
+            }
         );
-        if requested.is_none() && found.len() > 1 {
+        if !skipping && requested.is_none() && found.len() > 1 {
             log::warn!(
                 "NWB: reading ElectricalSeries {path}; available series: {} (choose with --nwb-series)",
-                available()
+                available(&found)
             );
         }
-        Ok(Some(found.swap_remove(index)))
+        Ok((Some(found.swap_remove(index)), None))
+    }
+
+    fn misses_units_electrodes(
+        f: &Group,
+        units: &Group,
+        ids: &Dataset,
+        series: &Group,
+    ) -> Result<bool> {
+        let Some(unit_region) = units.optional_dataset("electrodes")? else {
+            return Ok(false);
+        };
+        let series_region = series.dataset("electrodes")?;
+        let Some(table) = unit_region.shared_table(&series_region, f)? else {
+            return Ok(false);
+        };
+        let rows = |ds: &Dataset| -> Result<Vec<i64>> {
+            ensure!(
+                ds.shape().len() == 1
+                    && !matches!(ds.sample_type()?, SampleType::F32 | SampleType::F64)
+            );
+            ds.read_raw()
+        };
+        let referenced = rows(&unit_region)?;
+        let ends = rows(&units.dataset("electrodes_index")?)?;
+        ensure!(
+            ids.shape() == [ends.len()]
+                && ends.iter().is_sorted()
+                && ends.first().is_none_or(|&end| end >= 0)
+                && ends.last().copied().unwrap_or(0) == referenced.len() as i64
+        );
+        let recorded = rows(&series_region)?;
+        let shape = table.dataset("id")?.shape();
+        ensure!(
+            shape.len() == 1
+                && referenced
+                    .iter()
+                    .chain(&recorded)
+                    .all(|&r| { usize::try_from(r).is_ok_and(|r| r < shape[0]) })
+        );
+        let recorded: std::collections::HashSet<_> = recorded.into_iter().collect();
+        Ok(referenced.iter().any(|row| !recorded.contains(row)))
+    }
+
+    fn inspect_skipped_series(file: &Group) -> Value {
+        let (name, series) = match find_electrical_series(file, None, false, true) {
+            Ok((Some(series), _)) => series,
+            Ok((None, _)) => {
+                return json!({
+                    "status": "no acquisition series",
+                    "message": "No /acquisition ElectricalSeries was found.",
+                })
+            }
+            Err(err) => {
+                let mut skipped = json!({
+                    "status": "refused", "check": "series selection", "message": format!("{err:#}"),
+                });
+                if let Some(data) = err.downcast_ref::<SeriesDataError>() {
+                    skipped["series"] = json!(data.series);
+                    skipped["check"] = json!("data shape/type");
+                }
+                return skipped;
+            }
+        };
+        let data = series.dataset("data").and_then(|data| {
+            trace_sample_type(&data, &name)?;
+            Ok(data)
+        });
+        let data = match data {
+            Ok(data) => data,
+            Err(err) => {
+                return json!({
+                    "series": name, "status": "refused", "check": "data shape/type", "message": format!("{err:#}"),
+                })
+            }
+        };
+        let mut timestamps_fit = None;
+        let result = read_time_base_with(
+            file,
+            &name,
+            data.shape()[0],
+            |ds, n| {
+                let grid = probe_timestamps(ds, n, true)?;
+                timestamps_fit = Some((grid.probe_regular, grid.chunk_limited));
+                Ok((grid.rate, grid.t0))
+            },
+            "",
+        );
+        if let Err(err) = result {
+            let mut skipped = json!({
+                "series": name, "status": "refused", "check": "time base", "message": format!("{err:#}"),
+            });
+            if let Some(&TimestampDiscontinuity {
+                check, left, right, ..
+            }) = err.downcast_ref()
+            {
+                skipped["check"] = json!(check);
+                if right.0 - left.0 == 1 {
+                    skipped["sample"] = json!(left.0);
+                    skipped["next_sample"] = json!(right.0);
+                    skipped["jump_s"] = json!(right.1 - left.1);
+                    skipped["t_s"] = json!([left.1, right.1]);
+                }
+            }
+            return skipped;
+        }
+        let (status, message) = match timestamps_fit {
+            Some((_, true)) => ("not fully checked", format!("The timestamp probe was limited to an {MAX_UNITS_ONLY_PROBE_CHUNKS}-chunk I/O budget; the full scan was skipped.")),
+            Some((true, false)) => ("regular (probe)", "Sampled timestamps fit the inferred grid; the full scan was skipped.".into()),
+            Some((false, false)) => ("not fully checked", "Sampled timestamps deviate from the inferred grid; the probe did not locate a discontinuity and the full scan was skipped.".into()),
+            None => ("not fully checked", "No per-sample timestamps; checked series metadata and the declared clock only.".into()),
+        };
+        json!({ "series": name, "status": status, "message": message })
     }
 
     /// `(rate Hz, starting_time s, recorded timestamps)`.
-    fn read_time_base(
+    fn read_time_base_with(
         file: &Group,
         name: &str,
         n_samples: usize,
+        check_timestamps: impl FnOnce(&Dataset, usize) -> Result<(f64, f64)>,
+        hint: &str,
     ) -> Result<(f64, f64, Option<Dataset>)> {
         let read = || -> Result<_> {
             if let Some(ds) = file.optional_stored_dataset(&format!("{name}/timestamps"))? {
                 ds.exact_float("timestamps")?;
-                let (rate, t0) = regular_timestamps(&ds, n_samples)?;
+                let (rate, t0) = check_timestamps(&ds, n_samples)?;
                 return Ok((rate, t0, Some(ds)));
             }
             let st = file
@@ -774,10 +1306,11 @@ mod imp {
             check_time(t0, "starting_time")?;
             Ok((rate, t0, None))
         };
-        read().with_context(|| format!("ElectricalSeries {name}: invalid time base"))
+        read().with_context(|| format!("ElectricalSeries {name}: invalid time base{hint}"))
     }
 
     const TIMESTAMP_BLOCK: usize = 65_536;
+    const MAX_UNITS_ONLY_PROBE_CHUNKS: usize = 8;
 
     fn read_timestamp_block(ds: &Dataset, range: Range<usize>) -> Result<Vec<f64>> {
         let times = ds.read_rows(range)?;
@@ -787,13 +1320,104 @@ mod imp {
         Ok(times)
     }
 
-    fn regular_timestamps(ds: &Dataset, n: usize) -> Result<(f64, f64)> {
+    #[derive(Debug, thiserror::Error)]
+    #[error("{message}")]
+    struct TimestampDiscontinuity {
+        check: &'static str,
+        left: (usize, f64),
+        right: (usize, f64),
+        message: String,
+    }
+
+    fn checked_timestamp_step(left: (usize, f64), right: (usize, f64)) -> Result<f64> {
+        let step = right.1 - left.1;
+        let back = -step;
+        ensure!(
+            step.is_finite() && step > 0.0,
+            TimestampDiscontinuity {
+                check: "timestamp order",
+                left,
+                right,
+                message: format!(
+                    "timestamps must strictly increase: they step back by {back:.6} s between samples {} and {} \
+                     (t={} s to {} s); choose another series with --nwb-series",
+                    left.0, right.0, left.1, right.1
+                ),
+            }
+        );
+        Ok(step)
+    }
+
+    struct TimestampGrid {
+        rate: f64,
+        t0: f64,
+        period: f64,
+        limit: f64,
+        probe_regular: bool,
+        chunk_limited: bool,
+    }
+
+    impl TimestampGrid {
+        fn error(&self, sample: usize, t: f64) -> f64 {
+            (t - self.t0) / self.period - sample as f64
+        }
+    }
+
+    fn probe_timestamps(ds: &Dataset, n: usize, probe_only: bool) -> Result<TimestampGrid> {
         ensure!(
             ds.shape() == [n] && n >= 2,
             "timestamps must contain one time per sample and at least two times to infer a rate"
         );
-        let t0 = read_timestamp_block(ds, 0..1)?[0];
-        let last = read_timestamp_block(ds, n - 1..n)?[0];
+        let chunks: Option<[_; MAX_UNITS_ONLY_PROBE_CHUNKS]> = if probe_only {
+            ds.chunk_rows().and_then(|rows| {
+                let count = n.div_ceil(rows);
+                (count > MAX_UNITS_ONLY_PROBE_CHUNKS).then(|| {
+                    std::array::from_fn(|i| {
+                        // Include first and last chunks, even if the last is partial.
+                        let chunk = ((count - 1) as u128 * i as u128
+                            / (MAX_UNITS_ONLY_PROBE_CHUNKS - 1) as u128)
+                            as usize;
+                        let start = chunk * rows;
+                        start..start.saturating_add(rows).min(n)
+                    })
+                })
+            })
+        } else {
+            None
+        };
+        // Refinement may narrow within the selected chunks, but must not
+        // pull in additional chunks just to say where a jump happened.
+        let midpoint = |left: usize, right: usize| {
+            if right - left <= 1 {
+                return None;
+            }
+            let mid = left.midpoint(right);
+            match &chunks {
+                None => Some(mid),
+                Some(chunks) => chunks
+                    .iter()
+                    .map(|chunk| mid.clamp(chunk.start, chunk.end - 1))
+                    .filter(|&sample| left < sample && sample < right)
+                    .min_by_key(|&sample| sample.abs_diff(mid)),
+            }
+        };
+        let time_at =
+            |sample| -> Result<_> { Ok(read_timestamp_block(ds, sample..sample + 1)?[0]) };
+        let t0 = time_at(0)?;
+        let last = time_at(n - 1)?;
+        if last <= t0 {
+            // At least one half must retain the non-increasing endpoints.
+            let (mut left, mut right) = ((0, t0), (n - 1, last));
+            while let Some(mid) = midpoint(left.0, right.0) {
+                let t = time_at(mid)?;
+                if t <= left.1 {
+                    right = (mid, t);
+                } else {
+                    left = (mid, t);
+                }
+            }
+            checked_timestamp_step(left, right)?;
+        }
         // Use the end-to-end mean period, so a tiny bias from one rounded
         // interval cannot accumulate over a long recording.
         let period = (last - t0) / (n - 1) as f64;
@@ -808,7 +1432,139 @@ mod imp {
         // The grid interpolates two rounded endpoints. Allow a few ulps
         // for their error, each rounded timestamp, and the arithmetic.
         let limit = 1e-3 + 4.0 * ulp * rate;
+        let mut grid = TimestampGrid {
+            rate,
+            t0,
+            period,
+            limit,
+            probe_regular: true,
+            chunk_limited: chunks.is_some(),
+        };
+        // Don't probe if a full scan is planned and fits in one block.
+        let stride = if !probe_only && n <= TIMESTAMP_BLOCK {
+            n - 1
+        } else {
+            (n - 1).div_ceil(63)
+        };
+        // ponytail: fast refusal is best-effort and only localizes the first
+        // failed probe. The full scan still refuses discontinuities that return
+        // to the grid between probes or that the probe can't explain.
+        let samples: Vec<_> = match &chunks {
+            Some(chunks) => chunks
+                .iter()
+                .flat_map(|chunk| [chunk.start, chunk.end - 1].into_iter().take(chunk.len()))
+                .filter(|&i| i != 0 && i != n - 1)
+                .collect(),
+            None => (stride..n - 1).step_by(stride).collect(),
+        };
+        let mut last_in_grid = (0, t0);
+        for sample in samples {
+            let time = time_at(sample)?;
+            let drift = grid.error(sample, time);
+            if drift.abs() <= limit {
+                last_in_grid = (sample, time);
+                continue;
+            }
+            let probe = (sample, time);
+            let before = ((0, t0), probe);
+            let after = (probe, (n - 1, last));
+            let (longer, shorter) = if drift > 0.0 {
+                (before, after)
+            } else {
+                (after, before)
+            };
+            // First bracket an in-grid to out-of-grid transition. A lasting
+            // offset skews the mean, so this crossing may be on an ordinary
+            // interval. Also look for a short step and a long gap on the
+            // sides where each could account for the signed probe error.
+            let mut largest_error = 2.0 * limit;
+            let mut gap = None;
+            for ((mut left, mut right), direction) in [
+                ((last_in_grid, probe), None),
+                (shorter, Some(-1.0)),
+                (longer, Some(1.0)),
+            ] {
+                while let Some(mid) = midpoint(left.0, right.0) {
+                    let t = time_at(mid)?;
+                    let take_left = if let Some(sign) = direction {
+                        let left_mean = (t - left.1) / (mid - left.0) as f64;
+                        let right_mean = (right.1 - t) / (right.0 - mid) as f64;
+                        sign * left_mean >= sign * right_mean
+                    } else {
+                        grid.error(mid, t).abs() > limit
+                    };
+                    if take_left {
+                        right = (mid, t);
+                    } else {
+                        left = (mid, t);
+                    }
+                }
+                let step = checked_timestamp_step(left, right)?;
+                if right.0 - left.0 > 1 {
+                    continue; // The bracket crosses unprobed chunks, not one interval.
+                }
+                let mut candidate = (left, right, step);
+                if let Some(chunks) = &chunks {
+                    // A gap outside the sampled chunks can skew the mean.
+                    // Don't label an ordinary interval a jump without a
+                    // differing neighboring step in the sampled data.
+                    let Some((index, point)) =
+                        [(left.0.checked_sub(1), left), (Some(right.0 + 1), right)]
+                            .into_iter()
+                            .filter_map(|(i, point)| Some((i?, point)))
+                            .find(|(i, _)| chunks.iter().any(|chunk| chunk.contains(i)))
+                    else {
+                        continue;
+                    };
+                    let neighbor = (index, time_at(index)?);
+                    let (a, b) = if index < point.0 {
+                        (neighbor, point)
+                    } else {
+                        (point, neighbor)
+                    };
+                    let other = checked_timestamp_step(a, b)?;
+                    if ((other - step) * rate).abs() <= 2.0 * limit {
+                        continue;
+                    }
+                    if (other * rate - 1.0).abs() > (step * rate - 1.0).abs() {
+                        candidate = (a, b, other);
+                    }
+                }
+                // Adjacent grid errors differ by the interval error in samples.
+                let error = (candidate.2 * rate - 1.0).abs();
+                if error > largest_error {
+                    largest_error = error;
+                    gap = Some(candidate);
+                }
+            }
+            if let Some((left, right, jump)) = gap {
+                let jump_samples = jump * rate;
+                return Err(TimestampDiscontinuity {
+                    check: "timestamp grid",
+                    left,
+                    right,
+                    message: format!(
+                        "timestamps are not a regular grid: they jump by {jump:.6} s \
+                         ({jump_samples:.3} samples at the mean rate {rate} Hz) between samples {} and {} \
+                         (t={} s to {} s); Sorrel needs a regular sample grid for the trace; \
+                         choose another series with --nwb-series",
+                        left.0, right.0, left.1, right.1
+                    ),
+                }.into());
+            }
+            grid.probe_regular = false;
+            break;
+        }
+        Ok(grid)
+    }
+
+    fn regular_timestamps(ds: &Dataset, n: usize) -> Result<(f64, f64)> {
+        let grid = probe_timestamps(ds, n, false)?;
+        let TimestampGrid {
+            t0, rate, limit, ..
+        } = grid;
         let (mut max_drift, mut worst_sample) = (0.0, 0);
+        let (mut max_step, mut step_end) = (0.0, 1);
         let mut prev = t0;
         for start in (1..n).step_by(TIMESTAMP_BLOCK) {
             let times =
@@ -818,7 +1574,10 @@ mod imp {
                 let step = t - prev;
                 ensure!(step.is_finite() && step > 0.0,
                     "irregular timestamps at sample {sample}: interval {step} s; timestamps must strictly increase");
-                let drift = ((t - t0) / period - sample as f64).abs();
+                if step > max_step {
+                    (max_step, step_end) = (step, sample);
+                }
+                let drift = grid.error(sample, t).abs();
                 if drift > max_drift {
                     (max_drift, worst_sample) = (drift, sample);
                 }
@@ -826,7 +1585,8 @@ mod imp {
             }
         }
         ensure!(max_drift <= limit,
-            "irregular timestamps at sample {worst_sample}: max deviation {max_drift:.6} samples from the inferred grid (limit {limit:.6})");
+            "irregular timestamps at sample {worst_sample}: max deviation {max_drift:.6} samples from the inferred grid (limit {limit:.6}); largest interval {max_step:.6} s between samples {} and {step_end}",
+            step_end - 1);
         Ok((rate, t0))
     }
 
@@ -837,7 +1597,7 @@ mod imp {
     fn read_channels(f: &Group, series: &Group, name: &str, n_channels: usize) -> Result<Channels> {
         let region = series
             .dataset("electrodes")
-            .with_context(|| format!("ElectricalSeries {name}: no electrodes region"))?;
+            .with_context(|| format!("ElectricalSeries {name}: cannot open electrodes region"))?;
         let rows: Vec<i64> = region.read_raw()?;
         ensure!(
             rows.len() == n_channels,
@@ -917,6 +1677,30 @@ mod imp {
         cache: Mutex<VecDeque<(usize, Vec<f32>)>>,
     }
 
+    fn trace_sample_type(data: &Dataset, name: &str) -> Result<SampleType> {
+        let dtype = data
+            .sample_type()
+            .with_context(|| format!("ElectricalSeries {name}: unsupported sample datatype"))?;
+        ensure!(
+            matches!(
+                dtype,
+                SampleType::I8
+                    | SampleType::U8
+                    | SampleType::I16
+                    | SampleType::U16
+                    | SampleType::I32
+                    | SampleType::U32
+                    | SampleType::I64
+                    | SampleType::F32
+                    | SampleType::F64
+            ),
+            "ElectricalSeries {name}: {} samples are not supported \
+             (expected int8, uint8, int16, uint16, int32, uint32, int64, float32 or float64)",
+            dtype.name()
+        );
+        Ok(dtype)
+    }
+
     impl NwbTrace {
         fn new(
             series: &Group,
@@ -926,26 +1710,7 @@ mod imp {
             n_channels: usize,
         ) -> Result<Self> {
             ensure!(n_channels > 0, "ElectricalSeries {name}: no channels");
-            let dtype = data
-                .sample_type()
-                .with_context(|| format!("ElectricalSeries {name}: unsupported sample datatype"))?;
-            ensure!(
-                matches!(
-                    dtype,
-                    SampleType::I8
-                        | SampleType::U8
-                        | SampleType::I16
-                        | SampleType::U16
-                        | SampleType::I32
-                        | SampleType::U32
-                        | SampleType::I64
-                        | SampleType::F32
-                        | SampleType::F64
-                ),
-                "ElectricalSeries {name}: {} samples are not supported \
-                 (expected int8, uint8, int16, uint16, int32, uint32, int64, float32 or float64)",
-                dtype.name()
-            );
+            let dtype = trace_sample_type(&data, name)?;
             let (gain, offset_uv) = trace_scale(series, &data, name, n_channels)?;
             let max_frames = (TRACE_BLOCK_BYTES / 4 / n_channels).max(1);
             let block_frames = data
@@ -1058,6 +1823,14 @@ mod imp {
         Ok((gain, offset_uv))
     }
 
+    struct LoadedUnits {
+        spikes: Vec<Vec<SampleIndex>>,
+        ids: Vec<u32>,
+        same_mapping: bool,
+        // Only kept for validating units-only interval boundaries.
+        seconds: Vec<f64>,
+    }
+
     /// Spike sample indices per unit (relative to `t0`), unit ids, and
     /// whether the mapping agrees with the optional comparison rate. Any
     /// disagreement is an error when there is no explicit clock choice.
@@ -1069,7 +1842,7 @@ mod imp {
         t0: f64,
         series_clock: Option<(usize, Option<&Dataset>)>,
         mut comparison: Option<(f64, bool)>,
-    ) -> Result<(Vec<Vec<SampleIndex>>, Vec<u32>, bool)> {
+    ) -> Result<LoadedUnits> {
         let timestamps = series_clock.and_then(|(n_samples, ds)| ds.map(|ds| (ds, n_samples)));
         let ids: Vec<i64> = ids.read_raw()?;
         spike_times.exact_float("/units/spike_times")?;
@@ -1100,7 +1873,7 @@ mod imp {
                 .filter(|&e| e >= start && e <= all.len())
                 .ok_or_else(|| anyhow!("/units/spike_times_index is not a valid ragged index"))?;
             let times = &mut all[start..end];
-            if timestamps.is_some() && !times.is_sorted() {
+            if (series_clock.is_none() || timestamps.is_some()) && !times.is_sorted() {
                 times.sort_unstable_by(f64::total_cmp);
             }
             let mut bucket = times
@@ -1132,7 +1905,7 @@ mod imp {
                     Ok(SampleIndex::new(s as u64))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            if timestamps.is_none() {
+            if series_clock.is_some() && timestamps.is_none() {
                 bucket.sort_unstable();
             }
             out.push(bucket);
@@ -1147,7 +1920,16 @@ mod imp {
                 "Ambiguous NWB sample rate: stored series rate {rate} Hz and Units resolution rate {units_rate} Hz map {n_differing} {noun} to different samples (first: unit {id} spike {spike} at {t} s, sample indices {stored} vs {precise}, respectively); pass --sample-rate <Hz> to choose which clock applies"
             );
         }
-        Ok((out, unit_ids, n_differing == 0))
+        Ok(LoadedUnits {
+            spikes: out,
+            ids: unit_ids,
+            same_mapping: n_differing == 0,
+            seconds: if series_clock.is_none() {
+                all
+            } else {
+                Vec::new()
+            },
+        })
     }
 
     fn check_timestamp_spikes(
@@ -1422,15 +2204,167 @@ mod imp {
     fn timestamp_validation_rejects_subsample_jitter() {
         let dir = tempfile::tempdir().unwrap();
         let file = hdf5_metno::File::create(dir.path().join("timestamps.h5")).unwrap();
-        // Alternating 0.8/1.2 ms intervals on a nominal 1 kHz grid.
-        let times = [0.5, 0.5008, 0.502, 0.5028, 0.504];
+        // A short/long pair on a nominal 1 kHz grid.
+        let mut times: Vec<_> = (0..127).map(|i| 0.5 + f64::from(i) / 1000.0).collect();
+        times[3] -= 0.0002;
         let ds = file
             .new_dataset_builder()
             .with_data(&times)
             .create("timestamps")
             .unwrap();
         let err = regular_timestamps(&Dataset::Hdf5(ds.clone()), times.len()).unwrap_err();
-        assert!(err.to_string().contains("max deviation 0.200000 samples"));
+        let err = err.to_string();
+        assert!(err.contains("max deviation 0.200000 samples"), "{err}");
+        assert!(
+            err.contains("largest interval 0.001200 s between samples 3 and 4"),
+            "{err}"
+        );
+    }
+
+    #[cfg(all(test, feature = "hdf5"))]
+    #[test]
+    fn timestamp_validation_scans_one_block_without_probing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5_metno::File::create(dir.path().join("timestamps.h5")).unwrap();
+        let mut times: Vec<_> = (0..TIMESTAMP_BLOCK).map(|i| i as f64 / 1000.0).collect();
+        times[1041] -= 0.0002; // The first sparse probe would hit this sample.
+        let ds = file
+            .new_dataset_builder()
+            .with_data(&times)
+            .create("timestamps")
+            .unwrap();
+        let err = regular_timestamps(&Dataset::Hdf5(ds), times.len()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("at sample 1041: max deviation 0.200000 samples"),
+            "{err}"
+        );
+    }
+
+    #[cfg(all(test, feature = "hdf5"))]
+    #[test]
+    fn timestamp_validation_locates_one_dropped_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5_metno::File::create(dir.path().join("timestamps.h5")).unwrap();
+        let times: Vec<_> = (0..=100_001)
+            .filter(|&i| i != 73_259)
+            .map(|i| f64::from(i) / 1000.0)
+            .collect();
+        let ds = file
+            .new_dataset_builder()
+            .with_data(&times)
+            .create("timestamps")
+            .unwrap();
+        let err = regular_timestamps(&Dataset::Hdf5(ds), times.len())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("timestamps are not a regular grid: they jump by 0.002000 s"),
+            "{err}"
+        );
+        assert!(err.contains("between samples 73258 and 73259"), "{err}");
+    }
+
+    #[cfg(all(test, feature = "hdf5"))]
+    #[test]
+    fn timestamp_validation_reports_large_gap_at_the_adjacent_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5_metno::File::create(dir.path().join("gapped.h5")).unwrap();
+        let name = "/acquisition/e-series";
+        let series = file.create_group(name).unwrap();
+        let root = Group::Hdf5(file.group("/").unwrap());
+        let n = 100_001;
+        let ds = series
+            .new_dataset::<f64>()
+            .shape(n)
+            .create("timestamps")
+            .unwrap();
+        for gap in [1, 73_259, n - 1] {
+            let times: Vec<_> = (0..n)
+                .map(|i| i as f64 / 1000.0 + if i >= gap { 25.0 } else { 0.0 })
+                .collect();
+            ds.write(&times).unwrap();
+            let err = read_time_base_with(&root, name, n, regular_timestamps, "")
+                .err()
+                .unwrap();
+            assert_eq!(
+                err.to_string(),
+                format!("ElectricalSeries {name}: invalid time base")
+            );
+            let err = format!("{err:#}");
+            assert!(err.contains("jump by 25.001000 s"), "{err}");
+            assert!(
+                err.contains("20000.800 samples at the mean rate 800"),
+                "{err}"
+            );
+            assert!(
+                err.contains(&format!("between samples {} and {gap}", gap - 1)),
+                "{err}"
+            );
+            assert!(err.contains("--nwb-series"), "{err}");
+        }
+    }
+
+    #[cfg(all(test, feature = "hdf5"))]
+    #[test]
+    fn timestamp_validation_reports_backward_step_at_the_adjacent_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5_metno::File::create(dir.path().join("backward.h5")).unwrap();
+        let name = "/acquisition/e-series";
+        let series = file.create_group(name).unwrap();
+        let root = Group::Hdf5(file.group("/").unwrap());
+        let n = 100_001;
+        let ds = series
+            .new_dataset::<f64>()
+            .shape(n)
+            .create("timestamps")
+            .unwrap();
+        // Test a temporary offset detected by a later probe and a permanent
+        // offset that skews the endpoint mean before the step.
+        for end in [74_847, n] {
+            let times: Vec<_> = (0..n)
+                .map(|i| {
+                    i as f64 / 1000.0
+                        - if (73_259..end).contains(&i) {
+                            0.029
+                        } else {
+                            0.0
+                        }
+                })
+                .collect();
+            ds.write(&times).unwrap();
+            let err = format!(
+                "{:#}",
+                read_time_base_with(&root, name, n, regular_timestamps, "")
+                    .err()
+                    .unwrap()
+            );
+            assert!(
+                err.contains("invalid time base: timestamps must strictly increase: they step back by 0.028000 s between samples 73258 and 73259"),
+                "{err}"
+            );
+            assert!(err.contains("--nwb-series"), "{err}");
+        }
+    }
+
+    #[cfg(all(test, feature = "hdf5"))]
+    #[test]
+    fn timestamp_validation_locates_backward_step_with_nonincreasing_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5_metno::File::create(dir.path().join("timestamps.h5")).unwrap();
+        let times: Vec<_> = (0..100_001)
+            .map(|i| f64::from(i) / 1000.0 - if i >= 73_259 { 150.0 } else { 0.0 })
+            .collect();
+        let ds = file
+            .new_dataset_builder()
+            .with_data(&times)
+            .create("timestamps")
+            .unwrap();
+        let err = regular_timestamps(&Dataset::Hdf5(ds), times.len()).unwrap_err();
+        assert!(
+            err.to_string().contains("timestamps must strictly increase: they step back by 149.999000 s between samples 73258 and 73259"),
+            "{err}"
+        );
     }
 
     #[cfg(all(test, feature = "hdf5"))]

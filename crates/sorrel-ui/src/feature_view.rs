@@ -218,7 +218,7 @@ pub(crate) struct FeatureSet {
     pub(crate) feats: Vec<f32>,
     /// 0.5-99.5 percentile range (padded) per feature column.
     pub(crate) bounds: Vec<(f32, f32)>,
-    pub(crate) duration: f32,
+    pub(crate) time_range: (f32, f32),
     pub(crate) generation: u64,
 }
 
@@ -231,7 +231,7 @@ impl FeatureSet {
         full: bool,
         points: Vec<FeaturePoint>,
         feats: Vec<f32>,
-        duration: f32,
+        time_range: (f32, f32),
     ) -> Self {
         Self::new_cancellable(
             channels,
@@ -239,7 +239,7 @@ impl FeatureSet {
             full,
             points,
             feats,
-            duration,
+            time_range,
             &AtomicBool::new(false),
         )
     }
@@ -250,7 +250,7 @@ impl FeatureSet {
         full: bool,
         points: Vec<FeaturePoint>,
         feats: Vec<f32>,
-        duration: f32,
+        time_range: (f32, f32),
         cancel: &AtomicBool,
     ) -> Self {
         let width = 2 * channels.len();
@@ -276,7 +276,7 @@ impl FeatureSet {
             points,
             feats,
             bounds,
-            duration,
+            time_range,
             generation: GENERATION.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -297,7 +297,7 @@ impl FeatureSet {
             points: self.points.clone(),
             feats,
             bounds: cols.iter().map(|&c| self.bounds[c]).collect(),
-            duration: self.duration,
+            time_range: self.time_range,
             generation: GENERATION.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -345,7 +345,10 @@ impl FeatureSet {
     /// Data range of `dim` (time spans the recording).
     pub(crate) fn bound(&self, dim: Dim) -> (f32, f32) {
         match dim {
-            Dim::Time => (0.0, self.duration.max(1e-3)),
+            Dim::Time => (
+                self.time_range.0,
+                self.time_range.1.max(self.time_range.0 + 1e-3),
+            ),
             Dim::Pc { ch, pc } => self.bounds[pc as usize * self.n() + ch as usize],
         }
     }
@@ -417,11 +420,11 @@ impl Paint<'_> {
     }
 
     /// The colour of selected point `p` under the colour mode.
-    fn point_colour(&self, p: &FeaturePoint, duration: f32) -> Color32 {
+    fn point_colour(&self, p: &FeaturePoint, time_range: (f32, f32)) -> Color32 {
         let cluster = selection_colour(p.slot as usize);
         match self.colour {
             ColourBy::Cluster => cluster,
-            ColourBy::Time => ramp_colour(p.t, 0.0, duration),
+            ColourBy::Time => ramp_colour(p.t, time_range.0, time_range.1),
             ColourBy::Depth => self
                 .depths
                 .and_then(|d| {
@@ -3333,12 +3336,16 @@ fn draw_cell<P: DataProvider>(
         if resp.drag_started() {
             state.time_from = ui
                 .input(|i| i.pointer.press_origin())
-                .map(|p| to_data(p)[0].clamp(0.0, set.duration));
+                .map(|p| to_data(p)[0].clamp(set.time_range.0, set.time_range.1));
         }
         if let (true, Some(from), Some(at)) = (resp.dragged(), state.time_from, resp.hover_pos()) {
             let prev_only = c.time.is_some_and(|t| t.only);
             state.time_out = Some(
-                TimeBrush::new(from, to_data(at)[0].clamp(0.0, set.duration)).map(|t| TimeBrush {
+                TimeBrush::new(
+                    from,
+                    to_data(at)[0].clamp(set.time_range.0, set.time_range.1),
+                )
+                .map(|t| TimeBrush {
                     only: prev_only,
                     ..t
                 }),
@@ -3562,7 +3569,7 @@ fn colour_by(
         }
     });
     let (lo, hi, unit) = match (state.colour, depths) {
-        (ColourBy::Time, _) => (0.0, set.duration, "s"),
+        (ColourBy::Time, _) => (set.time_range.0, set.time_range.1, "s"),
         (ColourBy::Depth, Some(d)) => (d.min, d.max, "\u{b5}m"),
         _ => return,
     };
@@ -4103,7 +4110,7 @@ fn layer_vertices_cancellable(
                         2 => (ink, 240.0),
                         _ if previewed(i) => (ink, 240.0),
                         _ => {
-                            let c = paint.point_colour(p, set.duration);
+                            let c = paint.point_colour(p, set.time_range);
                             ([c.r(), c.g(), c.b()], 255.0)
                         }
                     };
@@ -4194,6 +4201,8 @@ pub(crate) fn compute<P: DataProvider>(
 ) -> FeatureSet {
     let computed = !s.has_pc_features();
     let sr = s.provider.sample_rate().max(1.0);
+    let span = s.provider.session_span();
+    let time_range = (span.start.as_f32() / sr, span.end.as_f32() / sr);
     // Cancelled jobs never publish. Return a well-formed empty set instead
     // of holding the session read lock through millions of obsolete rows.
     let cancelled_set = || {
@@ -4203,7 +4212,7 @@ pub(crate) fn compute<P: DataProvider>(
             key.full,
             Vec::new(),
             Vec::new(),
-            s.provider.n_samples().0 as f32 / sr,
+            time_range,
         )
     };
     let clusters = s.spike_clusters_global();
@@ -4297,7 +4306,7 @@ pub(crate) fn compute<P: DataProvider>(
         key.full || !computed,
         points,
         feats,
-        s.provider.n_samples().0 as f32 / sr,
+        time_range,
         cancel,
     );
     if key.keep_order || set.n() < 3 || key.selection.len() < 2 || cancel.load(Ordering::Relaxed) {
@@ -4948,7 +4957,7 @@ mod tests {
         for _ in 0..50 {
             push(0, BACKGROUND, 0.5, [2.5; 4]);
         }
-        let mut set = FeatureSet::new(vec![0, 1], false, true, points, feats, 1.0);
+        let mut set = FeatureSet::new(vec![0, 1], false, true, points, feats, (0.0, 1.0));
         set.bounds = vec![(-1.0, 6.0); 4];
         set
     }
@@ -5060,7 +5069,7 @@ mod tests {
             })
             .collect();
         let feats = rows.iter().flat_map(|r| [r.2, r.3, 0.0, 0.0]).collect();
-        let mut set = FeatureSet::new(vec![0, 1], false, true, points, feats, 1.0);
+        let mut set = FeatureSet::new(vec![0, 1], false, true, points, feats, (0.0, 1.0));
         set.bounds = vec![(-1.0, 1.0); 4];
         // Cell 1 plots x = 1A (f[1]) against y = 0A (f[0]).
         let lasso = Lasso::new(1, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
@@ -5080,7 +5089,7 @@ mod tests {
             full,
             points,
             vec![0.5, 0.5, 0.0, 0.0],
-            1.0,
+            (0.0, 1.0),
         );
         set.bounds = vec![(-1.0, 1.0); 4];
         set
@@ -5141,7 +5150,7 @@ mod tests {
             true,
             points,
             vec![0.5, 0.5, 0.0, 0.0],
-            1.0,
+            (0.0, 1.0),
         );
         set.bounds = vec![(-1.0, 1.0); 4];
         let selection = [ClusterId(7)];
@@ -5279,7 +5288,7 @@ mod tests {
                 ]);
             }
         }
-        FeatureSet::new(vec![10, 20, 30], false, true, points, feats, 1.0)
+        FeatureSet::new(vec![10, 20, 30], false, true, points, feats, (0.0, 1.0))
     }
 
     #[test]
@@ -5371,7 +5380,14 @@ mod tests {
                 slot: 0,
                 t: 0.0,
             }];
-            FeatureSet::new(channels.to_vec(), false, true, points, vec![0.0; 8], 1.0)
+            FeatureSet::new(
+                channels.to_vec(),
+                false,
+                true,
+                points,
+                vec![0.0; 8],
+                (0.0, 1.0),
+            )
         };
         let id = |d: Dim, ch: &[u32]| match d {
             Dim::Time => None,

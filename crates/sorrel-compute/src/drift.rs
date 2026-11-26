@@ -12,7 +12,7 @@
 //! the cross-correlation-of-depth-histogram registration that Kilosort2.5 /
 //! dredge perform; do not treat their output as a drift-correction signal.
 
-use sorrel_io::SampleIndex;
+use sorrel_io::{SampleIndex, SessionSpan, SpanSource};
 
 /// Sums needed to compute Pearson correlation or least-squares slope of a
 /// (time, amplitude) cloud. Returns `None` for fewer than 3 paired samples.
@@ -22,8 +22,8 @@ fn time_amp_covariance(
     amps: &[f32],
     time_to_f64: impl Fn(SampleIndex) -> f64,
 ) -> Option<(f64, f64, f64)> {
-    let n = times.len().min(amps.len());
-    if n < 3 {
+    let n = times.len();
+    if n < 3 || n != amps.len() {
         return None;
     }
     let nf = n as f64;
@@ -46,12 +46,16 @@ fn time_amp_covariance(
 /// to `[-1, 1]`. Magnitude near 0 means amplitudes are stationary; large
 /// magnitude means a monotonic drift.
 ///
-/// Returns 0 for fewer than 3 spikes.
+/// Returns `NaN` without at least 3 paired samples spanning time; 0 for a
+/// measured constant amplitude across distinct times.
 pub fn amplitude_drift_correlation(times: &[SampleIndex], amps: &[f32]) -> f32 {
     let Some((num, denom_t, denom_a)) = time_amp_covariance(times, amps, |t| t.as_f64()) else {
-        return 0.0;
+        return f32::NAN;
     };
-    if denom_t <= 0.0 || denom_a <= 0.0 {
+    if denom_t <= 0.0 {
+        return f32::NAN;
+    }
+    if denom_a <= 0.0 {
         return 0.0;
     }
     (num / (denom_t * denom_a).sqrt()) as f32
@@ -60,32 +64,39 @@ pub fn amplitude_drift_correlation(times: &[SampleIndex], amps: &[f32]) -> f32 {
 /// Slope (Δamp / Δt, in amplitude-units per second) of a least-squares line
 /// fit through the (time, amplitude) cloud. Useful as an absolute drift
 /// magnitude rather than the unitless correlation. Sample rate is needed to
-/// convert from sample-indexed times to seconds.
+/// convert from sample-indexed times to seconds. `NaN` without at least 3
+/// paired samples spanning time or with an invalid sample rate.
 pub fn amplitude_drift_slope(times: &[SampleIndex], amps: &[f32], sample_rate: f32) -> f32 {
-    if sample_rate <= 0.0 {
-        return 0.0;
+    if !sample_rate.is_finite() || sample_rate <= 0.0 {
+        return f32::NAN;
     }
     let inv_sr = 1.0_f64 / sample_rate as f64;
     let Some((num, denom_t, _)) = time_amp_covariance(times, amps, |t| t.as_f64() * inv_sr) else {
-        return 0.0;
+        return f32::NAN;
     };
     if denom_t <= 0.0 {
-        return 0.0;
+        return f32::NAN;
     }
     (num / denom_t) as f32
 }
 
 /// Coefficient of variation (std / |mean|) of bin counts in a presence-bin
-/// histogram. Higher = more bursty / patchy presence. Drops to 0 for fewer
-/// than 2 non-empty bins.
-pub fn presence_cv(times: &[SampleIndex], total_duration_samples: u64, n_bins: usize) -> f32 {
+/// histogram. Higher = more bursty / patchy presence. `NaN` without counts.
+pub fn presence_cv(times: &[SampleIndex], span: impl Into<SessionSpan>, n_bins: usize) -> f32 {
+    let span = span.into();
+    let total_duration_samples = span.duration_samples();
+    let n_bins = if span.source == SpanSource::Trace {
+        n_bins
+    } else {
+        n_bins.min(usize::try_from(total_duration_samples).unwrap_or(usize::MAX))
+    };
     if times.is_empty() || n_bins == 0 || total_duration_samples == 0 {
-        return 0.0;
+        return f32::NAN;
     }
     let bin_width = (total_duration_samples as f64 / n_bins as f64).max(1.0);
     let mut counts = vec![0u32; n_bins];
-    for &t in times {
-        let idx = ((t.as_f64()) / bin_width) as usize;
+    for (_, offset) in span.recorded_offsets(times) {
+        let idx = (offset as f64 / bin_width) as usize;
         if idx < n_bins {
             counts[idx] += 1;
         }
@@ -93,7 +104,7 @@ pub fn presence_cv(times: &[SampleIndex], total_duration_samples: u64, n_bins: u
     let counts_f32: Vec<f32> = counts.iter().map(|&c| c as f32).collect();
     let m = crate::distribution::Moments::from_f32(&counts_f32);
     if m.mean <= 0.0 {
-        return 0.0;
+        return f32::NAN;
     }
     (m.m2.sqrt() / m.mean) as f32
 }
@@ -108,22 +119,44 @@ pub fn presence_cv(times: &[SampleIndex], total_duration_samples: u64, n_bins: u
 pub fn sliding_refractory_contamination(
     times: &[SampleIndex],
     refractory_samples: u64,
-    total_duration_samples: u64,
+    span: impl Into<SessionSpan>,
     sample_rate: f32,
     n_windows: usize,
     min_spikes_per_window: usize,
 ) -> Vec<(f32, f32)> {
     use crate::metrics::refractory_contamination;
+    let span = span.into();
+    let total_duration_samples = span.duration_samples();
     if times.is_empty() || n_windows == 0 || total_duration_samples == 0 || sample_rate <= 0.0 {
         return Vec::new();
     }
-    let win_samples = (total_duration_samples / n_windows as u64).max(1);
+    let legacy = span.source == SpanSource::Trace;
+    let n_windows = if legacy {
+        n_windows
+    } else {
+        (n_windows as u64).min(total_duration_samples) as usize
+    };
+    let legacy_width = (total_duration_samples / n_windows as u64).max(1);
+    let edge = |i: usize| {
+        if legacy {
+            i as u64 * legacy_width
+        } else {
+            (i as u128 * total_duration_samples as u128 / n_windows as u128) as u64
+        }
+    };
+    let times = span.metric_spikes(times);
     let inv_sr = 1.0_f32 / sample_rate;
     let mut out = Vec::with_capacity(n_windows);
     let mut idx = 0usize;
     for w in 0..n_windows {
-        let lo = w as u64 * win_samples;
-        let hi = lo + win_samples;
+        let from = edge(w);
+        let to = edge(w + 1);
+        let win_samples = to - from;
+        let (lo, hi) = if legacy {
+            (span.start.0 + from, span.start.0 + to)
+        } else {
+            (span.sample_at_offset(from).0, span.sample_at_offset(to).0)
+        };
         // Advance to the first spike inside this window.
         while idx < times.len() && times[idx].0 < lo {
             idx += 1;
@@ -133,8 +166,15 @@ pub fn sliding_refractory_contamination(
         while end < times.len() && times[end].0 < hi {
             end += 1;
         }
-        let centre_s = (lo as f32 + win_samples as f32 * 0.5) * inv_sr;
-        let contam = if end - start >= min_spikes_per_window {
+        let centre_s = if span.n_intervals() <= 1 {
+            (lo as f32 + win_samples as f32 * 0.5) * inv_sr
+        } else {
+            let mid = span.sample_at_offset(from + win_samples / 2);
+            (mid.as_f32() + (win_samples % 2) as f32 * 0.5) * inv_sr
+        };
+        let contam = if end - start < min_spikes_per_window {
+            f32::NAN
+        } else if legacy {
             refractory_contamination(
                 &times[start..end],
                 refractory_samples,
@@ -142,7 +182,9 @@ pub fn sliding_refractory_contamination(
                 sample_rate,
             )
         } else {
-            f32::NAN
+            let window =
+                span.intersect(&SessionSpan::contiguous(lo.into(), hi.into(), span.source));
+            refractory_contamination(&times[start..end], refractory_samples, &window, sample_rate)
         };
         out.push((centre_s, contam));
     }
@@ -151,22 +193,21 @@ pub fn sliding_refractory_contamination(
 
 /// Largest "gap" in the recording where this cluster is silent, expressed as
 /// a fraction of the total recording length. Useful to flag electrode drop:
-/// 0.05 = a 5%-of-recording silent stretch.
-pub fn longest_silent_gap_frac(times: &[SampleIndex], total_duration_samples: u64) -> f32 {
-    if times.is_empty() || total_duration_samples == 0 {
-        return 1.0;
+/// 0.05 = a 5%-of-recording silent stretch. `NaN` without a recording span.
+pub fn longest_silent_gap_frac(times: &[SampleIndex], span: impl Into<SessionSpan>) -> f32 {
+    let span = span.into();
+    let total_duration_samples = span.duration_samples();
+    if total_duration_samples == 0 {
+        return f32::NAN;
     }
-    let total = total_duration_samples;
-    let first = times[0].0;
-    let last = times.last().unwrap().0;
-    let mut max_gap = first.max(total.saturating_sub(last));
-    for w in times.windows(2) {
-        let g = w[1].0.saturating_sub(w[0].0);
-        if g > max_gap {
-            max_gap = g;
-        }
+    let mut previous = 0;
+    let mut max_gap = 0;
+    for (_, offset) in span.recorded_offsets(times) {
+        max_gap = max_gap.max(offset.saturating_sub(previous));
+        previous = offset;
     }
-    (max_gap as f64 / total as f64).clamp(0.0, 1.0) as f32
+    max_gap = max_gap.max(total_duration_samples.saturating_sub(previous));
+    (max_gap as f64 / total_duration_samples as f64).clamp(0.0, 1.0) as f32
 }
 
 #[cfg(test)]
@@ -193,8 +234,9 @@ mod tests {
 
     #[test]
     fn drift_correlation_handles_short_inputs() {
-        assert_eq!(amplitude_drift_correlation(&[], &[]), 0.0);
-        assert_eq!(amplitude_drift_correlation(&si([1, 2]), &[3.0, 4.0]), 0.0);
+        assert!(amplitude_drift_correlation(&[], &[]).is_nan());
+        assert!(amplitude_drift_correlation(&si([1, 2]), &[3.0, 4.0]).is_nan());
+        assert!(amplitude_drift_correlation(&si([1, 2, 3, 4]), &[3.0, 4.0, 5.0]).is_nan());
     }
 
     #[test]
@@ -231,6 +273,22 @@ mod tests {
         // All spikes packed into 1 bin out of 10.
         let times = si(0..100);
         assert!(presence_cv(&times, 1000, 10) > 1.0);
+    }
+
+    #[test]
+    fn short_trace_presence_cv_preserves_requested_bins() {
+        assert_eq!(presence_cv(&si([1]), 10, 50), 7.0);
+    }
+
+    #[test]
+    fn presence_cv_uses_only_bins_with_exposure() {
+        let span = SessionSpan::contiguous(
+            SampleIndex(100),
+            SampleIndex(110),
+            SpanSource::Declared("/intervals/epochs"),
+        );
+        assert_eq!(presence_cv(&si([101]), span.clone(), 50), 3.0);
+        assert_eq!(presence_cv(&si(100..110), span, 50), 0.0);
     }
 
     #[test]
@@ -288,7 +346,7 @@ mod tests {
         let times = vec![SampleIndex(100); 10];
         let amps = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0];
         let r = amplitude_drift_correlation(&times, &amps);
-        assert!(r.is_finite() && r.abs() < 1e-3);
+        assert!(r.is_nan());
     }
 
     #[test]
@@ -310,16 +368,16 @@ mod tests {
 
     #[test]
     fn drift_slope_handles_short_inputs() {
-        assert_eq!(amplitude_drift_slope(&[], &[], 1000.0), 0.0);
-        assert_eq!(amplitude_drift_slope(&si([100]), &[1.0], 1000.0), 0.0);
+        assert!(amplitude_drift_slope(&[], &[], 1000.0).is_nan());
+        assert!(amplitude_drift_slope(&si([100]), &[1.0], 1000.0).is_nan());
     }
 
     #[test]
     fn drift_slope_handles_zero_or_negative_sample_rate() {
         let times = si(0..10);
         let amps: Vec<f32> = (0..10).map(|i| i as f32).collect();
-        assert_eq!(amplitude_drift_slope(&times, &amps, 0.0), 0.0);
-        assert_eq!(amplitude_drift_slope(&times, &amps, -1.0), 0.0);
+        assert!(amplitude_drift_slope(&times, &amps, 0.0).is_nan());
+        assert!(amplitude_drift_slope(&times, &amps, -1.0).is_nan());
     }
 
     #[test]
@@ -331,16 +389,16 @@ mod tests {
     }
 
     #[test]
-    fn presence_cv_zero_inputs_return_finite() {
-        assert!(presence_cv(&[], 1000, 10).is_finite());
-        assert!(presence_cv(&si([1, 2, 3]), 0, 10).is_finite());
-        assert!(presence_cv(&si([1, 2, 3]), 1000, 0).is_finite());
+    fn presence_cv_is_missing_without_counts_or_bins() {
+        assert!(presence_cv(&[], 1000, 10).is_nan());
+        assert!(presence_cv(&si([1, 2, 3]), 0, 10).is_nan());
+        assert!(presence_cv(&si([1, 2, 3]), 1000, 0).is_nan());
     }
 
     #[test]
-    fn longest_silent_gap_zero_total_returns_finite() {
+    fn longest_silent_gap_is_missing_without_a_span() {
         let g = longest_silent_gap_frac(&si([100]), 0);
-        assert!(g.is_finite());
+        assert!(g.is_nan());
     }
 
     /// Property: longest gap is in [0, 1] for any valid input.

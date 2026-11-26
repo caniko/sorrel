@@ -104,9 +104,9 @@ pub(crate) fn density_candidates_with<P: DataProvider>(
     if !sr.is_finite() || sr <= 0.0 {
         return vec![];
     }
-    let duration = session.provider.n_samples().0;
+    let span = session.unit_span(c);
     let measure = |t: &[_]| {
-        let (cont, rp) = windows.sweep(t, duration, sr);
+        let (cont, rp) = windows.sweep(&span.metric_spikes(t), &span, sr);
         if rp > 0 {
             cont
         } else {

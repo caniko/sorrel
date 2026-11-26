@@ -98,6 +98,7 @@ struct AmpSet {
     channel: Option<u32>,
     range: (f32, f32),
     duration: f32,
+    start_s: f32,
     generation: u64,
 }
 
@@ -282,7 +283,7 @@ pub fn amplitude_view<P: DataProvider>(
     let data = axes_data_rect(plot, true);
     // 5% padding on both axes so no point sits on an edge.
     let d = set.duration.max(1e-3);
-    let x = (-0.05 * d, 1.05 * d);
+    let x = (set.start_s - 0.05 * d, set.start_s + 1.05 * d);
     let y = set.range;
     let (x, y) = state.pz.apply(x, y);
     draw_axes_grid(
@@ -309,7 +310,7 @@ pub fn amplitude_view<P: DataProvider>(
                 stable_epochs(
                     session.spike_times(cluster),
                     session.spike_amplitudes(cluster),
-                    session.provider.n_samples().0,
+                    session.unit_span(cluster),
                     session.provider.sample_rate(),
                 )
             });
@@ -734,7 +735,8 @@ fn compute<P: DataProvider>(s: &Session<P>, key: &AmpKey, cancel: &AtomicBool) -
             (0.0, 1.0)
         },
         points,
-        duration: s.provider.n_samples().0 as f32 / sr,
+        duration: s.provider.session_span().extent_samples() as f32 / sr,
+        start_s: s.provider.session_span().start.as_f32() / sr,
         generation: GENERATION.fetch_add(1, Ordering::Relaxed),
     }
 }
@@ -830,6 +832,7 @@ mod tests {
             channel: None,
             range: (0.0, 60.0),
             duration: 2.0,
+            start_s: 0.0,
             generation: 0,
         };
         let c = [ClusterId(4)];

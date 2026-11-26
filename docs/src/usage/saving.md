@@ -170,13 +170,51 @@ sorrel qc <DATA_DIR> --out out/qc/
 
 Loads the data, runs the full metrics pipeline (firing rate, presence,
 refractory contamination, amplitude stats, ISI violations, isolation
-distance where PC features are available, composite quality), writes
-both:
+distance where PC features are available, composite quality), and writes:
 
 - `out/qc/cluster_qc.tsv` — one row per cluster, header columns are
   metric names.
-- `out/qc/cluster_qc.json` — same data, JSON shape for programmatic
-  consumption.
+- `out/qc/cluster_qc.json` — the v1 top-level array, with the same row fields
+  as the TSV.
+- `out/qc/cluster_qc.provenance.json` — a separate object with `schema_version: 1`,
+  `session_span`, trace `provenance`, and `composite_terms` by cluster ID.
+
+The sidecar and `sorrel describe --json` share the same `session_span` object,
+which describes the session-wide union of recorded intervals.
+`kind` is `measured`, `declared`, `derived`, or `unavailable`; `source` describes
+the origin, and `interval_source` is the declared NWB path or `null`.
+`start_s` and `end_s` are the outer bounds on the spike sample grid (end
+exclusive); `extent_s` is the time between them. `recorded_s` and its alias
+`duration_s` exclude gaps; `gap_s` is the difference and `n_intervals` counts
+the merged intervals. Times are `null` when unavailable. `sorrel describe`
+keeps `duration` as a string in seconds and also shows the extent when there
+are gaps.
+
+A trace gives the span `[0, trace length)`. Without a trace, NWB uses valid
+Units observation intervals (their union for the session), then epochs, then
+trials. If none covers the spikes, Sorrel estimates the span from the first
+spike through one sample past the last spike.
+
+Firing rate, presence, and coverage use each unit's recorded intervals,
+or the session span when no separate unit intervals are declared. Without a
+usable span, these metrics are `null` in JSON and blank in TSV. If any unit's
+span differs from the session union, the sidecar lists every cluster's
+denominator in seconds under `unit_recorded_s` (`null` when unavailable).
+For units-only data, refractory contamination estimates also require
+observable positive lags within the tested window. `isi_violation_ratio`
+counts violations per second of that unit's own first-to-last spike span,
+not a fraction of spikes or a rate over the session. It is missing when
+that unit has no positive spike span.
+
+Amplitude metrics require per-spike amplitudes, even if raw traces or
+waveform templates are available. Unmeasured metrics are `null` in JSON
+and blank in TSV, not zero. `composite_quality` is the equal-weight
+geometric mean of the measured subscores, with a floor of 0.001 per
+measured term. Missing terms are excluded from both the numerator (the
+sum of log scores) and the term count; with no measured terms the score
+is missing. The sidecar's `composite_terms` map lists the terms used
+for each cluster ID: `isi` (refractory contamination), `presence`,
+`coverage`, `snr`, `completeness`, `stability`, and `isolation`.
 
 …and exits without spawning a window. The journal is replayed first, so
 the export reflects current curation.

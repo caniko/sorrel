@@ -1,8 +1,90 @@
 //! Statistical evidence from refractory-period violations.
 
-use sorrel_io::SampleIndex;
+use sorrel_io::{SampleIndex, SessionSpan, SpanSource};
 
 use crate::{linalg::ln_gamma, RefractoryParams};
+
+/// Exposure for refractory metrics. A sample count or trace span uses the
+/// legacy continuous-window models. Other spans use recorded sample pairs.
+/// Callers must pass sorted spike times already restricted to the exposure.
+#[derive(Clone, Copy)]
+pub struct RefractoryExposure<'a> {
+    pub(crate) samples: u64,
+    pub(crate) recorded: Option<&'a SessionSpan>,
+}
+
+impl From<u64> for RefractoryExposure<'_> {
+    fn from(samples: u64) -> Self {
+        Self {
+            samples,
+            recorded: None,
+        }
+    }
+}
+
+impl<'a> From<&'a SessionSpan> for RefractoryExposure<'a> {
+    fn from(span: &'a SessionSpan) -> Self {
+        Self {
+            samples: span.recorded_samples(),
+            recorded: (span.source != SpanSource::Trace).then_some(span),
+        }
+    }
+}
+
+impl RefractoryExposure<'_> {
+    pub(crate) fn recorded_ratio(self, span: &SessionSpan, edge: u64) -> f64 {
+        lag_pair_samples(span, self.samples, edge) as f64 / (self.samples as f64).powi(2)
+    }
+}
+
+/// Number of recorded sample pairs separated by a lag in `1..=max_lag`.
+pub fn positive_lag_exposure(span: &SessionSpan, max_lag: u64) -> u128 {
+    lag_pair_samples(span, span.recorded_samples(), max_lag.saturating_add(1))
+}
+
+/// Sum |I ∩ (I - lag)| over integer lags 1..edge. If R(k) counts recorded
+/// samples strictly before k, sum R(t + edge) over recorded t and subtract
+/// the D(D+1)/2 pairs at nonpositive lags (D is the recorded sample count).
+/// Prefix sums of R are piecewise triangular, so one monotone sweep counts
+/// both within-interval and cross-interval pairs in O(intervals) per window.
+fn lag_pair_samples(span: &SessionSpan, samples: u64, edge: u64) -> u128 {
+    if edge <= 1 || samples <= 1 {
+        return 0;
+    }
+    let triangle = |n: u128| n * n.saturating_sub(1) / 2;
+    let mut intervals = span.intervals().peekable();
+    let mut observed = 0_u128;
+    let mut past_end = u128::from(span.start.0);
+    let mut area = 0;
+    let mut prefix_area = |bound: u128| {
+        while let Some(&(lo, hi)) = intervals.peek() {
+            let hi = u128::from(hi.0);
+            let lo = u128::from(lo.0);
+            if hi > bound {
+                return area + observed * (bound - past_end) + triangle(bound.saturating_sub(lo));
+            }
+            area += observed * (hi - past_end) + triangle(hi - lo);
+            observed += hi - lo;
+            past_end = hi;
+            intervals.next();
+        }
+        area + observed * (bound - past_end)
+    };
+    let end = u128::from(span.end.0);
+    let edge = u128::from(edge);
+    let d = u128::from(samples);
+    let sum: u128 = span
+        .intervals()
+        .map(|(lo, hi)| {
+            let lo = u128::from(lo.0) + edge;
+            let hi = u128::from(hi.0) + edge;
+            let a = prefix_area(lo.min(end));
+            let b = prefix_area(hi.min(end));
+            b - a + d * (hi.saturating_sub(end) - lo.saturating_sub(end))
+        })
+        .sum();
+    sum - d * (d + 1) / 2
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct SlidingRp {
@@ -54,7 +136,7 @@ pub fn sliding_rp(
     sr: f32,
     params: &RefractoryParams,
 ) -> SlidingRp {
-    compute_evidence(times, total_samples, sr, sweep_edges(params, sr), 0).0
+    compute_evidence(times, total_samples.into(), sr, sweep_edges(params, sr), 0).0
 }
 
 /// Fixed-window contamination posterior with a uniform Beta(1,1) prior on
@@ -71,21 +153,28 @@ pub fn contamination_posterior(
     sr: f32,
     params: &RefractoryParams,
 ) -> ContaminationPosterior {
-    compute_evidence(times, total_samples, sr, Vec::new(), fixed_edge(params, sr)).1
+    compute_evidence(
+        times,
+        total_samples.into(),
+        sr,
+        Vec::new(),
+        fixed_edge(params, sr),
+    )
+    .1
 }
 
 /// Compute [`sliding_rp`] and [`contamination_posterior`] together with a
 /// single pass over the spike pairs. `times` must be sorted in ascending
 /// sample order; duplicate timestamps are allowed but zero lags do not count.
-pub fn refractory_evidence(
+pub fn refractory_evidence<'a>(
     times: &[SampleIndex],
-    total_samples: u64,
+    exposure: impl Into<RefractoryExposure<'a>>,
     sr: f32,
     params: &RefractoryParams,
 ) -> (SlidingRp, ContaminationPosterior) {
     compute_evidence(
         times,
-        total_samples,
+        exposure.into(),
         sr,
         sweep_edges(params, sr),
         fixed_edge(params, sr),
@@ -114,26 +203,34 @@ fn fixed_edge(params: &RefractoryParams, sr: f32) -> u64 {
 
 fn compute_evidence(
     times: &[SampleIndex],
-    total_samples: u64,
+    exposure: RefractoryExposure<'_>,
     sr: f32,
     edges: Vec<u64>,
     fixed: u64,
 ) -> (SlidingRp, ContaminationPosterior) {
+    let total_samples = exposure.samples;
     if times.len() < 2 || total_samples == 0 || !sr.is_finite() || sr <= 0.0 {
         return (NO_SRP, NO_POSTERIOR);
     }
     let n = times.len() as f64;
-    // A window as long as the recording holds every pair, so more width
-    // cannot add counts while Ve keeps growing: such windows are no evidence.
-    // Ve's 2·τ/D pair probability also exceeds 1 past half the recording.
-    let fits = |e: u64| e.saturating_mul(2) < total_samples;
-    let edges: Vec<u64> = edges.into_iter().filter(|&e| fits(e)).collect();
-    let fixed = if fits(fixed) { fixed } else { 0 };
-    // Exposure / duration. Integer lags 1..edge-1 see edge - 1 samples of
-    // continuous lag (uniform sub-sample phase), not edge: charging the full
-    // edge, as IBL does, understates contamination on coarse timestamps.
-    // The sample rate cancels.
-    let ratio = |edge: u64| (edge - 1) as f64 / total_samples as f64;
+    let ratio = |edge: u64| match exposure.recorded {
+        Some(span) => exposure.recorded_ratio(span, edge),
+        // The legacy approximation uses edge - 1 for positive lags. Beyond
+        // half the recording, its two-sided pair probability would exceed 1.
+        None if edge > 1 && edge.saturating_mul(2) < total_samples => {
+            (edge - 1) as f64 / total_samples as f64
+        }
+        None => 0.0,
+    };
+    let (edges, ratios): (Vec<_>, Vec<_>) = edges
+        .into_iter()
+        .filter_map(|edge| {
+            let r = ratio(edge);
+            (r > 0.0).then_some((edge, r))
+        })
+        .unzip();
+    let fixed_ratio = ratio(fixed);
+    let fixed = if fixed_ratio > 0.0 { fixed } else { 0 };
     let (counts, fixed_count) = violation_counts(times, &edges, fixed);
     let srp = if edges.is_empty() {
         NO_SRP
@@ -145,13 +242,8 @@ fn compute_evidence(
         let best_edge = |c| {
             edges
                 .iter()
-                .zip(&counts)
-                .map(|(&edge, &v)| {
-                    (
-                        edge,
-                        poisson_log_cdf(v, expected_violations(n, ratio(edge), c)),
-                    )
-                })
+                .zip(counts.iter().zip(&ratios))
+                .map(|(&edge, (&v, &r))| (edge, poisson_log_cdf(v, expected_violations(n, r, c))))
                 .filter(|&(_, log_cdf)| -log_cdf.exp_m1() > 0.9)
                 .min_by(|a, b| a.1.total_cmp(&b.1))
                 .map(|(edge, _)| edge)
@@ -172,7 +264,7 @@ fn compute_evidence(
             })
     };
     let posterior = if fixed > 0 {
-        posterior_from_count(fixed_count, n, ratio(fixed))
+        posterior_from_count(fixed_count, n, fixed_ratio)
     } else {
         NO_POSTERIOR
     };
@@ -371,6 +463,96 @@ mod tests {
     use super::*;
 
     const SR: f32 = 32768.0;
+
+    #[test]
+    fn interval_lag_exposure_matches_explicit_pairs() {
+        // Exhaust every arrangement of 8 recorded/unrecorded samples, including
+        // cross-gap pairs, with absolute sample coordinates near u64::MAX.
+        for mask in 0..256 {
+            let samples: Vec<_> = (0..8)
+                .filter(|i| mask & (1 << i) != 0)
+                .map(|i| u64::MAX - 8 + i)
+                .collect();
+            let span = SessionSpan::from_intervals(
+                samples
+                    .iter()
+                    .map(|&t| (t.into(), (t + 1).into()))
+                    .collect(),
+                SpanSource::Declared("/intervals/epochs"),
+            );
+            for edge in (0..=9).chain([u64::MAX]) {
+                let want: usize = samples
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &t)| samples[i + 1..].iter().filter(|&&u| u - t < edge).count())
+                    .sum();
+                assert_eq!(
+                    lag_pair_samples(&span, samples.len() as u64, edge),
+                    want as u128
+                );
+            }
+        }
+        let huge = SessionSpan::contiguous(0.into(), u64::MAX.into(), SpanSource::Unavailable);
+        assert_eq!(
+            lag_pair_samples(&huge, u64::MAX, 2),
+            u128::from(u64::MAX - 1)
+        );
+    }
+
+    #[test]
+    fn fragmented_recording_without_positive_lags_has_no_refractory_evidence() {
+        let times: Vec<_> = (0..3000).map(|i| SampleIndex(i * 100)).collect();
+        let span = SessionSpan::from_intervals(
+            times.iter().map(|&t| (t, SampleIndex(t.0 + 1))).collect(),
+            SpanSource::Declared("/intervals/epochs"),
+        );
+        let params = RefractoryParams::default();
+        let (srp, post) = refractory_evidence(&times, &span, 1000.0, &params);
+        assert!(!srp.tested && srp.min_contamination.is_nan() && srp.rp_ms.is_nan());
+        assert!(post.mean.is_nan() && post.lo95.is_nan() && post.hi95.is_nan());
+        assert_eq!(params.sweep(&times, &span, 1000.0), (0.0, 0));
+        assert!(crate::refractory_contamination(&times, 2, &span, 1000.0).is_nan());
+        let (legacy, post) = refractory_evidence(&times, 3000, 1000.0, &params);
+        assert_eq!(legacy.min_contamination, 0.005);
+        assert!(post.hi95 < 0.001);
+    }
+
+    #[test]
+    fn long_segments_use_observable_lags_without_charging_the_gap() {
+        let span = SessionSpan::from_intervals(
+            vec![(0.into(), 10_000.into()), (80_000.into(), 90_000.into())],
+            SpanSource::Declared("/intervals/epochs"),
+        );
+        let times: Vec<_> = [0, 80_000]
+            .into_iter()
+            .flat_map(|start| {
+                [start, start + 1]
+                    .into_iter()
+                    .chain((start + 20..start + 10_000).step_by(10))
+            })
+            .map(SampleIndex)
+            .collect();
+        let params = RefractoryParams::default();
+        let (srp, post) = refractory_evidence(&times, &span, 1000.0, &params);
+        assert_eq!((srp.min_contamination, srp.rp_ms), (0.005, 10.0));
+        let n = times.len() as f64;
+        let r = 2.0 * 9999.0 / 20_000_f64.powi(2);
+        let expected = posterior_from_count(2, n, r);
+        assert_eq!(post.violations, 2);
+        assert_eq!(
+            (post.mean, post.lo95, post.hi95),
+            (expected.mean, expected.lo95, expected.hi95)
+        );
+        assert_eq!(
+            crate::refractory_contamination(&times, 2, &span, 1000.0),
+            (1.0 / (r * n * n)) as f32
+        );
+        let r = 2.0 * (1..10).map(|lag| 10_000 - lag).sum::<u64>() as f64 / 20_000_f64.powi(2);
+        assert_eq!(
+            params.sweep(&times, &span, 1000.0),
+            ((1.0 / (r * n * n)) as f32, 10)
+        );
+    }
 
     fn train(duration: u64, rate: f64, inject: bool) -> Vec<SampleIndex> {
         let sr = f64::from(SR);

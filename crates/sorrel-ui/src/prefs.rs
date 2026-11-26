@@ -63,16 +63,37 @@ impl Default for RateParams {
 }
 
 impl RateParams {
-    /// The `:frmin`/`:frmax` range within a `total_s` recording, or all of
-    /// it when the range is empty.
-    pub fn x_range(&self, total_s: f32) -> (f32, f32) {
-        let lo = self.x_min.unwrap_or(0.0).clamp(0.0, total_s);
-        let hi = self.x_max.unwrap_or(total_s).clamp(0.0, total_s);
+    /// The `:frmin`/`:frmax` range within the session, or all of it when
+    /// the range is empty.
+    pub fn x_range(&self, (start, end): (f32, f32)) -> (f32, f32) {
+        let lo = self.x_min.unwrap_or(start).clamp(start, end);
+        let hi = self.x_max.unwrap_or(end).clamp(start, end);
         if hi > lo {
             (lo, hi)
         } else {
-            (0.0, total_s)
+            (start, end)
         }
+    }
+
+    /// As above, but returns seconds relative to the origin so a short
+    /// exposure at a large offset retains its width in plot coordinates.
+    pub(crate) fn relative_x_range(&self, origin: f64, duration: f32) -> (f32, f32) {
+        if origin == 0.0 {
+            return self.x_range((0.0, duration));
+        }
+        let relative = |t: f32| (f64::from(t) - origin) as f32;
+        Self {
+            x_min: self.x_min.map(relative),
+            x_max: self.x_max.map(relative),
+            ..self.clone()
+        }
+        .x_range((0.0, duration))
+    }
+
+    pub(crate) fn visible_x_range(&self, origin: f64, duration: f32) -> (f32, f32) {
+        self.pz
+            .apply(self.relative_x_range(origin, duration), (0.0, 1.0))
+            .0
     }
 }
 
@@ -289,11 +310,11 @@ mod tests {
     #[test]
     fn rate_x_range_clamps_and_falls_back_to_the_recording() {
         let mut p = RateParams::default();
-        assert_eq!(p.x_range(100.0), (0.0, 100.0));
+        assert_eq!(p.x_range((0.0, 100.0)), (0.0, 100.0));
         (p.x_min, p.x_max) = (Some(10.0), Some(500.0));
-        assert_eq!(p.x_range(100.0), (10.0, 100.0));
+        assert_eq!(p.x_range((0.0, 100.0)), (10.0, 100.0));
         p.x_max = Some(5.0);
-        assert_eq!(p.x_range(100.0), (0.0, 100.0));
+        assert_eq!(p.x_range((0.0, 100.0)), (0.0, 100.0));
     }
 
     #[test]

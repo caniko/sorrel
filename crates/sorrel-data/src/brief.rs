@@ -167,7 +167,7 @@ const EXTRA_FLAGS: [(&str, &str); 3] = [
     ("REV", "tagged review:* (waiting for a decision)"),
 ];
 
-/// Ledger shows units with a flag or composite quality below this.
+/// Ledger shows units with a flag, missing quality, or composite quality below this.
 const Q_CLEAN: f32 = 0.7;
 /// ACG lag edges (ms): whole ms (the ACG has 1 ms bins), finer near the
 /// refractory period; see the header for the reader's view.
@@ -340,7 +340,7 @@ fn header<P: DataProvider>(
     let mut h = format!(
         "# sorrel brief v1\nrec: {:.1} s, {} Hz, {} ch, {} live clusters\n\
          amp: template units (uV only if the input says so); a missing key is NaN\n",
-        session.provider.n_samples().0 as f32 / sr.max(1.0),
+        session.provider.session_span().duration_samples() as f32 / sr.max(1.0),
         sr,
         session.provider.n_channels(),
         units.len()
@@ -481,13 +481,15 @@ fn card<P: DataProvider>(
         )
     );
     let (times, amps) = (session.spike_times(c), session.spike_amplitudes(c));
-    let total = session.provider.n_samples().0.max(1);
+    let span = session.unit_span(c);
+    let total = span.duration_samples().max(1);
     let mut amp_t = "-".to_string();
     if amps.len() == times.len() && !times.is_empty() {
         let mut acc = [(0.0f32, 0u32); AMP_BINS];
-        for (t, &a) in times.iter().zip(amps) {
-            let b = ((t.0 as u128 * AMP_BINS as u128 / total as u128) as usize).min(AMP_BINS - 1);
-            acc[b] = (acc[b].0 + a, acc[b].1 + 1);
+        for (i, offset) in span.recorded_offsets(times) {
+            let b =
+                ((offset as u128 * AMP_BINS as u128 / total as u128) as usize).min(AMP_BINS - 1);
+            acc[b] = (acc[b].0 + amps[i], acc[b].1 + 1);
         }
         let mean = amps.iter().sum::<f32>() / amps.len() as f32;
         let series: Vec<f32> = acc

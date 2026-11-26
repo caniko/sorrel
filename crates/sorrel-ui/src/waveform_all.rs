@@ -1637,6 +1637,12 @@ mod tests {
             fn n_samples(&self) -> SampleIndex {
                 self.inner.n_samples()
             }
+            fn session_span(&self) -> sorrel_io::SessionSpan {
+                self.inner.session_span()
+            }
+            fn unit_span(&self, cluster: ClusterId) -> sorrel_io::SessionSpan {
+                self.inner.unit_span(cluster)
+            }
             fn n_clusters(&self) -> u32 {
                 self.inner.n_clusters()
             }
@@ -1708,6 +1714,12 @@ mod tests {
         }
         fn n_samples(&self) -> SampleIndex {
             self.inner.n_samples()
+        }
+        fn session_span(&self) -> sorrel_io::SessionSpan {
+            self.inner.session_span()
+        }
+        fn unit_span(&self, cluster: ClusterId) -> sorrel_io::SessionSpan {
+            self.inner.unit_span(cluster)
         }
         fn n_clusters(&self) -> u32 {
             self.inner.n_clusters()
@@ -1884,6 +1896,12 @@ mod tests {
             fn n_samples(&self) -> SampleIndex {
                 self.inner.n_samples()
             }
+            fn session_span(&self) -> sorrel_io::SessionSpan {
+                self.inner.session_span()
+            }
+            fn unit_span(&self, cluster: ClusterId) -> sorrel_io::SessionSpan {
+                self.inner.unit_span(cluster)
+            }
             fn n_clusters(&self) -> u32 {
                 1
             }
@@ -2038,6 +2056,12 @@ mod tests {
             }
             fn n_samples(&self) -> SampleIndex {
                 self.inner.n_samples()
+            }
+            fn session_span(&self) -> sorrel_io::SessionSpan {
+                self.inner.session_span()
+            }
+            fn unit_span(&self, cluster: ClusterId) -> sorrel_io::SessionSpan {
+                self.inner.unit_span(cluster)
             }
             fn n_clusters(&self) -> u32 {
                 1

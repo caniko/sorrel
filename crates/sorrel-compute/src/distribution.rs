@@ -144,10 +144,10 @@ pub fn bimodality_coefficient(values: &[f32]) -> f32 {
 /// indicate the two distributions don't come from the same population. The
 /// asymptotic two-sided p-value at level α is `D > c(α) sqrt((n+m)/(n m))`.
 ///
-/// Returns `0.0` if either input is empty.
+/// Returns `NaN` if either input is empty or contains non-finite values.
 pub fn ks_two_sample(a: &[f32], b: &[f32]) -> f32 {
-    if a.is_empty() || b.is_empty() {
-        return 0.0;
+    if a.is_empty() || b.is_empty() || a.iter().chain(b).any(|v| !v.is_finite()) {
+        return f32::NAN;
     }
     let mut a: Vec<f32> = a.to_vec();
     let mut b: Vec<f32> = b.to_vec();
@@ -223,14 +223,18 @@ pub fn ks_pvalue(d: f32, n: usize, m: usize) -> f32 {
 /// low-amplitude detection threshold can hide at most the unobserved half of
 /// the distribution — matching the Allen ecephys convention. Consumers
 /// (e.g. `quality::completeness_score`) rely on this 0.5 ceiling.
+/// Returns `NaN` with fewer than 8 samples or bins.
 pub fn amplitude_cutoff(amps: &[f32], n_bins: usize) -> f32 {
     let n = amps.len();
     if n < 8 || n_bins < 8 {
-        return 0.0;
+        return f32::NAN;
     }
     let mut lo = f32::INFINITY;
     let mut hi = f32::NEG_INFINITY;
     for &v in amps {
+        if !v.is_finite() {
+            return f32::NAN;
+        }
         if v < lo {
             lo = v;
         }
@@ -297,12 +301,12 @@ pub fn amplitude_cutoff(amps: &[f32], n_bins: usize) -> f32 {
 /// distribution-shape signal for over-merge / split detection where the
 /// bimodality coefficient's moment-based heuristic is too coarse.
 ///
-/// Returns 0 for fewer than 4 samples or when all values are equal. Sorts a
+/// Returns `NaN` for fewer than 4 samples, 0 when all values are equal. Sorts a
 /// local copy; the input is left untouched.
 pub fn hartigan_dip(values: &[f32]) -> f32 {
     let n = values.len();
-    if n < 4 {
-        return 0.0;
+    if n < 4 || values.iter().any(|v| !v.is_finite()) {
+        return f32::NAN;
     }
     let mut x: Vec<f64> = values.iter().map(|&v| v as f64).collect();
     x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -595,6 +599,13 @@ mod tests {
     }
 
     #[test]
+    fn amplitude_cutoff_is_missing_without_enough_samples() {
+        assert!(amplitude_cutoff(&[], 30).is_nan());
+        assert!(amplitude_cutoff(&[1.0; 7], 30).is_nan());
+        assert!(amplitude_cutoff(&[1.0; 8], 7).is_nan());
+    }
+
+    #[test]
     fn amplitude_cutoff_zero_for_symmetric_distribution() {
         // Symmetric Gaussian-like — no cutoff expected.
         let mut v: Vec<f32> = Vec::new();
@@ -752,10 +763,11 @@ mod tests {
     }
 
     #[test]
-    fn ks_two_sample_handles_empty_inputs() {
-        assert_eq!(ks_two_sample(&[], &[1.0]), 0.0);
-        assert_eq!(ks_two_sample(&[1.0], &[]), 0.0);
-        assert_eq!(ks_two_sample(&[], &[]), 0.0);
+    fn ks_two_sample_handles_missing_inputs() {
+        assert!(ks_two_sample(&[], &[1.0]).is_nan());
+        assert!(ks_two_sample(&[1.0], &[]).is_nan());
+        assert!(ks_two_sample(&[], &[]).is_nan());
+        assert!(ks_two_sample(&[1.0, f32::NAN], &[2.0]).is_nan());
     }
 
     #[test]
@@ -808,8 +820,8 @@ mod tests {
 
     #[test]
     fn hartigan_dip_small_or_constant_is_zero() {
-        assert_eq!(hartigan_dip(&[]), 0.0);
-        assert_eq!(hartigan_dip(&[1.0, 2.0, 3.0]), 0.0);
+        assert!(hartigan_dip(&[]).is_nan());
+        assert!(hartigan_dip(&[1.0, 2.0, 3.0]).is_nan());
         assert_eq!(hartigan_dip(&[5.0; 50]), 0.0);
     }
 

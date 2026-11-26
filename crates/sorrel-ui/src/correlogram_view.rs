@@ -7,9 +7,9 @@
 use std::sync::Arc;
 
 use egui::{Color32, Sense, Stroke, Ui};
-use sorrel_compute::{ccg_baseline, correlograms};
+use sorrel_compute::{ccg_baseline, correlograms, positive_lag_exposure};
 use sorrel_data::Session;
-use sorrel_io::{ClusterId, DataProvider, SampleIndex};
+use sorrel_io::{ClusterId, DataProvider, SampleIndex, SessionSpan, SpanSource};
 
 use crate::jobs::{JobCtx, Memo};
 use crate::prefs::CcgParams;
@@ -43,6 +43,9 @@ pub struct CcgData {
     coverage: f64,
     /// Seconds the used spikes come from: the baseline's duration.
     duration_s: f64,
+    /// Shared-window baselines, absent per cell when exposure is insufficient.
+    /// Traces use `duration_s` instead of this matrix.
+    baselines: Option<Vec<Vec<Option<f64>>>>,
 }
 
 type CcgKey = (Vec<ClusterId>, u64, f32, f32);
@@ -76,14 +79,44 @@ impl CcgCache {
                 // seconds at 100k spikes can hold the read lock for a while.
                 // Upgrade path: a cancel parameter in the pairing loop.
                 let sr = s.provider.sample_rate().max(1.0);
-                let n_samples = s.provider.n_samples().0;
+                let span = s.provider.session_span();
+                let n_samples = span.duration_samples();
                 let window = (window_ms as f64 / 1e3 * sr as f64).ceil() as u64;
-                let all: Vec<&[SampleIndex]> = cl.iter().map(|&c| s.spike_times(c)).collect();
-                let (chunks, trains) = sample_trains(&all, n_samples, MAX_SPIKES, window);
+                let unit_spans: Vec<_> = cl.iter().map(|&c| s.unit_span(c)).collect();
+                let all: Vec<_> = cl
+                    .iter()
+                    .zip(&unit_spans)
+                    .map(|(&c, span)| span.metric_spikes(s.spike_times(c)))
+                    .collect();
+                let all: Vec<_> = all.iter().map(|t| t.as_ref()).collect();
+                let (chunks, trains) = sample_trains(&all, span.clone(), MAX_SPIKES, window);
                 let refs: Vec<&[SampleIndex]> = trains.iter().map(Vec::as_slice).collect();
-                let covered = chunks
-                    .as_ref()
-                    .map_or(n_samples, |ch| ch.iter().map(|(a, b)| b - a).sum());
+                let covered = chunks.as_ref().map_or(n_samples, |ch| {
+                    ch.iter()
+                        .flat_map(|&(a, b)| {
+                            span.intervals()
+                                .map(move |(lo, hi)| b.min(hi.0).saturating_sub(a.max(lo.0)))
+                        })
+                        .sum()
+                });
+                let baselines = (span.source != SpanSource::Trace).then(|| {
+                    let unit_spans = if let Some(chunks) = &chunks {
+                        let kept = SessionSpan::from_intervals(
+                            chunks.iter().map(|&(a, b)| (a.into(), b.into())).collect(),
+                            span.source,
+                        );
+                        unit_spans.iter().map(|s| s.intersect(&kept)).collect()
+                    } else {
+                        unit_spans
+                    };
+                    interval_baselines(
+                        &unit_spans,
+                        &trains,
+                        bin_ms as f64 / 1e3,
+                        window_ms as f64 / 1e3,
+                        f64::from(sr),
+                    )
+                });
                 Arc::new(CcgData {
                     counts: correlograms(&refs, sr, bin_ms as f64 / 1e3, window_ms as f64 / 1e3),
                     n_used: trains.iter().map(Vec::len).collect(),
@@ -91,6 +124,7 @@ impl CcgCache {
                     bin_ms,
                     coverage: covered as f64 / n_samples.max(1) as f64,
                     duration_s: covered as f64 / sr as f64,
+                    baselines,
                 })
             })
             .cloned();
@@ -146,14 +180,23 @@ type Chunks = Vec<(u64, u64)>;
 /// than `max` spikes inside them the kept time shrinks by the overshoot.
 pub(crate) fn sample_trains(
     trains: &[&[SampleIndex]],
-    n_samples: u64,
+    span: impl Into<sorrel_io::SessionSpan>,
     max: usize,
     window_samples: u64,
 ) -> (Option<Chunks>, Vec<Vec<SampleIndex>>) {
+    let span = span.into();
     let total: usize = trains.iter().map(|t| t.len()).sum();
     let mut budget = max;
     loop {
-        let chunks = time_chunks(n_samples, total, budget, window_samples);
+        let chunks = time_chunks(span.duration_samples(), total, budget, window_samples).map(
+            |mut chunks| {
+                for (start, end) in &mut chunks {
+                    *start = span.sample_at_offset(*start).0;
+                    *end = span.sample_at_offset(*end - 1).0 + 1;
+                }
+                chunks
+            },
+        );
         // Count by binary search; copy only the accepted chunks.
         let n: usize = match chunks.as_deref() {
             None => total,
@@ -223,6 +266,57 @@ fn next_budget(budget: usize, max: usize, n: usize) -> usize {
 /// Spikes of an ascending train in `[a, b)`.
 fn count_in(times: &[SampleIndex], a: u64, b: u64) -> usize {
     times.partition_point(|t| t.0 < b) - times.partition_point(|t| t.0 < a)
+}
+
+/// Maximum sample lag counted by [`sorrel_compute::correlograms`].
+fn correlogram_max_lag(sr: f64, bin_s: f64, window_s: f64) -> u64 {
+    let (bin_s, window_s) = (bin_s.clamp(1e-5, 1e5), window_s.clamp(1e-5, 1e5));
+    let bin = ((sr * bin_s) as u64).max(1);
+    let half = (0.5 * window_s / bin_s) as usize;
+    (half as u64 + 1).saturating_mul(bin).saturating_sub(1)
+}
+
+fn interval_baselines(
+    spans: &[SessionSpan],
+    trains: &[Vec<SampleIndex>],
+    bin_s: f64,
+    window_s: f64,
+    sr: f64,
+) -> Vec<Vec<Option<f64>>> {
+    let max_lag = correlogram_max_lag(sr, bin_s, window_s);
+    // A single line is useful only if the mean overlap across the counted
+    // lag window is close to the zero-lag (recorded) exposure.
+    let flat_duration = |span: &SessionSpan| {
+        let samples = span.recorded_samples() as f64;
+        (samples > 0.0
+            && (max_lag == 0
+                || positive_lag_exposure(span, max_lag) as f64 >= 0.9 * samples * max_lag as f64))
+            .then_some(samples / sr)
+    };
+    let mut baselines = vec![vec![None; spans.len()]; spans.len()];
+    for (i, span) in spans.iter().enumerate() {
+        baselines[i][i] = flat_duration(span)
+            .map(|duration| ccg_baseline(trains[i].len(), trains[i].len(), bin_s, duration));
+        for j in i + 1..spans.len() {
+            // A flat near-zero-lag reference is only meaningful where both
+            // units were observed. Spikes outside the shared window cannot
+            // estimate either rate within it.
+            let shared = span.intersect(&spans[j]);
+            let Some(duration) = flat_duration(&shared) else {
+                continue;
+            };
+            let n = |k: usize| {
+                shared
+                    .intervals()
+                    .map(|(a, b)| count_in(&trains[k], a.0, b.0))
+                    .sum()
+            };
+            let baseline = Some(ccg_baseline(n(i), n(j), bin_s, duration));
+            baselines[i][j] = baseline;
+            baselines[j][i] = baseline;
+        }
+    }
+    baselines
 }
 
 /// The spikes of an ascending train that fall inside `chunks` (all of them
@@ -530,7 +624,10 @@ fn grid<P: DataProvider>(
 
             let h = &data.counts[ri][ci];
             let max_count = h.iter().copied().max().unwrap_or(0);
-            let baseline = ccg_baseline(data.n_used[ri], data.n_used[ci], bin_s, data.duration_s);
+            let baseline = data.baselines.as_ref().map_or_else(
+                || ccg_baseline(data.n_used[ri], data.n_used[ci], bin_s, data.duration_s),
+                |baselines| baselines[ri][ci].unwrap_or(0.0),
+            );
             let y_top = y_top(max_count, global_max, baseline, p.uniform);
             let colour = if ri >= n_real {
                 ghost_grey
@@ -696,6 +793,68 @@ mod tests {
 
     fn train(n: u64, step: u64) -> Vec<SampleIndex> {
         (0..n).map(|i| SampleIndex(i * step)).collect()
+    }
+
+    #[test]
+    fn interval_baselines_use_unit_and_shared_exposure() {
+        let source = sorrel_io::SpanSource::Declared("/units/obs_intervals");
+        let spans = [
+            sorrel_io::SessionSpan::contiguous(0.into(), 1000.into(), source),
+            sorrel_io::SessionSpan::contiguous(9000.into(), 10_000.into(), source),
+            sorrel_io::SessionSpan::contiguous(500.into(), 1500.into(), source),
+        ];
+        let trains = [
+            train(100, 10),
+            (9000..10_000).step_by(10).map(SampleIndex).collect(),
+            (500..1500).step_by(10).map(SampleIndex).collect(),
+        ];
+        let baselines = interval_baselines(&spans, &trains, 0.001, 0.050, 1000.0);
+        assert_eq!(baselines[0][0], Some(10.0));
+        assert_eq!(baselines[0][1], None);
+        assert_eq!(
+            baselines[0][2],
+            Some(5.0),
+            "only spikes in the shared 0.5 s"
+        );
+        assert_eq!(baselines[2][0], baselines[0][2]);
+    }
+
+    #[test]
+    fn acg_baseline_requires_nearly_flat_lag_exposure() {
+        let source = SpanSource::Declared("/units/obs_intervals");
+        let isolated = train(3000, 100);
+        let fragmented = SessionSpan::from_intervals(
+            isolated.iter().map(|&t| (t, (t.0 + 1).into())).collect(),
+            source,
+        );
+        let gapped = SessionSpan::from_intervals(
+            vec![(0.into(), 10_000.into()), (15_000.into(), 25_000.into())],
+            source,
+        );
+        let long_train = vec![100.into(), 15_100.into()];
+        let short = SessionSpan::contiguous(0.into(), 100.into(), source);
+        // Two well-separated 250-sample segments retain >=90% exposure across
+        // every plotted lag (1..=25 samples for 1 ms bins in a 50 ms window).
+        let boundary = SessionSpan::from_intervals(
+            vec![(0.into(), 250.into()), (1_000.into(), 1_250.into())],
+            source,
+        );
+        let boundary_train = vec![10.into(), 1_010.into()];
+        let baselines = interval_baselines(
+            &[fragmented, gapped, short, boundary],
+            &[isolated, long_train, train(10, 10), boundary_train],
+            0.001,
+            0.050,
+            1000.0,
+        );
+        assert_eq!(baselines[0][0], None);
+        assert_eq!(baselines[0][1], None, "fragmented shared exposure");
+        assert!(baselines[1][1].is_some_and(|baseline| baseline > 0.0));
+        assert_eq!(baselines[2][2], None, "short contiguous exposure");
+        assert!(
+            baselines[3][3].is_some_and(|baseline| baseline > 0.0),
+            "250-sample segments retain >=90% exposure across the plotted 1..=25 lags"
+        );
     }
 
     #[test]

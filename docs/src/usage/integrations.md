@@ -136,6 +136,7 @@ auto-detect — see [Backend detection](#backend-detection)).
 sorrel open my_session.nwb
 sorrel open my_session.nwb --nwb-series ElectricalSeriesRaw
 sorrel open my_session.nwb --nwb-series /processing/ecephys/FilteredEphys/Processed
+sorrel describe my_session.nwb --nwb-series none --json
 sorrel open sorted_units.nwb --dat recording.nwb
 sorrel open sorted_units.nwb --sample-rate 30000  # if no resolution is recorded
 ```
@@ -155,10 +156,20 @@ What Sorrel reads:
   extension subtype declared in `/specifications`) under `/acquisition` and
   `/processing`, with 2-D `data` (time × channels) or 1-D `data` (one channel).
   Conflicting cached type definitions that affect series selection are refused.
-  By default it prefers 2-D series, then takes the first series by path
-  (acquisitions before processed series), and logs the available paths when there is
-  more than one. Linked series and linked datasets used by the reader are
-  refused; open the file or store that holds the data directly. `--nwb-series`
+  By default it selects only from `/acquisition`, preferring 2-D series and
+  breaking ties by path, and logs the available paths when there is more than one.
+  On an automatic single-file open, if the selected series and
+  `/units/electrodes` reference the same table but the series omits any of the
+  Units' electrodes, Sorrel opens without a trace. Pass `--nwb-series PATH`
+  to force that series.
+  A `/processing` series supplies a trace and clock only when explicitly selected
+  with `--nwb-series`. The reader follows same-file HDF5 soft links, with a
+  bounded hop count and cycle checks; literal `..` path components are not
+  supported. Discovery can recognize a soft-linked child as a series but
+  does not recurse into it. HDF5 external links, links that
+  reach through them, external raw storage, virtual datasets, and Zarr
+  `zarr_link` nodes are refused; open the file or store that holds the data
+  directly. `--nwb-series`
   takes an acquisition name or an absolute path in the NWB file, not a
   filesystem path. Use a separate `--journal` when
   curating against another series or a different paired recording. To reuse
@@ -178,7 +189,8 @@ What Sorrel reads:
   Timestamps must strictly increase and stay within 0.001 samples of the
   inferred grid, plus four floating-point steps at the largest absolute
   timestamp (converted to samples) to allow for rounding at large clock origins.
-  Irregular timestamps are refused.
+  Irregular timestamps are refused; when Sorrel detects a large gap, it reports
+  the adjacent sample indices and the size of the jump.
   NWB trials used as events are shifted by the same start time; CSV/NPY event
   times are already relative to the recording.
 - **Sample types.** int8, uint8, int16, uint16, int32, uint32, int64, float32
@@ -191,14 +203,41 @@ What Sorrel reads:
   and are not used as probe geometry; without `rel_x`/`rel_y` the session
   has no channel positions.
 
-**Units without a trace.** Without an ElectricalSeries, Sorrel takes the
+**Units without a trace.** Without a selected ElectricalSeries, Sorrel takes the
 rate from `1 / spike_times.resolution`. If that resolution is unspecified
-and no raw NWB is paired, supply the rate with `--sample-rate HZ` instead.
+and no raw NWB is paired, you must supply `--sample-rate HZ` as an analysis grid.
 Spike times are relative to zero
 (`timestamps_reference_time`).
 The electrodes table supplies channels if present, but there is no raw trace
-or waveform extraction. With `--dat recording.nwb`, the raw file supplies
-the trace, channels and time base; `--nwb-series` selects from that file.
+or waveform extraction. Session span comes from unit observation intervals,
+epochs, or trials (in that order), or is estimated from the spike extent;
+it is never a trace duration.
+
+Sorrel refuses a selected series with an invalid time base, including gaps or
+backward steps in its timestamps. Pass `--nwb-series none` to open the units
+without that trace. The same option works with `open`, `describe`, `qc`,
+`report`, `call`, and `mcp`.
+Do not combine it with `--dat`; select a series literally named `none` with
+`--nwb-series /acquisition/none`. Use a separate `--journal` when switching
+between units-only and trace-backed opens of the same recording.
+
+`describe` shows why the series was skipped. Its JSON output and
+`cluster_qc.provenance.json` include `provenance.mode: "units-only"` and
+`provenance.skipped_series` for explicit skips. The latter records the
+default acquisition series path (`series`), `status`, and `message`. Sorrel
+checks shape and type and probes timestamps without scanning them end to end.
+It does not read trace samples or the skipped series' electrodes region.
+`regular (probe)` only means the sampled timestamps fit; an unprobed gap can
+still be present. `not fully checked` means the probe hit the eight-chunk I/O
+budget, was otherwise inconclusive, or had no per-sample timestamps.
+A `refused` result names the failing `check`;
+when the probe locates a jump it also reports `sample`, `next_sample`, `jump_s`
+(signed seconds), and `t_s` (the two timestamps in seconds). If there is no
+acquisition series, the status says so. For trace-backed QC exports, the mode
+is `"trace"`.
+
+Without the opt-in, `--dat recording.nwb` lets the raw file supply
+the trace, channels and time base; use `--nwb-series` if that file has only processed series.
 If a Units rate is declared, it must be within one part per million of the
 raw series rate. The same exact clock choice and spike-index check apply.
 Spike indices must fit

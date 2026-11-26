@@ -5,7 +5,7 @@
 use sorrel_io::kilosort::PhyLabel;
 use sorrel_io::{
     ChannelId, ClusterId, DataProvider, HasGeometry, HasQualityMetrics, NwbOpenParams, NwbProvider,
-    SampleIndex,
+    SampleIndex, SessionSpan, SpanSource,
 };
 use std::path::PathBuf;
 
@@ -50,6 +50,372 @@ impl Format {
             Err(e) => format!("{e:#}"),
         }
     }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn opt_in_units_only_records_gaps_and_backward_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gapped.nwb");
+    let series = "/acquisition/ElectricalSeriesRaw";
+    let n = 100_001;
+    let next = 73_259;
+    std::fs::copy(fixture("timestamps.nwb"), &path).unwrap();
+    for (offset, check, reason) in [
+        (25.0, "timestamp grid", "they jump by 25.001000 s"),
+        (-0.029, "timestamp order", "they step back by 0.028000 s"),
+    ] {
+        let times: Vec<_> = (0..n)
+            .map(|i| i as f64 / 1000.0 + if i >= next { offset } else { 0.0 })
+            .collect();
+        {
+            let f = hdf5_metno::File::open_rw(&path).unwrap();
+            let g = f.group(series).unwrap();
+            g.unlink("data").unwrap();
+            g.new_dataset::<i16>().shape((n, 4)).create("data").unwrap();
+            g.unlink("timestamps").unwrap();
+            g.new_dataset_builder()
+                .with_data(&times)
+                .create("timestamps")
+                .unwrap();
+            let spikes = f.dataset("/units/spike_times").unwrap();
+            if spikes
+                .attr_names()
+                .unwrap()
+                .iter()
+                .any(|name| name == "resolution")
+            {
+                spikes.delete_attr("resolution").unwrap();
+            }
+            spikes
+                .new_attr::<f64>()
+                .create("resolution")
+                .unwrap()
+                .write_scalar(&0.001)
+                .unwrap();
+        }
+        let err = format!(
+            "{:#}",
+            NwbProvider::open(&path).err().expect("default must refuse")
+        );
+        assert!(
+            err.contains("invalid time base") && err.contains(reason),
+            "{err}"
+        );
+        assert!(err.contains("between samples 73258 and 73259"), "{err}");
+        assert!(
+            err.contains("--nwb-series none") && err.contains("--sample-rate HZ"),
+            "{err}"
+        );
+        let p = NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                series: Some("none"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(p.exact_sample_rate().unwrap(), 1000.0);
+        assert_eq!(p.spike_times(ClusterId(0))[0], SampleIndex(600));
+        assert_eq!(p.n_samples(), SampleIndex(0));
+        assert!(p.read_trace(SampleIndex(0), 10).unwrap().samples.is_empty());
+        assert_ne!(p.session_span().source, SpanSource::Trace);
+        assert!(p.session_span().duration_samples() > 0);
+        let provenance = p.trace_provenance();
+        let skipped = &provenance["skipped_series"];
+        assert_eq!(skipped["series"], series);
+        assert_eq!(skipped["status"], "refused");
+        assert_eq!(skipped["check"], check);
+        assert_eq!(skipped["sample"], next - 1);
+        assert_eq!(skipped["next_sample"], next);
+        assert!((skipped["jump_s"].as_f64().unwrap() - (offset + 0.001)).abs() < 1e-12);
+        assert_eq!(skipped["t_s"], serde_json::json!(times[next - 1..=next]));
+        let explicit = NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                series: Some(series),
+                ..Default::default()
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(!format!("{explicit:#}").contains("--nwb-series none"));
+        assert_eq!(skipped["message"], format!("{explicit:#}"));
+    }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn opt_in_units_only_does_not_scan_timestamps_or_load_trace() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sorting.nwb");
+    std::fs::copy(fixture("timestamps.nwb"), &path).unwrap();
+    let series = "/acquisition/ElectricalSeriesRaw";
+    {
+        let f = hdf5_metno::File::open_rw(&path).unwrap();
+        let g = f.group(series).unwrap();
+        let timestamps = g.dataset("timestamps").unwrap();
+        let mut times: Vec<_> = (0..timestamps.size()).map(|i| i as f64 / 1000.0).collect();
+        // 197 is between the probe's five-sample strides.
+        times[197] += 0.0005;
+        timestamps.write(&times).unwrap();
+        g.dataset("electrodes")
+            .unwrap()
+            .write(&[0_i64, 1, 2, 99])
+            .unwrap();
+        let data = g.dataset("data").unwrap();
+        data.delete_attr("conversion").unwrap();
+        data.new_attr::<i64>()
+            .shape(2)
+            .create("conversion")
+            .unwrap();
+    }
+    let err = format!("{:#}", NwbProvider::open(&path).err().unwrap());
+    assert!(
+        err.contains("invalid time base") && err.contains("max deviation") && err.contains("197"),
+        "{err}"
+    );
+    assert!(
+        err.contains("--nwb-series none") && err.contains("--sample-rate HZ"),
+        "{err}"
+    );
+    let p = NwbProvider::open_with(
+        &path,
+        NwbOpenParams {
+            series: Some("none"),
+            sample_rate: Some(1000.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(p.n_samples(), SampleIndex(0));
+    assert_eq!(p.spike_times(ClusterId(0))[0], SampleIndex(600));
+    let provenance = p.trace_provenance();
+    assert_eq!(provenance["skipped_series"]["series"], series);
+    assert_eq!(provenance["skipped_series"]["status"], "regular (probe)");
+    assert!(provenance["skipped_series"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("full scan was skipped"));
+}
+
+#[cfg(feature = "hdf5")]
+fn object_ref_attr(dataset: &hdf5_metno::Dataset, name: &std::ffi::CStr, target: &std::ffi::CStr) {
+    use hdf5_metno_sys::{
+        h5a::{H5Aclose, H5Acreate2, H5Awrite},
+        h5p::H5P_DEFAULT,
+        h5r::{hobj_ref_t, H5R_type_t::H5R_OBJECT1, H5Rcreate},
+        h5s::{H5S_class_t::H5S_SCALAR, H5Sclose, H5Screate},
+        h5t::H5T_STD_REF_OBJ,
+    };
+    hdf5_metno::sync::sync(|| {
+        // SAFETY: live dataset ID, NUL-terminated names and one scalar reference.
+        unsafe {
+            let mut reference: hobj_ref_t = 0;
+            let reference = (&mut reference as *mut hobj_ref_t).cast();
+            assert!(H5Rcreate(reference, dataset.id(), target.as_ptr(), H5R_OBJECT1, -1) >= 0);
+            let space = H5Screate(H5S_SCALAR);
+            assert!(space >= 0);
+            let attr = H5Acreate2(
+                dataset.id(),
+                name.as_ptr(),
+                *H5T_STD_REF_OBJ,
+                space,
+                H5P_DEFAULT,
+                H5P_DEFAULT,
+            );
+            assert!(attr >= 0);
+            assert!(H5Awrite(attr, *H5T_STD_REF_OBJ, reference) >= 0);
+            assert!(H5Aclose(attr) >= 0);
+            assert!(H5Sclose(space) >= 0);
+        }
+    });
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn auto_series_requires_units_electrode_coverage_in_the_same_table() {
+    let table_ref = |region: &hdf5_metno::Dataset, table: &std::ffi::CStr| {
+        object_ref_attr(region, c"table", table);
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sorting.nwb");
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    let series = "/acquisition/ElectricalSeriesEEG";
+    let table = c"/general/extracellular_ephys/electrodes";
+    {
+        let f = hdf5_metno::File::open_rw(&path).unwrap();
+        f.relink("/acquisition/ElectricalSeriesRaw", series)
+            .unwrap();
+        let g = f.group(series).unwrap();
+        g.unlink("data").unwrap();
+        g.new_dataset::<i16>()
+            .shape((300, 2))
+            .create("data")
+            .unwrap();
+        g.unlink("channel_conversion").unwrap();
+        g.unlink("electrodes").unwrap();
+        let region = g
+            .new_dataset_builder()
+            .with_data(&[0_i64, 1])
+            .create("electrodes")
+            .unwrap();
+        table_ref(&region, table);
+        let units = f.group("/units").unwrap();
+        let ids = units.dataset("id").unwrap();
+        let ends: Vec<_> = (1..=ids.size()).map(|i| i.min(2) as i64).collect();
+        units
+            .new_dataset_builder()
+            .with_data(&ends)
+            .create("electrodes_index")
+            .unwrap();
+        let region = units
+            .new_dataset_builder()
+            .with_data(&[0_i64, 1])
+            .create("electrodes")
+            .unwrap();
+        table_ref(&region, table);
+        let spikes = units.dataset("spike_times").unwrap();
+        spikes
+            .new_attr::<f64>()
+            .create("resolution")
+            .unwrap()
+            .write_scalar(&0.001)
+            .unwrap();
+    }
+    let forced = || {
+        NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                series: Some(series),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let covered = NwbProvider::open(&path).unwrap();
+    assert_eq!(covered.n_samples(), SampleIndex(300));
+    assert_eq!(covered.identity_bytes(), forced().identity_bytes());
+    drop(covered);
+    {
+        let f = hdf5_metno::File::open_rw(&path).unwrap();
+        f.dataset("/units/electrodes")
+            .unwrap()
+            .write(&[2_i64, 3])
+            .unwrap();
+    }
+    let p = NwbProvider::open(&path).unwrap();
+    assert_eq!(p.n_samples(), SampleIndex(0));
+    assert_eq!(p.exact_sample_rate().unwrap(), 1000.0);
+    assert_eq!(p.spike_times(ClusterId(0))[0], SampleIndex(600));
+    drop(p);
+    assert_eq!(forced().n_samples(), SampleIndex(300));
+    {
+        let f = hdf5_metno::File::open_rw(&path).unwrap();
+        f.dataset("/units/spike_times")
+            .unwrap()
+            .delete_attr("resolution")
+            .unwrap();
+    }
+    let err = NwbProvider::open(&path).err().unwrap().to_string();
+    for expected in [
+        series,
+        "does not record the Units' electrodes",
+        "--sample-rate HZ",
+        "--nwb-series PATH",
+    ] {
+        assert!(err.contains(expected), "{err}");
+    }
+    let p = NwbProvider::open_with(
+        &path,
+        NwbOpenParams {
+            sample_rate: Some(2000.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(p.n_samples(), SampleIndex(0));
+    assert_eq!(p.exact_sample_rate().unwrap(), 2000.0);
+    drop(p);
+    {
+        let f = hdf5_metno::File::open_rw(&path).unwrap();
+        let other = f.create_group("/other_electrodes").unwrap();
+        other.new_dataset::<i64>().shape(6).create("id").unwrap();
+        let region = f.dataset("/units/electrodes").unwrap();
+        region.delete_attr("table").unwrap();
+        table_ref(&region, c"/other_electrodes");
+    }
+    assert_eq!(
+        NwbProvider::open(&path).unwrap().n_samples(),
+        SampleIndex(300)
+    );
+}
+
+#[test]
+fn opt_in_units_only_preserves_identity_when_no_series_and_changes_it_when_skipping() {
+    let skip = NwbOpenParams {
+        series: Some("none"),
+        ..Default::default()
+    };
+    for format in FORMATS {
+        for (file, equal) in [("units_only.nwb", true), ("multiple_series.nwb", false)] {
+            let path = format.fixture(file);
+            let normal = NwbProvider::open(&path).unwrap();
+            let units = NwbProvider::open_with(&path, skip).unwrap();
+            assert_eq!(
+                normal.identity_bytes() == units.identity_bytes(),
+                equal,
+                "{file}"
+            );
+            let skipped = &units.trace_provenance()["skipped_series"];
+            if equal {
+                assert_eq!(skipped["status"], "no acquisition series");
+            } else {
+                assert_eq!(skipped["series"], "/acquisition/A_first");
+                assert_eq!(skipped["status"], "not fully checked");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn opt_in_units_only_keeps_a_series_named_none_selectable_by_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sorting.nwb");
+    std::fs::copy(fixture("multiple_series.nwb"), &path).unwrap();
+    hdf5_metno::File::open_rw(&path)
+        .unwrap()
+        .relink("/acquisition/A_first", "/acquisition/none")
+        .unwrap();
+    let open = |series| {
+        NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                series: Some(series),
+                ..Default::default()
+            },
+        )
+    };
+    assert_eq!(open("none").unwrap().n_samples(), SampleIndex(0));
+    assert_eq!(
+        open("/acquisition/none").unwrap().n_samples(),
+        SampleIndex(300)
+    );
+    let err = NwbProvider::open_with(
+        &path,
+        NwbOpenParams {
+            series: Some("none"),
+            raw_path: Some(&path),
+            ..Default::default()
+        },
+    )
+    .err()
+    .unwrap();
+    assert!(
+        err.to_string().contains("cannot be combined with --dat"),
+        "{err}"
+    );
 }
 
 /// The first frame of the trace, as f32.
@@ -501,70 +867,269 @@ fn refuses_spikes_that_disagree_with_recorded_timestamps() {
 
 #[cfg(feature = "hdf5")]
 #[test]
+fn spike_mapping_accepts_same_file_soft_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recording.nwb");
+    for component in [
+        "/acquisition/ElectricalSeriesRaw/starting_time",
+        "/acquisition",
+    ] {
+        let original = fixture("good.nwb");
+        std::fs::copy(&original, &path).unwrap();
+        {
+            let file = hdf5_metno::File::open_rw(&path).unwrap();
+            file.relink(component, "/local_target").unwrap();
+            file.link_soft("/local_target", component).unwrap();
+        }
+        for paired in [false, true] {
+            let open = |raw: &std::path::Path| {
+                let units = if paired {
+                    fixture("units_only.nwb")
+                } else {
+                    raw.to_owned()
+                };
+                NwbProvider::open_with(
+                    units,
+                    NwbOpenParams {
+                        raw_path: paired.then_some(raw),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_or_else(|err| panic!("{component} (paired: {paired}): {err:#}"))
+            };
+            let (actual, expected) = (open(&path), open(&original));
+            assert_eq!(actual.sample_rate(), expected.sample_rate());
+            assert_eq!(actual.starting_time(), expected.starting_time());
+            assert_eq!(
+                actual.spike_times(ClusterId(0)),
+                expected.spike_times(ClusterId(0))
+            );
+            assert_eq!(frame(&actual, 7), frame(&expected, 7));
+        }
+    }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
 fn spike_mapping_datasets_must_be_stored_in_the_opened_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("recording.nwb");
     let clock = "/acquisition/ElectricalSeriesRaw/starting_time";
-    for (kind, component) in [
-        ("soft link", clock),
-        ("soft link", "/acquisition"),
-        ("external raw storage", clock),
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        let external = dir.path().join("clock.bin");
+        file.unlink(clock).unwrap();
+        let st = file
+            .new_dataset::<f64>()
+            .external(external.to_str().unwrap(), 0, 8)
+            .shape(())
+            .create(clock)
+            .unwrap();
+        assert_eq!(st.dcpl().unwrap().get_external().unwrap().len(), 1);
+        st.write_scalar(&0.5).unwrap();
+        st.new_attr::<f64>()
+            .create("rate")
+            .unwrap()
+            .write_scalar(&1000.0)
+            .unwrap();
+    }
+    for (units, raw_path) in [
+        (path.clone(), None),
+        (fixture("units_only.nwb"), Some(path.as_path())),
     ] {
-        std::fs::copy(fixture("good.nwb"), &path).unwrap();
+        let err = NwbProvider::open_with(
+            units,
+            NwbOpenParams {
+                raw_path,
+                ..Default::default()
+            },
+        )
+        .err()
+        .expect("external raw storage");
+        let err = format!("{err:#}");
+        assert!(
+            err.contains(clock) && err.contains("external raw storage") && err.contains("--dat"),
+            "{err}"
+        );
+    }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn soft_links_refuse_external_hops_cycles_and_dangling_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recording.nwb");
+    let source = fixture("good.nwb");
+    let clock = "/acquisition/ElectricalSeriesRaw/starting_time";
+    std::fs::copy(&source, &path).unwrap();
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.unlink(clock).unwrap();
+        file.link_external(
+            source.to_str().unwrap(),
+            "/acquisition/ElectricalSeriesRaw",
+            "/sidecar",
+        )
+        .unwrap();
+        file.link_soft(clock, "/loop").unwrap();
+    }
+    for (target, expected) in [
+        (
+            "/sidecar/starting_time",
+            "/sidecar is an HDF5 external link",
+        ),
+        (
+            "/loop",
+            "soft link cycle at /acquisition/ElectricalSeriesRaw/starting_time",
+        ),
+        (
+            "/acquisition/missing",
+            "dangling HDF5 soft link /acquisition/ElectricalSeriesRaw/starting_time",
+        ),
+    ] {
         {
             let file = hdf5_metno::File::open_rw(&path).unwrap();
-            if kind == "soft link" {
-                file.relink(component, "/local_target").unwrap();
-                file.link_soft("/local_target", component).unwrap();
-            } else {
-                let external = dir.path().join("clock.bin");
-                file.unlink(clock).unwrap();
-                let st = file
-                    .new_dataset::<f64>()
-                    .external(external.to_str().unwrap(), 0, 8)
-                    .shape(())
-                    .create(clock)
-                    .unwrap();
-                assert_eq!(st.dcpl().unwrap().get_external().unwrap().len(), 1);
-                st.write_scalar(&0.5).unwrap();
-                st.new_attr::<f64>()
-                    .create("rate")
-                    .unwrap()
-                    .write_scalar(&1000.0)
-                    .unwrap();
-            }
+            file.link_soft(target, clock).unwrap();
         }
-        // Exercise the same check for the units file and the --dat file.
-        for paired in [false, true] {
-            let (units, raw_path) = if paired {
-                (fixture("units_only.nwb"), Some(path.as_path()))
-            } else {
-                (path.clone(), None)
-            };
-            let err = NwbProvider::open_with(
-                units,
-                NwbOpenParams {
-                    raw_path,
-                    ..Default::default()
-                },
-            )
-            .err()
-            .unwrap_or_else(|| panic!("must reject {kind} at {component} (paired: {paired})"));
-            let err = format!("{err:#}");
-            if component == clock {
-                assert!(
-                    err.contains(clock) && err.contains(kind) && err.contains("--dat"),
-                    "{err}"
-                );
-            }
-            if kind == "soft link" {
-                assert!(
-                    err.contains(&format!("{component} is an HDF5 soft link")),
-                    "{err}"
-                );
-            }
-        }
+        let err = NwbProvider::open(&path).err().expect(target);
+        let err = format!("{err:#}");
+        assert!(err.contains(clock) && err.contains(expected), "{err}");
+        hdf5_metno::File::open_rw(&path)
+            .unwrap()
+            .unlink(clock)
+            .unwrap();
     }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn discovery_ignores_soft_linked_datasets_and_does_not_walk_group_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recording.nwb");
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.create_group("/processing/behavior/Source")
+            .unwrap()
+            .new_dataset_builder()
+            .with_data(&[0.0, 1.0])
+            .create("timestamps")
+            .unwrap();
+        file.create_group("/processing/behavior/Acceleration")
+            .unwrap()
+            .link_soft("/processing/behavior/Source/timestamps", "timestamps")
+            .unwrap();
+        file.link_soft("/acquisition", "/processing/alias").unwrap();
+        file.link_soft("/acquisition/ElectricalSeriesRaw", "/processing/RawAlias")
+            .unwrap();
+    }
+    assert_eq!(NwbProvider::open(&path).unwrap().n_channels(), 4);
+    let selected = |series| {
+        NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                series: Some(series),
+                ..Default::default()
+            },
+        )
+    };
+    let alias =
+        selected("/processing/alias/ElectricalSeriesRaw").unwrap_or_else(|err| panic!("{err:#}"));
+    assert_eq!(
+        frame(&alias, 7),
+        frame(&NwbProvider::open(&path).unwrap(), 7)
+    );
+    let err = selected("missing")
+        .err()
+        .expect("missing series")
+        .to_string();
+    assert!(
+        err.ends_with("available series: /acquisition/ElectricalSeriesRaw, /processing/RawAlias"),
+        "{err}"
+    );
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn discovery_walks_a_soft_linked_processing_root_but_not_nested_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recording.nwb");
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.create_group("/shared/ecephys").unwrap();
+        file.relink("/acquisition/ElectricalSeriesRaw", "/shared/ecephys/Raw")
+            .unwrap();
+        file.unlink("/processing").unwrap();
+        file.link_soft("/shared", "/processing").unwrap();
+        file.link_soft("/shared/ecephys", "/shared/alias").unwrap();
+    }
+    let err = NwbProvider::open_with(
+        &path,
+        NwbOpenParams {
+            series: Some("missing"),
+            ..Default::default()
+        },
+    )
+    .err()
+    .expect("missing series")
+    .to_string();
+    assert!(
+        err.ends_with("available series: /processing/ecephys/Raw"),
+        "{err}"
+    );
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn only_acquisition_series_can_be_a_soft_link_and_declares_its_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recording.nwb");
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.create_group("/shared").unwrap();
+        file.relink("/acquisition/ElectricalSeriesRaw", "/shared/Raw")
+            .unwrap();
+        file.link_soft("/shared/Raw", "/acquisition/Raw").unwrap();
+    }
+    let p = NwbProvider::open(&path).unwrap();
+    assert_eq!(p.sample_rate(), 1000.0);
+    assert_eq!(p.n_samples(), SampleIndex(300));
+    let err = NwbProvider::open_with(
+        &path,
+        NwbOpenParams {
+            sample_rate: Some(2000.0),
+            ..Default::default()
+        },
+    )
+    .err()
+    .expect("the aliased series declares a clock")
+    .to_string();
+    assert!(err.contains("not a clock this NWB declares"), "{err}");
+    assert!(
+        err.contains("series /acquisition/Raw starting_time.rate"),
+        "{err}"
+    );
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn electrodes_region_accepts_a_relative_soft_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recording.nwb");
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        let series = file.group("/acquisition/ElectricalSeriesRaw").unwrap();
+        series.relink("electrodes", "region").unwrap();
+        series.link_soft("./region", "electrodes").unwrap();
+    }
+    let p = NwbProvider::open(&path).unwrap_or_else(|err| panic!("{err:#}"));
+    let original = NwbProvider::open(fixture("good.nwb")).unwrap();
+    assert_eq!(p.channel_map(), original.channel_map());
+    assert_eq!(p.channel_positions(), original.channel_positions());
 }
 
 #[test]
@@ -616,6 +1181,16 @@ fn units_only_have_no_trace_and_use_resolution_or_sample_rate() {
         let p = format.open("units_only.nwb").unwrap();
         assert_eq!(p.sample_rate(), 1000.0);
         assert_eq!(p.n_samples(), SampleIndex(0));
+        assert_eq!(
+            p.session_span(),
+            SessionSpan::contiguous(
+                SampleIndex(550),
+                SampleIndex(791),
+                SpanSource::SpikeExtent {
+                    rejected: Some("/intervals/trials"),
+                },
+            )
+        );
         assert_eq!(p.channel_map(), (10..16).map(ChannelId).collect::<Vec<_>>());
         assert_eq!(p.channel_positions()[3], [16.0, 20.0]);
         assert_eq!(p.spike_times(ClusterId(0))[0], SampleIndex(600));
@@ -648,6 +1223,304 @@ fn units_only_have_no_trace_and_use_resolution_or_sample_rate() {
         let err = with_resolution(1000.00000001).err().unwrap();
         assert_eq!(err.to_string(), "--sample-rate 1000.00000001 Hz is not a clock this NWB declares; pass one of: 1000 Hz (/units/spike_times resolution)");
     }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn units_only_span_prefers_observations_then_epochs_then_trials() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("units.nwb");
+    std::fs::copy(fixture("units_only.nwb"), &path).unwrap();
+    let span = || NwbProvider::open(&path).unwrap().session_span();
+    let table = |file: &hdf5_metno::File, path: &str, starts: &[f64], stops: &[f64]| {
+        let group = file.create_group(path).unwrap();
+        group
+            .new_dataset_builder()
+            .with_data(starts)
+            .create("start_time")
+            .unwrap();
+        group
+            .new_dataset_builder()
+            .with_data(stops)
+            .create("stop_time")
+            .unwrap();
+    };
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.unlink("/intervals/trials").unwrap();
+    }
+    let estimate = SessionSpan::contiguous(
+        SampleIndex(550),
+        SampleIndex(791),
+        SpanSource::SpikeExtent { rejected: None },
+    );
+    assert_eq!(span(), estimate);
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        table(&file, "/intervals/trials", &[0.35], &[1.3]);
+    }
+    assert_eq!(
+        span(),
+        SessionSpan::contiguous(
+            SampleIndex(350),
+            SampleIndex(1300),
+            SpanSource::Declared("/intervals/trials"),
+        )
+    );
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        let obs = file
+            .new_dataset::<f64>()
+            .shape((4, 2))
+            .create("/units/obs_intervals")
+            .unwrap();
+        // The 0.75 s spike is before the stop, although both round to 750.
+        obs.write_raw(&[2.0, 2.05, 0.5, 0.7504, 0.49, 0.52, 0.4, 1.1])
+            .unwrap();
+        file.new_dataset_builder()
+            .with_data(&[3_u64, 3, 4])
+            .create("/units/obs_intervals_index")
+            .unwrap();
+        table(
+            &file,
+            "/intervals/epochs",
+            &[2.0, 0.45, 0.35, 3.0, 5.0],
+            &[3.0, 1.0, 0.9, 4.0, 5.0],
+        );
+    }
+    assert_eq!(
+        span(),
+        SessionSpan::from_intervals(
+            vec![(400.into(), 1100.into()), (2000.into(), 2050.into())],
+            SpanSource::Declared("/units/obs_intervals"),
+        )
+    );
+    let p = NwbProvider::open(&path).unwrap();
+    let unit = p.unit_span(ClusterId(0));
+    assert_eq!(unit.source, SpanSource::Declared("/units/obs_intervals"));
+    assert_eq!(
+        unit.intervals().collect::<Vec<_>>(),
+        [(490.into(), 751.into()), (2000.into(), 2050.into())],
+    );
+    assert_eq!(p.unit_span(ClusterId(1)).duration_samples(), 0);
+    assert_eq!(p.unit_span(ClusterId(2)).duration_samples(), 700);
+    drop(p);
+    for (target, string, expected) in [
+        (c"/units/spike_times", false, "/intervals/epochs"),
+        (c"/units/obs_intervals", false, "/units/obs_intervals"),
+        (c"/units/obs_alias", false, "/units/obs_intervals"),
+        (c"obs_alias", true, "/units/obs_intervals"),
+        (c"/units/missing", true, "/intervals/epochs"),
+    ] {
+        {
+            let file = hdf5_metno::File::open_rw(&path).unwrap();
+            file.link_hard("/units/obs_intervals", "/units/obs_alias")
+                .unwrap();
+            let index = file.dataset("/units/obs_intervals_index").unwrap();
+            if string {
+                use hdf5_metno::types::VarLenUnicode;
+                let path: VarLenUnicode = target.to_str().unwrap().parse().unwrap();
+                index
+                    .new_attr::<VarLenUnicode>()
+                    .create("target")
+                    .unwrap()
+                    .write_scalar(&path)
+                    .unwrap();
+            } else {
+                object_ref_attr(&index, c"target", target);
+            }
+        }
+        assert_eq!(span().source, SpanSource::Declared(expected));
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.unlink("/units/obs_alias").unwrap();
+        file.unlink("/units/obs_intervals_index").unwrap();
+        file.new_dataset_builder()
+            .with_data(&[3_u64, 3, 4])
+            .create("/units/obs_intervals_index")
+            .unwrap();
+    }
+    {
+        // A spike at the closed stop_time endpoint (0.75 s) is covered.
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.dataset("/units/obs_intervals")
+            .unwrap()
+            .write_raw(&[2.0, 2.05, 0.5, 0.75, 0.49, 0.52, 0.4, 1.1])
+            .unwrap();
+    }
+    let p = NwbProvider::open(&path).unwrap();
+    assert_eq!(
+        p.session_span().source,
+        SpanSource::Declared("/units/obs_intervals")
+    );
+    assert_eq!(
+        p.unit_span(ClusterId(0)).intervals().collect::<Vec<_>>(),
+        [(490.into(), 751.into()), (2000.into(), 2050.into())],
+    );
+    drop(p);
+    {
+        // A spike strictly past stop_time (0.75 s > 0.7499 s, even when both
+        // round to sample 750) is outside the interval and falls back to epochs.
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.dataset("/units/obs_intervals")
+            .unwrap()
+            .write_raw(&[2.0, 2.05, 0.5, 0.7499, 0.49, 0.52, 0.4, 1.1])
+            .unwrap();
+    }
+    assert_eq!(span().source, SpanSource::Declared("/intervals/epochs"));
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.dataset("/units/obs_intervals")
+            .unwrap()
+            .write_raw(&[2.0, 2.05, 0.5, 0.7504, 0.49, 0.52, 0.4, 1.1])
+            .unwrap();
+        // Unit 0 still has spikes in the session union, but not in its own
+        // (now empty) observation row. Reject observations for all units.
+        file.dataset("/units/obs_intervals_index")
+            .unwrap()
+            .write_raw(&[0_u64, 0, 4])
+            .unwrap();
+    }
+    let epoch_span = span();
+    assert_eq!(epoch_span.start, SampleIndex(350));
+    assert_eq!(epoch_span.end, SampleIndex(4000));
+    assert_eq!(epoch_span.source, SpanSource::Declared("/intervals/epochs"));
+    assert_eq!(epoch_span.duration_samples(), 2650);
+    assert_eq!(epoch_span.extent_samples(), 3650);
+    assert_eq!(epoch_span.n_intervals(), 2);
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        // Now epochs have a gap around the spikes despite covering their extent.
+        file.dataset("/intervals/epochs/stop_time")
+            .unwrap()
+            .write_raw(&[3.0, 0.49, 0.44, 4.0, 5.0])
+            .unwrap();
+    }
+    assert_eq!(span().source, SpanSource::Declared("/intervals/trials"));
+    let replace_index = |set_index: &dyn Fn(&hdf5_metno::File)| {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.unlink("/units/obs_intervals_index").unwrap();
+        set_index(&file);
+    };
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.unlink("/intervals/epochs").unwrap();
+    }
+    replace_index(&|file| {
+        file.new_dataset_builder()
+            .with_data(&[3_i64, 3, 4])
+            .create("/units/obs_intervals_index")
+            .unwrap();
+    });
+    assert_eq!(span().source, SpanSource::Declared("/units/obs_intervals"));
+    hdf5_metno::File::open_rw(&path)
+        .unwrap()
+        .dataset("/units/obs_intervals_index")
+        .unwrap()
+        .write_raw(&[-1_i64, 0, 4])
+        .unwrap();
+    assert_eq!(span().source, SpanSource::Declared("/intervals/trials"));
+    hdf5_metno::File::open_rw(&path)
+        .unwrap()
+        .unlink("/intervals/trials")
+        .unwrap();
+    assert_eq!(span(), estimate);
+    replace_index(&|file| {
+        file.new_dataset_builder()
+            .with_data(&[0.0_f64, 0.0, 4.0])
+            .create("/units/obs_intervals_index")
+            .unwrap();
+    });
+    assert_eq!(span(), estimate);
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn series_selection_processing_only_needs_an_explicit_clock() {
+    const LFP: &str = "/processing/ecephys/LFP/lfp";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lfp.nwb");
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.create_group("/processing/ecephys/LFP").unwrap();
+        file.relink("/acquisition/ElectricalSeriesRaw", LFP)
+            .unwrap();
+        file.dataset(&format!("{LFP}/starting_time"))
+            .unwrap()
+            .attr("rate")
+            .unwrap()
+            .write_scalar(&1250.0)
+            .unwrap();
+    }
+    let err = NwbProvider::open(&path).err().unwrap().to_string();
+    for text in [
+        "no /acquisition ElectricalSeries",
+        "no /units/spike_times resolution",
+        LFP,
+        "not a spike clock",
+        "--sample-rate HZ",
+        "--nwb-series",
+    ] {
+        assert!(err.contains(text), "{err}");
+    }
+    let open = |series, sample_rate| {
+        NwbProvider::open_with(
+            &path,
+            NwbOpenParams {
+                series,
+                sample_rate,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let units = open(None, Some(20_000.0));
+    assert_eq!(units.sample_rate(), 20_000.0);
+    assert_eq!(units.spike_times(ClusterId(0))[0], SampleIndex(12_000));
+    assert_eq!(units.n_samples(), SampleIndex(0));
+    assert!(frame(&units, 0).is_empty());
+    let lfp = open(Some(LFP), None);
+    assert_eq!(lfp.sample_rate(), 1250.0);
+    assert_eq!(lfp.spike_times(ClusterId(0))[0], SampleIndex(125));
+    assert_eq!(lfp.n_samples(), SampleIndex(300));
+
+    let err = NwbProvider::open_with(
+        &path,
+        NwbOpenParams {
+            raw_path: Some(&path),
+            ..Default::default()
+        },
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(err.contains("--nwb-series") && err.contains(LFP), "{err}");
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn series_selection_prefers_rank_one_acquisition_over_rank_two_processing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.nwb");
+    std::fs::copy(fixture("one_channel.nwb"), &path).unwrap();
+    {
+        use hdf5_metno::types::VarLenUnicode;
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        let lfp = file.create_group("/processing/ecephys/LFP/lfp").unwrap();
+        lfp.new_attr::<VarLenUnicode>()
+            .create("neurodata_type")
+            .unwrap()
+            .write_scalar(&"ElectricalSeries".parse::<VarLenUnicode>().unwrap())
+            .unwrap();
+        lfp.new_dataset::<i16>()
+            .shape((300, 2))
+            .create("data")
+            .unwrap();
+    }
+    let p = NwbProvider::open(&path).unwrap();
+    assert_eq!(p.sample_rate(), 1000.0);
+    assert_eq!(frame(&p, 297), [297.0]);
+    assert_eq!(p.spike_times(ClusterId(0))[0], SampleIndex(100));
 }
 
 #[cfg(feature = "hdf5")]
@@ -704,6 +1577,38 @@ fn later_series_never_inherits_a_linked_earlier_series_legacy_seal() {
         assert_eq!(seal.get(32..32 + SELECTED.len()), Some(SELECTED.as_bytes()));
         earlier.unlink("data").unwrap();
     }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn legacy_seal_is_declined_for_later_soft_linked_members_or_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recording.nwb");
+    std::fs::copy(fixture("good.nwb"), &path).unwrap();
+    const SELECTED: &str = "/acquisition/ElectricalSeriesRaw";
+    let seal = || NwbProvider::open(&path).unwrap().identity_bytes();
+    assert_eq!(seal().len(), 32);
+
+    let file = hdf5_metno::File::open_rw(&path).unwrap();
+    file.create_group("/shared/Other").unwrap();
+    file.link_soft("/shared/Other", "/acquisition/ZOther")
+        .unwrap();
+    file.flush().unwrap();
+    assert_eq!(
+        seal().get(32..32 + SELECTED.len()),
+        Some(SELECTED.as_bytes())
+    );
+
+    file.unlink("/acquisition/ZOther").unwrap();
+    let later = file.create_group("/acquisition/ZOther").unwrap();
+    later
+        .link_soft("/acquisition/ElectricalSeriesRaw/data", "data")
+        .unwrap();
+    file.flush().unwrap();
+    assert_eq!(
+        seal().get(32..32 + SELECTED.len()),
+        Some(SELECTED.as_bytes())
+    );
 }
 
 #[test]
@@ -848,6 +1753,75 @@ mod zarr_tests {
                 copy_store(&entry.path(), &target);
             } else {
                 fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn units_only_limits_gzip_timestamp_chunk_reads_even_when_localizing_a_jump() {
+        use serde_json::{json, Value};
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("chunked.nwb.zarr");
+        copy_store(&Format::Zarr.fixture("timestamps.nwb"), &store);
+        let series = store.join("acquisition/ElectricalSeriesRaw");
+        let times = series.join("timestamps");
+        let array = series.join("data/.zarray");
+        let mut data: Value = serde_json::from_slice(&fs::read(&array).unwrap()).unwrap();
+        data["shape"][0] = json!(512);
+        fs::write(array, data.to_string()).unwrap();
+        fs::write(
+            times.join(".zarray"),
+            json!({
+                "zarr_format": 2, "shape": [512], "chunks": [8], "dtype": "<f8",
+                "compressor": {"id": "gzip", "level": 1}, "fill_value": 0.0,
+                "filters": null, "order": "C",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for (next, gap, sampled_jump) in [
+            (0, 0.0, false),
+            (35 * 8 + 4, 1.0, false),
+            (36 * 8 + 4, 1.0, true),
+        ] {
+            for chunk in 0..64 {
+                let key = times.join(chunk.to_string());
+                // Unselected chunks must never be decoded, including during
+                // binary search. A read of any of them would refuse the probe.
+                if chunk % 9 != 0 {
+                    fs::write(key, b"not a gzip chunk").unwrap();
+                    continue;
+                }
+                let mut codec = flate2::write::GzEncoder::new(
+                    fs::File::create(key).unwrap(),
+                    flate2::Compression::fast(),
+                );
+                for i in chunk * 8..(chunk + 1) * 8 {
+                    let time = i as f64 / 1000.0 + if i >= next { gap } else { 0.0 };
+                    codec.write_all(&time.to_le_bytes()).unwrap();
+                }
+                codec.finish().unwrap();
+            }
+            let units = NwbProvider::open_with(
+                &store,
+                NwbOpenParams {
+                    series: Some("none"),
+                    sample_rate: Some(1000.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let provenance = units.trace_provenance();
+            let skipped = &provenance["skipped_series"];
+            if !sampled_jump {
+                assert_eq!(skipped["status"], "not fully checked", "{skipped}");
+                assert!(skipped["message"].as_str().unwrap().contains("8-chunk"));
+            } else {
+                assert_eq!(skipped["check"], "timestamp grid", "{skipped}");
+                assert_eq!(skipped["sample"], next - 1);
+                assert_eq!(skipped["next_sample"], next);
             }
         }
     }

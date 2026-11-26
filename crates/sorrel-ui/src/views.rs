@@ -11,7 +11,7 @@ use sorrel_data::{
     cluster_quality, preview_merge, DepthSource, MergeCandidate, Session, SpikeDepths,
     SplitCandidate, SuggestConfig,
 };
-use sorrel_io::{ClusterId, DataProvider, Events, SampleIndex};
+use sorrel_io::{ClusterId, DataProvider, Events, SampleIndex, SessionSpan, SpanSource};
 
 use crate::theme::{selection_colour, Theme};
 
@@ -177,6 +177,14 @@ pub(crate) fn num_cell(ui: &mut Ui, text: String, colour: Option<Color32>) {
         }
         ui.label(t);
     });
+}
+
+fn metric_text(value: f32, precision: usize) -> String {
+    if value.is_finite() {
+        format!("{value:.precision$}")
+    } else {
+        "—".into()
+    }
 }
 
 /// One-row parameter bar for plot panes: `primary` controls inline, the
@@ -450,6 +458,15 @@ pub(crate) fn step_hist(
     let y_of = |v: f32| data.bottom() - (v / y_top).clamp(0.0, 1.0) * data.height();
     let mut pts = Vec::with_capacity(vals.len() * 2);
     for (i, &v) in vals.iter().enumerate() {
+        if !v.is_finite() {
+            if !pts.is_empty() {
+                painter.add(egui::Shape::line(
+                    std::mem::take(&mut pts),
+                    Stroke::new(1.25_f32, colour),
+                ));
+            }
+            continue;
+        }
         let x0 = data.left() + bw * i as f32;
         let y = y_of(v);
         if v > 0.0 {
@@ -462,7 +479,9 @@ pub(crate) fn step_hist(
         pts.push(egui::pos2(x0, y));
         pts.push(egui::pos2(x0 + bw, y));
     }
-    painter.add(egui::Shape::line(pts, Stroke::new(1.25_f32, colour)));
+    if !pts.is_empty() {
+        painter.add(egui::Shape::line(pts, Stroke::new(1.25_f32, colour)));
+    }
 }
 
 /// Integer y ticks, about `target` of them, from 0 to `max`.
@@ -504,7 +523,6 @@ pub fn selection_summary<P, F>(
             let theme = Theme::from_ui(ui);
             ui.heading(format!("{n} clusters selected"));
             let sr = session.provider.sample_rate().max(1.0);
-            let total_samples = session.provider.n_samples().0;
             let refractory = session.refractory().fixed_samples(sr);
             egui::Grid::new("summary-grid")
                 .num_columns(6)
@@ -534,12 +552,16 @@ pub fn selection_summary<P, F>(
                             times,
                             amps,
                             refractory,
-                            total_samples,
+                            session.unit_span(c),
                             sr,
                             50,
                         )
                         .composite();
-                        num_cell(ui, format!("{q:.2}"), Some(theme.quality_colour(q)));
+                        num_cell(
+                            ui,
+                            metric_text(q, 2),
+                            q.is_finite().then(|| theme.quality_colour(q)),
+                        );
                         ui.end_row();
                     }
                 });
@@ -954,11 +976,12 @@ pub enum RasterClick {
 
 // ---- FiringRateView -----------------------------------------------------
 
-/// Spike counts of `bins` bins of `bin_s` seconds from `x0`. With an
-/// `only` time brush, spikes outside it are not counted.
+/// Spike counts of `bins` bins of `bin_s` seconds from `x0`, relative to
+/// `start`. With an `only` time brush, spikes outside it are not counted.
 fn rate_counts(
     times: &[SampleIndex],
     sr: f32,
+    start: SampleIndex,
     x0: f32,
     bin_s: f32,
     bins: usize,
@@ -966,16 +989,50 @@ fn rate_counts(
 ) -> Vec<u32> {
     let mut h = vec![0u32; bins];
     for &t in times {
-        let ts = t.0 as f64 / sr as f64;
-        if time.is_some_and(|b| b.only && !b.contains(ts as f32)) {
+        if time.is_some_and(|b| b.only && !b.contains((t.as_f64() / f64::from(sr)) as f32)) {
             continue;
         }
+        let Some(sample) = t.0.checked_sub(start.0) else {
+            continue;
+        };
+        let ts = sample as f64 / f64::from(sr);
         let u = (ts - x0 as f64) / bin_s as f64;
         if u >= 0.0 && (u as usize) < bins {
             h[u as usize] += 1;
         }
     }
     h
+}
+
+fn rate_bin_exposure(
+    span: &SessionSpan,
+    origin: SampleIndex,
+    sr: f32,
+    x0: f32,
+    bin_s: f32,
+    bins: usize,
+) -> impl Iterator<Item = f64> + '_ {
+    let sr = f64::from(sr);
+    let (x0, width) = (f64::from(x0), f64::from(bin_s));
+    let seconds = move |t: SampleIndex| (i128::from(t.0) - i128::from(origin.0)) as f64 / sr;
+    let mut visible = span
+        .intervals_skipping(move |end| seconds(end) <= x0)
+        .map(move |(a, b)| (seconds(a), seconds(b)))
+        .peekable();
+    (0..bins).map(move |i| {
+        let lo = x0 + i as f64 * width;
+        let hi = lo + width;
+        while visible.peek().is_some_and(|&(_, b)| b <= lo) {
+            visible.next();
+        }
+        // Retain the cursor at the first possible overlap for the next bin.
+        // Only intersecting intervals are visited: O(bins + visible intervals).
+        visible
+            .clone()
+            .take_while(|&(a, _)| a < hi)
+            .map(|(a, b)| (hi.min(b) - lo.max(a)).max(0.0))
+            .sum()
+    })
 }
 
 /// Per-cluster firing rate over the recording, plotted as overlaid line
@@ -994,12 +1051,12 @@ pub fn firing_rate_view<P: DataProvider>(
         return;
     }
     let sr = session.provider.sample_rate().max(1.0);
-    let total_samples = session.provider.n_samples().0;
-    if total_samples == 0 {
+    let span = session.provider.session_span();
+    let duration = span.extent_samples() as f32 / sr;
+    if duration <= 0.0 {
         ui.label("recording has zero length");
         return;
     }
-    let total_s = total_samples as f32 / sr;
 
     // phy FiringRateView: `n_bins` over the recording (`:frn`, default
     // 200), x in the chosen unit (v2.1).
@@ -1015,22 +1072,36 @@ pub fn firing_rate_view<P: DataProvider>(
     });
     // `n_bins` over the visible span: the `:frmin`/`:frmax` range, then pan/zoom.
     let bins = params.n_bins.clamp(2, 5000);
-    let ((x0, x1), _) = params.pz.apply(params.x_range(total_s), (0.0, 1.0));
+    let origin = span.start.as_f64() / f64::from(sr);
+    let (x0, x1) = params.visible_x_range(origin, duration);
     let bin_s = (x1 - x0) / bins as f32;
     let unit = params.unit;
 
     // Bin every selected cluster's spike train into the same axis.
-    let mut histograms: Vec<Vec<u32>> = Vec::with_capacity(selection.len());
-    let mut max_count = 1u32;
+    let mut histograms: Vec<Vec<f32>> = Vec::with_capacity(selection.len());
+    let mut max_rate = 1.0 / bin_s;
     for &c in selection {
-        let times = session.spike_times(c);
-        let h = rate_counts(times, sr, x0, bin_s, bins, brushes.time);
-        if let Some(&m) = h.iter().max() {
-            if m > max_count {
-                max_count = m;
-            }
-        }
-        histograms.push(h);
+        let unit_span = session.unit_span(c);
+        let times = unit_span.metric_spikes(session.spike_times(c));
+        let h = rate_counts(&times, sr, span.start, x0, bin_s, bins, brushes.time);
+        let rates: Vec<_> = if unit_span.source == SpanSource::Trace {
+            h.into_iter().map(|count| count as f32 / bin_s).collect()
+        } else {
+            h.into_iter()
+                .zip(rate_bin_exposure(
+                    &unit_span, span.start, sr, x0, bin_s, bins,
+                ))
+                .map(|(count, exposure)| {
+                    if exposure > 0.0 {
+                        count as f32 / exposure as f32
+                    } else {
+                        f32::NAN
+                    }
+                })
+                .collect()
+        };
+        max_rate = rates.iter().copied().fold(max_rate, f32::max);
+        histograms.push(rates);
     }
 
     let width = if bin_s >= 1.0 {
@@ -1057,29 +1128,40 @@ pub fn firing_rate_view<P: DataProvider>(
     let data = axes_data_rect(rect, true);
     // Only time pans and zooms; y always fits the visible bins.
     params.pz.interact(&resp, data);
-    crate::widgets::time_brush_gesture(&resp, brushes, data, (x0, x1), true);
+    let absolute_x = (
+        (origin + f64::from(x0)) as f32,
+        (origin + f64::from(x1)) as f32,
+    );
+    crate::widgets::time_brush_gesture(&resp, brushes, data, absolute_x, true);
 
     // 15% headroom above the tallest bin.
-    let y_top = max_count as f32 / bin_s * 1.15;
+    let y_top = max_rate * 1.15;
+    let x_label = if origin == 0.0 {
+        format!("time ({})", unit.label())
+    } else {
+        format!("time since {origin:.9} s ({})", unit.label())
+    };
     draw_axes_grid(
         &painter,
         rect,
         (x0 / unit.seconds(), x1 / unit.seconds()),
         (0.0, y_top),
-        &format!("time ({})", unit.label()),
+        &x_label,
         "Hz",
         &theme,
     );
     let dp = painter.with_clip_rect(data);
     let fill = if histograms.len() == 1 { 0.6 } else { 0.2 };
-    for (ci, hist) in histograms.iter().enumerate() {
-        let rates: Vec<f32> = hist.iter().map(|&c| c as f32 / bin_s).collect();
-        step_hist(&dp, data, &rates, y_top, selection_colour(ci), fill);
+    for (ci, rates) in histograms.iter().enumerate() {
+        step_hist(&dp, data, rates, y_top, selection_colour(ci), fill);
     }
     // Time brush: fade the bins outside the range (with `only` they were
     // never counted).
     if let Some(tb) = brushes.time.filter(|tb| !tb.only) {
-        let px = |t: f32| data.left() + (t - x0) / (x1 - x0).max(1e-9) * data.width();
+        let px = |t: f32| {
+            let relative = (f64::from(t) - origin) as f32;
+            data.left() + (relative - x0) / (x1 - x0).max(1e-9) * data.width()
+        };
         let (a, b) = (
             px(tb.start).clamp(data.left(), data.right()),
             px(tb.end).clamp(data.left(), data.right()),
@@ -1092,7 +1174,7 @@ pub fn firing_rate_view<P: DataProvider>(
             );
         }
     }
-    crate::widgets::time_overlays(ui, &dp, data, (x0, x1), brushes, sr);
+    crate::widgets::time_overlays(ui, &dp, data, absolute_x, brushes, sr);
 }
 
 // ---- ProbeView ----------------------------------------------------------
@@ -1325,19 +1407,47 @@ mod rate_tests {
     use sorrel_io::SampleIndex;
 
     #[test]
+    fn counts_first_spike_in_short_offset_spans() {
+        let params = crate::prefs::RateParams::default();
+        for (start, duration, sr) in [(100, 20, 1_000.0), (30_720_000, 1, 30_000.0)] {
+            let origin = start as f64 / f64::from(sr);
+            let (x0, x1) = params.relative_x_range(origin, duration as f32 / sr);
+            assert!(x1 > x0);
+            assert_eq!(
+                rate_counts(
+                    &[SampleIndex(start - 1), SampleIndex(start)],
+                    sr,
+                    SampleIndex(start),
+                    x0,
+                    (x1 - x0) / 2.0,
+                    2,
+                    None,
+                ),
+                [1, 0]
+            );
+        }
+    }
+
+    #[test]
     fn only_counts_in_range_spikes() {
         // 10 Hz sampling: spikes at 0.5 s, 1.5 s, 2.5 s; 3 bins of 1 s.
         let t = [5, 15, 25].map(SampleIndex);
-        let all = rate_counts(&t[..], 10.0, 0.0, 1.0, 3, None);
+        let all = rate_counts(&t[..], 10.0, SampleIndex(0), 0.0, 1.0, 3, None);
         assert_eq!(all, [1, 1, 1]);
         let tb = TimeBrush {
             start: 1.0,
             end: 2.0,
             only: true,
         };
-        assert_eq!(rate_counts(&t, 10.0, 0.0, 1.0, 3, Some(tb)), [0, 1, 0]);
+        assert_eq!(
+            rate_counts(&t, 10.0, SampleIndex(0), 0.0, 1.0, 3, Some(tb)),
+            [0, 1, 0]
+        );
         let fade = TimeBrush { only: false, ..tb };
-        assert_eq!(rate_counts(&t, 10.0, 0.0, 1.0, 3, Some(fade)), all);
+        assert_eq!(
+            rate_counts(&t, 10.0, SampleIndex(0), 0.0, 1.0, 3, Some(fade)),
+            all
+        );
     }
 }
 
@@ -1959,13 +2069,18 @@ pub(crate) fn render_merge_table(
                         num_cell(ui, format!("{:+.1}", m.ccg_dip_z), None);
                     });
                     row.col(|ui| {
-                        num_cell(ui, format!("{:.2}", m.amp_ks), None);
+                        num_cell(ui, metric_text(m.amp_ks, 2), None);
                     });
                     row.col(|ui| {
-                        num_cell(ui, format!("{:.2}", m.amp_mean_delta), None);
+                        num_cell(ui, metric_text(m.amp_mean_delta, 2), None);
                     });
                     row.col(|ui| {
-                        let txt = format!("{:+.2}", preview.composite_delta);
+                        let d = preview.composite_delta;
+                        let txt = if d.is_finite() {
+                            format!("{d:+.2}")
+                        } else {
+                            "—".into()
+                        };
                         let colour = if preview.composite_delta < -0.05 {
                             theme.danger
                         } else if preview.composite_delta > 0.02 {
@@ -1976,7 +2091,12 @@ pub(crate) fn render_merge_table(
                         num_cell(ui, txt, Some(colour));
                     });
                     row.col(|ui| {
-                        let txt = format!("{:+.3}", preview.contamination_delta);
+                        let d = preview.contamination_delta;
+                        let txt = if d.is_finite() {
+                            format!("{d:+.3}")
+                        } else {
+                            "—".into()
+                        };
                         let colour = if preview.contamination_delta > 0.05 {
                             theme.danger
                         } else {
@@ -2087,16 +2207,16 @@ where
                         num_cell(ui, format!("{:.2}", s.score), None);
                     });
                     row.col(|ui| {
-                        num_cell(ui, format!("{:.2}", s.amp_bimodality), None);
+                        num_cell(ui, metric_text(s.amp_bimodality, 2), None);
                     });
                     row.col(|ui| {
-                        num_cell(ui, format!("{:.3}", s.amp_dip), None);
+                        num_cell(ui, metric_text(s.amp_dip, 3), None);
                     });
                     row.col(|ui| {
-                        num_cell(ui, format!("{:.3}", s.contamination), None);
+                        num_cell(ui, metric_text(s.contamination, 3), None);
                     });
                     row.col(|ui| {
-                        num_cell(ui, format!("{:.2}", s.drift_corr), None);
+                        num_cell(ui, metric_text(s.drift_corr, 2), None);
                     });
                     row.col(|ui| {
                         if s.gmm_bic_delta.is_finite() {
@@ -2331,8 +2451,8 @@ pub fn quality_view<P: DataProvider>(
                     row.col(|ui| {
                         num_cell(
                             ui,
-                            format!("{composite:.2}"),
-                            Some(theme.quality_colour(composite)),
+                            metric_text(composite, 2),
+                            composite.is_finite().then(|| theme.quality_colour(composite)),
                         );
                     });
                     for (s, tip) in &subs {
@@ -2350,7 +2470,13 @@ pub fn quality_view<P: DataProvider>(
                 if let Some(sp) = split.as_ref().filter(|sp| sp.cluster == c) {
                     for (name, part) in [("inside", &sp.inside), ("outside", &sp.outside)] {
                         let (score, d) = (part.composite(), part.composite() - composite);
-                        let tone = if d >= 0.0 { theme.good } else { theme.danger };
+                        let tone = if !d.is_finite() {
+                            theme.caption
+                        } else if d >= 0.0 {
+                            theme.good
+                        } else {
+                            theme.danger
+                        };
                         let fill = |ui: &mut Ui| {
                             ui.painter()
                                 .rect_filled(ui.max_rect(), 0.0, tone.gamma_multiply(0.14));
@@ -2372,7 +2498,11 @@ pub fn quality_view<P: DataProvider>(
                             // next column's header is a sub-score).
                             row.col(|ui| {
                                 fill(ui);
-                                num_cell(ui, format!("{score:.2} ({d:+.2})"), Some(tone));
+                                let mut text = metric_text(score, 2);
+                                if d.is_finite() {
+                                    text = format!("{text} ({d:+.2})");
+                                }
+                                num_cell(ui, text, Some(tone));
                             });
                             for _ in 1..n_cols {
                                 row.col(fill);
@@ -2388,6 +2518,10 @@ pub fn quality_view<P: DataProvider>(
 /// A coloured, right-aligned sub-score with its raw metric on hover.
 pub(crate) fn score_cell(ui: &mut Ui, theme: &Theme, s: f32, bold: bool, tip: String) {
     right_aligned(ui, |ui| {
+        if !s.is_finite() {
+            ui.label("—").on_hover_text("not measured");
+            return;
+        }
         let mut t = egui::RichText::new(format!("{s:.2}"))
             .monospace()
             .color(theme.quality_colour(s));
@@ -2642,12 +2776,15 @@ pub fn contamination_over_time_view<P: DataProvider>(
         return;
     }
     let sr = session.provider.sample_rate().max(1.0);
-    let total_samples = session.provider.n_samples().0;
+    let span = session.provider.session_span();
+    let total_samples = span.duration_samples();
     if total_samples == 0 {
         ui.label("recording has zero length");
         return;
     }
     let total_s = total_samples as f32 / sr;
+    let extent_s = span.extent_samples() as f32 / sr;
+    let start_s = span.start.as_f32() / sr;
     let refractory_samples = session.refractory().fixed_samples(sr);
     const N_WINDOWS: usize = 60;
     const MIN_SPIKES_PER_WINDOW: usize = 20;
@@ -2660,7 +2797,7 @@ pub fn contamination_over_time_view<P: DataProvider>(
             let s = sliding_refractory_contamination(
                 times,
                 refractory_samples,
-                total_samples,
+                session.unit_span(c),
                 sr,
                 N_WINDOWS,
                 MIN_SPIKES_PER_WINDOW,
@@ -2695,13 +2832,17 @@ pub fn contamination_over_time_view<P: DataProvider>(
         return;
     }
     let all_zero = finite.iter().all(|&y| y <= 0.0);
+    let windows = if span.source == sorrel_io::SpanSource::Trace {
+        format!("{N_WINDOWS} windows × {:.1} s", total_s / N_WINDOWS as f32)
+    } else {
+        format!("up to {N_WINDOWS} recorded-time windows per unit")
+    };
     caption(
         ui,
         &theme,
         format!(
-            "refractory contamination · {N_WINDOWS} windows × {:.1} s · {}",
-            total_s / N_WINDOWS as f32,
-            legend(selection),
+            "refractory contamination · {windows} · {}",
+            legend(selection)
         ),
     );
     let (rect, _resp) = alloc_plot(ui, egui::vec2(160.0, 180.0), Sense::hover());
@@ -2713,7 +2854,7 @@ pub fn contamination_over_time_view<P: DataProvider>(
     draw_axes_grid(
         &painter,
         rect,
-        (0.0, total_s),
+        (start_s, span.end.as_f32() / sr),
         (y_lo, y_max),
         "time (s)",
         "contam",
@@ -2751,7 +2892,7 @@ pub fn contamination_over_time_view<P: DataProvider>(
                 prev = None;
                 continue;
             }
-            let x = data.left() + (t / total_s).clamp(0.0, 1.0) * data.width();
+            let x = data.left() + ((t - start_s) / extent_s).clamp(0.0, 1.0) * data.width();
             let p = egui::pos2(x, y_of(y.min(y_max)));
             if let Some(pp) = prev {
                 dp.line_segment([pp, p], stroke);
@@ -3029,6 +3170,36 @@ mod axis_tests {
     use super::{
         axes_data_rect, draw_axes, draw_axes_grid, nice_ticks, tick_label, Theme, X_STRIP, Y_GUTTER,
     };
+
+    #[test]
+    fn rate_bin_exposure_matches_direct_intersection() {
+        use sorrel_io::{SessionSpan, SpanSource};
+        let origin = 1_000_000_u64;
+        let span = SessionSpan::from_intervals(
+            [(0, 2), (4, 22), (23, 25), (26, 29), (30, 42), (100, 130)]
+                .map(|(lo, hi)| ((origin + lo).into(), (origin + hi).into()))
+                .to_vec(),
+            SpanSource::Declared("/intervals/epochs"),
+        );
+        for (x0, width, bins) in [(-0.1, 0.1, 20), (0.232, 0.056, 20), (1.01, 0.09, 4)] {
+            let got: Vec<_> =
+                super::rate_bin_exposure(&span, origin.into(), 100.0, x0, width, bins).collect();
+            let expected: Vec<f64> = (0..bins)
+                .map(|i| {
+                    let lo = f64::from(x0) + i as f64 * f64::from(width);
+                    let hi = lo + f64::from(width);
+                    span.intervals()
+                        .map(|(a, b)| {
+                            let a = (a.0 - origin) as f64 / 100.0;
+                            let b = (b.0 - origin) as f64 / 100.0;
+                            (hi.min(b) - lo.max(a)).max(0.0)
+                        })
+                        .sum()
+                })
+                .collect();
+            assert_eq!(got, expected);
+        }
+    }
 
     #[test]
     fn data_rect_reserves_the_gutters() {

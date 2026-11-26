@@ -311,16 +311,20 @@ fn noise_scale(points: &[(f64, f64)]) -> f64 {
 ///
 /// Returns empty with fewer than ten spikes (twice the minimum bin count),
 /// recording shorter than 20 s (200 ms bins), invalid duration/sample rate,
-/// or times outside `[0, total_samples)`.
+/// or out-of-range trace-backed spikes. For a declared span the fit uses
+/// equal recorded exposure per bin; epoch boundaries are on the original
+/// acquisition clock, so an epoch may cross a recording pause.
 /// Missing/invalid amplitudes, or fewer than 20 consecutive pairs of
 /// nonempty bins, reduce the fit to rates only. Observed amplitude means are
 /// still reported if the amplitude data are valid.
 pub fn stable_epochs(
     times: &[SampleIndex],
     amps: &[f32],
-    total_samples: u64,
+    span: impl Into<sorrel_io::SessionSpan>,
     sr: f32,
 ) -> Vec<Epoch> {
+    let span = span.into();
+    let total_samples = span.duration_samples();
     let duration = total_samples as f64 / f64::from(sr);
     if times.len() < MIN_SPIKES
         || u32::try_from(times.len()).is_err()
@@ -335,16 +339,21 @@ pub fn stable_epochs(
     let has_amp = amps.len() == times.len() && amps.iter().all(|a| a.is_finite());
     let mut counts = [0_u32; BINS];
     let mut sums = [0.0_f64; BINS];
-    for (i, &t) in times.iter().enumerate() {
-        if t.0 >= total_samples {
-            return Vec::new();
-        }
+    if span.source == sorrel_io::SpanSource::Trace
+        && times.iter().any(|&t| t < span.start || t >= span.end)
+    {
+        return Vec::new();
+    }
+    for (i, offset) in span.recorded_offsets(times) {
         // Exact edges, including for recordings not divisible by 100 samples.
-        let b = (u128::from(t.0) * BINS as u128 / u128::from(total_samples)) as usize;
+        let b = (u128::from(offset) * BINS as u128 / u128::from(total_samples)) as usize;
         counts[b] += 1;
         if has_amp {
             sums[b] += f64::from(amps[i]);
         }
+    }
+    if (counts.iter().sum::<u32>() as usize) < MIN_SPIKES {
+        return Vec::new();
     }
 
     let anscombe = counts.map(|c| 2.0 * (f64::from(c) + 0.375).sqrt());
@@ -477,8 +486,8 @@ pub fn stable_epochs(
             return Vec::new();
         }
         epochs.push(Epoch {
-            start_s: edge(start) as f64 / f64::from(sr),
-            end_s: edge(end) as f64 / f64::from(sr),
+            start_s: span.sample_at_offset(edge(start)).as_f64() / f64::from(sr),
+            end_s: (span.sample_at_offset(edge(end) - 1).0 + 1) as f64 / f64::from(sr),
             n,
             rate_hz,
             amp_mean: if has_amp && n > 0 {
@@ -500,6 +509,27 @@ mod tests {
 
     const SR: f32 = 1_000.0;
     const TOTAL: u64 = BINS as u64 * 1_000;
+
+    #[test]
+    fn stable_epochs_fit_recorded_exposure_but_return_acquisition_time() {
+        let span = sorrel_io::SessionSpan::from_intervals(
+            vec![
+                (1000.into(), 21_000.into()),
+                (500_000.into(), 520_000.into()),
+            ],
+            sorrel_io::SpanSource::Declared("/intervals/epochs"),
+        );
+        let times: Vec<_> = (0..40_000)
+            .step_by(200)
+            .map(|i| span.sample_at_offset(i))
+            .collect();
+        let epochs = stable_epochs(&times, &[], span, SR);
+        assert_eq!(epochs.len(), 1);
+        assert_eq!(epochs[0].start_s, 1.0);
+        assert_eq!(epochs[0].end_s, 520.0);
+        assert_eq!(epochs[0].rate_hz, 5.0);
+        assert_eq!(epochs[0].n, 200);
+    }
 
     /// SplitMix64, uniform in (0, 1). A plain LCG from small seeds gave
     /// visibly overdispersed spike trains.

@@ -138,7 +138,13 @@ pub fn scheme_colours(
         ColourScheme::Depth => ramp(depth),
         ColourScheme::FiringRate => ramp(
             &fr.iter()
-                .map(|&f| (f.max(1e-3)).log10())
+                .map(|&f| {
+                    if f.is_finite() {
+                        f.max(1e-3).log10()
+                    } else {
+                        f
+                    }
+                })
                 .collect::<Vec<_>>(),
         ),
     }
@@ -334,6 +340,14 @@ mod tests {
         );
         assert_eq!(ColourScheme::Neutral.step(-1), ColourScheme::FiringRate);
         assert_eq!(ColourScheme::parse("group"), Some(ColourScheme::Group));
+    }
+
+    #[test]
+    fn firing_rate_scheme_keeps_missing_exposure_neutral() {
+        assert_eq!(
+            scheme_colours(ColourScheme::FiringRate, &[], &[], &[f32::NAN, 0.0]),
+            [None, Some(viridis(0.5))]
+        );
     }
 
     #[test]

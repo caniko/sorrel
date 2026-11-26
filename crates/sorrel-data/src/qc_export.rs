@@ -1,15 +1,14 @@
 //! QC export — write every cluster's quality metrics to a tab-separated
 //! file (SpikeInterface-compatible columns) and/or to a JSON snapshot.
 //!
-//! Two output formats:
+//! Outputs:
 //! * `cluster_qc.tsv`: one row per cluster, headed by phy-style column
 //!   names. Compatible with `pandas.read_csv(..., sep='\t')` and
 //!   `spikeinterface.curation.read_qm_csv`.
-//! * `cluster_qc.json`: a list of objects with the same fields plus the
-//!   isolation breakdown when available. Easier to consume from notebooks
-//!   when the column count grows.
+//! * `cluster_qc.json`: an array of rows with the same fields as the TSV.
+//! * `cluster_qc.provenance.json`: versioned session span, trace provenance, and composite terms.
 //!
-//! Both run the rayon-parallel quality + isolation pipeline so even 1k+
+//! Both row formats use the same quality + isolation pipeline so even 1k+
 //! cluster sessions export in a few seconds.
 
 use crate::cache::correlograms::acg_or_compute;
@@ -18,7 +17,9 @@ use crate::refractory::RefractoryWindows;
 use crate::session::Session;
 use anyhow::{Context, Result};
 use sorrel_compute::epochs::{stable_epochs, Epoch};
+use sorrel_compute::QualityBreakdown;
 use sorrel_io::{ClusterId, DataProvider};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -33,6 +34,7 @@ pub struct QcRow {
     pub firing_rate_hz: f32,
     pub presence_ratio: f32,
     pub isi_violations: u32,
+    /// Violations per second of the unit's own first-to-last spike span.
     pub isi_violation_ratio: f32,
     pub amplitude_cutoff: f32,
     pub amplitude_snr: f32,
@@ -315,14 +317,21 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
     positions: Option<&[[f32; 2]]>,
     windows: RefractoryWindows<'_>,
 ) -> Vec<QcRow> {
+    collect_qc(session, positions, windows, |_, _| {})
+}
+
+fn collect_qc<P: DataProvider>(
+    session: &Session<P>,
+    positions: Option<&[[f32; 2]]>,
+    windows: RefractoryWindows<'_>,
+    mut record_terms: impl FnMut(ClusterId, &QualityBreakdown),
+) -> Vec<QcRow> {
     use sorrel_compute::{
         amplitude_drift_slope, burst_index, footprint, hartigan_dip, isi_violation_rate,
         isi_violations, mean_amplitude, peak_channel, refractory_evidence, waveform_landmarks,
     };
     let sample_rate = session.provider.sample_rate();
     let sr = sample_rate.max(1.0);
-    let total_samples = session.provider.n_samples();
-    let total_seconds = total_samples.as_f32() / sr;
     let refractory_samples = windows.fixed_samples(sr);
     let (_, tpl_samples, tpl_channels) = session.template_shape();
     // ACG at 1 ms bins / 50 ms, the report's (and cache's) window.
@@ -333,24 +342,15 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
     let mut rows = Vec::with_capacity(n as usize);
     for c in (0..n).map(ClusterId) {
         let times = session.spike_times(c);
+        let span = session.unit_span(c);
+        let total_seconds = span.duration_seconds(sample_rate);
+        let exposed = span.metric_spikes(times);
         let amps = session.spike_amplitudes(c);
         let q = cluster_quality_with(session, c, refractory_samples);
-        let mean_amp = if amps.is_empty() {
-            f32::NAN
-        } else {
-            mean_amplitude(amps)
-        };
-        let firing_rate = if total_seconds > 0.0 {
-            times.len() as f32 / total_seconds
-        } else {
-            0.0
-        };
-        let isi_v = isi_violations(times, refractory_samples) as u32;
-        let isi_ratio = if !times.is_empty() {
-            isi_violation_rate(times, refractory_samples, sr)
-        } else {
-            0.0
-        };
+        record_terms(c, &q);
+        let firing_rate = exposed.len() as f32 / total_seconds;
+        let isi_v = isi_violations(&exposed, refractory_samples) as u32;
+        let isi_ratio = isi_violation_rate(&exposed, refractory_samples, sr);
         let (iso2, l_ratio, nn, d_prime, silhouette) = match q.isolation {
             Some(iso) => (
                 iso.isolation_distance_sq,
@@ -374,12 +374,11 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
             .and_then(|(w, p)| footprint(w, tpl_samples, tpl_channels, p, sr));
         let nan = f32::NAN;
         // (0, 0) means there is no estimate.
-        let (rp_contam, rp) = windows.sweep(times, total_samples.0, sr);
+        let (rp_contam, rp) = windows.sweep(&exposed, &span, sr);
         let (srp_contamination, srp_rp_ms, rpv_post_mean, rpv_post_lo95, rpv_post_hi95) =
             match windows {
                 RefractoryWindows::Session(params) => {
-                    let (srp, post) =
-                        refractory_evidence(times, total_samples.0, sample_rate, params);
+                    let (srp, post) = refractory_evidence(&exposed, &span, sample_rate, params);
                     (
                         srp.min_contamination,
                         srp.rp_ms,
@@ -392,9 +391,7 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
                 RefractoryWindows::Learn => (nan, nan, nan, nan, nan),
             };
         let epochs = match windows {
-            RefractoryWindows::Session(_) => {
-                stable_epochs(times, amps, total_samples.0, sample_rate)
-            }
+            RefractoryWindows::Session(_) => stable_epochs(times, amps, span, sample_rate),
             RefractoryWindows::Learn => Vec::new(), // not a versioned model feature
         };
         let acg = acg_or_compute(session, c, acg_bin, acg_window);
@@ -408,7 +405,7 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
         rows.push(QcRow {
             cluster_id: c.0,
             n_spikes: times.len() as u32,
-            mean_amplitude: mean_amp,
+            mean_amplitude: mean_amplitude(amps),
             firing_rate_hz: firing_rate,
             presence_ratio: q.raw_presence_ratio,
             isi_violations: isi_v,
@@ -437,16 +434,8 @@ pub(crate) fn collect_qc_rows_with_windows<P: DataProvider>(
             burst_index: burst_index(&acg, acg_bin as f32 * 1000.0 / sr),
             rp_estimate_ms: if rp > 0 { rp as f32 * 1000.0 / sr } else { nan },
             rp_contamination: if rp > 0 { rp_contam } else { nan },
-            amplitude_dip: if dip_amps.len() >= 4 {
-                hartigan_dip(&dip_amps)
-            } else {
-                nan
-            },
-            drift_slope: if amps.len() >= 2 && amps.len() == times.len() {
-                amplitude_drift_slope(times, amps, sr)
-            } else {
-                nan
-            },
+            amplitude_dip: hartigan_dip(&dip_amps),
+            drift_slope: amplitude_drift_slope(times, amps, sr),
             srp_contamination,
             srp_rp_ms,
             rpv_post_mean,
@@ -504,7 +493,7 @@ pub fn write_qc_tsv<P: AsRef<Path>>(rows: &[QcRow], path: P) -> Result<()> {
 /// Write QC rows to a JSON file (`[{...}, {...}]`). Streaming so we don't
 /// build a giant in-memory string for large recordings.
 pub fn write_qc_json<P: AsRef<Path>>(rows: &[QcRow], path: P) -> Result<()> {
-    let f = File::create(path.as_ref()).context("creating QC JSON file")?;
+    let f = File::create(path).context("creating QC JSON file")?;
     let mut w = BufWriter::new(f);
     w.write_all(b"[")?;
     for (i, row) in rows.iter().enumerate() {
@@ -515,9 +504,8 @@ pub fn write_qc_json<P: AsRef<Path>>(rows: &[QcRow], path: P) -> Result<()> {
     Ok(())
 }
 
-/// Convenience: compute all rows and write both formats into `out_dir`
-/// under `cluster_qc.tsv` / `cluster_qc.json`. `positions` as for
-/// [`collect_qc_rows_with`].
+/// Write `cluster_qc.tsv`, `cluster_qc.json`, and `cluster_qc.provenance.json`.
+/// `positions` as for [`collect_qc_rows_with`].
 pub fn export_qc<P: DataProvider>(
     session: &Session<P>,
     out_dir: impl AsRef<Path>,
@@ -525,9 +513,55 @@ pub fn export_qc<P: DataProvider>(
 ) -> Result<usize> {
     let dir = out_dir.as_ref();
     std::fs::create_dir_all(dir).context("creating QC output dir")?;
-    let rows = collect_qc_rows_with(session, positions);
+    let mut terms = BTreeMap::new();
+    let rows = collect_qc(
+        session,
+        positions,
+        RefractoryWindows::Session(session.refractory()),
+        |c, q| {
+            terms.insert(
+                c.0,
+                q.composite_terms()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+            );
+        },
+    );
     write_qc_tsv(&rows, dir.join("cluster_qc.tsv"))?;
     write_qc_json(&rows, dir.join("cluster_qc.json"))?;
+    let p = &session.provider;
+    let span = p.session_span();
+    let rate = p
+        .exact_sample_rate()
+        .unwrap_or_else(|_| f64::from(p.sample_rate()));
+    let mut sidecar = serde_json::json!({
+        "schema_version": 1,
+        "session_span": span.to_json(rate),
+        "provenance": p.trace_provenance(),
+        "composite_terms": terms,
+    });
+    let unit_spans = || {
+        rows.iter()
+            .map(|row| (row.cluster_id, session.unit_span(ClusterId(row.cluster_id))))
+    };
+    if unit_spans().any(|(_, unit)| unit != span) {
+        let recorded_s = unit_spans()
+            .map(|(c, unit)| {
+                let samples = unit.recorded_samples();
+                let seconds =
+                    (samples > 0 && rate.is_finite() && rate > 0.0).then(|| samples as f64 / rate);
+                (c, seconds)
+            })
+            .collect::<BTreeMap<_, _>>();
+        sidecar["unit_recorded_s"] = serde_json::json!(recorded_s);
+    }
+    let mut w = BufWriter::new(
+        File::create(dir.join("cluster_qc.provenance.json"))
+            .context("creating QC provenance file")?,
+    );
+    serde_json::to_writer_pretty(&mut w, &sidecar)?;
+    writeln!(w)?;
+    w.flush()?;
     Ok(rows.len())
 }
 
@@ -536,7 +570,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::journal::Journal;
     use sorrel_io::{
-        ClusterId, DataProvider, HasAmplitudes, SampleIndex, TraceSamples, TraceSlice,
+        ClusterId, DataProvider, HasAmplitudes, SampleIndex, SessionSpan, SpanSource, TraceSamples,
+        TraceSlice,
     };
 
     /// Shared with `report::tests`.
@@ -587,6 +622,296 @@ pub(crate) mod tests {
         fn spike_amplitudes(&self, c: ClusterId) -> &[f32] {
             self.amps.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
         }
+    }
+
+    struct SpanProvider(MockProvider, SessionSpan, Vec<SessionSpan>);
+
+    impl DataProvider for SpanProvider {
+        type Label = u8;
+        fn sample_rate(&self) -> f32 {
+            self.0.sample_rate()
+        }
+        fn n_channels(&self) -> u32 {
+            self.0.n_channels()
+        }
+        fn n_samples(&self) -> SampleIndex {
+            self.0.n_samples()
+        }
+        fn session_span(&self) -> SessionSpan {
+            self.1.clone()
+        }
+        fn unit_span(&self, c: ClusterId) -> SessionSpan {
+            self.2.get(c.idx()).unwrap_or(&self.1).clone()
+        }
+        fn n_clusters(&self) -> u32 {
+            self.0.n_clusters()
+        }
+        fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
+            self.0.spike_times(c)
+        }
+        fn trace(&self, start: SampleIndex, len: u32) -> TraceSlice<'_> {
+            self.0.trace(start, len)
+        }
+        fn initial_labels(&self) -> Vec<u8> {
+            self.0.initial_labels()
+        }
+    }
+
+    impl crate::session::ApplyPhyLabel for SpanProvider {
+        fn label_from_op(_: crate::command::PhyLabelOp) -> u8 {
+            0
+        }
+    }
+
+    #[test]
+    fn qc_and_brief_use_offset_spike_span_without_amplitudes() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = |start: u64, trace_len| MockProvider {
+            spikes: vec![(0..100).map(|i| SampleIndex(start + i * 10)).collect()],
+            amps: vec![],
+            n_samples: SampleIndex(trace_len),
+        };
+        let journal = |name| Journal::open(&dir.path().join(name)).unwrap();
+        let trace = Session::new(provider(0, 1000), journal("trace"));
+        let units = Session::new(
+            SpanProvider(
+                provider(5000, 0),
+                SessionSpan::contiguous(
+                    SampleIndex(5000),
+                    SampleIndex(6000),
+                    SpanSource::SpikeExtent { rejected: None },
+                ),
+                Vec::new(),
+            ),
+            journal("units"),
+        );
+        let rows = collect_qc_rows(&units);
+        let row = rows[0].to_json();
+        let trace_row = collect_qc_rows(&trace)[0].to_json();
+        for (key, value) in row.as_object().unwrap() {
+            if matches!(key.as_str(), "rpv_post_mean" | "rpv_post_hi95") {
+                // The interval model counts 999 observable lag-one pairs,
+                // not the legacy trace approximation's 1000.
+                assert!(value.as_f64().unwrap() > trace_row[key].as_f64().unwrap());
+            } else {
+                assert_eq!(value, &trace_row[key], "{key}");
+            }
+        }
+        assert_eq!(row["firing_rate"], 100.0);
+        assert_eq!(row["presence_ratio"], 1.0);
+        for key in ["rp_estimate_ms", "srp_contamination", "rpv_post_mean"] {
+            assert!(!row[key].is_null(), "{key}");
+        }
+        export_qc(&units, dir.path(), None).unwrap();
+        let qc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("cluster_qc.json")).unwrap())
+                .unwrap();
+        assert!(qc.is_array());
+        let exported = &qc[0];
+        let sidecar: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("cluster_qc.provenance.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(sidecar.get("unit_recorded_s").is_none());
+        for key in [
+            "mean_amplitude",
+            "amplitude_snr",
+            "amplitude_cutoff",
+            "drift_correlation",
+            "amplitude_dip",
+            "drift_slope",
+            "epoch_amp_ratio",
+        ] {
+            assert!(exported.get(key).unwrap().is_null(), "{key}");
+        }
+        let flags =
+            crate::brief::metric_flags(|key| exported[key].as_f64().unwrap_or(f64::NAN) as f32);
+        assert!(!flags
+            .iter()
+            .any(|f| ["LOWSNR", "CUT", "DRF", "BIMOD"].contains(f)));
+        let brief = crate::brief::render_brief(
+            &units,
+            &rows,
+            &[],
+            &[],
+            &[],
+            |_| "unsorted",
+            dir.path(),
+            &crate::brief::BriefOpts::default(),
+        );
+        assert!(!brief
+            .lines()
+            .any(|line| line.starts_with("mode:") && line.contains("LOWSNR")));
+        let q = crate::quality_ext::cluster_quality(&units, ClusterId(0));
+        let terms: Vec<_> = q.composite_terms().map(|(name, _)| name).collect();
+        assert_eq!(terms, ["isi", "presence", "coverage"]);
+        assert_eq!(sidecar["composite_terms"]["0"], serde_json::json!(terms));
+        assert!(
+            (q.composite() - (q.contamination_score * q.presence_score * q.coverage_score).cbrt())
+                .abs()
+                < 1e-6
+        );
+        assert!(
+            (exported["composite_quality"].as_f64().unwrap() - f64::from(q.composite())).abs()
+                < 1e-6
+        );
+        assert_eq!(
+            sidecar["session_span"],
+            serde_json::json!({
+                "kind": "derived", "source": "estimate: spike extent", "interval_source": null,
+                "start_s": 5.0, "end_s": 6.0, "extent_s": 1.0, "recorded_s": 1.0,
+                "duration_s": 1.0, "gap_s": 0.0, "n_intervals": 1,
+            })
+        );
+    }
+
+    #[test]
+    fn qc_uses_each_units_recorded_observation_intervals() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = SpanSource::Declared("/units/obs_intervals");
+        let first = SessionSpan::from_intervals(
+            vec![(1000.into(), 1470.into()), (10000.into(), 10530.into())],
+            source,
+        );
+        let second = SessionSpan::contiguous(20000.into(), 20500.into(), source);
+        let session_span = first.union_with([&second]);
+        let spikes = (0..first.recorded_samples())
+            .step_by(10)
+            .map(|i| first.sample_at_offset(i))
+            .collect();
+        let mut session = Session::new(
+            SpanProvider(
+                MockProvider {
+                    spikes: vec![
+                        spikes,
+                        (20000..20500).step_by(10).map(SampleIndex).collect(),
+                    ],
+                    amps: vec![],
+                    n_samples: SampleIndex(0),
+                },
+                session_span.clone(),
+                vec![first.clone(), second],
+            ),
+            Journal::open(&dir.path().join("j")).unwrap(),
+        );
+        let rows = collect_qc_rows(&session);
+        for (c, (row, gap)) in rows.iter().zip([0.01_f32, 0.02]).enumerate() {
+            assert_eq!(row.firing_rate_hz, 100.0);
+            assert_eq!(row.presence_ratio, 1.0);
+            assert_eq!(row.longest_silent_gap, gap);
+            let q = crate::quality_ext::cluster_quality(&session, ClusterId(c as u32));
+            assert_eq!(q.coverage_score, 1.0 - gap);
+            assert!((row.composite_quality - (1.0 - gap).cbrt()).abs() < 1e-6);
+        }
+        export_qc(&session, dir.path(), None).unwrap();
+        let sidecar: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("cluster_qc.provenance.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sidecar["session_span"]["recorded_s"], 1.5);
+        assert_eq!(
+            sidecar["unit_recorded_s"],
+            serde_json::json!({"0": 1.0, "1": 0.5})
+        );
+        use crate::command::{CurationCommand, Method};
+        let target = ClusterId(0);
+        session
+            .dispatch(CurationCommand::Merge {
+                sources: vec![ClusterId(1)],
+                target,
+            })
+            .unwrap();
+        assert_eq!(session.unit_span(target), session_span);
+        session.dispatch(CurationCommand::Undo).unwrap();
+        assert_eq!(session.unit_span(target), first);
+        session
+            .dispatch(CurationCommand::Split {
+                cluster: target,
+                new_cluster: ClusterId(2),
+                spike_idx: vec![0],
+                by: Method::Manual,
+            })
+            .unwrap();
+        assert_eq!(session.unit_span(ClusterId(2)), first);
+    }
+
+    #[test]
+    fn qc_missing_span_leaves_rate_and_presence_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::new(
+            SpanProvider(
+                MockProvider {
+                    spikes: vec![vec![]],
+                    amps: vec![],
+                    n_samples: SampleIndex(0),
+                },
+                SessionSpan::contiguous(0.into(), 0.into(), SpanSource::Unavailable),
+                Vec::new(),
+            ),
+            Journal::open(&dir.path().join("j")).unwrap(),
+        );
+        let row = collect_qc_rows(&session)[0].to_json();
+        for key in [
+            "firing_rate",
+            "presence_ratio",
+            "longest_silent_gap",
+            "isi_violation_ratio",
+            "composite_quality",
+        ] {
+            assert!(row.get(key).unwrap().is_null(), "{key}");
+        }
+    }
+
+    #[test]
+    fn qc_with_amplitudes_preserves_the_six_term_composite() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new(
+            MockProvider {
+                spikes: vec![(0..100).map(|i| SampleIndex(i * 10)).collect()],
+                amps: vec![vec![3.0; 100]],
+                n_samples: SampleIndex(1000),
+            },
+            Journal::open(&dir.path().join("j")).unwrap(),
+        );
+        session.seed_amplitudes();
+        export_qc(&session, dir.path(), None).unwrap();
+        let qc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("cluster_qc.json")).unwrap())
+                .unwrap();
+        let row = &qc[0];
+        for (name, value) in [
+            ("mean_amplitude", 3.0),
+            ("amplitude_cutoff", 0.0),
+            ("amplitude_snr", 0.0),
+            ("drift_correlation", 0.0),
+            ("drift_slope", 0.0),
+        ] {
+            assert_eq!(row[name].as_f64(), Some(value), "{name}");
+        }
+        let expected = ((0.99_f32.ln() + 0.001_f32.ln()) / 6.0).exp();
+        assert_eq!(
+            row["composite_quality"],
+            serde_json::json!(num(expected).parse::<f64>().unwrap())
+        );
+        let q = crate::quality_ext::cluster_quality(&session, ClusterId(0));
+        let terms: Vec<_> = q.composite_terms().map(|(name, _)| name).collect();
+        assert_eq!(
+            terms,
+            [
+                "isi",
+                "presence",
+                "coverage",
+                "snr",
+                "completeness",
+                "stability"
+            ]
+        );
+        assert_eq!(q.composite().to_bits(), expected.to_bits());
+        let sidecar: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("cluster_qc.provenance.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sidecar["composite_terms"]["0"], serde_json::json!(terms));
     }
 
     #[test]
@@ -726,7 +1051,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn export_writes_both_formats_with_one_row_per_cluster() {
+    fn export_writes_v1_rows_and_separate_provenance() {
         let prov = MockProvider {
             spikes: vec![
                 vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
@@ -747,6 +1072,12 @@ pub(crate) mod tests {
         assert_eq!(n, 4);
 
         let tsv = std::fs::read_to_string(outdir.join("cluster_qc.tsv")).unwrap();
+        let rows = collect_qc_rows(&s);
+        let mut expected_tsv = QcRow::tsv_header().into_bytes();
+        for row in &rows {
+            row.write_tsv(&mut expected_tsv).unwrap();
+        }
+        assert_eq!(tsv.as_bytes(), expected_tsv);
         let lines: Vec<&str> = tsv.lines().collect();
         // 1 header + 4 rows.
         assert_eq!(lines.len(), 5);
@@ -754,8 +1085,23 @@ pub(crate) mod tests {
         assert!(lines[1].starts_with("0\t"));
 
         let json = std::fs::read_to_string(outdir.join("cluster_qc.json")).unwrap();
-        assert!(json.starts_with("["));
-        assert!(json.trim_end().ends_with("]"));
+        let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(rows.is_array());
+        let sidecar: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(outdir.join("cluster_qc.provenance.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sidecar["schema_version"], 1);
+        assert_eq!(
+            sidecar["session_span"],
+            serde_json::json!({
+                "kind": "measured", "source": "trace", "interval_source": null,
+                "start_s": 0.0, "end_s": 1.0, "extent_s": 1.0, "recorded_s": 1.0,
+                "duration_s": 1.0, "gap_s": 0.0, "n_intervals": 1,
+            })
+        );
+        assert_eq!(sidecar["provenance"]["mode"], "trace");
+        assert!(sidecar.get("unit_recorded_s").is_none());
         // Each row contains its cluster id.
         assert!(json.contains("\"cluster_id\": 0"));
         assert!(json.contains("\"cluster_id\": 2"));
@@ -770,7 +1116,6 @@ pub(crate) mod tests {
         let json_keys: Vec<&str> = first_row.split('"').skip(1).step_by(2).collect();
         assert_eq!(tsv_keys, json_keys);
         assert!(tsv_keys.ends_with(&["n_epochs", "epoch_amp_ratio", "epoch_rate_ratio"]));
-        let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
         for name in [
             "srp_contamination",
             "srp_rp_ms",

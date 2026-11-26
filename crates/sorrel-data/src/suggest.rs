@@ -170,7 +170,7 @@ pub struct SuggestMemo {
     gen: u64,
     pair_sig: [u64; 4],
     pairs: HashMap<([u8; 32], [u8; 32]), (PairScore, u64)>,
-    split_sig: [u64; 7],
+    split_sig: [u64; 8],
     splits: HashMap<[u8; 32], (SplitCandidate, u64)>,
 }
 
@@ -192,12 +192,17 @@ fn content_key(times: &[SampleIndex], amps: &[f32]) -> blake3::Hasher {
     h
 }
 
-/// Firing counts of `times` in [`PRESENCE_BINS`] equal slices of the recording.
-fn presence_counts(times: &[SampleIndex], total: u64) -> Vec<f32> {
-    let width = (total as f64 / PRESENCE_BINS as f64).max(1.0);
-    let mut c = vec![0.0f32; PRESENCE_BINS];
-    for t in times {
-        c[((t.0 as f64 / width) as usize).min(PRESENCE_BINS - 1)] += 1.0;
+/// Firing counts of `times` in up to [`PRESENCE_BINS`] equal slices of the recording.
+fn presence_counts(times: &[SampleIndex], span: &sorrel_io::SessionSpan) -> Vec<f32> {
+    let duration = span.duration_samples();
+    let bins = duration.min(PRESENCE_BINS as u64) as usize;
+    if bins == 0 {
+        return Vec::new();
+    }
+    let width = duration as f64 / bins as f64;
+    let mut c = vec![0.0f32; bins];
+    for (_, offset) in span.recorded_offsets(times) {
+        c[((offset as f64 / width) as usize).min(bins - 1)] += 1.0;
     }
     c
 }
@@ -208,6 +213,9 @@ fn presence_counts(times: &[SampleIndex], total: u64) -> Vec<f32> {
 /// bin). A unit split in two by a drift event fires in one fragment or the
 /// other, so this is near 1; independent stationary units score near 0.
 fn presence_complement(a: &[f32], b: &[f32]) -> f32 {
+    if a.is_empty() {
+        return 0.0;
+    }
     let n = a.len() as f32;
     let (ma, mb) = (a.iter().sum::<f32>() / n, b.iter().sum::<f32>() / n);
     let (mut cov, mut va, mut vb) = (0.0, 0.0, 0.0);
@@ -306,13 +314,8 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
             summaries.push(None);
             continue;
         }
-        let mean_amp = if amps.is_empty() {
-            f32::NAN
-        } else {
-            mean_amplitude(amps)
-        };
         summaries.push(Some(ClusterSummary {
-            mean_amp,
+            mean_amp: mean_amplitude(amps),
             n: times.len(),
         }));
     }
@@ -330,13 +333,16 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
 
     // Drift source inputs: peak-channel position and presence histogram per
     // cluster (both `None` without positions / templates).
-    let total = session.provider.n_samples().0;
+    let span = session.provider.session_span();
     let drift: Vec<Option<([f32; 2], Vec<f32>)>> = (0..n)
         .map(|c| {
             summaries[c as usize].as_ref()?;
             let c = ClusterId(c);
             let pos = *memo.positions.get(peak_channel(session, c)?)?;
-            Some((pos, presence_counts(session.spike_times(c), total)))
+            // Complementarity compares the same recorded-time bins for both
+            // units, even when their observation windows differ.
+            let times = session.unit_span(c).metric_spikes(session.spike_times(c));
+            Some((pos, presence_counts(&times, &span)))
         })
         .collect();
 
@@ -409,7 +415,7 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
                 let hi = sa.mean_amp.abs().max(sb.mean_amp.abs()).max(1e-6);
                 ((sa.mean_amp - sb.mean_amp).abs() / hi).min(1.0)
             } else {
-                0.0
+                f32::NAN
             };
             if amp_mean_delta > cfg.max_amp_mean_delta {
                 continue;
@@ -469,11 +475,7 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
             PairScore {
                 dip_score: refractory_dip_score(&analysis),
                 z: analysis.z,
-                amp_ks: if amps_a.is_empty() || amps_b.is_empty() {
-                    0.0
-                } else {
-                    ks_two_sample(amps_a, amps_b)
-                },
+                amp_ks: ks_two_sample(amps_a, amps_b),
             }
         })
         .collect();
@@ -492,16 +494,15 @@ pub fn rank_merge_candidates_memo<P: DataProvider>(
                 let s = s?;
                 // Missing amplitudes are absent evidence, not a perfect match:
                 // the amplitude terms contribute nothing.
-                let has_amps = !session.spike_amplitudes(a).is_empty()
-                    && !session.spike_amplitudes(b).is_empty();
-                let (amp_sim, amp_mean_sim) = if has_amps {
-                    (
-                        (1.0 - s.amp_ks).clamp(0.0, 1.0),
-                        (1.0 - amp_mean_delta).clamp(0.0, 1.0),
-                    )
-                } else {
-                    (0.0, 0.0)
+                let similarity = |distance: f32| {
+                    if distance.is_finite() {
+                        (1.0 - distance).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
                 };
+                let amp_sim = similarity(s.amp_ks);
+                let amp_mean_sim = similarity(amp_mean_delta);
 
                 // Weighted combination — refractory dip is the strongest single
                 // signal (0.6); amplitude evidence rounds it out (0.3 + 0.1).
@@ -582,13 +583,13 @@ fn score_split<P: DataProvider>(
     refractory_samples: u64,
 ) -> SplitCandidate {
     let sr = session.provider.sample_rate().max(1.0);
-    let total_duration = session.provider.n_samples();
+    let span = session.unit_span(c);
     let times = session.spike_times(c);
     let amps = session.spike_amplitudes(c);
     let bc = if amps.len() >= 8 {
         bimodality_coefficient(amps)
     } else {
-        0.0
+        f32::NAN
     };
     // Hartigan dip corroborates the moment-based BC. Blend via `max`
     // so the dip can only strengthen a detection the BC already
@@ -597,7 +598,7 @@ fn score_split<P: DataProvider>(
     let dip = if amps.len() >= 8 {
         hartigan_dip(amps)
     } else {
-        0.0
+        f32::NAN
     };
     // dip ≈ 0.02 is noise-level; ≳ 0.06 is a clear gap.
     let score_of = |bc: f32, dip: f32| {
@@ -619,7 +620,8 @@ fn score_split<P: DataProvider>(
             }
         }
     }
-    let contamination = refractory_contamination(times, refractory_samples, total_duration.0, sr);
+    let contamination =
+        refractory_contamination(&span.metric_spikes(times), refractory_samples, &span, sr);
     let cont_score = (contamination * 2.0).clamp(0.0, 1.0);
     let drift = amplitude_drift_correlation(times, amps).abs();
     let drift_score = ((drift - 0.3) / 0.5).clamp(0.0, 1.0);
@@ -641,9 +643,19 @@ fn score_split<P: DataProvider>(
         (gmm_delta.min(40.0) / 40.0 * 0.15).clamp(0.0, 0.15)
     };
 
-    let mut raw = ((0.6 * bc_score + 0.25 * cont_score + 0.15 * drift_score) * snr_gate
-        + gmm_bonus)
-        .clamp(0.0, 1.0);
+    // No SNR measurement means no amplitude-based score; the independent
+    // PC proposers below can still supply evidence.
+    let contribution = |score: f32| if score.is_finite() { score } else { 0.0 };
+    let mut raw = if snr_gate.is_finite() {
+        ((0.6 * contribution(bc_score)
+            + 0.25 * contribution(cont_score)
+            + 0.15 * contribution(drift_score))
+            * snr_gate
+            + gmm_bonus)
+            .clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     // PC-feature k-means is the stronger proposer: when it passes
     // its validation it replaces the GMM bipartition and lifts the
     // score to [0.5, 1] by silhouette.
@@ -711,9 +723,11 @@ pub fn rank_split_candidates_memo<P: DataProvider>(
     let globals = session
         .has_pc_features()
         .then(|| crate::proposers::all_cluster_globals(session));
+    let span = session.provider.session_span();
     let sig = [
         sr.to_bits() as u64,
-        session.provider.n_samples().0,
+        span.start.0,
+        span.end.0,
         globals.is_some() as u64,
         rp.fixed_ms.to_bits() as u64,
         rp.sweep_min_ms.to_bits() as u64,
@@ -737,6 +751,13 @@ pub fn rank_split_candidates_memo<P: DataProvider>(
         })
         .map(|c| {
             let mut h = content_key(session.spike_times(c), session.spike_amplitudes(c));
+            let span = session.unit_span(c);
+            if span.source != sorrel_io::SpanSource::Trace {
+                for (lo, hi) in span.intervals() {
+                    h.update(&lo.0.to_le_bytes());
+                    h.update(&hi.0.to_le_bytes());
+                }
+            }
             if let Some(g) = &globals {
                 feed(&mut h, &g[c.idx()], u32::to_le_bytes);
             }
@@ -817,6 +838,17 @@ mod tests {
         ClusterId, DataProvider, HasAmplitudes, SampleIndex, TraceSamples, TraceSlice,
     };
 
+    #[test]
+    fn merge_presence_counts_only_bins_with_exposure() {
+        let span = sorrel_io::SessionSpan::contiguous(
+            SampleIndex(100),
+            SampleIndex(110),
+            sorrel_io::SpanSource::Declared("/intervals/epochs"),
+        );
+        let spikes: Vec<_> = (99..=110).map(SampleIndex).collect();
+        assert_eq!(presence_counts(&spikes, &span), [1.0; 10]);
+    }
+
     /// In-memory provider backed by per-cluster spike times + amplitudes.
     struct MockProvider {
         spikes: Vec<Vec<SampleIndex>>,
@@ -865,6 +897,28 @@ mod tests {
         let mut s = Session::new(prov, journal);
         s.seed_amplitudes();
         (s, dir)
+    }
+
+    #[test]
+    fn suggestions_rank_without_treating_missing_amplitudes_as_a_match() {
+        let (session, _dir) = fresh_session(MockProvider {
+            spikes: [0, 5]
+                .iter()
+                .map(|&offset| (0..500).map(|i| SampleIndex(i * 10 + offset)).collect())
+                .collect(),
+            amps: vec![],
+            n_samples: SampleIndex(5000),
+        });
+        let cfg = SuggestConfig {
+            min_score: 0.0,
+            ..SuggestConfig::default()
+        };
+        let merges = rank_merge_candidates(&session, &cfg);
+        assert_eq!(merges.len(), 1);
+        let m = &merges[0];
+        assert!(m.amp_ks.is_nan() && m.amp_mean_delta.is_nan());
+        assert!(m.score.is_finite() && m.score <= 0.6);
+        assert!(rank_split_candidates(&session, &SuggestConfig::default()).is_empty());
     }
 
     #[test]

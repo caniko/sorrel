@@ -243,8 +243,7 @@ where
     F: Fn(&P::Label) -> &'static str,
 {
     let keys = session.custom_label_keys();
-    let duration =
-        session.provider.n_samples().0 as f64 / session.provider.sample_rate().max(1.0) as f64;
+    let rate = session.provider.sample_rate().max(1.0) as f64;
     let mut text = String::from("cluster_id\tch\tfr\tamp\tn_spikes\tgroup");
     for k in &keys {
         text.push('\t');
@@ -284,10 +283,17 @@ where
             )
         };
         let group = session.label(c).map_or("", |l| label_str(&l));
-        text.push_str(&format!(
-            "{c}\t{ch}\t{:.3}\t{amp}\t{n}\t{group}",
-            n as f64 / duration.max(f64::MIN_POSITIVE)
-        ));
+        let span = session.unit_span(c);
+        let duration = span.duration_samples() as f64 / rate;
+        let fr = if duration > 0.0 {
+            format!(
+                "{:.3}",
+                span.metric_spikes(session.spike_times(c)).len() as f64 / duration
+            )
+        } else {
+            String::new()
+        };
+        text.push_str(&format!("{c}\t{ch}\t{fr}\t{amp}\t{n}\t{group}"));
         for k in &keys {
             text.push('\t');
             text.push_str(session.custom_label(c, k).unwrap_or(""));

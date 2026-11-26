@@ -11,11 +11,12 @@ use crate::distribution::amplitude_cutoff;
 use crate::drift::{amplitude_drift_correlation, longest_silent_gap_frac, presence_cv};
 use crate::metrics::{amplitude_snr, isi_violations, presence_ratio, refractory_contamination};
 use crate::metrics_iso::IsolationMetrics;
-use sorrel_io::SampleIndex;
+use sorrel_io::{SampleIndex, SessionSpan};
 
 /// Per-cluster quality breakdown. All fields are bounded to `[0, 1]`
 /// where 1.0 = best and 0.0 = worst, except the raw inputs noted below.
-#[derive(Clone, Copy, Debug, Default)]
+/// Unavailable measurements are `NaN`.
+#[derive(Clone, Copy, Debug)]
 pub struct QualityBreakdown {
     /// `1 - clamp(refractory_contamination, 0, 1)`. 1.0 means a clean
     /// refractory period, 0.0 means heavy contamination.
@@ -27,7 +28,7 @@ pub struct QualityBreakdown {
     /// Saturating SNR score: `amp_snr / (amp_snr + 1)`. 1.0 is unreachable
     /// but values above 0.7 indicate a confident detection.
     pub snr_score: f32,
-    /// `1 - amplitude_cutoff`. 1.0 means the amp distribution looks fully
+    /// `1 - 2 * amplitude_cutoff`. 1.0 means the amp distribution looks fully
     /// sampled; lower means likely missed spikes below threshold.
     pub completeness_score: f32,
     /// `1 - |drift_correlation|`. 1.0 means stationary amplitudes; lower
@@ -52,28 +53,61 @@ pub struct QualityBreakdown {
     pub isolation: Option<IsolationMetrics>,
 }
 
-impl QualityBreakdown {
-    /// Composite score in `[0, 1]`. Geometric mean of all available
-    /// sub-scores so no single dimension can boost a cluster past a clear
-    /// weakness in another — this matches what curators do when eyeballing
-    /// the views (any one ugly view sinks the cluster).
-    pub fn composite(&self) -> f32 {
-        let mut parts: Vec<f32> = vec![
-            self.contamination_score.max(1e-3),
-            self.presence_score.max(1e-3),
-            self.coverage_score.max(1e-3),
-            self.snr_score.max(1e-3),
-            self.completeness_score.max(1e-3),
-            self.stability_score.max(1e-3),
-        ];
-        if let Some(iso) = self.isolation {
-            let s = iso.score();
-            if s.is_finite() {
-                parts.push(s.max(1e-3));
-            }
+impl Default for QualityBreakdown {
+    fn default() -> Self {
+        Self {
+            contamination_score: f32::NAN,
+            presence_score: f32::NAN,
+            coverage_score: f32::NAN,
+            snr_score: f32::NAN,
+            completeness_score: f32::NAN,
+            stability_score: f32::NAN,
+            raw_contamination: f32::NAN,
+            raw_presence_ratio: f32::NAN,
+            raw_silent_gap: f32::NAN,
+            raw_snr: f32::NAN,
+            raw_amp_cutoff: f32::NAN,
+            raw_drift_corr: f32::NAN,
+            raw_isi_violations: 0,
+            raw_presence_cv: f32::NAN,
+            n_spikes: 0,
+            isolation: None,
         }
-        let log_mean: f32 = parts.iter().map(|p| p.ln()).sum::<f32>() / parts.len() as f32;
-        log_mean.exp().clamp(0.0, 1.0)
+    }
+}
+
+impl QualityBreakdown {
+    /// Named, measured sub-scores used by [`Self::composite`].
+    pub fn composite_terms(&self) -> impl Iterator<Item = (&'static str, f32)> {
+        [
+            ("isi", self.contamination_score),
+            ("presence", self.presence_score),
+            ("coverage", self.coverage_score),
+            ("snr", self.snr_score),
+            ("completeness", self.completeness_score),
+            ("stability", self.stability_score),
+            (
+                "isolation",
+                self.isolation.map_or(f32::NAN, |iso| iso.score()),
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, score)| score.is_finite())
+    }
+
+    /// Equal-weight geometric mean of measured sub-scores, floored at 1e-3
+    /// per term. Returns `NaN` when none were measured.
+    pub fn composite(&self) -> f32 {
+        let (sum, n) = self
+            .composite_terms()
+            .fold((0.0, 0), |(sum, n), (_, score)| {
+                (sum + score.max(1e-3).ln(), n + 1)
+            });
+        if n == 0 {
+            f32::NAN
+        } else {
+            (sum / n as f32).exp().clamp(0.0, 1.0)
+        }
     }
 
     /// True when this breakdown carries PC-feature isolation evidence.
@@ -88,24 +122,27 @@ pub fn quality_breakdown(
     spike_times: &[SampleIndex],
     spike_amplitudes: &[f32],
     refractory_samples: u64,
-    total_duration_samples: u64,
+    span: impl Into<SessionSpan>,
     sample_rate: f32,
     presence_bins: usize,
 ) -> QualityBreakdown {
+    let span = span.into();
     let n = spike_times.len();
-    let raw_contamination = refractory_contamination(
-        spike_times,
-        refractory_samples,
-        total_duration_samples,
-        sample_rate,
-    );
-    let raw_presence = presence_ratio(spike_times, total_duration_samples, presence_bins);
-    let raw_gap = longest_silent_gap_frac(spike_times, total_duration_samples);
+    let spike_amplitudes = if spike_amplitudes.len() == n {
+        spike_amplitudes
+    } else {
+        &[]
+    };
+    let exposed = span.metric_spikes(spike_times);
+    let raw_contamination =
+        refractory_contamination(&exposed, refractory_samples, &span, sample_rate);
+    let raw_presence = presence_ratio(spike_times, span.clone(), presence_bins);
+    let raw_gap = longest_silent_gap_frac(spike_times, span.clone());
     let raw_snr = amplitude_snr(spike_amplitudes);
     let raw_cutoff = amplitude_cutoff(spike_amplitudes, 30);
     let raw_drift = amplitude_drift_correlation(spike_times, spike_amplitudes);
-    let raw_isi_violations = isi_violations(spike_times, refractory_samples) as u32;
-    let raw_presence_cv = presence_cv(spike_times, total_duration_samples, presence_bins);
+    let raw_isi_violations = isi_violations(&exposed, refractory_samples) as u32;
+    let raw_presence_cv = presence_cv(spike_times, span, presence_bins);
 
     QualityBreakdown {
         contamination_score: (1.0 - raw_contamination).clamp(0.0, 1.0),
@@ -135,6 +172,35 @@ pub fn quality_breakdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolated_sample_intervals_do_not_measure_refractory_contamination() {
+        let times: Vec<_> = (0..3000).map(|i| SampleIndex(i * 100)).collect();
+        let span = SessionSpan::from_intervals(
+            times.iter().map(|&t| (t, SampleIndex(t.0 + 1))).collect(),
+            sorrel_io::SpanSource::Declared("/intervals/epochs"),
+        );
+        let q = quality_breakdown(&times, &[], 2, span, 1000.0, 100);
+        assert!(q.raw_contamination.is_nan());
+    }
+
+    #[test]
+    fn recorded_coverage_ignores_pauses_and_gap_spikes() {
+        let span = SessionSpan::from_intervals(
+            vec![(10.into(), 60.into()), (10_000.into(), 10_050.into())],
+            sorrel_io::SpanSource::Declared("/intervals/epochs"),
+        );
+        let times = [15, 35, 55, 500, 10_015, 10_035].map(SampleIndex);
+        assert_eq!(
+            span.metric_spikes(&times).len() as f32 / span.duration_seconds(100.0),
+            5.0
+        );
+        let q = quality_breakdown(&times, &[], 1, span, 100.0, 5);
+        assert_eq!(q.raw_presence_ratio, 1.0);
+        assert_eq!(q.raw_presence_cv, 0.0);
+        assert_eq!(q.raw_silent_gap, 0.2);
+        assert_eq!(q.coverage_score, 0.8);
+    }
 
     #[test]
     fn composite_is_geometric_mean() {
@@ -198,12 +264,22 @@ mod tests {
     }
 
     #[test]
-    fn empty_inputs_produce_zero_scores() {
-        let q = quality_breakdown(&[], &[], 100, 1000, 1000.0, 10);
+    fn unavailable_inputs_do_not_contribute_to_quality() {
+        let q = quality_breakdown(&[], &[], 100, 0, 1000.0, 10);
         assert_eq!(q.n_spikes, 0);
         assert_eq!(q.raw_isi_violations, 0);
-        // SNR over no amplitudes is 0 → snr_score should be 0.
-        assert_eq!(q.snr_score, 0.0);
+        for v in [
+            q.raw_contamination,
+            q.raw_silent_gap,
+            q.raw_presence_cv,
+            q.raw_snr,
+            q.raw_amp_cutoff,
+            q.raw_drift_corr,
+            q.composite(),
+            QualityBreakdown::default().composite(),
+        ] {
+            assert!(v.is_nan(), "{v}");
+        }
     }
 
     #[test]

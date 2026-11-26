@@ -217,7 +217,8 @@ pub fn kmeans_split_proposal(
 
     let largest = (0..k).max_by_key(|&j| parts[j].len())?;
     let all: Vec<u32> = (0..n as u32).collect();
-    if contamination(&parts[largest]) > contamination(&all) {
+    let (part, whole) = (contamination(&parts[largest]), contamination(&all));
+    if !part.is_finite() || !whole.is_finite() || part > whole {
         return None;
     }
     let mut minor_idx: Vec<u32> = parts
@@ -560,10 +561,10 @@ pub(crate) fn kmeans_split_with<P: DataProvider>(
     let times = session.spike_times(cluster);
     let sr = session.provider.sample_rate().max(1.0);
     let refractory = windows.fixed_samples(sr);
-    let duration = session.provider.n_samples().0;
+    let span = session.unit_span(cluster);
     kmeans_split_proposal(&feats, d, |idx| {
         let t: Vec<_> = idx.iter().map(|&i| times[i as usize]).collect();
-        refractory_contamination(&t, refractory, duration, sr)
+        refractory_contamination(&span.metric_spikes(&t), refractory, &span, sr)
     })
 }
 
@@ -591,13 +592,13 @@ pub(crate) fn core_split_with<P: DataProvider>(
 ) -> Option<CoreSplit> {
     let times = session.spike_times(cluster);
     let sr = session.provider.sample_rate().max(1.0);
-    let duration = session.provider.n_samples().0;
+    let span = session.unit_span(cluster);
     let pick = |idx: &[u32]| -> Vec<_> { idx.iter().map(|&i| times[i as usize]).collect() };
     core_split_lazy(
         globals.len(),
         || feature_space(session, cluster, globals, CORE_CHANNELS),
         |idx| {
-            let (c, rp) = windows.sweep(&pick(idx), duration, sr);
+            let (c, rp) = windows.sweep(&span.metric_spikes(&pick(idx)), &span, sr);
             if rp > 0 {
                 c
             } else {
@@ -666,7 +667,7 @@ pub fn attention_with<P: DataProvider>(
         session.spike_times(cluster),
         session.spike_amplitudes(cluster),
         refractory,
-        session.provider.n_samples().0,
+        session.unit_span(cluster),
         sr,
         50,
     )

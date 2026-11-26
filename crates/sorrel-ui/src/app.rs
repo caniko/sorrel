@@ -1106,8 +1106,12 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             Snippet::RateBins(n) => self.view_params.rate.n_bins = n,
             Snippet::RateBinSize(secs) => {
                 let s = read(&self.session);
-                let duration = s.provider.n_samples().0 as f32 / s.provider.sample_rate().max(1.0);
-                let (lo, hi) = self.view_params.rate.x_range(duration);
+                let sr = s.provider.sample_rate().max(1.0);
+                let span = s.provider.session_span();
+                let (lo, hi) = self.view_params.rate.visible_x_range(
+                    span.start.as_f64() / f64::from(sr),
+                    span.extent_samples() as f32 / sr,
+                );
                 self.view_params.rate.n_bins =
                     (((hi - lo) / secs.max(1e-3)).round() as usize).clamp(2, 5000);
             }
@@ -2389,9 +2393,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 .is_none_or(|(k, ..)| *k != scheme_key)
             {
                 let n = session.n_clusters();
-                let duration = (session.provider.n_samples().0 as f32
-                    / session.provider.sample_rate().max(1.0))
-                .max(1e-3);
+                let rate = session.provider.sample_rate();
                 let ids = (0..n).map(ClusterId);
                 let groups: Vec<&str> = ids
                     .clone()
@@ -2399,7 +2401,11 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     .collect();
                 let fr: Vec<f32> = ids
                     .clone()
-                    .map(|c| session.spike_times(c).len() as f32 / duration)
+                    .map(|c| {
+                        let span = session.unit_span(c);
+                        span.metric_spikes(session.spike_times(c)).len() as f32
+                            / span.duration_seconds(rate)
+                    })
                     .collect();
                 let depth: Vec<f32> = ids
                     .map(|c| depths.and_then(|d| d.cluster_mean(c)).unwrap_or(f32::NAN))
@@ -2865,6 +2871,7 @@ mod tests {
     /// session/intent loop.
     struct StubProvider {
         spikes: Vec<Vec<SampleIndex>>,
+        span: Option<sorrel_io::SessionSpan>,
     }
 
     impl DataProvider for StubProvider {
@@ -2877,6 +2884,11 @@ mod tests {
         }
         fn n_samples(&self) -> SampleIndex {
             SampleIndex(1_000_000)
+        }
+        fn session_span(&self) -> sorrel_io::SessionSpan {
+            self.span
+                .clone()
+                .unwrap_or_else(|| self.n_samples().0.into())
         }
         fn n_clusters(&self) -> u32 {
             self.spikes.len() as u32
@@ -2923,9 +2935,41 @@ mod tests {
                 vec![SampleIndex(40), SampleIndex(60)],
                 vec![SampleIndex(80)],
             ],
+            span: None,
         };
         let journal = Journal::open_or_create(&dir.join("j.sqlite"), 0xCAFE, 3).unwrap();
         Session::new(provider, journal)
+    }
+
+    #[test]
+    fn rate_bin_size_uses_elapsed_extent_across_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = stub_session(dir.path());
+        session.provider.span = Some(sorrel_io::SessionSpan::from_intervals(
+            vec![
+                (0.into(), 30_000.into()),
+                (3_000_000.into(), 3_030_000.into()),
+            ],
+            sorrel_io::SpanSource::Declared("/intervals/epochs"),
+        ));
+        let mut app = SorrelApp::new(session, label_str);
+        app.run_snippet(crate::snippets::parse(":frb 1").unwrap());
+        assert_eq!(app.view_params.rate.n_bins, 101);
+    }
+
+    #[test]
+    fn rate_bin_size_uses_visible_zoom() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = stub_session(dir.path());
+        session.provider.span = Some(sorrel_io::SessionSpan::contiguous(
+            0.into(),
+            3_000_000.into(),
+            sorrel_io::SpanSource::Trace,
+        ));
+        let mut app = SorrelApp::new(session, label_str);
+        app.view_params.rate.pz = crate::panzoom::PanZoom::centered_zoom(2.0);
+        app.run_snippet(crate::snippets::parse(":frb 1").unwrap());
+        assert_eq!(app.view_params.rate.n_bins, 50);
     }
 
     impl HasGeometry for StubProvider {

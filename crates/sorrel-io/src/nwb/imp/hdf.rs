@@ -160,57 +160,135 @@ fn fixed_strings(
 
 // The journal only seals explicitly opened files. Check each link before
 // following it: even a link that resolves back into this file can go via a sidecar.
-pub(super) fn hard_link_exists(group: &hdf5::Group, path: &str) -> Result<bool> {
+pub(super) fn resolve_local_path(
+    group: &hdf5::Group,
+    path: &str,
+    include_soft_links: bool,
+) -> Result<Option<String>> {
+    fn walk(
+        group: &hdf5::Group,
+        path: &str,
+        mut prefix: String,
+        include_soft_links: bool,
+        active: &mut Vec<String>,
+        hops: &mut usize,
+    ) -> Result<Option<String>> {
+        for component in path.split('/').filter(|c| !matches!(*c, "" | ".")) {
+            ensure!(component != "..", "invalid HDF5 object path {path:?}");
+            let parent_len = prefix.len();
+            prefix.push('/');
+            prefix.push_str(component);
+            match link(group, &prefix)? {
+                None => return Ok(None),
+                Some(Link::Hard) => {}
+                Some(Link::Soft(target)) => {
+                    ensure!(include_soft_links, "{prefix} is an HDF5 soft link");
+                    ensure!(
+                        !active.contains(&prefix),
+                        "HDF5 soft link cycle at {prefix}"
+                    );
+                    // ponytail: track paths, not object tokens; the cap also
+                    // covers cycles reached through different hard aliases.
+                    ensure!(*hops < 32, "too many HDF5 soft link hops at {prefix}");
+                    *hops += 1;
+                    let parent = if target.starts_with('/') {
+                        String::new()
+                    } else {
+                        prefix[..parent_len].to_owned()
+                    };
+                    // Resolve the target before checking the remaining caller
+                    // path: an optional child of a valid alias may be absent.
+                    active.push(prefix);
+                    let resolved = walk(group, &target, parent, include_soft_links, active, hops);
+                    let link = active.pop().expect("active soft link");
+                    prefix = resolved?
+                        .with_context(|| format!("dangling HDF5 soft link {link} -> {target}"))?;
+                }
+            }
+        }
+        Ok(Some(prefix))
+    }
+
+    ensure!(
+        path.trim_start_matches('/')
+            .split('/')
+            .all(|c| !matches!(c, "" | "." | "..")),
+        "invalid HDF5 object path {path:?}"
+    );
+    let prefix = if path.starts_with('/') {
+        String::new()
+    } else {
+        // Regular groups are only opened from resolved hard paths.
+        group.name().trim_end_matches('/').to_owned()
+    };
+    let mut hops = 0;
+    let resolved = walk(
+        group,
+        path,
+        prefix,
+        include_soft_links,
+        &mut Vec::new(),
+        &mut hops,
+    )?;
+    Ok(resolved.map(|p| if p.is_empty() { "/".into() } else { p }))
+}
+
+enum Link {
+    Hard,
+    Soft(String),
+}
+
+fn link(group: &hdf5::Group, path: &str) -> Result<Option<Link>> {
     use hdf5_metno_sys::{
         h5l::{self, H5L_info2_t, H5L_TYPE_EXTERNAL, H5L_TYPE_HARD, H5L_TYPE_SOFT},
         h5p::H5P_DEFAULT,
     };
-    use std::ffi::{c_int, CString};
+    use std::ffi::{c_int, CStr, CString};
     use std::mem::MaybeUninit;
 
-    let mut prefix = if path.starts_with('/') {
-        String::new()
-    } else {
-        group.name().trim_end_matches('/').to_owned()
-    };
-    for component in path.trim_start_matches('/').split('/') {
-        ensure!(
-            !component.is_empty() && !matches!(component, "." | ".."),
-            "invalid HDF5 object path {path:?}"
-        );
-        prefix.push('/');
-        prefix.push_str(component);
-        let name = CString::new(prefix.as_str())?;
-        let mut info = MaybeUninit::<H5L_info2_t>::uninit();
-        let kind = hdf5::sync::sync(|| {
-            // SAFETY: group and the NUL-terminated name are live, info points to
-            // writable storage, and the HDF5 lock serializes the call. Read the
-            // type as a C int, since user-defined links can use other enum values.
-            unsafe {
-                if hdf5::h5check(h5l::H5Lexists(group.id(), name.as_ptr(), H5P_DEFAULT))? == 0 {
-                    return Ok(None);
-                }
-                // HDF5 2.x no longer exports H5Lget_info1.
-                hdf5::h5check(h5l::H5Lget_info2(
-                    group.id(),
-                    name.as_ptr(),
-                    info.as_mut_ptr(),
-                    H5P_DEFAULT,
-                ))?;
-                Ok::<_, hdf5::Error>(Some(info.as_ptr().cast::<c_int>().read()))
+    let name = CString::new(path)?;
+    let mut info = MaybeUninit::<H5L_info2_t>::uninit();
+    hdf5::sync::sync(|| {
+        // SAFETY: IDs and C strings are live under the lock. Read the type
+        // as a C int because user-defined links can use other values. For
+        // soft links, the active union field gives the link value buffer size.
+        unsafe {
+            if hdf5::h5check(h5l::H5Lexists(group.id(), name.as_ptr(), H5P_DEFAULT))? == 0 {
+                return Ok(None);
             }
-        })
-        .with_context(|| format!("cannot inspect HDF5 link {prefix}"))?;
-        let Some(kind) = kind else { return Ok(false) };
-        let kind = match kind {
-            k if k == H5L_TYPE_HARD as c_int => continue,
-            k if k == H5L_TYPE_SOFT as c_int => "soft link",
-            k if k == H5L_TYPE_EXTERNAL as c_int => "external link",
-            _ => "non-hard link",
-        };
-        anyhow::bail!("{prefix} is an HDF5 {kind}");
-    }
-    Ok(true)
+            // HDF5 2.x no longer exports H5Lget_info1.
+            hdf5::h5check(h5l::H5Lget_info2(
+                group.id(),
+                name.as_ptr(),
+                info.as_mut_ptr(),
+                H5P_DEFAULT,
+            ))?;
+            match info.as_ptr().cast::<c_int>().read() {
+                k if k == H5L_TYPE_HARD as c_int => Ok(Some(Link::Hard)),
+                k if k == H5L_TYPE_SOFT as c_int => {
+                    let size = *info.assume_init().u.val_size();
+                    let mut bytes = Vec::new();
+                    bytes.try_reserve_exact(size)?;
+                    bytes.resize(size, 0u8);
+                    hdf5::h5check(h5l::H5Lget_val(
+                        group.id(),
+                        name.as_ptr(),
+                        bytes.as_mut_ptr().cast(),
+                        size,
+                        H5P_DEFAULT,
+                    ))?;
+                    let target = CStr::from_bytes_with_nul(&bytes)?.to_str()?;
+                    ensure!(!target.is_empty(), "empty HDF5 soft link target");
+                    Ok(Some(Link::Soft(target.to_owned())))
+                }
+                k if k == H5L_TYPE_EXTERNAL as c_int => {
+                    anyhow::bail!("{path} is an HDF5 external link")
+                }
+                _ => anyhow::bail!("{path} is an HDF5 non-hard link"),
+            }
+        }
+    })
+    .with_context(|| format!("cannot inspect HDF5 link {path}"))
 }
 
 pub(super) fn local_dataset(file: &hdf5::Group, path: &str) -> Result<hdf5::Dataset> {
@@ -219,6 +297,57 @@ pub(super) fn local_dataset(file: &hdf5::Group, path: &str) -> Result<hdf5::Data
         .with_context(|| format!("cannot open HDF5 dataset {path}"))?;
     check_dataset_storage(&ds)?;
     Ok(ds)
+}
+
+pub(super) fn local_trace_dataset(group: &hdf5::Group, path: &str) -> Result<hdf5::Dataset> {
+    use hdf5::plist::DatasetAccess;
+    use hdf5_metno_sys::h5d::H5Dopen2;
+    use std::ffi::CString;
+
+    let ds = local_dataset(group, path)?;
+    let Some(chunk) = ds.dcpl()?.get_chunk()? else {
+        return Ok(ds);
+    };
+    let channel_chunks = match (chunk.as_slice(), ds.space()?.shape().as_slice()) {
+        ([_], [_]) => 1,
+        ([_, chunk_channels], [_, channels]) => channels.div_ceil(*chunk_channels),
+        _ => return Ok(ds),
+    };
+    // ponytail: cap at 256 MiB per open trace; use channel-subset reads if a
+    // complete time tile no longer fits.
+    let tile_bytes = chunk
+        .iter()
+        .fold(ds.dtype()?.size(), |bytes, &dim| bytes.saturating_mul(dim))
+        .saturating_mul(channel_chunks)
+        .min(256 * 1024 * 1024);
+    let default = ds.dapl()?.get_chunk_cache()?;
+    // HDF5 recommends at least ten hash slots per cached chunk. Keep prime
+    // sizes to limit collisions and bound the table for very wide traces.
+    let target_slots = channel_chunks.saturating_mul(10).min(262_147);
+    if tile_bytes <= default.nbytes && target_slots <= default.nslots {
+        return Ok(ds);
+    }
+    let slots = if target_slots <= 12_421 {
+        12_421
+    } else {
+        262_147
+    };
+    let dapl = DatasetAccess::build()
+        .chunk_cache(
+            slots.max(default.nslots),
+            tile_bytes.max(default.nbytes),
+            default.w0,
+        )
+        .finish()?;
+    let name = CString::new(path)?;
+    hdf5::sync::sync(|| {
+        // HDF5 shares the cache across open handles. Close the probe first.
+        drop(ds);
+        // SAFETY: the group and DAPL are live under the HDF5 lock; the name
+        // is the same checked hard path, and from_id owns the returned ID.
+        unsafe { hdf5::from_id(H5Dopen2(group.id(), name.as_ptr(), dapl.id())) }
+    })
+    .with_context(|| format!("cannot reopen HDF5 trace dataset {path}"))
 }
 
 pub(super) fn check_dataset_storage(ds: &hdf5::Dataset) -> Result<()> {
@@ -282,7 +411,42 @@ pub(super) fn spec_object(group: &hdf5::Group, path: &str) -> Result<hdf5::Locat
     .with_context(|| format!("cannot open same-file HDF5 spec object {path:?}"))
 }
 
-pub(super) fn spec_reference(root: &hdf5::Group, attr: &hdf5::Attribute) -> Result<hdf5::Group> {
+pub(super) fn group_reference(root: &hdf5::Group, attr: &hdf5::Attribute) -> Result<hdf5::Group> {
+    Ok(object_reference(root, attr)?.as_group()?)
+}
+
+pub(super) fn dataset_reference(
+    root: &hdf5::Group,
+    dataset: &hdf5::Dataset,
+    attr: &hdf5::Attribute,
+) -> Result<hdf5::Dataset> {
+    use hdf5_metno_sys::h5t::{H5Tget_class, H5T_STRING};
+
+    let dtype = attr.dtype()?;
+    // SAFETY: the datatype handle remains live for the class query.
+    if hdf5::sync::sync(|| unsafe { H5Tget_class(dtype.id()) }) == H5T_STRING {
+        let path = read_str(attr)?;
+        let path = if path.starts_with('/') {
+            path
+        } else {
+            let name = dataset.name();
+            let (parent, _) = name.rsplit_once('/').context("unnamed index dataset")?;
+            format!("{parent}/{path}")
+        };
+        let resolved = resolve_local_path(root, &path, true)?
+            .with_context(|| format!("missing HDF5 reference target {path}"))?;
+        local_dataset(root, &resolved)
+    } else {
+        Ok(object_reference(root, attr)?.as_dataset()?)
+    }
+}
+
+pub(super) fn same_object(left: &hdf5::Location, right: &hdf5::Location) -> Result<bool> {
+    let (a, b) = (left.loc_info()?, right.loc_info()?);
+    Ok(a.fileno == b.fileno && a.token == b.token)
+}
+
+fn object_reference(root: &hdf5::Group, attr: &hdf5::Attribute) -> Result<hdf5::Location> {
     use hdf5_metno_sys::{
         h5a::H5Aread,
         h5p::H5P_DEFAULT,
@@ -290,7 +454,7 @@ pub(super) fn spec_reference(root: &hdf5::Group, attr: &hdf5::Attribute) -> Resu
         h5t::{H5Tequal, H5T_STD_REF_OBJ},
     };
 
-    ensure!(attr.ndim() == 0, "HDF5 .specloc must be scalar");
+    ensure!(attr.ndim() == 0, "HDF5 {} must be scalar", attr.name());
     let dtype = attr.dtype()?;
     hdf5::sync::sync(|| {
         // SAFETY: the scalar old-style object reference has exactly the
@@ -298,7 +462,8 @@ pub(super) fn spec_reference(root: &hdf5::Group, attr: &hdf5::Attribute) -> Resu
         unsafe {
             ensure!(
                 H5Tequal(dtype.id(), *H5T_STD_REF_OBJ) > 0,
-                "HDF5 .specloc must be an object reference"
+                "HDF5 {} must be an object reference",
+                attr.name()
             );
             let mut reference: hobj_ref_t = 0;
             hdf5::h5check(H5Aread(

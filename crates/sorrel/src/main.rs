@@ -119,7 +119,7 @@ enum Cmd {
         #[arg(long)]
         remove: bool,
     },
-    /// Headless: run every metric and write cluster_qc.tsv + cluster_qc.json
+    /// Headless: run every metric and write QC TSV, JSON, and a provenance sidecar
     Qc {
         #[command(flatten)]
         open: OpenArgs,
@@ -468,7 +468,7 @@ struct OpenArgs {
     /// Overrides params.py:sample_rate. For NWB, select an exact declared clock (copy a value from the error), or supply a rate if no clock is declared
     #[arg(long, value_name = "Hz")]
     sample_rate: Option<f64>,
-    /// NWB ElectricalSeries name under /acquisition or absolute NWB object path
+    /// NWB ElectricalSeries name under /acquisition or absolute NWB path; use `none` to open units only
     #[cfg(any(feature = "hdf5", feature = "zarr"))]
     #[arg(long, value_name = "PATH|NAME")]
     nwb_series: Option<String>,
@@ -593,6 +593,17 @@ impl OpenArgs {
 
     fn has_remote_input(&self) -> bool {
         is_remote(self.root()) || self.dat.as_deref().is_some_and(is_remote)
+    }
+
+    #[cfg(any(feature = "hdf5", feature = "zarr"))]
+    fn nwb_params(&self) -> Result<sorrel_io::NwbOpenParams<'_>> {
+        let params = sorrel_io::NwbOpenParams {
+            series: self.nwb_series.as_deref(),
+            raw_path: self.dat.as_deref(),
+            sample_rate: self.sample_rate,
+        };
+        params.validate()?;
+        Ok(params)
     }
 
     /// Make the path fields absolute against `cwd`: the args came from a
@@ -815,6 +826,8 @@ fn with_session_refractory<V: SessionVisitor>(
     v: V,
 ) -> Result<()> {
     let refractory = open.refractory.resolve(base)?;
+    #[cfg(any(feature = "hdf5", feature = "zarr"))]
+    let nwb = open.nwb_params()?;
     let inputs = RemoteInputs::resolve(open)?;
     #[cfg(any(feature = "hdf5", feature = "dandi"))]
     let mut v = v;
@@ -832,6 +845,11 @@ fn with_session_refractory<V: SessionVisitor>(
         (Some(b), false) => b,
         (None, false) => detect_backend(open.root())?,
     };
+    #[cfg(any(feature = "hdf5", feature = "zarr"))]
+    anyhow::ensure!(
+        nwb.series != Some(sorrel_io::nwb::UNITS_ONLY_SERIES) || backend == Backend::Nwb,
+        "--nwb-series none requires the NWB backend"
+    );
     #[cfg(feature = "dandi")]
     anyhow::ensure!(
         inputs.dat.is_none() || backend == Backend::Nwb,
@@ -877,11 +895,6 @@ fn with_session_refractory<V: SessionVisitor>(
         #[cfg(any(feature = "hdf5", feature = "zarr"))]
         Backend::Nwb => {
             let path = open.root().to_path_buf();
-            let params = sorrel_io::NwbOpenParams {
-                series: open.nwb_series.as_deref(),
-                raw_path: open.dat.as_deref(),
-                sample_rate: open.sample_rate,
-            };
             #[cfg(feature = "dandi")]
             let (provider, path) = {
                 let dir = inputs
@@ -890,7 +903,7 @@ fn with_session_refractory<V: SessionVisitor>(
                     .map(|asset| Ok::<_, anyhow::Error>(dandi_data_dir()?.join(asset.state_path())))
                     .transpose()?;
                 let provider =
-                    sorrel_io::NwbProvider::open_pinned(&path, params, inputs.root, inputs.dat)?;
+                    sorrel_io::NwbProvider::open_pinned(&path, nwb, inputs.root, inputs.dat)?;
                 let path = if let Some(dir) = dir {
                     v.read_remote_trials(&provider);
                     let mut builder = std::fs::DirBuilder::new();
@@ -907,7 +920,7 @@ fn with_session_refractory<V: SessionVisitor>(
                 (provider, path)
             };
             #[cfg(not(feature = "dandi"))]
-            let provider = sorrel_io::NwbProvider::open_with(&path, params)?;
+            let provider = sorrel_io::NwbProvider::open_with(&path, nwb)?;
             #[cfg(feature = "hdf5")]
             v.prepare_nwb(&provider)?;
             let starting_time = provider.starting_time();
@@ -1599,18 +1612,38 @@ impl SessionVisitor for Describe {
         P: DataProvider<Label = PhyLabel> + ApplyPhyLabel + HasGeometry,
     {
         let s = seeded(session, seed)?;
-        let rows = describe(&s);
+        let p = &s.provider;
+        let span = p.session_span();
+        let rate = p
+            .exact_sample_rate()
+            .unwrap_or_else(|_| f64::from(p.sample_rate()));
+        let mut rows = describe(&s, &span, rate);
+        let provenance = p.trace_provenance();
+        let skipped = provenance.get("skipped_series");
+        if let Some(skipped) = skipped {
+            rows.push(("trace", "skipped (units-only)".into()));
+            let message = skipped["message"].as_str().unwrap_or_default();
+            let summary = match skipped["series"].as_str() {
+                Some(series) => format!("{series} — {message}"),
+                None => message.to_owned(),
+            };
+            rows.push(("skipped series", summary));
+        }
         if self.json {
-            let obj: serde_json::Map<String, serde_json::Value> = rows
+            let mut obj: serde_json::Map<String, serde_json::Value> = rows
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v.into()))
                 .collect();
+            obj.insert("session_span".into(), span.to_json(rate));
+            if skipped.is_some() {
+                obj.insert("provenance".into(), provenance);
+            }
             println!("{}", serde_json::to_string_pretty(&obj)?);
         } else {
             print!(
                 "{}",
                 rows.iter()
-                    .map(|(k, v)| format!("{k:<14}{v}\n"))
+                    .map(|(k, v)| format!("{k:<14}{}{v}\n", if k.len() >= 14 { " " } else { "" }))
                     .collect::<String>()
             );
         }
@@ -1619,9 +1652,18 @@ impl SessionVisitor for Describe {
 }
 
 /// phy `template-describe`: one `(name, value)` row per dataset fact.
-fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> Vec<(&'static str, String)> {
+fn describe<P: DataProvider<Label = PhyLabel>>(
+    s: &Session<P>,
+    span: &sorrel_io::SessionSpan,
+    rate: f64,
+) -> Vec<(&'static str, String)> {
     let p = &s.provider;
     let sr = p.sample_rate();
+    let rate = if rate.is_finite() && rate > 0.0 {
+        rate
+    } else {
+        f64::NAN
+    };
     let n_spikes: usize = (0..s.n_clusters())
         .map(|c| s.spike_times(sorrel_io::ClusterId(c)).len())
         .sum();
@@ -1639,7 +1681,7 @@ fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> Vec<(&'static 
             )
             .or_default() += 1;
     }
-    let rows = [
+    let mut rows = vec![
         (
             "data files",
             p.raw_file()
@@ -1653,8 +1695,23 @@ fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> Vec<(&'static 
         ("sample rate", format!("{:.1} kHz", sr / 1000.0)),
         (
             "duration",
-            format!("{:.1} s", p.n_samples().0 as f64 / sr.max(1.0) as f64),
+            format!("{:.1} s", span.recorded_samples() as f64 / rate),
         ),
+        ("duration source", span.source.to_string()),
+    ];
+    let gaps = span.gap_samples();
+    if gaps > 0 {
+        rows.push((
+            "extent",
+            format!(
+                "{:.1} s ({} intervals, {:.1} s gaps)",
+                span.extent_samples() as f64 / rate,
+                span.n_intervals(),
+                gaps as f64 / rate
+            ),
+        ));
+    }
+    rows.extend([
         ("# channels", p.n_channels().to_string()),
         ("# spikes", n_spikes.to_string()),
         (
@@ -1694,8 +1751,8 @@ fn describe<P: DataProvider<Label = PhyLabel>>(s: &Session<P>) -> Vec<(&'static 
             }
         }),
         ("undo history", s.history_len().to_string()),
-    ];
-    rows.to_vec()
+    ]);
+    rows
 }
 
 /// The save directory a host for `open` registers under: the dataset
@@ -1824,6 +1881,8 @@ fn session_path(path: &Path) -> PathBuf {
 /// Only local requests may attach to a running session. Remote and mixed
 /// requests always open fresh and let the journal lock arbitrate ownership.
 fn session_key(open: &OpenArgs) -> Result<Option<String>> {
+    #[cfg(any(feature = "hdf5", feature = "zarr"))]
+    open.nwb_params()?;
     if open.has_remote_input() {
         return Ok(None);
     }
@@ -1858,7 +1917,11 @@ fn session_key(open: &OpenArgs) -> Result<Option<String>> {
         *path = session_path(path);
     }
     #[cfg(any(feature = "hdf5", feature = "zarr"))]
-    if let Some(name) = args.nwb_series.as_mut().filter(|s| !s.starts_with('/')) {
+    if let Some(name) = args
+        .nwb_series
+        .as_mut()
+        .filter(|s| s.as_str() != sorrel_io::nwb::UNITS_ONLY_SERIES && !s.starts_with('/'))
+    {
         *name = format!("/acquisition/{name}");
     }
     // ponytail: compare normalized flags without opening a provider to resolve implicit defaults.
@@ -2435,6 +2498,8 @@ fn run_bare() -> Result<()> {
 }
 
 fn require_exists(open: &OpenArgs) -> Result<()> {
+    #[cfg(any(feature = "hdf5", feature = "zarr"))]
+    open.nwb_params()?;
     anyhow::ensure!(
         is_remote(open.root()) || open.root().exists(),
         "{} does not exist",
@@ -3123,6 +3188,53 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "hdf5")]
+    #[test]
+    fn describe_units_only_shows_estimated_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../release/fixtures/nwb/units_only.nwb");
+        let provider = sorrel_io::NwbProvider::open(path).unwrap();
+        let journal = Journal::open(&dir.path().join("j.sqlite")).unwrap();
+        let s = Session::new(provider, journal);
+        let rate = s.provider.exact_sample_rate().unwrap();
+        let rows = describe(&s, &s.provider.session_span(), rate);
+        assert!(rows.contains(&("duration", "0.2 s".into())));
+        assert!(rows
+            .iter()
+            .any(|(key, value)| *key == "duration source"
+                && value.starts_with("estimate: spike extent")));
+        assert!(!rows.iter().any(|(key, _)| *key == "extent"));
+
+        let span = sorrel_io::SessionSpan::from_intervals(
+            vec![(1000.into(), 2000.into()), (5000.into(), 7000.into())],
+            sorrel_io::SpanSource::Declared("/units/obs_intervals"),
+        );
+        let rows = describe(&s, &span, 1000.0);
+        assert!(rows.contains(&("duration", "3.0 s".into())));
+        assert!(rows.contains(&("extent", "6.0 s (2 intervals, 3.0 s gaps)".into())));
+        assert_eq!(
+            span.to_json(1000.0),
+            serde_json::json!({
+                "kind": "declared", "source": "declared: /units/obs_intervals",
+                "interval_source": "/units/obs_intervals", "start_s": 1.0, "end_s": 7.0,
+                "extent_s": 6.0, "recorded_s": 3.0, "duration_s": 3.0, "gap_s": 3.0,
+                "n_intervals": 2,
+            })
+        );
+        let unknown = span.to_json(f64::NAN);
+        for key in [
+            "start_s",
+            "end_s",
+            "extent_s",
+            "recorded_s",
+            "duration_s",
+            "gap_s",
+        ] {
+            assert!(unknown.get(key).unwrap().is_null(), "{key}");
+        }
+    }
+
     /// The crate-local icon decodes, and still equals the canonical asset
     /// (absent in a packaged crate).
     #[test]
@@ -3539,6 +3651,34 @@ mod tests {
         assert_eq!(
             tab_target(&open, session_key(&open)?.as_deref(), tabs())?,
             None
+        );
+        Ok(())
+    }
+
+    #[cfg(any(feature = "hdf5", feature = "zarr"))]
+    #[test]
+    fn nwb_units_only_tab_and_host_keys_keep_none_distinct_from_a_path() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut open = OpenArgs {
+            root: Some(dir.path().join("sorting.nwb")),
+            nwb_series: Some("none".into()),
+            ..Default::default()
+        };
+        let key = session_key(&open)?.unwrap();
+        let tabs = || [(dir.path(), Some(key.as_str()))].into_iter();
+        assert!(mcp_open_args(&open)?.contains("--nwb-series none"));
+        assert_eq!(tab_target(&open, Some(&key), tabs())?, Some(0));
+        for series in [None, Some("/acquisition/none")] {
+            open.nwb_series = series.map(str::to_owned);
+            let err = tab_target(&open, session_key(&open)?.as_deref(), tabs()).unwrap_err();
+            assert!(err.to_string().contains("session conflict"), "{err}");
+        }
+        open.nwb_series = Some("none".into());
+        open.dat = Some("https://example.invalid/recording.nwb".into());
+        let err = session_key(&open).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be combined with --dat"),
+            "{err}"
         );
         Ok(())
     }

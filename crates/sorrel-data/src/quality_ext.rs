@@ -34,12 +34,11 @@ pub(crate) fn cluster_quality_with<P: DataProvider>(
     refractory_samples: u64,
 ) -> QualityBreakdown {
     let sr = session.provider.sample_rate().max(1.0);
-    let total_duration = session.provider.n_samples();
     let mut q = quality_breakdown(
         session.spike_times(cluster),
         session.spike_amplitudes(cluster),
         refractory_samples,
-        total_duration.0,
+        session.unit_span(cluster),
         sr,
         50,
     );

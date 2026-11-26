@@ -104,7 +104,6 @@ fn rows<P: DataProvider>(
     s: &Session<P>,
     depths: Option<&SpikeDepths>,
 ) -> Vec<(ClusterId, [f32; 5])> {
-    let duration = (s.provider.n_samples().0 as f32 / s.provider.sample_rate().max(1.0)).max(1e-3);
     let (_, ns, nc) = s.template_shape();
     (0..s.n_clusters())
         .map(ClusterId)
@@ -134,7 +133,19 @@ fn rows<P: DataProvider>(
                     })
                 })
                 .map_or(f32::NAN, |ch| ch as f32);
-            (c, [n, n / duration, mean(s.spike_amplitudes(c)), depth, ch])
+            let span = s.unit_span(c);
+            let duration = span.duration_seconds(s.provider.sample_rate());
+            let exposed = span.metric_spikes(s.spike_times(c)).len() as f32;
+            (
+                c,
+                [
+                    n,
+                    exposed / duration,
+                    mean(s.spike_amplitudes(c)),
+                    depth,
+                    ch,
+                ],
+            )
         })
         .collect()
 }
@@ -186,8 +197,9 @@ pub fn cluster_scatter_view<P: DataProvider>(
         .map(|r| r.2.as_slice())
         .unwrap_or_default();
     let value = |r: &[f32; 5], axis: usize| {
-        let v = r[col_index(state.axes[axis])];
-        if state.log[axis] {
+        let col = state.axes[axis];
+        let v = r[col_index(col)];
+        if state.log[axis] && (col != Column::FiringRate || v.is_finite()) {
             v.max(1e-6).log10()
         } else {
             v

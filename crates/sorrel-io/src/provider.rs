@@ -1,5 +1,8 @@
+use std::borrow::Cow;
 use std::fmt::Debug;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// One saved row of the annotations sidecar, as text: the origin label is
 /// parsed by the session (`sorrel_data::UnitOrigin::parse`), which owns the
@@ -72,6 +75,311 @@ impl std::fmt::Display for SampleIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(&self.0, f)
     }
+}
+
+/// Provenance of the exposure used for session-wide spike statistics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpanSource {
+    Trace,
+    Declared(&'static str),
+    SpikeExtent { rejected: Option<&'static str> },
+    Unavailable,
+}
+
+impl std::fmt::Display for SpanSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Trace => f.write_str("trace"),
+            Self::Declared(path) => write!(f, "declared: {path}"),
+            Self::SpikeExtent { rejected: None } => f.write_str("estimate: spike extent"),
+            Self::SpikeExtent {
+                rejected: Some(path),
+            } => {
+                write!(
+                    f,
+                    "estimate: spike extent ({path} does not cover all spikes)"
+                )
+            }
+            Self::Unavailable => f.write_str("unavailable"),
+        }
+    }
+}
+
+type SampleInterval = (SampleIndex, SampleIndex);
+
+/// Recorded exposure on the spike sample grid, with outer bounds `[start, end)`.
+/// It does not imply that any raw samples can be read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSpan {
+    pub start: SampleIndex,
+    pub end: SampleIndex,
+    pub source: SpanSource,
+    // Contiguous (including trace-backed) and empty spans need no allocation.
+    gapped: Option<Arc<[SampleInterval]>>,
+}
+
+impl SessionSpan {
+    pub fn contiguous(start: SampleIndex, end: SampleIndex, source: SpanSource) -> Self {
+        Self {
+            start,
+            end,
+            source,
+            gapped: None,
+        }
+    }
+
+    /// Form the union of half-open intervals, ignoring empty rows.
+    pub fn from_intervals(mut intervals: Vec<SampleInterval>, source: SpanSource) -> Self {
+        intervals.retain(|&(lo, hi)| lo < hi);
+        intervals.sort_unstable();
+        let mut n = 0;
+        for i in 0..intervals.len() {
+            let (lo, hi) = intervals[i];
+            if n > 0 && lo <= intervals[n - 1].1 {
+                intervals[n - 1].1 = intervals[n - 1].1.max(hi);
+            } else {
+                intervals[n] = (lo, hi);
+                n += 1;
+            }
+        }
+        intervals.truncate(n);
+        Self::from_sorted_disjoint(intervals, source)
+    }
+
+    fn from_sorted_disjoint(intervals: Vec<SampleInterval>, source: SpanSource) -> Self {
+        let mut span = Self::contiguous(
+            intervals.first().map_or(SampleIndex(0), |&(lo, _)| lo),
+            intervals.last().map_or(SampleIndex(0), |&(_, hi)| hi),
+            source,
+        );
+        if intervals.len() > 1 {
+            span.gapped = Some(intervals.into());
+        }
+        span
+    }
+
+    pub fn intervals(&self) -> impl Iterator<Item = SampleInterval> + '_ {
+        self.intervals_skipping(|_| false)
+    }
+
+    /// Whole intervals after a prefix of skipped ends. `skip_end` must be
+    /// true only up to a cutoff on the sample clock.
+    pub fn intervals_skipping(
+        &self,
+        skip_end: impl Fn(SampleIndex) -> bool,
+    ) -> impl Iterator<Item = SampleInterval> + Clone + '_ {
+        let rows = self.gapped.as_deref().unwrap_or_default();
+        let i = if skip_end(self.start) {
+            rows.partition_point(|&(_, hi)| skip_end(hi))
+        } else {
+            0
+        };
+        (self.gapped.is_none() && self.start < self.end && !skip_end(self.end))
+            .then_some((self.start, self.end))
+            .into_iter()
+            .chain(rows[i..].iter().copied())
+    }
+
+    /// Shared exposure on the same acquisition clock. Retains `self`'s source.
+    pub fn intersect(&self, other: &Self) -> Self {
+        let mut left = self.intervals_skipping(|end| end <= other.start).peekable();
+        let mut right = other.intervals_skipping(|end| end <= self.start).peekable();
+        let mut rows = Vec::new();
+        while let (Some(&(a, b)), Some(&(c, d))) = (left.peek(), right.peek()) {
+            let (lo, hi) = (a.max(c), b.min(d));
+            if lo < hi {
+                rows.push((lo, hi));
+            }
+            if b <= d {
+                left.next();
+            }
+            if d <= b {
+                right.next();
+            }
+        }
+        Self::from_sorted_disjoint(rows, self.source)
+    }
+
+    /// Combine exposures on the same acquisition clock.
+    pub fn union_with<'a>(&self, others: impl IntoIterator<Item = &'a Self>) -> Self {
+        let mut others = others.into_iter().filter(|&span| span != self).peekable();
+        if others.peek().is_none() {
+            return self.clone();
+        }
+        Self::from_intervals(
+            self.intervals()
+                .chain(others.flat_map(Self::intervals))
+                .collect(),
+            self.source,
+        )
+    }
+
+    pub fn n_intervals(&self) -> usize {
+        self.gapped
+            .as_ref()
+            .map_or(usize::from(self.start < self.end), |rows| rows.len())
+    }
+
+    pub fn extent_samples(&self) -> u64 {
+        self.end.0.saturating_sub(self.start.0)
+    }
+
+    pub fn recorded_samples(&self) -> u64 {
+        self.gapped.as_ref().map_or_else(
+            || self.extent_samples(),
+            |rows| rows.iter().map(|&(lo, hi)| hi.0 - lo.0).sum(),
+        )
+    }
+
+    pub fn duration_samples(&self) -> u64 {
+        self.recorded_samples()
+    }
+
+    pub fn gap_samples(&self) -> u64 {
+        self.extent_samples() - self.recorded_samples()
+    }
+
+    /// Exposure and its provenance on the spike sample grid, in seconds.
+    /// An empty span or an invalid rate has no time measurements.
+    pub fn to_json(&self, rate: f64) -> serde_json::Value {
+        let (kind, interval_source) = match self.source {
+            SpanSource::Trace => ("measured", None),
+            SpanSource::Declared(path) => ("declared", Some(path)),
+            SpanSource::SpikeExtent { .. } => ("derived", None),
+            SpanSource::Unavailable => ("unavailable", None),
+        };
+        let recorded = self.recorded_samples();
+        let known = recorded > 0 && rate.is_finite() && rate > 0.0;
+        let seconds = |samples: u64| known.then(|| samples as f64 / rate);
+        let recorded_s = seconds(recorded);
+        serde_json::json!({
+            "kind": kind,
+            "source": self.source.to_string(),
+            "interval_source": interval_source,
+            "start_s": seconds(self.start.0),
+            "end_s": seconds(self.end.0),
+            "extent_s": seconds(self.extent_samples()),
+            "recorded_s": recorded_s,
+            "duration_s": recorded_s,
+            "gap_s": seconds(self.gap_samples()),
+            "n_intervals": self.n_intervals(),
+        })
+    }
+
+    pub fn contains(&self, sample: SampleIndex) -> bool {
+        if let Some(rows) = &self.gapped {
+            let i = rows.partition_point(|&(_, hi)| hi <= sample);
+            rows.get(i).is_some_and(|&(lo, _)| sample >= lo)
+        } else {
+            (self.start..self.end).contains(&sample)
+        }
+    }
+
+    /// Exposure for firing-rate metrics, or NaN if there is no usable exposure.
+    pub fn duration_seconds(&self, sample_rate: f32) -> f32 {
+        let rate = if self.source == SpanSource::Trace {
+            sample_rate.max(1.0)
+        } else {
+            sample_rate
+        };
+        let duration = self.duration_samples() as f32 / rate;
+        if rate.is_finite() && rate > 0.0 && duration.is_finite() && duration > 0.0 {
+            duration
+        } else {
+            f32::NAN
+        }
+    }
+
+    fn spike_range(times: &[SampleIndex], start: SampleIndex, end: SampleIndex) -> Range<usize> {
+        let lo = times.partition_point(|&t| t < start);
+        lo..lo + times[lo..].partition_point(|&t| t < end)
+    }
+
+    /// Recorded spikes at their original sample indices, so e.g. a
+    /// refractory check does not invent spike pairs across recording pauses.
+    /// Trace-backed inputs keep their legacy handling of out-of-range spikes.
+    pub fn metric_spikes<'a>(&self, times: &'a [SampleIndex]) -> Cow<'a, [SampleIndex]> {
+        if self.source == SpanSource::Trace {
+            return Cow::Borrowed(times);
+        }
+        let times = &times[Self::spike_range(times, self.start, self.end)];
+        if self.gapped.is_none()
+            || self
+                .intervals()
+                .map(|(lo, hi)| Self::spike_range(times, lo, hi).len())
+                .sum::<usize>()
+                == times.len()
+        {
+            return Cow::Borrowed(times);
+        }
+        Cow::Owned(
+            self.intervals()
+                .flat_map(|(lo, hi)| times[Self::spike_range(times, lo, hi)].iter().copied())
+                .collect(),
+        )
+    }
+
+    /// `(index in times, recorded-time offset)` for sorted spikes. Trace
+    /// spans keep every spike and use the legacy zero-based sample clock.
+    pub fn recorded_offsets<'a>(
+        &'a self,
+        times: &'a [SampleIndex],
+    ) -> impl Iterator<Item = (usize, u64)> + 'a {
+        let trace = self.source == SpanSource::Trace;
+        let mut offset = 0;
+        trace
+            .then_some((0..times.len(), self.start, 0))
+            .into_iter()
+            .chain(
+                self.intervals()
+                    .filter(move |_| !trace)
+                    .map(move |(lo, hi)| {
+                        let segment = (Self::spike_range(times, lo, hi), lo, offset);
+                        offset += hi.0 - lo.0;
+                        segment
+                    }),
+            )
+            .flat_map(move |(range, lo, offset)| {
+                range.map(move |i| (i, offset + (times[i].0 - lo.0)))
+            })
+    }
+
+    /// Map an offset back onto the acquisition clock. A boundary at a pause
+    /// maps to the next segment's start; the final boundary maps to `end`.
+    pub fn sample_at_offset(&self, mut offset: u64) -> SampleIndex {
+        for (lo, hi) in self.intervals() {
+            let len = hi.0 - lo.0;
+            if offset < len {
+                return SampleIndex(lo.0 + offset);
+            }
+            offset -= len;
+        }
+        self.end
+    }
+}
+
+impl From<u64> for SessionSpan {
+    fn from(trace_samples: u64) -> Self {
+        Self::contiguous(
+            SampleIndex(0),
+            SampleIndex(trace_samples),
+            SpanSource::Trace,
+        )
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn firing_rate_uses_exact_span_exposure() {
+    let span = SessionSpan::contiguous(
+        SampleIndex(30_720_000),
+        SampleIndex(30_720_001),
+        SpanSource::SpikeExtent { rejected: None },
+    );
+    assert_eq!(1.0 / span.duration_seconds(30_000.0), 30_000.0);
+    assert!(span.duration_seconds(f32::NAN).is_nan());
+    let empty = SessionSpan::contiguous(span.start, span.start, span.source);
+    assert!(empty.duration_seconds(30_000.0).is_nan());
 }
 
 #[repr(transparent)]
@@ -441,7 +749,29 @@ pub trait DataProvider: Send + Sync + 'static {
         Ok(f64::from(self.sample_rate()))
     }
     fn n_channels(&self) -> u32;
+    /// Length of the readable raw trace, not the session exposure.
     fn n_samples(&self) -> SampleIndex;
+    /// Whether any raw samples can be read, independent of exposure provenance.
+    fn has_trace(&self) -> bool {
+        self.n_samples().0 > 0
+    }
+    /// Exposure for session-wide spike statistics, independent of raw reads.
+    fn session_span(&self) -> SessionSpan {
+        self.n_samples().0.into()
+    }
+    /// Exposure for one unit; most backends share a single session span.
+    fn unit_span(&self, _cluster: ClusterId) -> SessionSpan {
+        self.session_span()
+    }
+    /// Trace mode and, for an explicitly skipped NWB trace, its inspection result.
+    fn trace_provenance(&self) -> serde_json::Value {
+        let mode = if self.has_trace() {
+            "trace"
+        } else {
+            "units-only"
+        };
+        serde_json::json!({ "mode": mode })
+    }
     fn n_clusters(&self) -> u32;
 
     /// Spike sample indices for a single cluster, sorted ascending.

@@ -386,6 +386,12 @@ fn phy_from_sparse_pc_feature_lookup_round_trip() {
         fn n_samples(&self) -> SampleIndex {
             self.inner.n_samples()
         }
+        fn session_span(&self) -> sorrel_io::SessionSpan {
+            self.inner.session_span()
+        }
+        fn unit_span(&self, cluster: ClusterId) -> sorrel_io::SessionSpan {
+            self.inner.unit_span(cluster)
+        }
         fn n_clusters(&self) -> u32 {
             self.inner.n_clusters()
         }
@@ -587,6 +593,12 @@ fn phy_feature_view_channels_and_lookup() {
         fn n_samples(&self) -> SampleIndex {
             self.inner.n_samples()
         }
+        fn session_span(&self) -> sorrel_io::SessionSpan {
+            self.inner.session_span()
+        }
+        fn unit_span(&self, cluster: ClusterId) -> sorrel_io::SessionSpan {
+            self.inner.unit_span(cluster)
+        }
         fn n_clusters(&self) -> u32 {
             self.inner.n_clusters()
         }
@@ -672,6 +684,12 @@ fn phy_cluster_similarity_is_max_over_templates() {
         }
         fn n_samples(&self) -> SampleIndex {
             self.inner.n_samples()
+        }
+        fn session_span(&self) -> sorrel_io::SessionSpan {
+            self.inner.session_span()
+        }
+        fn unit_span(&self, cluster: ClusterId) -> sorrel_io::SessionSpan {
+            self.inner.unit_span(cluster)
         }
         fn n_clusters(&self) -> u32 {
             self.inner.n_clusters()
@@ -789,6 +807,12 @@ fn phy_split_init_restores_one_cluster_per_template() {
         fn n_samples(&self) -> SampleIndex {
             self.inner.n_samples()
         }
+        fn session_span(&self) -> sorrel_io::SessionSpan {
+            self.inner.session_span()
+        }
+        fn unit_span(&self, cluster: ClusterId) -> sorrel_io::SessionSpan {
+            self.inner.unit_span(cluster)
+        }
         fn n_clusters(&self) -> u32 {
             self.inner.n_clusters()
         }
@@ -852,6 +876,12 @@ fn phy_spike_attributes_and_reorder() {
         }
         fn n_samples(&self) -> SampleIndex {
             self.inner.n_samples()
+        }
+        fn session_span(&self) -> sorrel_io::SessionSpan {
+            self.inner.session_span()
+        }
+        fn unit_span(&self, cluster: ClusterId) -> sorrel_io::SessionSpan {
+            self.inner.unit_span(cluster)
         }
         fn n_clusters(&self) -> u32 {
             self.inner.n_clusters()

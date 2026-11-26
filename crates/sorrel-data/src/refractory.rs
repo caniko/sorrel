@@ -1,5 +1,5 @@
 use sorrel_compute::{sliding_refractory_argmin, RefractoryParams};
-use sorrel_io::SampleIndex;
+use sorrel_io::{SampleIndex, SessionSpan};
 
 /// Versioned model features (including QC, evaluations and proposer inputs)
 /// must never follow user settings. Keep the legacy sample rounding and
@@ -47,15 +47,15 @@ fn ccg_bins_round_alike() {
 }
 
 impl RefractoryWindows<'_> {
-    pub(crate) fn sweep(self, times: &[SampleIndex], total: u64, sr: f32) -> (f32, u64) {
+    pub(crate) fn sweep(self, times: &[SampleIndex], span: &SessionSpan, sr: f32) -> (f32, u64) {
         match self {
-            Self::Session(params) => params.sweep(times, total, sr),
+            Self::Session(params) => params.sweep(times, span, sr),
             Self::Learn => sliding_refractory_argmin(
                 times,
                 (sr * 0.0005) as u64,
                 (sr * 0.010) as u64,
                 20,
-                total,
+                span.duration_samples(),
                 sr,
             ),
         }
