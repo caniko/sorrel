@@ -620,12 +620,8 @@ fn score_split<P: DataProvider>(
             }
         }
     }
-    let contamination = refractory_contamination(
-        &span.metric_spikes(times),
-        refractory_samples,
-        span.duration_samples(),
-        sr,
-    );
+    let contamination =
+        refractory_contamination(&span.metric_spikes(times), refractory_samples, &span, sr);
     let cont_score = (contamination * 2.0).clamp(0.0, 1.0);
     let drift = amplitude_drift_correlation(times, amps).abs();
     let drift_score = ((drift - 0.3) / 0.5).clamp(0.0, 1.0);

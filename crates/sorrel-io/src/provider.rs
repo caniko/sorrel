@@ -143,22 +143,61 @@ impl SessionSpan {
             }
         }
         intervals.truncate(n);
+        Self::from_sorted_disjoint(intervals, source)
+    }
+
+    fn from_sorted_disjoint(intervals: Vec<SampleInterval>, source: SpanSource) -> Self {
         let mut span = Self::contiguous(
             intervals.first().map_or(SampleIndex(0), |&(lo, _)| lo),
             intervals.last().map_or(SampleIndex(0), |&(_, hi)| hi),
             source,
         );
-        if n > 1 {
+        if intervals.len() > 1 {
             span.gapped = Some(intervals.into());
         }
         span
     }
 
     pub fn intervals(&self) -> impl Iterator<Item = SampleInterval> + '_ {
-        (self.gapped.is_none() && self.start < self.end)
+        self.intervals_skipping(|_| false)
+    }
+
+    /// Whole intervals after a prefix of skipped ends. `skip_end` must be
+    /// true only up to a cutoff on the sample clock.
+    pub fn intervals_skipping(
+        &self,
+        skip_end: impl Fn(SampleIndex) -> bool,
+    ) -> impl Iterator<Item = SampleInterval> + Clone + '_ {
+        let rows = self.gapped.as_deref().unwrap_or_default();
+        let i = if skip_end(self.start) {
+            rows.partition_point(|&(_, hi)| skip_end(hi))
+        } else {
+            0
+        };
+        (self.gapped.is_none() && self.start < self.end && !skip_end(self.end))
             .then_some((self.start, self.end))
             .into_iter()
-            .chain(self.gapped.iter().flat_map(|rows| rows.iter().copied()))
+            .chain(rows[i..].iter().copied())
+    }
+
+    /// Shared exposure on the same acquisition clock. Retains `self`'s source.
+    pub fn intersect(&self, other: &Self) -> Self {
+        let mut left = self.intervals_skipping(|end| end <= other.start).peekable();
+        let mut right = other.intervals_skipping(|end| end <= self.start).peekable();
+        let mut rows = Vec::new();
+        while let (Some(&(a, b)), Some(&(c, d))) = (left.peek(), right.peek()) {
+            let (lo, hi) = (a.max(c), b.min(d));
+            if lo < hi {
+                rows.push((lo, hi));
+            }
+            if b <= d {
+                left.next();
+            }
+            if d <= b {
+                right.next();
+            }
+        }
+        Self::from_sorted_disjoint(rows, self.source)
     }
 
     /// Combine exposures on the same acquisition clock.

@@ -17,7 +17,7 @@ use crate::suggest::MergeCandidate;
 use sorrel_compute::epochs::stable_epochs;
 use sorrel_compute::{
     burst_index, gmm_split_proposal, log_bins, mean_amplitude, peak_channel, sax,
-    waveform_landmarks, RefractoryParams,
+    waveform_landmarks, RefractoryExposure, RefractoryParams,
 };
 use sorrel_io::{ClusterId, DataProvider, SampleIndex, SessionSpan, SpanSource};
 
@@ -245,13 +245,18 @@ pub fn run<P: DataProvider>(
         Query::Acg { c, win, bin } => {
             let c = cl(session, *c)?;
             let span = session.unit_span(c);
+            let exposure = if span.source == SpanSource::Trace {
+                RefractoryExposure::from(span.duration_samples().max(1))
+            } else {
+                RefractoryExposure::from(&span)
+            };
             let (b, w) = (samples(*bin).max(1), samples(*win));
             let h = acg_or_compute(session, c, b, w);
             Ok(acg_text(
                 c.0,
                 &span.metric_spikes(times(c)),
                 sr,
-                span.duration_samples().max(1),
+                exposure,
                 &h,
                 b as f32 * 1000.0 / sr,
                 *win,
@@ -436,18 +441,18 @@ fn axis_handles<P: DataProvider>(
 
 /// ACG detail from the centred two-sided histogram `h`.
 #[allow(clippy::too_many_arguments)]
-pub fn acg_text(
+pub fn acg_text<'a>(
     c: u32,
     times: &[SampleIndex],
     sr: f32,
-    total: u64,
+    exposure: impl Into<RefractoryExposure<'a>>,
     h: &[u32],
     bin_ms: f32,
     win_ms: f32,
     extra: &[(String, f32)],
     params: &RefractoryParams,
 ) -> String {
-    let (cont, rp) = params.sweep(times, total, sr);
+    let (cont, rp) = params.sweep(times, exposure, sr);
     let rp = match rp {
         0 => "-".into(),
         r => format!("{:.1}ms", r as f32 * 1000.0 / sr),

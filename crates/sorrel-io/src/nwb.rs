@@ -836,12 +836,10 @@ mod imp {
             index.shape() == [spikes.len()],
             "expected one observation index per unit"
         );
-        if let Some(target) = index.reference_path("target")? {
-            ensure!(
-                target == OBS_INTERVALS,
-                "invalid observation interval index target"
-            );
-        }
+        ensure!(
+            index.target_matches(f, &ds, OBS_INTERVALS)?,
+            "invalid observation interval index target"
+        );
         let signed = match index.sample_type()? {
             SampleType::I8 | SampleType::I16 | SampleType::I32 | SampleType::I64 => true,
             SampleType::U8 | SampleType::U16 | SampleType::U32 | SampleType::U64 => false,

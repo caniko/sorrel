@@ -179,7 +179,8 @@ distance where PC features are available, composite quality), and writes:
 - `out/qc/cluster_qc.provenance.json` — a separate object with `schema_version: 1`,
   `session_span`, trace `provenance`, and `composite_terms` by cluster ID.
 
-The sidecar and `sorrel describe --json` share the same `session_span` object.
+The sidecar and `sorrel describe --json` share the same `session_span` object,
+which describes the session-wide union of recorded intervals.
 `kind` is `measured`, `declared`, `derived`, or `unavailable`; `source` describes
 the origin, and `interval_source` is the declared NWB path or `null`.
 `start_s` and `end_s` are the outer bounds on the spike sample grid (end
@@ -194,12 +195,16 @@ Units observation intervals (their union for the session), then epochs, then
 trials. If none covers the spikes, Sorrel estimates the span from the first
 spike through one sample past the last spike.
 
-Firing rate and presence use the reported span, including when it is
-derived; neither is available when there is no span (`null` in JSON,
-blank in TSV). `isi_violation_ratio` counts violations
-per second of that unit's own first-to-last spike span, not a fraction of
-spikes or a rate over the session. It is missing when that unit has no
-positive spike span.
+Firing rate, presence, and coverage use each unit's recorded intervals,
+or the session span when no separate unit intervals are declared. Without a
+usable span, these metrics are `null` in JSON and blank in TSV. If any unit's
+span differs from the session union, the sidecar lists every cluster's
+denominator in seconds under `unit_recorded_s` (`null` when unavailable).
+For units-only data, refractory contamination estimates also require
+observable positive lags within the tested window. `isi_violation_ratio`
+counts violations per second of that unit's own first-to-last spike span,
+not a fraction of spikes or a rate over the session. It is missing when
+that unit has no positive spike span.
 
 Amplitude metrics require per-spike amplitudes, even if raw traces or
 waveform templates are available. Unmeasured metrics are `null` in JSON

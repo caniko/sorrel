@@ -9,7 +9,7 @@ use std::sync::Arc;
 use egui::{Color32, Sense, Stroke, Ui};
 use sorrel_compute::{ccg_baseline, correlograms};
 use sorrel_data::Session;
-use sorrel_io::{ClusterId, DataProvider, SampleIndex};
+use sorrel_io::{ClusterId, DataProvider, SampleIndex, SessionSpan, SpanSource};
 
 use crate::jobs::{JobCtx, Memo};
 use crate::prefs::CcgParams;
@@ -43,6 +43,8 @@ pub struct CcgData {
     coverage: f64,
     /// Seconds the used spikes come from: the baseline's duration.
     duration_s: f64,
+    /// Shared-window baselines for interval-backed data; traces use `duration_s`.
+    baselines: Option<Vec<Vec<f64>>>,
 }
 
 type CcgKey = (Vec<ClusterId>, u64, f32, f32);
@@ -79,9 +81,11 @@ impl CcgCache {
                 let span = s.provider.session_span();
                 let n_samples = span.duration_samples();
                 let window = (window_ms as f64 / 1e3 * sr as f64).ceil() as u64;
+                let unit_spans: Vec<_> = cl.iter().map(|&c| s.unit_span(c)).collect();
                 let all: Vec<_> = cl
                     .iter()
-                    .map(|&c| s.unit_span(c).metric_spikes(s.spike_times(c)))
+                    .zip(&unit_spans)
+                    .map(|(&c, span)| span.metric_spikes(s.spike_times(c)))
                     .collect();
                 let all: Vec<_> = all.iter().map(|t| t.as_ref()).collect();
                 let (chunks, trains) = sample_trains(&all, span.clone(), MAX_SPIKES, window);
@@ -94,6 +98,18 @@ impl CcgCache {
                         })
                         .sum()
                 });
+                let baselines = (span.source != SpanSource::Trace).then(|| {
+                    let unit_spans = if let Some(chunks) = &chunks {
+                        let kept = SessionSpan::from_intervals(
+                            chunks.iter().map(|&(a, b)| (a.into(), b.into())).collect(),
+                            span.source,
+                        );
+                        unit_spans.iter().map(|s| s.intersect(&kept)).collect()
+                    } else {
+                        unit_spans
+                    };
+                    interval_baselines(&unit_spans, &trains, bin_ms as f64 / 1e3, f64::from(sr))
+                });
                 Arc::new(CcgData {
                     counts: correlograms(&refs, sr, bin_ms as f64 / 1e3, window_ms as f64 / 1e3),
                     n_used: trains.iter().map(Vec::len).collect(),
@@ -101,6 +117,7 @@ impl CcgCache {
                     bin_ms,
                     coverage: covered as f64 / n_samples.max(1) as f64,
                     duration_s: covered as f64 / sr as f64,
+                    baselines,
                 })
             })
             .cloned();
@@ -242,6 +259,42 @@ fn next_budget(budget: usize, max: usize, n: usize) -> usize {
 /// Spikes of an ascending train in `[a, b)`.
 fn count_in(times: &[SampleIndex], a: u64, b: u64) -> usize {
     times.partition_point(|t| t.0 < b) - times.partition_point(|t| t.0 < a)
+}
+
+fn interval_baselines(
+    spans: &[SessionSpan],
+    trains: &[Vec<SampleIndex>],
+    bin_s: f64,
+    sr: f64,
+) -> Vec<Vec<f64>> {
+    let mut baselines = vec![vec![0.0; spans.len()]; spans.len()];
+    for (i, span) in spans.iter().enumerate() {
+        let samples = span.recorded_samples();
+        if samples > 0 {
+            baselines[i][i] =
+                ccg_baseline(trains[i].len(), trains[i].len(), bin_s, samples as f64 / sr);
+        }
+        for j in i + 1..spans.len() {
+            // A flat near-zero-lag reference is only meaningful where both
+            // units were observed. Spikes outside the shared window cannot
+            // estimate either rate within it.
+            let shared = span.intersect(&spans[j]);
+            let samples = shared.recorded_samples();
+            if samples == 0 {
+                continue;
+            }
+            let n = |k: usize| {
+                shared
+                    .intervals()
+                    .map(|(a, b)| count_in(&trains[k], a.0, b.0))
+                    .sum()
+            };
+            let baseline = ccg_baseline(n(i), n(j), bin_s, samples as f64 / sr);
+            baselines[i][j] = baseline;
+            baselines[j][i] = baseline;
+        }
+    }
+    baselines
 }
 
 /// The spikes of an ascending train that fall inside `chunks` (all of them
@@ -549,7 +602,10 @@ fn grid<P: DataProvider>(
 
             let h = &data.counts[ri][ci];
             let max_count = h.iter().copied().max().unwrap_or(0);
-            let baseline = ccg_baseline(data.n_used[ri], data.n_used[ci], bin_s, data.duration_s);
+            let baseline = data.baselines.as_ref().map_or_else(
+                || ccg_baseline(data.n_used[ri], data.n_used[ci], bin_s, data.duration_s),
+                |baselines| baselines[ri][ci],
+            );
             let y_top = y_top(max_count, global_max, baseline, p.uniform);
             let colour = if ri >= n_real {
                 ghost_grey
@@ -715,6 +771,26 @@ mod tests {
 
     fn train(n: u64, step: u64) -> Vec<SampleIndex> {
         (0..n).map(|i| SampleIndex(i * step)).collect()
+    }
+
+    #[test]
+    fn interval_baselines_use_unit_and_shared_exposure() {
+        let source = sorrel_io::SpanSource::Declared("/units/obs_intervals");
+        let spans = [
+            sorrel_io::SessionSpan::contiguous(0.into(), 1000.into(), source),
+            sorrel_io::SessionSpan::contiguous(9000.into(), 10_000.into(), source),
+            sorrel_io::SessionSpan::contiguous(500.into(), 1500.into(), source),
+        ];
+        let trains = [
+            train(100, 10),
+            (9000..10_000).step_by(10).map(SampleIndex).collect(),
+            (500..1500).step_by(10).map(SampleIndex).collect(),
+        ];
+        let baselines = interval_baselines(&spans, &trains, 0.001, 1000.0);
+        assert_eq!(baselines[0][0], 10.0);
+        assert_eq!(baselines[0][1], 0.0);
+        assert_eq!(baselines[0][2], 5.0, "only spikes in the shared 0.5 s");
+        assert_eq!(baselines[2][0], baselines[0][2]);
     }
 
     #[test]

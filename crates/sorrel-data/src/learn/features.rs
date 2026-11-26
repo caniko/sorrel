@@ -1887,7 +1887,7 @@ fn template_compare<P: DataProvider + HasGeometry>(
 /// root-local indices; `NaN` when no refractory window fits.
 fn measure(times: &[SampleIndex], idx: &[u32], sr: f32, total: u64) -> f32 {
     let pick: Vec<SampleIndex> = idx.iter().map(|&i| times[i as usize]).collect();
-    let (c, rp) = LEARN_WINDOWS.sweep(&pick, total, sr);
+    let (c, rp) = LEARN_WINDOWS.sweep(&pick, &total.into(), sr);
     if rp > 0 {
         c
     } else {

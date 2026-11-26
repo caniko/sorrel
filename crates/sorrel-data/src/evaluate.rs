@@ -90,7 +90,7 @@ pub(crate) fn unit_stats_with(
 ) -> UnitStats {
     let span = span.into();
     let exposed = span.metric_spikes(times);
-    let (c, rp) = windows.sweep(&exposed, span.duration_samples(), sr);
+    let (c, rp) = windows.sweep(&exposed, &span, sr);
     let refractory = windows.fixed_samples(sr);
     let q = quality_breakdown(times, amps, refractory, span, sr, PRESENCE_BINS);
     UnitStats {

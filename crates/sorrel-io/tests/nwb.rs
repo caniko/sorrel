@@ -200,40 +200,44 @@ fn opt_in_units_only_does_not_scan_timestamps_or_load_trace() {
 }
 
 #[cfg(feature = "hdf5")]
+fn object_ref_attr(dataset: &hdf5_metno::Dataset, name: &std::ffi::CStr, target: &std::ffi::CStr) {
+    use hdf5_metno_sys::{
+        h5a::{H5Aclose, H5Acreate2, H5Awrite},
+        h5p::H5P_DEFAULT,
+        h5r::{hobj_ref_t, H5R_type_t::H5R_OBJECT1, H5Rcreate},
+        h5s::{H5S_class_t::H5S_SCALAR, H5Sclose, H5Screate},
+        h5t::H5T_STD_REF_OBJ,
+    };
+    hdf5_metno::sync::sync(|| {
+        // SAFETY: live dataset ID, NUL-terminated names and one scalar reference.
+        unsafe {
+            let mut reference: hobj_ref_t = 0;
+            let reference = (&mut reference as *mut hobj_ref_t).cast();
+            assert!(H5Rcreate(reference, dataset.id(), target.as_ptr(), H5R_OBJECT1, -1) >= 0);
+            let space = H5Screate(H5S_SCALAR);
+            assert!(space >= 0);
+            let attr = H5Acreate2(
+                dataset.id(),
+                name.as_ptr(),
+                *H5T_STD_REF_OBJ,
+                space,
+                H5P_DEFAULT,
+                H5P_DEFAULT,
+            );
+            assert!(attr >= 0);
+            assert!(H5Awrite(attr, *H5T_STD_REF_OBJ, reference) >= 0);
+            assert!(H5Aclose(attr) >= 0);
+            assert!(H5Sclose(space) >= 0);
+        }
+    });
+}
+
+#[cfg(feature = "hdf5")]
 #[test]
 fn auto_series_requires_units_electrode_coverage_in_the_same_table() {
-    fn table_ref(region: &hdf5_metno::Dataset, table: &std::ffi::CStr) {
-        use hdf5_metno_sys::{
-            h5a::{H5Aclose, H5Acreate2, H5Awrite},
-            h5p::H5P_DEFAULT,
-            h5r::{hobj_ref_t, H5R_type_t::H5R_OBJECT1, H5Rcreate},
-            h5s::{H5S_class_t::H5S_SCALAR, H5Sclose, H5Screate},
-            h5t::H5T_STD_REF_OBJ,
-        };
-        hdf5_metno::sync::sync(|| {
-            // SAFETY: live dataset ID, NUL-terminated names and one scalar reference.
-            unsafe {
-                let mut reference: hobj_ref_t = 0;
-                let reference = (&mut reference as *mut hobj_ref_t).cast();
-                assert!(H5Rcreate(reference, region.id(), table.as_ptr(), H5R_OBJECT1, -1) >= 0);
-                let space = H5Screate(H5S_SCALAR);
-                assert!(space >= 0);
-                let attr = H5Acreate2(
-                    region.id(),
-                    c"table".as_ptr(),
-                    *H5T_STD_REF_OBJ,
-                    space,
-                    H5P_DEFAULT,
-                    H5P_DEFAULT,
-                );
-                assert!(attr >= 0);
-                assert!(H5Awrite(attr, *H5T_STD_REF_OBJ, reference) >= 0);
-                assert!(H5Aclose(attr) >= 0);
-                assert!(H5Sclose(space) >= 0);
-            }
-        });
-    }
-
+    let table_ref = |region: &hdf5_metno::Dataset, table: &std::ffi::CStr| {
+        object_ref_attr(region, c"table", table);
+    };
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sorting.nwb");
     std::fs::copy(fixture("good.nwb"), &path).unwrap();
@@ -1301,6 +1305,40 @@ fn units_only_span_prefers_observations_then_epochs_then_trials() {
     assert_eq!(p.unit_span(ClusterId(1)).duration_samples(), 0);
     assert_eq!(p.unit_span(ClusterId(2)).duration_samples(), 700);
     drop(p);
+    for (target, string, expected) in [
+        (c"/units/spike_times", false, "/intervals/epochs"),
+        (c"/units/obs_intervals", false, "/units/obs_intervals"),
+        (c"/units/obs_alias", false, "/units/obs_intervals"),
+        (c"obs_alias", true, "/units/obs_intervals"),
+        (c"/units/missing", true, "/intervals/epochs"),
+    ] {
+        {
+            let file = hdf5_metno::File::open_rw(&path).unwrap();
+            file.link_hard("/units/obs_intervals", "/units/obs_alias")
+                .unwrap();
+            let index = file.dataset("/units/obs_intervals_index").unwrap();
+            if string {
+                use hdf5_metno::types::VarLenUnicode;
+                let path: VarLenUnicode = target.to_str().unwrap().parse().unwrap();
+                index
+                    .new_attr::<VarLenUnicode>()
+                    .create("target")
+                    .unwrap()
+                    .write_scalar(&path)
+                    .unwrap();
+            } else {
+                object_ref_attr(&index, c"target", target);
+            }
+        }
+        assert_eq!(span().source, SpanSource::Declared(expected));
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.unlink("/units/obs_alias").unwrap();
+        file.unlink("/units/obs_intervals_index").unwrap();
+        file.new_dataset_builder()
+            .with_data(&[3_u64, 3, 4])
+            .create("/units/obs_intervals_index")
+            .unwrap();
+    }
     {
         let file = hdf5_metno::File::open_rw(&path).unwrap();
         file.dataset("/units/obs_intervals")

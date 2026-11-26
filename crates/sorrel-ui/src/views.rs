@@ -11,7 +11,7 @@ use sorrel_data::{
     cluster_quality, preview_merge, DepthSource, MergeCandidate, Session, SpikeDepths,
     SplitCandidate, SuggestConfig,
 };
-use sorrel_io::{ClusterId, DataProvider, Events, SampleIndex};
+use sorrel_io::{ClusterId, DataProvider, Events, SampleIndex, SessionSpan, SpanSource};
 
 use crate::theme::{selection_colour, Theme};
 
@@ -1004,6 +1004,37 @@ fn rate_counts(
     h
 }
 
+fn rate_bin_exposure(
+    span: &SessionSpan,
+    origin: SampleIndex,
+    sr: f32,
+    x0: f32,
+    bin_s: f32,
+    bins: usize,
+) -> impl Iterator<Item = f64> + '_ {
+    let sr = f64::from(sr);
+    let (x0, width) = (f64::from(x0), f64::from(bin_s));
+    let seconds = move |t: SampleIndex| (i128::from(t.0) - i128::from(origin.0)) as f64 / sr;
+    let mut visible = span
+        .intervals_skipping(|end| seconds(end) <= x0)
+        .map(move |(a, b)| (seconds(a), seconds(b)))
+        .peekable();
+    (0..bins).map(move |i| {
+        let lo = x0 + i as f64 * width;
+        let hi = lo + width;
+        while visible.peek().is_some_and(|&(_, b)| b <= lo) {
+            visible.next();
+        }
+        // Retain the cursor at the first possible overlap for the next bin.
+        // Only intersecting intervals are visited: O(bins + visible intervals).
+        visible
+            .clone()
+            .take_while(|&(a, _)| a < hi)
+            .map(|(a, b)| (hi.min(b) - lo.max(a)).max(0.0))
+            .sum()
+    })
+}
+
 /// Per-cluster firing rate over the recording, plotted as overlaid line
 /// graphs colour-coded by cluster. Useful for spotting drift, electrode
 /// failure, and post-stimulus modulation — all phy parity.
@@ -1055,31 +1086,22 @@ pub fn firing_rate_view<P: DataProvider>(
         let unit_span = session.unit_span(c);
         let times = unit_span.metric_spikes(session.spike_times(c));
         let h = rate_counts(&times, sr, span.start, x0, bin_s, bins, brushes.time);
-        let width = f64::from(bin_s);
-        let rates = h
-            .iter()
-            .enumerate()
-            .map(|(i, &count)| {
-                if unit_span.source == sorrel_io::SpanSource::Trace {
-                    return count as f32 / bin_s;
-                }
-                let lo = f64::from(x0) + i as f64 * width;
-                let hi = lo + width;
-                let exposure: f64 = unit_span
-                    .intervals()
-                    .map(|(a, b)| {
-                        let a = (a.0 - span.start.0) as f64 / f64::from(sr);
-                        let b = (b.0 - span.start.0) as f64 / f64::from(sr);
-                        (hi.min(b) - lo.max(a)).max(0.0)
-                    })
-                    .sum();
-                if exposure > 0.0 {
-                    count as f32 / exposure as f32
-                } else {
-                    f32::NAN
-                }
-            })
-            .collect::<Vec<_>>();
+        let rates: Vec<_> = if unit_span.source == SpanSource::Trace {
+            h.into_iter().map(|count| count as f32 / bin_s).collect()
+        } else {
+            h.into_iter()
+                .zip(rate_bin_exposure(
+                    &unit_span, span.start, sr, x0, bin_s, bins,
+                ))
+                .map(|(count, exposure)| {
+                    if exposure > 0.0 {
+                        count as f32 / exposure as f32
+                    } else {
+                        f32::NAN
+                    }
+                })
+                .collect()
+        };
         max_rate = rates.iter().copied().fold(max_rate, f32::max);
         histograms.push(rates);
     }
@@ -3150,6 +3172,36 @@ mod axis_tests {
     use super::{
         axes_data_rect, draw_axes, draw_axes_grid, nice_ticks, tick_label, Theme, X_STRIP, Y_GUTTER,
     };
+
+    #[test]
+    fn rate_bin_exposure_matches_direct_intersection() {
+        use sorrel_io::{SessionSpan, SpanSource};
+        let origin = 1_000_000_u64;
+        let span = SessionSpan::from_intervals(
+            [(0, 2), (4, 22), (23, 25), (26, 29), (30, 42), (100, 130)]
+                .map(|(lo, hi)| ((origin + lo).into(), (origin + hi).into()))
+                .to_vec(),
+            SpanSource::Declared("/intervals/epochs"),
+        );
+        for (x0, width, bins) in [(-0.1, 0.1, 20), (0.232, 0.056, 20), (1.01, 0.09, 4)] {
+            let got: Vec<_> =
+                super::rate_bin_exposure(&span, origin.into(), 100.0, x0, width, bins).collect();
+            let expected: Vec<f64> = (0..bins)
+                .map(|i| {
+                    let lo = f64::from(x0) + i as f64 * f64::from(width);
+                    let hi = lo + f64::from(width);
+                    span.intervals()
+                        .map(|(a, b)| {
+                            let a = (a.0 - origin) as f64 / 100.0;
+                            let b = (b.0 - origin) as f64 / 100.0;
+                            (hi.min(b) - lo.max(a)).max(0.0)
+                        })
+                        .sum()
+                })
+                .collect();
+            assert_eq!(got, expected);
+        }
+    }
 
     #[test]
     fn data_rect_reserves_the_gutters() {

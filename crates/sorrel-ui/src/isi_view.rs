@@ -120,7 +120,7 @@ fn refractory_tooltip<P: DataProvider>(ui: &Ui, session: &Session<P>, c: Cluster
     let span = session.unit_span(c);
     let (srp, post) = refractory_evidence(
         &span.metric_spikes(session.spike_times(c)),
-        span.duration_samples(),
+        &span,
         session.provider.sample_rate(),
         session.refractory(),
     );

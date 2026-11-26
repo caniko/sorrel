@@ -134,12 +134,8 @@ pub fn quality_breakdown(
         &[]
     };
     let exposed = span.metric_spikes(spike_times);
-    let raw_contamination = refractory_contamination(
-        &exposed,
-        refractory_samples,
-        span.duration_samples(),
-        sample_rate,
-    );
+    let raw_contamination =
+        refractory_contamination(&exposed, refractory_samples, &span, sample_rate);
     let raw_presence = presence_ratio(spike_times, span.clone(), presence_bins);
     let raw_gap = longest_silent_gap_frac(spike_times, span.clone());
     let raw_snr = amplitude_snr(spike_amplitudes);
@@ -176,6 +172,17 @@ pub fn quality_breakdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolated_sample_intervals_do_not_measure_refractory_contamination() {
+        let times: Vec<_> = (0..3000).map(|i| SampleIndex(i * 100)).collect();
+        let span = SessionSpan::from_intervals(
+            times.iter().map(|&t| (t, SampleIndex(t.0 + 1))).collect(),
+            sorrel_io::SpanSource::Declared("/intervals/epochs"),
+        );
+        let q = quality_breakdown(&times, &[], 2, span, 1000.0, 100);
+        assert!(q.raw_contamination.is_nan());
+    }
 
     #[test]
     fn recorded_coverage_ignores_pauses_and_gap_spikes() {

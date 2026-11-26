@@ -438,6 +438,26 @@ impl Dataset {
         }, _d.reference_path(attribute))
     }
 
+    /// A missing target is allowed, but a present target must resolve to this dataset.
+    pub fn target_matches(&self, root: &Group, expected: &Self, _path: &str) -> Result<bool> {
+        match (self, root, expected) {
+            #[cfg(feature = "hdf5")]
+            (Self::Hdf5(index), Group::Hdf5(root), Self::Hdf5(expected)) => {
+                let Some(Attr::Hdf5(attr)) = hdf_attr(index, "target")? else {
+                    return Ok(true);
+                };
+                let target = hdf::dataset_reference(root, index, &attr)?;
+                hdf::same_object(&target, expected)
+            }
+            #[cfg(feature = "zarr")]
+            (Self::Zarr(index), Group::Zarr(_), Self::Zarr(_)) => Ok(index
+                .reference_path("target")?
+                .is_none_or(|target| target == _path)),
+            #[cfg(all(feature = "hdf5", feature = "zarr"))]
+            _ => Ok(false),
+        }
+    }
+
     // Unlike the historical channel mapping, this check requires two actual
     // references to the same table; missing references cannot imply a match.
     pub fn shared_table(&self, other: &Self, root: &Group) -> Result<Option<Group>> {
@@ -452,8 +472,7 @@ impl Dataset {
                 }
                 let left = hdf::group_reference(root, &left.attr("table")?)?;
                 let right = hdf::group_reference(root, &right.attr("table")?)?;
-                let (a, b) = (left.loc_info()?, right.loc_info()?);
-                Ok((a.fileno == b.fileno && a.token == b.token).then_some(Group::Hdf5(left)))
+                Ok(hdf::same_object(&left, &right)?.then_some(Group::Hdf5(left)))
             }
             #[cfg(feature = "zarr")]
             (Self::Zarr(left), Self::Zarr(right), root @ Group::Zarr(_)) => {

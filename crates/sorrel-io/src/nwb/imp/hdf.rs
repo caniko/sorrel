@@ -412,6 +412,41 @@ pub(super) fn spec_object(group: &hdf5::Group, path: &str) -> Result<hdf5::Locat
 }
 
 pub(super) fn group_reference(root: &hdf5::Group, attr: &hdf5::Attribute) -> Result<hdf5::Group> {
+    Ok(object_reference(root, attr)?.as_group()?)
+}
+
+pub(super) fn dataset_reference(
+    root: &hdf5::Group,
+    dataset: &hdf5::Dataset,
+    attr: &hdf5::Attribute,
+) -> Result<hdf5::Dataset> {
+    use hdf5_metno_sys::h5t::{H5Tget_class, H5T_STRING};
+
+    let dtype = attr.dtype()?;
+    // SAFETY: the datatype handle remains live for the class query.
+    if hdf5::sync::sync(|| unsafe { H5Tget_class(dtype.id()) }) == H5T_STRING {
+        let path = read_str(attr)?;
+        let path = if path.starts_with('/') {
+            path
+        } else {
+            let name = dataset.name();
+            let (parent, _) = name.rsplit_once('/').context("unnamed index dataset")?;
+            format!("{parent}/{path}")
+        };
+        let resolved = resolve_local_path(root, &path, true)?
+            .with_context(|| format!("missing HDF5 reference target {path}"))?;
+        local_dataset(root, &resolved)
+    } else {
+        Ok(object_reference(root, attr)?.as_dataset()?)
+    }
+}
+
+pub(super) fn same_object(left: &hdf5::Location, right: &hdf5::Location) -> Result<bool> {
+    let (a, b) = (left.loc_info()?, right.loc_info()?);
+    Ok(a.fileno == b.fileno && a.token == b.token)
+}
+
+fn object_reference(root: &hdf5::Group, attr: &hdf5::Attribute) -> Result<hdf5::Location> {
     use hdf5_metno_sys::{
         h5a::H5Aread,
         h5p::H5P_DEFAULT,

@@ -343,7 +343,6 @@ fn collect_qc<P: DataProvider>(
     for c in (0..n).map(ClusterId) {
         let times = session.spike_times(c);
         let span = session.unit_span(c);
-        let total_samples = span.duration_samples();
         let total_seconds = span.duration_seconds(sample_rate);
         let exposed = span.metric_spikes(times);
         let amps = session.spike_amplitudes(c);
@@ -375,12 +374,11 @@ fn collect_qc<P: DataProvider>(
             .and_then(|(w, p)| footprint(w, tpl_samples, tpl_channels, p, sr));
         let nan = f32::NAN;
         // (0, 0) means there is no estimate.
-        let (rp_contam, rp) = windows.sweep(&exposed, total_samples, sr);
+        let (rp_contam, rp) = windows.sweep(&exposed, &span, sr);
         let (srp_contamination, srp_rp_ms, rpv_post_mean, rpv_post_lo95, rpv_post_hi95) =
             match windows {
                 RefractoryWindows::Session(params) => {
-                    let (srp, post) =
-                        refractory_evidence(&exposed, total_samples, sample_rate, params);
+                    let (srp, post) = refractory_evidence(&exposed, &span, sample_rate, params);
                     (
                         srp.min_contamination,
                         srp.rp_ms,
@@ -536,12 +534,27 @@ pub fn export_qc<P: DataProvider>(
     let rate = p
         .exact_sample_rate()
         .unwrap_or_else(|_| f64::from(p.sample_rate()));
-    let sidecar = serde_json::json!({
+    let mut sidecar = serde_json::json!({
         "schema_version": 1,
         "session_span": span.to_json(rate),
         "provenance": p.trace_provenance(),
         "composite_terms": terms,
     });
+    let unit_spans = || {
+        rows.iter()
+            .map(|row| (row.cluster_id, session.unit_span(ClusterId(row.cluster_id))))
+    };
+    if unit_spans().any(|(_, unit)| unit != span) {
+        let recorded_s = unit_spans()
+            .map(|(c, unit)| {
+                let samples = unit.recorded_samples();
+                let seconds =
+                    (samples > 0 && rate.is_finite() && rate > 0.0).then(|| samples as f64 / rate);
+                (c, seconds)
+            })
+            .collect::<BTreeMap<_, _>>();
+        sidecar["unit_recorded_s"] = serde_json::json!(recorded_s);
+    }
     let mut w = BufWriter::new(
         File::create(dir.join("cluster_qc.provenance.json"))
             .context("creating QC provenance file")?,
@@ -674,7 +687,16 @@ pub(crate) mod tests {
         );
         let rows = collect_qc_rows(&units);
         let row = rows[0].to_json();
-        assert_eq!(row, collect_qc_rows(&trace)[0].to_json());
+        let trace_row = collect_qc_rows(&trace)[0].to_json();
+        for (key, value) in row.as_object().unwrap() {
+            if matches!(key.as_str(), "rpv_post_mean" | "rpv_post_hi95") {
+                // The interval model counts 999 observable lag-one pairs,
+                // not the legacy trace approximation's 1000.
+                assert!(value.as_f64().unwrap() > trace_row[key].as_f64().unwrap());
+            } else {
+                assert_eq!(value, &trace_row[key], "{key}");
+            }
+        }
         assert_eq!(row["firing_rate"], 100.0);
         assert_eq!(row["presence_ratio"], 1.0);
         for key in ["rp_estimate_ms", "srp_contamination", "rpv_post_mean"] {
@@ -690,6 +712,7 @@ pub(crate) mod tests {
             &std::fs::read(dir.path().join("cluster_qc.provenance.json")).unwrap(),
         )
         .unwrap();
+        assert!(sidecar.get("unit_recorded_s").is_none());
         for key in [
             "mean_amplitude",
             "amplitude_snr",
@@ -780,6 +803,16 @@ pub(crate) mod tests {
             assert_eq!(q.coverage_score, 1.0 - gap);
             assert!((row.composite_quality - (1.0 - gap).cbrt()).abs() < 1e-6);
         }
+        export_qc(&session, dir.path(), None).unwrap();
+        let sidecar: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("cluster_qc.provenance.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sidecar["session_span"]["recorded_s"], 1.5);
+        assert_eq!(
+            sidecar["unit_recorded_s"],
+            serde_json::json!({"0": 1.0, "1": 0.5})
+        );
         use crate::command::{CurationCommand, Method};
         let target = ClusterId(0);
         session
@@ -1068,6 +1101,7 @@ pub(crate) mod tests {
             })
         );
         assert_eq!(sidecar["provenance"]["mode"], "trace");
+        assert!(sidecar.get("unit_recorded_s").is_none());
         // Each row contains its cluster id.
         assert!(json.contains("\"cluster_id\": 0"));
         assert!(json.contains("\"cluster_id\": 2"));

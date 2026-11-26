@@ -154,9 +154,8 @@ pub(crate) fn axis_candidates_with<P: DataProvider>(
         return vec![];
     }
     let span = session.unit_span(c);
-    let duration = span.duration_samples();
     let contamination = |t: &[_]| {
-        let (c, rp) = windows.sweep(&span.metric_spikes(t), duration, sr);
+        let (c, rp) = windows.sweep(&span.metric_spikes(t), &span, sr);
         if rp > 0 {
             c
         } else {

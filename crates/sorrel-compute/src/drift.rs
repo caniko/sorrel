@@ -172,7 +172,9 @@ pub fn sliding_refractory_contamination(
             let mid = span.sample_at_offset(from + win_samples / 2);
             (mid.as_f32() + (win_samples % 2) as f32 * 0.5) * inv_sr
         };
-        let contam = if end - start >= min_spikes_per_window {
+        let contam = if end - start < min_spikes_per_window {
+            f32::NAN
+        } else if legacy {
             refractory_contamination(
                 &times[start..end],
                 refractory_samples,
@@ -180,7 +182,9 @@ pub fn sliding_refractory_contamination(
                 sample_rate,
             )
         } else {
-            f32::NAN
+            let window =
+                span.intersect(&SessionSpan::contiguous(lo.into(), hi.into(), span.source));
+            refractory_contamination(&times[start..end], refractory_samples, &window, sample_rate)
         };
         out.push((centre_s, contam));
     }

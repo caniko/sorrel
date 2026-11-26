@@ -6,6 +6,8 @@
 
 use sorrel_io::SampleIndex;
 
+use crate::RefractoryExposure;
+
 /// Cross-correlogram between two spike trains: for every spike in `a`, count
 /// spikes in `b` whose Δt falls within ±`max_lag_samples`, binned uniformly.
 ///
@@ -223,17 +225,32 @@ pub fn isi_violation_rate(
 /// is accumulated in `f64` because it overflows `f32` for large clusters.
 ///
 /// `refractory_samples` is the length of the refractory window in samples;
-/// `total_duration_samples` is the recording's total length.
-pub fn refractory_contamination(
+/// `exposure` is a trace sample count or the observation span. Interval
+/// exposure counts only positive observable lags, so duplicate timestamps
+/// do not contribute to its adjacent-ISI count.
+pub fn refractory_contamination<'a>(
     spike_times: &[SampleIndex],
     refractory_samples: u64,
-    total_duration_samples: u64,
+    exposure: impl Into<RefractoryExposure<'a>>,
     sample_rate: f32,
 ) -> f32 {
+    let exposure = exposure.into();
+    let total_duration_samples = exposure.samples;
     if spike_times.len() < 2 || refractory_samples == 0 || total_duration_samples == 0 {
         return f32::NAN;
     }
     let n = spike_times.len() as f64;
+    if let Some(span) = exposure.recorded {
+        let ratio = exposure.recorded_ratio(span, refractory_samples);
+        if ratio == 0.0 || !sample_rate.is_finite() || sample_rate <= 0.0 {
+            return f32::NAN;
+        }
+        let viol = spike_times
+            .windows(2)
+            .filter(|w| (1..refractory_samples).contains(&w[1].0.saturating_sub(w[0].0)))
+            .count() as f64;
+        return ((viol / (2.0 * ratio * n * n)) as f32).clamp(0.0, 1.0);
+    }
     let viol = isi_violations(spike_times, refractory_samples) as f64;
     let total_s = total_duration_samples as f64 / sample_rate as f64;
     let rp_s = refractory_samples as f64 / sample_rate as f64;
@@ -323,14 +340,19 @@ impl RefractoryParams {
     /// Minimise the linearised Hill estimate over the configured grid, rounded
     /// to samples. Ties prefer the longest window. Returns `(0.0, 0)` for an
     /// invalid grid or insufficient data.
-    pub fn sweep(&self, times: &[SampleIndex], total_samples: u64, sr: f32) -> (f32, u64) {
+    pub fn sweep<'a>(
+        &self,
+        times: &[SampleIndex],
+        exposure: impl Into<RefractoryExposure<'a>>,
+        sr: f32,
+    ) -> (f32, u64) {
         if !sr.is_finite() || sr <= 0.0 || self.validate().is_err() {
             return (0.0, 0);
         }
         refractory_argmin(
             times,
             self.windows(sr).filter(|&rp| rp > 0),
-            total_samples,
+            exposure.into(),
             sr,
         )
     }
@@ -392,21 +414,26 @@ pub fn sliding_refractory_argmin(
             lo + ((hi - lo) * step as u64) / (n_steps as u64 - 1)
         }
     });
-    refractory_argmin(spike_times, windows, total_duration_samples, sample_rate)
+    refractory_argmin(
+        spike_times,
+        windows,
+        total_duration_samples.into(),
+        sample_rate,
+    )
 }
 
 fn refractory_argmin(
     spike_times: &[SampleIndex],
     windows: impl Iterator<Item = u64>,
-    total_duration_samples: u64,
+    exposure: RefractoryExposure<'_>,
     sample_rate: f32,
 ) -> (f32, u64) {
-    if spike_times.len() < 2 || total_duration_samples == 0 {
+    if spike_times.len() < 2 || exposure.samples == 0 {
         return (0.0, 0);
     }
     let (mut min_contam, mut best_rp) = (f32::INFINITY, 0);
     for rp in windows {
-        let c = refractory_contamination(spike_times, rp, total_duration_samples, sample_rate);
+        let c = refractory_contamination(spike_times, rp, exposure, sample_rate);
         if c <= min_contam {
             (min_contam, best_rp) = (c, rp);
         }
