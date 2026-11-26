@@ -1340,10 +1340,30 @@ fn units_only_span_prefers_observations_then_epochs_then_trials() {
             .unwrap();
     }
     {
+        // A spike at the closed stop_time endpoint (0.75 s) is covered.
         let file = hdf5_metno::File::open_rw(&path).unwrap();
         file.dataset("/units/obs_intervals")
             .unwrap()
             .write_raw(&[2.0, 2.05, 0.5, 0.75, 0.49, 0.52, 0.4, 1.1])
+            .unwrap();
+    }
+    let p = NwbProvider::open(&path).unwrap();
+    assert_eq!(
+        p.session_span().source,
+        SpanSource::Declared("/units/obs_intervals")
+    );
+    assert_eq!(
+        p.unit_span(ClusterId(0)).intervals().collect::<Vec<_>>(),
+        [(490.into(), 751.into()), (2000.into(), 2050.into())],
+    );
+    drop(p);
+    {
+        // A spike strictly past stop_time (0.75 s > 0.7499 s, even when both
+        // round to sample 750) is outside the interval and falls back to epochs.
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.dataset("/units/obs_intervals")
+            .unwrap()
+            .write_raw(&[2.0, 2.05, 0.5, 0.7499, 0.49, 0.52, 0.4, 1.1])
             .unwrap();
     }
     assert_eq!(span().source, SpanSource::Declared("/intervals/epochs"));

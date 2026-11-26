@@ -797,12 +797,14 @@ mod imp {
             if times[next] < row.start_s {
                 return false;
             }
-            let n = times[next..].partition_point(|&t| t < row.stop_s);
+            let n = times[next..].partition_point(|&t| t <= row.stop_s);
             if n != 0 {
                 next += n;
-                // A spike strictly before the stop can round to the same
-                // sample as the stop. Include that sample only when needed;
-                // checking continuous time first still rejects spikes at the stop.
+                // NWB intervals [start_time, stop_time] are closed (stop_time
+                // is often the exact timestamp of the last recorded sample),
+                // and a spike just before stop_time can also round to `end`.
+                // Extend the half-open grid interval by one sample when needed
+                // while still rejecting spikes strictly past `stop_s`.
                 row.end = row.end.max(SampleIndex(samples[next - 1].0 + 1));
             }
         }
