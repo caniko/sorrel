@@ -113,8 +113,8 @@ impl CcgCache {
                         &unit_spans,
                         &trains,
                         bin_ms as f64 / 1e3,
+                        window_ms as f64 / 1e3,
                         f64::from(sr),
-                        window,
                     )
                 });
                 Arc::new(CcgData {
@@ -268,21 +268,29 @@ fn count_in(times: &[SampleIndex], a: u64, b: u64) -> usize {
     times.partition_point(|t| t.0 < b) - times.partition_point(|t| t.0 < a)
 }
 
+/// Maximum sample lag counted by [`sorrel_compute::correlograms`].
+fn correlogram_max_lag(sr: f64, bin_s: f64, window_s: f64) -> u64 {
+    let (bin_s, window_s) = (bin_s.clamp(1e-5, 1e5), window_s.clamp(1e-5, 1e5));
+    let bin = ((sr * bin_s) as u64).max(1);
+    let half = (0.5 * window_s / bin_s) as usize;
+    (half as u64 + 1).saturating_mul(bin).saturating_sub(1)
+}
+
 fn interval_baselines(
     spans: &[SessionSpan],
     trains: &[Vec<SampleIndex>],
     bin_s: f64,
+    window_s: f64,
     sr: f64,
-    window_samples: u64,
 ) -> Vec<Vec<Option<f64>>> {
-    // A single line is useful only if the mean overlap across the lag
-    // window is close to the zero-lag (recorded) exposure.
+    let max_lag = correlogram_max_lag(sr, bin_s, window_s);
+    // A single line is useful only if the mean overlap across the counted
+    // lag window is close to the zero-lag (recorded) exposure.
     let flat_duration = |span: &SessionSpan| {
         let samples = span.recorded_samples() as f64;
         (samples > 0.0
-            && window_samples > 0
-            && positive_lag_exposure(span, window_samples) as f64
-                >= 0.9 * samples * window_samples as f64)
+            && (max_lag == 0
+                || positive_lag_exposure(span, max_lag) as f64 >= 0.9 * samples * max_lag as f64))
             .then_some(samples / sr)
     };
     let mut baselines = vec![vec![None; spans.len()]; spans.len()];
@@ -800,7 +808,7 @@ mod tests {
             (9000..10_000).step_by(10).map(SampleIndex).collect(),
             (500..1500).step_by(10).map(SampleIndex).collect(),
         ];
-        let baselines = interval_baselines(&spans, &trains, 0.001, 1000.0, 50);
+        let baselines = interval_baselines(&spans, &trains, 0.001, 0.050, 1000.0);
         assert_eq!(baselines[0][0], Some(10.0));
         assert_eq!(baselines[0][1], None);
         assert_eq!(
@@ -825,17 +833,28 @@ mod tests {
         );
         let long_train = vec![100.into(), 15_100.into()];
         let short = SessionSpan::contiguous(0.into(), 100.into(), source);
+        // Two well-separated 250-sample segments retain >=90% exposure across
+        // every plotted lag (1..=25 samples for 1 ms bins in a 50 ms window).
+        let boundary = SessionSpan::from_intervals(
+            vec![(0.into(), 250.into()), (1_000.into(), 1_250.into())],
+            source,
+        );
+        let boundary_train = vec![10.into(), 1_010.into()];
         let baselines = interval_baselines(
-            &[fragmented, gapped, short],
-            &[isolated, long_train, train(10, 10)],
+            &[fragmented, gapped, short, boundary],
+            &[isolated, long_train, train(10, 10), boundary_train],
             0.001,
+            0.050,
             1000.0,
-            50,
         );
         assert_eq!(baselines[0][0], None);
         assert_eq!(baselines[0][1], None, "fragmented shared exposure");
         assert!(baselines[1][1].is_some_and(|baseline| baseline > 0.0));
         assert_eq!(baselines[2][2], None, "short contiguous exposure");
+        assert!(
+            baselines[3][3].is_some_and(|baseline| baseline > 0.0),
+            "250-sample segments retain >=90% exposure across the plotted 1..=25 lags"
+        );
     }
 
     #[test]
