@@ -226,8 +226,8 @@ pub fn isi_violation_rate(
 ///
 /// `refractory_samples` is the length of the refractory window in samples;
 /// `exposure` is a trace sample count or the observation span. Interval
-/// exposure counts only positive observable lags, so duplicate timestamps
-/// do not contribute to its adjacent-ISI count.
+/// exposure counts only positive observable lags. When that exposure is
+/// nonzero, duplicate timestamps still count as adjacent-ISI violations.
 pub fn refractory_contamination<'a>(
     spike_times: &[SampleIndex],
     refractory_samples: u64,
@@ -245,10 +245,7 @@ pub fn refractory_contamination<'a>(
         if ratio == 0.0 || !sample_rate.is_finite() || sample_rate <= 0.0 {
             return f32::NAN;
         }
-        let viol = spike_times
-            .windows(2)
-            .filter(|w| (1..refractory_samples).contains(&w[1].0.saturating_sub(w[0].0)))
-            .count() as f64;
+        let viol = isi_violations(spike_times, refractory_samples) as f64;
         return ((viol / (2.0 * ratio * n * n)) as f32).clamp(0.0, 1.0);
     }
     let viol = isi_violations(spike_times, refractory_samples) as f64;
@@ -760,6 +757,18 @@ mod tests {
         // viol = 1 (the 0→50 gap). duration = 1 s. rate = 1.0 /s.
         let times = si([0u64, 50, 1000]);
         assert!((isi_violation_rate(&times, 100, 1000.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hill_counts_duplicate_timestamps_in_a_declared_span() {
+        let times = siv((0..10_000).step_by(100).flat_map(|t| [t, t]));
+        let span = sorrel_io::SessionSpan::contiguous(
+            0.into(),
+            10_000.into(),
+            sorrel_io::SpanSource::Declared("/intervals/epochs"),
+        );
+        assert_eq!(isi_violations(&times, 2), 100);
+        assert_eq!(refractory_contamination(&times, 2, &span, 1000.0), 1.0);
     }
 
     #[test]

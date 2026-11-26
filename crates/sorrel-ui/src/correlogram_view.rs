@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use egui::{Color32, Sense, Stroke, Ui};
-use sorrel_compute::{ccg_baseline, correlograms};
+use sorrel_compute::{ccg_baseline, correlograms, positive_lag_exposure};
 use sorrel_data::Session;
 use sorrel_io::{ClusterId, DataProvider, SampleIndex, SessionSpan, SpanSource};
 
@@ -43,8 +43,9 @@ pub struct CcgData {
     coverage: f64,
     /// Seconds the used spikes come from: the baseline's duration.
     duration_s: f64,
-    /// Shared-window baselines for interval-backed data; traces use `duration_s`.
-    baselines: Option<Vec<Vec<f64>>>,
+    /// Shared-window baselines, absent per cell when exposure is insufficient.
+    /// Traces use `duration_s` instead of this matrix.
+    baselines: Option<Vec<Vec<Option<f64>>>>,
 }
 
 type CcgKey = (Vec<ClusterId>, u64, f32, f32);
@@ -108,7 +109,13 @@ impl CcgCache {
                     } else {
                         unit_spans
                     };
-                    interval_baselines(&unit_spans, &trains, bin_ms as f64 / 1e3, f64::from(sr))
+                    interval_baselines(
+                        &unit_spans,
+                        &trains,
+                        bin_ms as f64 / 1e3,
+                        f64::from(sr),
+                        window,
+                    )
                 });
                 Arc::new(CcgData {
                     counts: correlograms(&refs, sr, bin_ms as f64 / 1e3, window_ms as f64 / 1e3),
@@ -266,30 +273,37 @@ fn interval_baselines(
     trains: &[Vec<SampleIndex>],
     bin_s: f64,
     sr: f64,
-) -> Vec<Vec<f64>> {
-    let mut baselines = vec![vec![0.0; spans.len()]; spans.len()];
+    window_samples: u64,
+) -> Vec<Vec<Option<f64>>> {
+    // A single line is useful only if the mean overlap across the lag
+    // window is close to the zero-lag (recorded) exposure.
+    let flat_duration = |span: &SessionSpan| {
+        let samples = span.recorded_samples() as f64;
+        (samples > 0.0
+            && window_samples > 0
+            && positive_lag_exposure(span, window_samples) as f64
+                >= 0.9 * samples * window_samples as f64)
+            .then_some(samples / sr)
+    };
+    let mut baselines = vec![vec![None; spans.len()]; spans.len()];
     for (i, span) in spans.iter().enumerate() {
-        let samples = span.recorded_samples();
-        if samples > 0 {
-            baselines[i][i] =
-                ccg_baseline(trains[i].len(), trains[i].len(), bin_s, samples as f64 / sr);
-        }
+        baselines[i][i] = flat_duration(span)
+            .map(|duration| ccg_baseline(trains[i].len(), trains[i].len(), bin_s, duration));
         for j in i + 1..spans.len() {
             // A flat near-zero-lag reference is only meaningful where both
             // units were observed. Spikes outside the shared window cannot
             // estimate either rate within it.
             let shared = span.intersect(&spans[j]);
-            let samples = shared.recorded_samples();
-            if samples == 0 {
+            let Some(duration) = flat_duration(&shared) else {
                 continue;
-            }
+            };
             let n = |k: usize| {
                 shared
                     .intervals()
                     .map(|(a, b)| count_in(&trains[k], a.0, b.0))
                     .sum()
             };
-            let baseline = ccg_baseline(n(i), n(j), bin_s, samples as f64 / sr);
+            let baseline = Some(ccg_baseline(n(i), n(j), bin_s, duration));
             baselines[i][j] = baseline;
             baselines[j][i] = baseline;
         }
@@ -604,7 +618,7 @@ fn grid<P: DataProvider>(
             let max_count = h.iter().copied().max().unwrap_or(0);
             let baseline = data.baselines.as_ref().map_or_else(
                 || ccg_baseline(data.n_used[ri], data.n_used[ci], bin_s, data.duration_s),
-                |baselines| baselines[ri][ci],
+                |baselines| baselines[ri][ci].unwrap_or(0.0),
             );
             let y_top = y_top(max_count, global_max, baseline, p.uniform);
             let colour = if ri >= n_real {
@@ -786,11 +800,42 @@ mod tests {
             (9000..10_000).step_by(10).map(SampleIndex).collect(),
             (500..1500).step_by(10).map(SampleIndex).collect(),
         ];
-        let baselines = interval_baselines(&spans, &trains, 0.001, 1000.0);
-        assert_eq!(baselines[0][0], 10.0);
-        assert_eq!(baselines[0][1], 0.0);
-        assert_eq!(baselines[0][2], 5.0, "only spikes in the shared 0.5 s");
+        let baselines = interval_baselines(&spans, &trains, 0.001, 1000.0, 50);
+        assert_eq!(baselines[0][0], Some(10.0));
+        assert_eq!(baselines[0][1], None);
+        assert_eq!(
+            baselines[0][2],
+            Some(5.0),
+            "only spikes in the shared 0.5 s"
+        );
         assert_eq!(baselines[2][0], baselines[0][2]);
+    }
+
+    #[test]
+    fn acg_baseline_requires_nearly_flat_lag_exposure() {
+        let source = SpanSource::Declared("/units/obs_intervals");
+        let isolated = train(3000, 100);
+        let fragmented = SessionSpan::from_intervals(
+            isolated.iter().map(|&t| (t, (t.0 + 1).into())).collect(),
+            source,
+        );
+        let gapped = SessionSpan::from_intervals(
+            vec![(0.into(), 10_000.into()), (15_000.into(), 25_000.into())],
+            source,
+        );
+        let long_train = vec![100.into(), 15_100.into()];
+        let short = SessionSpan::contiguous(0.into(), 100.into(), source);
+        let baselines = interval_baselines(
+            &[fragmented, gapped, short],
+            &[isolated, long_train, train(10, 10)],
+            0.001,
+            1000.0,
+            50,
+        );
+        assert_eq!(baselines[0][0], None);
+        assert_eq!(baselines[0][1], None, "fragmented shared exposure");
+        assert!(baselines[1][1].is_some_and(|baseline| baseline > 0.0));
+        assert_eq!(baselines[2][2], None, "short contiguous exposure");
     }
 
     #[test]

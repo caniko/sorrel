@@ -37,6 +37,11 @@ impl RefractoryExposure<'_> {
     }
 }
 
+/// Number of recorded sample pairs separated by a lag in `1..=max_lag`.
+pub fn positive_lag_exposure(span: &SessionSpan, max_lag: u64) -> u128 {
+    lag_pair_samples(span, span.recorded_samples(), max_lag.saturating_add(1))
+}
+
 /// Sum |I ∩ (I - lag)| over integer lags 1..edge. If R(k) counts recorded
 /// samples strictly before k, sum R(t + edge) over recorded t and subtract
 /// the D(D+1)/2 pairs at nonpositive lags (D is the recorded sample count).

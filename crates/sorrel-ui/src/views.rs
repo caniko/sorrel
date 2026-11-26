@@ -1073,9 +1073,7 @@ pub fn firing_rate_view<P: DataProvider>(
     // `n_bins` over the visible span: the `:frmin`/`:frmax` range, then pan/zoom.
     let bins = params.n_bins.clamp(2, 5000);
     let origin = span.start.as_f64() / f64::from(sr);
-    let ((x0, x1), _) = params
-        .pz
-        .apply(params.relative_x_range(origin, duration), (0.0, 1.0));
+    let (x0, x1) = params.visible_x_range(origin, duration);
     let bin_s = (x1 - x0) / bins as f32;
     let unit = params.unit;
 

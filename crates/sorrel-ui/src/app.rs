@@ -1108,7 +1108,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                 let s = read(&self.session);
                 let sr = s.provider.sample_rate().max(1.0);
                 let span = s.provider.session_span();
-                let (lo, hi) = self.view_params.rate.relative_x_range(
+                let (lo, hi) = self.view_params.rate.visible_x_range(
                     span.start.as_f64() / f64::from(sr),
                     span.extent_samples() as f32 / sr,
                 );
@@ -2955,6 +2955,21 @@ mod tests {
         let mut app = SorrelApp::new(session, label_str);
         app.run_snippet(crate::snippets::parse(":frb 1").unwrap());
         assert_eq!(app.view_params.rate.n_bins, 101);
+    }
+
+    #[test]
+    fn rate_bin_size_uses_visible_zoom() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = stub_session(dir.path());
+        session.provider.span = Some(sorrel_io::SessionSpan::contiguous(
+            0.into(),
+            3_000_000.into(),
+            sorrel_io::SpanSource::Trace,
+        ));
+        let mut app = SorrelApp::new(session, label_str);
+        app.view_params.rate.pz = crate::panzoom::PanZoom::centered_zoom(2.0);
+        app.run_snippet(crate::snippets::parse(":frb 1").unwrap());
+        assert_eq!(app.view_params.rate.n_bins, 50);
     }
 
     impl HasGeometry for StubProvider {

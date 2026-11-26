@@ -89,6 +89,12 @@ impl RateParams {
         }
         .x_range((0.0, duration))
     }
+
+    pub(crate) fn visible_x_range(&self, origin: f64, duration: f32) -> (f32, f32) {
+        self.pz
+            .apply(self.relative_x_range(origin, duration), (0.0, 1.0))
+            .0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

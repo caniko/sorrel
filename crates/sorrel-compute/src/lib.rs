@@ -54,8 +54,8 @@ pub use metrics_iso::{
 };
 pub use quality::{quality_breakdown, QualityBreakdown};
 pub use refractory::{
-    contamination_posterior, refractory_evidence, sliding_rp, ContaminationPosterior,
-    RefractoryExposure, SlidingRp,
+    contamination_posterior, positive_lag_exposure, refractory_evidence, sliding_rp,
+    ContaminationPosterior, RefractoryExposure, SlidingRp,
 };
 pub use shape::{
     burst_index, footprint, log_bins, peak_channel, sax, waveform_landmarks, Footprint,

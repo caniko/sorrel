@@ -21,6 +21,14 @@ impl Default for PanZoom {
 }
 
 impl PanZoom {
+    #[cfg(test)]
+    pub(crate) fn centered_zoom(zoom: f32) -> Self {
+        Self {
+            zoom: [zoom; 2],
+            ..Self::default()
+        }
+    }
+
     /// The visible part of the full ranges `x`, `y`.
     pub fn apply(&self, x: (f32, f32), y: (f32, f32)) -> ((f32, f32), (f32, f32)) {
         let f = |(lo, hi): (f32, f32), a: usize| {
