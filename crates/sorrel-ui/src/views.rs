@@ -1016,7 +1016,7 @@ fn rate_bin_exposure(
     let (x0, width) = (f64::from(x0), f64::from(bin_s));
     let seconds = move |t: SampleIndex| (i128::from(t.0) - i128::from(origin.0)) as f64 / sr;
     let mut visible = span
-        .intervals_skipping(|end| seconds(end) <= x0)
+        .intervals_skipping(move |end| seconds(end) <= x0)
         .map(move |(a, b)| (seconds(a), seconds(b)))
         .peekable();
     (0..bins).map(move |i| {
