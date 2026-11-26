@@ -1,14 +1,18 @@
 # CLI Reference
 
 ```text
-sorrel                                 # the GUI, detached, with a launcher
-sorrel open <DATA_DIR> [OPTIONS]       # open a dataset as a tab in the GUI
-sorrel run [<DATA_DIR>] [OPTIONS]      # the GUI in the foreground, or --headless for agents
-sorrel <SUBCOMMAND> ...                # headless tools on the same data
+sorrel
+sorrel open <DATA_DIR> [OPTIONS]
+sorrel run [<DATA_DIR>] [OPTIONS]
+sorrel <SUBCOMMAND> ...
 ```
 
-`<DATA_DIR>` is either a directory (phy / Kilosort or SortingAnalyzer)
-or a single file (`*.nwb`, `rez.mat`).
+Use `sorrel` for the detached GUI launcher, `sorrel open` for a dataset tab,
+or `sorrel run` for the foreground GUI (add `--headless` for agents).
+Subcommands can process the same datasets without a window.
+
+`<DATA_DIR>` is a phy / Kilosort or SortingAnalyzer directory. Builds with
+[HDF5 support](installation.md#with-cargo) also accept `*.nwb` and `rez.mat`.
 
 ## Subcommands
 
@@ -185,7 +189,7 @@ in `$PROFILE`.
 `sorrel install-shortcut` creates `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Sorrel.lnk`
 for the current user. It targets `sorrelw.exe` in the folder of the running
 `sorrel.exe` and uses its icon, through PowerShell's `WScript.Shell`.
-`--remove` deletes the shortcut. It is for winget and zip installs; the
+`--remove` deletes the shortcut. It is useful for manual ZIP installs; the
 Chocolatey package creates its own entry. On other systems the command fails
 with "Windows only". `sorrelw` is `sorrel` without a console window; see
 [Windows](installation.md#windows).

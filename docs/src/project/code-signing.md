@@ -6,10 +6,14 @@ Free code signing provided by SignPath.io, certificate by SignPath Foundation.
 
 Signing is not active yet. The Windows executables of current releases are
 unsigned, so Windows SmartScreen may show an "unknown publisher" warning. This
-page states the policy that applies once signing is enabled. Until then, check
-a download against the release's `SHA256SUMS.txt`, which is signed with
+page states the policy that applies once signing is enabled.
+
+## Verify downloads
+
+Check the download's SHA-256 hash against the release's `SHA256SUMS.txt`, which is signed with
 minisign (key in [`keys/minisign.pub`](https://github.com/caniko/sorrel/blob/trunk/keys/minisign.pub)).
 Each asset also has a Sigstore `.cosign.bundle` and `.intoto.bundle`.
+See the [verification commands](../getting-started/installation.md#windows) for a Windows example.
 
 ## What is signed
 

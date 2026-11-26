@@ -57,8 +57,9 @@ flattened sorting under `<root>/sorting/`. A Zarr analyzer converts with
 
 ## NWB and legacy MATLAB `rez.mat`
 
-Both readers are included by default. The `rez.mat` reader is for MATLAB
-v7.3 (HDF5) files from Kilosort 2, 2.5, and 3.
+Both readers are enabled by default on `trunk`, but not in the stable 0.4.0
+binaries. See [Installation](installation.md#with-cargo). The `rez.mat`
+reader is for MATLAB v7.3 (HDF5) files from Kilosort 2, 2.5, and 3.
 
 ```bash
 sorrel open my_session.nwb

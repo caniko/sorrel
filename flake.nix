@@ -29,7 +29,7 @@
 
     # Static project-site generator for the landing page (built via crane below).
     plinth = {
-      url = "git+https://github.com/caniko/plinth.git?ref=trunk&rev=fa783dda2f2fd339e2bc3daa8b5436f4e787f9e3";
+      url = "git+https://github.com/caniko/plinth.git?ref=trunk&rev=520efdcdb4dbd09568865bfe586ef7df1e2e1ce2";
       flake = false;
     };
   };

@@ -26,7 +26,7 @@ body .nav-links a { font-size: 1rem; }
 body .nav-links .nav-primary { background: var(--sorrel-green); color: #0d1117; padding: .45rem 1rem; border-radius: .5rem; min-height: 2.75rem; font-weight: 650; }
 body .nav-links .nav-primary:hover { color: #0d1117; filter: brightness(1.08); }
 
-/* Hero: centred copy over the product at nearly full width (plinth's split layout, restacked). */
+/* Hero: copy over the product (plinth's split layout, restacked). */
 .hero.hero--split {
   position: relative;
   max-width: 1440px;
@@ -142,9 +142,18 @@ main h2 { text-wrap: balance; }
 
 /* Cards: three a row, so six benefits fill both rows without orphans. */
 .hero--split ~ .features .features-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.install-routes { grid-template-columns: minmax(0, 1fr); }
-/* Platform-filtered route cards (platform.js hides the Windows ones off Windows). */
-.install-routes article[hidden], .secondary-routes article[hidden] { display: none; }
+.hero--split ~ .install-section .install-routes { grid-template-columns: minmax(0, 1fr); }
+.install-section .command-row pre {
+  font-size: .875rem;
+}
+#downloads .command-row pre {
+  white-space: pre;
+  overflow-x: auto;
+}
+#downloads .command-row code { overflow-wrap: normal; word-break: normal; }
+.secondary-routes {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
+}
 .hero--split ~ .features .feature-card { padding: 1.25rem 0 0; border: 0; border-top: 1px solid var(--pp-line); border-radius: 0; background: none; }
 .hero--split ~ .features .features-grid { column-gap: 2rem; row-gap: 2.25rem; }
 .hero--split ~ .features .feature-card p { font-size: 1rem; line-height: 1.55; }
@@ -154,10 +163,46 @@ main h2 { text-wrap: balance; }
 
 footer { margin-top: clamp(4rem, 8vw, 7rem); }
 
-.hero:not(.hero--split) { max-width: var(--sorrel-wrap); margin-inline: auto; padding: 3rem var(--sorrel-gutter) 0; }
+.hero:not(.hero--split) { padding-block: clamp(1.75rem, 4vw, 3rem) 0; text-align: left; }
 .hero:not(.hero--split) h1 { font-size: clamp(2.5rem, 5vw, 4rem); max-width: 20ch; line-height: 1.08; letter-spacing: -.035em; }
 .hero:not(.hero--split) .tagline { max-width: 42rem; font-size: 1.125rem; color: var(--pp-ink-soft); }
-body:not(:has(.hero--split)) .install-routes { grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr)); }
+.hero:not(.hero--split) .hero-actions { justify-content: flex-start; }
+main > #download-platform { padding-block: 1rem 0; }
+#download-platform:has([hidden]) { display: none; }
+#download-platform-notice { margin: 0; font-weight: 650; }
+main > #downloads { padding-block: clamp(1.5rem, 4vw, 3rem) 0; scroll-margin-top: 4.5rem; }
+#downloads .section-heading { display: flex; flex-wrap: wrap; align-items: center; gap: .25rem 1.25rem; margin-bottom: .875rem; }
+#downloads .section-heading h2 { flex-basis: 100%; }
+#downloads .section-heading p:empty { display: none; }
+#downloads :is(.section-heading a, .show-all-platforms) {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2rem;
+  padding: 0;
+  border: 0;
+  color: var(--pp-ink-soft);
+  font-size: .875rem;
+  text-decoration: underline;
+  text-underline-offset: .15em;
+}
+#downloads :is(.section-heading a, .show-all-platforms):hover { color: var(--pp-ink); }
+#downloads .install-routes:not(:has(> article:not([hidden]) ~ article:not([hidden]))) { max-width: 32rem; }
+#downloads .install-route p { display: block; }
+#downloads .secondary-routes article:not([hidden]) { display: flex; flex-direction: column; }
+#downloads .route-link {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  min-height: 2rem;
+  margin-top: auto;
+}
+#downloads .install-route .route-link {
+  padding: .25rem .75rem;
+  border-radius: .375rem;
+  background: var(--sorrel-green);
+  color: #0d1117;
+}
+#downloads .install-route .route-link:hover { filter: brightness(1.12); }
 
 /* Wide screens: compact editorial band. Headline left; tagline, actions and note right.
    The workspace stays full width underneath, so product evidence comes first. */
@@ -170,7 +215,8 @@ body:not(:has(.hero--split)) .install-routes { grid-template-columns: repeat(aut
   }
   .hero--split .hero-copy {
     display: grid;
-    width: 100%;
+    width: min(100%, calc(var(--sorrel-wrap) - 2 * var(--sorrel-gutter)));
+    margin-inline: auto;
     max-width: none;
     grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
     grid-template-areas:
@@ -199,9 +245,6 @@ body:not(:has(.hero--split)) .install-routes { grid-template-columns: repeat(aut
 @media (max-width: 1100px) {
   .hero--split ~ .features .features-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
-@media (max-width: 900px) {
-  .secondary-routes { grid-template-columns: minmax(0, 1fr); }
-}
 @media (max-width: 700px) {
   body:not(:has(.nav-menu)) .nav-inner { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: .5rem 0; }
   body:not(:has(.nav-menu)) .nav-brand { grid-column: 1 / 4; grid-row: 1; }
@@ -224,6 +267,9 @@ body:not(:has(.hero--split)) .install-routes { grid-template-columns: repeat(aut
   .hero--split ~ .features .feature-index { display: none; }
   .hero--split ~ .features .feature-card p { font-size: .9375rem; }
   .hero .btn { min-width: 0; }
+  .hero:not(.hero--split) .hero-actions { gap: .75rem; }
+  .hero:not(.hero--split) .btn { padding-inline: 1rem; }
+  main > #downloads { scroll-margin-top: 7.5rem; }
   body { font-size: 1rem; }
 }
 @media (prefers-reduced-motion: reduce) {
