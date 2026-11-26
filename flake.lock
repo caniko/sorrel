@@ -460,17 +460,17 @@
     "plinth": {
       "flake": false,
       "locked": {
-        "lastModified": 1795646594,
-        "narHash": "sha256-BFvLrNOQWJlIWmlXiQud+MXgIFNPOSkXLsORp2LW3W0=",
-        "ref": "fix/install-route-labels",
-        "rev": "0e3a7d20bbae90459c74c9637a03ea80f61e83af",
-        "revCount": 497,
+        "lastModified": 1795662360,
+        "narHash": "sha256-nE9h7XqnWETXZMTX3YEHVLzPVRC0/AE05ZmdZLB8oxU=",
+        "ref": "trunk",
+        "rev": "520efdcdb4dbd09568865bfe586ef7df1e2e1ce2",
+        "revCount": 506,
         "type": "git",
         "url": "https://github.com/caniko/plinth.git"
       },
       "original": {
-        "ref": "fix/install-route-labels",
-        "rev": "0e3a7d20bbae90459c74c9637a03ea80f61e83af",
+        "ref": "trunk",
+        "rev": "520efdcdb4dbd09568865bfe586ef7df1e2e1ce2",
         "type": "git",
         "url": "https://github.com/caniko/plinth.git"
       }
