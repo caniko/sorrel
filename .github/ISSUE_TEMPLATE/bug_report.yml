@@ -1,0 +1,28 @@
+name: Bug report
+description: Report incorrect behavior, a crash or a regression.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: This issue is public. Do not attach private data or credentials. For vulnerabilities, see the [security policy](https://github.com/caniko/sorrel/security/policy).
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Sorrel version or commit, OS, and install method.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include the command or UI steps, input backend, and a minimal public or synthetic example if available.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      description: Include any relevant error text after removing private paths or identifiers.
+    validations:
+      required: true

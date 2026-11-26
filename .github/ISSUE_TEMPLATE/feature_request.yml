@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest a change to a Sorrel workflow.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: This issue is public. Do not include private data or credentials.
+  - type: textarea
+    id: workflow
+    attributes:
+      label: What are you trying to do?
+      description: Describe the workflow and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help?
+      description: Describe the behavior you want and any workaround you tried.
+    validations:
+      required: true

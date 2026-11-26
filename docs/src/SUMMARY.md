@@ -12,6 +12,7 @@
 
 - [Backends & Inputs](./usage/backends.md)
 - [Kilosort / phy2](./usage/kilosort-inputs.md)
+- [Coming from phy](./usage/coming-from-phy.md)
 - [Integrations](./usage/integrations.md)
 - [Views](./usage/views.md)
 - [Keyboard & Mouse](./usage/keyboard-controls.md)
