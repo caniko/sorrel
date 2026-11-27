@@ -52,7 +52,8 @@ pub use devdb::DevDb;
 pub use diff::{diff_labels, LabelDiff};
 pub use evaluate::{eval_merge, eval_split, Handles, MergeEval, Relation, SplitEval};
 pub use feature_subspace::{
-    collect_pc_subspace, PcSubspace, DEFAULT_CHANNEL_IDX, DEFAULT_D, DEFAULT_MAX_BACKGROUND,
+    collect_pairwise_physical_subspace, collect_pc_subspace, pairwise_cluster_separation,
+    PairwisePhysicalSubspace, PcSubspace, DEFAULT_CHANNEL_IDX, DEFAULT_D, DEFAULT_MAX_BACKGROUND,
 };
 pub use host::{AgentPolicy, AgentSeat, HostEvent, SessionHost};
 pub use instance::{send_instance, serve_instance, InstanceHandle, InstanceRequest, Pending};

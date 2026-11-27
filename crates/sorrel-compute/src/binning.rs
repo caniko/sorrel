@@ -54,6 +54,36 @@ pub fn isi_histogram_range(
     histogram_u64(&isis, min_samples, max_samples, n_bins)
 }
 
+/// Inter-spike-interval histogram with geometric bins over `[min_samples, max_samples)`.
+/// Zero intervals and intervals outside the range are dropped.
+pub fn isi_histogram_log(
+    spikes: &[SampleIndex],
+    min_samples: f64,
+    max_samples: f64,
+    n_bins: usize,
+) -> Vec<u32> {
+    let mut hist = vec![0; n_bins];
+    if n_bins == 0
+        || !min_samples.is_finite()
+        || !max_samples.is_finite()
+        || min_samples <= 0.0
+        || max_samples <= min_samples
+    {
+        return hist;
+    }
+    let (log_min, log_max) = (min_samples.log10(), max_samples.log10());
+    for w in spikes.windows(2) {
+        let dt = w[1].0.saturating_sub(w[0].0);
+        let dt_f = dt as f64;
+        if dt == 0 || dt_f < min_samples || dt_f >= max_samples {
+            continue;
+        }
+        let bin = ((dt_f.log10() - log_min) / (log_max - log_min) * n_bins as f64).floor() as usize;
+        hist[bin.min(n_bins - 1)] += 1;
+    }
+    hist
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,6 +101,34 @@ mod tests {
         // Upper edge is exclusive: both 60s drop out.
         assert_eq!(isi_histogram_range(&spikes, 0, 60, 3), vec![2, 1, 0]);
         assert!(isi_histogram_range(&spikes, 0, 60, 0).is_empty());
+    }
+
+    #[test]
+    fn log_isi_counts_decades_with_half_open_bounds() {
+        // Intervals: 0, 9, 10, 99, 100, 999, 1000, 10_000.
+        let spikes = [0, 0, 9, 19, 118, 218, 1217, 2217, 12217].map(SampleIndex);
+        assert_eq!(isi_histogram_log(&spikes, 10.0, 10_000.0, 3), [2, 2, 1]);
+        assert_eq!(isi_histogram_log(&spikes[..2], 0.1, 10.0, 2), [0, 0]);
+    }
+
+    #[test]
+    fn log_isi_handles_short_input_and_invalid_bounds() {
+        let spikes = [SampleIndex(0), SampleIndex(10)];
+        assert_eq!(isi_histogram_log(&[], 1.0, 100.0, 2), [0, 0]);
+        assert_eq!(isi_histogram_log(&spikes[..1], 1.0, 100.0, 2), [0, 0]);
+        assert!(isi_histogram_log(&spikes, 1.0, 100.0, 0).is_empty());
+        for (min, max) in [
+            (0.0, 100.0),
+            (-1.0, 100.0),
+            (10.0, 10.0),
+            (10.0, 1.0),
+            (f64::NAN, 100.0),
+            (1.0, f64::NAN),
+            (f64::NEG_INFINITY, 100.0),
+            (1.0, f64::INFINITY),
+        ] {
+            assert_eq!(isi_histogram_log(&spikes, min, max, 2), [0, 0]);
+        }
     }
 
     #[test]

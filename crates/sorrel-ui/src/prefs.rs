@@ -32,8 +32,73 @@ pub struct ViewParams {
     pub ccg: CcgParams,
     pub isi: IsiParams,
     pub rate: RateParams,
+    #[serde(default)]
+    pub feature: FeatureParams,
     /// Cluster/Similar table columns the user hid (by column name).
     pub hidden_cols: Vec<String>,
+}
+
+/// Feature basis shown in the Features pane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FeatureBasis {
+    #[default]
+    #[serde(rename = "pc_2ch")]
+    Pc2Ch,
+    #[serde(rename = "pc0_4ch")]
+    Pc0_4Ch,
+    #[serde(rename = "energy_4ch")]
+    Energy4Ch,
+    #[serde(rename = "peak_4ch")]
+    Peak4Ch,
+    #[serde(rename = "valley_4ch")]
+    Valley4Ch,
+}
+
+impl FeatureBasis {
+    pub const ALL: [Self; 5] = [
+        Self::Pc2Ch,
+        Self::Pc0_4Ch,
+        Self::Energy4Ch,
+        Self::Peak4Ch,
+        Self::Valley4Ch,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pc2Ch => "PC (2 ch)",
+            Self::Pc0_4Ch => "PC0 (4 ch)",
+            Self::Energy4Ch => "Energy (4 ch)",
+            Self::Peak4Ch => "Peak (4 ch)",
+            Self::Valley4Ch => "Valley (4 ch)",
+        }
+    }
+
+    pub fn is_four_channel(self) -> bool {
+        !matches!(self, Self::Pc2Ch)
+    }
+
+    pub fn is_raw_scalar(self) -> bool {
+        matches!(self, Self::Energy4Ch | Self::Peak4Ch | Self::Valley4Ch)
+    }
+}
+
+/// How spike clouds are rendered in the Features pane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeatureDisplayMode {
+    #[default]
+    Points,
+    Density,
+    Contours,
+}
+
+/// Per-view parameters for the Features pane.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FeatureParams {
+    pub basis: FeatureBasis,
+    pub display_mode: FeatureDisplayMode,
+    pub same_shank_clusters: bool,
 }
 
 /// phy `FiringRateView` (v2.1): bin count over the recording (`:frn`) and
@@ -175,6 +240,10 @@ pub struct WaveformParams {
     /// Draw the focused feature plot's PC1/PC2 temporal shapes on its
     /// channels (cross-talk with the Features pane).
     pub pc_shapes: bool,
+    /// In `WaveformMode::Mean`, draw a translucent ±1 SD ribbon behind each
+    /// cluster's mean waveform.
+    #[serde(default)]
+    pub show_sd: bool,
 }
 
 impl Default for WaveformParams {
@@ -190,6 +259,7 @@ impl Default for WaveformParams {
             probe_scale: [1.0, 1.0],
             amp_scale: 1.0,
             pc_shapes: true,
+            show_sd: false,
         }
     }
 }
@@ -214,6 +284,18 @@ impl Default for CcgParams {
     }
 }
 
+fn default_isi_log_min_ms() -> f32 {
+    0.2
+}
+
+fn default_isi_log_max_ms() -> f32 {
+    10_000.0
+}
+
+fn default_isi_log_n_bins() -> usize {
+    80
+}
+
 /// phy `ISIView` defaults.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -221,6 +303,14 @@ pub struct IsiParams {
     pub x_min_ms: f32,
     pub x_max_ms: f32,
     pub n_bins: usize,
+    #[serde(default)]
+    pub log_x: bool,
+    #[serde(default = "default_isi_log_min_ms")]
+    pub log_min_ms: f32,
+    #[serde(default = "default_isi_log_max_ms")]
+    pub log_max_ms: f32,
+    #[serde(default = "default_isi_log_n_bins")]
+    pub log_n_bins: usize,
 }
 
 impl Default for IsiParams {
@@ -229,6 +319,10 @@ impl Default for IsiParams {
             x_min_ms: 0.0,
             x_max_ms: 50.0,
             n_bins: 50,
+            log_x: false,
+            log_min_ms: default_isi_log_min_ms(),
+            log_max_ms: default_isi_log_max_ms(),
+            log_n_bins: default_isi_log_n_bins(),
         }
     }
 }
@@ -353,5 +447,103 @@ mod tests {
         assert!(UiPrefs::load(Path::new("/nonexistent/sorrel"))
             .anchor
             .is_none());
+    }
+
+    #[test]
+    fn legacy_ui_json_deserializes_with_exact_phy_defaults() {
+        let legacy = r#"{
+            "views": {
+                "waveform": { "mode": "Waveforms", "n_spikes": 100 },
+                "isi": { "x_min_ms": 0.0, "x_max_ms": 50.0, "n_bins": 50 }
+            }
+        }"#;
+        let prefs: UiPrefs = serde_json::from_str(legacy).unwrap();
+        assert_eq!(prefs.views.feature.basis, FeatureBasis::Pc2Ch);
+        assert_eq!(prefs.views.feature.display_mode, FeatureDisplayMode::Points);
+        assert!(!prefs.views.feature.same_shank_clusters);
+        assert!(!prefs.views.isi.log_x);
+        assert_eq!(prefs.views.isi.x_min_ms, 0.0);
+        assert_eq!(prefs.views.isi.x_max_ms, 50.0);
+        assert_eq!(prefs.views.isi.n_bins, 50);
+        assert_eq!(prefs.views.isi.log_min_ms, 0.2);
+        assert_eq!(prefs.views.isi.log_max_ms, 10_000.0);
+        assert_eq!(prefs.views.isi.log_n_bins, 80);
+        assert_eq!(prefs.views.waveform.mode, WaveformMode::Waveforms);
+        assert!(!prefs.views.waveform.show_sd);
+
+        // Also an completely empty object produces identical defaults.
+        let empty: UiPrefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.views.feature, FeatureParams::default());
+        assert!(!empty.views.isi.log_x);
+        assert_eq!(empty.views.isi.log_min_ms, 0.2);
+        assert_eq!(empty.views.isi.log_max_ms, 10_000.0);
+        assert_eq!(empty.views.isi.log_n_bins, 80);
+        assert!(!empty.views.waveform.show_sd);
+    }
+
+    #[test]
+    fn new_prefs_fields_and_enum_variants_round_trip() {
+        for (basis, expected_json, expected_four_ch, expected_raw_scalar) in [
+            (FeatureBasis::Pc2Ch, "\"pc_2ch\"", false, false),
+            (FeatureBasis::Pc0_4Ch, "\"pc0_4ch\"", true, false),
+            (FeatureBasis::Energy4Ch, "\"energy_4ch\"", true, true),
+            (FeatureBasis::Peak4Ch, "\"peak_4ch\"", true, true),
+            (FeatureBasis::Valley4Ch, "\"valley_4ch\"", true, true),
+        ] {
+            let s = serde_json::to_string(&basis).unwrap();
+            assert_eq!(s, expected_json);
+            assert_eq!(serde_json::from_str::<FeatureBasis>(&s).unwrap(), basis);
+            assert_eq!(basis.is_four_channel(), expected_four_ch);
+            assert_eq!(basis.is_raw_scalar(), expected_raw_scalar);
+            assert!(!basis.label().is_empty());
+        }
+
+        for (mode, expected_json) in [
+            (FeatureDisplayMode::Points, "\"points\""),
+            (FeatureDisplayMode::Density, "\"density\""),
+            (FeatureDisplayMode::Contours, "\"contours\""),
+        ] {
+            let s = serde_json::to_string(&mode).unwrap();
+            assert_eq!(s, expected_json);
+            assert_eq!(
+                serde_json::from_str::<FeatureDisplayMode>(&s).unwrap(),
+                mode
+            );
+        }
+
+        let prefs = UiPrefs {
+            views: ViewParams {
+                waveform: WaveformParams {
+                    show_sd: true,
+                    ..Default::default()
+                },
+                isi: IsiParams {
+                    x_min_ms: 1.0,
+                    x_max_ms: 100.0,
+                    n_bins: 60,
+                    log_x: true,
+                    log_min_ms: 0.5,
+                    log_max_ms: 5_000.0,
+                    log_n_bins: 120,
+                },
+                feature: FeatureParams {
+                    basis: FeatureBasis::Energy4Ch,
+                    display_mode: FeatureDisplayMode::Contours,
+                    same_shank_clusters: true,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let back: UiPrefs = serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+        assert!(back.views.waveform.show_sd);
+        assert!(back.views.isi.log_x);
+        assert_eq!(back.views.isi.x_min_ms, 1.0);
+        assert_eq!(back.views.isi.x_max_ms, 100.0);
+        assert_eq!(back.views.isi.n_bins, 60);
+        assert_eq!(back.views.isi.log_min_ms, 0.5);
+        assert_eq!(back.views.isi.log_max_ms, 5_000.0);
+        assert_eq!(back.views.isi.log_n_bins, 120);
+        assert_eq!(back.views.feature, prefs.views.feature);
     }
 }

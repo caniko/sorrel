@@ -25,7 +25,7 @@ pub mod rescue;
 pub mod shape;
 pub mod snippets;
 
-pub use binning::{histogram_u64, isi_histogram, isi_histogram_range, psth};
+pub use binning::{histogram_u64, isi_histogram, isi_histogram_log, isi_histogram_range, psth};
 pub use ccg_analysis::{analyse_refractory_dip, refractory_dip_score, CcgRefractoryAnalysis};
 pub use cmr::{subtract_channel_median, subtract_channel_median_grouped};
 pub use distribution::{
@@ -43,14 +43,14 @@ pub use hull3d::convex_hull_3d;
 pub use kmeans::{assign as kmeans_assign, kmeans, KMeans};
 pub use lttb::lttb_downsample;
 pub use metrics::{
-    amplitude_snr, auto_correlogram, ccg_baseline, correlograms, cross_correlogram, fraction_below,
-    isi_violation_rate, isi_violations, mean_amplitude, min_contamination_sliding_refractory,
-    presence_ratio, refractory_contamination, sliding_refractory_argmin, std_amplitude,
-    RefractoryParams,
+    amplitude_snr, auto_correlogram, ccg_baseline, correlograms, cross_correlogram,
+    duplicate_spike_indices, fraction_below, isi_violation_rate, isi_violations, mean_amplitude,
+    min_contamination_sliding_refractory, presence_ratio, refractory_contamination,
+    sliding_refractory_argmin, std_amplitude, RefractoryParams,
 };
 pub use metrics_iso::{
-    isolation_metrics, lda_d_prime, nn_isolation_metric, simplified_silhouette, IsolationMetrics,
-    MIN_CLUSTER_SPIKES,
+    isolation_metrics, lda_d_prime, nn_isolation_metric, pairwise_separation,
+    simplified_silhouette, IsolationMetrics, PairwiseSeparation, MIN_CLUSTER_SPIKES,
 };
 pub use quality::{quality_breakdown, QualityBreakdown};
 pub use refractory::{

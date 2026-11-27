@@ -32,6 +32,7 @@ pub enum BrushSource {
     SpikeDataLasso,
     TemplateFeatureLasso,
     IsiViolators,
+    Duplicates,
 }
 
 impl BrushSource {
@@ -44,6 +45,7 @@ impl BrushSource {
             Self::SpikeDataLasso => "Spike data lasso",
             Self::TemplateFeatureLasso => "Tmpl features lasso",
             Self::IsiViolators => "ISI violators",
+            Self::Duplicates => "duplicates",
         }
     }
 }
@@ -319,5 +321,10 @@ mod tests {
             "nothing hovered clears it"
         );
         assert!(!b.end_frame());
+    }
+
+    #[test]
+    fn duplicates_source_label_is_duplicates() {
+        assert_eq!(BrushSource::Duplicates.label(), "duplicates");
     }
 }

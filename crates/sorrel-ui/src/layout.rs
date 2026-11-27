@@ -1054,9 +1054,14 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                 }
             }
             Pane::Isi => {
-                let (p, brushes, jobs) = (&mut self.view_params.isi, &mut *self.brushes, self.jobs);
+                let (p, brushes, jobs, actions) = (
+                    &mut self.view_params.isi,
+                    &mut *self.brushes,
+                    self.jobs,
+                    &mut self.actions,
+                );
                 scroll(ui, *pane, &mut |ui| {
-                    isi_view(ui, session, selected, p, brushes, jobs)
+                    isi_view(ui, session, selected, p, brushes, jobs, actions)
                 });
             }
             Pane::Ccg => {
@@ -1067,7 +1072,7 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                 });
             }
             Pane::Features => {
-                // Computed PCs follow the trace pane's HP/CMR toggles.
+                // Computed PCs and waveform scalars follow the trace pane's HP/CMR toggles.
                 let shanks = if *self.trace.per_shank {
                     self.trace.shanks
                 } else {
@@ -1079,9 +1084,11 @@ impl<P: DataProvider> Behavior<Pane> for ViewBehavior<'_, P> {
                     session,
                     selected,
                     self.feature_state,
+                    &mut self.view_params.feature,
                     self.jobs,
                     cfg,
                     shanks,
+                    self.trace.shanks,
                     self.spike_reorder,
                     self.brushes,
                     self.depths,

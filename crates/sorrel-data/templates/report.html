@@ -54,6 +54,9 @@ polyline.wf.peak{stroke:var(--peak);stroke-width:1.9}
 text.wf{font-size:9px;fill:var(--faint);text-anchor:middle}
 text.wf.peak{fill:var(--peak);font-weight:600}
 .dots{fill:none;stroke:var(--dots);stroke-width:2.4;stroke-linecap:round;opacity:.5;vector-effect:non-scaling-stroke}
+.tick{font-size:9px;fill:var(--faint)}
+.iqr{fill:var(--dots);fill-opacity:.25}
+.median{fill:none;stroke:var(--peak);stroke-width:1.5;vector-effect:non-scaling-stroke}
 .all{width:100%;margin-top:12px;font-size:11px}
 .all tbody{display:grid;grid-template-columns:repeat(4,1fr);column-gap:22px;border-top:1px solid var(--line);padding-top:6px}
 .all tr{display:flex;justify-content:space-between;gap:8px;border-bottom:1px dotted var(--line);padding:1px 0}
@@ -100,9 +103,10 @@ figure.wave{grid-column:1/-1}
 <div class="plots">
 <figure class="wave">{% if let Some(svg) = c.svgs.waveform %}{{ svg|safe }}{% else %}<p class="none">no templates</p>{% endif %}<figcaption><b>template</b><span>{{ c.shape }}</span></figcaption></figure>
 <figure>{{ c.svgs.isi|safe }}<figcaption><span>0</span><b>ISI</b><span>50 ms</span></figcaption></figure>
-<figure>{{ c.svgs.log_isi|safe }}<figcaption><span>1 ms</span><b>ISI, log</b><span>1000 s</span></figcaption></figure>
+<figure>{{ c.svgs.log_isi|safe }}<figcaption><span>0.2 ms</span><b>Log-ISI</b><span>10 s</span></figcaption></figure>
 <figure>{{ c.svgs.acg|safe }}<figcaption><span>−50</span><b>ACG</b><span>+50 ms</span></figcaption></figure>
 <figure class="amp">{% if let Some(svg) = c.svgs.amplitude %}{{ svg|safe }}{% else %}<p class="none">no amplitudes</p>{% endif %}<figcaption><span>0</span><b>amplitude over time</b><span>{{ duration_min }} min</span></figcaption></figure>
+{% if let Some(svg) = c.svgs.amplitude_iqr %}<figure class="amp">{{ svg|safe }}<figcaption><b>amplitude over time (median + IQR)</b></figcaption></figure>{% endif %}
 </div>
 <table class="all"><tbody>
 {%- for (name, v) in c.metrics %}

@@ -4149,3 +4149,617 @@ fn xtalk_3d_positions() {
         h
     });
 }
+
+/// Ctrl+click the first `n` corners of a square around `cell`'s middle.
+/// Re-reads `feature_cell` before each vertex to stay robust to layout updates.
+fn lasso_points_in_cell(h: &mut Harness<'static, App>, cell: usize, n: usize) {
+    for d in [
+        egui::vec2(-1.0, -1.0),
+        egui::vec2(1.0, -1.0),
+        egui::vec2(1.0, 1.0),
+        egui::vec2(-1.0, 1.0),
+    ]
+    .into_iter()
+    .take(n)
+    {
+        let rect = feature_cell(h, cell);
+        let pos = rect.center() + d * (rect.size() * 0.35);
+        h.hover_at(pos);
+        h.input_mut().modifiers = egui::Modifiers::COMMAND;
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::COMMAND,
+            });
+            h.step();
+        }
+        settle(h);
+    }
+    h.input_mut().modifiers = egui::Modifiers::NONE;
+    settle(h);
+}
+
+/// Insert synthetic duplicate spikes (`dt = 3 samples = 0.1 ms < 0.2 ms` at
+/// 30 kHz) after every sixth spike, with 80 % amplitude so `dedup` picks them.
+fn add_duplicate_spikes(root: &Path) {
+    let raw = std::fs::read(root.join("spike_times.npy")).unwrap();
+    let hlen = u16::from_le_bytes([raw[8], raw[9]]) as usize;
+    let times: Vec<u64> = raw[10 + hlen..]
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|b| u64::from_le_bytes(*b))
+        .collect();
+    let clusters = npy::read_1d_u32(&root.join("spike_clusters.npy")).unwrap();
+    let amps = npy::read_1d_f32(&root.join("amplitudes.npy")).unwrap();
+    let (pcs, _) = npy::read_npy_f32_flat(&root.join("pc_features.npy")).unwrap();
+    let (tf, _) = npy::read_npy_f32_flat(&root.join("template_features.npy")).unwrap();
+    let snr = npy::read_1d_f32(&root.join("spike_snr.npy")).unwrap();
+    let (mut t2, mut c2, mut a2, mut p2) = (vec![], vec![], vec![], vec![]);
+    let (mut f2, mut s2) = (vec![], vec![]);
+    for i in 0..times.len() {
+        let mut push = |t: u64, amp_scale: f32| {
+            t2.push(t);
+            c2.push(clusters[i]);
+            a2.push(amps[i] * amp_scale);
+            p2.extend_from_slice(&pcs[i * 12..i * 12 + 12]);
+            f2.extend_from_slice(&tf[i * 2..i * 2 + 2]);
+            s2.push(snr[i]);
+        };
+        push(times[i], 1.0);
+        if i % 6 == 0 && times.get(i + 1).is_none_or(|&n| n > times[i] + 6) {
+            push(times[i] + 3, 0.8);
+        }
+    }
+    let n = t2.len();
+    npy::write_1d_u64_atomic(&root.join("spike_times.npy"), &t2).unwrap();
+    npy::write_1d_u32_atomic(&root.join("spike_clusters.npy"), &c2).unwrap();
+    npy::write_1d_u32_atomic(&root.join("spike_templates.npy"), &c2).unwrap();
+    npy::write_f32_atomic(&root.join("amplitudes.npy"), &[n], &a2).unwrap();
+    npy::write_f32_atomic(&root.join("pc_features.npy"), &[n, 3, 4], &p2).unwrap();
+    npy::write_f32_atomic(&root.join("template_features.npy"), &[n, 2], &f2).unwrap();
+    npy::write_f32_atomic(&root.join("spike_snr.npy"), &[n], &s2).unwrap();
+}
+
+#[test]
+fn mclust_w1_limit_set_multi_projection_commit_esc_brush_and_atomic_split() {
+    if no_gpu() {
+        return;
+    }
+    let mut h = wide_fixture("mclust-w1-limits", egui::Theme::Dark);
+    select_two_and_open_features(&mut h);
+
+    // Draw an active lasso in cell 1 and verify limit controls appear.
+    lasso_points_in_cell(&mut h, 1, 4);
+    h.get_by_label("+ limit");
+    h.get_by_label("− exclude");
+    assert!(
+        h.state().brushes().spikes.is_some(),
+        "active closed polygon publishes a spike brush (summary={:?})",
+        h.state().feature_interaction_summary()
+    );
+
+    // Commit the first polygon as an Include limit via `+ limit`.
+    h.get_by_label("+ limit").click();
+    settle(&mut h);
+    let count_committed_include = |h: &Harness<'static, App>| {
+        h.query_all_by_label_contains("∩ ")
+            .filter(|n| {
+                n.accesskit_node()
+                    .label()
+                    .is_some_and(|l| l.ends_with(" ×"))
+            })
+            .count()
+    };
+    assert_eq!(
+        count_committed_include(&h),
+        1,
+        "one committed Include limit chip should render"
+    );
+    let brush_after_first = h
+        .state()
+        .brushes()
+        .spikes
+        .clone()
+        .expect("committed limit keeps the spike brush alive");
+    assert_eq!(brush_after_first.source, BrushSource::FeatureLasso);
+    assert!(!brush_after_first.is_empty());
+
+    // Draw a second polygon on cell 2 and commit it via `− exclude` (arms next as Exclude).
+    lasso_points_in_cell(&mut h, 2, 4);
+    h.get_by_label("− exclude").click();
+    settle(&mut h);
+    assert_eq!(
+        count_committed_include(&h),
+        2,
+        "two committed Include limit chips should render"
+    );
+    h.get_by_label("∖ exclude");
+
+    // Draw an active Exclude polygon on cell 6.
+    lasso_points_in_cell(&mut h, 6, 3);
+    h.get_by_label("∖ active");
+
+    // First Esc clears the active polygon while leaving both committed chips intact.
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert!(
+        h.query_by_label("∖ active").is_none(),
+        "first Esc clears the active polygon"
+    );
+    assert_eq!(
+        count_committed_include(&h),
+        2,
+        "first Esc leaves committed limits intact"
+    );
+
+    // Second Esc pops the most recently committed limit.
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert_eq!(
+        count_committed_include(&h),
+        1,
+        "second Esc pops one committed limit"
+    );
+
+    // Remaining committed limit still brushes across views.
+    let brush = h
+        .state()
+        .brushes()
+        .spikes
+        .clone()
+        .expect("remaining committed limit still publishes a spike brush");
+    assert_eq!(brush.source, BrushSource::FeatureLasso);
+    assert!(!brush.is_empty());
+    h.get_by_label_contains("brush:");
+    click_tab(&mut h, "Amplitudes");
+    assert!(
+        h.state().brushes().spikes.is_some(),
+        "combined limit brush survives switching to Amplitudes"
+    );
+    click_tab(&mut h, "Features");
+
+    // Pressing K commits one atomic split, and Ctrl+Z undoes it cleanly.
+    let (before_clusters, before_n) = {
+        let s = sorrel_ui::jobs::read(h.state().session());
+        (s.spike_clusters_global().to_vec(), s.n_clusters())
+    };
+    h.key_press(egui::Key::K);
+    settle(&mut h);
+    {
+        let s = sorrel_ui::jobs::read(h.state().session());
+        assert_eq!(s.history_len(), 1, "K commits one atomic split");
+        assert!(
+            s.n_clusters() > before_n,
+            "split creates at least one child cluster"
+        );
+        assert_ne!(s.spike_clusters_global(), before_clusters);
+    }
+
+    h.key_press_modifiers(primary_modifiers(), egui::Key::Z);
+    settle(&mut h);
+    assert_eq!(
+        sorrel_ui::jobs::read(h.state().session()).spike_clusters_global(),
+        before_clusters,
+        "Ctrl+Z restores membership after atomic limit split"
+    );
+}
+
+#[test]
+fn mclust_w2_feature_basis_switching_and_prefs_persistence() {
+    if no_gpu() {
+        return;
+    }
+    use sorrel_ui::prefs::{FeatureBasis, UiPrefs};
+
+    let root = dataset("mclust-w2-basis", 3);
+    let root_for_app = root.clone();
+    let mut h = harness_sized(egui::Theme::Dark, [2200.0, 1100.0], move || {
+        let (session, positions) = open(&root_for_app);
+        let mut app = SorrelApp::new(session, label_str);
+        configure(&mut app, &root_for_app, positions);
+        app
+    });
+    settle(&mut h);
+    select_two_and_open_features(&mut h);
+    assert_eq!(h.state().view_params.feature.basis, FeatureBasis::Pc2Ch);
+    assert_full_feature_grid(&h);
+
+    for next in [
+        FeatureBasis::Pc0_4Ch,
+        FeatureBasis::Energy4Ch,
+        FeatureBasis::Peak4Ch,
+        FeatureBasis::Valley4Ch,
+        FeatureBasis::Pc2Ch,
+        FeatureBasis::Energy4Ch,
+    ] {
+        let current_label = h.state().view_params.feature.basis.label();
+        h.get(By::new().role(Role::ComboBox).value(current_label))
+            .click();
+        settle(&mut h);
+        h.get_by_label(next.label()).click();
+        settle(&mut h);
+        assert_eq!(
+            h.state().view_params.feature.basis,
+            next,
+            "basis switched to {next:?}"
+        );
+        assert_full_feature_grid(&h);
+    }
+
+    // Ctrl+S triggers SorrelApp::save() -> save_prefs().
+    h.key_press_modifiers(primary_modifiers(), egui::Key::S);
+    settle(&mut h);
+    drop(h);
+    let persisted = UiPrefs::load(&root);
+    assert_eq!(
+        persisted.views.feature.basis,
+        FeatureBasis::Energy4Ch,
+        "UiPrefs persists the selected FeatureBasis"
+    );
+
+    // Reopening the dataset restores the persisted basis.
+    let root_reopen = root.clone();
+    let mut h2 = harness_sized(egui::Theme::Dark, [2200.0, 1100.0], move || {
+        let (session, positions) = open(&root_reopen);
+        let mut app = SorrelApp::new(session, label_str);
+        configure(&mut app, &root_reopen, positions);
+        app
+    });
+    settle(&mut h2);
+    assert_eq!(
+        h2.state().view_params.feature.basis,
+        FeatureBasis::Energy4Ch
+    );
+}
+
+#[test]
+fn mclust_w3_density_contours_and_same_shank_coexist_with_lasso() {
+    if no_gpu() {
+        return;
+    }
+    use sorrel_ui::prefs::FeatureDisplayMode;
+
+    let root = dataset("mclust-w3-density", 4);
+    let mut h = harness_sized(egui::Theme::Dark, [2200.0, 1100.0], move || {
+        let (session, positions) = open(&root);
+        let mut app = SorrelApp::new(session, label_str);
+        configure(&mut app, &root, positions);
+        app.set_channel_shanks((0..N_CHANNELS).map(|c| (c / 8) as u32).collect());
+        app
+    });
+    settle(&mut h);
+    select_two_and_open_features(&mut h);
+    lasso_points_in_cell(&mut h, 1, 4);
+
+    let selected_before = h.state().selected_clusters().to_vec();
+    let brush_before = h
+        .state()
+        .brushes()
+        .spikes
+        .clone()
+        .expect("lasso brush active before display-mode toggles");
+    assert_eq!(brush_before.source, BrushSource::FeatureLasso);
+    assert!(!brush_before.is_empty());
+
+    let open_feature_gear = |h: &mut Harness<'static, App>| {
+        let two_d_rect = h.get_by_label("2D").rect();
+        let gear = h
+            .get_all_by_label("⚙")
+            .filter(|n| {
+                let r = n.rect();
+                (r.center().y - two_d_rect.center().y).abs() < 24.0 && r.min.x > two_d_rect.max.x
+            })
+            .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+            .expect("Features toolbar gear button");
+        gear.click();
+        settle(h);
+    };
+    let click_display_mode = |h: &mut Harness<'static, App>, label: &str| {
+        if h.query_by_label(label).is_none() {
+            open_feature_gear(h);
+        }
+        h.get_by_label(label).click();
+        settle(h);
+    };
+
+    // Density mode
+    click_display_mode(&mut h, "Density");
+    assert_eq!(
+        h.state().view_params.feature.display_mode,
+        FeatureDisplayMode::Density
+    );
+    assert_full_feature_grid(&h);
+    assert_eq!(h.state().selected_clusters(), selected_before);
+    assert!(h
+        .state()
+        .brushes()
+        .spikes
+        .as_ref()
+        .is_some_and(|b| b.source == BrushSource::FeatureLasso && !b.is_empty()));
+
+    // Contours mode
+    click_display_mode(&mut h, "Contours");
+    assert_eq!(
+        h.state().view_params.feature.display_mode,
+        FeatureDisplayMode::Contours
+    );
+    assert_full_feature_grid(&h);
+    assert_eq!(h.state().selected_clusters(), selected_before);
+    assert!(h
+        .state()
+        .brushes()
+        .spikes
+        .as_ref()
+        .is_some_and(|b| b.source == BrushSource::FeatureLasso && !b.is_empty()));
+
+    // Toggle Same-shank clusters via the Features toolbar gear menu.
+    if h.query_by_label("Same-shank clusters").is_none() {
+        open_feature_gear(&mut h);
+    }
+    h.get_by_label("Same-shank clusters").click();
+    settle(&mut h);
+    assert!(h.state().view_params.feature.same_shank_clusters);
+    assert_full_feature_grid(&h);
+    assert_eq!(h.state().selected_clusters(), selected_before);
+    assert!(h
+        .state()
+        .brushes()
+        .spikes
+        .as_ref()
+        .is_some_and(|b| b.source == BrushSource::FeatureLasso && !b.is_empty()));
+
+    // Return to Points mode and confirm state stays intact.
+    click_display_mode(&mut h, "Points");
+    assert_eq!(
+        h.state().view_params.feature.display_mode,
+        FeatureDisplayMode::Points
+    );
+    assert_eq!(h.state().selected_clusters(), selected_before);
+    assert!(h.state().brushes().spikes.is_some());
+}
+
+#[test]
+fn mclust_w4_log_isi_duplicate_brush_and_undoable_dedup() {
+    if no_gpu() {
+        return;
+    }
+    use sorrel_data::command::{CurationCommand, Method};
+
+    let root = dataset("mclust-w4-dedup", 3);
+    add_duplicate_spikes(&root);
+    let mut h = harness_sized(egui::Theme::Dark, [2200.0, 1100.0], move || {
+        let (session, positions) = open(&root);
+        let mut app = SorrelApp::new(session, label_str);
+        configure(&mut app, &root, positions);
+        app
+    });
+    settle(&mut h);
+    click_cluster_row(&mut h, 0);
+    click_tab(&mut h, "ISI");
+
+    // Toggle logarithmic ISI x-axis and verify it settles cleanly.
+    h.get_by_label("log").click();
+    settle(&mut h);
+    assert!(h.state().view_params.isi.log_x);
+    h.get_by_label_contains("ISI histogram (log)");
+
+    // Click the amber duplicate chip and assert BrushSource::Duplicates.
+    h.get_by_label("duplicates c0").click();
+    settle(&mut h);
+    let dup_brush = h
+        .state()
+        .brushes()
+        .spikes
+        .clone()
+        .expect("duplicate chip publishes a spike brush");
+    assert_eq!(dup_brush.source, BrushSource::Duplicates);
+    assert!(!dup_brush.is_empty());
+
+    let (before_clusters, before_n) = {
+        let s = sorrel_ui::jobs::read(h.state().session());
+        (s.spike_clusters_global().to_vec(), s.n_clusters())
+    };
+
+    // Click `Remove duplicates` and verify atomic Noise child tagged "duplicate" with Method::Algo("dedup").
+    h.get_by_label("Remove duplicates").click();
+    settle(&mut h);
+    let new_cluster = ClusterId(before_n);
+    {
+        let s = sorrel_ui::jobs::read(h.state().session());
+        assert_eq!(s.history_len(), 1, "dedup records one undoable batch");
+        assert_eq!(s.n_clusters(), before_n + 1);
+        assert_eq!(s.label(new_cluster), Some(PhyLabel::Noise));
+        assert!(
+            s.tags(new_cluster).iter().any(|t| t == "duplicate"),
+            "new cluster should be tagged \"duplicate\", got {:?}",
+            s.tags(new_cluster)
+        );
+        assert!(!s.spike_times(new_cluster).is_empty());
+        let has_dedup_split = s.history_commands().any(|cmd| match cmd {
+            CurationCommand::Batch { children } => children.iter().any(|c| {
+                matches!(
+                    c,
+                    CurationCommand::Split {
+                        by: Method::Algo(algo),
+                        ..
+                    } if algo == "dedup"
+                )
+            }),
+            CurationCommand::Split {
+                by: Method::Algo(algo),
+                ..
+            } => algo == "dedup",
+            _ => false,
+        });
+        assert!(
+            has_dedup_split,
+            "history must record Method::Algo(\"dedup\")"
+        );
+    }
+    assert!(
+        h.state().brushes().spikes.is_none(),
+        "duplicate brush is cleared after removal"
+    );
+
+    // Ctrl+Z undoes the dedup split cleanly.
+    h.key_press_modifiers(primary_modifiers(), egui::Key::Z);
+    settle(&mut h);
+    {
+        let s = sorrel_ui::jobs::read(h.state().session());
+        assert_eq!(s.spike_clusters_global(), before_clusters);
+        assert!(s.spike_times(new_cluster).is_empty());
+    }
+}
+
+#[test]
+fn mclust_w5_eval_overlap_quality_pairwise_and_merge_tip() {
+    if no_gpu() {
+        return;
+    }
+    // 4 clusters: c0 (peak ch 3, PC chs [3,4,5,6]) and c3 (peak ch 2, PC chs
+    // [2,3,4,5]) share 3 PC channels, yielding finite pairwise separation.
+    let root = dataset("mclust-w5-overlap", 4);
+    let mut h = harness_sized(egui::Theme::Dark, [2200.0, 1100.0], move || {
+        let (session, positions) = open(&root);
+        let mut app = SorrelApp::new(session, label_str);
+        configure(&mut app, &root, positions);
+        app
+    });
+    settle(&mut h);
+    click_cluster_row(&mut h, 0);
+    ctrl_click_row(&mut h, "3");
+    click_tab(&mut h, "Quality");
+
+    // Collapsible "Pairwise separation" section settles with c0 × c3 and finite metrics.
+    h.get_by_label("Pairwise separation");
+    assert!(
+        h.query_by_label_contains("computing pairwise separation")
+            .is_none(),
+        "pairwise separation job should settle"
+    );
+    h.get_by_label("c0 × c3");
+    {
+        let s = sorrel_ui::jobs::read(h.state().session());
+        let sep = sorrel_data::pairwise_cluster_separation(&*s, ClusterId(0), ClusterId(3))
+            .expect("shared PC channels yield finite pairwise separation");
+        assert!(sep.d_prime.is_finite());
+        assert!(sep.bhattacharyya.is_finite());
+        assert!(sep.overlap_est.is_finite());
+        assert!(sep.l_ratio_ab.is_finite());
+    }
+
+    // Hovering a Similar row with shared PC channels shows MergeTip with feature d' and overlap.
+    click_cluster_row(&mut h, 0);
+    click_tab(&mut h, "Similar");
+    let row = h
+        .get_all_by_label("good")
+        .map(|n| n.rect())
+        .find(|r| r.min.x > 900.0)
+        .expect("Similar row for c3");
+    h.hover_at(row.center());
+    settle(&mut h);
+    h.hover_at(row.center());
+    settle(&mut h);
+    h.get_by_label_contains("merge c");
+    let tip_text = h
+        .get_by_label_contains("feature d'")
+        .accesskit_node()
+        .value()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        tip_text.contains("overlap "),
+        "MergeTip should include overlap alongside feature d', got {tip_text:?}"
+    );
+}
+
+#[test]
+fn mclust_w6_waveform_mean_sd_and_time_brush_overlay() {
+    if no_gpu() {
+        return;
+    }
+    use sorrel_ui::prefs::WaveformMode;
+
+    let mut h = wide_fixture("mclust-w6-waveform", egui::Theme::Dark);
+    click_cluster_row(&mut h, 0);
+
+    // Open Waveforms gear menu (same toolbar row as Waveforms' `overlap` checkbox).
+    let open_wf_gear = |h: &mut Harness<'static, App>| {
+        let overlap_rect = h.get_by_label("overlap").rect();
+        let gear = h
+            .get_all_by_label("⚙")
+            .filter(|n| {
+                let r = n.rect();
+                (r.center().y - overlap_rect.center().y).abs() < 24.0
+                    && r.min.x >= overlap_rect.min.x
+            })
+            .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+            .expect("Waveforms gear button");
+        gear.click();
+        settle(h);
+    };
+    open_wf_gear(&mut h);
+    h.get_by_label("mean").click();
+    settle(&mut h);
+    // Selecting "mean" closes the popup menu; reopen it to toggle "± SD".
+    open_wf_gear(&mut h);
+    h.get_by_label("± SD").click();
+    settle(&mut h);
+    assert_eq!(h.state().view_params.waveform.mode, WaveformMode::Mean);
+    assert!(h.state().view_params.waveform.show_sd);
+    h.get_by_label_contains("mean of all");
+
+    // Activate a TimeBrush via Shift+drag on Amplitudes (visible beside Waveforms in wide_fixture).
+    click_tab(&mut h, "Amplitudes");
+    let plot = h.get_by_label("amplitude plot").rect();
+    let y = plot.center().y;
+    let (a, b) = (
+        egui::pos2(plot.left() + plot.width() * 0.25, y),
+        egui::pos2(plot.left() + plot.width() * 0.75, y),
+    );
+    let shift = egui::Modifiers::SHIFT;
+    h.input_mut().modifiers = shift;
+    h.hover_at(a);
+    h.event(egui::Event::PointerButton {
+        pos: a,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: shift,
+    });
+    h.run_ok();
+    h.hover_at(b);
+    h.run_ok();
+    h.event(egui::Event::PointerButton {
+        pos: b,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: shift,
+    });
+    h.run_ok();
+    h.input_mut().modifiers = egui::Modifiers::NONE;
+    settle(&mut h);
+
+    assert!(
+        h.state().brushes().time.is_some(),
+        "Shift+drag on Amplitudes activates the TimeBrush"
+    );
+    // Waveforms settles the time-brush dashed overlay job and shows the caption.
+    let caption_node = h.get_by_label_contains("dashed = ");
+    let caption = caption_node
+        .accesskit_node()
+        .value()
+        .or_else(|| caption_node.accesskit_node().label())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        caption.contains("spikes)"),
+        "expected settled time-brush caption with spike count, got {caption:?}"
+    );
+    assert!(
+        !caption.contains("loading"),
+        "time-brush overlay job should be settled, got {caption:?}"
+    );
+}

@@ -1,6 +1,6 @@
 //! Build the same curated Units payload for the CLI and PyNWB.
 
-use crate::{collect_qc_rows_with, provenance, Session};
+use crate::{collect_qc_rows_with, provenance, QcRow, Session};
 use anyhow::{ensure, Result};
 use sorrel_io::curation_json::unit_id_text;
 use sorrel_io::extras::QualityMetrics;
@@ -87,14 +87,8 @@ where
     }
 
     let qc = std::cell::OnceCell::new();
-    let computed = |c: ClusterId, name: &str| {
-        let rows =
-            qc.get_or_init(|| collect_qc_rows_with(session, Some(provider.channel_positions())));
-        rows[c.idx()]
-            .get(name)
-            .filter(|v| v.is_finite())
-            .unwrap_or(f32::NAN)
-    };
+    let qc_rows =
+        || qc.get_or_init(|| collect_qc_rows_with(session, Some(provider.channel_positions())));
     if let Some(stored) = stored_metrics.filter(|m| !m.is_empty()) {
         for name in stored.names() {
             if name == "id"
@@ -108,15 +102,16 @@ where
             // Imported metrics describe the original trains. Keep them for
             // unchanged rows; recompute what we can for edited trains.
             let original = stored.get(name).unwrap_or_default();
+            let count = qc_count(name);
             let values = clusters
                 .iter()
                 .map(|&c| {
-                    let v = if session.spike_times(c) == provider.spike_times(c) {
-                        original.get(c.idx()).copied().unwrap_or(f32::NAN)
+                    if session.spike_times(c) == provider.spike_times(c) {
+                        f64::from(original.get(c.idx()).copied().unwrap_or(f32::NAN))
                     } else {
-                        computed(c, name)
-                    };
-                    f64::from(v)
+                        let row = &qc_rows()[c.idx()];
+                        count.map_or_else(|| qc_float(row, name), |count| f64::from(count(row)))
+                    }
                 })
                 .collect();
             let doc = metric_docs().find(|(key, _)| *key == name).map_or(
@@ -131,18 +126,10 @@ where
             ));
         }
     } else {
+        let rows = qc_rows();
         for (name, doc) in metric_docs() {
-            let values: Vec<_> = clusters
-                .iter()
-                .map(|&c| f64::from(computed(c, name)))
-                .collect();
-            if values.iter().any(|v| !v.is_nan()) {
-                let data = match name {
-                    "n_spikes" | "isi_violations" => {
-                        Values::Int(values.into_iter().map(|v| v as i64).collect())
-                    }
-                    _ => Values::Float(values),
-                };
+            let data = computed_qc_values(name, clusters.iter().map(|&c| &rows[c.idx()]));
+            if !matches!(&data, Values::Float(values) if values.iter().all(|v| v.is_nan())) {
                 columns.push(column(name, format!("Sorrel QC metric. {doc}"), data, None));
             }
         }
@@ -171,6 +158,27 @@ where
         columns,
         generated_by: ["sorrel-ephys", version],
     })
+}
+
+fn qc_count(name: &str) -> Option<fn(&QcRow) -> u32> {
+    match name {
+        "n_spikes" => Some(|row| row.n_spikes),
+        "isi_violations" => Some(|row| row.isi_violations),
+        "duplicate_spikes" => Some(|row| row.duplicate_spikes),
+        _ => None,
+    }
+}
+
+fn qc_float(row: &QcRow, name: &str) -> f64 {
+    f64::from(row.get(name).filter(|v| v.is_finite()).unwrap_or(f32::NAN))
+}
+
+fn computed_qc_values<'a>(name: &str, rows: impl Iterator<Item = &'a QcRow>) -> Values {
+    if let Some(count) = qc_count(name) {
+        Values::Int(rows.map(|row| i64::from(count(row))).collect())
+    } else {
+        Values::Float(rows.map(|row| qc_float(row, name)).collect())
+    }
 }
 
 pub fn unit_name<P: DataProvider>(provider: &P, cluster: ClusterId) -> String {
@@ -221,6 +229,21 @@ fn counts(map: &BTreeMap<String, u32>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn nwb_duplicate_spike_count_does_not_round_through_f32() {
+        let row = crate::QcRow {
+            duplicate_spikes: 16_777_217,
+            ..Default::default()
+        };
+        let Values::Int(counts) = computed_qc_values("duplicate_spikes", std::iter::once(&row))
+        else {
+            panic!("duplicate_spikes must be an integer column");
+        };
+        assert_eq!(counts, [16_777_217]);
+    }
+
     #[test]
     fn documents_all_qc_metrics() {
         assert_eq!(

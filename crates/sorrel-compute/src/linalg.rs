@@ -156,6 +156,37 @@ pub fn covariance(data: &[f64], n: usize, d: usize) -> Sym {
     s
 }
 
+/// Natural log of the determinant from the diagonal of a Cholesky factor.
+/// Returns `None` for non-finite entries or non-positive Cholesky pivots.
+pub fn log_det(m: &Sym) -> Option<f64> {
+    let d = m.d;
+    if d == 0 {
+        return Some(0.0);
+    }
+    if m.data.len() != d.checked_mul(d)? || m.data.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let mut l = Sym::zeros(d);
+    let mut sum = 0.0;
+    for i in 0..d {
+        for j in 0..=i {
+            let dot = (0..j).map(|k| l.get(i, k) * l.get(j, k)).sum::<f64>();
+            let v = m.get(i, j) - dot;
+            if i == j {
+                if v <= 0.0 || !v.is_finite() {
+                    return None;
+                }
+                let diag = v.sqrt();
+                l.set(i, i, diag);
+                sum += diag.ln();
+            } else {
+                l.set(i, j, v / l.get(j, j));
+            }
+        }
+    }
+    Some(2.0 * sum)
+}
+
 /// In-place Gauss-Jordan inverse of a symmetric matrix. Returns `None` if
 /// the matrix is singular (within `tol`). Operates on `m.data` directly;
 /// only the upper triangle is meaningful afterward — we resymmetrise.
@@ -355,6 +386,31 @@ pub(crate) fn ln_gamma(z: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_det_matches_analytic_determinants() {
+        assert_eq!(log_det(&Sym::zeros(0)), Some(0.0));
+        for (d, data, det) in [
+            (2, vec![1.0, 0.0, 0.0, 1.0], 1.0_f64),
+            (2, vec![2.0, 0.0, 0.0, 8.0], 16.0),
+            (2, vec![2.0, 1.0, 1.0, 3.0], 5.0),
+            (3, vec![4.0, 2.0, 2.0, 2.0, 5.0, 1.0, 2.0, 1.0, 3.0], 32.0),
+        ] {
+            assert!((log_det(&Sym { d, data }).unwrap() - det.ln()).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn log_det_rejects_non_positive_definite_and_nonfinite_matrices() {
+        for data in [
+            vec![1.0, 2.0, 2.0, 4.0], // Singular.
+            vec![1.0, 2.0, 2.0, 1.0], // Indefinite.
+            vec![1.0, 0.0, 0.0, f64::INFINITY],
+            vec![1.0, f64::NAN, 0.0, 1.0], // Non-finite in the unused triangle.
+        ] {
+            assert_eq!(log_det(&Sym { d: 2, data }), None);
+        }
+    }
 
     #[test]
     fn top_eigenvectors_recover_known_basis() {

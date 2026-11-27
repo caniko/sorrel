@@ -29,6 +29,23 @@ pub(crate) const TAG_SPLIT: &str = "split";
 
 static AUTO: UnitOrigin = UnitOrigin::Auto;
 
+fn split_inherited_tags(tags: &[String]) -> impl Iterator<Item = &String> {
+    tags.iter()
+        .filter(|t| !matches!(t.as_str(), TAG_TUNED | TAG_SPLIT))
+}
+
+fn human_review_tags(old: &[String]) -> Vec<String> {
+    let mut tags: Vec<String> = old
+        .iter()
+        .filter(|t| !t.starts_with("review:"))
+        .cloned()
+        .collect();
+    if !old.is_empty() && !tags.iter().any(|t| t == "src:human") {
+        tags.push("src:human".into());
+    }
+    tags
+}
+
 /// Set `v[i]` (grown on demand with defaults), returning the previous value.
 fn set_slot<T: Default>(v: &mut Vec<T>, c: ClusterId, val: T) -> T {
     if v.len() <= c.idx() {
@@ -796,6 +813,50 @@ impl<P: DataProvider> Session<P> {
         Ok(CurationCommand::Tag { cluster, tags })
     }
 
+    /// Split duplicates into a noise unit, retaining the tags the child
+    /// inherits after the host applies the actor's provenance to the parent.
+    pub fn dedup_split_commands(
+        &self,
+        cluster: ClusterId,
+        spike_idx: Vec<u32>,
+        new_cluster: ClusterId,
+        actor: &Actor,
+    ) -> [CurationCommand; 3] {
+        let old = self.tags(cluster);
+        let mut parent = match actor {
+            Actor::Human => human_review_tags(old),
+            _ => old.to_vec(),
+        };
+        if matches!(actor, Actor::Agent { .. }) && !parent.iter().any(|t| t == "src:agent") {
+            parent.push("src:agent".into());
+        }
+        let mut tags = Vec::new();
+        for tag in split_inherited_tags(&parent)
+            .map(String::as_str)
+            .chain(["duplicate"])
+        {
+            if !tags.iter().any(|t| t == tag) {
+                tags.push(tag.to_owned());
+            }
+        }
+        [
+            CurationCommand::Split {
+                cluster,
+                spike_idx,
+                new_cluster,
+                by: Method::Algo("dedup".into()),
+            },
+            CurationCommand::Relabel {
+                cluster: new_cluster,
+                op: PhyLabelOp::SetNoise,
+            },
+            CurationCommand::Tag {
+                cluster: new_cluster,
+                tags,
+            },
+        ]
+    }
+
     /// `cmd` as a human decision: preceded by retags that drop the touched
     /// clusters' `review:*` tags and add `src:human`, all in one undoable
     /// batch. Untagged clusters are left alone (sessions that never ran
@@ -828,14 +889,7 @@ impl<P: DataProvider> Session<P> {
                 if old.is_empty() {
                     return None;
                 }
-                let mut tags: Vec<String> = old
-                    .iter()
-                    .filter(|t| !t.starts_with("review:"))
-                    .cloned()
-                    .collect();
-                if !tags.iter().any(|t| t == "src:human") {
-                    tags.push("src:human".into());
-                }
+                let tags = human_review_tags(old);
                 (tags != old).then_some(CurationCommand::Tag { cluster: c, tags })
             })
             .collect();
@@ -872,6 +926,7 @@ impl<P: DataProvider> Session<P> {
         clusters.dedup();
         let mut children: Vec<CurationCommand> = clusters
             .into_iter()
+            .filter(|&c| c.0 < self.n_clusters())
             .filter(|&c| !self.tags(c).iter().any(|t| t == "src:agent"))
             .map(|cluster| {
                 let mut tags = self.tags(cluster).to_vec();
@@ -1675,11 +1730,7 @@ impl<P: DataProvider> Session<P> {
                 // The child inherits the parent's provenance but not its
                 // tuned/split markers; it is a sorrel unit with one parent.
                 let parent_tags = self.tags(*cluster).to_vec();
-                let inherited = parent_tags
-                    .iter()
-                    .filter(|t| !matches!(t.as_str(), TAG_TUNED | TAG_SPLIT))
-                    .cloned()
-                    .collect();
+                let inherited = split_inherited_tags(&parent_tags).cloned().collect();
                 let child = record.new_cluster;
                 let span = self.unit_span(*cluster);
                 if span != self.provider.unit_span(child) {

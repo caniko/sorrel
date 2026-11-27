@@ -17,8 +17,9 @@ use crate::session::Session;
 use anyhow::{Context, Result};
 use askama::Template;
 use rayon::prelude::*;
-use sorrel_compute::isi_histogram;
-use sorrel_io::{ClusterId, DataProvider, SampleIndex};
+use sorrel_compute::{isi_histogram, isi_histogram_log};
+use sorrel_io::{ClusterId, DataProvider, SampleIndex, SessionSpan};
+use std::fmt::Write;
 use std::path::Path;
 
 /// Which clusters to include.
@@ -39,6 +40,7 @@ pub struct ClusterSvgs {
     pub log_isi: String,
     pub acg: String,
     pub amplitude: Option<String>,
+    pub amplitude_iqr: Option<String>,
 }
 
 const W: f32 = 240.0;
@@ -48,14 +50,15 @@ const WINDOW_S: f32 = 0.050;
 const BIN_S: f32 = 0.001;
 /// Channels in the waveform panel: the strongest few, a tetrode's worth.
 const WAVE_CHANNELS: usize = 4;
-/// Log-ISI axis: 1 ms to 1000 s, ten bins per decade.
-const LOG_ISI_MIN: f64 = -3.0;
-const LOG_ISI_MAX: f64 = 3.0;
-const LOG_ISI_BINS: usize = 60;
+/// Log-ISI axis: 0.2 ms to 10 s.
+const LOG_ISI_MIN_MS: f64 = 0.2;
+const LOG_ISI_MAX_MS: f64 = 10_000.0;
+const LOG_ISI_BINS: usize = 80;
 /// Amplitude strip size and its dot budget (evenly strided beyond it).
 const STRIP_W: f32 = 960.0;
 const STRIP_H: f32 = 64.0;
 const MAX_DOTS: usize = 2000;
+const AMP_TIME_BINS: usize = 24;
 
 /// Headline numbers: (heading, metric column, unit). The card's tiles and
 /// the overview table's columns.
@@ -82,7 +85,7 @@ pub fn render_cluster_svgs<P: DataProvider>(
     let waveform = session.primary_template(cluster).and_then(|t| {
         let wf = session.template_waveform(t)?;
         let (_, n_samples, n_channels) = session.template_shape();
-        if n_samples == 0 || n_channels == 0 {
+        if n_samples == 0 || n_channels == 0 || wf.len() / n_channels < n_samples {
             return None;
         }
         let trace =
@@ -105,12 +108,14 @@ pub fn render_cluster_svgs<P: DataProvider>(
     let isi = isi_histogram(spikes, window as u64, (window / bin) as usize);
     let acg = acg_or_compute(session, cluster, bin, window);
     let amps = session.spike_amplitudes(cluster);
+    let span = session.unit_span(cluster);
     ClusterSvgs {
         waveform,
         isi: svg_bars(&isi, W, H),
-        log_isi: svg_bars(&log_isi_histogram(spikes, sr), W, H),
+        log_isi: svg_log_isi(spikes, sr, session.refractory().fixed_ms),
         acg: svg_bars(&acg, W, H),
-        amplitude: (!amps.is_empty()).then(|| svg_dots(spikes, amps, session.unit_span(cluster))),
+        amplitude: (!amps.is_empty()).then(|| svg_dots(spikes, amps, span.clone())),
+        amplitude_iqr: svg_amplitude_iqr(spikes, amps, &span),
     }
 }
 
@@ -120,22 +125,44 @@ fn range(values: &[f32]) -> (f32, f32) {
         .fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)))
 }
 
-/// ISI counts over log10(seconds) in `[LOG_ISI_MIN, LOG_ISI_MAX)`; the
-/// bimodal shape (bursts vs tonic firing) the linear 50 ms window hides.
-fn log_isi_histogram(spikes: &[SampleIndex], sample_rate: f32) -> Vec<u32> {
-    let mut h = vec![0u32; LOG_ISI_BINS];
-    let per_bin = (LOG_ISI_MAX - LOG_ISI_MIN) / LOG_ISI_BINS as f64;
-    for w in spikes.windows(2) {
-        let dt = w[1].0.saturating_sub(w[0].0);
-        if dt == 0 {
-            continue;
-        }
-        let x = (dt as f64 / sample_rate as f64).log10();
-        if (LOG_ISI_MIN..LOG_ISI_MAX).contains(&x) {
-            h[(((x - LOG_ISI_MIN) / per_bin) as usize).min(LOG_ISI_BINS - 1)] += 1;
-        }
+fn svg_log_isi(spikes: &[SampleIndex], sample_rate: f32, fixed_ms: f32) -> String {
+    let samples_per_ms = f64::from(sample_rate) / 1000.0;
+    let counts = isi_histogram_log(
+        spikes,
+        LOG_ISI_MIN_MS * samples_per_ms,
+        LOG_ISI_MAX_MS * samples_per_ms,
+        LOG_ISI_BINS,
+    );
+    let x = |ms: f64| {
+        f64::from(W) * (ms / LOG_ISI_MIN_MS).ln() / (LOG_ISI_MAX_MS / LOG_ISI_MIN_MS).ln()
+    };
+    let mut out = format!(
+        r#"<svg viewBox="0 0 {W} {}" role="img" aria-label="Log ISI in milliseconds and seconds">{}"#,
+        H + 13.0,
+        bar_elements(&counts, W, H),
+    );
+    let fixed_ms = f64::from(fixed_ms);
+    if fixed_ms.is_finite() && fixed_ms > 0.0 {
+        let x = x(fixed_ms.clamp(LOG_ISI_MIN_MS, LOG_ISI_MAX_MS));
+        out += &format!(
+            r#"<line x1="{x:.1}" x2="{x:.1}" y1="0" y2="{H}" stroke="red" stroke-dasharray="2 2"><title>Fixed refractory window: {fixed_ms:.3} ms</title></line>"#
+        );
     }
-    h
+    for (ms, label, anchor) in [
+        (0.2, "0.2", "start"),
+        (1.0, "1", "middle"),
+        (10.0, "10", "middle"),
+        (100.0, "100", "middle"),
+        (1000.0, "1s", "middle"),
+        (10_000.0, "10s", "end"),
+    ] {
+        out += &format!(
+            r#"<text class="tick" x="{:.1}" y="{}" text-anchor="{anchor}">{label}</text>"#,
+            x(ms),
+            H + 11.0,
+        );
+    }
+    out + "</svg>"
 }
 
 /// Template traces side by side on one shared amplitude scale, each with
@@ -184,6 +211,13 @@ pub fn svg_waveforms(traces: &[(usize, Vec<f32>)], peak: usize) -> String {
 
 /// Bars scaled to the tallest bin, left to right, on a baseline.
 pub fn svg_bars(counts: &[u32], w: f32, h: f32) -> String {
+    format!(
+        r#"<svg viewBox="0 0 {w} {h}" role="img">{}</svg>"#,
+        bar_elements(counts, w, h)
+    )
+}
+
+fn bar_elements(counts: &[u32], w: f32, h: f32) -> String {
     let max = counts.iter().copied().max().unwrap_or(0).max(1) as f32;
     let n = counts.len().max(1) as f32;
     let bw = w / n;
@@ -202,9 +236,7 @@ pub fn svg_bars(counts: &[u32], w: f32, h: f32) -> String {
             )
         })
         .collect();
-    format!(
-        r#"<svg viewBox="0 0 {w} {h}" role="img"><g class="bars">{bars}</g><line class="axis" x1="0" x2="{w}" y1="{h}" y2="{h}"/></svg>"#
-    )
+    format!(r#"<g class="bars">{bars}</g><line class="axis" x1="0" x2="{w}" y1="{h}" y2="{h}"/>"#)
 }
 
 /// Amplitude against recording time as one dotted path (round caps on
@@ -243,6 +275,95 @@ pub fn svg_dots(
     format!(
         r#"<svg viewBox="0 0 {STRIP_W} {STRIP_H}" preserveAspectRatio="none" role="img" aria-label="amplitude over time"><line class="axis" x1="0" x2="{STRIP_W}" y1="{STRIP_H}" y2="{STRIP_H}"/><path class="dots" d="{d}"/></svg>"#
     )
+}
+
+/// Equal time bins on the unit's own clock, with a median trace and IQR ribbon.
+fn svg_amplitude_iqr(times: &[SampleIndex], amps: &[f32], span: &SessionSpan) -> Option<String> {
+    if times.len() != amps.len() {
+        return None;
+    }
+    let width = span.extent_samples().max(1) as u128;
+    let offset = |time: SampleIndex| u128::from(time.0.saturating_sub(span.start.0));
+    let bin_coord = |time| (offset(time) * AMP_TIME_BINS as u128) as f64 / width as f64;
+    let mut segments = Vec::new();
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    // Bin each recorded interval separately: even one bin may straddle a gap.
+    for (start, end) in span.intervals() {
+        let range = if span.source == sorrel_io::SpanSource::Trace && span.n_intervals() == 1 {
+            // Preserve the edge bins for spikes outside a contiguous trace.
+            0..times.len()
+        } else {
+            times.partition_point(|&t| t < start)..times.partition_point(|&t| t < end)
+        };
+        let mut bins: [Vec<f32>; AMP_TIME_BINS] = std::array::from_fn(|_| Vec::new());
+        for (&time, &amp) in times[range.clone()].iter().zip(&amps[range]) {
+            if amp.is_finite() {
+                let bin =
+                    (offset(time) * AMP_TIME_BINS as u128 / width).min((AMP_TIME_BINS - 1) as u128);
+                bins[bin as usize].push(amp);
+            }
+        }
+        let mut stats = Vec::new();
+        for (i, b) in bins.iter_mut().enumerate().filter(|(_, b)| !b.is_empty()) {
+            b.sort_unstable_by(f32::total_cmp);
+            let quantile = |q: f64| {
+                let pos = q * (b.len() - 1) as f64;
+                let (lo, hi) = (
+                    f64::from(b[pos as usize]),
+                    f64::from(b[pos.ceil() as usize]),
+                );
+                lo + (hi - lo) * pos.fract()
+            };
+            let (q25, q50, q75) = (quantile(0.25), quantile(0.5), quantile(0.75));
+            lo = lo.min(q25);
+            hi = hi.max(q75);
+            stats.push((i, q25, q50, q75));
+        }
+        if !stats.is_empty() {
+            segments.push((bin_coord(start), bin_coord(end), stats));
+        }
+    }
+    segments.first()?;
+    let point = |bin: f64, a| {
+        let level = if hi == lo { 0.5 } else { (a - lo) / (hi - lo) };
+        format!(
+            "{:.2},{:.1}",
+            bin / AMP_TIME_BINS as f64 * f64::from(STRIP_W),
+            4.0 + (1.0 - level) * f64::from(STRIP_H - 8.0)
+        )
+    };
+    let mut svg = format!(
+        r#"<svg viewBox="0 0 {STRIP_W} {STRIP_H}" preserveAspectRatio="none" role="img" aria-label="Binned amplitude median and interquartile range">"#
+    );
+    for (start, end, stats) in segments {
+        for run in stats.chunk_by(|a, b| a.0 + 1 == b.0) {
+            let (mut upper, mut median, mut lower) = (Vec::new(), Vec::new(), Vec::new());
+            let mut push = |bin, q25, q50, q75| {
+                upper.push(point(bin, q75));
+                median.push(point(bin, q50));
+                lower.push(point(bin, q25));
+            };
+            if let &[(i, q25, q50, q75)] = run {
+                push((i as f64).max(start), q25, q50, q75);
+                push((i as f64 + 1.0).min(end), q25, q50, q75);
+            } else {
+                for &(i, q25, q50, q75) in run {
+                    let from = (i as f64).max(start);
+                    let to = (i as f64 + 1.0).min(end);
+                    push(f64::midpoint(from, to), q25, q50, q75);
+                }
+            }
+            upper.extend(lower.into_iter().rev());
+            let _ = write!(
+                svg,
+                r#"<polygon class="iqr" points="{}"/><polyline class="median" points="{}"/>"#,
+                upper.join(" "),
+                median.join(" "),
+            );
+        }
+    }
+    svg.push_str("</svg>");
+    Some(svg)
 }
 
 /// A metric for display: `–` for missing, integers bare, otherwise about
@@ -413,6 +534,101 @@ mod tests {
     use crate::qc_export::tests::MockProvider;
 
     #[test]
+    fn askama_report_renders_waveforms_log_isi_and_amplitude_iqr() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = crate::feature_subspace::tests::physical_test_session(dir.path());
+        s.seed_template_waveforms();
+        s.set_refractory(sorrel_compute::RefractoryParams {
+            fixed_ms: 2.25,
+            ..Default::default()
+        })
+        .unwrap();
+        let plots = render_cluster_svgs(&s, ClusterId(0));
+        let waveform = plots.waveform.unwrap();
+        for ch in 0..3 {
+            assert!(waveform.contains(&format!(">ch {ch}</text>")));
+        }
+        assert_eq!(waveform.matches("<polyline").count(), 3);
+        assert!(plots.log_isi.contains("stroke=\"red\""));
+        assert!(plots.log_isi.contains("Fixed refractory window: 2.250 ms"));
+        for label in ["0.2", "1", "10", "100", "1s", "10s"] {
+            assert!(plots.log_isi.contains(&format!(">{label}</text>")));
+        }
+        let amplitudes = plots.amplitude_iqr.unwrap();
+        assert!(amplitudes.contains("<polygon class=\"iqr\""));
+        assert!(amplitudes.contains("<polyline class=\"median\""));
+        for id in [1, 2] {
+            assert!(render_cluster_svgs(&s, ClusterId(id))
+                .amplitude_iqr
+                .is_none());
+        }
+        let html = render_report(&s, |_| "unsorted", &ReportFilter::default()).unwrap();
+        assert!(html.contains("<b>Log-ISI</b>"));
+        assert!(html.contains(&amplitudes));
+        assert!(html.contains("<path class=\"dots\""));
+    }
+
+    #[test]
+    fn amplitude_iqr_uses_the_unit_clock_and_excludes_recording_gaps() {
+        let span = SessionSpan::from_intervals(
+            vec![
+                (SampleIndex(100), SampleIndex(104)),
+                (SampleIndex(120), SampleIndex(124)),
+            ],
+            sorrel_io::SpanSource::Declared("test"),
+        );
+        let svg = svg_amplitude_iqr(
+            &[SampleIndex(100), SampleIndex(110), SampleIndex(123)],
+            &[1.0, 1000.0, 3.0],
+            &span,
+        )
+        .unwrap();
+        assert_eq!(svg.matches(r#"<polygon class="iqr""#).count(), 2);
+        assert_eq!(svg.matches(r#"<polyline class="median""#).count(), 2);
+        assert!(svg.contains(r#"class="median" points="0.00,60.0 40.00,60.0""#));
+        assert!(svg.contains(r#"class="median" points="920.00,4.0 960.00,4.0""#));
+    }
+
+    #[test]
+    fn amplitude_iqr_does_not_bridge_a_gap_within_a_single_bin() {
+        let span = SessionSpan::from_intervals(
+            vec![
+                (SampleIndex(0), SampleIndex(1)),
+                (SampleIndex(2), SampleIndex(240)),
+            ],
+            sorrel_io::SpanSource::Declared("test"),
+        );
+        let svg = svg_amplitude_iqr(
+            &[
+                SampleIndex(0),
+                SampleIndex(1),
+                SampleIndex(2),
+                SampleIndex(30),
+            ],
+            &[1.0, 1000.0, 3.0, 2.0],
+            &span,
+        )
+        .unwrap();
+        assert_eq!(svg.matches(r#"<polygon class="iqr""#).count(), 3);
+        assert_eq!(svg.matches(r#"<polyline class="median""#).count(), 3);
+        assert!(svg.contains(r#"class="median" points="0.00,60.0 4.00,60.0""#));
+        assert!(svg.contains(r#"class="median" points="8.00,4.0 40.00,4.0""#));
+
+        // Sub-tenth-pixel gap on a 30,000-sample span still serializes with distinct x edges.
+        let fine = SessionSpan::from_intervals(
+            vec![
+                (SampleIndex(0), SampleIndex(300)),
+                (SampleIndex(301), SampleIndex(30_000)),
+            ],
+            sorrel_io::SpanSource::Declared("test"),
+        );
+        let fine_svg =
+            svg_amplitude_iqr(&[SampleIndex(100), SampleIndex(500)], &[5.0, 5.0], &fine).unwrap();
+        assert!(fine_svg.contains(r#"class="median" points="0.00,32.0 9.60,32.0""#));
+        assert!(fine_svg.contains(r#"class="median" points="9.63,32.0 40.00,32.0""#));
+    }
+
+    #[test]
     fn report_distinguishes_confirmed_srp_and_unavailable_metrics() {
         let dir = tempfile::tempdir().unwrap();
         let s = Session::new(
@@ -528,10 +744,11 @@ mod tests {
         let wf = svg_waveforms(&[(2, vec![-1.0, 0.0, 1.0]), (5, vec![0.0, 0.5, 0.0])], 2);
         assert_eq!(wf.matches("<polyline").count(), 2);
         assert!(wf.contains(r#"class="wf peak">ch 2<"#) && wf.contains(r#"class="wf">ch 5<"#));
-        // 1 ms, 1 s and 100 s at 1 kHz land in the 1 ms, 1 s and 100 s bins.
+        // At 1 kHz, 1 ms and 1 s hit their geometric bins; 100 s is out of range.
         let t = [0, 1, 1001, 101_001].map(SampleIndex);
-        let h = log_isi_histogram(&t, 1000.0);
-        assert_eq!((h[0], h[30], h[50], h.iter().sum::<u32>()), (1, 1, 1, 3));
+        let log = svg_log_isi(&t, 1000.0, 1.5);
+        assert_eq!(log.matches("<rect").count(), 2);
+        assert!(log.contains(r#"<rect x="33.0""#) && log.contains(r#"<rect x="186.0""#));
         let many: Vec<SampleIndex> = (0..10_000).map(SampleIndex).collect();
         let dots = svg_dots(&many, &vec![1.0; 10_000], 10_000);
         assert_eq!(dots.matches('M').count(), MAX_DOTS);
