@@ -2507,15 +2507,18 @@ fn has_raw_trace<P: DataProvider>(state: &mut FeatureViewState, session: &Sessio
             return available;
         }
     }
-    let available = if dims.0 > 0 && dims.1 > 0 {
-        let slice = session.provider.trace(SampleIndex(0), 1);
-        slice.n_channels > 0
-            && (!slice.samples.is_empty() || session.provider.pending_fetches() > 0)
-    } else {
-        false
-    };
-    state.raw_trace_probe = Some((dims, available));
-    available
+    if dims.0 == 0 || dims.1 == 0 {
+        state.raw_trace_probe = Some((dims, false));
+        return false;
+    }
+    let slice = session.provider.trace(SampleIndex(0), 1);
+    if slice.n_channels > 0 && !slice.samples.is_empty() {
+        state.raw_trace_probe = Some((dims, true));
+        return true;
+    }
+    // A remote read can fail after the fetch has stopped being pending.
+    // Keep probing until data arrives instead of caching a transient miss.
+    slice.n_channels > 0 && session.provider.pending_fetches() > 0
 }
 
 /// Whether computed features should request the full spike set on the next
@@ -6190,7 +6193,8 @@ fn fitted_basis<P: DataProvider>(
 mod tests {
     use super::*;
 
-    struct EmptyTrace;
+    #[derive(Default)]
+    struct EmptyTrace(std::sync::atomic::AtomicBool);
 
     impl DataProvider for EmptyTrace {
         type Label = u8;
@@ -6210,15 +6214,30 @@ mod tests {
             &[SampleIndex(10), SampleIndex(30)]
         }
         fn trace(&self, _: SampleIndex, _: u32) -> sorrel_io::TraceSlice<'_> {
+            let ready = self.0.load(std::sync::atomic::Ordering::Relaxed);
             sorrel_io::TraceSlice {
                 start: SampleIndex(0),
-                n_channels: 0,
-                samples: sorrel_io::TraceSamples::I16(&[]),
+                n_channels: if ready { 4 } else { 0 },
+                samples: sorrel_io::TraceSamples::I16(if ready { &[0; 4] } else { &[] }),
             }
         }
         fn initial_labels(&self) -> Vec<u8> {
             vec![0; 3]
         }
+    }
+
+    #[test]
+    fn raw_trace_probe_recovers_after_a_failed_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = sorrel_data::Journal::open(&dir.path().join("journal")).unwrap();
+        let session = Session::new(EmptyTrace::default(), journal);
+        let mut state = FeatureViewState::default();
+        assert!(!has_raw_trace(&mut state, &session));
+        session
+            .provider
+            .0
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(has_raw_trace(&mut state, &session));
     }
 
     #[test]
@@ -6228,7 +6247,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal =
             sorrel_data::Journal::open_or_create(&dir.path().join("journal"), 0, 3).unwrap();
-        let session = Arc::new(RwLock::new(Session::new(EmptyTrace, journal)));
+        let session = Arc::new(RwLock::new(Session::new(EmptyTrace::default(), journal)));
         let ctx = egui::Context::default();
         let jobs = JobCtx {
             session: Arc::clone(&session),

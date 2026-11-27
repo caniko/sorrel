@@ -1322,20 +1322,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     affected += 1;
                     let new_cluster = ClusterId(next_id);
                     next_id += 1;
-                    children.push(CurationCommand::Split {
-                        cluster: c,
-                        spike_idx: dup_idx,
-                        new_cluster,
-                        by: sorrel_data::command::Method::Algo("dedup".into()),
-                    });
-                    children.push(CurationCommand::Relabel {
-                        cluster: new_cluster,
-                        op: PhyLabelOp::SetNoise,
-                    });
-                    children.push(CurationCommand::Tag {
-                        cluster: new_cluster,
-                        tags: vec!["duplicate".into()],
-                    });
+                    children.extend(s.dedup_split_commands(c, dup_idx, new_cluster, &Actor::Human));
                 }
                 Ok(CurationCommand::batch(children))
             },
@@ -1346,7 +1333,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
         }
         if total_dups == 0 {
             self.status = toast(format!(
-                "no duplicate spikes (<{tol_ms:.2} ms) in selection"
+                "no duplicate spikes (≤{tol_ms:.2} ms) in selection"
             ));
             return;
         }
@@ -1359,7 +1346,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             self.brushes.spikes = None;
         }
         self.status = toast(format!(
-            "removed {total_dups} duplicate spike{} from {affected} cluster{} (<{tol_ms:.2} ms)",
+            "removed {total_dups} duplicate spike{} from {affected} cluster{} (≤{tol_ms:.2} ms)",
             if total_dups == 1 { "" } else { "s" },
             if affected == 1 { "" } else { "s" },
         ));
@@ -3771,7 +3758,21 @@ mod tests {
             ],
         };
         let journal = Journal::open_or_create(&dir.path().join("j.sqlite"), 0xCAFE, 2).unwrap();
-        let session = Session::new(provider, journal);
+        let mut session = Session::new(provider, journal);
+        session
+            .dispatch(CurationCommand::Tag {
+                cluster: ClusterId(0),
+                tags: [
+                    "src:sorter",
+                    "src:agent",
+                    "duplicate",
+                    "src:agent",
+                    "review:split",
+                ]
+                .map(String::from)
+                .into(),
+            })
+            .unwrap();
         let mut app = SorrelApp::new(session, label_str);
         app.selection.replace(ClusterId(0));
         app.selection.toggle(ClusterId(1));
@@ -3785,7 +3786,7 @@ mod tests {
 
         app.apply_remove_duplicates(0.2);
 
-        assert_eq!(history_len(&app), 1, "dedup must be one undoable batch");
+        assert_eq!(history_len(&app), 2, "dedup must be one undoable batch");
         assert!(
             app.brushes.spikes.is_none(),
             "Duplicates brush is cleared after dedup"
@@ -3801,7 +3802,10 @@ mod tests {
                 UnitOrigin::Sorrel(Method::Algo("dedup".into()))
             );
             assert_eq!(s.label(ClusterId(2)), Some(3), "SetNoise on StubProvider");
-            assert_eq!(s.tags(ClusterId(2)), &["duplicate".to_string()]);
+            assert_eq!(
+                s.tags(ClusterId(2)),
+                &["src:sorter", "src:agent", "duplicate", "src:human"]
+            );
         }
 
         // Single undo restores everything cleanly.

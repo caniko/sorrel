@@ -46,6 +46,10 @@ struct IsiEntry {
     dups: Arc<Vec<Vec<u32>>>,
 }
 
+fn isi_cache_id<P: DataProvider>(session: &Session<P>) -> egui::Id {
+    egui::Id::new(("isi_view_cache", session.journal_path()))
+}
+
 /// Local indices of every spike that is part of an ISI below `refractory`
 /// samples (both members of each pair, ascending), and the pair count.
 pub(crate) fn isi_violators(times: &[SampleIndex], refractory: u64) -> (Vec<u32>, usize) {
@@ -104,7 +108,7 @@ pub(crate) fn split_preview<P: DataProvider>(
 ) -> Option<std::sync::Arc<SplitPreview>> {
     let (c, idx) = split_target(brushes, selection, |c| session.spike_times(c).len())?;
     let key = (brushes.spikes.as_ref()?.key(), c, session.metrics_version());
-    let id = egui::Id::new("split_whatif_memo");
+    let id = egui::Id::new(("split_whatif_memo", session.journal_path()));
     let memo: SplitMemo = ui.data_mut(|d| {
         d.get_temp_mut_or_insert_with(id, SplitMemo::default)
             .clone()
@@ -332,7 +336,9 @@ pub fn isi_view<P: DataProvider>(
     }
     let sr = session.provider.sample_rate().max(1.0);
     let to_samples_u64 = |ms: f32| (sr as f64 * ms as f64 / 1e3).round() as u64;
-    let to_samples_f64 = |ms: f32| sr as f64 * ms as f64 / 1e3;
+    // Canonicalize the f32 control values to microseconds before converting.
+    // In particular, 0.2 ms must include a six-sample interval at 30 kHz.
+    let to_samples_f64 = |ms: f32| (f64::from(ms) * 1e3).round() / 1e3 * (f64::from(sr) / 1e3);
     let (lo_u64, hi_u64) = (to_samples_u64(p.x_min_ms), to_samples_u64(p.x_max_ms));
     let (log_lo_f64, log_hi_f64) = (to_samples_f64(p.log_min_ms), to_samples_f64(p.log_max_ms));
     let n_bins = if p.log_x { p.log_n_bins } else { p.n_bins };
@@ -349,7 +355,7 @@ pub fn isi_view<P: DataProvider>(
         hi_key,
         n_bins,
     );
-    let id = egui::Id::new("isi_view_cache");
+    let id = isi_cache_id(session);
     let (hists, dups) = match ui.data(|d| d.get_temp::<IsiEntry>(id)) {
         Some(e) if e.key == key => (e.hists, e.dups),
         _ => {
@@ -447,7 +453,7 @@ pub fn isi_view<P: DataProvider>(
                 let k = dup_idx.len();
                 let bg = theme.warn;
                 let fg = contrast_text(bg);
-                let text = format!("c{c} · {k} dup (<0.2 ms)");
+                let text = format!("c{c} · {k} dup (≤0.2 ms)");
                 let g = ui
                     .painter()
                     .layout_no_wrap(text, egui::FontId::proportional(TICK_PX), fg);
@@ -463,7 +469,7 @@ pub fn isi_view<P: DataProvider>(
                     )
                 });
                 if resp
-                    .on_hover_text("Click to brush this cluster's duplicate spikes (<0.2 ms)")
+                    .on_hover_text("Click to brush this cluster's duplicate spikes (≤0.2 ms)")
                     .clicked()
                 {
                     clicked_dup = Some((c, dup_idx.clone()));
@@ -472,7 +478,7 @@ pub fn isi_view<P: DataProvider>(
             if ui
                 .small_button("Remove duplicates")
                 .on_hover_text(
-                    "Split duplicate spikes (<0.2 ms) into a noise cluster tagged \"duplicate\" (undoable)",
+                    "Split duplicate spikes (≤0.2 ms) into a noise cluster tagged \"duplicate\" (undoable)",
                 )
                 .clicked()
             {
@@ -695,7 +701,7 @@ pub fn isi_view<P: DataProvider>(
                 pts
             };
             // Parts' histograms, cached per preview and bin range.
-            let hid = egui::Id::new("isi_split_hists");
+            let hid = egui::Id::new(("isi_split_hists", session.journal_path()));
             let hkey = (Arc::as_ptr(&sp) as usize, p.log_x, lo_key, hi_key, n_bins);
             let h = match ui.data(|d| {
                 d.get_temp::<((usize, bool, u64, u64, usize), Arc<(Vec<u32>, Vec<u32>)>)>(hid)
@@ -743,46 +749,105 @@ fn brush_violators(
 mod tests {
     use super::*;
 
+    use sorrel_data::Journal;
+    use sorrel_io::{TraceSamples, TraceSlice};
+
+    struct Provider(Vec<SampleIndex>, f32);
+    impl DataProvider for Provider {
+        type Label = u8;
+        fn sample_rate(&self) -> f32 {
+            self.1
+        }
+        fn n_samples(&self) -> SampleIndex {
+            SampleIndex(1_000)
+        }
+        fn n_channels(&self) -> u32 {
+            1
+        }
+        fn n_clusters(&self) -> u32 {
+            1
+        }
+        fn spike_times(&self, _: ClusterId) -> &[SampleIndex] {
+            &self.0
+        }
+        fn initial_labels(&self) -> Vec<u8> {
+            vec![0]
+        }
+        fn trace(&self, start: SampleIndex, _: u32) -> TraceSlice<'_> {
+            TraceSlice {
+                start,
+                n_channels: 1,
+                samples: TraceSamples::I16(&[]),
+            }
+        }
+    }
+
+    #[test]
+    fn isi_cache_keeps_duplicate_indices_and_histograms_isolated() {
+        use std::sync::RwLock;
+
+        let dir = tempfile::tempdir().unwrap();
+        let make = |name, times: [u64; 2]| {
+            let session = Session::new(
+                Provider(times.map(SampleIndex).into(), 30_000.0),
+                Journal::open(&dir.path().join(name)).unwrap(),
+            );
+            Arc::new(RwLock::new(session))
+        };
+        let a = make("duplicates", [10, 16]);
+        let b = make("clean", [10, 310]);
+        let ctx = egui::Context::default();
+        let mut params = IsiParams {
+            log_x: true,
+            ..Default::default()
+        };
+        let mut draw = |session: &Arc<RwLock<Session<Provider>>>| {
+            let session_guard = session.read().unwrap();
+            let jobs = crate::jobs::JobCtx {
+                session: Arc::clone(session),
+                egui: ctx.clone(),
+            };
+            let mut entry = None;
+            let output = ctx.run_ui(Default::default(), |ui| {
+                isi_view(
+                    ui,
+                    &session_guard,
+                    &[ClusterId(0)],
+                    &mut params,
+                    &mut Brushes::default(),
+                    &jobs,
+                    &mut Vec::new(),
+                );
+                entry = ui.data(|d| d.get_temp::<IsiEntry>(isi_cache_id(&session_guard)));
+            });
+            (entry.unwrap(), output)
+        };
+        let (first, output) = draw(&a);
+        let (second, _) = draw(&b);
+        assert_eq!(
+            first.key, second.key,
+            "same version, selection, and parameters"
+        );
+        assert_eq!(*first.dups, [vec![1]]);
+        assert!(second.dups[0].is_empty());
+        assert_ne!(first.hists, second.hists);
+
+        assert_eq!(first.hists[0].iter().sum::<u32>(), 1);
+        assert_eq!(first.hists[0][0], 1);
+        let plots = sorrel_data::report::render_cluster_svgs(&a.read().unwrap(), ClusterId(0));
+        assert_eq!(plots.log_isi.matches("<rect x=\"0.0\"").count(), 1);
+        assert!(output.shapes.iter().any(|clipped| {
+            matches!(&clipped.shape, Shape::Text(text) if text.galley.text() == "c0 · 1 dup (≤0.2 ms)")
+        }));
+    }
+
     #[test]
     fn refractory_tooltip_refreshes_and_keeps_sessions_isolated() {
         use sorrel_compute::RefractoryParams;
-        use sorrel_data::Journal;
-        use sorrel_io::{TraceSamples, TraceSlice};
-
-        struct Provider(Vec<SampleIndex>);
-        impl DataProvider for Provider {
-            type Label = u8;
-            fn sample_rate(&self) -> f32 {
-                1_000.0
-            }
-            fn n_samples(&self) -> SampleIndex {
-                SampleIndex(1_000)
-            }
-            fn n_channels(&self) -> u32 {
-                1
-            }
-            fn n_clusters(&self) -> u32 {
-                1
-            }
-            fn spike_times(&self, _: ClusterId) -> &[SampleIndex] {
-                &self.0
-            }
-            fn initial_labels(&self) -> Vec<u8> {
-                vec![0]
-            }
-            fn trace(&self, start: SampleIndex, _: u32) -> TraceSlice<'_> {
-                TraceSlice {
-                    start,
-                    n_channels: 1,
-                    samples: TraceSamples::I16(&[]),
-                }
-            }
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let make = |name, n: u64| {
             Session::new(
-                Provider((0..n).map(|i| SampleIndex(i * 10)).collect()),
+                Provider((0..n).map(|i| SampleIndex(i * 10)).collect(), 1_000.0),
                 Journal::open(&dir.path().join(name)).unwrap(),
             )
         };

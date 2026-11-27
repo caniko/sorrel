@@ -673,28 +673,16 @@ where
                 format!("cluster {c} changed since its spikes were read; read them again and retry")
             };
             let ev = host
-                .apply_built(agent, |s| {
+                .apply_built(agent.clone(), |s| {
                     refuse_if_propose_only(host)?;
                     if proposals::spike_basis(s, cluster) != basis {
                         bail!("{}", stale());
                     }
                     let new_cluster = ClusterId(s.n_clusters());
-                    Ok(CurationCommand::batch(vec![
-                        CurationCommand::Split {
-                            cluster,
-                            spike_idx,
-                            new_cluster,
-                            by: Method::Algo("dedup".into()),
-                        },
-                        CurationCommand::Relabel {
-                            cluster: new_cluster,
-                            op: crate::command::PhyLabelOp::SetNoise,
-                        },
-                        CurationCommand::Tag {
-                            cluster: new_cluster,
-                            tags: vec!["duplicate".into()],
-                        },
-                    ]))
+                    Ok(CurationCommand::batch(
+                        s.dedup_split_commands(cluster, spike_idx, new_cluster, &agent)
+                            .into(),
+                    ))
                 })?
                 .expect("dedup batch always has three children");
             let ev = env.mine(ev);
@@ -2560,6 +2548,13 @@ mod tests {
         };
         let mut s = Session::new(prov, Journal::open(&dir.path().join("j.journal")).unwrap());
         s.seed_amplitudes();
+        s.dispatch(CurationCommand::Tag {
+            cluster: ClusterId(0),
+            tags: ["src:sorter", "src:human", "tuned"]
+                .map(String::from)
+                .into(),
+        })
+        .unwrap();
         let host = SessionHost::new(s);
         let mut env = Env::new(dir.path(), false, label);
         let run = |env: &mut _, name, args| handle_line(&host, env, &call(1, name, args)).unwrap();
@@ -2579,7 +2574,10 @@ mod tests {
                     crate::command::PhyLabelOp::SetNoise
                 ))
             );
-            assert_eq!(s.tags(child), &["duplicate"]);
+            assert_eq!(
+                s.tags(child),
+                &["src:sorter", "src:human", "src:agent", "duplicate"]
+            );
             let Some(CurationCommand::Batch { children }) = s.history_commands().last() else {
                 panic!("expected a batch");
             };

@@ -19,6 +19,7 @@ use askama::Template;
 use rayon::prelude::*;
 use sorrel_compute::{isi_histogram, isi_histogram_log};
 use sorrel_io::{ClusterId, DataProvider, SampleIndex, SessionSpan};
+use std::fmt::Write;
 use std::path::Path;
 
 /// Which clusters to include.
@@ -282,60 +283,87 @@ fn svg_amplitude_iqr(times: &[SampleIndex], amps: &[f32], span: &SessionSpan) ->
         return None;
     }
     let width = span.extent_samples().max(1) as u128;
-    let mut bins: [Vec<f32>; AMP_TIME_BINS] = std::array::from_fn(|_| Vec::new());
-    for (&time, &amp) in times.iter().zip(amps) {
-        if amp.is_finite() && (span.source == sorrel_io::SpanSource::Trace || span.contains(time)) {
-            let offset = time.0.saturating_sub(span.start.0);
-            let bin = (u128::from(offset) * AMP_TIME_BINS as u128 / width)
-                .min((AMP_TIME_BINS - 1) as u128);
-            bins[bin as usize].push(amp);
+    let offset = |time: SampleIndex| u128::from(time.0.saturating_sub(span.start.0));
+    let bin_coord = |time| (offset(time) * AMP_TIME_BINS as u128) as f64 / width as f64;
+    let mut segments = Vec::new();
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    // Bin each recorded interval separately: even one bin may straddle a gap.
+    for (start, end) in span.intervals() {
+        let range = if span.source == sorrel_io::SpanSource::Trace && span.n_intervals() == 1 {
+            // Preserve the edge bins for spikes outside a contiguous trace.
+            0..times.len()
+        } else {
+            times.partition_point(|&t| t < start)..times.partition_point(|&t| t < end)
+        };
+        let mut bins: [Vec<f32>; AMP_TIME_BINS] = std::array::from_fn(|_| Vec::new());
+        for (&time, &amp) in times[range.clone()].iter().zip(&amps[range]) {
+            if amp.is_finite() {
+                let bin =
+                    (offset(time) * AMP_TIME_BINS as u128 / width).min((AMP_TIME_BINS - 1) as u128);
+                bins[bin as usize].push(amp);
+            }
+        }
+        let mut stats = Vec::new();
+        for (i, b) in bins.iter_mut().enumerate().filter(|(_, b)| !b.is_empty()) {
+            b.sort_unstable_by(f32::total_cmp);
+            let quantile = |q: f64| {
+                let pos = q * (b.len() - 1) as f64;
+                let (lo, hi) = (
+                    f64::from(b[pos as usize]),
+                    f64::from(b[pos.ceil() as usize]),
+                );
+                lo + (hi - lo) * pos.fract()
+            };
+            let (q25, q50, q75) = (quantile(0.25), quantile(0.5), quantile(0.75));
+            lo = lo.min(q25);
+            hi = hi.max(q75);
+            stats.push((i, q25, q50, q75));
+        }
+        if !stats.is_empty() {
+            segments.push((bin_coord(start), bin_coord(end), stats));
         }
     }
-    let mut stats = Vec::new();
-    for (i, b) in bins.iter_mut().enumerate().filter(|(_, b)| !b.is_empty()) {
-        b.sort_unstable_by(f32::total_cmp);
-        let quantile = |q: f64| {
-            let pos = q * (b.len() - 1) as f64;
-            let (lo, hi) = (
-                f64::from(b[pos as usize]),
-                f64::from(b[pos.ceil() as usize]),
-            );
-            lo + (hi - lo) * pos.fract()
-        };
-        stats.push((i, quantile(0.25), quantile(0.5), quantile(0.75)));
-    }
-    stats.first()?;
-    let lo = stats.iter().map(|s| s.1).fold(f64::INFINITY, f64::min);
-    let hi = stats.iter().map(|s| s.3).fold(f64::NEG_INFINITY, f64::max);
-    let x = |bin: f32| bin / AMP_TIME_BINS as f32 * STRIP_W;
-    let point = |bin, a| {
+    segments.first()?;
+    let point = |bin: f64, a| {
         let level = if hi == lo { 0.5 } else { (a - lo) / (hi - lo) };
         format!(
             "{:.1},{:.1}",
-            x(bin),
+            bin / AMP_TIME_BINS as f64 * f64::from(STRIP_W),
             4.0 + (1.0 - level) * f64::from(STRIP_H - 8.0)
         )
     };
-    let (mut upper, mut median, mut lower) = (Vec::new(), Vec::new(), Vec::new());
-    let mut push = |bin, q25, q50, q75| {
-        upper.push(point(bin, q75));
-        median.push(point(bin, q50));
-        lower.push(point(bin, q25));
-    };
-    if let [(i, q25, q50, q75)] = stats.as_slice() {
-        push(*i as f32, *q25, *q50, *q75);
-        push(*i as f32 + 1.0, *q25, *q50, *q75);
-    } else {
-        for (i, q25, q50, q75) in stats {
-            push(i as f32 + 0.5, q25, q50, q75);
+    let mut svg = format!(
+        r#"<svg viewBox="0 0 {STRIP_W} {STRIP_H}" preserveAspectRatio="none" role="img" aria-label="Binned amplitude median and interquartile range">"#
+    );
+    for (start, end, stats) in segments {
+        for run in stats.chunk_by(|a, b| a.0 + 1 == b.0) {
+            let (mut upper, mut median, mut lower) = (Vec::new(), Vec::new(), Vec::new());
+            let mut push = |bin, q25, q50, q75| {
+                upper.push(point(bin, q75));
+                median.push(point(bin, q50));
+                lower.push(point(bin, q25));
+            };
+            if let &[(i, q25, q50, q75)] = run {
+                push((i as f64).max(start), q25, q50, q75);
+                push((i as f64 + 1.0).min(end), q25, q50, q75);
+            } else {
+                for &(i, q25, q50, q75) in run {
+                    let from = (i as f64).max(start);
+                    let to = (i as f64 + 1.0).min(end);
+                    push(f64::midpoint(from, to), q25, q50, q75);
+                }
+            }
+            upper.extend(lower.into_iter().rev());
+            let _ = write!(
+                svg,
+                r#"<polygon class="iqr" points="{}"/><polyline class="median" points="{}"/>"#,
+                upper.join(" "),
+                median.join(" "),
+            );
         }
     }
-    upper.extend(lower.into_iter().rev());
-    Some(format!(
-        r#"<svg viewBox="0 0 {STRIP_W} {STRIP_H}" preserveAspectRatio="none" role="img" aria-label="Binned amplitude median and interquartile range"><polygon class="iqr" points="{}"/><polyline class="median" points="{}"/></svg>"#,
-        upper.join(" "),
-        median.join(" "),
-    ))
+    svg.push_str("</svg>");
+    Some(svg)
 }
 
 /// A metric for display: `–` for missing, integers bare, otherwise about
@@ -555,7 +583,36 @@ mod tests {
             &span,
         )
         .unwrap();
-        assert!(svg.contains(r#"class="median" points="20.0,60.0 940.0,4.0""#));
+        assert_eq!(svg.matches(r#"<polygon class="iqr""#).count(), 2);
+        assert_eq!(svg.matches(r#"<polyline class="median""#).count(), 2);
+        assert!(svg.contains(r#"class="median" points="0.0,60.0 40.0,60.0""#));
+        assert!(svg.contains(r#"class="median" points="920.0,4.0 960.0,4.0""#));
+    }
+
+    #[test]
+    fn amplitude_iqr_does_not_bridge_a_gap_within_a_single_bin() {
+        let span = SessionSpan::from_intervals(
+            vec![
+                (SampleIndex(0), SampleIndex(1)),
+                (SampleIndex(2), SampleIndex(240)),
+            ],
+            sorrel_io::SpanSource::Declared("test"),
+        );
+        let svg = svg_amplitude_iqr(
+            &[
+                SampleIndex(0),
+                SampleIndex(1),
+                SampleIndex(2),
+                SampleIndex(30),
+            ],
+            &[1.0, 1000.0, 3.0, 2.0],
+            &span,
+        )
+        .unwrap();
+        assert_eq!(svg.matches(r#"<polygon class="iqr""#).count(), 3);
+        assert_eq!(svg.matches(r#"<polyline class="median""#).count(), 3);
+        assert!(svg.contains(r#"class="median" points="0.0,60.0 4.0,60.0""#));
+        assert!(svg.contains(r#"class="median" points="8.0,4.0 40.0,4.0""#));
     }
 
     #[test]
