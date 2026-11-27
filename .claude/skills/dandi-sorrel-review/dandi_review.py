@@ -2008,7 +2008,8 @@ def audit_asset(bundle: Path, asset: Doc, inventory: dict[str, Doc], files: dict
             if not isinstance(row, dict):
                 continue
             pointer = f"/messages/{index}" if wrapped else f"/{index}"
-            inspector_rows[pointer] = False
+            severities = {s for s in (row.get("severity"), row.get("importance")) if isinstance(s, str)}
+            inspector_rows[pointer] = (False, severities)
             check_name, msg = row.get("check_function_name"), row.get("message")
             msg = msg if isinstance(msg, str) else ""
             if check_name == "check_ascending_spike_times":
@@ -2019,14 +2020,14 @@ def audit_asset(bundle: Path, asset: Doc, inventory: dict[str, Doc], files: dict
                 match = re.search(r"external file ['\"]([^'\"]+)['\"]", msg, re.I)
                 if match and (path.parent / match[1]).as_posix() in inventory:
                     warnings.add("INSPECTOR_EXTERNAL_FILE_PRESENT")
-                    inspector_rows[pointer] = True
-                    false_critical += "CRITICAL" in (row.get("severity"), row.get("importance"))
+                    inspector_rows[pointer] = (True, severities)
+                    false_critical += "CRITICAL" in severities
                     continue
             if check_name == "check_file_extension" and "remfile" in msg.lower():
                 warnings.add("INSPECTOR_STREAMING_FILENAME_ARTIFACT")
-                inspector_rows[pointer] = True
+                inspector_rows[pointer] = (True, severities)
                 continue
-            real_critical += "CRITICAL" in (row.get("severity"), row.get("importance"))
+            real_critical += "CRITICAL" in severities
     return {"asset_id": asset["asset_id"], "open_status": asset["open_status"],
             "units": asset.get("units_before") or 0, "mapped_good": mapped_good,
             "trace_backed": trace, "waveform_probe_succeeded": waveform,
@@ -2085,6 +2086,8 @@ def audit_metric_claim(finding: Doc, thresholds: Doc, asset: Doc, qc: str | None
         matched[unit] = (match[1], value)
     if matched.keys() != set(units):
         return unmatched
+    if counter and (type(asset.get(counter)) is not int or asset[counter] < len(units)):
+        return "METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM"
     stated = finite(finding.get("value"))
     if any(not qc_threshold_hit(metric, cutoff, v, threshold)
            or finding.get("value") is not None and (
@@ -2225,10 +2228,7 @@ def audit_bundle(bundle: Path, doc: Doc, snapshot: Any, inventory: dict[str, Doc
         blockers.add("SELECTION_DENOMINATOR_MISMATCH")
     excluded = (nwb_total if selection.get("scope") == "nwb" else len(inventory)) - len(doc["assets"])
     if any(type(total) is not int or total != len(inventory) for total in audit_archive_totals(snapshot)):
-        if selection["policy"] == "all" or excluded == 0:
-            blockers.add("SELECTION_DENOMINATOR_MISMATCH")
-        else:
-            warnings.add("SELECTION_DENOMINATOR_MISMATCH")
+        blockers.add("SELECTION_DENOMINATOR_MISMATCH")
     if excluded > 0:
         warnings.add("ASSETS_EXCLUDED")
         if not selection.get("rationale", "").strip():
@@ -2312,6 +2312,11 @@ def audit_bundle(bundle: Path, doc: Doc, snapshot: Any, inventory: dict[str, Doc
             risks.update(set(row["warnings"]) & {"NWB_PROVENANCE_MISSING", "CONFLICTING_AUTHOR_LABELS"})
         if code.startswith("nwb."):
             inspector = files.get("nwb_inspector.json")
+            expected_sev = {"nwb.inspector_critical": "CRITICAL",
+                            "nwb.dandi_profile_violation": "BEST_PRACTICE_VIOLATION"}.get(code)
+            summary_key = {"nwb.inspector_critical": "nwbi_critical",
+                           "nwb.dandi_profile_violation": "nwbi_violation"}.get(code)
+            bound_rows = set()
             if not evidence:
                 b.add("INSPECTOR_EVIDENCE_UNMATCHED")
             for ref in evidence:
@@ -2321,8 +2326,30 @@ def audit_bundle(bundle: Path, doc: Doc, snapshot: Any, inventory: dict[str, Doc
                         or not row or row[0] not in inspector_rows
                         or not json_pointer_exists(read_evidence(inspector), pointer)):
                     b.add("INSPECTOR_EVIDENCE_UNMATCHED")
-                elif inspector_rows[row[0]]:
-                    b.add("INSPECTOR_STREAMING_ARTIFACT_CLAIM")
+                else:
+                    excluded_row, severities = inspector_rows[row[0]]
+                    if excluded_row:
+                        b.add("INSPECTOR_STREAMING_ARTIFACT_CLAIM")
+                    elif expected_sev and expected_sev not in severities:
+                        b.add("INSPECTOR_EVIDENCE_UNMATCHED")
+                    else:
+                        bound_rows.add(row[0])
+            if f.get("value") is not None:
+                stated = finite(f.get("value"))
+                if stated is None or not bound_rows or not math.isclose(stated, len(bound_rows), rel_tol=0, abs_tol=1e-9):
+                    b.add("METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM")
+            if summary_key and bound_rows and (
+                    type(source.get(summary_key)) is int and source[summary_key] < len(bound_rows)):
+                b.add("METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM")
+        elif f.get("value") is not None and not any(f"qc.{rc}" == code for rc, *_ in QC_FINDING_RULES):
+            stated = finite(f.get("value"))
+            units = f.get("unit_ids") or []
+            if code == "qc.noise_as_good":
+                if (stated is None or not units or not math.isclose(stated, len(units), rel_tol=0, abs_tol=1e-9)
+                        or type(source.get("n_noise_as_good")) is not int or source["n_noise_as_good"] < len(units)):
+                    b.add("METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM")
+            else:
+                b.add("METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM")
         if code == "meta.no_quality_labels" and (
                 not no_quality_labels or not any(
                     e["artifact_sha256"] == digests[files["clusters.before.tsv"]] for e in evidence)):

@@ -181,17 +181,24 @@ class ReviewKitTest(unittest.TestCase):
         doc["assets"].append(dict(asset, **second))
         doc["asset_selection"]["n_assets_total"] = 2
         first_report = artifact / asset["path"] / "nwb_inspector.json"
-        self.cite(finding, first_report, {"messages": [{"message": "real"}, {
-            "check_function_name": "check_file_extension", "message": "remfile extension",
-        }]}, "/messages/1/message")
+        self.cite(finding, first_report, {"messages": [{"severity": "CRITICAL", "message": "real"}, {
+            "severity": "CRITICAL", "check_function_name": "check_file_extension", "message": "remfile extension",
+        }, {"importance": "BEST_PRACTICE_SUGGESTION", "message": "suggestion"}]}, "/messages/1/message")
         self.assertIn("INSPECTOR_STREAMING_ARTIFACT_CLAIM", self.audited(doc)["findings"][0]["blockers"])
-        self.cite(finding, first_report, {"messages": [{"message": "real"}]}, "/messages/0/message")
+        finding["evidence"][0]["pointer"] = "/messages/2/message"
+        self.assertIn("INSPECTOR_EVIDENCE_UNMATCHED", self.audited(doc)["findings"][0]["blockers"])
+        self.cite(finding, first_report, {"messages": [{"severity": "CRITICAL", "message": "real"}]}, "/messages/0/message")
         self.assertEqual(self.audited(doc)["findings"][0]["verdict"], "outreach_ready")
+        finding["value"] = 999999
+        self.assertIn("METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM", self.audited(doc)["findings"][0]["blockers"])
+        finding["value"] = 1
+        self.assertEqual(self.audited(doc)["findings"][0]["verdict"], "outreach_ready")
+        finding.pop("value")
         first_refs = finding["evidence"]
         finding["asset_id"] = second["asset_id"]
         self.assertIn("INSPECTOR_EVIDENCE_UNMATCHED", self.audited(doc)["findings"][0]["blockers"])
         other_report = artifact / second["path"] / "nwb_inspector.json"
-        self.cite(finding, other_report, {"messages": [{"message": "different asset"}]}, "/messages")
+        self.cite(finding, other_report, {"messages": [{"importance": "CRITICAL", "message": "different asset"}]}, "/messages")
         shutil.copyfile(first_report.with_name("describe.json"), other_report.with_name("describe.json"))
         self.assertIn("INSPECTOR_EVIDENCE_UNMATCHED", self.audited(doc)["findings"][0]["blockers"])
         finding["evidence"][0]["pointer"] = "/messages/0"
@@ -225,6 +232,38 @@ class ReviewKitTest(unittest.TestCase):
         self.assertIn("METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM", self.audited(doc)["findings"][0]["blockers"])
         doc["findings"][0]["value"] = 0.20000000001
         self.assertEqual(self.audited(doc)["findings"][0]["verdict"], "outreach_ready")
+
+    def test_audit_summary_counter_must_cover_claimed_units(self):
+        doc = self.audit_fixture(code="qc.low_presence", metric="presence_ratio",
+                                 threshold=kit.DEFAULT_THRESHOLDS["presence_ratio_min"],
+                                 unit_ids=[2, 3], n_units=2)
+        asset = doc["assets"][0]
+        qc_path = self.stage / "artifacts" / asset["path"] / "cluster_qc.before.json"
+        qc_path.write_text(json.dumps([
+            {"cluster_id": 2, "n_spikes": 100, "presence_ratio": 0.1},
+            {"cluster_id": 3, "n_spikes": 100, "presence_ratio": 0.2},
+        ]) + "\n")
+        sha = kit.digest_file(qc_path)[0]
+        doc["findings"][0]["evidence"] = [
+            {"artifact_sha256": sha, "pointer": "/0/presence_ratio"},
+            {"artifact_sha256": sha, "pointer": "/1/presence_ratio"},
+        ]
+        asset["n_low_presence"] = 1
+        self.assertIn("METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM", self.audited(doc)["findings"][0]["blockers"])
+        asset["n_low_presence"] = 2
+        self.assertEqual(self.audited(doc)["findings"][0]["verdict"], "outreach_ready")
+
+    def test_audit_sampled_inventory_mismatch_blocks_findings(self):
+        doc = self.audit_fixture()
+        doc["asset_selection"].update(policy="sample", rationale="Sampled 1 of 2 assets.", n_assets_total=2, n_nwb_assets=2)
+        p = self.stage / "artifacts/dandiset.json"
+        snapshot = json.loads(p.read_text())
+        second = dict(snapshot["assets"][0], asset_id="asset-2", path="sub-b/sub-b.nwb")
+        snapshot["assets"].append(second)
+        snapshot["assets_summary"] = {"n_assets_total": 3, "n_nwb_assets": 3,
+                                      "total_size_bytes": 2, "encodings": {"hdf5": 3}}
+        p.write_text(json.dumps(snapshot))
+        self.assertIn("SELECTION_DENOMINATOR_MISMATCH", self.audited(doc)["findings"][0]["blockers"])
 
     def test_audit_waveform_rejects_impossible_window_and_channel_counts(self):
         doc = self.audit_fixture(code="curation.oversplit", unit_ids=[2])
