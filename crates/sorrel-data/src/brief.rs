@@ -161,8 +161,15 @@ pub static FLAGS: &[Flag] = &[
 ];
 
 /// Non-metric flags: (code, meaning).
-const EXTRA_FLAGS: [(&str, &str); 3] = [
-    ("MERGE?", "in a merge candidate (merge_candidates)"),
+const EXTRA_FLAGS: [(&str, &str); 4] = [
+    (
+        "MERGE?",
+        "merge candidate with template evidence; verify it before editing",
+    ),
+    (
+        "MERGE-SCREEN",
+        "uncorroborated merge screening without template evidence; not an edit recommendation",
+    ),
     ("SPLIT?", "has a split candidate (split_proposals)"),
     ("REV", "tagged review:* (waiting for a decision)"),
 ];
@@ -397,6 +404,11 @@ fn header<P: DataProvider>(
     for (c, m) in EXTRA_FLAGS {
         let _ = writeln!(h, "{c}: {m}");
     }
+    h.push_str(
+        "RP/epoch caveats: check the ACG for bursting; account for behavioral state, \
+         stimulation, and mismatches between trace, spike and observation spans before \
+         interpreting refractory or epoch flags. These flags are not unit verdicts.\n",
+    );
     let _ =
         writeln!(
         h,
@@ -534,16 +546,23 @@ fn card<P: DataProvider>(
 
 const RELATIONS_LEGEND: &str =
     "relations (level 3), strongest first: mK = merge component (<= 4 units), \
-sI.K = split candidate (sc = score); act by handle, test other sets with eval {merge:[..]}.\n\
+sI.K = split candidate (sc = score); test sets with eval {merge:[..]} before editing.\n\
 merge: rpc/pres/cut = rp_contamination/presence_ratio/amplitude_cutoff of each part -> merged; \
-per pair dip_z < 0 = refractory dip (one neuron), sync_z > 0 = fire together (two neurons: do not \
-merge), ks amplitude KS, sim template similarity, d um apart, pc presence complement (drift); \
+per pair dip_z < 0 = refractory dip (not proof of one neuron), sync_z > 0 = fire together \
+(argues against merging), ks amplitude KS, sim template similarity, d um apart, pc presence complement (drift); \
 - = too few CCG counts to say.\n\
 split: parts = major/minor spikes, amp/rpc per part, dip_z/sync_z between parts (dip = one \
 neuron: do not split), bic.\n";
 
-/// Render the brief. `rows` as from `collect_qc_rows_with`; the candidate
-/// lists as from the suggestion rankers (any listed unit gets MERGE?/SPLIT?).
+fn merge_flag(candidate: &MergeCandidate) -> &'static str {
+    if candidate.template_sim.is_finite() {
+        "MERGE?"
+    } else {
+        "MERGE-SCREEN"
+    }
+}
+
+/// Render the brief from `collect_qc_rows_with` and the suggestion rankers.
 #[allow(clippy::too_many_arguments)] // ponytail: one render entry point; bundle into a struct if it grows again
 pub fn render_brief<P: DataProvider>(
     session: &Session<P>,
@@ -555,15 +574,24 @@ pub fn render_brief<P: DataProvider>(
     save_dir: &Path,
     opts: &BriefOpts,
 ) -> String {
-    let in_merge: BTreeSet<u32> = merges.iter().flat_map(|m| [m.a.0, m.b.0]).collect();
+    let mut in_merge = BTreeMap::<u32, BTreeSet<_>>::new();
+    let mut screening_edges = BTreeSet::new();
+    for m in merges {
+        if merge_flag(m) == "MERGE-SCREEN" {
+            screening_edges.insert((m.a.0.min(m.b.0), m.a.0.max(m.b.0)));
+        }
+        for id in [m.a.0, m.b.0] {
+            in_merge.entry(id).or_default().insert(merge_flag(m));
+        }
+    }
     let in_split: BTreeSet<u32> = splits.iter().map(|s| s.cluster.0).collect();
     let units: Vec<Unit> = rows
         .iter()
         .filter(|r| r.n_spikes > 0)
         .map(|r| {
             let mut flags = metric_flags(|m| r.get(m).unwrap_or(f32::NAN));
-            if in_merge.contains(&r.cluster_id) {
-                flags.push("MERGE?");
+            if let Some(merge_flags) = in_merge.get(&r.cluster_id) {
+                flags.extend(merge_flags);
             }
             if in_split.contains(&r.cluster_id) {
                 flags.push("SPLIT?");
@@ -711,7 +739,18 @@ pub fn render_brief<P: DataProvider>(
         out.push_str("relations:\n");
         let mut cut = 0;
         for r in relations {
-            let line = format!("{}\n", r.line);
+            let screening = r.handle.starts_with('m')
+                && r.clusters.iter().enumerate().any(|(i, &a)| {
+                    r.clusters[i + 1..]
+                        .iter()
+                        .any(|&b| screening_edges.contains(&(a.min(b), a.max(b))))
+                });
+            let suffix = if screening {
+                " [contains uncorroborated merge screening; do not act without waveform review]"
+            } else {
+                ""
+            };
+            let line = format!("{}{suffix}\n", r.line);
             if fit(&line) {
                 out.push_str(&line);
             } else {
@@ -746,6 +785,26 @@ pub fn render_brief<P: DataProvider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ccg_only_merge_is_screening() {
+        let mut candidate = MergeCandidate {
+            a: ClusterId(1),
+            b: ClusterId(2),
+            score: 0.9,
+            ccg_dip_z: 8.0,
+            amp_ks: f32::NAN,
+            amp_mean_delta: f32::NAN,
+            n_a: 10,
+            n_b: 10,
+            presence_complement: 0.0,
+            template_sim: f32::NAN,
+            centroid_um: f32::NAN,
+        };
+        assert_eq!(merge_flag(&candidate), "MERGE-SCREEN");
+        candidate.template_sim = 0.9;
+        assert_eq!(merge_flag(&candidate), "MERGE?");
+    }
 
     /// xorshift, deterministic.
     fn rng(s: &mut u64) -> f32 {
