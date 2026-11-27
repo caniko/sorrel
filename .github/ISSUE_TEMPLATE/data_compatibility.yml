@@ -1,0 +1,28 @@
+name: Data compatibility
+description: Report a problem opening, interpreting or exporting a dataset.
+title: "[Data]: "
+body:
+  - type: markdown
+    attributes:
+      value: This issue is public. Share only public dataset links or synthetic fixtures. Remove credentials, private paths and subject identifiers.
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Sorrel version or commit and OS.
+    validations:
+      required: true
+  - type: input
+    id: backend
+    attributes:
+      label: Input format and producer
+      description: For example, Kilosort 4 phy output, a SpikeInterface binary-folder SortingAnalyzer, or HDF5 NWB / NWB-Zarr.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps, expected result and actual result
+      description: Include relevant flags and the error or mismatch. If using a public DANDI asset, include the Dandiset version and asset path.
+    validations:
+      required: true
