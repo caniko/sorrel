@@ -724,6 +724,16 @@ def qc_threshold_hit(metric: str, cutoff: str, value: float, threshold: float) -
     return value < threshold if cutoff.endswith("_min") else value > threshold
 
 
+def qc_metric_value(asset: Doc, row: Doc, metric: str) -> float | None:
+    if metric == "presence_ratio" and asset.get("duration_s") is None:
+        return None
+    if metric in {"amplitude_cutoff", "epoch_amp_ratio"} and (
+            asset["open_status"] != "ok" or asset.get("evidence_level") not in {"raw", "waveforms"}
+            or not finite(row.get("mean_amplitude"))):
+        return None
+    return finite(row.get(metric))
+
+
 def summarize_asset(args: argparse.Namespace) -> None:
     asset = asset_from_args(args)
     if args.unique_metadata is not None:
@@ -797,12 +807,7 @@ def summarize_asset(args: argparse.Namespace) -> None:
         hits: dict[int, list[tuple[int, str]]] = {}
         for unit, (index, row) in sorted(rows.items()):
             for metric, cutoff in zip(metrics, cutoffs):
-                if metric == "presence_ratio" and asset["duration_s"] is None:
-                    continue
-                if metric in {"amplitude_cutoff", "epoch_amp_ratio"} and (
-                        recording_evidence not in {"raw", "waveforms"} or not finite(row.get("mean_amplitude"))):
-                    continue
-                value = finite(row.get(metric))
+                value = qc_metric_value(asset, row, metric)
                 if value is None:
                     continue
                 observed.add(unit)
@@ -1869,7 +1874,7 @@ def audit_artifact_paths(asset_paths: set[str], listed: set[str]) -> tuple[dict[
 
 
 def audit_asset(bundle: Path, asset: Doc, inventory: dict[str, Doc], files: dict[str, str],
-                ambiguous: bool, human: bool) -> tuple[Doc, set[str]]:
+                ambiguous: bool, human: bool, metadata: Any) -> tuple[Doc, dict[str, bool], bool]:
     blockers: set[str] = set()
     if ambiguous:
         blockers.add("ARTIFACT_PATH_AMBIGUOUS")
@@ -1893,11 +1898,10 @@ def audit_asset(bundle: Path, asset: Doc, inventory: dict[str, Doc], files: dict
 
     span = notes.get("session_span") or {}
     raw = notes.get("raw_access") or notes.get("raw_access_79eeaad")
-    raw_note = audit_notes(raw)
     trace = (asset.get("evidence_level") == "raw" or
              isinstance(span, dict) and span.get("kind") == "measured" and span.get("source") == "trace")
-    waveform = bool(re.search(r"windows\s+[1-9]\d*/\d+", raw_note)
-                    or isinstance(raw, dict) and raw.get("verified") is True)
+    waveform = bool(isinstance(raw, dict) and raw.get("verified") is True
+                    and raw.get("exit_code") in (None, 0) and not raw.get("error"))
     if audit_timeout(raw):
         warnings.add("WAVEFORM_PROBE_TIMEOUT")
         waveform = False
@@ -1913,9 +1917,11 @@ def audit_asset(bundle: Path, asset: Doc, inventory: dict[str, Doc], files: dict
         warnings.add("INSPECTOR_TIMEOUT")
 
     artifact_files = {name: bundle / location for name, location in files.items()}
-    if human and "nwb_meta.json" in artifact_files:
-        metadata = read_json(artifact_files["nwb_meta.json"])
-        subject = metadata.get("subject") or {}
+    if "nwb_meta.json" in files and not isinstance(metadata, dict):
+        warnings.add("NWB_PROVENANCE_MISSING")
+    if human and isinstance(metadata, dict):
+        subject = metadata.get("subject")
+        subject = subject if isinstance(subject, dict) else {}
         subject_id = subject.get("subject_id") or metadata.get("/general/subject/subject_id") or notes.get("subject")
         if isinstance(subject_id, dict):
             subject_id = subject_id.get("value")
@@ -1929,9 +1935,12 @@ def audit_asset(bundle: Path, asset: Doc, inventory: dict[str, Doc], files: dict
     for name in ("describe.json", "cluster_qc.provenance.json", "cluster_qc.before.provenance.json"):
         if name in artifact_files:
             evidence = read_json(artifact_files[name])
+            if not isinstance(evidence, dict):
+                warnings.add("NWB_PROVENANCE_MISSING")
+                continue
             provenance.append(evidence.get("provenance") or {})
-            span = evidence.get("session_span") or {}
-            trace |= span.get("kind") == "measured" and span.get("source") == "trace"
+            span = evidence.get("session_span")
+            trace |= isinstance(span, dict) and span.get("kind") == "measured" and span.get("source") == "trace"
     if asset["open_status"] == "ok" and is_nwb_asset(asset) and not any(
             isinstance(source, dict) and source.get("mode") in ("trace", "units-only") for source in provenance):
         warnings.add("NWB_PROVENANCE_MISSING")
@@ -1939,10 +1948,17 @@ def audit_asset(bundle: Path, asset: Doc, inventory: dict[str, Doc], files: dict
         if not isinstance(source, dict):
             continue
         trace |= source.get("mode") == "trace"
-        for item in source.get("source_diagnostics", []):
+        diagnostics = source.get("source_diagnostics", [])
+        if not isinstance(diagnostics, list):
+            warnings.add("NWB_PROVENANCE_MISSING")
+            diagnostics = []
+        for item in diagnostics:
+            if not isinstance(item, dict):
+                warnings.add("NWB_PROVENANCE_MISSING")
+                continue
             if item.get("code") == "non_increasing_source_spikes":
                 blockers.add("NON_INCREASING_SOURCE_SPIKES")
-                if item.get("equal_pairs", 0) > 0:
+                if (finite(item.get("equal_pairs")) or 0) > 0:
                     blockers.add("EQUAL_CONSECUTIVE_SOURCE_SPIKES")
             elif item.get("code") == "identical_cross_unit_spike_vectors":
                 blockers.add("IDENTICAL_CROSS_UNIT_SPIKE_VECTORS")
@@ -1968,23 +1984,33 @@ def audit_asset(bundle: Path, asset: Doc, inventory: dict[str, Doc], files: dict
     if trace and not waveform:
         warnings.add("TRACE_BACKED_NOT_WAVEFORM_VERIFIED")
     mapped_good = asset.get("good_before")
+    no_quality_labels = False
     if asset["open_status"] == "ok" and "clusters.before.tsv" in artifact_files:
-        mapped_good = sum(label == "good" for label, *_ in clusters(artifact_files["clusters.before.tsv"]).values())
+        baseline = clusters(artifact_files["clusters.before.tsv"])
+        counts = label_counts((label for label, *_ in baseline.values()), "before")
+        mapped_good = counts["good_before"]
         if asset.get("good_before") != mapped_good:
             blockers.add("MAPPED_GOOD_DENOMINATOR_MISMATCH")
+        no_quality_labels = (bool(baseline) and asset.get("units_before") in (None, len(baseline))
+                             and not any(counts[key] or asset.get(key)
+                                         for key in ("good_before", "mua_before", "noise_before")))
     elif mapped_good:
         warnings.add("MAPPED_GOOD_DENOMINATOR_UNCHECKED")
     false_critical = real_critical = 0
-    inspector_exclusions = set()
+    inspector_rows = {}
     if "nwb_inspector.json" in artifact_files:
         report = read_json(artifact_files["nwb_inspector.json"])
         wrapped = isinstance(report, dict)
         messages = report.get("messages", []) if wrapped else report
         if isinstance(report, dict) and audit_timeout(report.get("status")):
             warnings.add("INSPECTOR_TIMEOUT")
-        for index, row in enumerate(messages):
+        for index, row in enumerate(messages if isinstance(messages, list) else []):
+            if not isinstance(row, dict):
+                continue
             pointer = f"/messages/{index}" if wrapped else f"/{index}"
-            check_name, msg = row.get("check_function_name"), row.get("message", "")
+            inspector_rows[pointer] = False
+            check_name, msg = row.get("check_function_name"), row.get("message")
+            msg = msg if isinstance(msg, str) else ""
             if check_name == "check_ascending_spike_times":
                 blockers.add("NON_INCREASING_SOURCE_SPIKES")
                 if re.search(r"equal|identical|duplicate", msg, re.I):
@@ -1993,12 +2019,12 @@ def audit_asset(bundle: Path, asset: Doc, inventory: dict[str, Doc], files: dict
                 match = re.search(r"external file ['\"]([^'\"]+)['\"]", msg, re.I)
                 if match and (path.parent / match[1]).as_posix() in inventory:
                     warnings.add("INSPECTOR_EXTERNAL_FILE_PRESENT")
-                    inspector_exclusions.add(pointer)
+                    inspector_rows[pointer] = True
                     false_critical += "CRITICAL" in (row.get("severity"), row.get("importance"))
                     continue
             if check_name == "check_file_extension" and "remfile" in msg.lower():
                 warnings.add("INSPECTOR_STREAMING_FILENAME_ARTIFACT")
-                inspector_exclusions.add(pointer)
+                inspector_rows[pointer] = True
                 continue
             real_critical += "CRITICAL" in (row.get("severity"), row.get("importance"))
     return {"asset_id": asset["asset_id"], "open_status": asset["open_status"],
@@ -2006,21 +2032,27 @@ def audit_asset(bundle: Path, asset: Doc, inventory: dict[str, Doc], files: dict
             "trace_backed": trace, "waveform_probe_succeeded": waveform,
             "inspector_external_file_false_criticals": false_critical,
             "inspector_other_criticals": real_critical,
-             **audit_result(blockers, warnings, bool(warnings))}, inspector_exclusions
+             **audit_result(blockers, warnings, bool(warnings))}, inspector_rows, no_quality_labels
 
 
-def audit_metric_claim(finding: Doc, thresholds: Doc, qc: str | None, digests: dict[str, str],
+def audit_metric_claim(finding: Doc, thresholds: Doc, asset: Doc, qc: str | None, digests: dict[str, str],
                        read_evidence: Callable[[str], Any]) -> str | None:
-    rules = {m: k for code, _, metrics, cutoffs, _ in QC_FINDING_RULES
+    rules = {m: (k, counter) for code, counter, metrics, cutoffs, _ in QC_FINDING_RULES
              if f"qc.{code}" == finding["code"] for m, k in zip(metrics, cutoffs)}
     if not rules:  # Label/curation findings are not threshold claims.
         return None
     metric = finding.get("metric")
     threshold = finite(finding.get("threshold"))
     unmatched = "METRIC_THRESHOLD_EVIDENCE_UNMATCHED"
-    if not qc or metric not in rules or threshold is None:
+    if metric not in rules:
         return unmatched
-    cutoff = rules[metric]
+    cutoff, counter = rules[metric]
+    if (asset.get("open_status") != "ok" or counter and not asset.get(counter)
+            or finding["code"].startswith(("qc.refractory", "qc.epoch", "qc.low_presence"))
+            and not asset.get("duration_s")):
+        return "METRIC_MEASUREMENT_UNAVAILABLE"
+    if not qc or threshold is None:
+        return unmatched
     if threshold != thresholds.get(cutoff):
         return "METRIC_THRESHOLD_CONFIG_MISMATCH"
     units = finding.get("unit_ids", [])
@@ -2046,10 +2078,18 @@ def audit_metric_claim(finding: Doc, thresholds: Doc, qc: str | None, digests: d
         if (type(unit) is not int or unit not in units or type(n_spikes) is not int or n_spikes <= 0
                 or unit in matched and matched[unit][0] != match[1]):
             return unmatched
-        matched[unit] = (match[1], finite(row.get(metric)))
+        value = qc_metric_value(asset, row, metric)
+        if value is None or metric == "isi_violation_ratio" and any(
+                finite(row.get(m)) is not None for m in ("rpv_post_lo95", "srp_contamination")):
+            return "METRIC_MEASUREMENT_UNAVAILABLE"
+        matched[unit] = (match[1], value)
     if matched.keys() != set(units):
         return unmatched
-    if any(v is None or not qc_threshold_hit(metric, cutoff, v, threshold) for _, v in matched.values()):
+    stated = finite(finding.get("value"))
+    if any(not qc_threshold_hit(metric, cutoff, v, threshold)
+           or finding.get("value") is not None and (
+               stated is None or not math.isclose(v, stated, rel_tol=1e-6, abs_tol=1e-9))
+           for _, v in matched.values()):
         return "METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM"
     return None
 
@@ -2082,9 +2122,15 @@ def audit_waveform_support(finding: Doc, files: dict[str, str], digests: dict[st
             if len(lines) % 2:
                 return set()
             for query, line in zip(lines[::2], lines[1::2]):
-                match = re.fullmatch(r"waveform (0|[1-9]\d{0,9}) raw dc_only hp_input "
-                                     r"(?:true|false|unknown): windows ([1-9]\d{0,2})/([1-9]\d{0,2}) channels .+", line)
-                if not match or query != f"> waveform {match[1]}" or not 2 <= int(match[2]) <= int(match[3]):
+                number = r"(?:-|-?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)"
+                match = re.fullmatch(
+                    r"waveform (0|[1-9][0-9]{0,9}) raw dc_only hp_input (?:true|false|unknown): "
+                    r"windows ([1-9][0-9]{0,2})/([1-9][0-9]{0,2}) channels [1-8] peak_ch (0|[1-9][0-9]{0,3})"
+                    rf" snr {number} early_late_cos {number} ttp_ms {number} hw_ms {number} extrema (?:-|0|[1-9][0-9]*)",
+                    line)
+                if (not match or query != f"> waveform {match[1]}"
+                        or not 2 <= int(match[2]) <= int(match[3]) <= 128
+                        or int(match[1]) > 2**32 - 1 or int(match[4]) >= 4096):
                     return set()
                 covered.add(int(match[1]))
         return covered
@@ -2137,15 +2183,31 @@ def audit_inventory(snapshot: Any, ident: str, version: str) -> tuple[dict[str, 
     return ({} if blockers else inventory), blockers
 
 
-def audit_human_species(snapshot: Any) -> bool:
-    if not isinstance(snapshot, dict):
+def audit_human_species(metadata: Any) -> bool:
+    if isinstance(metadata, list):
+        return any(audit_human_species(item) for item in metadata)
+    if not isinstance(metadata, dict):
         return False
-    raw = snapshot.get("dandi_raw_metadata")
-    summary = raw.get("assetsSummary") if isinstance(raw, dict) else None
-    terms = audit_notes([snapshot.get("species"), summary.get("species") if isinstance(summary, dict) else None])
-    return bool(re.search(
+    terms = [value for key, value in metadata.items()
+             if key.rsplit("/", 1)[-1].casefold() in {"species", "subject", "subject_species", "species_name"}]
+    if terms and re.search(
         r"\b(?:(?:homo[\s_-]+|h\.\s*)sapiens|(?<!non[- ])humans?|"
-        r"(?:ncbitaxon[:_/]|taxonomy/|txid)\s*9606)\b|(?<!\w)9606(?=[\",}\]\s])", terms, re.I))
+        r"(?:ncbitaxon[:_/]|taxonomy/|txid)\s*9606)\b|(?<!\w)9606(?=[\",}\]\s])", audit_notes(terms), re.I
+    ):
+        return True
+    return any(audit_human_species(value) for value in metadata.values())
+
+
+def audit_archive_totals(snapshot: Any) -> Iterable[Any]:
+    if not isinstance(snapshot, dict):
+        return
+    raw = snapshot.get("dandi_raw_metadata")
+    sections = [snapshot.get("assets_summary"), raw, raw.get("assetsSummary") if isinstance(raw, dict) else None]
+    for section in sections:
+        if isinstance(section, dict):
+            for key in ("n_assets_total", "numberOfFiles", "asset_count"):
+                if key in section:
+                    yield section[key]
 
 
 def audit_bundle(bundle: Path, doc: Doc, snapshot: Any, inventory: dict[str, Doc], pin_blockers: set[str],
@@ -2162,6 +2224,11 @@ def audit_bundle(bundle: Path, doc: Doc, snapshot: Any, inventory: dict[str, Doc
             or selection.get("n_nwb_assets", nwb_total) != nwb_total):
         blockers.add("SELECTION_DENOMINATOR_MISMATCH")
     excluded = (nwb_total if selection.get("scope") == "nwb" else len(inventory)) - len(doc["assets"])
+    if any(type(total) is not int or total != len(inventory) for total in audit_archive_totals(snapshot)):
+        if selection["policy"] == "all" or excluded == 0:
+            blockers.add("SELECTION_DENOMINATOR_MISMATCH")
+        else:
+            warnings.add("SELECTION_DENOMINATOR_MISMATCH")
     if excluded > 0:
         warnings.add("ASSETS_EXCLUDED")
         if not selection.get("rationale", "").strip():
@@ -2187,20 +2254,26 @@ def audit_bundle(bundle: Path, doc: Doc, snapshot: Any, inventory: dict[str, Doc
     if selected_shared:
         warnings.add("CROSS_ARCHIVE_SELECTED_PATH_REVIEW")
 
-    human = audit_human_species(snapshot)
+    paths, ambiguous = audit_artifact_paths({a["path"] for a in doc["assets"]} | inventory.keys(), listed)
+    nwb_metadata = {}
+    for path, files in paths.items():
+        if "nwb_meta.json" in files:
+            with contextlib.suppress(ValueError):
+                nwb_metadata[path] = read_json(bundle / files["nwb_meta.json"])
+    human = audit_human_species([snapshot, doc["dandiset"], doc.get("unique_metadata"),
+                                 *(a.get("unique_metadata") for a in doc["assets"]), *nwb_metadata.values()])
     if human:
         warnings.add("HUMAN_DATA_PRIVACY_REVIEW")
-    paths, ambiguous = audit_artifact_paths({a["path"] for a in doc["assets"]} | inventory.keys(), listed)
     assets = []
     by_id = {}
     digests = {f["path"]: f["sha256"] for f in doc["files"]}
     for a in doc["assets"]:
         path = a["path"]
         files = paths[path]
-        row, exclusions = audit_asset(bundle, a, inventory, files, path in ambiguous, human)
+        row, inspector_rows, no_quality_labels = audit_asset(
+            bundle, a, inventory, files, path in ambiguous, human, nwb_metadata.get(path))
         assets.append(row)
-        by_id[a["asset_id"]] = row, files, {
-            (digests[files["nwb_inspector.json"]], pointer) for pointer in exclusions}
+        by_id[a["asset_id"]] = a, row, files, inspector_rows, no_quality_labels
 
     @lru_cache(maxsize=8)
     def read_evidence(name: str) -> Any:
@@ -2225,8 +2298,9 @@ def audit_bundle(bundle: Path, doc: Doc, snapshot: Any, inventory: dict[str, Doc
         evidence = f.get("evidence") or []
         if not evidence:
             risks.add("FINDING_EVIDENCE_MISSING")
-        asset, files, exclusions = by_id.get(f.get("asset_id"), (None, {}, set()))
-        if claim_issue := audit_metric_claim(f, doc["thresholds"], files.get("cluster_qc.before.json"),
+        source, asset, files, inspector_rows, no_quality_labels = by_id.get(
+            f.get("asset_id"), ({}, None, {}, {}, False))
+        if claim_issue := audit_metric_claim(f, doc["thresholds"], source, files.get("cluster_qc.before.json"),
                                              digests, read_evidence):
             if claim_issue != "METRIC_THRESHOLD_EVIDENCE_UNMATCHED":
                 b.add(claim_issue)
@@ -2236,10 +2310,23 @@ def audit_bundle(bundle: Path, doc: Doc, snapshot: Any, inventory: dict[str, Doc
         for row in sources:
             b.update(row["blockers"])
             risks.update(set(row["warnings"]) & {"NWB_PROVENANCE_MISSING", "CONFLICTING_AUTHOR_LABELS"})
-        if f["scope"] == "dandiset":
-            exclusions = set().union(*(row[2] for row in by_id.values()))
-        if code.startswith("nwb.") and any((e["artifact_sha256"], e["pointer"]) in exclusions for e in evidence):
-            b.add("INSPECTOR_STREAMING_ARTIFACT_CLAIM")
+        if code.startswith("nwb."):
+            inspector = files.get("nwb_inspector.json")
+            if not evidence:
+                b.add("INSPECTOR_EVIDENCE_UNMATCHED")
+            for ref in evidence:
+                pointer = ref["pointer"]
+                row = re.match(r"/(?:messages/)?(?:0|[1-9][0-9]*)(?=/|$)", pointer)
+                if (not inspector or ref["artifact_sha256"] != digests[inspector]
+                        or not row or row[0] not in inspector_rows
+                        or not json_pointer_exists(read_evidence(inspector), pointer)):
+                    b.add("INSPECTOR_EVIDENCE_UNMATCHED")
+                elif inspector_rows[row[0]]:
+                    b.add("INSPECTOR_STREAMING_ARTIFACT_CLAIM")
+        if code == "meta.no_quality_labels" and (
+                not no_quality_labels or not any(
+                    e["artifact_sha256"] == digests[files["clusters.before.tsv"]] for e in evidence)):
+            b.add("NO_QUALITY_LABELS_EVIDENCE_UNMATCHED")
         if (code in {"curation.oversplit", "curation.overmerge"}
                 or re.search(r"\b(?:merge|waveforms? verified)\b", claim, re.I)) and not audit_waveform_support(
                     f, files, digests, read_evidence):

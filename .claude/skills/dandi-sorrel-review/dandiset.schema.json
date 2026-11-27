@@ -39,6 +39,7 @@
       "required": ["n_assets_total", "n_nwb_assets", "total_size_bytes", "encodings"],
       "properties": {
         "n_assets_total": {"$ref": "#/$defs/count"},
+        "numberOfFiles": {"$ref": "#/$defs/count"},
         "n_nwb_assets": {"$ref": "#/$defs/count"},
         "total_size_bytes": {"$ref": "#/$defs/count"},
         "encodings": {

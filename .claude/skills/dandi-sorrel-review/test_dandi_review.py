@@ -99,7 +99,7 @@ class ReviewKitTest(unittest.TestCase):
     def audit_fixture(self, verified=True, note="", **finding):
         doc = self.review(verified)
         asset = dict(doc["assets"][0], blob_id="blob-1", sha256="a" * 64,
-                     evidence_level="raw", duration_s=10, sample_rate_hz=20_000,
+                     evidence_level="raw", duration_s=10, sample_rate_hz=20_000, n_rp_contaminated=1,
                      unique_metadata={"spike_extent_s": 9, "raw_access": {"result": "windows 8/8"}})
         doc["assets"] = [asset]
         doc["findings"][0].update(finding)
@@ -139,7 +139,7 @@ class ReviewKitTest(unittest.TestCase):
                 doc = self.audit_fixture()
                 p = self.stage / "artifacts/dandiset.json"
                 p.write_text(json.dumps(dict(json.loads(p.read_text()), species=[species])))
-                doc["findings"].append(dict(doc["findings"][0], id="f02", code="meta.no_quality_labels",
+                doc["findings"].append(dict(doc["findings"][0], id="f02", code="meta.no_sorter_provenance",
                                             scope="dandiset", asset_id=None))
                 for finding in self.audited(doc)["findings"]:
                     self.assertEqual(finding["verdict"], "needs_human_review")
@@ -154,6 +154,150 @@ class ReviewKitTest(unittest.TestCase):
         ]}}
         p.write_text(json.dumps(snapshot))
         self.assertIn("HUMAN_DATA_PRIVACY_REVIEW", self.audited(doc)["findings"][0]["warnings"])
+
+    def test_audit_human_hold_from_review_species_and_subject_metadata(self):
+        for species in ("Homo sapiens", "Human"):
+            doc = self.audit_fixture()
+            doc["dandiset"]["species"] = [species]
+            self.assertIn("HUMAN_DATA_PRIVACY_REVIEW", self.audited(doc)["findings"][0]["warnings"])
+        doc = self.audit_fixture()
+        doc["assets"][0]["unique_metadata"]["subject"] = {"species": {"identifier": "NCBITaxon:9606"}}
+        self.assertIn("HUMAN_DATA_PRIVACY_REVIEW", self.audited(doc)["findings"][0]["warnings"])
+        doc = self.audit_fixture()
+        path = self.stage / "artifacts" / doc["assets"][0]["path"] / "nwb_meta.json"
+        path.write_text(json.dumps({"/general/subject/species": {"value": "Human"}}))
+        self.assertIn("HUMAN_DATA_PRIVACY_REVIEW", self.audited(doc)["findings"][0]["warnings"])
+
+    def test_audit_inspector_binds_nested_pointer_and_claimed_asset(self):
+        doc = self.audit_fixture(code="nwb.inspector_critical")
+        asset = doc["assets"][0]
+        finding = doc["findings"][0]
+        artifact = self.stage / "artifacts"
+        pin_path = artifact / "dandiset.json"
+        pin = json.loads(pin_path.read_text())
+        second = dict(pin["assets"][0], asset_id="asset-2", path="sub-b/sub-b.nwb")
+        pin["assets"].append(second)
+        pin_path.write_text(json.dumps(pin))
+        doc["assets"].append(dict(asset, **second))
+        doc["asset_selection"]["n_assets_total"] = 2
+        first_report = artifact / asset["path"] / "nwb_inspector.json"
+        self.cite(finding, first_report, {"messages": [{"message": "real"}, {
+            "check_function_name": "check_file_extension", "message": "remfile extension",
+        }]}, "/messages/1/message")
+        self.assertIn("INSPECTOR_STREAMING_ARTIFACT_CLAIM", self.audited(doc)["findings"][0]["blockers"])
+        self.cite(finding, first_report, {"messages": [{"message": "real"}]}, "/messages/0/message")
+        self.assertEqual(self.audited(doc)["findings"][0]["verdict"], "outreach_ready")
+        first_refs = finding["evidence"]
+        finding["asset_id"] = second["asset_id"]
+        self.assertIn("INSPECTOR_EVIDENCE_UNMATCHED", self.audited(doc)["findings"][0]["blockers"])
+        other_report = artifact / second["path"] / "nwb_inspector.json"
+        self.cite(finding, other_report, {"messages": [{"message": "different asset"}]}, "/messages")
+        shutil.copyfile(first_report.with_name("describe.json"), other_report.with_name("describe.json"))
+        self.assertIn("INSPECTOR_EVIDENCE_UNMATCHED", self.audited(doc)["findings"][0]["blockers"])
+        finding["evidence"][0]["pointer"] = "/messages/0"
+        self.assertEqual(self.audited(doc)["findings"][0]["verdict"], "outreach_ready")
+        finding["evidence"].extend(first_refs)
+        self.assertIn("INSPECTOR_EVIDENCE_UNMATCHED", self.audited(doc)["findings"][0]["blockers"])
+
+    def test_audit_qc_requires_duration_and_metric_specific_summary(self):
+        for code, summary, metric, cutoff, value in (
+            ("low_presence", "n_low_presence", "presence_ratio", "presence_ratio_min", 0.01),
+            ("epoch_instability", "n_unstable", "epoch_rate_ratio", "epoch_rate_ratio_min", 0.01),
+            ("refractory_contamination", "n_rp_contaminated", "rpv_post_lo95", "rp_contamination_lo95_max", 0.2),
+            ("refractory_screening", "n_rp_screened", "srp_contamination", "srp_contamination_upper_max", 0.2),
+        ):
+            with self.subTest(metric=metric):
+                doc = self.audit_fixture(code=f"qc.{code}", metric=metric, threshold=kit.DEFAULT_THRESHOLDS[cutoff])
+                asset = doc["assets"][0]
+                self.cite(doc["findings"][0], self.stage / "artifacts" / asset["path"] / "cluster_qc.before.json",
+                          [{"cluster_id": 2, "n_spikes": 100, metric: value}], f"/0/{metric}")
+                asset[summary] = None
+                self.assertIn("METRIC_MEASUREMENT_UNAVAILABLE", self.audited(doc)["findings"][0]["blockers"])
+                asset[summary] = 1
+                self.assertEqual(self.audited(doc)["findings"][0]["verdict"], "outreach_ready")
+                asset.update(duration_s=None, sample_rate_hz=None, evidence_level="spike_times")
+                if metric == "presence_ratio":
+                    asset[summary] = None  # The review schema also forbids this count without duration.
+                self.assertIn("METRIC_MEASUREMENT_UNAVAILABLE", self.audited(doc)["findings"][0]["blockers"])
+
+    def test_audit_checks_stated_value_against_the_cited_metric(self):
+        doc = self.audit_fixture(value=0.01)
+        self.assertIn("METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM", self.audited(doc)["findings"][0]["blockers"])
+        doc["findings"][0]["value"] = 0.20000000001
+        self.assertEqual(self.audited(doc)["findings"][0]["verdict"], "outreach_ready")
+
+    def test_audit_waveform_rejects_impossible_window_and_channel_counts(self):
+        doc = self.audit_fixture(code="curation.oversplit", unit_ids=[2])
+        path = self.stage / "artifacts" / doc["assets"][0]["path"] / "waveform.json"
+        for counts, valid in (("2/128 channels 8", True), ("2/2 channels 0", False),
+                              ("999/999 channels 1", False), ("3/2 channels 1", False),
+                              ("2/2 channels 9", False), ("0/2 channels 1", False)):
+            with self.subTest(counts=counts):
+                text = (f"> waveform 2\nwaveform 2 raw dc_only hp_input unknown: windows {counts}"
+                        " peak_ch 0 snr 1 early_late_cos .9 ttp_ms - hw_ms - extrema -")
+                self.cite(doc["findings"][0], path, {"receipt": {
+                    "kind": "waveform", "exit_code": 0, "asset_id": doc["assets"][0]["asset_id"],
+                    "probe_reply": {"result": {"content": [{"type": "text", "text": text}]}},
+                }}, "/receipt")
+                self.assertEqual("WAVEFORM_SUPPORT_MISSING" not in self.audited(doc)["findings"][0]["warnings"], valid)
+
+    def test_audit_no_quality_labels_needs_bound_tsv_and_no_mapped_counts(self):
+        doc = self.audit_fixture(code="meta.no_quality_labels")
+        asset = doc["assets"][0]
+        asset["units_before"] = 1
+        asset["n_good_rp_contaminated"] = None
+        path = self.stage / "artifacts" / asset["path"] / "clusters.before.tsv"
+        finding = doc["findings"][0]
+        for label, mapped_mua, expected in (("good", None, False), ("mua", None, False),
+                                             ("noise", None, False), ("good2", 1, False),
+                                             ("good2", None, True)):
+            with self.subTest(label=label, mapped_mua=mapped_mua):
+                asset.update(good_before=int(label == "good"), mua_before=mapped_mua, unlabeled_before=0)
+                path.write_text(CLUSTER_HEADER + f"2\t100\t{label}\t-\t-\t-\t\n")
+                finding["evidence"] = [{"artifact_sha256": kit.digest_file(path)[0], "pointer": "L1"}]
+                result = self.audited(doc)["findings"][0]
+                self.assertEqual("NO_QUALITY_LABELS_EVIDENCE_UNMATCHED" not in result["blockers"], expected)
+        path.unlink()
+        finding["evidence"] = []
+        self.assertIn("NO_QUALITY_LABELS_EVIDENCE_UNMATCHED", self.audited(doc)["findings"][0]["blockers"])
+
+    def test_audit_archive_inventory_checks_each_declared_total(self):
+        for field in ("numberOfFiles", "n_assets_total", "dandi_raw_metadata", "asset_count"):
+            for policy in ("all", "sample"):
+                with self.subTest(field=field, policy=policy):
+                    doc = self.audit_fixture()
+                    doc["asset_selection"]["policy"] = policy
+                    p = self.stage / "artifacts/dandiset.json"
+                    snapshot = json.loads(p.read_text())
+                    snapshot["assets_summary"] = {"n_assets_total": 1, "n_nwb_assets": 1,
+                                                  "total_size_bytes": 1, "encodings": {"hdf5": 1}}
+                    if field == "dandi_raw_metadata":
+                        snapshot[field] = {"assetsSummary": {"numberOfFiles": 2}}
+                    elif field == "asset_count":
+                        snapshot["dandi_raw_metadata"][field] = 2
+                    else:
+                        snapshot["assets_summary"][field] = 2
+                    p.write_text(json.dumps(snapshot))
+                    self.assertIn("SELECTION_DENOMINATOR_MISMATCH", self.audited(doc)["findings"][0]["blockers"])
+
+    def test_audit_waveform_probe_needs_verified_nonfailed_raw_access(self):
+        doc = self.audit_fixture()
+        for raw, expected in (({"result": "windows 8/8"}, False), ({"verified": True, "exit_code": 1}, False),
+                              ({"verified": True, "error": "read failed"}, False), ({"verified": True}, True),
+                              ({"verified": True, "exit_code": 0, "error": ""}, True)):
+            with self.subTest(raw=raw):
+                doc["assets"][0]["unique_metadata"]["raw_access"] = raw
+                self.assertEqual(self.audited(doc)["assets"][0]["waveform_probe_succeeded"], expected)
+
+    def test_audit_handles_null_and_malformed_describe_and_source_diagnostics(self):
+        doc = self.audit_fixture()
+        p = self.stage / "artifacts" / doc["assets"][0]["path"] / "describe.json"
+        for value in (None, [], {"provenance": {"mode": "trace", "source_diagnostics": None}},
+                      {"provenance": {"mode": "trace", "source_diagnostics": {"code": "bad"}}},
+                      {"provenance": {"mode": "trace", "source_diagnostics": [None]}}):
+            with self.subTest(value=value):
+                p.write_text(json.dumps(value))
+                self.assertIn("NWB_PROVENANCE_MISSING", self.audited(doc)["findings"][0]["warnings"])
 
     def test_audit_requires_explicit_public_snapshot_and_schema(self):
         for key, value, flag in (
@@ -180,6 +324,7 @@ class ReviewKitTest(unittest.TestCase):
         doc = self.audit_fixture(code="qc.low_presence", metric="presence_ratio",
                                  threshold=kit.DEFAULT_THRESHOLDS["presence_ratio_min"])
         asset = doc["assets"][0]
+        asset["n_low_presence"] = 1
         asset["unique_metadata"]["spike_extent_s"] = 1
         self.cite(doc["findings"][0], self.stage / "artifacts" / asset["path"] / "cluster_qc.before.json",
                   [{"cluster_id": 2, "n_spikes": 100, "presence_ratio": 0.01}], "/0/presence_ratio")
@@ -235,7 +380,8 @@ class ReviewKitTest(unittest.TestCase):
             doc = self.audit_fixture(code=code, statement_md="These clusters need editing.",
                                      unit_ids=[1, 2], n_units=2)
             directory = self.stage / "artifacts" / doc["assets"][0]["path"]
-            first = "> waveform 1\nwaveform 1 raw dc_only hp_input unknown: windows 4/8 channels 4 peak_ch 0\n"
+            first = ("> waveform 1\nwaveform 1 raw dc_only hp_input unknown: windows 4/8 channels 4"
+                     " peak_ch 0 snr 1 early_late_cos .9 ttp_ms - hw_ms - extrema -\n")
             second = first.replace("waveform 1", "waveform 2")
             for update, transcript, parent in (
                 ({"exit_code": 124}, first + second, {}),
