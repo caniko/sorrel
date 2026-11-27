@@ -107,6 +107,7 @@ mod imp {
         identity_bytes: Vec<u8>,
         trace: Option<NwbTrace>,
         skipped_series: Option<Value>,
+        source_diagnostics: Vec<Value>,
         #[cfg(any(feature = "hdf5", feature = "dandi"))]
         source: Group,
         #[cfg(feature = "dandi")]
@@ -331,6 +332,7 @@ mod imp {
                 ids: unit_ids,
                 same_mapping,
                 seconds,
+                mut source_diagnostics,
             } = load_units(
                 &ids,
                 &spike_times,
@@ -346,6 +348,44 @@ mod imp {
             } else {
                 units_span(&f, &spikes_per_cluster, &seconds, rate, t0)
             };
+            let spike_extent =
+                spike_bounds(&spikes_per_cluster).map_or(0, |(first, last)| last.0 - first.0);
+            const EPOCHS: &str = "/intervals/epochs";
+            let check_span = |diagnostics: &mut Vec<Value>, source, samples: f64| {
+                if let Some(ratio) = span_ratio(samples, spike_extent as f64) {
+                    let diagnostic = json!({
+                        "code": "suspicious_declared_span", "source": source,
+                        "span_samples": samples, "spike_extent_samples": spike_extent, "ratio": ratio
+                    });
+                    log::warn!("NWB: {diagnostic}");
+                    diagnostics.push(diagnostic);
+                }
+            };
+            match span.source {
+                SpanSource::Trace => check_span(
+                    &mut source_diagnostics,
+                    "trace",
+                    span.extent_samples() as f64,
+                ),
+                SpanSource::Declared(path) => {
+                    check_span(&mut source_diagnostics, path, span.extent_samples() as f64)
+                }
+                _ => {}
+            }
+            if spike_extent > 0 && span.source != SpanSource::Declared(EPOCHS) {
+                // Check declared seconds independently of the trace clock.
+                // An epoch can start before the first trace sample.
+                match time_table_intervals(&f, EPOCHS) {
+                    Ok(rows) => {
+                        if let Some(((first, _), (_, last))) =
+                            rows.first_key_value().zip(rows.last_key_value())
+                        {
+                            check_span(&mut source_diagnostics, EPOCHS, (last.0 - first.0) * rate);
+                        }
+                    }
+                    Err(err) => log::warn!("NWB: unable to check epoch span at {EPOCHS}: {err:#}"),
+                }
+            }
             drop(seconds);
             if raw.is_some() {
                 ensure!(spikes_per_cluster.iter().filter_map(|s| s.last()).all(|s| s.0 < n_samples as u64),
@@ -387,6 +427,7 @@ mod imp {
                 identity_bytes,
                 trace,
                 skipped_series: params.units_only().then(|| inspect_skipped_series(&f)),
+                source_diagnostics,
                 #[cfg(any(feature = "hdf5", feature = "dandi"))]
                 source: f,
                 #[cfg(feature = "dandi")]
@@ -470,10 +511,18 @@ mod imp {
         }
 
         fn trace_provenance(&self) -> Value {
+            let mut provenance =
+                json!({ "mode": if self.has_trace() { "trace" } else { "units-only" } });
             if let Some(skipped) = &self.skipped_series {
-                return json!({ "mode": "units-only", "skipped_series": skipped });
+                provenance["skipped_series"] = skipped.clone();
             }
-            json!({ "mode": if self.has_trace() { "trace" } else { "units-only" } })
+            if !self.source_diagnostics.is_empty() {
+                provenance["source_diagnostics"] = json!(self.source_diagnostics);
+            }
+            if !self.metadata.label_provenance.is_empty() {
+                provenance["author_label_columns"] = json!(self.metadata.label_provenance);
+            }
+            provenance
         }
         fn n_clusters(&self) -> u32 {
             self.spikes_per_cluster.len() as u32
@@ -669,7 +718,7 @@ mod imp {
         }
 
         for path in ["/intervals/epochs", "/intervals/trials"] {
-            match time_table_intervals(f, path, rate, t0) {
+            match time_table_intervals(f, path).and_then(|rows| grid_intervals(rows, rate, t0)) {
                 Ok(mut rows) => {
                     if rows.is_empty() {
                         continue;
@@ -688,9 +737,7 @@ mod imp {
                 Err(err) => log::warn!("ignoring NWB intervals at {path}: {err:#}"),
             }
         }
-        let first = spikes.iter().filter_map(|row| row.first().copied()).min();
-        let last = spikes.iter().filter_map(|row| row.last().copied()).max();
-        let span = match first.zip(last) {
+        let span = match spike_bounds(spikes) {
             Some((start, last)) => SessionSpan::contiguous(
                 start,
                 SampleIndex(last.0 + 1),
@@ -701,6 +748,16 @@ mod imp {
             }
         };
         (span, Vec::new())
+    }
+
+    fn spike_bounds(spikes: &[Vec<SampleIndex>]) -> Option<(SampleIndex, SampleIndex)> {
+        let first = spikes.iter().filter_map(|row| row.first().copied()).min()?;
+        let last = spikes.iter().filter_map(|row| row.last().copied()).max()?;
+        Some((first, last))
+    }
+
+    fn span_ratio(span: f64, spike_extent: f64) -> Option<f64> {
+        (spike_extent > 0.0 && span > 100.0 * spike_extent).then(|| span / spike_extent)
     }
 
     fn spike_rows<'a>(
@@ -892,14 +949,9 @@ mod imp {
         Ok(covered.then_some(spans))
     }
 
-    fn time_table_intervals(
-        f: &Group,
-        path: &str,
-        rate: f64,
-        t0: f64,
-    ) -> Result<Vec<GridInterval>> {
+    fn time_table_intervals(f: &Group, path: &str) -> Result<TimeIntervals> {
         let Some(g) = f.optional_group(path)? else {
-            return Ok(Vec::new());
+            return Ok(TimeIntervals::new());
         };
         let (starts, stops) = (g.dataset("start_time")?, g.dataset("stop_time")?);
         let shape = starts.shape();
@@ -921,7 +973,7 @@ mod imp {
                 add_interval(&mut rows, start, stop)?;
             }
         }
-        grid_intervals(rows, rate, t0)
+        Ok(rows)
     }
 
     pub(crate) fn read_trials(path: &Path) -> Result<crate::Events> {
@@ -1829,6 +1881,45 @@ mod imp {
         same_mapping: bool,
         // Only kept for validating units-only interval boundaries.
         seconds: Vec<f64>,
+        source_diagnostics: Vec<Value>,
+    }
+
+    fn source_spike_diagnostics(all: &[f64], ends: &[i64], ids: &[u32]) -> Result<Vec<Value>> {
+        let mut diagnostics = Vec::new();
+        let mut start = 0;
+        let mut seen: HashMap<_, Vec<(&[u8], u32)>> = HashMap::new();
+        for (&end, &id) in ends.iter().zip(ids) {
+            let end = usize::try_from(end)
+                .ok()
+                .filter(|&e| e >= start && e <= all.len())
+                .context("/units/spike_times_index is not a valid ragged index")?;
+            let row = &all[start..end];
+            start = end;
+            let (mut descending, mut equal) = (0, 0);
+            for pair in row.windows(2) {
+                descending += usize::from(pair[0] > pair[1]);
+                equal += usize::from(pair[0] == pair[1]);
+            }
+            if descending + equal > 0 {
+                diagnostics.push(json!({
+                    "code": "non_increasing_source_spikes", "unit_id": id,
+                    "descending_pairs": descending, "equal_pairs": equal,
+                }));
+            }
+            if !row.is_empty() {
+                let bytes = bytemuck::cast_slice(row);
+                let matches = seen.entry(blake3::hash(bytes)).or_default();
+                if let Some((_, first)) = matches.iter().find(|(other, _)| *other == bytes) {
+                    diagnostics.push(json!({
+                        "code": "identical_cross_unit_spike_vectors", "unit_ids": [*first, id],
+                        "n_spikes": row.len(),
+                    }));
+                } else {
+                    matches.push((bytes, id));
+                }
+            }
+        }
+        Ok(diagnostics)
     }
 
     /// Spike sample indices per unit (relative to `t0`), unit ids, and
@@ -1862,6 +1953,10 @@ mod imp {
         sorted.sort_unstable();
         sorted.dedup();
         ensure!(sorted.len() == unit_ids.len(), "/units/id has duplicates");
+        let source_diagnostics = source_spike_diagnostics(&all, &ends, &unit_ids)?;
+        for diagnostic in &source_diagnostics {
+            log::warn!("NWB: {diagnostic}");
+        }
 
         let mut out = Vec::with_capacity(ends.len());
         let mut start = 0usize;
@@ -1921,6 +2016,7 @@ mod imp {
             );
         }
         Ok(LoadedUnits {
+            source_diagnostics,
             spikes: out,
             ids: unit_ids,
             same_mapping: n_differing == 0,
@@ -2005,6 +2101,7 @@ mod imp {
 
     struct UnitMetadata {
         labels: Vec<PhyLabel>,
+        label_provenance: serde_json::Map<String, Value>,
         tags: Vec<Vec<String>>,
         annotations: Vec<UnitAnnotation>,
         names: Option<Vec<String>>,
@@ -2020,20 +2117,65 @@ mod imp {
             Ok((ds.shape() == [n]).then(|| ds.strings().ok()).flatten())
         };
         let mut label_columns = Vec::new();
-        for name in ["label", "quality", "KSLabel"] {
-            label_columns.extend(string_column(name)?);
+        let mut label_provenance = serde_json::Map::new();
+        for (name, maps_quality) in [
+            ("label", true),
+            ("quality", true),
+            ("KSLabel", true),
+            ("unit_quality_post_sorting", false),
+            ("sort_label", false),
+            ("cell_type", false),
+            ("cell_class", false),
+            ("unit_type", false),
+            ("ACGquality", false),
+            ("UnitStability", false),
+        ] {
+            let column = units.optional_dataset(name).or_else(|err| {
+                if maps_quality {
+                    Err(err)
+                } else {
+                    log::warn!(
+                        "NWB: unable to inspect optional author column /units/{name}: {err:#}"
+                    );
+                    Ok(None)
+                }
+            })?;
+            let Some(ds) = column else {
+                continue;
+            };
+            let shape = ds.shape();
+            let values = if shape == [n] {
+                ds.optional_strings().unwrap_or_else(|err| {
+                    log::warn!("NWB: unable to read /units/{name} as strings: {err:#}");
+                    None
+                })
+            } else {
+                None
+            };
+            let mut unmapped = BTreeMap::new();
+            if let Some(values) = &values {
+                for value in values {
+                    if !maps_quality || imported_label(value).is_none() {
+                        *unmapped.entry(value).or_insert(0usize) += 1;
+                    }
+                }
+            }
+            label_provenance.insert(
+                name.into(),
+                json!({
+                    "dtype": ds.dtype_name(), "shape": shape,
+                    "maps_quality": maps_quality && values.is_some(), "unmapped": unmapped,
+                }),
+            );
+            if maps_quality {
+                label_columns.extend(values);
+            }
         }
         let labels = (0..n)
             .map(|i| {
                 label_columns
                     .iter()
-                    .find_map(|col| {
-                        let value = &col[i];
-                        let label = PhyLabel::parse_tsv_value(value);
-                        (label != PhyLabel::Unsorted
-                            || value.trim().eq_ignore_ascii_case("unsorted"))
-                        .then_some(label)
-                    })
+                    .find_map(|col| imported_label(&col[i]))
                     .unwrap_or_default()
             })
             .collect();
@@ -2127,11 +2269,18 @@ mod imp {
         metrics.sort_by_name();
         Ok(UnitMetadata {
             labels,
+            label_provenance,
             tags,
             annotations,
             names,
             metrics,
         })
+    }
+
+    fn imported_label(value: &str) -> Option<PhyLabel> {
+        let label = PhyLabel::parse_tsv_value(value);
+        (label != PhyLabel::Unsorted || value.trim().eq_ignore_ascii_case("unsorted"))
+            .then_some(label)
     }
 
     fn ragged_rows<T: Clone>(values: &[T], ends: &[usize]) -> Option<Vec<Vec<T>>> {
@@ -2429,6 +2578,108 @@ mod imp {
         assert_eq!(exact_sample(0.0, 0.25, 1.0), 0.0);
         assert!(exact_sample(f64::NAN, 0.0, 1.0).is_nan());
         assert!(exact_sample(f64::INFINITY, 0.0, 1.0).is_nan());
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn source_spike_diagnostics_precede_sorting_and_quantization() {
+        let times = [0.2, 0.1, 0.1, 0.2, 0.1, 0.1, 0.1, 0.1, 0.2];
+        let issues =
+            source_spike_diagnostics(&times, &[3, 6, 9, 9, 9], &[10, 20, 30, 40, 50]).unwrap();
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|v| v["code"] == "non_increasing_source_spikes")
+                .count(),
+            3
+        );
+        assert_eq!(issues[0]["descending_pairs"], 1);
+        assert_eq!(issues[0]["equal_pairs"], 1);
+        let duplicates: Vec<_> = issues
+            .iter()
+            .filter(|v| v["code"] == "identical_cross_unit_spike_vectors")
+            .collect();
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0]["unit_ids"], json!([10, 20]));
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn declared_span_warning_uses_strict_scale_threshold() {
+        assert_eq!(span_ratio(1_000_000.0, 1_000.0), Some(1000.0));
+        assert_eq!(span_ratio(100_000.0, 1_000.0), None);
+        assert_eq!(span_ratio(1_000.0, 0.0), None);
+    }
+
+    #[cfg(all(test, feature = "hdf5"))]
+    #[test]
+    fn oversized_epochs_are_reported_even_on_trace_backed_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized-epochs.nwb");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../release/fixtures/nwb/timestamps.nwb");
+        std::fs::copy(fixture, &path).unwrap();
+        {
+            let file = hdf5_metno::File::open_rw(&path).unwrap();
+            if file.link_exists("intervals/epochs") {
+                file.unlink("intervals/epochs").unwrap();
+            }
+            let epochs = file.create_group("intervals/epochs").unwrap();
+            for (name, value) in [("start_time", 0.0_f64), ("stop_time", 100_000.0)] {
+                epochs
+                    .new_dataset_builder()
+                    .with_data(&[value])
+                    .create(name)
+                    .unwrap();
+            }
+        }
+        let provider = NwbProvider::open(path).unwrap();
+        assert_eq!(provider.session_span().source, SpanSource::Trace);
+        let provenance = provider.trace_provenance();
+        assert!(provenance["source_diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "suspicious_declared_span"
+                && issue["source"] == "/intervals/epochs"
+                && issue["ratio"].as_f64().unwrap() > 100.0));
+    }
+
+    #[cfg(all(test, feature = "hdf5"))]
+    #[test]
+    fn label_provenance_keeps_raw_labels_and_numeric_dtype() {
+        use hdf5_metno::types::VarLenUnicode;
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5_metno::File::create(dir.path().join("labels.h5")).unwrap();
+        let units = file.create_group("units").unwrap();
+        units
+            .new_dataset_builder()
+            .with_data(&[1_i32, 2])
+            .create("quality")
+            .unwrap();
+        let labels: Vec<VarLenUnicode> = ["good", "good2"]
+            .iter()
+            .map(|v| v.parse().unwrap())
+            .collect();
+        units
+            .new_dataset_builder()
+            .with_data(&labels)
+            .create("label")
+            .unwrap();
+        units
+            .new_dataset_builder()
+            .with_data(&labels)
+            .create("cell_type")
+            .unwrap();
+        units.create_group("cell_class").unwrap(); // A non-column must not prevent opening.
+        let metadata = read_unit_metadata(&Group::Hdf5(units), &[10, 11]).unwrap();
+        assert_eq!(metadata.labels, [PhyLabel::Good, PhyLabel::Unsorted]);
+        assert_eq!(metadata.label_provenance["quality"]["dtype"], "int32");
+        assert_eq!(metadata.label_provenance["label"]["unmapped"]["good2"], 1);
+        assert_eq!(
+            metadata.label_provenance["cell_type"]["unmapped"]["good"],
+            1
+        );
     }
 
     #[cfg(test)]

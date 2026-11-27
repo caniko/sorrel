@@ -362,6 +362,11 @@ use h5::H5Type as Number;
 use zarr::Number;
 
 impl Dataset {
+    pub fn dtype_name(&self) -> String {
+        dispatch!(self, Self, d => d.dtype().and_then(|t| t.to_descriptor())
+            .map_or_else(|_| "unknown HDF5 type".into(), |t| t.to_string()), d.dtype_name())
+    }
+
     pub fn shape(&self) -> Vec<usize> {
         dispatch!(self, Self, d => d.shape(), d.shape().to_vec())
     }

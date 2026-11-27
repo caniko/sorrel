@@ -445,6 +445,11 @@ macro_rules! numeric_types {
 }
 
 impl Dataset {
+    pub fn dtype_name(&self) -> String {
+        self.array()
+            .map_or_else(|_| "JSON string".into(), |a| format!("{:?}", a.data_type()))
+    }
+
     pub fn exact_float(&self, what: &str) -> Result<()> {
         ensure!(
             matches!(self.array()?.metadata(), ArrayMetadata::V2(meta)
