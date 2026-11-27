@@ -551,8 +551,8 @@ merge: rpc/pres/cut = rp_contamination/presence_ratio/amplitude_cutoff of each p
 per pair dip_z < 0 = refractory dip (not proof of one neuron), sync_z > 0 = fire together \
 (argues against merging), ks amplitude KS, sim template similarity, d um apart, pc presence complement (drift); \
 - = too few CCG counts to say.\n\
-split: parts = major/minor spikes, amp/rpc per part, dip_z/sync_z between parts (dip = one \
-neuron: do not split), bic.\n";
+split: parts = major/minor spikes, amp/rpc per part, dip_z/sync_z between parts \
+(a refractory dip is not proof of one neuron; check waveform or feature evidence), bic.\n";
 
 fn merge_flag(candidate: &MergeCandidate) -> &'static str {
     if candidate.template_sim.is_finite() {
@@ -785,6 +785,14 @@ pub fn render_brief<P: DataProvider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_legend_requires_corroboration_of_ccg_dips() {
+        let (_, split) = RELATIONS_LEGEND.split_once("\nsplit: ").unwrap();
+        assert!(split.contains("not proof of one neuron"));
+        assert!(split.contains("waveform or feature evidence"));
+        assert!(!split.contains("do not split"));
+    }
 
     #[test]
     fn ccg_only_merge_is_screening() {

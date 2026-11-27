@@ -522,6 +522,9 @@ mod imp {
             if !self.metadata.label_provenance.is_empty() {
                 provenance["author_label_columns"] = json!(self.metadata.label_provenance);
             }
+            if !self.metadata.label_conflicts.is_empty() {
+                provenance["author_label_conflicts"] = json!(self.metadata.label_conflicts);
+            }
             provenance
         }
         fn n_clusters(&self) -> u32 {
@@ -1919,6 +1922,12 @@ mod imp {
                 }
             }
         }
+        ensure!(
+            start == all.len(),
+            "/units/spike_times_index ends at {start} but /units/spike_times has {} values ({} unreferenced source spikes)",
+            all.len(),
+            all.len() - start
+        );
         Ok(diagnostics)
     }
 
@@ -1953,7 +1962,7 @@ mod imp {
         sorted.sort_unstable();
         sorted.dedup();
         ensure!(sorted.len() == unit_ids.len(), "/units/id has duplicates");
-        let source_diagnostics = source_spike_diagnostics(&all, &ends, &unit_ids)?;
+        let mut source_diagnostics = source_spike_diagnostics(&all, &ends, &unit_ids)?;
         for diagnostic in &source_diagnostics {
             log::warn!("NWB: {diagnostic}");
         }
@@ -1962,6 +1971,7 @@ mod imp {
         let mut start = 0usize;
         let mut n_differing = 0;
         let mut first_difference = None;
+        let (mut before_start, mut at_or_after_end) = (0usize, 0usize);
         for (&end, &id) in ends.iter().zip(&unit_ids) {
             let end = usize::try_from(end)
                 .ok()
@@ -1977,10 +1987,18 @@ mod imp {
                 .map(|(spike, &t)| {
                     check_time(t, "/units/spike_times value")?;
                     let s = exact_sample(t, t0, rate);
+                    let before_trace = series_clock.is_some() && t < t0;
+                    let past_trace = series_clock.is_some_and(|(n, _)| s >= n as f64);
+                    before_start += usize::from(before_trace);
+                    at_or_after_end += usize::from(past_trace);
                     ensure!(s.is_finite() && (0.0..u64::MAX as f64).contains(&s)
                         && timestamps.is_none_or(|(_, n_samples)| (s as u64) < n_samples as u64),
                         "unit {id}: spike at {t} s is outside the sample index range or cannot be placed on a sample exactly (starting time {t0} s, {rate} Hz){}",
-                        if series_clock.is_none() && t < 0.0 {
+                        if before_trace {
+                            "; spike is before ElectricalSeries starting_time"
+                        } else if past_trace {
+                            "; spike is at or past ElectricalSeries EOF"
+                        } else if series_clock.is_none() && t < 0.0 {
                             "; pair the raw NWB file with --dat to restore its time base"
                         } else {
                             ""
@@ -2008,6 +2026,14 @@ mod imp {
         }
         if let Some((ds, n_samples)) = timestamps {
             check_timestamp_spikes(ds, n_samples, &all, &unit_ids, &out)?;
+        }
+        if before_start != 0 || at_or_after_end != 0 {
+            let diagnostic = json!({
+                "code": "spikes_outside_trace", "before_start": before_start,
+                "at_or_after_end": at_or_after_end,
+            });
+            log::warn!("NWB: {diagnostic}");
+            source_diagnostics.push(diagnostic);
         }
         if let Some((units_rate, id, spike, t, stored, precise)) = first_difference {
             let noun = if n_differing == 1 { "spike" } else { "spikes" };
@@ -2102,6 +2128,7 @@ mod imp {
     struct UnitMetadata {
         labels: Vec<PhyLabel>,
         label_provenance: serde_json::Map<String, Value>,
+        label_conflicts: serde_json::Map<String, Value>,
         tags: Vec<Vec<String>>,
         annotations: Vec<UnitAnnotation>,
         names: Option<Vec<String>>,
@@ -2167,16 +2194,33 @@ mod imp {
                     "maps_quality": maps_quality && values.is_some(), "unmapped": unmapped,
                 }),
             );
-            if maps_quality {
-                label_columns.extend(values);
+            if let (true, Some(values)) = (maps_quality, values) {
+                label_columns.push((name, values));
             }
         }
-        let labels = (0..n)
-            .map(|i| {
-                label_columns
-                    .iter()
-                    .find_map(|col| imported_label(&col[i]))
-                    .unwrap_or_default()
+        let mut label_conflicts = serde_json::Map::new();
+        let labels = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let mapped = label_columns.iter().filter_map(|(name, col)| {
+                    imported_label(&col[i]).map(|label| (*name, &col[i], label))
+                });
+                let mut rows = mapped.clone();
+                let Some((_, _, first)) = rows.next() else {
+                    return PhyLabel::default();
+                };
+                if rows.any(|(_, _, label)| label != first) {
+                    label_conflicts.insert(
+                        id.to_string(),
+                        Value::Object(
+                            mapped
+                                .map(|(name, raw, _)| (name.into(), json!(raw)))
+                                .collect(),
+                        ),
+                    );
+                }
+                first
             })
             .collect();
 
@@ -2270,6 +2314,7 @@ mod imp {
         Ok(UnitMetadata {
             labels,
             label_provenance,
+            label_conflicts,
             tags,
             annotations,
             names,
@@ -2605,6 +2650,43 @@ mod imp {
 
     #[cfg(test)]
     #[test]
+    fn ragged_spike_index_cannot_leave_source_spikes_unreferenced() {
+        for (ends, ids) in [(&[1_i64][..], &[10_u32][..]), (&[][..], &[][..])] {
+            let err = source_spike_diagnostics(&[0.1, 0.2], ends, ids).unwrap_err();
+            assert!(err.to_string().contains("unreferenced"));
+        }
+    }
+
+    #[cfg(all(test, feature = "hdf5"))]
+    #[test]
+    fn starting_time_rate_reports_spikes_outside_both_trace_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outside.nwb");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../release/fixtures/nwb/good.nwb");
+        std::fs::copy(fixture, &path).unwrap();
+        {
+            let file = hdf5_metno::File::open_rw(&path).unwrap();
+            let spikes = file.dataset("/units/spike_times").unwrap();
+            let mut seconds: Vec<f64> = spikes.read_raw().unwrap();
+            seconds[0] = 0.4999; // Before starting_time, but rounds to sample 0.
+            *seconds.last_mut().unwrap() = 1.0; // Past trace EOF.
+            spikes.write_raw(&seconds).unwrap();
+        }
+        let provider = NwbProvider::open(path).unwrap();
+        let provenance = provider.trace_provenance();
+        let issue = provenance["source_diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|issue| issue["code"] == "spikes_outside_trace")
+            .unwrap();
+        assert_eq!(issue["before_start"], 1);
+        assert_eq!(issue["at_or_after_end"], 1);
+    }
+
+    #[cfg(test)]
+    #[test]
     fn declared_span_warning_uses_strict_scale_threshold() {
         assert_eq!(span_ratio(1_000_000.0, 1_000.0), Some(1000.0));
         assert_eq!(span_ratio(100_000.0, 1_000.0), None);
@@ -2679,6 +2761,29 @@ mod imp {
         assert_eq!(
             metadata.label_provenance["cell_type"]["unmapped"]["good"],
             1
+        );
+    }
+
+    #[cfg(all(test, feature = "hdf5"))]
+    #[test]
+    fn author_label_provenance_records_conflicts_by_source_unit() {
+        use hdf5_metno::types::VarLenUnicode;
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5_metno::File::create(dir.path().join("labels.h5")).unwrap();
+        let units = file.create_group("units").unwrap();
+        for (name, values) in [("label", ["good", "good"]), ("quality", ["noise", "good"])] {
+            let values: Vec<VarLenUnicode> = values.iter().map(|v| v.parse().unwrap()).collect();
+            units
+                .new_dataset_builder()
+                .with_data(&values)
+                .create(name)
+                .unwrap();
+        }
+        let metadata = read_unit_metadata(&Group::Hdf5(units), &[42, 43]).unwrap();
+        assert_eq!(metadata.labels, [PhyLabel::Good, PhyLabel::Good]);
+        assert_eq!(
+            Value::Object(metadata.label_conflicts),
+            json!({"42": {"label": "good", "quality": "noise"}})
         );
     }
 
