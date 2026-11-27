@@ -5,6 +5,9 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "../../sorrel-data/tests/support/mclust_phy.rs"]
+mod mclust_phy;
+
 fn sorrel(user_dir: &Path, args: &[&Path]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_sorrel"))
         .args(args)
@@ -204,6 +207,129 @@ fn offline_commands_work() {
     let none = run(tmp.path(), &["mcp"]);
     assert!(!none.status.success());
     assert!(String::from_utf8_lossy(&none.stderr).contains("no running sorrel host"));
+}
+
+#[test]
+fn mclust_qc_eval_dedup_undo_and_report_on_the_real_binary() {
+    use mclust_phy::{DUPLICATE_TIMES, SPIKES_PER_UNIT};
+    use serde_json::Value;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("phy");
+    mclust_phy::write_phy(&ds, 20.0);
+    let ds = ds.to_str().unwrap();
+    let run_ok = |args: &[&str]| {
+        let result = run(tmp.path(), args);
+        assert!(
+            result.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout).unwrap()
+    };
+    let check_qc = |name: &str, spikes: usize, duplicates: usize| {
+        let out = tmp.path().join(name);
+        run_ok(&["qc", ds, "--out", out.to_str().unwrap()]);
+        let json: Value =
+            serde_json::from_slice(&std::fs::read(out.join("cluster_qc.json")).unwrap()).unwrap();
+        let tsv = std::fs::read_to_string(out.join("cluster_qc.tsv")).unwrap();
+        let header: Vec<_> = tsv.lines().next().unwrap().split('\t').collect();
+        let col = |name| header.iter().position(|&field| field == name).unwrap();
+        for (id, n, dups) in [(0, spikes, duplicates), (1, SPIKES_PER_UNIT, 0)] {
+            let row = json
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["cluster_id"] == id)
+                .unwrap();
+            assert_eq!(row["n_spikes"], n);
+            assert_eq!(row["duplicate_spikes"], dups);
+            let row = tsv
+                .lines()
+                .skip(1)
+                .map(|line| line.split('\t').collect::<Vec<_>>())
+                .find(|row| row[col("cluster_id")] == id.to_string())
+                .unwrap();
+            assert_eq!(row[col("n_spikes")], n.to_string());
+            assert_eq!(row[col("duplicate_spikes")], dups.to_string());
+        }
+        json
+    };
+    let n_dups = DUPLICATE_TIMES.len();
+    check_qc("before", SPIKES_PER_UNIT + n_dups, n_dups);
+
+    // The MCP tool renders a text line, not the underlying MergeEval JSON.
+    let eval = run_ok(&["call", ds, "eval", r#"{"merge":[0,1]}"#]);
+    let metric = |prefix, suffix| {
+        eval.split_whitespace()
+            .find_map(|token| token.strip_prefix(prefix))
+            .and_then(|value| value.strip_suffix(suffix))
+            .unwrap_or_else(|| panic!("missing {prefix} in {eval}"))
+            .parse::<f64>()
+            .unwrap()
+    };
+    let d_prime = metric("feat_d'=", "");
+    assert!(d_prime.is_finite() && d_prime > 5.0, "{eval}");
+    assert!((0.0..1.0).contains(&metric("overlap=", "%")), "{eval}");
+
+    let split: Value = serde_json::from_str(&run_ok(&[
+        "call",
+        ds,
+        "remove_duplicates",
+        r#"{"cluster":0,"tol_ms":0.2}"#,
+    ]))
+    .unwrap();
+    assert_eq!(split["ok"], true);
+    assert_eq!(split["duplicates"], n_dups);
+    assert_eq!(split["new_cluster"], 2);
+    let units = run_ok(&["call", ds, "list_clusters"]);
+    let child: Vec<_> = units
+        .lines()
+        .find(|line| line.starts_with("2\t"))
+        .unwrap()
+        .split('\t')
+        .collect();
+    assert_eq!(&child[..3], &["2", "2", "noise"]);
+    let tags: Vec<_> = child[3].split(',').collect();
+    assert!(
+        tags.contains(&"src:agent") && tags.contains(&"duplicate"),
+        "{units}"
+    );
+    let qc = check_qc("deduped", SPIKES_PER_UNIT, 0);
+    let child_qc = qc
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["cluster_id"] == 2)
+        .unwrap();
+    assert_eq!(child_qc["mean_amplitude"].as_f64(), Some(0.375));
+
+    run_ok(&["call", ds, "undo"]);
+    assert!(run_ok(&["call", ds, "list_clusters"])
+        .lines()
+        .all(|line| !line.starts_with("2\t")));
+    check_qc("undone", SPIKES_PER_UNIT + n_dups, n_dups);
+
+    let html = tmp.path().join("report.html");
+    run_ok(&["report", ds, "--out", html.to_str().unwrap()]);
+    let html = std::fs::read_to_string(html).unwrap();
+    let wave = html.split_once(r#"<figure class="wave">"#).unwrap().1;
+    let wave = wave.split_once("</figure>").unwrap().0;
+    assert_eq!(wave.matches("<polyline").count(), 2, "{wave}");
+    assert!(
+        wave.contains(">ch 0</text>") && wave.contains(">ch 1</text>"),
+        "{wave}"
+    );
+    let log_isi = html.split_once("<b>Log-ISI</b>").unwrap().0;
+    let log_isi = log_isi.rsplit_once("<figure>").unwrap().1;
+    assert!(log_isi.contains("Fixed refractory window:"));
+    let amplitude = html
+        .split_once("<b>amplitude over time (median + IQR)</b>")
+        .unwrap()
+        .0;
+    let amplitude = amplitude.rsplit_once(r#"<figure class="amp">"#).unwrap().1;
+    assert!(amplitude.contains(r#"<polygon class="iqr" points=""#));
+    assert!(amplitude.contains(r#"<polyline class="median" points=""#));
 }
 
 #[test]

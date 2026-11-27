@@ -8171,6 +8171,32 @@ mod tests {
         }
     }
 
+    // Stored PCs for the two-spike fixture below, deliberately in a
+    // different order from the view. PC1 must not leak into the PC0 grid.
+    impl sorrel_io::HasPcFeatures for CountingTraceProvider {
+        fn pc_features(&self) -> &[f32] {
+            &[
+                30., 10., 40., 20., 300., 100., 400., 200., 31., 11., 41., 21., 301., 101., 401.,
+                201.,
+            ]
+        }
+        fn pc_shape(&self) -> (usize, usize) {
+            (2, 4)
+        }
+        fn pc_feature_ind(&self) -> &[u32] {
+            &[2, 0, 3, 1]
+        }
+        fn spike_pc_indices(&self, _cluster: ClusterId) -> &[u32] {
+            &[0, 1]
+        }
+    }
+
+    impl sorrel_io::HasSpikeTemplates for CountingTraceProvider {
+        fn spike_templates(&self, _cluster: ClusterId) -> &[u32] {
+            &[0, 0]
+        }
+    }
+
     #[test]
     fn single_pass_scalar_extraction_computes_exact_values_and_reuses_cache_across_scalar_bases() {
         use std::sync::atomic::AtomicUsize;
@@ -8186,8 +8212,8 @@ mod tests {
         let spike_centers = [500usize, 1500usize];
         let patterns: [[(i16, i16, i16); 4]; 2] = [
             // (base, peak_override, valley_override) per channel
-            [(10, 100, -40), (20, 200, -80), (5, 50, -30), (0, 150, -120)],
-            [(15, 120, -60), (0, 300, -20), (30, 90, -90), (10, 60, -10)],
+            [(10, 100, -40), (20, 80, -200), (5, 50, -30), (0, 120, -150)],
+            [(15, 60, -120), (0, 300, -20), (30, 90, -40), (10, 10, -60)],
         ];
         for (si, &center) in spike_centers.iter().enumerate() {
             let start = center - half as usize;
@@ -8221,7 +8247,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal =
             sorrel_data::Journal::open_or_create(&dir.path().join("journal"), 0, 1).unwrap();
-        let session = Session::new(provider, journal);
+        let mut session = Session::new(provider, journal);
+        session.seed_templates();
+        session.seed_pc_features();
 
         let basis_cache = Basis::default();
         let scalar_cache = ScalarCache::default();
@@ -8296,6 +8324,33 @@ mod tests {
                 );
                 assert_eq!(got_pk, max_v, "spike {si} ch {ch} peak");
                 assert_eq!(got_vl, min_v, "spike {si} ch {ch} valley");
+            }
+        }
+
+        let pc_set = compute(
+            &session,
+            &make_key(FeatureBasis::Pc0_4Ch),
+            &basis_cache,
+            &scalar_cache,
+            &cancel,
+        );
+        assert_eq!(pc_set.points.len(), 2);
+        assert_eq!(pc_set.channels, [0, 1, 2, 3]);
+        assert_eq!(trace_calls.load(Ordering::SeqCst), calls_after_energy);
+        for (spike, expected) in [[10., 20., 30., 40.], [11., 21., 31., 41.]]
+            .into_iter()
+            .enumerate()
+        {
+            for (row, &expected_y) in expected.iter().enumerate() {
+                for (col, &expected_x) in expected.iter().enumerate() {
+                    let (x, y) = pc_set.cell_dims(row * 4 + col);
+                    assert_eq!(pc_set.value(spike, y), expected_y);
+                    if col == row {
+                        assert_eq!(x, Dim::Time);
+                    } else {
+                        assert_eq!(pc_set.value(spike, x), expected_x);
+                    }
+                }
             }
         }
     }

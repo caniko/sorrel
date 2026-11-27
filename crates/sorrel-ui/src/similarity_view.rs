@@ -324,5 +324,11 @@ mod tests {
             partial.text(),
             "composite -0.05\ncontamination +1.2 % · feature d' 3.10"
         );
+        let unavailable = MergeTip {
+            feature_d_prime: Some(f32::NAN),
+            feature_overlap_est: Some(f32::NAN),
+            ..t
+        };
+        assert_eq!(unavailable.text(), "composite -0.05\ncontamination +1.2 %");
     }
 }

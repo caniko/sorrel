@@ -1508,12 +1508,13 @@ mod tests {
     }
 
     #[test]
-    fn optimized_extraction_reproduces_the_reference_mean_and_extrema_exactly() {
+    fn parallel_extraction_matches_single_pass_sample_statistics() {
         // Above EXTRACT_CHUNK, so this exercises the parallel merge too.
-        let n = 5_000;
+        let n = PARALLEL_EXTRACT_MIN.max(EXTRACT_CHUNK) + 904;
         let provider = provider_with_spikes(n);
-        let expected_mean = {
+        let (mean, min, max, std) = {
             let mut sum = vec![vec![0.0f64; 61]; NC];
+            let mut sum_sq = sum.clone();
             let mut min = vec![f32::INFINITY; NC];
             let mut max = vec![f32::NEG_INFINITY; NC];
             let nc = NC;
@@ -1526,18 +1527,30 @@ mod tests {
                 for (ch, ((row, low), high)) in channels.enumerate() {
                     for (s, &v) in snip[ch..].iter().step_by(nc).take(61).enumerate() {
                         row[s] += v as f64;
+                        sum_sq[ch][s] += f64::from(v).powi(2);
                         *low = low.min(v);
                         *high = high.max(v);
                     }
                 }
             }
             let n = provider.spikes[0].len() as f64;
+            let std = sum
+                .iter()
+                .zip(sum_sq)
+                .map(|(sum, sum_sq)| {
+                    sum.iter()
+                        .zip(sum_sq)
+                        .map(|(s, ss)| ((ss - s * s / n) / (n - 1.0)).sqrt() as f32)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
             (
                 sum.into_iter()
                     .map(|row| row.into_iter().map(|v| (v / n) as f32).collect::<Vec<_>>())
                     .collect::<Vec<_>>(),
                 min,
                 max,
+                std,
             )
         };
         let (session, _dir) = session(provider);
@@ -1549,12 +1562,21 @@ mod tests {
             &AtomicBool::new(false),
             None,
         );
-        assert_eq!(
-            result.clusters[0].mean, expected_mean.0,
-            "bit-identical mean"
-        );
-        assert_eq!(result.clusters[0].min, expected_mean.1, "exact extrema");
-        assert_eq!(result.clusters[0].max, expected_mean.2);
+        let cluster = &result.clusters[0];
+        assert_eq!(cluster.valid, n);
+        assert_eq!(cluster.mean, mean, "bit-identical mean");
+        assert_eq!(cluster.min, min, "exact extrema");
+        assert_eq!(cluster.max, max);
+        assert_eq!(cluster.std.len(), std.len());
+        for (ch, (actual, expected)) in cluster.std.iter().zip(std).enumerate() {
+            assert_eq!(actual.len(), expected.len());
+            for (t, (&actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() < 1e-4,
+                    "ch {ch}, sample {t}: sample SD {actual} vs {expected}"
+                );
+            }
+        }
     }
 
     #[test]

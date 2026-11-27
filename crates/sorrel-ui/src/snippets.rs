@@ -200,7 +200,7 @@ mod tests {
         assert_eq!(parse(":max"), Ok(Snippet::Maximize));
         assert_eq!(parse(":pop"), Ok(Snippet::PopOut));
         assert_eq!(parse(":dedup"), Ok(Snippet::Dedup(None)));
-        assert_eq!(parse(":dedup 0.3"), Ok(Snippet::Dedup(Some(0.3))));
+        assert_eq!(parse(":dedup 0.5"), Ok(Snippet::Dedup(Some(0.5))));
         assert_eq!(parse(":dedup 0"), Ok(Snippet::Dedup(Some(0.0))));
         assert!(parse(":dedup -0.1").is_err());
         assert!(parse(":dedup NaN").is_err());

@@ -1324,6 +1324,9 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     next_id += 1;
                     children.extend(s.dedup_split_commands(c, dup_idx, new_cluster, &Actor::Human));
                 }
+                if children.is_empty() {
+                    return Ok(None);
+                }
                 Ok(CurationCommand::batch(children))
             },
             Box::new(|_| Vec::new()),
@@ -3732,6 +3735,29 @@ mod tests {
         app.brushes.spikes = brush(BrushSource::IsiViolators);
         app.dispatch_intent(Intent::Cancel);
         assert!(!app.feature_state.lasso_active() && app.brushes.spikes.is_some());
+    }
+
+    #[test]
+    fn dedup_snippet_on_a_clean_selection_does_not_create_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = SorrelApp::new(stub_session(dir.path()), label_str);
+        app.selection.replace(ClusterId(0));
+        let before = read(&app.session).spike_clusters_global().to_vec();
+        let version = read(&app.session).version();
+
+        for (snippet, message) in [
+            (":dedup", "no duplicate spikes (≤0.20 ms) in selection"),
+            (":dedup 0.5", "no duplicate spikes (≤0.50 ms) in selection"),
+        ] {
+            app.run_snippet(crate::snippets::parse(snippet).unwrap());
+            assert_eq!(app.status.as_ref().unwrap().0, message);
+            assert_eq!(history_len(&app), 0);
+            assert_eq!(app.selection.as_slice(), &[ClusterId(0)]);
+            let session = read(&app.session);
+            assert_eq!(session.version(), version);
+            assert_eq!(session.spike_clusters_global(), before);
+            assert_eq!(session.n_clusters(), 3);
+        }
     }
 
     #[test]
