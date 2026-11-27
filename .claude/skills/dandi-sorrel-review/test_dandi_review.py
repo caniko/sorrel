@@ -207,6 +207,15 @@ class ReviewKitTest(unittest.TestCase):
         self.assertEqual(finding["verdict"], "blocked")
         self.assertIn("METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM", finding["blockers"])
 
+    def test_audit_blocks_dataset_wide_claim_on_bad_selection_denominator(self):
+        doc = self.audit_fixture(scope="dandiset")
+        del doc["findings"][0]["asset_id"]
+        doc["asset_selection"] = {"policy": "sample", "n_assets_total": 3, "rationale": "Example sample."}
+        result = json.loads(self.cli("audit-review", self.pack(doc)))
+        review = result["dandisets"][0]["reviews"][0]
+        self.assertIn("SELECTION_DENOMINATOR_MISMATCH", review["blockers"])
+        self.assertEqual(review["findings"][0]["verdict"], "blocked")
+
     def test_audit_cross_archive_same_path_is_not_an_asset_identity(self):
         self.pack(self.audit_fixture())
         doc = self.audit_fixture()

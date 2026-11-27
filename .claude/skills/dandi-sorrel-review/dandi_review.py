@@ -2045,7 +2045,7 @@ def audit_bundle(bundle: Path, doc: Doc, snapshot: Doc,
         claim = f["statement_md"]
         code = f["code"]
         risks = audit_text(claim)
-        b = set()
+        b = set(blockers)  # A finding cannot clear a broken review-wide pin or denominator.
         if f.get("human_verified") is not True:
             b.add("HUMAN_VERIFICATION_REQUIRED")
             if re.search(r"(?<!not )\b(?:rp confirmed|confirmed refractory|confirmed contamination)\b", claim, re.I):
@@ -2068,6 +2068,8 @@ def audit_bundle(bundle: Path, doc: Doc, snapshot: Doc,
             if (code.startswith("nwb.") and asset["inspector_external_file_false_criticals"]
                     and re.search(r"external|avi|critical", claim, re.I)):
                 b.add("INSPECTOR_STREAMING_ARTIFACT_CLAIM")
+        elif f["scope"] == "dandiset":
+            b.update(code for row in assets for code in row["blockers"])
         if re.search(r"\b(?:merge|waveforms? verified)\b", claim, re.I) and not any(
                 "waveform" in (by_digest[e["artifact_sha256"]] + e.get("pointer", "")).lower()
                 for e in evidence):
