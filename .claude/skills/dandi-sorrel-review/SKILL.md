@@ -113,6 +113,7 @@ journal="$workdir/sorrel.journal"
   sorrel call --sample-rate 1000 --journal "$journal" "$input" list_clusters > "$art/clusters.before.tsv"
   sorrel qc --sample-rate 1000 --journal "$journal" "$input" --out "$workdir/qc-before"
   cp "$workdir/qc-before/cluster_qc.json" "$art/cluster_qc.before.json"
+  cp "$workdir/qc-before/cluster_qc.provenance.json" "$art/cluster_qc.before.provenance.json"
   sorrel report --sample-rate 1000 --journal "$journal" "$input" --out "$art/sorrel_report.html"
 )
 ```
@@ -128,8 +129,9 @@ agent review start with `sorrel agent-guide --prompt review`; use `sorrel mcp`
 with the same input/options, or `sorrel call … brief '{"level":2}'`. Record
 whether a human, agent, or both did the work. Capture the baseline before
 edits. To capture a curated state, repeat `list_clusters`, `qc` and optionally
-`report` with the same journal after edits; write `clusters.after.tsv` and
-`cluster_qc.after.json`. `sorrel call --sample-rate 1000 --journal "$journal"
+`report` with the same journal after edits; write `clusters.after.tsv`,
+`cluster_qc.after.json` and `cluster_qc.after.provenance.json`.
+`sorrel call --sample-rate 1000 --journal "$journal"
 "$input" save` (on one shell line) reports `save_dir`, where Sorrel writes
 `curation.json` and Phy sidecars. For streaming, those files are local; for a
 local NWB they are written beside the input. Copy only `curation.json` into
@@ -211,6 +213,41 @@ can make the measured share a floor; check `n_assets_with_good_rp_*` and
 sums are `null` (`N/A` in text or Markdown), not zero. An unlabeled asset has
 no good/mua/noise labels on any live unit. Independent latest reviews of the
 same asset remain separate observations.
+
+### Screen findings before outreach
+
+```sh
+python3 "$kit" audit-review "$STORE" --json-out "$OUT/audit.json" --md-out "$OUT/audit.md"
+```
+
+Pass a packed review directory to check just that bundle, or the whole store
+to check cross-archive overlaps and supersession. Outputs must be outside the
+input tree. With no output options, the command prints JSON. When comparing
+against collection notes, repeat `--batch-summary FILE` to reconcile the
+active review IDs against the IDs cited in each summary.
+
+`blocked` means the audit found a reason not to use the claim as written.
+`needs_human_review` means it lacks human verification or has an unresolved
+caveat. A successful command does not mean a review is ready. Even
+`outreach_ready` only means the checked bundle passed this offline gate; it
+does not authorize sending or publishing. Inspect original ACGs, waveforms,
+timing, and privacy-sensitive material when needed. A trace-backed open is
+not waveform verification, and a mapped `good` count does not include
+unmapped quality labels or cell classes.
+
+The audit requires a version-matched inventory snapshot with `embargo_status:
+"OPEN"`. Keep each asset's artifacts under `artifacts/<archive-relative
+asset path>/`, and keep the NWB provenance from `describe --json` and the QC
+sidecar. A verified finding on a human Dandiset still needs a separate privacy
+review. For threshold findings, cite the baseline QC field for every claimed
+Sorrel cluster and record the metric, configured threshold, cluster IDs, and
+count. For merge or split findings, run `sorrel call --raw … probe
+'{"q":["waveform 1","waveform 2"]}'` with the same open options and the
+claimed Sorrel cluster IDs. Save the raw reply under `probe_reply` in a JSON
+receipt with `kind: "waveform"`, the pinned `asset_id`, and the command's
+`exit_code`. Place the receipt under a named key (e.g. `receipt`) in the
+asset's artifact directory and cite `/receipt`. The audit checks that the
+probe read complete windows for every claimed cluster.
 
 ### Offline or older Sorrel
 

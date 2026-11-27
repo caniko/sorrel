@@ -1635,9 +1635,7 @@ impl SessionVisitor for Describe {
                 .map(|(k, v)| (k.to_owned(), v.into()))
                 .collect();
             obj.insert("session_span".into(), span.to_json(rate));
-            if skipped.is_some() {
-                obj.insert("provenance".into(), provenance);
-            }
+            obj.insert("provenance".into(), provenance);
             println!("{}", serde_json::to_string_pretty(&obj)?);
         } else {
             print!(

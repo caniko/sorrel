@@ -30,6 +30,10 @@ label = "Documentation"
 href = "/docs/"
 
 [[nav]]
+label = "DANDI Review Ledger"
+href = "https://nexus.beloda.co/sorrel"
+
+[[nav]]
 label = "Source"
 href = "https://github.com/caniko/sorrel"
 
@@ -124,7 +128,7 @@ target = "showcase/gallery-history.webp"
 
 [[pages]]
 slug = "index"
-title = "Sorrel"
+title = "Spike-sorting curation"
 description = "Native spike-sorting curation: a high-performance GUI for manual curation of spike-sorted electrophysiology data."
 
 [[pages.sections]]

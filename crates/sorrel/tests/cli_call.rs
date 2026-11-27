@@ -44,6 +44,27 @@ fn fixture(into: &Path) -> Option<PathBuf> {
 
 #[cfg(feature = "hdf5")]
 #[test]
+fn nwb_trace_describe_reports_provenance_without_a_skipped_series() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../release/fixtures/nwb/good.nwb");
+    if !src.is_file() {
+        return;
+    }
+    let ds = tmp.path().join("sorting.nwb");
+    std::fs::copy(src, &ds).unwrap();
+    let result = run(tmp.path(), &["describe", "--json", ds.to_str().unwrap()]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let description: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(description["provenance"]["mode"], "trace");
+    assert!(description["provenance"].get("skipped_series").is_none());
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
 fn nwb_units_only_describe_and_qc_report_the_same_probe() {
     let tmp = tempfile::tempdir().unwrap();
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))

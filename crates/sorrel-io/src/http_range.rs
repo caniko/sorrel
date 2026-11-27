@@ -28,23 +28,38 @@ pub(crate) fn request(
     headers: &[(&str, &str)],
 ) -> Result<Response<ureq::Body>> {
     for attempt in 0..3 {
-        let mut req = agent
-            .get(url.as_str())
-            .header("Accept-Encoding", "identity");
-        for &(key, value) in headers {
-            req = req.header(key, value);
-        }
-        match req.call() {
-            Ok(res)
-                if attempt < 2 && matches!(res.status().as_u16(), 429 | 500 | 502 | 503 | 504) => {}
+        match request_once(agent, url, headers) {
+            Ok(res) if attempt < 2 && transient_status(res.status()) => {}
             Ok(res) => return Ok(res),
             Err(ureq::Error::Timeout(_) | ureq::Error::Io(_)) if attempt < 2 => {}
             Err(ureq::Error::Timeout(_)) => bail!("HTTP GET timed out"),
             Err(_) => bail!("HTTP GET failed"),
         }
-        std::thread::sleep(Duration::from_millis(50 << attempt));
+        backoff(attempt);
     }
     unreachable!()
+}
+
+fn request_once(
+    agent: &ureq::Agent,
+    url: &Url,
+    headers: &[(&str, &str)],
+) -> std::result::Result<Response<ureq::Body>, ureq::Error> {
+    let mut req = agent
+        .get(url.as_str())
+        .header("Accept-Encoding", "identity");
+    for &(key, value) in headers {
+        req = req.header(key, value);
+    }
+    req.call()
+}
+
+fn transient_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn backoff(attempt: u32) {
+    std::thread::sleep(Duration::from_millis(50 << attempt));
 }
 
 pub(crate) fn validate_url(url: &Url) -> Result<()> {
@@ -162,13 +177,12 @@ impl Source {
         etag: Option<&str>,
     ) -> Result<(Vec<u8>, u64, String)> {
         let range = format!("bytes={first}-{last}");
-        let mut headers = vec![("Range", range.as_str())];
-        if let Some(tag) = etag {
-            headers.push(("If-Match", tag));
-        }
         let mut refreshed = false;
         let mut candidate = self.url.clone();
-        for _ in 0..=6 {
+        let mut transitions = 0;
+        let mut retries = 0;
+        let mut partial_pin: Option<(String, u64, String)> = None;
+        while transitions <= 6 {
             let (url, from_dandi_api) = match candidate.take() {
                 Some(candidate) => candidate,
                 None => (
@@ -176,13 +190,30 @@ impl Source {
                     true,
                 ),
             };
-            let mut res = request(&self.agent, &url, &headers)?;
+            let mut headers = vec![("Range", range.as_str())];
+            if let Some(tag) = etag.or_else(|| partial_pin.as_ref().map(|p| p.2.as_str())) {
+                headers.push(("If-Match", tag));
+            }
+            let mut res = match request_once(&self.agent, &url, &headers) {
+                Ok(res) if retries == 2 || !transient_status(res.status()) => res,
+                Ok(_) | Err(ureq::Error::Timeout(_) | ureq::Error::Io(_)) if retries < 2 => {
+                    candidate = Some((url, from_dandi_api));
+                    backoff(retries);
+                    retries += 1;
+                    continue;
+                }
+                Err(ureq::Error::Timeout(_)) => bail!("HTTP GET timed out"),
+                Err(_) => bail!("HTTP GET failed"),
+                Ok(res) => res,
+            };
             if res.status().is_redirection() {
                 candidate = Some((redirect(&url, &res)?, false));
+                transitions += 1;
                 continue;
             }
             if res.status() == StatusCode::FORBIDDEN && self.refresh.is_some() && !refreshed {
                 refreshed = true;
+                transitions += 1;
                 continue;
             }
             ensure!(
@@ -225,6 +256,12 @@ impl Source {
                 "Content-Range total changed"
             );
             ensure!(
+                partial_pin.as_ref().is_none_or(|(key, size, tag)| {
+                    key == &identity && *size == actual_total && tag == &actual_tag
+                }),
+                "range identity changed after an incomplete response"
+            );
+            ensure!(
                 last < actual_total
                     && content_range == format!("bytes {first}-{last}/{actual_total}"),
                 "unexpected Content-Range"
@@ -239,11 +276,24 @@ impl Source {
                 "wrong Content-Length"
             );
             let mut data = Vec::with_capacity(count as usize);
-            res.body_mut()
+            let read = res
+                .body_mut()
                 .as_reader()
                 .take(count + 1)
-                .read_to_end(&mut data)
-                .map_err(|_| anyhow!("could not read complete range body"))?;
+                .read_to_end(&mut data);
+            // Never append partial bytes. Retry the same range against the
+            // identity validated from this response, even on the initial probe.
+            if retries < 2
+                && (data.len() as u64) <= count
+                && (read.is_err() || (data.len() as u64) < count)
+            {
+                partial_pin = Some((identity, actual_total, actual_tag));
+                candidate = Some((url, from_dandi_api));
+                backoff(retries);
+                retries += 1;
+                continue;
+            }
+            read.map_err(|_| anyhow!("could not read complete range body"))?;
             ensure!(data.len() as u64 == count, "wrong range body length");
             self.url = Some((url, from_dandi_api));
             self.identity = Some(identity);
@@ -429,5 +479,81 @@ impl Object {
         {
             seq.working = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    fn serve(replies: &[&'static str]) -> (Source, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let replies = replies.to_vec();
+        let server = std::thread::spawn(move || {
+            replies
+                .into_iter()
+                .map(|reply| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut reader = BufReader::new(&stream);
+                    let mut request = String::new();
+                    loop {
+                        let offset = request.len();
+                        if reader.read_line(&mut request).unwrap() == 0
+                            || &request[offset..] == "\r\n"
+                        {
+                            break;
+                        }
+                    }
+                    stream.write_all(reply.as_bytes()).unwrap();
+                    request.to_ascii_lowercase()
+                })
+                .collect()
+        });
+        let source = Source {
+            label: "fixture".into(),
+            agent: agent(Duration::from_secs(2)),
+            url: Some((url, false)),
+            refresh: None,
+            identity: None,
+        };
+        (source, server)
+    }
+
+    const TRUNCATED: &str = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/8\r\nContent-Length: 4\r\nETag: \"v1\"\r\nConnection: close\r\n\r\nab";
+    const COMPLETE: &str = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/8\r\nContent-Length: 4\r\nETag: \"v1\"\r\nConnection: close\r\n\r\nabcd";
+
+    #[test]
+    fn range_retries_status_and_truncated_body_with_one_budget() {
+        let (mut source, server) = serve(&[
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            TRUNCATED,
+            COMPLETE,
+        ]);
+        assert_eq!(source.fetch(0, 3, None, None).unwrap().0, b"abcd");
+        let requests = server.join().unwrap();
+        assert!(requests.iter().all(|req| req.contains("range: bytes=0-3")));
+        assert!(requests[2].contains("if-match: \"v1\""));
+    }
+
+    #[test]
+    fn range_stops_after_three_truncations_without_committing_identity() {
+        let (mut source, server) = serve(&[TRUNCATED; 3]);
+        assert!(source.fetch(0, 3, None, None).is_err());
+        assert!(source.identity.is_none());
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn range_does_not_retry_pin_mismatch() {
+        let (mut source, server) = serve(&[COMPLETE]);
+        let error = source.fetch(0, 3, Some(8), Some("\"v2\"")).unwrap_err();
+        assert!(format!("{error:#}").contains("ETag changed"));
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 }
