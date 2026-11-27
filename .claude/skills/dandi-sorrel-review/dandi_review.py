@@ -2334,6 +2334,8 @@ def audit_bundle(bundle: Path, doc: Doc, snapshot: Any, inventory: dict[str, Doc
                         b.add("INSPECTOR_EVIDENCE_UNMATCHED")
                     else:
                         bound_rows.add(row[0])
+            if f.get("metric") is not None and f.get("metric") != summary_key:
+                b.add("METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM")
             if f.get("value") is not None:
                 stated = finite(f.get("value"))
                 if stated is None or not bound_rows or not math.isclose(stated, len(bound_rows), rel_tol=0, abs_tol=1e-9):
@@ -2341,11 +2343,14 @@ def audit_bundle(bundle: Path, doc: Doc, snapshot: Any, inventory: dict[str, Doc
             if summary_key and bound_rows and (
                     type(source.get(summary_key)) is int and source[summary_key] < len(bound_rows)):
                 b.add("METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM")
-        elif f.get("value") is not None and not any(f"qc.{rc}" == code for rc, *_ in QC_FINDING_RULES):
+        elif (f.get("value") is not None or f.get("metric") is not None) and not any(
+                f"qc.{rc}" == code for rc, *_ in QC_FINDING_RULES):
             stated = finite(f.get("value"))
             units = f.get("unit_ids") or []
             if code == "qc.noise_as_good":
-                if (stated is None or not units or not math.isclose(stated, len(units), rel_tol=0, abs_tol=1e-9)
+                if (f.get("metric") not in (None, "n_noise_as_good")
+                        or f.get("value") is not None and (
+                            stated is None or not units or not math.isclose(stated, len(units), rel_tol=0, abs_tol=1e-9))
                         or type(source.get("n_noise_as_good")) is not int or source["n_noise_as_good"] < len(units)):
                     b.add("METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM")
             else:

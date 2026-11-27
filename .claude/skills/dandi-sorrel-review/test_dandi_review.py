@@ -117,8 +117,11 @@ class ReviewKitTest(unittest.TestCase):
             "assets": [{k: asset[k] for k in ("asset_id", "path", "size_bytes", "encoding", "blob_id", "sha256")}],
         }))
         f = doc["findings"][0]
-        f.update({"metric": "rpv_post_lo95", "threshold": doc["thresholds"]["rp_contamination_lo95_max"],
-                  "unit_id_namespace": "sorrel_cluster_index", "unit_ids": [2], "n_units": 1, **finding})
+        if finding.get("code", f["code"]).startswith("qc.") and finding.get("code", f["code"]) != "qc.noise_as_good":
+            f.update({"metric": "rpv_post_lo95", "threshold": doc["thresholds"]["rp_contamination_lo95_max"],
+                      "unit_id_namespace": "sorrel_cluster_index", "unit_ids": [2], "n_units": 1, **finding})
+        else:
+            f.update({"unit_id_namespace": "sorrel_cluster_index", "unit_ids": [2], "n_units": 1, **finding})
         self.cite(f, asset_dir / "cluster_qc.before.json",
                   [{"cluster_id": 2, "n_spikes": 100, "rpv_post_lo95": 0.2}], "/0/rpv_post_lo95")
         (self.stage / "report.md").write_text(note)
@@ -139,7 +142,8 @@ class ReviewKitTest(unittest.TestCase):
                 doc = self.audit_fixture()
                 p = self.stage / "artifacts/dandiset.json"
                 p.write_text(json.dumps(dict(json.loads(p.read_text()), species=[species])))
-                doc["findings"].append(dict(doc["findings"][0], id="f02", code="meta.no_sorter_provenance",
+                f2 = {k: v for k, v in doc["findings"][0].items() if k not in ("metric", "threshold", "value")}
+                doc["findings"].append(dict(f2, id="f02", code="meta.no_sorter_provenance",
                                             scope="dandiset", asset_id=None))
                 for finding in self.audited(doc)["findings"]:
                     self.assertEqual(finding["verdict"], "needs_human_review")
@@ -192,8 +196,12 @@ class ReviewKitTest(unittest.TestCase):
         finding["value"] = 999999
         self.assertIn("METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM", self.audited(doc)["findings"][0]["blockers"])
         finding["value"] = 1
+        finding["metric"] = "nwbi_violation"
+        self.assertIn("METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM", self.audited(doc)["findings"][0]["blockers"])
+        finding["metric"] = "nwbi_critical"
         self.assertEqual(self.audited(doc)["findings"][0]["verdict"], "outreach_ready")
         finding.pop("value")
+        finding.pop("metric")
         first_refs = finding["evidence"]
         finding["asset_id"] = second["asset_id"]
         self.assertIn("INSPECTOR_EVIDENCE_UNMATCHED", self.audited(doc)["findings"][0]["blockers"])
