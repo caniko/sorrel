@@ -14,14 +14,14 @@ from html.parser import HTMLParser
 import io
 import json
 import math
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import sqlite3
 import statistics
 import sys
 import tempfile
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.error import HTTPError
 from urllib.parse import quote, unquote, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -1019,9 +1019,9 @@ def check_review(doc: Doc) -> None:
             require(finding_id in finding_ids, f"{improvement['id']}: unknown finding {finding_id}")
 
 
-def json_pointer_exists(value: Any, pointer: str) -> bool:
+def json_pointer(value: Any, pointer: str) -> tuple[bool, Any]:
     if not pointer.startswith("/") or re.search(r"~(?![01])", pointer):
-        return False
+        return False, None
     for token in pointer[1:].split("/"):
         key = token.replace("~1", "/").replace("~0", "~")
         if isinstance(value, dict) and key in value:
@@ -1030,8 +1030,12 @@ def json_pointer_exists(value: Any, pointer: str) -> bool:
               and len(key) <= len(str(len(value))) and int(key) < len(value)):
             value = value[int(key)]
         else:
-            return False
-    return True
+            return False, None
+    return True, value
+
+
+def json_pointer_exists(value: Any, pointer: str) -> bool:
+    return json_pointer(value, pointer)[0]
 
 
 class HTMLIds(HTMLParser):
@@ -1779,6 +1783,414 @@ def impact(args: argparse.Namespace) -> None:
            for bucket, entries in buckets.items()))
 
 
+AUDIT_TEXT_RISKS = {
+    "SUSPICIOUS_EPOCH_SPAN": r"1000(?:\.0+)?\s*[x×]|epochs?.{0,60}millisecond",
+    "TRACE_SPIKE_SPAN_MISMATCH": (
+        r"(?:trace|recording).{0,90}(?:span|duration).{0,55}(?:mismatch|shorter|longer|exceeds)"
+        r"|spikes?.{0,45}(?:beyond|outside).{0,55}(?:trace|recording)"
+        r"|(?:trace|duration).{0,100}vs\.?.{0,45}(?:sorted )?spike (?:extent|span)"
+        r"|mismatch.{0,100}trace span.{0,100}(?:spike|sorted)"
+    ),
+    "CCG_ONLY_MERGE_SCREENING": r"merge-screen|ccg[- ]only|ccgs? alone|merge\?.{0,100}(?:ccg|waveform)",
+    "RP_EPOCH_CONTEXT_CONFOUND": r"\bburst(?:s|ing|y)?\b|state transitions?|(?:cortical|opto\w*) stimulat|optogenetic_series",
+    "UNMAPPED_AUTHOR_LABELS": (
+        r"\bgood2\b|\bexcellent\b|numeric(?:al)? .{0,20}\bquality\b|\bquality\b.{0,30}numeric"
+        r"|\b(?:cell_type|cell_class|unit_type|ACGquality|UnitStability|unit_quality_post_sorting)\b"
+    ),
+    "NONSTANDARD_CLOCK": (
+        r"nominal.{0,45}(?:grid|clock)|(?:analysis|quantization)[- ]grid|"
+        r"timestamps_reference_time.{0,25}mismatch|non[- ]standard clock"
+    ),
+    "WAVEFORM_PROBE_TIMEOUT": (
+        r"waveform.{0,110}(?:timed? ?out|timeout|hit.{0,45}cap)|"
+        r"(?:timed? ?out|timeout).{0,45}waveform"
+    ),
+    "INSPECTOR_TIMEOUT": r"(?:nwb.?inspector|nwbi).{0,160}(?:timed? ?out|timeout)",
+}
+PRIVATE_TEXT = re.compile(
+    r"(?<!free of )\b(?:private|non[- ]public|unredacted|identifiable)\s+(?:human\s+)?"
+    r"(?:subject|patient|participant|identifier|id)\b"
+    r"|\b(?:mrn|medical record (?:number|id)|social security (?:number|id)|date of birth|patient name)\s*[:=#]"
+    r"|\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I
+)
+AUDIT_VERDICTS = ("outreach_ready", "needs_human_review", "blocked")
+
+
+def audit_text(text: str) -> set[str]:
+    return {code for code, pattern in AUDIT_TEXT_RISKS.items() if re.search(pattern, text, re.I)}
+
+
+def audit_result(blockers: set[str], warnings: set[str], hold: bool = False) -> Doc:
+    return {"verdict": "blocked" if blockers - {"HUMAN_VERIFICATION_REQUIRED"}
+            else "needs_human_review" if blockers or hold else "outreach_ready",
+            "blockers": sorted(blockers), "warnings": sorted(warnings)}
+
+
+def audit_notes(value: Any) -> str:
+    # Do not reproduce source prose, paths, subject IDs or raw values in the audit.
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def audit_timeout(value: Any) -> bool:
+    return bool(re.search(r'time[ -]?out|timed out|"(?:rc|exit_code)": 124\b', audit_notes(value), re.I))
+
+
+def audit_asset(bundle: Path, asset: Doc, inventory: dict[str, Doc], listed: set[str], human: bool) -> Doc:
+    blockers: set[str] = set()
+    notes = asset.get("unique_metadata", {})
+    text = audit_notes(notes)
+    warnings = audit_text(text)
+    path = PurePosixPath(asset["path"])
+    archived = inventory.get(asset["path"])
+    if archived is None:
+        blockers.add("PIN_ASSET_NOT_IN_INVENTORY")
+    elif any(asset.get(k) != archived.get(k)
+             for k in ("asset_id", "size_bytes", "encoding", "blob_id", "sha256", "zarr_id", "zarr_checksum")):
+        blockers.add("PIN_ASSET_MISMATCH")
+    required = ("zarr_id", "zarr_checksum") if asset["encoding"] == "zarr" else ("blob_id", "sha256")
+    if not all(asset.get(key) for key in required):
+        blockers.add("PIN_STORAGE_IDENTITY_INCOMPLETE")
+    if asset["open_status"] != "ok":
+        warnings.add("ASSET_REFUSED" if asset["open_status"] == "refused" else "ASSET_OPEN_FAILED")
+    if PRIVATE_TEXT.search(text) or PRIVATE_TEXT.search(asset.get("refusal_reason", "")):
+        blockers.add("POSSIBLE_PRIVATE_IDENTIFIER")
+
+    span = notes.get("session_span") or {}
+    raw = notes.get("raw_access") or notes.get("raw_access_79eeaad")
+    raw_note = audit_notes(raw)
+    trace = (asset.get("evidence_level") == "raw" or
+             isinstance(span, dict) and span.get("kind") == "measured" and span.get("source") == "trace")
+    waveform = bool(re.search(r"windows\s+[1-9]\d*/\d+", raw_note)
+                    or isinstance(raw, dict) and raw.get("verified") is True)
+    if audit_timeout(raw):
+        warnings.add("WAVEFORM_PROBE_TIMEOUT")
+        waveform = False
+    if (asset["open_status"] == "ok" and not asset.get("sample_rate_hz")
+            and not any(notes.get(k) for k in (
+                "selected_clock", "clock", "declared_units_resolution_s", "analysis_grid",
+                "units_spike_times_resolution_s", "series_clock_metadata",
+            ))):
+        warnings.add("CLOCK_PROVENANCE_MISSING")
+    if asset.get("analysis_sample_rate_hz"):
+        warnings.add("NONSTANDARD_CLOCK")
+    if any(audit_timeout(notes.get(k)) for k in ("nwbinspector", "nwb_inspector")):
+        warnings.add("INSPECTOR_TIMEOUT")
+
+    stem = path.name.removesuffix(".nwb.zarr").removesuffix(".nwb")
+    dirs = {PurePosixPath("artifacts") / path, PurePosixPath("artifacts") / stem,
+            PurePosixPath("artifacts") / path.parent / stem}
+    artifact_files = {p.name: bundle / p for name in sorted(listed) if (p := PurePosixPath(name)).parent in dirs}
+    if human and "nwb_meta.json" in artifact_files:
+        metadata = read_json(artifact_files["nwb_meta.json"])
+        subject = metadata.get("subject") or {}
+        subject_id = subject.get("subject_id") or metadata.get("/general/subject/subject_id") or notes.get("subject")
+        if isinstance(subject_id, dict):
+            subject_id = subject_id.get("value")
+        if isinstance(subject_id, (str, int)):
+            public_ids = {p.removeprefix("sub-") for p in path.parts[:-1] if p.startswith("sub-")}
+            if str(subject_id).removeprefix("sub-") not in public_ids:
+                blockers.add("SUBJECT_IDENTIFIER_NOT_IN_PUBLIC_ASSET_PATH")
+        elif asset["open_status"] == "ok":
+            warnings.add("PUBLIC_SUBJECT_ID_NOT_RECONCILED")
+    provenance = [notes.get("provenance") or {}]
+    for name in ("describe.json", "cluster_qc.provenance.json", "cluster_qc.before.provenance.json"):
+        if name in artifact_files:
+            evidence = read_json(artifact_files[name])
+            provenance.append(evidence.get("provenance") or {})
+            span = evidence.get("session_span") or {}
+            trace |= span.get("kind") == "measured" and span.get("source") == "trace"
+    for source in provenance:
+        if not isinstance(source, dict):
+            continue
+        trace |= source.get("mode") == "trace"
+        for item in source.get("source_diagnostics", []):
+            if item.get("code") == "non_increasing_source_spikes":
+                blockers.add("NON_INCREASING_SOURCE_SPIKES")
+                if item.get("equal_pairs", 0) > 0:
+                    blockers.add("EQUAL_CONSECUTIVE_SOURCE_SPIKES")
+            elif item.get("code") == "identical_cross_unit_spike_vectors":
+                blockers.add("IDENTICAL_CROSS_UNIT_SPIKE_VECTORS")
+            elif item.get("code") == "suspicious_declared_span":
+                warnings.add("TRACE_SPIKE_SPAN_MISMATCH" if item.get("source") == "trace" else "SUSPICIOUS_EPOCH_SPAN")
+        if any(v.get("unmapped") or not v.get("maps_quality")
+               for v in source.get("author_label_columns", {}).values()):
+            warnings.add("UNMAPPED_AUTHOR_LABELS")
+    spike_extent = finite(notes.get("spike_extent_s"))
+    epoch_span = finite(notes.get("epoch_span_s"))
+    trace_span = finite(notes.get("trace_span_s")) or finite(asset.get("duration_s"))
+    if spike_extent and spike_extent > 0:
+        if epoch_span and epoch_span > 100 * spike_extent:
+            warnings.add("SUSPICIOUS_EPOCH_SPAN")
+        if trace_span and (trace_span > 2 * spike_extent or spike_extent > 1.01 * trace_span):
+            warnings.add("TRACE_SPIKE_SPAN_MISMATCH")
+    elif trace:
+        warnings.add("TRACE_SPIKE_SPAN_NOT_RECONCILED")
+    if trace and not waveform:
+        warnings.add("TRACE_BACKED_NOT_WAVEFORM_VERIFIED")
+    mapped_good = asset.get("good_before")
+    if asset["open_status"] == "ok" and "clusters.before.tsv" in artifact_files:
+        mapped_good = sum(label == "good" for label, *_ in clusters(artifact_files["clusters.before.tsv"]).values())
+        if asset.get("good_before") != mapped_good:
+            blockers.add("MAPPED_GOOD_DENOMINATOR_MISMATCH")
+    elif mapped_good:
+        warnings.add("MAPPED_GOOD_DENOMINATOR_UNCHECKED")
+    false_critical = real_critical = 0
+    if "nwb_inspector.json" in artifact_files:
+        report = read_json(artifact_files["nwb_inspector.json"])
+        messages = report.get("messages", []) if isinstance(report, dict) else report
+        if isinstance(report, dict) and audit_timeout(report.get("status")):
+            warnings.add("INSPECTOR_TIMEOUT")
+        for row in messages:
+            check_name, msg = row.get("check_function_name"), row.get("message", "")
+            if check_name == "check_ascending_spike_times":
+                blockers.add("NON_INCREASING_SOURCE_SPIKES")
+                if re.search(r"equal|identical|duplicate", msg, re.I):
+                    blockers.add("EQUAL_CONSECUTIVE_SOURCE_SPIKES")
+            if check_name == "check_image_series_external_file_valid":
+                match = re.search(r"external file ['\"]([^'\"]+)['\"]", msg, re.I)
+                if match and (path.parent / match[1]).as_posix() in inventory:
+                    warnings.add("INSPECTOR_EXTERNAL_FILE_PRESENT")
+                    false_critical += row.get("importance") == "CRITICAL"
+                    continue
+            if check_name == "check_file_extension" and "remfile" in msg.lower():
+                warnings.add("INSPECTOR_STREAMING_FILENAME_ARTIFACT")
+            real_critical += row.get("importance") == "CRITICAL"
+    return {"asset_id": asset["asset_id"], "open_status": asset["open_status"],
+            "units": asset.get("units_before") or 0, "mapped_good": mapped_good,
+            "trace_backed": trace, "waveform_probe_succeeded": waveform,
+            "inspector_external_file_false_criticals": false_critical,
+            "inspector_other_criticals": real_critical,
+            **audit_result(blockers, warnings, bool(warnings))}
+
+
+def audit_metric_claim(finding: Doc, evidence: list[Doc], by_digest: dict[str, str],
+                       read_evidence: Callable[[str], Any]) -> str | None:
+    metric = finding.get("metric")
+    threshold = finite(finding.get("threshold"))
+    if threshold is None or not metric:
+        return None
+    values = []
+    for ref in evidence:
+        name = by_digest[ref["artifact_sha256"]]
+        pointer = ref.get("pointer", "")
+        if name.endswith(".json") and pointer.rsplit("/", 1)[-1] == metric:
+            _, value = json_pointer(read_evidence(name), pointer)
+            values.append(finite(value))
+    if not values:
+        return "METRIC_THRESHOLD_EVIDENCE_UNMATCHED"
+    below = finding["code"] in {"qc.low_presence", "qc.epoch_instability"}
+    if any(v is None or not (v < threshold if below else v > threshold) for v in values):
+        return "METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM"
+    return None
+
+
+def audit_bundle(bundle: Path, doc: Doc, snapshot: Doc,
+                 overlap: dict[str, dict[str, list[Doc]]], active: bool) -> Doc:
+    ident, version = doc["dandiset"]["id"], doc["dandiset"]["version"]
+    inventory = {a["path"]: a for a in snapshot.get("assets", [])}
+    selection = doc["asset_selection"]
+    nwb_total = sum(is_nwb_asset(a) for a in inventory.values())
+    listed = {f["path"] for f in doc["files"]}
+    report = (bundle / "report.md").read_text(encoding="utf-8")
+    text = "\n".join((report, selection.get("rationale", ""), audit_notes(doc.get("unique_metadata", {}))))
+    warnings = audit_text(text)
+    blockers: set[str] = set()
+    if not snapshot:
+        blockers.add("PIN_INVENTORY_MISSING")
+    elif (snapshot.get("pinned_version"), snapshot.get("dandiset_id")) != (version, ident):
+        blockers.add("PIN_VERSION_OR_DANDISET_MISMATCH")
+        inventory = {}  # Never use a different version to exonerate an Inspector error.
+    if (len(inventory) != len(snapshot.get("assets", [])) or len(inventory) != selection["n_assets_total"]
+            or selection.get("n_nwb_assets", nwb_total) != nwb_total):
+        blockers.add("SELECTION_DENOMINATOR_MISMATCH")
+    excluded = (nwb_total if selection.get("scope") == "nwb" else len(inventory)) - len(doc["assets"])
+    if excluded > 0:
+        warnings.add("ASSETS_EXCLUDED")
+        if not selection.get("rationale", "").strip():
+            blockers.add("EXCLUSION_RATIONALE_MISSING")
+    if PRIVATE_TEXT.search(text):
+        blockers.add("POSSIBLE_PRIVATE_IDENTIFIER")
+    if version == "draft":
+        warnings.add("DRAFT_PIN_RECHECK_BEFORE_OUTREACH")
+    shared = {path for path in inventory if overlap.get(path, {}).keys() - {ident}}
+    selected_shared = sum(a["path"] in shared for a in doc["assets"])
+    if shared:
+        warnings.add("CROSS_ARCHIVE_SAME_PATH")
+    same_content = 0
+    for path in shared:
+        asset = inventory[path]
+        key = "zarr_checksum" if asset["encoding"] == "zarr" else "sha256"
+        if asset.get(key) and any(asset[key] == other.get(key)
+                                  for ds, peers in overlap[path].items() if ds != ident
+                                  for other in peers):
+            same_content += 1
+    if same_content:
+        warnings.add("CROSS_ARCHIVE_SAME_PATH_AND_DIGEST")
+    if selected_shared:
+        warnings.add("CROSS_ARCHIVE_SELECTED_PATH_REVIEW")
+
+    human = any("homo sapiens" in s.lower() for s in snapshot.get("species", []))
+    if human:
+        warnings.add("HUMAN_DATA_PRIVACY_REVIEW")
+    assets = [audit_asset(bundle, a, inventory, listed, human) for a in doc["assets"]]
+    by_id = {a["asset_id"]: a for a in assets}
+    by_digest = {f["sha256"]: f["path"] for f in doc["files"]}
+
+    @lru_cache(maxsize=8)
+    def read_evidence(name: str) -> Any:
+        return read_json(bundle / name, qc=True)
+
+    findings = []
+    for f in sorted(doc["findings"], key=lambda f: f["id"]):
+        claim = f["statement_md"]
+        code = f["code"]
+        risks = audit_text(claim)
+        b = set()
+        if f.get("human_verified") is not True:
+            b.add("HUMAN_VERIFICATION_REQUIRED")
+            if re.search(r"(?<!not )\b(?:rp confirmed|confirmed refractory|confirmed contamination)\b", claim, re.I):
+                risks.add("UNVERIFIED_CONFIRMATION_WORDING")
+        if PRIVATE_TEXT.search(claim):
+            b.add("POSSIBLE_PRIVATE_IDENTIFIER")
+        if code == "curation.duplicate_unit":
+            b.add("IDENTICAL_CROSS_UNIT_SPIKE_VECTORS")
+        evidence = f.get("evidence") or []
+        if not evidence:
+            risks.add("FINDING_EVIDENCE_MISSING")
+        elif claim_issue := audit_metric_claim(f, evidence, by_digest, read_evidence):
+            if claim_issue == "METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM":
+                b.add(claim_issue)
+            else:
+                risks.add(claim_issue)
+        asset = by_id.get(f.get("asset_id"))
+        if asset:
+            b.update(asset["blockers"])
+            if (code.startswith("nwb.") and asset["inspector_external_file_false_criticals"]
+                    and re.search(r"external|avi|critical", claim, re.I)):
+                b.add("INSPECTOR_STREAMING_ARTIFACT_CLAIM")
+        if re.search(r"\b(?:merge|waveforms? verified)\b", claim, re.I) and not any(
+                "waveform" in (by_digest[e["artifact_sha256"]] + e.get("pointer", "")).lower()
+                for e in evidence):
+            risks.add("WAVEFORM_SUPPORT_MISSING")
+        if code.startswith(("qc.refractory", "qc.epoch")):
+            risks.update((warnings | set(asset["warnings"] if asset else ())) & {
+                "SUSPICIOUS_EPOCH_SPAN", "TRACE_SPIKE_SPAN_MISMATCH",
+                "TRACE_SPIKE_SPAN_NOT_RECONCILED", "CLOCK_PROVENANCE_MISSING",
+                "NONSTANDARD_CLOCK", "RP_EPOCH_CONTEXT_CONFOUND",
+            })
+        findings.append({"finding_id": f["id"], "code": code, **audit_result(b, risks, bool(risks))})
+    if any(f.get("human_verified") is not True for f in doc["findings"]) and re.search(
+            r"\b(?:rp confirmed|confirmed refractory|confirmed rp)\b", text, re.I):
+        warnings.add("UNVERIFIED_CONFIRMATION_WORDING")
+    if not findings:
+        warnings.add("NO_FINDINGS_TO_SEND")
+    for row in [*assets, *findings]:
+        warnings.update(row["warnings"])
+        blockers.update(row["blockers"])
+    hold = bool(warnings - {"ASSETS_EXCLUDED", "CROSS_ARCHIVE_SAME_PATH",
+                            "TRACE_BACKED_NOT_WAVEFORM_VERIFIED", "TRACE_SPIKE_SPAN_NOT_RECONCILED",
+                            "INSPECTOR_STREAMING_FILENAME_ARTIFACT"})
+    hold |= any(f["verdict"] == "needs_human_review" for f in findings)
+    return {"version": version, "active": active,
+            "archive_assets": len(inventory), "archive_nwb_assets": nwb_total,
+            "excluded_in_scope": max(excluded, 0), "shared_archive_paths": len(shared),
+            "shared_archive_paths_with_matching_digest": same_content,
+            "shared_selected_paths": selected_shared, "assets": assets, "findings": findings,
+            **audit_result(blockers, warnings, hold)}
+
+
+def audit_review(args: argparse.Namespace) -> None:
+    root = args.review_dir
+    directory(root)
+    outputs = [p.resolve() for p in (args.json_out, args.md_out) if p]
+    require(len(set(outputs)) == len(outputs), "use different JSON and Markdown outputs")
+    require(not any(p.is_relative_to(root.resolve()) for p in outputs), "audit outputs must be outside the input tree")
+    single = (root / "review.json").exists()
+    if single:
+        regular_file(root / "review.json")
+        paths = {hashlib.sha256((root / "review.json").read_bytes()).hexdigest(): root}
+        docs = {rid: bundle_doc(root, rid) for rid in paths}
+    else:
+        _, docs, _ = load_store(root)
+        paths = {rid: root / "reviews" / d["dandiset"]["id"] / rid for rid, d in docs.items()}
+    require(docs, "no packed reviews found")
+    snapshots = {}
+    overlap: dict[str, dict[str, list[Doc]]] = {}
+    for rid, doc in docs.items():
+        pin = paths[rid] / "artifacts/dandiset.json"
+        snapshot = read_json(pin) if any(f["path"] == "artifacts/dandiset.json" for f in doc["files"]) else {}
+        snapshots[rid] = snapshot
+        if ((snapshot.get("dandiset_id"), snapshot.get("pinned_version"))
+                == (doc["dandiset"]["id"], doc["dandiset"]["version"])):
+            for asset in snapshot["assets"]:
+                overlap.setdefault(asset["path"], {}).setdefault(snapshot["dandiset_id"], []).append(asset)
+    superseded = {d.get("supersedes") for d in docs.values()}
+    grouped: dict[str, list[Doc]] = {}
+    for rid, doc in sorted(docs.items()):
+        row = audit_bundle(paths[rid], doc, snapshots[rid], overlap, rid not in superseded)
+        row["review_id"] = rid
+        grouped.setdefault(doc["dandiset"]["id"], []).append(row)
+    datasets = []
+    for ident, reviews in sorted(grouped.items()):
+        active = [row for row in reviews if row["active"]]
+        blockers = {code for row in active for code in row["blockers"]}
+        warnings = {code for row in active for code in row["warnings"]}
+        if len(active) > 1:
+            warnings.add("MULTIPLE_ACTIVE_REVIEWS")
+        hold = len(active) > 1 or any(row["verdict"] == "needs_human_review" for row in active)
+        datasets.append({"dandiset_id": ident, "reviews": reviews, **audit_result(blockers, warnings, hold)})
+    active = [r for d in datasets for r in d["reviews"] if r["active"]]
+    active_assets = [a for r in active for a in r["assets"]]
+    active_findings = [f for r in active for f in r["findings"]]
+    def counts(rows: list[Doc]) -> Doc:
+        return {v: sum(r["verdict"] == v for r in rows) for v in AUDIT_VERDICTS}
+
+    summary = {
+        "dandisets": counts(datasets), "findings": counts(active_findings),
+        "review_bundles": len(docs), "active_review_bundles": len(active),
+        "assets": dict(sorted(Counter(a["open_status"] for a in active_assets).items())),
+        "units": sum(a["units"] for a in active_assets),
+    }
+    result = {"schema_version": 1, "summary": summary, "dandisets": datasets}
+    if args.batch_summary:
+        active_ids = {r["review_id"] for r in active}
+        matched: set[str] = set()
+        batches = []
+        for path in sorted(args.batch_summary):
+            hashes = set(re.findall(r"\b[0-9a-f]{64}\b", path.read_text(encoding="utf-8")))
+            batch = active_ids & hashes
+            matched.update(batch)
+            batches.append({"file": path.name, "active_review_ids_matched": len(batch)})
+        result["batch_summary_crosscheck"] = {
+            "files": batches, "matched_active_reviews": len(matched),
+            "unmatched_active_review_ids": sorted(active_ids - matched),
+        }
+    if args.md_out:
+        lines = ["# DANDI pre-outreach audit", "",
+                 "Offline screening of pinned review bundles, not a new source inspection or permission to contact labs.",
+                 "Counts exclude superseded reviews. No finding prose or subject identifiers are included.", ""]
+        for label in ("dandisets", "findings", "assets"):
+            lines.append(f"- {label.capitalize()}: " + ", ".join(f"{k}: {v}" for k, v in summary[label].items()))
+        lines += [f"- Review bundles: {len(active)} active of {len(docs)}; units: {summary['units']}", ""]
+        if args.batch_summary:
+            batch_counts = ", ".join("{}: {}".format(b["file"], b["active_review_ids_matched"]) for b in batches)
+            lines += [f"- Batch summaries cite {len(matched)}/{len(active)} active review IDs "
+                      f"({batch_counts}).", ""]
+        for d in datasets:
+            lines += [f"## DANDI:{d['dandiset_id']} — {d['verdict']}", ""]
+            for row in d["reviews"]:
+                state = row["verdict"] if row["active"] else "superseded"
+                lines.append(f"- `{row['review_id']}` ({row['version']}): {state}; "
+                             f"codes: {', '.join(row['blockers'] + row['warnings']) or 'none'}")
+                for f in row["findings"]:
+                    lines.append(f"  - `{f['finding_id']}` `{f['code']}`: {f['verdict']}; "
+                                 f"{', '.join(f['blockers'] + f['warnings']) or 'no flags'}")
+            lines.append("")
+        atomic_write(args.md_out, ("\n".join(lines) + "\n").encode())
+    if args.json_out or not args.md_out:
+        emit(result, args.json_out)
+
+
 def parser() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(description=__doc__)
     sub = cli.add_subparsers(dest="command", required=True)
@@ -1789,6 +2201,13 @@ def parser() -> argparse.ArgumentParser:
             cmd.add_argument("--format", choices=("text", "md", "json"), default="text")
             cmd.add_argument("--as-of")
         cmd.set_defaults(handler=handler)
+
+    cmd = sub.add_parser("audit-review", help="screen packed DANDI reviews before outreach")
+    cmd.add_argument("review_dir", type=Path, help="packed review directory or complete review store")
+    cmd.add_argument("--json-out", type=Path)
+    cmd.add_argument("--md-out", type=Path)
+    cmd.add_argument("--batch-summary", type=Path, action="append", help="cross-check active review IDs cited in a batch summary")
+    cmd.set_defaults(handler=audit_review)
 
     cmd = sub.add_parser("pin")
     cmd.add_argument("dandiset_id")

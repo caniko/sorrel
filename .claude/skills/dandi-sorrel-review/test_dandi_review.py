@@ -96,6 +96,136 @@ class ReviewKitTest(unittest.TestCase):
         review_id = result.split()[0]
         return self.store / "reviews" / "000006" / review_id
 
+    def audit_fixture(self, verified=True, note="", **finding):
+        doc = self.review(verified)
+        asset = dict(doc["assets"][0], blob_id="blob-1", sha256="a" * 64,
+                     evidence_level="raw", duration_s=10, sample_rate_hz=20_000,
+                     unique_metadata={"spike_extent_s": 9, "raw_access": {"result": "windows 8/8"}})
+        doc["assets"] = [asset]
+        doc["findings"][0].update(finding)
+        artifact = self.stage / "artifacts"
+        asset_dir = artifact / asset["path"]
+        asset_dir.mkdir(parents=True, exist_ok=True)
+        (asset_dir / "clusters.before.tsv").write_text(
+            CLUSTER_HEADER + "".join(f"{i}\t100\t{label}\t-\t-\t-\t\n"
+                                     for i, label in enumerate(("good", "good", "good2"))))
+        (artifact / "dandiset.json").write_text(json.dumps({
+            "dandiset_id": "000006", "pinned_version": doc["dandiset"]["version"],
+            "assets": [asset],
+        }))
+        evidence = artifact / "evidence.json"
+        evidence.write_text('{"rpv_post_lo95": 0.2}')
+        doc["findings"][0]["evidence"] = [{
+            "artifact_sha256": kit.digest_file(evidence)[0], "pointer": "/rpv_post_lo95",
+        }]
+        (self.stage / "report.md").write_text(note)
+        return doc
+
+    def test_audit_ready_and_unverified_and_deterministic(self):
+        bundle = self.pack(self.audit_fixture())
+        first = self.cli("audit-review", bundle)
+        self.assertEqual(json.loads(first)["dandisets"][0]["verdict"], "outreach_ready")
+        self.assertEqual(first, self.cli("audit-review", self.store))
+        bundle = self.pack(self.audit_fixture(False, "RP confirmed"))
+        result = json.loads(self.cli("audit-review", bundle))["dandisets"][0]
+        self.assertEqual(result["verdict"], "needs_human_review")
+        findings = result["reviews"][0]["findings"]
+        self.assertIn("HUMAN_VERIFICATION_REQUIRED", findings[0]["blockers"])
+        self.assertIn("UNVERIFIED_CONFIRMATION_WORDING", result["reviews"][0]["warnings"])
+
+    def test_audit_reconciles_pins_and_redacts_private_text(self):
+        doc = self.audit_fixture(statement_md="Private subject ID: private-patient-42")
+        doc["assets"][0]["sha256"] = "b" * 64
+        bundle = self.pack(doc)
+        j, m = self.root / "audit.json", self.root / "audit.md"
+        self.cli("audit-review", bundle, "--json-out", j, "--md-out", m)
+        result = json.loads(j.read_text())["dandisets"][0]
+        self.assertEqual(result["verdict"], "blocked")
+        self.assertIn("PIN_ASSET_MISMATCH", result["reviews"][0]["assets"][0]["blockers"])
+        self.assertIn("POSSIBLE_PRIVATE_IDENTIFIER", result["reviews"][0]["findings"][0]["blockers"])
+        self.assertNotIn("private-patient-42", j.read_text() + m.read_text())
+
+    def test_audit_corpus_risk_signals(self):
+        doc = self.audit_fixture(False, """
+        Epochs in milliseconds, a 1000× ratio versus spike extent.
+        Trace span mismatch. Waveform probe hit the 900 s cap.
+        CCG-only merge suggestions without waveform support.
+        CA1 bursting and cortical stimulation confound epoch metrics.
+        NWB Inspector timed out. Raw labels good2, excellent and numeric quality;
+        the cell_type column is not a quality label. Nominal analysis grid.
+        """)
+        a = self.stage / "artifacts" / doc["assets"][0]["path"]
+        (a / "nwb_inspector.json").write_text(json.dumps({"messages": [
+            {"check_function_name": "check_ascending_spike_times", "message": "Equal consecutive spike times"}
+        ]}))
+        doc["findings"][0]["code"] = "curation.duplicate_unit"
+        bundle = self.pack(doc)
+        result = json.loads(self.cli("audit-review", bundle))["dandisets"][0]["reviews"][0]
+        self.assertLessEqual({
+            "SUSPICIOUS_EPOCH_SPAN", "TRACE_SPIKE_SPAN_MISMATCH", "WAVEFORM_PROBE_TIMEOUT",
+            "CCG_ONLY_MERGE_SCREENING", "RP_EPOCH_CONTEXT_CONFOUND", "INSPECTOR_TIMEOUT",
+            "UNMAPPED_AUTHOR_LABELS", "NONSTANDARD_CLOCK",
+        }, set(result["warnings"]))
+        self.assertIn("NON_INCREASING_SOURCE_SPIKES", result["assets"][0]["blockers"])
+        self.assertIn("EQUAL_CONSECUTIVE_SOURCE_SPIKES", result["assets"][0]["blockers"])
+        self.assertIn("IDENTICAL_CROSS_UNIT_SPIKE_VECTORS", result["findings"][0]["blockers"])
+
+    def test_audit_does_not_treat_pinned_external_avi_or_good2_as_a_source_claim(self):
+        doc = self.audit_fixture(
+            statement_md="Inspector reported missing external AVI; two author good units.",
+            code="nwb.inspector_critical",
+        )
+        a = self.stage / "artifacts" / doc["assets"][0]["path"]
+        (a / "nwb_inspector.json").write_text(json.dumps({"messages": [{
+            "check_function_name": "check_image_series_external_file_valid",
+            "message": "The external file 'sidecar.avi' does not exist.", "importance": "CRITICAL",
+        }]}))
+        snapshot = self.stage / "artifacts" / "dandiset.json"
+        pin = json.loads(snapshot.read_text())
+        pin["assets"].append(dict(ASSET, path="sub-a/sidecar.avi", asset_id="sidecar"))
+        snapshot.write_text(json.dumps(pin))
+        doc["asset_selection"] = {"policy": "all", "scope": "nwb", "n_assets_total": 2, "n_nwb_assets": 1}
+        result = json.loads(self.cli("audit-review", self.pack(doc)))["dandisets"][0]["reviews"][0]
+        self.assertEqual(result["assets"][0]["mapped_good"], 2)
+        self.assertEqual(result["assets"][0]["inspector_external_file_false_criticals"], 1)
+        self.assertIn("INSPECTOR_STREAMING_ARTIFACT_CLAIM", result["findings"][0]["blockers"])
+
+    def test_audit_superseded_reviews_do_not_count_and_crosscheck_reports(self):
+        first = self.pack(self.audit_fixture(False))
+        second = self.pack(dict(self.audit_fixture(), supersedes=first.name))
+        batch = self.root / "batch.md"
+        batch.write_text(f"`{first.name}` is superseded by `{second.name}`")
+        result = json.loads(self.cli("audit-review", self.store, "--batch-summary", batch))
+        self.assertEqual(result["summary"]["active_review_bundles"], 1)
+        self.assertEqual(result["summary"]["findings"]["outreach_ready"], 1)
+        self.assertEqual(result["batch_summary_crosscheck"]["matched_active_reviews"], 1)
+
+    def test_audit_checks_metric_direction_against_pointed_value(self):
+        doc = self.audit_fixture(metric="rpv_post_lo95", threshold=0.3)
+        result = json.loads(self.cli("audit-review", self.pack(doc)))
+        finding = result["dandisets"][0]["reviews"][0]["findings"][0]
+        self.assertEqual(finding["verdict"], "blocked")
+        self.assertIn("METRIC_THRESHOLD_EVIDENCE_CONTRADICTS_CLAIM", finding["blockers"])
+
+    def test_audit_cross_archive_same_path_is_not_an_asset_identity(self):
+        self.pack(self.audit_fixture())
+        doc = self.audit_fixture()
+        doc["dandiset"]["id"] = "000007"
+        doc["assets"][0]["asset_id"] = "asset-7"
+        doc["findings"][0]["asset_id"] = "asset-7"
+        path = self.stage / "artifacts" / "dandiset.json"
+        pin = json.loads(path.read_text())
+        pin.update(dandiset_id="000007", assets=doc["assets"])
+        path.write_text(json.dumps(pin))
+        self.dump("stage/review.json", doc)
+        self.cli("pack", self.stage, "--store", self.store)
+        result = json.loads(self.cli("audit-review", self.store))
+        for dataset in result["dandisets"]:
+            review = dataset["reviews"][0]
+            self.assertIn("CROSS_ARCHIVE_SAME_PATH_AND_DIGEST", review["warnings"])
+            self.assertEqual(review["shared_selected_paths"], 1)
+            self.assertNotIn("PIN_ASSET_MISMATCH", review["blockers"])
+
     def summary(self, *args):
         return json.loads(self.cli("summarize-asset", "--asset-id", ASSET["asset_id"],
                                    "--path", ASSET["path"], "--size-bytes", "123",

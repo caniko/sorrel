@@ -212,6 +212,27 @@ sums are `null` (`N/A` in text or Markdown), not zero. An unlabeled asset has
 no good/mua/noise labels on any live unit. Independent latest reviews of the
 same asset remain separate observations.
 
+### Screen findings before outreach
+
+```sh
+python3 "$kit" audit-review "$STORE" --json-out "$OUT/audit.json" --md-out "$OUT/audit.md"
+```
+
+Pass a packed review directory to check just that bundle, or the whole store
+to check cross-archive overlaps and supersession. Outputs must be outside the
+input tree. With no output options, the command prints JSON. When comparing
+against collection notes, repeat `--batch-summary FILE` to reconcile the
+active review IDs against the IDs cited in each summary.
+
+`blocked` means the audit found a reason not to use the claim as written.
+`needs_human_review` means it lacks human verification or has an unresolved
+caveat. A successful command does not mean a review is ready. Even
+`outreach_ready` only means the checked bundle passed this offline gate; it
+does not authorize sending or publishing. Inspect original ACGs, waveforms,
+timing, and privacy-sensitive material when needed. A trace-backed open is
+not waveform verification, and a mapped `good` count does not include
+unmapped quality labels or cell classes.
+
 ### Offline or older Sorrel
 
 Transfer the pinned manifest and a verified local NWB copy (or intact
