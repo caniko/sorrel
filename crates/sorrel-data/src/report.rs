@@ -327,7 +327,7 @@ fn svg_amplitude_iqr(times: &[SampleIndex], amps: &[f32], span: &SessionSpan) ->
     let point = |bin: f64, a| {
         let level = if hi == lo { 0.5 } else { (a - lo) / (hi - lo) };
         format!(
-            "{:.1},{:.1}",
+            "{:.2},{:.1}",
             bin / AMP_TIME_BINS as f64 * f64::from(STRIP_W),
             4.0 + (1.0 - level) * f64::from(STRIP_H - 8.0)
         )
@@ -585,8 +585,8 @@ mod tests {
         .unwrap();
         assert_eq!(svg.matches(r#"<polygon class="iqr""#).count(), 2);
         assert_eq!(svg.matches(r#"<polyline class="median""#).count(), 2);
-        assert!(svg.contains(r#"class="median" points="0.0,60.0 40.0,60.0""#));
-        assert!(svg.contains(r#"class="median" points="920.0,4.0 960.0,4.0""#));
+        assert!(svg.contains(r#"class="median" points="0.00,60.0 40.00,60.0""#));
+        assert!(svg.contains(r#"class="median" points="920.00,4.0 960.00,4.0""#));
     }
 
     #[test]
@@ -611,8 +611,21 @@ mod tests {
         .unwrap();
         assert_eq!(svg.matches(r#"<polygon class="iqr""#).count(), 3);
         assert_eq!(svg.matches(r#"<polyline class="median""#).count(), 3);
-        assert!(svg.contains(r#"class="median" points="0.0,60.0 4.0,60.0""#));
-        assert!(svg.contains(r#"class="median" points="8.0,4.0 40.0,4.0""#));
+        assert!(svg.contains(r#"class="median" points="0.00,60.0 4.00,60.0""#));
+        assert!(svg.contains(r#"class="median" points="8.00,4.0 40.00,4.0""#));
+
+        // Sub-tenth-pixel gap on a 30,000-sample span still serializes with distinct x edges.
+        let fine = SessionSpan::from_intervals(
+            vec![
+                (SampleIndex(0), SampleIndex(300)),
+                (SampleIndex(301), SampleIndex(30_000)),
+            ],
+            sorrel_io::SpanSource::Declared("test"),
+        );
+        let fine_svg =
+            svg_amplitude_iqr(&[SampleIndex(100), SampleIndex(500)], &[5.0, 5.0], &fine).unwrap();
+        assert!(fine_svg.contains(r#"class="median" points="0.00,32.0 9.60,32.0""#));
+        assert!(fine_svg.contains(r#"class="median" points="9.63,32.0 40.00,32.0""#));
     }
 
     #[test]
