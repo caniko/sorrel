@@ -6,12 +6,17 @@
 use std::sync::Arc;
 
 use egui::{Sense, Shape, Stroke, Ui};
-use sorrel_compute::{isi_histogram_range, isi_violations, refractory_evidence};
+use sorrel_compute::{
+    duplicate_spike_indices, isi_histogram_log, isi_histogram_range, isi_violations,
+    refractory_evidence,
+};
 use sorrel_data::{preview_split, Session, SplitPreview};
 use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 
 use crate::brush::{BrushSource, Brushes, SpikeBrush};
 use crate::correlogram_view::{band_fill, wheel_scale};
+use crate::intent::Intent;
+use crate::layout::ViewAction;
 use crate::prefs::IsiParams;
 use crate::theme::{contrast_text, selection_colour, Theme};
 use crate::views::{axes, axes_data_rect, fill_height, int_ticks, param_bar, AxisOpts, TICK_PX};
@@ -19,15 +24,26 @@ use crate::views::{axes, axes_data_rect, fill_height, int_ticks, param_bar, Axis
 /// Rows past this are not drawn (phy's grid limit; keeps the pane legible).
 const MAX_CLUSTERS: usize = 20;
 const MAX_BINS: usize = 500;
+const DUP_TOL_MS: f32 = 0.2;
+const LOG_TICKS: &[(f32, &str)] = &[
+    (0.2, "0.2"),
+    (1.0, "1"),
+    (10.0, "10"),
+    (100.0, "100"),
+    (1_000.0, "1s"),
+    (10_000.0, "10s"),
+];
 
-type IsiKey = (Vec<ClusterId>, u64, u64, u64, usize);
+type IsiKey = (Vec<ClusterId>, u64, bool, u64, u64, usize);
 
-/// Histograms for one key, parked in egui's temp memory: the compute is a
-/// linear scan per cluster, so a key-compared cache is all it needs.
+/// Histograms and duplicate spike indices for one key, parked in egui's temp
+/// memory: the compute is a linear scan per cluster, so a key-compared cache
+/// is all it needs.
 #[derive(Clone)]
 struct IsiEntry {
     key: IsiKey,
     hists: Arc<Vec<Vec<u32>>>,
+    dups: Arc<Vec<Vec<u32>>>,
 }
 
 /// Local indices of every spike that is part of an ISI below `refractory`
@@ -58,7 +74,10 @@ pub(crate) fn split_target(
     session_n: impl Fn(ClusterId) -> usize,
 ) -> Option<(ClusterId, std::sync::Arc<[u32]>)> {
     let b = brushes.spikes.as_ref()?;
-    if b.source == BrushSource::IsiViolators {
+    if matches!(
+        b.source,
+        BrushSource::IsiViolators | BrushSource::Duplicates
+    ) {
         return None;
     }
     selection.iter().find_map(|&c| {
@@ -174,6 +193,9 @@ pub(crate) fn clamp_params(p: &mut IsiParams) {
     p.x_min_ms = fin(p.x_min_ms, 0.0, 9_999.0, 0.0);
     p.x_max_ms = fin(p.x_max_ms, 0.1, 10_000.0, 50.0).max(p.x_min_ms + 0.1);
     p.n_bins = p.n_bins.clamp(1, MAX_BINS);
+    p.log_min_ms = fin(p.log_min_ms, 0.05, 50_000.0, 0.2);
+    p.log_max_ms = fin(p.log_max_ms, 0.1, 100_000.0, 10_000.0).max(p.log_min_ms + 0.05);
+    p.log_n_bins = p.log_n_bins.clamp(4, MAX_BINS);
 }
 
 /// Scale a bin count by a wheel factor, always moving at least one step
@@ -187,42 +209,92 @@ pub(crate) fn scale_bins(n: usize, f: f32) -> usize {
     }
 }
 
-/// One row: x max inline, x min and bins behind the gear.
+/// One row: log toggle + x max inline, min/max/bins behind the gear.
 fn header(ui: &mut Ui, p: &mut IsiParams) {
-    let caption = format!(
-        "ISI histogram · {} · {} bins",
-        isi_caption(p.x_min_ms, p.x_max_ms),
-        p.n_bins
-    );
-    let (x_min, x_max, bins) = (&mut p.x_min_ms, &mut p.x_max_ms, &mut p.n_bins);
+    let caption = if p.log_x {
+        format!(
+            "ISI histogram (log) · {} · {} bins",
+            isi_caption(p.log_min_ms, p.log_max_ms),
+            p.log_n_bins
+        )
+    } else {
+        format!(
+            "ISI histogram · {} · {} bins",
+            isi_caption(p.x_min_ms, p.x_max_ms),
+            p.n_bins
+        )
+    };
+    let is_log = p.log_x;
+    let mut log_x = p.log_x;
+    let mut log_max_primary = p.log_max_ms;
+    let mut log_max_primary_changed = false;
     param_bar(
         ui,
         &caption,
         |ui| {
+            ui.toggle_value(&mut log_x, "log")
+                .on_hover_text("Logarithmic x-axis (ms)");
             ui.label("x max");
-            ui.add(
-                egui::DragValue::new(x_max)
-                    .speed(0.5)
-                    .range(0.1..=10_000.0)
-                    .suffix(" ms"),
-            );
+            if is_log {
+                log_max_primary_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut log_max_primary)
+                            .speed(10.0)
+                            .range(0.1..=100_000.0)
+                            .suffix(" ms"),
+                    )
+                    .changed();
+            } else {
+                ui.add(
+                    egui::DragValue::new(&mut p.x_max_ms)
+                        .speed(0.5)
+                        .range(0.1..=10_000.0)
+                        .suffix(" ms"),
+                );
+            }
         },
         |ui| {
             egui::Grid::new("isi_params").show(ui, |ui| {
-                ui.label("x min");
-                ui.add(
-                    egui::DragValue::new(x_min)
-                        .speed(0.5)
-                        .range(0.0..=9_999.0)
-                        .suffix(" ms"),
-                );
-                ui.end_row();
-                ui.label("bins");
-                ui.add(egui::DragValue::new(bins).range(1..=MAX_BINS));
-                ui.end_row();
+                if is_log {
+                    ui.label("log min");
+                    ui.add(
+                        egui::DragValue::new(&mut p.log_min_ms)
+                            .speed(0.05)
+                            .range(0.05..=50_000.0)
+                            .suffix(" ms"),
+                    );
+                    ui.end_row();
+                    ui.label("log max");
+                    ui.add(
+                        egui::DragValue::new(&mut p.log_max_ms)
+                            .speed(10.0)
+                            .range(0.1..=100_000.0)
+                            .suffix(" ms"),
+                    );
+                    ui.end_row();
+                    ui.label("log bins");
+                    ui.add(egui::DragValue::new(&mut p.log_n_bins).range(4..=MAX_BINS));
+                    ui.end_row();
+                } else {
+                    ui.label("x min");
+                    ui.add(
+                        egui::DragValue::new(&mut p.x_min_ms)
+                            .speed(0.5)
+                            .range(0.0..=9_999.0)
+                            .suffix(" ms"),
+                    );
+                    ui.end_row();
+                    ui.label("bins");
+                    ui.add(egui::DragValue::new(&mut p.n_bins).range(1..=MAX_BINS));
+                    ui.end_row();
+                }
             });
         },
     );
+    p.log_x = log_x;
+    if log_max_primary_changed {
+        p.log_max_ms = log_max_primary;
+    }
 }
 
 /// Inter-spike-interval histograms of the selection, overlaid in one plot
@@ -234,14 +306,20 @@ pub fn isi_view<P: DataProvider>(
     p: &mut IsiParams,
     brushes: &mut Brushes,
     jobs: &crate::jobs::JobCtx<Session<P>>,
+    actions: &mut Vec<ViewAction>,
 ) {
     let theme = Theme::from_ui(ui);
     if selection.is_empty() {
         ui.label("no selection");
         return;
     }
-    p.x_max_ms *= wheel_scale(ui, true);
-    p.n_bins = scale_bins(p.n_bins, wheel_scale(ui, false));
+    if p.log_x {
+        p.log_max_ms *= wheel_scale(ui, true);
+        p.log_n_bins = scale_bins(p.log_n_bins, wheel_scale(ui, false));
+    } else {
+        p.x_max_ms *= wheel_scale(ui, true);
+        p.n_bins = scale_bins(p.n_bins, wheel_scale(ui, false));
+    }
     header(ui, p);
     clamp_params(p);
 
@@ -253,17 +331,52 @@ pub fn isi_view<P: DataProvider>(
         ));
     }
     let sr = session.provider.sample_rate().max(1.0);
-    let to_samples = |ms: f32| (sr as f64 * ms as f64 / 1e3).round() as u64;
-    let (lo, hi) = (to_samples(p.x_min_ms), to_samples(p.x_max_ms));
-    let key: IsiKey = (shown.to_vec(), session.version(), lo, hi, p.n_bins);
+    let to_samples_u64 = |ms: f32| (sr as f64 * ms as f64 / 1e3).round() as u64;
+    let to_samples_f64 = |ms: f32| sr as f64 * ms as f64 / 1e3;
+    let (lo_u64, hi_u64) = (to_samples_u64(p.x_min_ms), to_samples_u64(p.x_max_ms));
+    let (log_lo_f64, log_hi_f64) = (to_samples_f64(p.log_min_ms), to_samples_f64(p.log_max_ms));
+    let n_bins = if p.log_x { p.log_n_bins } else { p.n_bins };
+    let (lo_key, hi_key) = if p.log_x {
+        (log_lo_f64.to_bits(), log_hi_f64.to_bits())
+    } else {
+        (lo_u64, hi_u64)
+    };
+    let key: IsiKey = (
+        shown.to_vec(),
+        session.version(),
+        p.log_x,
+        lo_key,
+        hi_key,
+        n_bins,
+    );
     let id = egui::Id::new("isi_view_cache");
-    let hists = match ui.data(|d| d.get_temp::<IsiEntry>(id)) {
-        Some(e) if e.key == key => e.hists,
+    let (hists, dups) = match ui.data(|d| d.get_temp::<IsiEntry>(id)) {
+        Some(e) if e.key == key => (e.hists, e.dups),
         _ => {
             let hists = Arc::new(
                 shown
                     .iter()
-                    .map(|&c| isi_histogram_range(session.spike_times(c), lo, hi, p.n_bins))
+                    .map(|&c| {
+                        let times = session.spike_times(c);
+                        if p.log_x {
+                            isi_histogram_log(times, log_lo_f64, log_hi_f64, n_bins)
+                        } else {
+                            isi_histogram_range(times, lo_u64, hi_u64, n_bins)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let tol_samples = (DUP_TOL_MS as f64 * 1e-3 * sr as f64).round().max(0.0) as u64;
+            let dups = Arc::new(
+                shown
+                    .iter()
+                    .map(|&c| {
+                        duplicate_spike_indices(
+                            session.spike_times(c),
+                            session.spike_amplitudes(c),
+                            tol_samples,
+                        )
+                    })
                     .collect::<Vec<_>>(),
             );
             ui.data_mut(|d| {
@@ -272,10 +385,11 @@ pub fn isi_view<P: DataProvider>(
                     IsiEntry {
                         key,
                         hists: Arc::clone(&hists),
+                        dups: Arc::clone(&dups),
                     },
                 )
             });
-            hists
+            (hists, dups)
         }
     };
 
@@ -322,6 +436,58 @@ pub fn isi_view<P: DataProvider>(
         }
     });
 
+    let total_dups: usize = dups.iter().map(Vec::len).sum();
+    if total_dups > 0 {
+        let mut clicked_dup: Option<(ClusterId, Vec<u32>)> = None;
+        ui.horizontal_wrapped(|ui| {
+            for (slot, &c) in shown.iter().enumerate() {
+                let Some(dup_idx) = dups.get(slot).filter(|v| !v.is_empty()) else {
+                    continue;
+                };
+                let k = dup_idx.len();
+                let bg = theme.warn;
+                let fg = contrast_text(bg);
+                let text = format!("c{c} · {k} dup (<0.2 ms)");
+                let g = ui
+                    .painter()
+                    .layout_no_wrap(text, egui::FontId::proportional(TICK_PX), fg);
+                let (r, resp) =
+                    ui.allocate_exact_size(g.size() + egui::vec2(10.0, 4.0), Sense::click());
+                ui.painter().rect_filled(r, 3.0, bg);
+                ui.painter().galley(r.min + egui::vec2(5.0, 2.0), g, fg);
+                resp.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        true,
+                        format!("duplicates c{c}"),
+                    )
+                });
+                if resp
+                    .on_hover_text("Click to brush this cluster's duplicate spikes (<0.2 ms)")
+                    .clicked()
+                {
+                    clicked_dup = Some((c, dup_idx.clone()));
+                }
+            }
+            if ui
+                .small_button("Remove duplicates")
+                .on_hover_text(
+                    "Split duplicate spikes (<0.2 ms) into a noise cluster tagged \"duplicate\" (undoable)",
+                )
+                .clicked()
+            {
+                actions.push(ViewAction::Intent(Intent::RemoveDuplicates));
+            }
+        });
+        if let Some((c, dup_idx)) = clicked_dup {
+            if let Some(b) =
+                SpikeBrush::new(BrushSource::Duplicates, session.version(), [(c, dup_idx)])
+            {
+                brushes.spikes = Some(b);
+            }
+        }
+    }
+
     let split =
         split_preview(ui, session, jobs, brushes, shown).filter(|sp| shown.contains(&sp.cluster));
     if let Some(sp) = &split {
@@ -342,25 +508,87 @@ pub fn isi_view<P: DataProvider>(
     let max_count = hists.iter().flatten().copied().max().unwrap_or(1).max(1) as f32;
     let y_top = max_count * 1.1;
     let yt = int_ticks(max_count, 3);
-    axes(
-        &painter,
-        rect,
-        (p.x_min_ms, p.x_max_ms),
-        (0.0, y_top),
-        "ms",
-        "",
-        &theme,
-        AxisOpts {
-            grid: true,
-            y_ticks: Some(&yt),
-            ..AxisOpts::default()
-        },
-    );
+    let log_min = p.log_min_ms.log10();
+    let log_max = p.log_max_ms.log10();
+    let x_of = |ms: f32| {
+        if p.log_x {
+            data.left() + (ms.log10() - log_min) / (log_max - log_min) * data.width()
+        } else {
+            data.left() + (ms - p.x_min_ms) / (p.x_max_ms - p.x_min_ms) * data.width()
+        }
+    };
+    if p.log_x {
+        axes(
+            &painter,
+            rect,
+            (log_min, log_max),
+            (0.0, y_top),
+            "",
+            "",
+            &theme,
+            AxisOpts {
+                grid: true,
+                hide_x: true,
+                x_ticks: Some(&[]),
+                y_ticks: Some(&yt),
+                ..AxisOpts::default()
+            },
+        );
+        let font = egui::FontId::proportional(TICK_PX);
+        let ink = theme.caption;
+        let tick_stroke = Stroke::new(1.0_f32, ink);
+        let label_top = data.bottom() + 5.0;
+        let mut right_edge = f32::NEG_INFINITY;
+        for &(t_ms, label) in LOG_TICKS {
+            if t_ms < p.log_min_ms - 1e-4 || t_ms > p.log_max_ms + 1e-4 {
+                continue;
+            }
+            let sx = x_of(t_ms).clamp(data.left(), data.right());
+            painter.line_segment(
+                [
+                    egui::pos2(sx, data.bottom()),
+                    egui::pos2(sx, data.bottom() + 3.0),
+                ],
+                tick_stroke,
+            );
+            let g = painter.layout_no_wrap(label.to_owned(), font.clone(), ink);
+            let w = g.size().x;
+            let left = (sx - w / 2.0).clamp(rect.left(), (rect.right() - w).max(rect.left()));
+            if left < right_edge + 4.0 {
+                continue;
+            }
+            right_edge = left + w;
+            painter.galley(egui::pos2(left, label_top), g, ink);
+        }
+        let unit = painter.layout_no_wrap("ms".to_owned(), font, ink);
+        let unit_x = rect.right() - unit.size().x - 2.0;
+        if right_edge + 6.0 <= unit_x {
+            painter.galley(egui::pos2(unit_x, label_top), unit, ink);
+        }
+    } else {
+        axes(
+            &painter,
+            rect,
+            (p.x_min_ms, p.x_max_ms),
+            (0.0, y_top),
+            "ms",
+            "",
+            &theme,
+            AxisOpts {
+                grid: true,
+                y_ticks: Some(&yt),
+                ..AxisOpts::default()
+            },
+        );
+    }
     let dp = painter.with_clip_rect(data);
-    let x_of = |ms: f32| data.left() + (ms - p.x_min_ms) / (p.x_max_ms - p.x_min_ms) * data.width();
 
     // Shade the fixed refractory window, clipped to the visible range.
-    let band = (p.x_min_ms.max(0.0), refractory_ms.min(p.x_max_ms));
+    let band = if p.log_x {
+        (p.log_min_ms, refractory_ms.min(p.log_max_ms))
+    } else {
+        (p.x_min_ms.max(0.0), refractory_ms.min(p.x_max_ms))
+    };
     if band.1 > band.0 {
         let (x0, x1) = (x_of(band.0), x_of(band.1).max(x_of(band.0) + 3.0));
         dp.rect_filled(
@@ -435,7 +663,7 @@ pub fn isi_view<P: DataProvider>(
     }
 
     // Step outlines, one per cluster, on a shared count axis.
-    let bw = data.width() / p.n_bins as f32;
+    let bw = data.width() / n_bins as f32;
     let y_of = |count: u32| data.bottom() - count as f32 / y_top * data.height();
     for (slot, h) in hists.iter().enumerate() {
         let mut pts = Vec::with_capacity(h.len() * 2 + 2);
@@ -468,16 +696,23 @@ pub fn isi_view<P: DataProvider>(
             };
             // Parts' histograms, cached per preview and bin range.
             let hid = egui::Id::new("isi_split_hists");
-            let hkey = (Arc::as_ptr(&sp) as usize, lo, hi, p.n_bins);
-            let h = match ui
-                .data(|d| d.get_temp::<((usize, u64, u64, usize), Arc<(Vec<u32>, Vec<u32>)>)>(hid))
-            {
+            let hkey = (Arc::as_ptr(&sp) as usize, p.log_x, lo_key, hi_key, n_bins);
+            let h = match ui.data(|d| {
+                d.get_temp::<((usize, bool, u64, u64, usize), Arc<(Vec<u32>, Vec<u32>)>)>(hid)
+            }) {
                 Some((k, h)) if k == hkey => h,
                 _ => {
-                    let h = Arc::new((
-                        isi_histogram_range(&sp.inside_times, lo, hi, p.n_bins),
-                        isi_histogram_range(&sp.outside_times, lo, hi, p.n_bins),
-                    ));
+                    let h = Arc::new(if p.log_x {
+                        (
+                            isi_histogram_log(&sp.inside_times, log_lo_f64, log_hi_f64, n_bins),
+                            isi_histogram_log(&sp.outside_times, log_lo_f64, log_hi_f64, n_bins),
+                        )
+                    } else {
+                        (
+                            isi_histogram_range(&sp.inside_times, lo_u64, hi_u64, n_bins),
+                            isi_histogram_range(&sp.outside_times, lo_u64, hi_u64, n_bins),
+                        )
+                    });
                     ui.data_mut(|d| d.insert_temp(hid, (hkey, Arc::clone(&h))));
                     h
                 }
@@ -613,6 +848,8 @@ mod tests {
         assert!(split_target(&br, &[a], n).is_none(), "cluster not selected");
         let isi = mk(BrushSource::IsiViolators, b, vec![1, 2]);
         assert!(split_target(&isi, &[b], n).is_none());
+        let dup = mk(BrushSource::Duplicates, b, vec![1, 2]);
+        assert!(split_target(&dup, &[b], n).is_none());
         let all = mk(BrushSource::KMeansPart, b, (0..10).collect());
         assert!(
             split_target(&all, &[b], n).is_none(),
@@ -644,12 +881,21 @@ mod tests {
             x_min_ms: 60.0,
             x_max_ms: 50.0,
             n_bins: 0,
+            log_min_ms: 0.01,
+            log_max_ms: 0.005,
+            log_n_bins: 1,
+            ..Default::default()
         };
         clamp_params(&mut p);
         assert!(p.x_max_ms > p.x_min_ms);
         assert_eq!(p.n_bins, 1);
+        assert!(p.log_min_ms >= 0.05);
+        assert!(p.log_max_ms > p.log_min_ms);
+        assert_eq!(p.log_n_bins, 4);
         p.x_min_ms = f32::NAN;
+        p.log_min_ms = f32::NAN;
         clamp_params(&mut p);
         assert_eq!(p.x_min_ms, 0.0);
+        assert_eq!(p.log_min_ms, 0.2);
     }
 }

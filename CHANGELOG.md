@@ -13,6 +13,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
+- **MClust-style curation.** Combine limits across feature projections, switch between PC, energy, peak and valley features, and show density contours or same-shank neighbours. Inspect ISIs on a log scale, remove duplicate spikes in one undoable edit, and review pairwise feature separation before merging.
+- **Waveform and report evidence.** Show waveform variability and the mean for spikes inside a time brush. HTML reports mark the configured refractory window on the log-ISI plot and show binned median amplitude with its interquartile range.
 - **DANDI streaming.** Open HDF5 NWB and NWB-Zarr assets by `dandi://` or HTTPS. Sessions with remote inputs always open fresh, equivalent asset paths share one pinned store, and two distinct draft assets can't be combined (unversioned DANDI asset-ID URLs also count as draft). Sorrel verifies DANDI Zarr listings and pins storage objects before reusing cached ranges. Remote NWB GUI sessions show trial events, and waveform probes report failed reads. Journals stay local.
 - **NWB-Zarr reads without native compression libraries.** The reader decodes Blosc 1 chunks with LZ4, LZ4HC, Zstd, zlib, BloscLZ, or Snappy on the same release targets as Sorrel.
 - **Stable epochs.** Amplitudes marks inferred rate or amplitude change points. QC exports, MCP metrics and rules expose epoch counts and level ratios; `probe epochs C` lists the intervals for review and optional time splits.

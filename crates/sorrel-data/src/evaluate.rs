@@ -13,6 +13,7 @@
 //! noise, e.g. 99 from a std floor).
 
 use crate::brief::{quantise, thresholds_with};
+use crate::feature_subspace::pairwise_cluster_separation;
 use crate::proposals::{basis_of, spike_basis};
 use crate::refractory::RefractoryWindows;
 use crate::session::Session;
@@ -43,7 +44,7 @@ pub struct UnitStats {
     pub drift_correlation: f32,
 }
 
-/// CCG evidence between part `i` and part `j` of an evaluation.
+/// CCG and optional feature evidence between parts `i` and `j`.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct PairStats {
     pub i: usize,
@@ -51,6 +52,14 @@ pub struct PairStats {
     pub dip_z: f32,
     pub sync_z: f32,
     pub amp_ks: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feature_d_prime: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feature_bhattacharyya: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feature_overlap_est: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feature_l_ratio: Option<f32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -197,6 +206,10 @@ fn eval_trains_with_spans(
                     dip_z,
                     sync_z,
                     amp_ks: ks_two_sample(a, b),
+                    feature_d_prime: None,
+                    feature_bhattacharyya: None,
+                    feature_overlap_est: None,
+                    feature_l_ratio: None,
                 });
             }
         }
@@ -227,6 +240,17 @@ pub fn eval_merge<P: DataProvider>(session: &Session<P>, ids: &[ClusterId]) -> M
         RefractoryWindows::Session(session.refractory()),
     );
     ev.ids = ids.iter().map(|c| c.0).collect();
+    if session.has_pc_features() {
+        let finite = |v: f32| v.is_finite().then_some(v);
+        for p in &mut ev.pairs {
+            if let Some(sep) = pairwise_cluster_separation(session, ids[p.i], ids[p.j]) {
+                p.feature_d_prime = finite(sep.d_prime);
+                p.feature_bhattacharyya = finite(sep.bhattacharyya);
+                p.feature_overlap_est = finite(sep.overlap_est);
+                p.feature_l_ratio = finite(sep.l_ratio_ab);
+            }
+        }
+    }
     ev
 }
 
@@ -380,6 +404,12 @@ pub fn render_merge(
                 let _ = write!(s, " d {}um", qn(e.centroid_um));
             }
             let _ = write!(s, " pc {}", qn(e.presence_complement));
+        }
+        if let Some(d) = p.feature_d_prime {
+            let _ = write!(s, " feat_d'={d:.2}");
+        }
+        if let Some(overlap) = p.feature_overlap_est {
+            let _ = write!(s, " overlap={:.1}%", 100.0 * overlap);
         }
     }
     s
@@ -722,6 +752,28 @@ mod tests {
     use super::*;
 
     const SR: f32 = 30_000.0;
+
+    #[test]
+    fn merge_feature_metrics_are_optional_and_serialize() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = crate::feature_subspace::tests::physical_test_session(dir.path());
+        let ids = [ClusterId(0), ClusterId(1)];
+        let fields = [
+            "feature_d_prime",
+            "feature_bhattacharyya",
+            "feature_overlap_est",
+            "feature_l_ratio",
+        ];
+        let ev = eval_merge(&s, &ids);
+        assert!(ev.pairs[0].feature_d_prime.is_none());
+        let without = serde_json::to_value(ev).unwrap();
+        s.seed_pc_features();
+        let with = serde_json::to_value(eval_merge(&s, &ids)).unwrap();
+        for field in fields {
+            assert!(without["pairs"][0].get(field).is_none());
+            assert!(with["pairs"][0][field].as_f64().unwrap().is_finite());
+        }
+    }
 
     fn rng(s: &mut u64) -> f32 {
         *s ^= *s << 13;

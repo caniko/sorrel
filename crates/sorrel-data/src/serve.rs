@@ -289,6 +289,8 @@ pub fn tool_list() -> Value {
          "inputSchema": {"type": "object", "properties": {"sources": {"type": "array", "items": {"type": "integer"}}, "target": {"type": "integer"}}, "required": ["sources", "target"]}}),
         json!({"name": "split", "description": "Split a cluster. Preferred: candidate = a split handle (\"s12.1\") from brief level 3, suggest or split_proposals; it is refused as stale once that cluster changed. Alternatively cluster + spike_idx (positions in the cluster's time-sorted spikes) move into a new cluster. Queued as a proposal instead when the human chose propose-only",
          "inputSchema": {"type": "object", "properties": {"candidate": {"type": "string"}, "cluster": {"type": "integer"}, "spike_idx": {"type": "array", "items": {"type": "integer"}}}}}),
+        json!({"name": "remove_duplicates", "description": "Split duplicate spikes into a noise cluster tagged duplicate in one undoable edit. Unavailable in propose-only mode",
+         "inputSchema": {"type": "object", "properties": {"cluster": {"type": "integer"}, "tol_ms": {"type": "number", "minimum": 0, "default": 0.2}}, "required": ["cluster"]}}),
         json!({"name": "tag", "description": "Replace a cluster's tag set (provenance/review markers, e.g. drop review:* once decided); journaled and undoable",
          "inputSchema": {"type": "object", "properties": {"cluster": {"type": "integer"}, "tags": {"type": "array", "items": {"type": "string"}}}, "required": ["cluster", "tags"]}}),
         json!({"name": "rules_apply", "description": "Apply a rule set (TOML, as in rules_eval; default: the last evaluated or <save_dir>/.sorrel/review_rules.toml) as relabels in ONE undoable edit, and remember it in <save_dir>/.sorrel/review_rules.toml. Evaluate with rules_eval first. Queued as one proposal per relabel (reason rule:<name>) instead when the human chose propose-only",
@@ -547,7 +549,7 @@ where
                 let p = parse_proposal(&host.read(), &args)?;
                 return queue(host, env, p);
             }
-            "tag" | "undo" | "save" | "export_phy" => {
+            "remove_duplicates" | "tag" | "undo" | "save" | "export_phy" => {
                 return fail("the human set agents to propose-only: use propose")
             }
             _ => {}
@@ -639,6 +641,66 @@ where
             let ev = env.mine(apply_split(host, agent, cluster, spike_idx, &basis)?);
             let new_cluster = ev.clusters.last().map(|c| c.0);
             text(json!({"ok": true, "new_cluster": new_cluster, "version": ev.version}))
+        }
+        "remove_duplicates" => {
+            let c = arg_u32(args, "cluster")?;
+            let tol_ms = match args.get("tol_ms") {
+                None => 0.2,
+                Some(v) => v
+                    .as_f64()
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .ok_or_else(|| {
+                        ToolError::Failed("tol_ms must be a finite non-negative number".into())
+                    })?,
+            };
+            let (cluster, spike_idx, basis) = {
+                let s = host.read();
+                let cluster = check(&s, c)?;
+                let sr = s.provider.sample_rate();
+                let tol_samples = (tol_ms * 1e-3 * sr as f64).round().max(0.0) as u64;
+                let spike_idx = sorrel_compute::duplicate_spike_indices(
+                    s.spike_times(cluster),
+                    s.spike_amplitudes(cluster),
+                    tol_samples,
+                );
+                if spike_idx.is_empty() {
+                    return Ok(plain(format!("cluster {c}: no duplicates")));
+                }
+                (cluster, spike_idx, proposals::spike_basis(&s, cluster))
+            };
+            let duplicates = spike_idx.len();
+            let stale = || {
+                format!("cluster {c} changed since its spikes were read; read them again and retry")
+            };
+            let ev = host
+                .apply_built(agent, |s| {
+                    refuse_if_propose_only(host)?;
+                    if proposals::spike_basis(s, cluster) != basis {
+                        bail!("{}", stale());
+                    }
+                    let new_cluster = ClusterId(s.n_clusters());
+                    Ok(CurationCommand::batch(vec![
+                        CurationCommand::Split {
+                            cluster,
+                            spike_idx,
+                            new_cluster,
+                            by: Method::Algo("dedup".into()),
+                        },
+                        CurationCommand::Relabel {
+                            cluster: new_cluster,
+                            op: crate::command::PhyLabelOp::SetNoise,
+                        },
+                        CurationCommand::Tag {
+                            cluster: new_cluster,
+                            tags: vec!["duplicate".into()],
+                        },
+                    ]))
+                })?
+                .expect("dedup batch always has three children");
+            let ev = env.mine(ev);
+            text(
+                json!({"ok": true, "duplicates": duplicates, "new_cluster": ev.clusters.last().map(|c| c.0), "version": ev.version}),
+            )
         }
         "undo" => ok(env.mine(host.apply(agent, CurationCommand::Undo)?)),
         "rules_apply" => rules_apply(host, env, args)?,
@@ -2322,7 +2384,7 @@ mod tests {
         assert_eq!(replies[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(
             replies[1]["result"]["tools"].as_array().unwrap().len(),
-            23 + usize::from(cfg!(feature = "phy-export"))
+            24 + usize::from(cfg!(feature = "phy-export"))
         );
         let refractory = replies[1]["result"]["tools"]
             .as_array()
@@ -2465,6 +2527,96 @@ mod tests {
 
     fn payload(reply: &Value) -> Value {
         serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn merge_probe_displays_feature_separation_when_seeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::feature_subspace::tests::physical_test_session(dir.path());
+        let host = SessionHost::new(s);
+        let mut env = Env::new(dir.path(), false, label);
+        let req = call(1, "probe", json!({"q": "eval merge 0 1"}));
+        let run = |env: &mut _| texts(&handle_line(&host, env, &req).unwrap());
+        let before = run(&mut env);
+        assert!(
+            before.contains("0-1 dip_z") && !before.contains("feat_d'="),
+            "{before}"
+        );
+        host.write().seed_pc_features();
+        let after = run(&mut env);
+        assert!(
+            after.contains("feat_d'=") && after.contains("overlap="),
+            "{after}"
+        );
+    }
+
+    #[test]
+    fn remove_duplicates_is_one_undoable_noise_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let prov = MockProvider {
+            spikes: vec![vec![SampleIndex(10), SampleIndex(10), SampleIndex(20)]],
+            amps: vec![vec![1.0, 2.0, 3.0]],
+            n_samples: SampleIndex(1000),
+        };
+        let mut s = Session::new(prov, Journal::open(&dir.path().join("j.journal")).unwrap());
+        s.seed_amplitudes();
+        let host = SessionHost::new(s);
+        let mut env = Env::new(dir.path(), false, label);
+        let run = |env: &mut _, name, args| handle_line(&host, env, &call(1, name, args)).unwrap();
+        let c = ClusterId(0);
+        let child = ClusterId(1);
+        assert_eq!(
+            payload(&run(&mut env, "remove_duplicates", json!({"cluster": 0})))["new_cluster"],
+            1
+        );
+        {
+            let s = host.read();
+            assert_eq!(s.spike_amplitudes(c), &[2.0, 3.0]);
+            assert_eq!(s.spike_amplitudes(child), &[1.0]);
+            assert_eq!(
+                s.label(child),
+                Some(MockProvider::label_from_op(
+                    crate::command::PhyLabelOp::SetNoise
+                ))
+            );
+            assert_eq!(s.tags(child), &["duplicate"]);
+            let Some(CurationCommand::Batch { children }) = s.history_commands().last() else {
+                panic!("expected a batch");
+            };
+            assert!(children.iter().any(
+                |cmd| matches!(cmd, CurationCommand::Split { by: Method::Algo(name), .. } if name == "dedup")
+            ));
+        }
+        let version = host.read().version();
+        assert!(
+            texts(&run(&mut env, "remove_duplicates", json!({"cluster": 0})))
+                .contains("no duplicates")
+        );
+        assert_eq!(host.read().version(), version);
+        assert!(payload(&run(&mut env, "undo", json!({})))["ok"] == true);
+        assert_eq!(host.read().spike_amplitudes(c), &[1.0, 2.0, 3.0]);
+        assert!(host.read().spike_times(child).is_empty());
+        assert_eq!(
+            payload(&run(
+                &mut env,
+                "remove_duplicates",
+                json!({"cluster": 0, "tol_ms": 10.0})
+            ))["duplicates"],
+            2
+        );
+        assert_eq!(
+            run(
+                &mut env,
+                "remove_duplicates",
+                json!({"cluster": 0, "tol_ms": -1})
+            )["result"]["isError"],
+            true
+        );
+        host.set_policy(AgentPolicy::ProposeOnly);
+        assert_eq!(
+            run(&mut env, "remove_duplicates", json!({"cluster": 0}))["result"]["isError"],
+            true
+        );
     }
 
     #[test]

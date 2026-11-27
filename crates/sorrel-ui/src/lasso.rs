@@ -403,6 +403,515 @@ impl Lasso {
     }
 }
 
+/// Channel-local features other than principal components.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScalarFeature {
+    Energy,
+    Peak,
+    Valley,
+}
+
+impl ScalarFeature {
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Energy => "E",
+            Self::Peak => "Pk",
+            Self::Valley => "Vl",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Energy => "Energy",
+            Self::Peak => "Peak",
+            Self::Valley => "Valley",
+        }
+    }
+}
+
+/// A feature axis keyed by channel ID, not its position in the grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AxisId {
+    Time,
+    Pc { channel: u32, pc: u8 },
+    Scalar { channel: u32, kind: ScalarFeature },
+}
+
+impl AxisId {
+    pub fn channel(self) -> Option<u32> {
+        match self {
+            Self::Time => None,
+            Self::Pc { channel, .. } | Self::Scalar { channel, .. } => Some(channel),
+        }
+    }
+
+    pub fn short_label(self) -> String {
+        match self {
+            Self::Time => "t".into(),
+            Self::Pc { channel, pc } => format!("ch{channel}·PC{pc}"),
+            Self::Scalar { channel, kind } => format!("ch{channel}·{}", kind.short_label()),
+        }
+    }
+
+    pub fn chip_label(self) -> String {
+        match self {
+            Self::Time => "t".into(),
+            Self::Pc { channel, pc } => format!("{channel}p{pc}"),
+            Self::Scalar { channel, kind } => format!("{channel}{}", kind.short_label()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LimitOp {
+    #[default]
+    Include,
+    Exclude,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Limit {
+    pub x: AxisId,
+    pub y: AxisId,
+    pub op: LimitOp,
+    pub poly: Vec<[f32; 2]>,
+}
+
+impl Limit {
+    pub fn is_valid(&self) -> bool {
+        self.poly.len() >= 3
+    }
+
+    pub fn contains(&self, get_val: impl Fn(AxisId) -> Option<f32>) -> bool {
+        self.is_valid() && limit_contains(self.x, self.y, &self.poly, &get_val)
+    }
+
+    /// Whether this cell displays the axes directly (`false`) or transposed (`true`).
+    pub fn axes_match(&self, cell_x: AxisId, cell_y: AxisId) -> Option<bool> {
+        if (self.x, self.y) == (cell_x, cell_y) {
+            Some(false)
+        } else if (self.x, self.y) == (cell_y, cell_x) {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    pub fn poly_for_axes(&self, cell_x: AxisId, cell_y: AxisId) -> Option<Vec<[f32; 2]>> {
+        Some(if self.axes_match(cell_x, cell_y)? {
+            self.poly.iter().map(|&[x, y]| [y, x]).collect()
+        } else {
+            self.poly.clone()
+        })
+    }
+
+    pub fn set_poly_for_axes(
+        &mut self,
+        cell_x: AxisId,
+        cell_y: AxisId,
+        mut pts: Vec<[f32; 2]>,
+    ) -> bool {
+        let Some(swap) = self.axes_match(cell_x, cell_y) else {
+            return false;
+        };
+        if swap {
+            for p in &mut pts {
+                p.swap(0, 1);
+            }
+        }
+        self.poly = pts;
+        true
+    }
+
+    pub fn uses_only_channels(&self, channels: &[u32]) -> bool {
+        [self.x, self.y]
+            .into_iter()
+            .all(|axis| axis.channel().is_none_or(|ch| channels.contains(&ch)))
+    }
+}
+
+fn orient([x, y]: [f32; 2], swap: bool) -> [f32; 2] {
+    if swap {
+        [y, x]
+    } else {
+        [x, y]
+    }
+}
+
+fn limit_contains(
+    x: AxisId,
+    y: AxisId,
+    poly: &[[f32; 2]],
+    get_val: impl Fn(AxisId) -> Option<f32>,
+) -> bool {
+    let (Some(x), Some(y)) = (get_val(x), get_val(y)) else {
+        return false;
+    };
+    x.is_finite() && y.is_finite() && point_in_polygon([x, y], poly)
+}
+
+/// Bit-exact geometry and operation for one limit.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LimitKey {
+    x: AxisId,
+    y: AxisId,
+    op: LimitOp,
+    poly: Vec<[u32; 2]>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LimitSet {
+    pub committed: Vec<Limit>,
+    pub active: Lasso,
+    pub active_op: LimitOp,
+    /// Transient pointer state; not part of selection or its cache key.
+    pub edit: CommittedEdit,
+}
+
+type LimitGeometry<'a> = (AxisId, AxisId, LimitOp, &'a [[f32; 2]]);
+
+impl LimitSet {
+    fn limit_geometries(
+        &self,
+        active_axes: Option<(AxisId, AxisId)>,
+    ) -> impl Iterator<Item = LimitGeometry<'_>> {
+        self.committed
+            .iter()
+            .map(|limit| (limit.x, limit.y, limit.op, limit.poly.as_slice()))
+            .chain(
+                active_axes
+                    .filter(|_| self.active.is_closed())
+                    .map(|(x, y)| (x, y, self.active_op, self.active.points.as_slice())),
+            )
+    }
+
+    /// Intersect includes, then subtract any excludes. No limits means no selection.
+    pub fn matches(
+        &self,
+        active_axes: Option<(AxisId, AxisId)>,
+        get_val: impl Fn(AxisId) -> Option<f32>,
+    ) -> bool {
+        let mut limits = self
+            .limit_geometries(active_axes)
+            .filter(|(_, _, _, poly)| poly.len() >= 3)
+            .peekable();
+        limits.peek().is_some()
+            && limits.all(|(x, y, op, poly)| {
+                limit_contains(x, y, poly, &get_val) == (op == LimitOp::Include)
+            })
+    }
+
+    pub fn matches_committed(&self, get_val: impl Fn(AxisId) -> Option<f32>) -> bool {
+        self.matches(None, get_val)
+    }
+
+    pub fn key_data(&self, active_axes: Option<(AxisId, AxisId)>) -> Vec<LimitKey> {
+        self.limit_geometries(active_axes)
+            .map(|(x, y, op, poly)| LimitKey {
+                x,
+                y,
+                op,
+                poly: poly.iter().map(|p| p.map(f32::to_bits)).collect(),
+            })
+            .collect()
+    }
+
+    pub fn commit_active(&mut self, x: AxisId, y: AxisId) -> bool {
+        if !self.active.is_closed() {
+            return false;
+        }
+        self.committed.push(Limit {
+            x,
+            y,
+            op: self.active_op,
+            poly: std::mem::take(&mut self.active.points),
+        });
+        self.active.clear();
+        self.active_op = LimitOp::Include;
+        true
+    }
+
+    pub fn retain_channels(&mut self, channels: &[u32]) -> bool {
+        let len = self.committed.len();
+        self.committed
+            .retain(|limit| limit.uses_only_channels(channels));
+        let removed = self.committed.len() != len;
+        if removed {
+            self.edit = CommittedEdit::default();
+        }
+        removed
+    }
+
+    pub fn has_committed(&self) -> bool {
+        !self.committed.is_empty()
+    }
+
+    pub fn has_any_closed(&self) -> bool {
+        self.active.is_closed() || self.committed.iter().any(Limit::is_valid)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.has_committed() && !self.active.is_active()
+    }
+
+    pub fn remove_committed(&mut self, idx: usize) -> bool {
+        if idx >= self.committed.len() {
+            return false;
+        }
+        self.committed.remove(idx);
+        self.edit = CommittedEdit::default();
+        true
+    }
+
+    pub fn pop_committed(&mut self) -> Option<Limit> {
+        let limit = self.committed.pop()?;
+        self.edit = CommittedEdit::default();
+        Some(limit)
+    }
+
+    pub fn clear_all(&mut self) {
+        self.committed.clear();
+        self.active.clear();
+        self.active_op = LimitOp::Include;
+        self.edit = CommittedEdit::default();
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CommittedEdit {
+    blocked_press: Option<egui::Id>,
+    drag: Option<(egui::Id, usize, usize)>,
+    hover: Option<(egui::Id, AxisId, AxisId, usize, LimitHit)>,
+}
+
+impl CommittedEdit {
+    pub fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LimitHit {
+    Node(usize),
+    Edge(usize, Pos2),
+}
+
+impl LimitSet {
+    /// Let the active lasso handle input first; skip this call if it consumed
+    /// the gesture. On overlaps, vertices take priority over edges, then the
+    /// nearest handle wins (newest limit first on a tie).
+    pub fn interact_committed(
+        &mut self,
+        cell_x: AxisId,
+        cell_y: AxisId,
+        resp: &egui::Response,
+        to_data: impl Fn(Pos2) -> [f32; 2],
+        to_screen: impl Fn([f32; 2]) -> Pos2,
+    ) -> LassoEvent {
+        use egui::PointerButton::Primary;
+        let command = |m: egui::Modifiers| m.ctrl || m.command;
+        let (blocked, primary_down, secondary_down, press) = resp.ctx.input(|input| {
+            let mut blocked = command(input.modifiers) || self.active.is_drafting();
+            for event in &input.events {
+                let egui::Event::PointerButton {
+                    pos,
+                    pressed,
+                    modifiers,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+                if resp.rect.contains(*pos) {
+                    blocked |= command(*modifiers);
+                    if *pressed
+                        && (resp.is_pointer_button_down_on()
+                            || resp.clicked()
+                            || resp.secondary_clicked())
+                    {
+                        self.edit.blocked_press = blocked.then_some(resp.id);
+                    }
+                }
+            }
+            (
+                blocked,
+                input.pointer.primary_down(),
+                input.pointer.secondary_down(),
+                input.pointer.press_origin(),
+            )
+        });
+        let blocked = blocked || self.edit.blocked_press == Some(resp.id);
+        if !primary_down && !secondary_down && self.edit.blocked_press == Some(resp.id) {
+            self.edit.blocked_press = None;
+        }
+        let old_hover = self.edit.hover;
+        if old_hover.is_some_and(|(owner, ..)| owner == resp.id) {
+            self.edit.hover = None;
+        }
+
+        let mut ev = LassoEvent::default();
+        let at = resp.interact_pointer_pos().map(|p| resp.rect.clamp(p));
+        let started = resp.drag_started_by(Primary);
+        let stopped = resp.drag_stopped_by(Primary);
+        if started
+            || (!primary_down
+                && !stopped
+                && self.edit.drag.is_some_and(|(owner, ..)| owner == resp.id))
+        {
+            self.edit.drag = None;
+        }
+        let pick = |set: &Self, p, edges| set.pick_committed(cell_x, cell_y, p, &to_screen, edges);
+        if let Some((limit, LimitHit::Node(node))) = press
+            .filter(|_| started && !blocked)
+            .and_then(|p| pick(self, p, false))
+        {
+            self.edit.drag = Some((resp.id, limit, node));
+            resp.request_focus();
+        }
+
+        if let Some((owner, idx, node)) = self.edit.drag.filter(|(owner, ..)| *owner == resp.id) {
+            let target = self
+                .committed
+                .get_mut(idx)
+                .filter(|_| !blocked)
+                .and_then(|limit| {
+                    let swap = limit.axes_match(cell_x, cell_y)?;
+                    Some((limit.poly.get_mut(node)?, swap))
+                });
+            if let Some((point, swap)) = target {
+                ev.consumed = true;
+                if let Some(p) = at.filter(|_| resp.dragged_by(Primary) || stopped) {
+                    let new = orient(to_data(p), swap);
+                    ev.changed = *point != new;
+                    *point = new;
+                }
+                self.edit.hover = Some((owner, cell_x, cell_y, idx, LimitHit::Node(node)));
+            }
+            if stopped || blocked || !ev.consumed {
+                self.edit.drag = None;
+                resp.ctx.request_repaint();
+            }
+        } else if !blocked {
+            if let Some((idx, hit)) = at
+                .filter(|_| resp.double_clicked() || resp.secondary_clicked())
+                .and_then(|p| pick(self, p, resp.double_clicked()))
+            {
+                let limit = &mut self.committed[idx];
+                ev.consumed = true;
+                match hit {
+                    LimitHit::Node(i) if resp.secondary_clicked() && limit.poly.len() > 3 => {
+                        limit.poly.remove(i);
+                        ev.changed = true;
+                    }
+                    LimitHit::Edge(i, p) => {
+                        let swap = limit.axes_match(cell_x, cell_y) == Some(true);
+                        limit.poly.insert(i + 1, orient(to_data(p), swap));
+                        ev.changed = true;
+                    }
+                    LimitHit::Node(_) => {}
+                }
+            }
+            if let Some((idx, hit)) = resp.hover_pos().and_then(|p| pick(self, p, true)) {
+                self.edit.hover = Some((resp.id, cell_x, cell_y, idx, hit));
+            }
+        }
+        if ev.changed || self.edit.hover != old_hover {
+            resp.ctx.request_repaint();
+        }
+        ev
+    }
+
+    fn pick_committed(
+        &self,
+        cell_x: AxisId,
+        cell_y: AxisId,
+        p: Pos2,
+        to_screen: impl Fn([f32; 2]) -> Pos2,
+        edges: bool,
+    ) -> Option<(usize, LimitHit)> {
+        self.committed
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, limit)| limit.is_valid())
+            .filter_map(|(idx, limit)| {
+                let swap = limit.axes_match(cell_x, cell_y)?;
+                let pts: Vec<_> = limit
+                    .poly
+                    .iter()
+                    .map(|&v| to_screen(orient(v, swap)))
+                    .collect();
+                if let Some(i) = nearest_node(&pts, p, NODE_HIT) {
+                    Some(((false, pts[i].distance_sq(p)), idx, LimitHit::Node(i)))
+                } else if edges {
+                    nearest_edge(&pts, p, EDGE_HIT)
+                        .map(|(i, q)| ((true, q.distance_sq(p)), idx, LimitHit::Edge(i, q)))
+                } else {
+                    None
+                }
+            })
+            .min_by(|a, b| {
+                (a.0)
+                    .0
+                    .cmp(&(b.0).0)
+                    .then_with(|| (a.0).1.total_cmp(&(b.0).1))
+            })
+            .map(|(_, idx, hit)| (idx, hit))
+    }
+
+    /// Paint matching committed outlines. `exclude` should be the theme's danger color.
+    pub fn paint_committed_in_cell(
+        &self,
+        cell_x: AxisId,
+        cell_y: AxisId,
+        painter: &egui::Painter,
+        to_screen: impl Fn([f32; 2]) -> Pos2,
+        include: Color32,
+        exclude: Color32,
+    ) {
+        for (idx, limit) in self
+            .committed
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.is_valid())
+        {
+            let Some(swap) = limit.axes_match(cell_x, cell_y) else {
+                continue;
+            };
+            let color = match limit.op {
+                LimitOp::Include => include,
+                LimitOp::Exclude => exclude,
+            };
+            let pts: Vec<_> = limit
+                .poly
+                .iter()
+                .map(|&p| to_screen(orient(p, swap)))
+                .collect();
+            let stroke = Stroke::new(1.5_f32, color);
+            if let Some((_, _, _, _, hit)) = self.edit.hover.filter(|&(_, x, y, i, _)| {
+                (x, y, i) == (cell_x, cell_y, idx) && !self.active.is_drafting()
+            }) {
+                painter.add(egui::Shape::closed_line(pts.clone(), stroke));
+                for (i, p) in pts.into_iter().enumerate() {
+                    if hit == LimitHit::Node(i) {
+                        painter.circle(p, 5.0, color, Stroke::new(1.5_f32, Color32::WHITE));
+                    } else {
+                        painter.circle_filled(p, 3.5, color);
+                    }
+                }
+                if let LimitHit::Edge(_, p) = hit {
+                    painter.circle_stroke(p, 5.0, stroke);
+                    for d in [egui::vec2(3.0, 0.0), egui::vec2(0.0, 3.0)] {
+                        painter.line_segment([p - d, p + d], stroke);
+                    }
+                }
+            } else {
+                painter.add(egui::Shape::closed_line(pts, stroke));
+            }
+        }
+    }
+}
+
 /// Index of the node within `r` px of `p`, nearest first.
 fn nearest_node(pts: &[Pos2], p: Pos2, r: f32) -> Option<usize> {
     pts.iter()
@@ -489,6 +998,217 @@ pub fn point_in_polygon(p: [f32; 2], poly: &[[f32; 2]]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const X: AxisId = AxisId::Time;
+    const Y: AxisId = AxisId::Pc { channel: 7, pc: 0 };
+
+    fn rect_limit(op: LimitOp, [left, top]: [f32; 2], [right, bottom]: [f32; 2]) -> Limit {
+        Limit {
+            x: X,
+            y: Y,
+            op,
+            poly: vec![[left, top], [right, top], [right, bottom], [left, bottom]],
+        }
+    }
+
+    #[test]
+    fn lasso_limits_compose_includes_and_excludes() {
+        let mut set = LimitSet::default();
+        let sample = |x, y| move |axis| Some(if axis == X { x } else { y });
+        assert!(!set.matches_committed(sample(3.0, 2.0)));
+        let mut invalid = rect_limit(LimitOp::Include, [0.0, 0.0], [1.0, 1.0]);
+        invalid.poly.truncate(2);
+        set.committed.push(invalid);
+        assert!(!set.matches_committed(sample(3.0, 2.0)));
+        set.committed
+            .push(rect_limit(LimitOp::Include, [0.0, 0.0], [8.0, 4.0]));
+        assert!(set.matches_committed(sample(7.0, 2.0)));
+        assert!(!set.matches_committed(sample(7.0, 7.0)));
+        assert!(!set.matches_committed(|axis| (axis == X).then_some(3.0)));
+        assert!(!set.matches_committed(sample(f32::NAN, 2.0)));
+        assert!(!set.matches_committed(sample(3.0, f32::INFINITY)));
+
+        let mut swapped = rect_limit(LimitOp::Include, [2.0, 1.0], [5.0, 7.0]);
+        swapped.poly = swapped.poly_for_axes(Y, X).unwrap();
+        (swapped.x, swapped.y) = (Y, X);
+        set.committed.push(swapped);
+        assert!(set.matches_committed(sample(3.0, 2.0)));
+        assert!(!set.matches_committed(sample(7.0, 2.0)));
+        assert!(!set.matches_committed(sample(3.0, 6.0)));
+
+        set.active = Lasso::new(0, rect_limit(LimitOp::Exclude, [2.5, 1.5], [3.5, 2.5]).poly);
+        set.active_op = LimitOp::Exclude;
+        assert!(set.matches_committed(sample(3.0, 2.0)));
+        assert!(!set.matches(Some((X, Y)), sample(3.0, 2.0)));
+        assert!(set.matches(Some((X, Y)), sample(4.0, 2.0)));
+
+        set.committed.clear();
+        assert!(!set.matches(Some((X, Y)), sample(3.0, 2.0)));
+        assert!(set.matches(Some((X, Y)), sample(4.0, 2.0)));
+        assert!(set.matches(Some((X, Y)), |_| None));
+        assert!(set.matches(Some((X, Y)), sample(3.0, f32::NAN)));
+    }
+
+    #[test]
+    fn lasso_limit_lifecycle_and_bit_exact_key() {
+        let mut set = LimitSet::default();
+        assert!(set.is_empty());
+        assert!(!set.commit_active(X, Y));
+        let limit = rect_limit(LimitOp::Exclude, [0.0, 0.0], [8.0, 4.0]);
+        set.active = Lasso::new(2, limit.poly.clone());
+        set.active_op = limit.op;
+        assert!(set.has_any_closed());
+        assert!(!set.has_committed());
+        assert!(set.key_data(None).is_empty());
+        let key = set.key_data(Some((X, Y)));
+        set.active.points[0][0] = -0.0;
+        assert_ne!(key, set.key_data(Some((X, Y))));
+        set.active.points[0][0] = 0.0;
+        assert!(set.commit_active(X, Y));
+        assert!(set.has_committed());
+        assert!(set.has_any_closed());
+        assert!(!set.active.is_active());
+        assert_eq!(set.active_op, LimitOp::Include);
+        assert_eq!(set.key_data(None), key);
+        assert_eq!(set.committed, std::slice::from_ref(&limit));
+        let other = AxisId::Scalar {
+            channel: 8,
+            kind: ScalarFeature::Energy,
+        };
+        set.committed.push(Limit {
+            x: other,
+            ..limit.clone()
+        });
+        set.committed.push(Limit {
+            y: X,
+            ..limit.clone()
+        });
+        assert!(set.retain_channels(&[7]));
+        assert_eq!(set.committed.len(), 2);
+        assert!(!set.retain_channels(&[7]));
+        assert!(!set.remove_committed(2));
+        assert!(set.remove_committed(1));
+        assert_eq!(set.pop_committed(), Some(limit.clone()));
+        assert_eq!(set.pop_committed(), None);
+        assert!(set.is_empty());
+        assert!(!set.has_any_closed());
+        set.active.points.push([1.0, 2.0]);
+        set.active_op = LimitOp::Exclude;
+        assert!(!set.is_empty());
+        assert!(!set.has_any_closed());
+        set.committed.push(limit);
+        set.clear_all();
+        assert!(set.is_empty());
+        assert_eq!(set.active_op, LimitOp::Include);
+    }
+
+    #[test]
+    fn lasso_limit_polygons_roundtrip_through_either_cell_orientation() {
+        let mut limit = rect_limit(LimitOp::Include, [1.0, 2.0], [8.0, 4.0]);
+        let poly = limit.poly.clone();
+        assert_eq!(limit.poly_for_axes(X, Y), Some(poly.clone()));
+        assert!(limit.set_poly_for_axes(X, Y, poly.clone()));
+        let mut swapped = limit.poly_for_axes(Y, X).unwrap();
+        assert_eq!(swapped[0], [2.0, 1.0]);
+        swapped[0] = [3.0, 5.0];
+        assert!(limit.set_poly_for_axes(Y, X, swapped.clone()));
+        assert_eq!(limit.poly[0], [5.0, 3.0]);
+        assert_eq!(limit.poly_for_axes(Y, X), Some(swapped));
+        assert_eq!(limit.poly_for_axes(X, X), None);
+        assert!(!limit.set_poly_for_axes(X, X, vec![]));
+        assert_eq!(limit.poly[0], [5.0, 3.0]);
+    }
+
+    #[test]
+    fn lasso_committed_edits_roundtrip_through_a_transposed_cell() {
+        use egui::{Event, Modifiers, PointerButton};
+
+        let mut set = LimitSet::default();
+        set.committed
+            .push(rect_limit(LimitOp::Include, [25.0, 30.0], [85.0, 90.0]));
+        let ctx = egui::Context::default();
+        let cell = egui::Rect::from_min_size(Pos2::ZERO, egui::Vec2::splat(120.0));
+        let frame = |set: &mut LimitSet, events| {
+            let mut event = LassoEvent::default();
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(cell),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let resp =
+                        ui.interact(cell, ui.id().with("limit"), egui::Sense::click_and_drag());
+                    event = set.interact_committed(Y, X, &resp, |p| [p.x, p.y], |p| p.into());
+                },
+            );
+            event
+        };
+        let button = |pos, button, pressed, modifiers| Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers,
+        };
+        let click = |set: &mut LimitSet, pos, which, modifiers| {
+            frame(
+                set,
+                vec![
+                    Event::PointerMoved(pos),
+                    button(pos, which, true, modifiers),
+                ],
+            );
+            frame(set, vec![button(pos, which, false, Modifiers::NONE)])
+        };
+
+        frame(&mut set, vec![]);
+        let start = Pos2::new(30.0, 25.0);
+        frame(
+            &mut set,
+            vec![
+                Event::PointerMoved(start),
+                button(start, PointerButton::Primary, true, Modifiers::NONE),
+            ],
+        );
+        let mid = Pos2::new(45.0, 35.0);
+        let drag = frame(&mut set, vec![Event::PointerMoved(mid)]);
+        assert!(drag.consumed && drag.changed && !drag.drawn);
+        assert_eq!(set.committed[0].poly[0], [35.0, 45.0]);
+        let end = Pos2::new(50.0, 35.0);
+        let release = frame(
+            &mut set,
+            vec![button(end, PointerButton::Primary, false, Modifiers::NONE)],
+        );
+        assert!(release.consumed && release.changed);
+        assert_eq!(set.committed[0].poly[0], [35.0, 50.0]);
+
+        let edge = Pos2::new(90.0, 55.0);
+        click(&mut set, edge, PointerButton::Primary, Modifiers::NONE);
+        let insert = click(&mut set, edge, PointerButton::Primary, Modifiers::NONE);
+        assert!(insert.consumed && insert.changed && !insert.drawn);
+        assert_eq!(set.committed[0].poly.len(), 5);
+        assert_eq!(set.committed[0].poly[3], [55.0, 90.0]);
+
+        let blocked = click(&mut set, edge, PointerButton::Secondary, Modifiers::CTRL);
+        assert!(!blocked.changed);
+        set.active.set_test_drafting(true);
+        let blocked = click(&mut set, edge, PointerButton::Secondary, Modifiers::NONE);
+        assert!(!blocked.changed);
+        set.active.set_test_drafting(false);
+        set.active.set_test_editing(true);
+        let blocked = click(&mut set, edge, PointerButton::Secondary, Modifiers::NONE);
+        assert!(!blocked.changed);
+        set.active.set_test_editing(false);
+
+        let delete = click(&mut set, edge, PointerButton::Secondary, Modifiers::NONE);
+        assert!(delete.consumed && delete.changed);
+        assert_eq!(set.committed[0].poly.len(), 4);
+        assert!(click(&mut set, end, PointerButton::Secondary, Modifiers::NONE).changed);
+        let corner = Pos2::new(30.0, 85.0);
+        let at_minimum = click(&mut set, corner, PointerButton::Secondary, Modifiers::NONE);
+        assert!(at_minimum.consumed && !at_minimum.changed);
+        assert_eq!(set.committed[0].poly.len(), 3);
+    }
 
     fn frame(ctx: &egui::Context, lasso: &mut Lasso, events: Vec<egui::Event>) -> [LassoEvent; 2] {
         frame_with_modifiers(ctx, lasso, events, egui::Modifiers::COMMAND)

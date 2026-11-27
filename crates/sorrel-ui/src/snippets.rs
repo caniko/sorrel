@@ -49,6 +49,9 @@ pub enum Snippet {
     Maximize,
     /// `:pop`: move that pane to its own window.
     PopOut,
+    /// `:dedup [ms]`: split duplicate spikes (within tolerance ms, default 0.2)
+    /// into a noise cluster tagged `"duplicate"`.
+    Dedup(Option<f32>),
 }
 
 /// Parse one snippet; the leading `:` is optional. Errors are shown to the
@@ -93,6 +96,11 @@ pub fn parse(text: &str) -> Result<Snippet, String> {
         }),
         "max" => Snippet::Maximize,
         "pop" => Snippet::PopOut,
+        "dedup" => Snippet::Dedup(
+            (!rest.is_empty())
+                .then(|| number("a tolerance in ms"))
+                .transpose()?,
+        ),
         "frb" => Snippet::RateBinSize(number("a bin size in seconds")?),
         "frmin" | "frmax" => {
             let t = (!rest.is_empty())
@@ -191,6 +199,13 @@ mod tests {
         assert!(parse(":km 1").is_err());
         assert_eq!(parse(":max"), Ok(Snippet::Maximize));
         assert_eq!(parse(":pop"), Ok(Snippet::PopOut));
+        assert_eq!(parse(":dedup"), Ok(Snippet::Dedup(None)));
+        assert_eq!(parse(":dedup 0.3"), Ok(Snippet::Dedup(Some(0.3))));
+        assert_eq!(parse(":dedup 0"), Ok(Snippet::Dedup(Some(0.0))));
+        assert!(parse(":dedup -0.1").is_err());
+        assert!(parse(":dedup NaN").is_err());
+        assert!(parse(":dedup inf").is_err());
+        assert!(parse(":dedup abc").is_err());
         assert_eq!(parse(":frb 2.5"), Ok(Snippet::RateBinSize(2.5)));
         assert_eq!(parse(":frmin 10"), Ok(Snippet::RateXMin(Some(10.0))));
         assert_eq!(parse(":frmax"), Ok(Snippet::RateXMax(None)));

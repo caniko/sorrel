@@ -2270,12 +2270,44 @@ where
 
 // ---- QualityView (per-cluster composite score breakdown) ---------------
 
+type PairwiseRows = Vec<(
+    ClusterId,
+    ClusterId,
+    Option<sorrel_compute::PairwiseSeparation>,
+)>;
+
+/// Compute pairwise feature separation for every unordered pair of `selection`
+/// when `2..=6` clusters are selected and PC features are available.
+fn compute_pairwise_separations<P: DataProvider>(
+    session: &Session<P>,
+    selection: &[ClusterId],
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> PairwiseRows {
+    use std::sync::atomic::Ordering;
+    let mut out = Vec::new();
+    if !(2..=6).contains(&selection.len()) || !session.has_pc_features() {
+        return out;
+    }
+    for i in 0..selection.len() {
+        for j in (i + 1)..selection.len() {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return out;
+            }
+            let (a, b) = (selection[i], selection[j]);
+            let sep = sorrel_data::pairwise_cluster_separation(session, a, b);
+            out.push((a, b, sep));
+        }
+    }
+    out
+}
+
 /// Job-backed memo of [`cluster_quality`] for the selection, keyed on
 /// selection + curation version: the PC-isolation k-NN plus the disk-cache
 /// probe it performs are far too heavy for the UI thread.
 #[derive(Default)]
 pub struct QualityCache {
     memo: crate::jobs::Memo<(Vec<ClusterId>, u64), std::sync::Arc<Vec<QualityBreakdown>>>,
+    pairwise_memo: crate::jobs::Memo<(Vec<ClusterId>, u64), std::sync::Arc<PairwiseRows>>,
 }
 
 impl QualityCache {
@@ -2310,12 +2342,28 @@ impl QualityCache {
             .cloned()
     }
 
+    fn ensure_pairwise<P: DataProvider>(
+        &mut self,
+        session: &Session<P>,
+        selection: &[ClusterId],
+        jobs: &crate::jobs::JobCtx<Session<P>>,
+    ) -> Option<std::sync::Arc<PairwiseRows>> {
+        let key = (selection.to_vec(), session.metrics_version());
+        let clusters = selection.to_vec();
+        self.pairwise_memo
+            .ensure(key, &jobs.session, jobs.repaint(), move |s, cancel| {
+                std::sync::Arc::new(compute_pairwise_separations(s, &clusters, Some(cancel)))
+            })
+            .cloned()
+    }
+
     pub fn cancel(&mut self) {
         self.memo.cancel();
+        self.pairwise_memo.cancel();
     }
 
     pub fn pending(&self) -> bool {
-        self.memo.pending()
+        self.memo.pending() || self.pairwise_memo.pending()
     }
 }
 
@@ -2513,6 +2561,79 @@ pub fn quality_view<P: DataProvider>(
             }
         });
     });
+
+    if (2..=6).contains(&selection.len()) && has_features {
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new("Pairwise separation")
+            .default_open(true)
+            .show(ui, |ui| {
+                let Some(pairs) = cache.ensure_pairwise(session, selection, jobs) else {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("computing pairwise separation…");
+                    });
+                    return;
+                };
+                egui::ScrollArea::horizontal()
+                    .id_salt("pairwise_separation_scroll")
+                    .show(ui, |ui| {
+                        let tb = TableBuilder::new(ui)
+                            .id_salt("pairwise_separation_table")
+                            .striped(true)
+                            .resizable(false)
+                            .column(Column::exact(84.0))
+                            .column(Column::exact(52.0))
+                            .column(Column::exact(56.0))
+                            .column(Column::exact(60.0))
+                            .column(Column::exact(58.0));
+                        tb.header(22.0, |mut h| {
+                            h.col(|ui| {
+                                ui.strong("Pair");
+                            });
+                            for name in ["d'", "Bhatt.", "Overlap", "L-ratio"] {
+                                h.col(|ui| {
+                                    num_head(ui, name);
+                                });
+                            }
+                        })
+                        .body(|mut body| {
+                            for &(a, b, sep) in pairs.iter() {
+                                body.row(22.0, |mut row| {
+                                    row.col(|ui| {
+                                        ui.label(format!("c{a} × c{b}"));
+                                    });
+                                    let fmt_opt = |v: Option<f32>, fmt: fn(f32) -> String| {
+                                        v.filter(|x| x.is_finite())
+                                            .map_or_else(|| "—".to_owned(), fmt)
+                                    };
+                                    let dp = sep.map(|s| s.d_prime).filter(|v| v.is_finite());
+                                    let bh = sep.map(|s| s.bhattacharyya).filter(|v| v.is_finite());
+                                    let ov = sep.map(|s| s.overlap_est).filter(|v| v.is_finite());
+                                    let lr = sep.map(|s| s.l_ratio_ab).filter(|v| v.is_finite());
+                                    let dp_col = dp.and_then(|v| (v < 2.0).then_some(theme.warn));
+                                    let ov_col = ov.and_then(|v| (v > 0.1).then_some(theme.warn));
+                                    row.col(|ui| {
+                                        num_cell(ui, fmt_opt(dp, |v| format!("{v:.2}")), dp_col)
+                                    });
+                                    row.col(|ui| {
+                                        num_cell(ui, fmt_opt(bh, |v| format!("{v:.2}")), None)
+                                    });
+                                    row.col(|ui| {
+                                        num_cell(
+                                            ui,
+                                            fmt_opt(ov, |v| format!("{:.1}%", v * 100.0)),
+                                            ov_col,
+                                        )
+                                    });
+                                    row.col(|ui| {
+                                        num_cell(ui, fmt_opt(lr, |v| format!("{v:.3}")), None)
+                                    });
+                                });
+                            }
+                        });
+                    });
+            });
+    }
 }
 
 /// A coloured, right-aligned sub-score with its raw metric on hover.
@@ -3257,5 +3378,156 @@ mod axis_tests {
         }
         assert!(nice_ticks(1.0, 1.0, 5).is_empty());
         assert!(nice_ticks(f32::NAN, 1.0, 5).is_empty());
+    }
+
+    #[test]
+    fn pairwise_separation_rows_cover_all_unordered_pairs_when_pc_features_exist() {
+        use sorrel_data::journal::Journal;
+        use sorrel_data::Session;
+        use sorrel_io::{
+            ClusterId, DataProvider, HasPcFeatures, HasSpikeTemplates, SampleIndex, TraceSamples,
+            TraceSlice,
+        };
+
+        struct PairwiseProvider {
+            spikes: Vec<Vec<SampleIndex>>,
+            pc_features: Vec<f32>,
+            pc_indices: Vec<Vec<u32>>,
+            templates: Vec<Vec<u32>>,
+        }
+
+        impl DataProvider for PairwiseProvider {
+            type Label = u8;
+            fn n_channels(&self) -> u32 {
+                2
+            }
+            fn sample_rate(&self) -> f32 {
+                30_000.0
+            }
+            fn n_samples(&self) -> SampleIndex {
+                SampleIndex(100_000)
+            }
+            fn n_clusters(&self) -> u32 {
+                self.spikes.len() as u32
+            }
+            fn spike_times(&self, c: ClusterId) -> &[SampleIndex] {
+                self.spikes.get(c.idx()).map(Vec::as_slice).unwrap_or(&[])
+            }
+            fn trace(&self, _: SampleIndex, _: u32) -> TraceSlice<'_> {
+                TraceSlice {
+                    start: SampleIndex(0),
+                    n_channels: 0,
+                    samples: TraceSamples::I16(&[]),
+                }
+            }
+            fn initial_labels(&self) -> Vec<u8> {
+                vec![0; self.spikes.len()]
+            }
+        }
+
+        impl HasSpikeTemplates for PairwiseProvider {
+            fn spike_templates(&self, c: ClusterId) -> &[u32] {
+                self.templates
+                    .get(c.idx())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+            }
+        }
+
+        impl HasPcFeatures for PairwiseProvider {
+            fn pc_features(&self) -> &[f32] {
+                &self.pc_features
+            }
+            fn pc_shape(&self) -> (usize, usize) {
+                (1, 2)
+            }
+            fn pc_feature_ind(&self) -> &[u32] {
+                // Templates 0, 1, 2 all share physical channels [0, 1].
+                &[0, 1, 0, 1, 0, 1]
+            }
+            fn spike_pc_indices(&self, c: ClusterId) -> &[u32] {
+                self.pc_indices
+                    .get(c.idx())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let provider = PairwiseProvider {
+            spikes: vec![
+                vec![
+                    SampleIndex(10),
+                    SampleIndex(20),
+                    SampleIndex(30),
+                    SampleIndex(35),
+                ],
+                vec![
+                    SampleIndex(40),
+                    SampleIndex(50),
+                    SampleIndex(60),
+                    SampleIndex(65),
+                ],
+                vec![
+                    SampleIndex(70),
+                    SampleIndex(80),
+                    SampleIndex(90),
+                    SampleIndex(95),
+                ],
+            ],
+            // 12 spikes × 1 pc × 2 chans (non-collinear so 2×2 covariance is full-rank):
+            // cluster 0 near (0, 0), cluster 1 near (10, 10), cluster 2 near (0.3, 0.2).
+            pc_features: vec![
+                -1.0, 0.0, 1.0, 0.0, 0.0, -1.0, 0.0, 1.0, // c0
+                9.0, 10.0, 11.0, 10.0, 10.0, 9.0, 10.0, 11.0, // c1
+                -0.7, 0.2, 1.3, 0.2, 0.3, -0.8, 0.3, 1.2, // c2
+            ],
+            pc_indices: vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]],
+            templates: vec![vec![0, 0, 0, 0], vec![1, 1, 1, 1], vec![2, 2, 2, 2]],
+        };
+        let journal = Journal::open_or_create(&dir.path().join("j.sqlite"), 0xBEEF, 3).unwrap();
+        let mut session = Session::new(provider, journal);
+        session.seed_templates();
+
+        // Without PC features seeded: empty.
+        assert!(
+            super::compute_pairwise_separations(&session, &[ClusterId(0), ClusterId(1)], None)
+                .is_empty()
+        );
+
+        session.seed_pc_features();
+        // Fewer than 2 or more than 6 clusters: empty.
+        assert!(super::compute_pairwise_separations(&session, &[ClusterId(0)], None).is_empty());
+        assert!(super::compute_pairwise_separations(
+            &session,
+            &[0, 1, 2, 0, 1, 2, 0].map(ClusterId),
+            None
+        )
+        .is_empty());
+
+        let rows = super::compute_pairwise_separations(
+            &session,
+            &[ClusterId(0), ClusterId(1), ClusterId(2)],
+            None,
+        );
+        assert_eq!(rows.len(), 3, "3 choose 2 = 3 unordered pairs");
+        assert_eq!((rows[0].0, rows[0].1), (ClusterId(0), ClusterId(1)));
+        assert_eq!((rows[1].0, rows[1].1), (ClusterId(0), ClusterId(2)));
+        assert_eq!((rows[2].0, rows[2].1), (ClusterId(1), ClusterId(2)));
+        let sep_far = rows[0].2.expect("c0 x c1 separation");
+        let sep_near = rows[1].2.expect("c0 x c2 separation");
+        assert!(sep_far.d_prime.is_finite() && sep_near.d_prime.is_finite());
+        assert!(
+            sep_far.d_prime > sep_near.d_prime,
+            "far pair d' ({}) should exceed near pair d' ({})",
+            sep_far.d_prime,
+            sep_near.d_prime
+        );
+        assert!(
+            sep_far.overlap_est < sep_near.overlap_est,
+            "far pair overlap ({}) should be smaller than near pair overlap ({})",
+            sep_far.overlap_est,
+            sep_near.overlap_est
+        );
     }
 }

@@ -41,6 +41,7 @@ pub enum Intent {
     ToggleMaximize,
     Split,
     SplitInit,
+    RemoveDuplicates,
     ToggleFeatureChannels,
     CycleAmplitudes(i32),
     Snippet(&'static str),

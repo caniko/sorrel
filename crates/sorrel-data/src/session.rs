@@ -872,6 +872,7 @@ impl<P: DataProvider> Session<P> {
         clusters.dedup();
         let mut children: Vec<CurationCommand> = clusters
             .into_iter()
+            .filter(|&c| c.0 < self.n_clusters())
             .filter(|&c| !self.tags(c).iter().any(|t| t == "src:agent"))
             .map(|cluster| {
                 let mut tags = self.tags(cluster).to_vec();

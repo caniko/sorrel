@@ -86,6 +86,8 @@ pub struct QcRow {
     pub epoch_amp_ratio: f32,
     /// Lowest / highest fitted firing rate.
     pub epoch_rate_ratio: f32,
+    /// Spikes discarded by deduplication at a fixed 0.2 ms tolerance.
+    pub duplicate_spikes: u32,
 }
 
 impl Default for QcRow {
@@ -134,6 +136,7 @@ impl Default for QcRow {
             n_epochs: n,
             epoch_amp_ratio: n,
             epoch_rate_ratio: n,
+            duplicate_spikes: 0,
         }
     }
 }
@@ -141,7 +144,7 @@ impl Default for QcRow {
 impl QcRow {
     /// Every metric column name, in TSV order. The single source of truth
     /// for names used by `get`, the rule engine, and the exports.
-    pub const METRICS: [&'static str; 40] = [
+    pub const METRICS: [&'static str; 41] = [
         "n_spikes",
         "firing_rate",
         "mean_amplitude",
@@ -182,6 +185,7 @@ impl QcRow {
         "n_epochs",
         "epoch_amp_ratio",
         "epoch_rate_ratio",
+        "duplicate_spikes",
     ];
 
     /// `{"cluster_id": .., "<metric>": number | null, ...}` — NaN becomes
@@ -190,6 +194,10 @@ impl QcRow {
         let mut m = serde_json::Map::new();
         m.insert("cluster_id".into(), self.cluster_id.into());
         for name in Self::METRICS {
+            if name == "duplicate_spikes" {
+                m.insert(name.into(), self.duplicate_spikes.into());
+                continue;
+            }
             let v = self.get(name).unwrap_or(f32::NAN);
             m.insert(
                 name.to_string(),
@@ -246,6 +254,7 @@ impl QcRow {
             "n_epochs" => self.n_epochs,
             "epoch_amp_ratio" => self.epoch_amp_ratio,
             "epoch_rate_ratio" => self.epoch_rate_ratio,
+            "duplicate_spikes" => self.duplicate_spikes as f32,
             _ => return None,
         })
     }
@@ -259,6 +268,7 @@ impl QcRow {
             // Do not round integer counts through the f32 metric lookup.
             "n_spikes" => self.n_spikes.to_string(),
             "isi_violations" => self.isi_violations.to_string(),
+            "duplicate_spikes" => self.duplicate_spikes.to_string(),
             _ => match self.get(name).filter(|v| v.is_finite()) {
                 Some(value) => num(value),
                 None => missing.to_owned(),
@@ -333,6 +343,7 @@ fn collect_qc<P: DataProvider>(
     let sample_rate = session.provider.sample_rate();
     let sr = sample_rate.max(1.0);
     let refractory_samples = windows.fixed_samples(sr);
+    let tol_samples = (0.2e-3 * sr as f64).round().max(0.0) as u64;
     let (_, tpl_samples, tpl_channels) = session.template_shape();
     // ACG at 1 ms bins / 50 ms, the report's (and cache's) window.
     let acg_window = (0.050 * sr) as u32;
@@ -448,6 +459,8 @@ fn collect_qc<P: DataProvider>(
             },
             epoch_amp_ratio: epoch_amp_ratio(&epochs),
             epoch_rate_ratio: epoch_ratio(&epochs, |e| e.rate_hz),
+            duplicate_spikes: sorrel_compute::duplicate_spike_indices(times, amps, tol_samples)
+                .len() as u32,
         });
     }
     rows
@@ -1054,7 +1067,7 @@ pub(crate) mod tests {
     fn export_writes_v1_rows_and_separate_provenance() {
         let prov = MockProvider {
             spikes: vec![
-                vec![SampleIndex(10), SampleIndex(30), SampleIndex(150)],
+                vec![SampleIndex(10), SampleIndex(10), SampleIndex(150)],
                 vec![SampleIndex(20), SampleIndex(200)],
                 vec![SampleIndex(100)],
                 vec![],
@@ -1115,7 +1128,18 @@ pub(crate) mod tests {
             .unwrap();
         let json_keys: Vec<&str> = first_row.split('"').skip(1).step_by(2).collect();
         assert_eq!(tsv_keys, json_keys);
-        assert!(tsv_keys.ends_with(&["n_epochs", "epoch_amp_ratio", "epoch_rate_ratio"]));
+        assert!(tsv_keys.ends_with(&[
+            "n_epochs",
+            "epoch_amp_ratio",
+            "epoch_rate_ratio",
+            "duplicate_spikes"
+        ]));
+        let qc = collect_qc_rows(&s);
+        assert_eq!(qc[0].get("duplicate_spikes"), Some(1.0));
+        assert_eq!(qc[0].to_json()["duplicate_spikes"], 1);
+        assert_eq!(rows[0]["duplicate_spikes"], 1);
+        assert_eq!(rows[3]["duplicate_spikes"], 0);
+        assert_eq!(lines[1].split('\t').next_back(), Some("1"));
         for name in [
             "srp_contamination",
             "srp_rp_ms",
@@ -1165,7 +1189,7 @@ pub(crate) mod tests {
             serde_json::from_slice(&std::fs::read(json).unwrap()).unwrap();
         let mut lines = tsv.lines();
         let header: Vec<_> = lines.next().unwrap().split('\t').collect();
-        assert_eq!(header.len(), 41);
+        assert_eq!(header.len(), 42);
         let evidence = [
             "srp_contamination",
             "srp_rp_ms",

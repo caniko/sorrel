@@ -10,12 +10,14 @@ use sorrel_data::Session;
 use sorrel_io::{ClusterId, DataProvider, SampleIndex};
 use sorrel_render::{extract_snippet, snippet_window, TracePreproc};
 
+use crate::brush::{BrushSource, TimeBrush};
 use crate::feature_view::{ChannelEdit, FeatureLink};
-use crate::jobs::JobCtx;
+use crate::jobs::{JobCtx, Memo};
 use crate::layout::ViewAction;
 use crate::prefs::{WaveformMode, WaveformParams, WaveformSource};
 use crate::theme::{selection_colour, Theme};
 use crate::views::{alloc_plot, grid_colour, nice_ticks, pad_range, tick_label, TICK_PX};
+use crate::widgets::time_key;
 
 #[path = "waveform_all.rs"]
 mod waveform_all;
@@ -30,6 +32,8 @@ const MAX_TEMPLATES: usize = 16;
 const SLOT_K: f32 = 8.0;
 /// Density textures uploaded per UI frame (see `prepare_textures`).
 const MAX_TEXTURE_UPLOADS_PER_FRAME: usize = 2;
+/// Maximum in-time-range spikes extracted per cluster for the time-brush mean overlay.
+const MAX_TIME_BRUSH_SPIKES: usize = 800;
 
 // ---- Waveform extraction & cache ---------------------------------------
 
@@ -108,6 +112,10 @@ pub struct WaveformCache {
     /// with the all-result generation they came from.
     textures: std::collections::HashMap<(usize, usize), (u64, egui::TextureHandle)>,
     texture_generation: u64,
+    /// Background in-time-range mean waveforms for `brushes.time`.
+    time_brush: Memo<TimeBrushKey, TimeBrushResult>,
+    /// True when `time_brush` holds a current result for this frame's key.
+    time_brush_ready: bool,
 }
 
 impl std::fmt::Debug for WaveformCache {
@@ -152,6 +160,23 @@ pub struct WaveformAllSummary {
 
 /// `[inside, outside]`, each `[channel][sample]`.
 type WhatIfMeans = [Vec<Vec<f32>>; 2];
+
+/// Cache key for the background time-brush mean overlay.
+#[derive(Clone, Debug, PartialEq)]
+struct TimeBrushKey {
+    time: Option<(u32, u32, bool)>,
+    clusters: Vec<ClusterId>,
+    channels: Vec<usize>,
+    pre: u32,
+    post: u32,
+    cfg: TracePreproc,
+    shanks: Vec<u32>,
+    sample_rate_bits: u32,
+    version: u64,
+}
+
+/// Per-cluster `(mean: [channel][sample], in_range_count)` for `brushes.time`.
+type TimeBrushResult = Vec<(Vec<Vec<f32>>, usize)>;
 
 type WhatIfKey = (
     Option<WaveformKey>,
@@ -215,6 +240,8 @@ impl Default for WaveformCache {
             all: AllCache::default(),
             textures: std::collections::HashMap::new(),
             texture_generation: 0,
+            time_brush: Memo::default(),
+            time_brush_ready: false,
         }
     }
 }
@@ -251,6 +278,8 @@ impl WaveformCache {
             self.all.invalidate();
             self.textures.clear();
             self.texture_generation = 0;
+            self.time_brush.invalidate();
+            self.time_brush_ready = false;
         }
         self.cfg = cfg;
     }
@@ -267,6 +296,8 @@ impl WaveformCache {
     /// never be rendered for a newer selection.
     pub fn cancel(&mut self) {
         self.all.cancel();
+        self.time_brush.cancel();
+        self.time_brush_ready = false;
     }
 
     fn all_progress(&self) -> Option<ProgressSnapshot> {
@@ -370,13 +401,64 @@ impl WaveformCache {
         self.all.ensure(&key, jobs, total);
     }
 
-    /// Stop the worker and forget the result/textures. Used when the pane no
-    /// longer has a current unit (empty selection or no channels), so an old
-    /// unit's summary can never claim to be ready for the new state.
+    /// Stop the all-spike worker and forget its result/textures. Does not
+    /// touch `time_brush` because `clear_all` is also called every frame in
+    /// `Sampled` mode (where `self.all.requested()` is `None`).
     fn clear_all(&mut self) {
         self.all.invalidate();
         self.textures.clear();
         self.texture_generation = 0;
+    }
+
+    /// Start or reuse the off-thread in-time-range mean computation.
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_time_brush<P: DataProvider>(
+        &mut self,
+        session: &Session<P>,
+        jobs: &JobCtx<Session<P>>,
+        selection: &[ClusterId],
+        chans: &[usize],
+        pre: u32,
+        post: u32,
+        tb: TimeBrush,
+    ) {
+        let key = TimeBrushKey {
+            time: time_key(Some(tb)),
+            clusters: selection.to_vec(),
+            channels: chans.to_vec(),
+            pre,
+            post,
+            cfg: self.cfg,
+            shanks: self.shanks.clone(),
+            sample_rate_bits: session.provider.sample_rate().to_bits(),
+            version: session.version(),
+        };
+        let clusters = selection.to_vec();
+        let cfg = self.cfg;
+        let shanks = self.shanks.clone();
+        self.time_brush_ready = self
+            .time_brush
+            .ensure(key, &jobs.session, jobs.repaint(), move |s, cancel| {
+                compute_time_brush_means(
+                    s,
+                    &clusters,
+                    pre,
+                    post,
+                    cfg,
+                    &shanks,
+                    tb,
+                    MAX_TIME_BRUSH_SPIKES,
+                    cancel,
+                )
+            })
+            .is_some();
+    }
+
+    /// The current time-brush mean result when ready for this frame.
+    fn time_brush_current(&self) -> Option<&TimeBrushResult> {
+        self.time_brush_ready
+            .then(|| self.time_brush.last())
+            .flatten()
     }
 
     fn all_scope_matches(&self, selection: &[ClusterId], version: u64) -> bool {
@@ -1118,6 +1200,171 @@ fn mean_of<'a>(
         .collect()
 }
 
+/// Per-sample standard deviation on channel `ch` across `snips`
+/// (`[sample * nc + channel]` each). Returns zeros when fewer than 2 snippets
+/// are present.
+fn std_for_channel(
+    snips: &[Vec<f32>],
+    mean: &[f32],
+    ch: usize,
+    nc: usize,
+    snippet_len: usize,
+) -> Vec<f32> {
+    let n = snips.len();
+    if n < 2 || nc == 0 || ch >= nc {
+        return vec![0.0; snippet_len];
+    }
+    let mut sum_sq = vec![0.0f64; snippet_len];
+    for snip in snips {
+        for (t, cv) in snip.chunks_exact(nc).enumerate().take(snippet_len) {
+            let m = mean.get(t).copied().unwrap_or(0.0) as f64;
+            let d = cv[ch] as f64 - m;
+            sum_sq[t] += d * d;
+        }
+    }
+    let denom = (n - 1) as f64;
+    sum_sq
+        .into_iter()
+        .map(|v| (v / denom).sqrt() as f32)
+        .collect()
+}
+
+/// Build a triangulated strip mesh for the `[mean - sd, mean + sd]` ribbon so
+/// concave curves never self-intersect. Returns `None` when fewer than two
+/// finite samples exist or all SDs are non-positive.
+fn sd_ribbon_mesh(
+    mean: &[f32],
+    sd: &[f32],
+    color: Color32,
+    mut map: impl FnMut(usize, f32) -> Pos2,
+) -> Option<egui::Mesh> {
+    let n = mean.len().min(sd.len());
+    if n < 2 {
+        return None;
+    }
+    let mut mesh = egui::Mesh::default();
+    let mut prev: Option<(u32, u32)> = None;
+    let mut has_positive_sd = false;
+    for t in 0..n {
+        let m = mean[t];
+        let s = sd[t];
+        if !m.is_finite() || !s.is_finite() {
+            prev = None;
+            continue;
+        }
+        let s = s.max(0.0);
+        if s > 0.0 {
+            has_positive_sd = true;
+        }
+        let hi = map(t, m + s);
+        let lo = map(t, m - s);
+        if !hi.x.is_finite() || !hi.y.is_finite() || !lo.x.is_finite() || !lo.y.is_finite() {
+            prev = None;
+            continue;
+        }
+        let idx_hi = mesh.vertices.len() as u32;
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: hi,
+            uv: egui::epaint::WHITE_UV,
+            color,
+        });
+        let idx_lo = mesh.vertices.len() as u32;
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: lo,
+            uv: egui::epaint::WHITE_UV,
+            color,
+        });
+        if let Some((p_hi, p_lo)) = prev {
+            mesh.indices
+                .extend_from_slice(&[p_hi, p_lo, idx_hi, p_lo, idx_lo, idx_hi]);
+        }
+        prev = Some((idx_hi, idx_lo));
+    }
+    (has_positive_sd && !mesh.indices.is_empty()).then_some(mesh)
+}
+
+/// Compute per-cluster `(mean, in_range_count)` for spikes whose recording
+/// time `spike.0 as f32 / sr` satisfies `tb.contains(t)`.
+/// Strides evenly up to `max_spikes` per cluster, batch-prefetches windows,
+/// and polls `cancel` periodically.
+#[allow(clippy::too_many_arguments)]
+fn compute_time_brush_means<P: DataProvider>(
+    session: &Session<P>,
+    clusters: &[ClusterId],
+    pre: u32,
+    post: u32,
+    cfg: TracePreproc,
+    shanks: &[u32],
+    tb: TimeBrush,
+    max_spikes: usize,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> TimeBrushResult {
+    use std::sync::atomic::Ordering;
+
+    let sr = session.provider.sample_rate().max(1.0);
+    let nc = session.provider.n_channels() as usize;
+    let snippet_len = (pre + post + 1) as usize;
+    let cap = max_spikes.max(1);
+    let mut out = Vec::with_capacity(clusters.len());
+
+    for &c in clusters {
+        if cancel.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+        let times = session.spike_times(c);
+        let in_range: Vec<SampleIndex> = times
+            .iter()
+            .copied()
+            .filter(|t| tb.contains(t.0 as f32 / sr))
+            .collect();
+        let total_in_range = in_range.len();
+        if total_in_range == 0 || nc == 0 || snippet_len < 3 {
+            out.push((Vec::new(), 0));
+            continue;
+        }
+        let take = total_in_range.min(cap);
+        let chosen: Vec<SampleIndex> = (0..take)
+            .map(|i| in_range[i * total_in_range / take])
+            .collect();
+        let windows: Vec<(SampleIndex, u32)> = chosen
+            .iter()
+            .map(|&t| {
+                let (start, len, _) = snippet_window(sr, t, pre, post, cfg);
+                (start, len)
+            })
+            .collect();
+        session.provider.prefetch(&windows);
+
+        let mut sum = vec![vec![0.0f64; snippet_len]; nc];
+        let mut extracted = 0usize;
+        for (i, &t) in chosen.iter().enumerate() {
+            if i % 64 == 0 && cancel.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
+            if let Some(mut s) = extract_snippet(&session.provider, t, pre, post, cfg, shanks) {
+                subtract_median_baseline(&mut s, nc);
+                extracted += 1;
+                for (ti, cv) in s.chunks_exact(nc).enumerate().take(snippet_len) {
+                    for (ch, ch_sum) in sum.iter_mut().enumerate() {
+                        ch_sum[ti] += cv[ch] as f64;
+                    }
+                }
+            }
+        }
+        if extracted == 0 {
+            out.push((Vec::new(), 0));
+        } else {
+            let denom = extracted as f64;
+            let mean = sum
+                .into_iter()
+                .map(|row| row.into_iter().map(|v| (v / denom) as f32).collect())
+                .collect();
+            out.push((mean, total_in_range));
+        }
+    }
+    out
+}
+
 /// Density coverage (one byte per texel) as a white-alpha image. The pane
 /// tints it with the slot colour, so one upload serves both themes and the
 /// dim/fade overlays.
@@ -1209,6 +1456,8 @@ fn waveform_view_impl<P: DataProvider>(
 ) {
     if selection.is_empty() {
         cache.clear_all();
+        cache.time_brush.cancel();
+        cache.time_brush_ready = false;
         ui.label("no selection");
         return;
     }
@@ -1220,6 +1469,8 @@ fn waveform_view_impl<P: DataProvider>(
     let nc = session.provider.n_channels() as usize;
     if nc == 0 || snippet_len < 3 {
         cache.clear_all();
+        cache.time_brush.cancel();
+        cache.time_brush_ready = false;
         ui.label("no channels");
         return;
     }
@@ -1281,17 +1532,32 @@ fn waveform_view_impl<P: DataProvider>(
         .spikes
         .as_ref()
         .filter(|b| b.version == session.version());
-    let whatif =
+    let is_highlight_brush = brush.is_some_and(|b| {
+        matches!(
+            b.source,
+            BrushSource::IsiViolators | BrushSource::Duplicates
+        )
+    });
+    let whatif = if is_highlight_brush {
+        None
+    } else {
         crate::isi_view::split_target(brushes, selection, |c| session.spike_times(c).len())
-            .filter(|_| brush.is_some());
+            .filter(|_| brush.is_some())
+    };
     let brushed: Vec<_> = match (brush, &whatif) {
         (_, Some((c, idx))) => vec![(*c, std::sync::Arc::clone(idx))],
-        (Some(b), None) if b.source == crate::brush::BrushSource::IsiViolators => b
-            .spikes
-            .iter()
-            .filter(|(c, _)| selection.contains(c))
-            .cloned()
-            .collect(),
+        (Some(b), None)
+            if matches!(
+                b.source,
+                BrushSource::IsiViolators | BrushSource::Duplicates
+            ) =>
+        {
+            b.spikes
+                .iter()
+                .filter(|(c, _)| selection.contains(c))
+                .cloned()
+                .collect()
+        }
         _ => Vec::new(),
     };
     cache.ensure_brushed(session, &brushed, pre, post);
@@ -1347,10 +1613,21 @@ fn waveform_view_impl<P: DataProvider>(
                     .request_repaint_after(std::time::Duration::from_millis(100));
             }
         } else {
-            cache.cancel();
+            cache.all.cancel();
         }
     } else {
-        cache.cancel();
+        cache.all.cancel();
+    }
+    if mode != WaveformMode::Templates {
+        if let (Some(tb), Some(jobs)) = (brushes.time, jobs) {
+            cache.ensure_time_brush(session, jobs, selection, &chans, pre, post, tb);
+        } else {
+            cache.time_brush.cancel();
+            cache.time_brush_ready = false;
+        }
+    } else {
+        cache.time_brush.cancel();
+        cache.time_brush_ready = false;
     }
 
     let theme = Theme::from_ui(ui);
@@ -1441,6 +1718,9 @@ fn waveform_view_impl<P: DataProvider>(
             }
             ui.checkbox(&mut params.show_labels, "channel labels")
                 .on_hover_text(crate::settings::hint(ui.ctx(), "waveforms.labels"));
+            ui.checkbox(&mut params.show_sd, "± SD").on_hover_text(
+                "In Mean mode, draw a translucent ±1 SD ribbon behind each cluster's mean",
+            );
         },
     );
     if compact {
@@ -1562,6 +1842,27 @@ fn waveform_view_impl<P: DataProvider>(
     }
     ui.add(egui::Label::new(egui::RichText::new(link_hint(&link.set)).small().weak()).truncate())
         .on_hover_text(link_legend(link, params.pc_shapes));
+    if mode != WaveformMode::Templates {
+        if let Some(tb) = brushes.time {
+            if let Some(res) = cache.time_brush_current() {
+                let total: usize = res.iter().map(|(_, n)| *n).sum();
+                ui.weak(format!(
+                    "dashed = {:.1}–{:.1} s ({total} spikes)",
+                    tb.start, tb.end
+                ));
+            } else if cache.time_brush.pending() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.weak(format!(
+                        "dashed = {:.1}–{:.1} s (loading…)",
+                        tb.start, tb.end
+                    ));
+                });
+            } else {
+                ui.weak(format!("dashed = {:.1}–{:.1} s", tb.start, tb.end));
+            }
+        }
+    }
     // V6.2 legend: swatch, cluster id and honest spike counts per slot.
     ui.horizontal_wrapped(|ui| {
         for (slot, c) in selection.iter().enumerate() {
@@ -2084,13 +2385,35 @@ impl<P: DataProvider> Ctx<'_, P> {
             painter.add(egui::Shape::line(pts, Stroke::new(2.0_f32, self.accent)));
         }
         for (k, &ci) in present.iter().enumerate() {
-            let mean = all
-                .and_then(|all| all.cluster(k))
+            let all_cluster = all.and_then(|all| all.cluster(k));
+            let mean = all_cluster
                 .and_then(|cluster| cluster.mean.get(ch))
                 .or_else(|| cache.means.get(ci).and_then(|m| m.get(ch)));
             let Some(mean) = mean else {
                 continue;
             };
+            if self.mode == WaveformMode::Mean && self.params.show_sd {
+                let sampled_sd;
+                let sd: Option<&[f32]> = if let Some(cluster) = all_cluster {
+                    cluster.std.get(ch).map(Vec::as_slice)
+                } else if let Some(snips) = cache.snippets.get(ci) {
+                    sampled_sd = std_for_channel(snips, mean, ch, self.nc, self.snippet_len);
+                    Some(&sampled_sd)
+                } else {
+                    None
+                };
+                if let Some(sd) = sd {
+                    let col = selection_colour(ci);
+                    let ribbon_alpha = ((if theme.dark { 52.0 } else { 46.0 }) * fade) as u8;
+                    let ribbon_col =
+                        Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), ribbon_alpha);
+                    if let Some(mesh) =
+                        sd_ribbon_mesh(mean, sd, ribbon_col, |t, v| map(k, t as f32 / last, v))
+                    {
+                        painter.add(egui::Shape::mesh(mesh));
+                    }
+                }
+            }
             let pts: Vec<Pos2> = mean
                 .iter()
                 .enumerate()
@@ -2100,6 +2423,28 @@ impl<P: DataProvider> Ctx<'_, P> {
                 pts,
                 Stroke::new(mean_width, selection_colour(ci).gamma_multiply(fade)),
             ));
+            // Time-brush overlay: dashed mean of in-time-range spikes over the
+            // full-recording mean.
+            if let Some((tb_mean, _)) = cache
+                .time_brush_current()
+                .and_then(|res| res.get(k))
+                .filter(|(_, count)| *count > 0)
+            {
+                if let Some(m) = tb_mean.get(ch) {
+                    let col = selection_colour(ci).gamma_multiply(fade);
+                    let pts: Vec<Pos2> = m
+                        .iter()
+                        .enumerate()
+                        .map(|(t, &v)| map(k, t as f32 / last, v))
+                        .collect();
+                    painter.extend(egui::Shape::dashed_line(
+                        &pts,
+                        Stroke::new(mean_width, col),
+                        5.0,
+                        3.0,
+                    ));
+                }
+            }
             // Split what-if: inside dashed, outside dotted, same colour.
             if let Some((_, slot, [inside, outside])) = &cache.whatif {
                 if *slot == ci {
@@ -2304,6 +2649,7 @@ mod tests {
                 missing: 0,
                 drawn: 0,
                 mean: vec![],
+                std: vec![],
                 min: vec![],
                 max: vec![],
                 raster: vec![],
@@ -2614,5 +2960,325 @@ mod tests {
             left, 1,
             "only the repeat event is left for downstream widgets"
         );
+    }
+
+    #[test]
+    fn sd_ribbon_mesh_builds_symmetric_finite_bounds_and_skips_zero_sd() {
+        let col = Color32::from_rgba_unmultiplied(100, 150, 200, 50);
+        let map = |t: usize, v: f32| Pos2::new(t as f32 * 10.0, 100.0 - v * 2.0);
+
+        // Zero SD everywhere produces no mesh.
+        assert!(sd_ribbon_mesh(&[1.0, 2.0, 3.0], &[0.0, 0.0, 0.0], col, map).is_none());
+        // Too few samples produces no mesh.
+        assert!(sd_ribbon_mesh(&[1.0], &[0.5], col, map).is_none());
+
+        let mean = [0.0, 10.0, -5.0, 2.0];
+        let sd = [2.0, 4.0, 0.0, 1.0];
+        let mesh = sd_ribbon_mesh(&mean, &sd, col, map).expect("ribbon mesh");
+        assert_eq!(mesh.vertices.len(), mean.len() * 2);
+        assert_eq!(mesh.indices.len(), (mean.len() - 1) * 6);
+        assert!(mesh
+            .vertices
+            .iter()
+            .all(|v| v.pos.x.is_finite() && v.pos.y.is_finite() && v.color == col));
+        for t in 0..mean.len() {
+            let hi = mesh.vertices[t * 2].pos;
+            let lo = mesh.vertices[t * 2 + 1].pos;
+            let mid = map(t, mean[t]);
+            assert_eq!(hi.x, mid.x);
+            assert_eq!(lo.x, mid.x);
+            assert!(((hi.y + lo.y) * 0.5 - mid.y).abs() < 1e-5);
+            assert!(((lo.y - hi.y) - 4.0 * sd[t]).abs() < 1e-5);
+        }
+
+        // Non-finite sample splits the strip without emitting NaN vertices.
+        let mesh_nan = sd_ribbon_mesh(
+            &[0.0, 1.0, f32::NAN, 2.0, 3.0],
+            &[1.0, 1.0, 1.0, 1.0, 1.0],
+            col,
+            map,
+        )
+        .expect("ribbon with NaN gap");
+        assert_eq!(mesh_nan.vertices.len(), 8);
+        assert_eq!(mesh_nan.indices.len(), 12);
+        assert!(mesh_nan
+            .vertices
+            .iter()
+            .all(|v| v.pos.x.is_finite() && v.pos.y.is_finite()));
+    }
+
+    #[test]
+    fn sampled_std_for_channel_matches_sample_sd() {
+        // 3 snippets, 2 channels, 3 samples: ch 0 at t=1 has values [10, 20, 30] -> mean 20, sample SD = 10.
+        let snips = vec![
+            vec![0.0, 0.0, 10.0, 5.0, 0.0, 0.0],
+            vec![0.0, 0.0, 20.0, 5.0, 0.0, 0.0],
+            vec![0.0, 0.0, 30.0, 5.0, 0.0, 0.0],
+        ];
+        let sd0 = std_for_channel(&snips, &[0.0, 20.0, 0.0], 0, 2, 3);
+        let sd1 = std_for_channel(&snips, &[0.0, 5.0, 0.0], 1, 2, 3);
+        assert!((sd0[0]).abs() < 1e-5);
+        assert!((sd0[1] - 10.0).abs() < 1e-5);
+        assert!((sd0[2]).abs() < 1e-5);
+        assert_eq!(sd1, vec![0.0, 0.0, 0.0]);
+        assert_eq!(
+            std_for_channel(&snips[..1], &[0.0, 10.0, 0.0], 0, 2, 3),
+            vec![0.0; 3]
+        );
+    }
+
+    #[test]
+    fn compute_time_brush_means_filters_strictly_by_range_and_computes_accurate_mean() {
+        use sorrel_data::Journal;
+        use sorrel_io::{TraceSamples, TraceSlice};
+
+        struct StubProvider {
+            trace: Vec<f32>,
+            spikes: Vec<Vec<SampleIndex>>,
+            n_samples: u64,
+            sr: f32,
+        }
+        impl DataProvider for StubProvider {
+            type Label = u8;
+            fn sample_rate(&self) -> f32 {
+                self.sr
+            }
+            fn n_channels(&self) -> u32 {
+                2
+            }
+            fn n_samples(&self) -> SampleIndex {
+                SampleIndex(self.n_samples)
+            }
+            fn n_clusters(&self) -> u32 {
+                self.spikes.len() as u32
+            }
+            fn spike_times(&self, cluster: ClusterId) -> &[SampleIndex] {
+                self.spikes
+                    .get(cluster.0 as usize)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+            }
+            fn trace(&self, start: SampleIndex, len: u32) -> TraceSlice<'_> {
+                let begin = start.0 as usize * 2;
+                let end = begin.saturating_add(len as usize * 2);
+                let samples = self.trace.get(begin..end).map_or(&[][..], |s| s);
+                TraceSlice {
+                    start,
+                    n_channels: 2,
+                    samples: TraceSamples::F32(samples),
+                }
+            }
+            fn initial_labels(&self) -> Vec<Self::Label> {
+                vec![0; self.spikes.len()]
+            }
+        }
+
+        // sr = 1000 Hz => 1 sample = 1 ms; pre = post = 1 => snippet_len = 3.
+        // Place 3 spikes at t = 1.0 s (sample 1000), 2.0 s (sample 2000), 3.0 s (sample 3000)
+        // with distinct center-sample peaks on ch 0: 10, 20, 40 (and ch 1: -10, -20, -40).
+        let n_samples = 4_000usize;
+        let mut trace = vec![0.0f32; n_samples * 2];
+        for (sample, amp) in [(1000usize, 10.0f32), (2000, 20.0), (3000, 40.0)] {
+            trace[sample * 2] = amp;
+            trace[sample * 2 + 1] = -amp;
+        }
+        let provider = StubProvider {
+            trace,
+            spikes: vec![vec![
+                SampleIndex(1000),
+                SampleIndex(2000),
+                SampleIndex(3000),
+            ]],
+            n_samples: n_samples as u64,
+            sr: 1_000.0,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("j.jsonl")).unwrap();
+        let session = Session::new(provider, journal);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        // Range [1.5, 3.0] includes spikes at 2.0 s (amp 20) and 3.0 s (amp 40) -> mean 30.
+        let tb = TimeBrush::new(1.5, 3.0).unwrap();
+        let res = compute_time_brush_means(
+            &session,
+            &[ClusterId(0)],
+            1,
+            1,
+            TracePreproc::default(),
+            &[],
+            tb,
+            100,
+            &cancel,
+        );
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].1, 2);
+        assert!((res[0].0[0][1] - 30.0).abs() < 1e-5);
+        assert!((res[0].0[1][1] + 30.0).abs() < 1e-5);
+
+        // Empty range [3.5, 3.9] yields count 0 and empty mean.
+        let tb_empty = TimeBrush::new(3.5, 3.9).unwrap();
+        let res_empty = compute_time_brush_means(
+            &session,
+            &[ClusterId(0)],
+            1,
+            1,
+            TracePreproc::default(),
+            &[],
+            tb_empty,
+            100,
+            &cancel,
+        );
+        assert_eq!(res_empty.len(), 1);
+        assert_eq!(res_empty[0].1, 0);
+        assert!(res_empty[0].0.is_empty());
+    }
+
+    #[test]
+    fn clear_all_preserves_time_brush_and_sampled_mode_settles_cleanly() {
+        use sorrel_data::Journal;
+        use sorrel_io::{TraceSamples, TraceSlice};
+        use std::sync::{Arc, RwLock};
+        use std::time::{Duration, Instant};
+
+        struct StubProvider {
+            trace: Vec<f32>,
+            spikes: Vec<Vec<SampleIndex>>,
+            n_samples: u64,
+            sr: f32,
+        }
+        impl DataProvider for StubProvider {
+            type Label = u8;
+            fn sample_rate(&self) -> f32 {
+                self.sr
+            }
+            fn n_channels(&self) -> u32 {
+                2
+            }
+            fn n_samples(&self) -> SampleIndex {
+                SampleIndex(self.n_samples)
+            }
+            fn n_clusters(&self) -> u32 {
+                self.spikes.len() as u32
+            }
+            fn spike_times(&self, cluster: ClusterId) -> &[SampleIndex] {
+                self.spikes
+                    .get(cluster.0 as usize)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+            }
+            fn trace(&self, start: SampleIndex, len: u32) -> TraceSlice<'_> {
+                let begin = start.0 as usize * 2;
+                let end = begin.saturating_add(len as usize * 2);
+                let samples = self.trace.get(begin..end).map_or(&[][..], |s| s);
+                TraceSlice {
+                    start,
+                    n_channels: 2,
+                    samples: TraceSamples::F32(samples),
+                }
+            }
+            fn initial_labels(&self) -> Vec<Self::Label> {
+                vec![0; self.spikes.len()]
+            }
+        }
+
+        let n_samples = 4_000usize;
+        let mut trace = vec![0.0f32; n_samples * 2];
+        for (sample, amp) in [(1000usize, 10.0f32), (2000, 20.0), (3000, 40.0)] {
+            trace[sample * 2] = amp;
+            trace[sample * 2 + 1] = -amp;
+        }
+        let provider = StubProvider {
+            trace,
+            spikes: vec![vec![
+                SampleIndex(1000),
+                SampleIndex(2000),
+                SampleIndex(3000),
+            ]],
+            n_samples: n_samples as u64,
+            sr: 1_000.0,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("j.jsonl")).unwrap();
+        let session = Arc::new(RwLock::new(Session::new(provider, journal)));
+        let ctx = egui::Context::default();
+        let jobs = JobCtx {
+            session: Arc::clone(&session),
+            egui: ctx.clone(),
+        };
+
+        let mut cache = WaveformCache::default();
+        let mut params = WaveformParams {
+            source: WaveformSource::Sampled,
+            ..Default::default()
+        };
+        let link = FeatureLink::default();
+        let mut brushes = crate::brush::Brushes {
+            time: TimeBrush::new(1.5, 3.0),
+            ..Default::default()
+        };
+        let geometry = [[0.0, 0.0], [0.0, 20.0]];
+        let mut actions = Vec::new();
+
+        // Repeated frames in Sampled mode call `cache.clear_all()` every frame
+        // because `all_scope_matches` is false; `time_brush` must still settle.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cache.time_brush_current().is_none() && Instant::now() < deadline {
+            let guard = session.read().unwrap();
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    waveform_view_with_jobs(
+                        ui,
+                        &guard,
+                        &[ClusterId(0)],
+                        &geometry,
+                        &[],
+                        &mut cache,
+                        &mut params,
+                        &link,
+                        &brushes,
+                        &jobs,
+                        &mut actions,
+                    );
+                });
+            });
+            drop(guard);
+            if cache.time_brush_current().is_none() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        let res = cache
+            .time_brush_current()
+            .expect("Sampled + TimeBrush must settle despite per-frame clear_all()");
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].1, 2);
+
+        // Calling `clear_all()` directly must not discard a settled time_brush result.
+        cache.clear_all();
+        assert!(cache.time_brush_current().is_some());
+
+        // Clearing `brushes.time` cancels `time_brush` on the next frame.
+        brushes.time = None;
+        {
+            let guard = session.read().unwrap();
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    waveform_view_with_jobs(
+                        ui,
+                        &guard,
+                        &[ClusterId(0)],
+                        &geometry,
+                        &[],
+                        &mut cache,
+                        &mut params,
+                        &link,
+                        &brushes,
+                        &jobs,
+                        &mut actions,
+                    );
+                });
+            });
+        }
+        assert!(cache.time_brush_current().is_none());
     }
 }

@@ -38,3 +38,4 @@ rpv_post_hi95	Upper endpoint of the fixed-window contamination posterior's short
 n_epochs	Number of stable firing-rate and amplitude epochs inferred over the recording; NaN when not computed.
 epoch_amp_ratio	Smallest divided by largest magnitude of the epoch mean amplitudes; NaN if amplitudes were not fitted, any epoch is silent, or the largest magnitude is zero.
 epoch_rate_ratio	Lowest divided by highest epoch firing rate; 1 for one epoch, NaN when not computed.
+duplicate_spikes	Count of spikes that deduplication would discard at the default 0.2 ms tolerance.

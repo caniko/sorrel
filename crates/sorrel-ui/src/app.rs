@@ -1103,6 +1103,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             Snippet::KMeans(k) => self.feature_state.request_kmeans(k),
             Snippet::Maximize => self.detached.toggle_maximize_target(&self.tree),
             Snippet::PopOut => self.detached.pop_out_target(&self.tree),
+            Snippet::Dedup(tol) => self.apply_remove_duplicates(tol.unwrap_or(0.2)),
             Snippet::RateBins(n) => self.view_params.rate.n_bins = n,
             Snippet::RateBinSize(secs) => {
                 let s = read(&self.session);
@@ -1287,6 +1288,81 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
             self.brushes.spikes = None;
         }
         was_cutting
+    }
+
+    /// Split duplicate spikes (within `tol_ms`) from every selected cluster
+    /// into noise clusters tagged `"duplicate"`, as one undoable atomic batch.
+    fn apply_remove_duplicates(&mut self, tol_ms: f32) {
+        let selected = self.selection.as_slice().to_vec();
+        if selected.is_empty() {
+            self.status = toast("no cluster selected");
+            return;
+        }
+        let mut total_dups = 0usize;
+        let mut affected = 0usize;
+        let ok = self.commit_built(
+            "remove duplicates",
+            |s| {
+                let tol_samples = (tol_ms as f64 * 1e-3 * s.provider.sample_rate() as f64)
+                    .round()
+                    .max(0.0) as u64;
+                let mut next_id = s.n_clusters();
+                let mut children = Vec::new();
+                for &c in &selected {
+                    let times = s.spike_times(c);
+                    let dup_idx = sorrel_compute::duplicate_spike_indices(
+                        times,
+                        s.spike_amplitudes(c),
+                        tol_samples,
+                    );
+                    if dup_idx.is_empty() || dup_idx.len() >= times.len() {
+                        continue;
+                    }
+                    total_dups += dup_idx.len();
+                    affected += 1;
+                    let new_cluster = ClusterId(next_id);
+                    next_id += 1;
+                    children.push(CurationCommand::Split {
+                        cluster: c,
+                        spike_idx: dup_idx,
+                        new_cluster,
+                        by: sorrel_data::command::Method::Algo("dedup".into()),
+                    });
+                    children.push(CurationCommand::Relabel {
+                        cluster: new_cluster,
+                        op: PhyLabelOp::SetNoise,
+                    });
+                    children.push(CurationCommand::Tag {
+                        cluster: new_cluster,
+                        tags: vec!["duplicate".into()],
+                    });
+                }
+                Ok(CurationCommand::batch(children))
+            },
+            Box::new(|_| Vec::new()),
+        );
+        if !ok {
+            return;
+        }
+        if total_dups == 0 {
+            self.status = toast(format!(
+                "no duplicate spikes (<{tol_ms:.2} ms) in selection"
+            ));
+            return;
+        }
+        if self
+            .brushes
+            .spikes
+            .as_ref()
+            .is_some_and(|b| b.source == crate::brush::BrushSource::Duplicates)
+        {
+            self.brushes.spikes = None;
+        }
+        self.status = toast(format!(
+            "removed {total_dups} duplicate spike{} from {affected} cluster{} (<{tol_ms:.2} ms)",
+            if total_dups == 1 { "" } else { "s" },
+            if affected == 1 { "" } else { "s" },
+        ));
     }
 
     /// Turn lasso hits into one journal entry (a batch when several
@@ -1816,6 +1892,7 @@ impl<P: DataProvider + ApplyPhyLabel> SorrelApp<P> {
                     self.status = toast("draw a lasso first: Ctrl+click in Features or Amplitudes");
                 }
             }
+            Intent::RemoveDuplicates => self.apply_remove_duplicates(0.2),
             Intent::CycleAmplitudes(delta) => {
                 let kind = self.amplitude_state.cycle(delta);
                 self.status = toast(format!("amplitudes: {kind:?}").to_lowercase());
@@ -3668,6 +3745,73 @@ mod tests {
         app.brushes.spikes = brush(BrushSource::IsiViolators);
         app.dispatch_intent(Intent::Cancel);
         assert!(!app.feature_state.lasso_active() && app.brushes.spikes.is_some());
+    }
+
+    #[test]
+    fn remove_duplicates_commits_one_undoable_batch_with_noise_and_tag() {
+        use crate::brush::{BrushSource, SpikeBrush};
+        use sorrel_data::command::Method;
+        use sorrel_data::UnitOrigin;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Sample rate is 30_000 Hz, so 0.2 ms = 6 samples.
+        // Cluster 0 has spikes at 100, 102 (dup of 100), 1000, 1005 (dup of 1000), 2000.
+        // Cluster 1 has no duplicates (500, 1500).
+        let provider = StubProvider {
+            span: None,
+            spikes: vec![
+                vec![
+                    SampleIndex(100),
+                    SampleIndex(102),
+                    SampleIndex(1000),
+                    SampleIndex(1005),
+                    SampleIndex(2000),
+                ],
+                vec![SampleIndex(500), SampleIndex(1500)],
+            ],
+        };
+        let journal = Journal::open_or_create(&dir.path().join("j.sqlite"), 0xCAFE, 2).unwrap();
+        let session = Session::new(provider, journal);
+        let mut app = SorrelApp::new(session, label_str);
+        app.selection.replace(ClusterId(0));
+        app.selection.toggle(ClusterId(1));
+
+        let before_clusters = read(&app.session).spike_clusters_global().to_vec();
+        app.brushes.spikes = SpikeBrush::new(
+            BrushSource::Duplicates,
+            read(&app.session).version(),
+            [(ClusterId(0), vec![1, 3])],
+        );
+
+        app.apply_remove_duplicates(0.2);
+
+        assert_eq!(history_len(&app), 1, "dedup must be one undoable batch");
+        assert!(
+            app.brushes.spikes.is_none(),
+            "Duplicates brush is cleared after dedup"
+        );
+        {
+            let s = read(&app.session);
+            assert_eq!(s.n_clusters(), 3);
+            assert_eq!(s.spike_times(ClusterId(0)).len(), 3);
+            assert_eq!(s.spike_times(ClusterId(1)).len(), 2);
+            assert_eq!(s.spike_times(ClusterId(2)).len(), 2);
+            assert_eq!(
+                *s.origin(ClusterId(2)),
+                UnitOrigin::Sorrel(Method::Algo("dedup".into()))
+            );
+            assert_eq!(s.label(ClusterId(2)), Some(3), "SetNoise on StubProvider");
+            assert_eq!(s.tags(ClusterId(2)), &["duplicate".to_string()]);
+        }
+
+        // Single undo restores everything cleanly.
+        app.dispatch_intent(Intent::Undo);
+        {
+            let s = read(&app.session);
+            assert_eq!(s.n_clusters(), 2);
+            assert_eq!(s.spike_clusters_global(), before_clusters);
+            assert_eq!(s.spike_times(ClusterId(0)).len(), 5);
+        }
     }
 
     #[test]

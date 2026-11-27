@@ -38,6 +38,8 @@ use crate::feature_view::{
     BACKGROUND,
 };
 use crate::jobs::{JobCtx, Memo};
+use crate::lasso::{AxisId, LimitOp};
+use crate::prefs::FeatureBasis;
 use crate::theme::{selection_colour, viridis, Theme};
 use crate::wgpu_raster::pack_rgba;
 use crate::wgpu_scene3d::{Orbit, Point3, Scene3d, Scene3dCallback, Vert3};
@@ -60,6 +62,8 @@ const INK_R: f32 = 3.5;
 const PICK_PX: f32 = 6.0;
 /// Id of the pseudo channel carrying the space axes (no real channel has it).
 const SPACE_CH: u32 = u32::MAX;
+/// Second pseudo channel for spike x in 1-feature-per-channel bases.
+const SPACE_X_CH: u32 = u32::MAX - 1;
 
 /// How the points are coloured instead of by cluster (Features colour mode).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -72,8 +76,8 @@ pub(crate) enum PointColour {
 pub(crate) struct Overlay<'a> {
     /// Indices into `set.points` of the k-means part shown (exact members), if any.
     pub km_part: Option<&'a [usize]>,
-    /// The closed lasso: its cell's (x, y) dims and polygon in data coords.
-    pub lasso: Option<(Dim, Dim, &'a [[f32; 2]])>,
+    /// All closed 2-D limits (committed + settled active): `(x, y, op, polygon)`.
+    pub limits: Vec<(AxisId, AxisId, LimitOp, &'a [[f32; 2]])>,
     /// All k-means parts, for the separation score when < 2 clusters are selected.
     pub km_parts: Option<&'a [Vec<usize>]>,
     /// The focused 2-D cell's (x, y) dims: what the pin holds.
@@ -154,7 +158,8 @@ fn ghost_job<P: DataProvider>(
 ) -> impl FnOnce(&Session<P>, &AtomicBool) -> Arc<FeatureSet> + Send + 'static {
     move |s, cancel| {
         let basis = Arc::new(Mutex::new(None));
-        Arc::new(compute(s, &gkey, &basis, cancel))
+        let scalars = Arc::new(Mutex::new(None));
+        Arc::new(compute(s, &gkey, &basis, &scalars, cancel))
     }
 }
 
@@ -187,44 +192,79 @@ impl View3dState {
     }
 }
 
-/// `set` with a pseudo channel last whose PC1 is spike depth (µm) and whose PC2
-/// is spike x (µm; NaN when the data has no `spike_positions.npy`), so the
+/// `set` with pseudo channel(s) last whose axes are spike depth (µm) and
+/// spike x (µm; NaN when the data has no `spike_positions.npy`), so the
 /// space axes are ordinary dims of the triples. `selection` maps the points'
 /// slots to clusters. Background points have no depth (NaN): they drop out of
 /// any triple holding it.
 fn with_space(set: &FeatureSet, selection: &[ClusterId], depths: &SpikeDepths) -> FeatureSet {
     let n = set.n();
-    let mut feats = Vec::with_capacity(set.points.len() * 2 * (n + 1));
-    for (i, p) in set.points.iter().enumerate() {
-        let at = |v: &[Vec<f32>]| {
-            selection
-                .get(p.slot as usize)
-                .and_then(|c| v.get(c.idx()))
-                .and_then(|d| d.get(p.local as usize))
-                .copied()
-                .unwrap_or(f32::NAN)
-        };
-        let row = set.row(i);
-        feats.extend_from_slice(&row[..n]);
-        feats.push(at(&depths.per_cluster));
-        feats.extend_from_slice(&row[n..]);
-        feats.push(depths.x.as_deref().map_or(f32::NAN, at));
+    let at = |p: &crate::feature_view::FeaturePoint, v: &[Vec<f32>]| {
+        selection
+            .get(p.slot as usize)
+            .and_then(|c| v.get(c.idx()))
+            .and_then(|d| d.get(p.local as usize))
+            .copied()
+            .unwrap_or(f32::NAN)
+    };
+    if set.basis == FeatureBasis::Pc2Ch {
+        let mut feats = Vec::with_capacity(set.points.len() * 2 * (n + 1));
+        for (i, p) in set.points.iter().enumerate() {
+            let row = set.row(i);
+            feats.extend_from_slice(&row[..n]);
+            feats.push(at(p, &depths.per_cluster));
+            feats.extend_from_slice(&row[n..]);
+            feats.push(depths.x.as_deref().map_or(f32::NAN, |v| at(p, v)));
+        }
+        let channels = set.channels.iter().copied().chain([SPACE_CH]).collect();
+        FeatureSet::new_with_basis(
+            set.basis,
+            channels,
+            set.computed,
+            set.full,
+            set.points.clone(),
+            feats,
+            set.time_range,
+        )
+    } else {
+        let mut feats = Vec::with_capacity(set.points.len() * (n + 2));
+        for (i, p) in set.points.iter().enumerate() {
+            let row = set.row(i);
+            feats.extend_from_slice(row);
+            feats.push(at(p, &depths.per_cluster));
+            feats.push(depths.x.as_deref().map_or(f32::NAN, |v| at(p, v)));
+        }
+        let channels = set
+            .channels
+            .iter()
+            .copied()
+            .chain([SPACE_CH, SPACE_X_CH])
+            .collect();
+        FeatureSet::new_with_basis(
+            set.basis,
+            channels,
+            set.computed,
+            set.full,
+            set.points.clone(),
+            feats,
+            set.time_range,
+        )
     }
-    let channels = set.channels.iter().copied().chain([SPACE_CH]).collect();
-    FeatureSet::new(
-        channels,
-        set.computed,
-        set.full,
-        set.points.clone(),
-        feats,
-        set.time_range,
-    )
 }
 
 /// The space dims of `set`: `(depth, x)`.
 fn space_dims(set: &FeatureSet) -> Option<(Dim, Dim)> {
-    let ch = (set.channels.last() == Some(&SPACE_CH)).then(|| (set.n() - 1) as u8)?;
-    Some((Dim::Pc { ch, pc: 0 }, Dim::Pc { ch, pc: 1 }))
+    if set.basis == FeatureBasis::Pc2Ch {
+        let ch = (set.channels.last() == Some(&SPACE_CH)).then(|| (set.n() - 1) as u8)?;
+        Some((Dim::Pc { ch, pc: 0 }, Dim::Pc { ch, pc: 1 }))
+    } else {
+        let n = set.n();
+        if n >= 2 && set.channels[n - 2] == SPACE_CH && set.channels[n - 1] == SPACE_X_CH {
+            Some((set.dim(1 + (n - 2)), set.dim(1 + (n - 1))))
+        } else {
+            None
+        }
+    }
 }
 
 /// Axis name: the space axes by name, the rest as in the 2-D plots.
@@ -236,14 +276,15 @@ fn label(dim: Dim, set: &FeatureSet) -> String {
     }
 }
 
-/// The channels of `t`'s PC dims, each once (time has none).
+/// The channels of `t`'s channel-bound dims, each once (time and space have none).
 fn channels_of(set: &FeatureSet, t: Triple) -> Vec<u32> {
     let mut out = Vec::new();
     for d in t {
-        if let Dim::Pc { ch, .. } = set.dim(d) {
-            let c = set.channels[ch as usize];
-            if c != SPACE_CH && !out.contains(&c) {
-                out.push(c);
+        if let Some(ch) = set.dim(d).channel_slot() {
+            if let Some(&c) = set.channels.get(ch) {
+                if c != SPACE_CH && c != SPACE_X_CH && !out.contains(&c) {
+                    out.push(c);
+                }
             }
         }
     }
@@ -515,6 +556,7 @@ struct Palette {
     ghost: Color32,
     strong: Color32,
     accent: Color32,
+    danger: Color32,
     /// Members of the shown k-means part (as in the 2-D preview).
     part: Color32,
     dark: bool,
@@ -673,8 +715,14 @@ fn build_scene(inp: &SceneInput) -> (Scene3d, Scene3d, Scene3d) {
             None,
         );
     }
-    if let Some(l) = overlay.lasso {
-        prism(set, triple, l, rgba(palette.strong, 0.95), &mut lines);
+    for &(ax, ay, op, poly) in &overlay.limits {
+        if let (Some(dx), Some(dy)) = (set.axis_dim(ax), set.axis_dim(ay)) {
+            let colour = match op {
+                LimitOp::Include => rgba(palette.strong, 0.95),
+                LimitOp::Exclude => rgba(palette.danger, 0.95),
+            };
+            prism(set, triple, (dx, dy, poly), colour, &mut lines);
+        }
     }
     if part_pts.len() >= 4 {
         let accent = rgba(palette.accent, 0.95);
@@ -718,8 +766,16 @@ fn before_points(
 
 fn hash_overlay(h: &mut impl Hasher, overlay: &Overlay, set: &FeatureSet) {
     overlay.km_part.hash(h);
-    if let Some((dx, dy, poly)) = overlay.lasso {
-        (set.dim_idx(dx), set.dim_idx(dy)).hash(h);
+    overlay.limits.len().hash(h);
+    for &(ax, ay, op, poly) in &overlay.limits {
+        (
+            ax,
+            ay,
+            op,
+            set.axis_dim(ax).map(|d| set.dim_idx(d)),
+            set.axis_dim(ay).map(|d| set.dim_idx(d)),
+        )
+            .hash(h);
         poly.iter().flatten().for_each(|v| v.to_bits().hash(h));
     }
 }
@@ -751,13 +807,19 @@ fn triple_label(set: &FeatureSet, t: Triple) -> String {
     t.map(|d| label(set.dim(d), set)).join(" · ")
 }
 
-/// `3·1 5·1 3·2`: channel and PC number, `t` for time.
+/// `3·1 5·1 3·2` or `3·E 5·E t`: channel and feature, `t` for time.
 fn short_label(set: &FeatureSet, t: Triple) -> String {
-    t.map(|d| match set.dim(d) {
-        Dim::Time => "t".to_owned(),
-        _ if space_dims(set).is_some_and(|s| s.0 == set.dim(d)) => "depth".to_owned(),
-        _ if space_dims(set).is_some_and(|s| s.1 == set.dim(d)) => "x".to_owned(),
-        Dim::Pc { ch, pc } => format!("{}·{}", set.channels[ch as usize], pc + 1),
+    t.map(|d| {
+        let dim = set.dim(d);
+        match dim {
+            Dim::Time => "t".to_owned(),
+            _ if space_dims(set).is_some_and(|s| s.0 == dim) => "depth".to_owned(),
+            _ if space_dims(set).is_some_and(|s| s.1 == dim) => "x".to_owned(),
+            Dim::Pc { ch, pc } => format!("{}·{}", set.channels[ch as usize], pc + 1),
+            Dim::Scalar { ch, kind } => {
+                format!("{}·{}", set.channels[ch as usize], kind.short_label())
+            }
+        }
     })
     .join("  ")
 }
@@ -839,9 +901,14 @@ pub(crate) fn feature_3d<P: DataProvider>(
         })
         .cloned()
         .or_else(|| state.scores.last().cloned());
-    // Triples to choose from: the pin holds the focused plot's pair.
-    let pair =
-        (!state.unpinned).then(|| [overlay.focus.0, overlay.focus.1].map(|d| set.dim_idx(d)));
+    // Triples to choose from: the pin holds the focused plot's pair (when both
+    // dims exist in the current feature set).
+    let pair = (!state.unpinned)
+        .then(|| {
+            (set.has_dim(overlay.focus.0) && set.has_dim(overlay.focus.1))
+                .then(|| [overlay.focus.0, overlay.focus.1].map(|d| set.dim_idx(d)))
+        })
+        .flatten();
     let nd = set.n_dims();
     let mut list = scores
         .as_deref()
@@ -852,6 +919,12 @@ pub(crate) fn feature_3d<P: DataProvider>(
             .map(|t| (t, f32::NAN))
             .collect();
         list = listed(&unscored, nd, pair);
+        if list.is_empty() {
+            list = listed(&unscored, nd, None);
+        }
+    }
+    if list.is_empty() {
+        return;
     }
     let triple = effective(&list, state.chosen);
     state.shown = Some(triple);
@@ -888,6 +961,8 @@ pub(crate) fn feature_3d<P: DataProvider>(
         selection: clusters,
         channels: Some(orig.channels.clone()),
         keep_order: true,
+        same_shank_clusters: false,
+        channel_shanks: Vec::new(),
         ..key.clone()
     };
     // (clusters its slots index, what it is, the features)
@@ -974,6 +1049,7 @@ pub(crate) fn feature_3d<P: DataProvider>(
             ghost: visuals.text_color(),
             strong: visuals.strong_text_color(),
             accent: visuals.hyperlink_color,
+            danger: theme.danger,
             part: ink_colour(dark),
             dark,
         };
@@ -1040,9 +1116,19 @@ pub(crate) fn feature_3d<P: DataProvider>(
         });
     }
 
-    let prism_missing = overlay
-        .lasso
-        .filter(|&(dx, dy, _)| prism_axes(set, triple, dx, dy).is_none());
+    let missing_prisms: Vec<(AxisId, AxisId)> = overlay
+        .limits
+        .iter()
+        .filter(|&&(ax, ay, _, poly)| {
+            poly.len() >= 3
+                && set
+                    .axis_dim(ax)
+                    .zip(set.axis_dim(ay))
+                    .and_then(|(dx, dy)| prism_axes(set, triple, dx, dy))
+                    .is_none()
+        })
+        .map(|&(ax, ay, ..)| (ax, ay))
+        .collect();
     let mut legend: Vec<(Swatch, String)> = selection
         .iter()
         .zip(&styles)
@@ -1095,12 +1181,16 @@ pub(crate) fn feature_3d<P: DataProvider>(
             .into(),
         ));
     }
-    if let Some((dx, dy, _)) = overlay.lasso {
-        let cell = format!("{} × {}", label(dx, set), label(dy, set));
-        legend.push((
-            Swatch::Prism(visuals.strong_text_color()),
-            format!("lasso prism ({cell})"),
-        ));
+    for &(ax, ay, op, poly) in &overlay.limits {
+        if poly.len() < 3 {
+            continue;
+        }
+        let cell = format!("{} × {}", ax.short_label(), ay.short_label());
+        let (swatch, kind) = match op {
+            LimitOp::Include => (visuals.strong_text_color(), "lasso prism"),
+            LimitOp::Exclude => (theme.danger, "exclude prism"),
+        };
+        legend.push((Swatch::Prism(swatch), format!("{kind} ({cell})")));
     }
     if overlay.km_part.is_some() {
         legend.push((
@@ -1267,12 +1357,19 @@ pub(crate) fn feature_3d<P: DataProvider>(
     {
         painter.circle_stroke(at, 6.0, Stroke::new(1.5_f32, visuals.hyperlink_color));
     }
-    if let Some((dx, dy, _)) = prism_missing {
-        let text = format!(
-            "lasso in {} × {} — pick a triple with both axes to see its prism",
-            label(dx, set),
-            label(dy, set)
-        );
+    if !missing_prisms.is_empty() {
+        let text = if let [(ax, ay)] = missing_prisms.as_slice() {
+            format!(
+                "lasso in {} × {} — pick a triple with both axes to see its prism",
+                ax.short_label(),
+                ay.short_label()
+            )
+        } else {
+            format!(
+                "{} limits off-axes — pick a triple holding their axes to see their prisms",
+                missing_prisms.len()
+            )
+        };
         let galley = painter.layout(
             text,
             FontId::proportional(11.0),
@@ -1783,13 +1880,16 @@ mod tests {
             ghost: Color32::GRAY,
             strong: Color32::WHITE,
             accent: Color32::LIGHT_BLUE,
+            danger: Color32::RED,
             part: Color32::WHITE,
             dark: true,
         };
-        let lines = |triple, lasso| {
+        let ax1 = set.dim_axis(set.dim(1)).unwrap();
+        let ax2 = set.dim_axis(set.dim(2)).unwrap();
+        let lines = |triple, limits| {
             let overlay = Overlay {
                 km_part: None,
-                lasso,
+                limits,
                 km_parts: None,
                 focus: (Dim::Time, Dim::Time),
             };
@@ -1807,11 +1907,82 @@ mod tests {
             assert!(bg.points.is_empty() && !fg.tris.is_empty());
             fg.lines.len()
         };
-        let none = lines([1, 2, 3], None);
-        let with = lines([1, 2, 3], Some((set.dim(1), set.dim(2), &poly[..])));
-        let without = lines([2, 3, 4], Some((set.dim(1), set.dim(2), &poly[..])));
+        let none = lines([1, 2, 3], Vec::new());
+        let with = lines([1, 2, 3], vec![(ax1, ax2, LimitOp::Include, &poly[..])]);
+        let without = lines([2, 3, 4], vec![(ax1, ax2, LimitOp::Include, &poly[..])]);
         assert!(with > none);
-        assert_eq!(without, lines([2, 3, 4], None));
+        assert_eq!(without, lines([2, 3, 4], Vec::new()));
+    }
+
+    #[test]
+    fn multiple_include_and_exclude_prisms_extrude_with_distinct_colors_and_skip_off_axes() {
+        let set = blobs();
+        let styles = [
+            Style {
+                colour: Color32::RED,
+                filled: true,
+            },
+            Style {
+                colour: Color32::BLUE,
+                filled: false,
+            },
+        ];
+        let poly_inc = [[0.1, 0.1], [0.5, 0.1], [0.3, 0.6]];
+        let poly_exc = [[0.2, 0.2], [0.6, 0.2], [0.4, 0.7]];
+        let poly_off = [[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]];
+        let palette = Palette {
+            cube: Color32::GRAY,
+            ghost: Color32::GRAY,
+            strong: Color32::WHITE,
+            accent: Color32::LIGHT_BLUE,
+            danger: Color32::from_rgb(220, 40, 40),
+            part: Color32::WHITE,
+            dark: true,
+        };
+        let ax0 = set.dim_axis(set.dim(0)).unwrap();
+        let ax1 = set.dim_axis(set.dim(1)).unwrap();
+        let ax2 = set.dim_axis(set.dim(2)).unwrap();
+        let ax3 = set.dim_axis(set.dim(3)).unwrap();
+        let missing_ch = AxisId::Pc { channel: 99, pc: 0 };
+        let build = |limits| {
+            let overlay = Overlay {
+                km_part: None,
+                limits,
+                km_parts: None,
+                focus: (Dim::Time, Dim::Time),
+            };
+            build_scene(&SceneInput {
+                set: &set,
+                triple: [1, 2, 3],
+                styles: &styles,
+                ghosts: &[],
+                overlay: &overlay,
+                palette: &palette,
+                brush: BrushInput::default(),
+            })
+            .0
+        };
+        let base = build(Vec::new());
+        let inc_only = build(vec![(ax1, ax2, LimitOp::Include, &poly_inc[..])]);
+        let both = build(vec![
+            (ax1, ax2, LimitOp::Include, &poly_inc[..]),
+            (ax2, ax3, LimitOp::Exclude, &poly_exc[..]),
+            // Off-triple (uses dim 0) and missing channel must be skipped.
+            (ax0, ax1, LimitOp::Include, &poly_off[..]),
+            (missing_ch, ax1, LimitOp::Exclude, &poly_off[..]),
+        ]);
+        let inc_color = rgba(palette.strong, 0.95);
+        let exc_color = rgba(palette.danger, 0.95);
+        assert!(inc_only.lines.len() > base.lines.len());
+        assert!(both.lines.len() > inc_only.lines.len());
+        assert!(both.lines.iter().any(|v| v.color == inc_color));
+        assert!(both.lines.iter().any(|v| v.color == exc_color));
+        // Adding off-axis limits does not add any extra line vertices.
+        let both_no_off = build(vec![
+            (ax1, ax2, LimitOp::Include, &poly_inc[..]),
+            (ax2, ax3, LimitOp::Exclude, &poly_exc[..]),
+        ]);
+        assert_eq!(both.lines.len(), both_no_off.lines.len());
     }
 
     /// `blobs_n` with each point's `local` its position in its cluster, and
@@ -1911,12 +2082,13 @@ mod tests {
             ghost: Color32::GRAY,
             strong: Color32::WHITE,
             accent: Color32::LIGHT_BLUE,
+            danger: Color32::RED,
             part: Color32::WHITE,
             dark: true,
         };
         let overlay = Overlay {
             km_part: None,
-            lasso: None,
+            limits: Vec::new(),
             km_parts: None,
             focus: (Dim::Time, Dim::Time),
         };
@@ -1958,12 +2130,13 @@ mod tests {
             ghost: Color32::GRAY,
             strong: Color32::WHITE,
             accent: Color32::LIGHT_BLUE,
+            danger: Color32::RED,
             part: Color32::WHITE,
             dark: true,
         };
         let overlay = Overlay {
             km_part: None,
-            lasso: None,
+            limits: Vec::new(),
             km_parts: None,
             focus: (Dim::Time, Dim::Time),
         };
@@ -2058,6 +2231,7 @@ mod tests {
             ghost: Color32::GRAY,
             strong: Color32::WHITE,
             accent: Color32::LIGHT_BLUE,
+            danger: Color32::RED,
             part: Color32::WHITE,
             dark: true,
         };
@@ -2068,7 +2242,7 @@ mod tests {
         let lines = |km_part: Option<&[usize]>, brush: Option<&crate::brush::SpikeBrush>| {
             let overlay = Overlay {
                 km_part,
-                lasso: None,
+                limits: Vec::new(),
                 km_parts: None,
                 focus: (Dim::Time, Dim::Time),
             };
@@ -2146,5 +2320,122 @@ mod tests {
     fn camera_fits_the_cube() {
         assert!(fit_distance(1.0) > 4.0 && fit_distance(0.5) > fit_distance(1.0));
         assert_eq!(fit_distance(2.0), fit_distance(1.0));
+    }
+
+    #[test]
+    fn scalar_axes_appear_in_3d_triples_and_extrude_scalar_prisms() {
+        use crate::lasso::ScalarFeature;
+
+        // 4-channel Energy set: 2 clusters separated on ch10 and ch20 Energy.
+        let mut s = 0x5CA1_u32;
+        let (mut points, mut feats) = (Vec::new(), Vec::new());
+        for slot in 0..2u16 {
+            for local in 0..60u32 {
+                let off = slot as f32 * 0.8;
+                points.push(FeaturePoint {
+                    local,
+                    slot,
+                    t: noise(&mut s) * 10.0,
+                });
+                feats.extend([
+                    off + 0.1 * noise(&mut s),
+                    off + 0.1 * noise(&mut s),
+                    noise(&mut s),
+                    noise(&mut s),
+                ]);
+            }
+        }
+        let mut set = FeatureSet::new_with_basis(
+            FeatureBasis::Energy4Ch,
+            vec![10, 20, 30, 40],
+            true,
+            true,
+            points,
+            feats,
+            (2.0, 10.0),
+        );
+        set.bounds = vec![(0.0, 1.0); 4];
+
+        // 1 + 4 = 5 dims -> C(5, 3) = 10 triples; best triple contains ch10 & ch20 Energy (dims 1, 2).
+        assert_eq!(set.n_dims(), 5);
+        let scores = scored(&set, Source::Clusters);
+        assert_eq!(scores.len(), 10);
+        let best = scores[0].0;
+        assert!(best.contains(&1) && best.contains(&2), "{best:?}");
+        assert_eq!(label(set.dim(1), &set), "ch10 Energy");
+        assert_eq!(short_label(&set, [0, 1, 2]), "t  10·E  20·E");
+        assert_eq!(channels_of(&set, [0, 1, 2]), vec![10, 20]);
+
+        // AxisId::Scalar prism extrudes cleanly in build_scene.
+        let ax1 = AxisId::Scalar {
+            channel: 10,
+            kind: ScalarFeature::Energy,
+        };
+        let ax2 = AxisId::Scalar {
+            channel: 20,
+            kind: ScalarFeature::Energy,
+        };
+        let poly = [[0.1, 0.1], [0.5, 0.1], [0.3, 0.6]];
+        let styles = [
+            Style {
+                colour: Color32::RED,
+                filled: true,
+            },
+            Style {
+                colour: Color32::BLUE,
+                filled: false,
+            },
+        ];
+        let palette = Palette {
+            cube: Color32::GRAY,
+            ghost: Color32::GRAY,
+            strong: Color32::WHITE,
+            accent: Color32::LIGHT_BLUE,
+            danger: Color32::RED,
+            part: Color32::WHITE,
+            dark: true,
+        };
+        let build = |limits| {
+            let overlay = Overlay {
+                km_part: None,
+                limits,
+                km_parts: None,
+                focus: (set.dim(1), set.dim(2)),
+            };
+            build_scene(&SceneInput {
+                set: &set,
+                triple: [1, 2, 3],
+                styles: &styles,
+                ghosts: &[],
+                overlay: &overlay,
+                palette: &palette,
+                brush: BrushInput::default(),
+            })
+            .0
+            .lines
+            .len()
+        };
+        let base_lines = build(Vec::new());
+        let with_scalar_prism = build(vec![(ax1, ax2, LimitOp::Include, &poly[..])]);
+        assert!(
+            with_scalar_prism > base_lines,
+            "AxisId::Scalar prism must add extruded edges to the 3D scene"
+        );
+
+        // Space axes (depth) also work cleanly on scalar sets.
+        let per = |base: f32| (0..60).map(|i| base + i as f32 * 0.1).collect();
+        let depths = SpikeDepths {
+            per_cluster: vec![per(100.0), per(500.0)],
+            x: None,
+            source: sorrel_data::DepthSource::PcWeighted,
+            min: 100.0,
+            max: 506.0,
+        };
+        let ext = with_space(&set, &[ClusterId(0), ClusterId(1)], &depths);
+        assert_eq!(ext.bound(Dim::Time), (2.0, 10.0));
+        let (depth, x) = space_dims(&ext).unwrap();
+        assert_eq!(label(depth, &ext), "depth");
+        assert_eq!(label(x, &ext), "x");
+        assert!(!channels_of(&ext, [0, 1, ext.dim_idx(depth)]).contains(&SPACE_CH));
     }
 }

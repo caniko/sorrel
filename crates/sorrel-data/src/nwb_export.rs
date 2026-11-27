@@ -138,7 +138,7 @@ where
                 .collect();
             if values.iter().any(|v| !v.is_nan()) {
                 let data = match name {
-                    "n_spikes" | "isi_violations" => {
+                    "n_spikes" | "isi_violations" | "duplicate_spikes" => {
                         Values::Int(values.into_iter().map(|v| v as i64).collect())
                     }
                     _ => Values::Float(values),

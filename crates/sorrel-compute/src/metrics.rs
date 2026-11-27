@@ -181,6 +181,32 @@ pub fn isi_violations(spike_times: &[SampleIndex], refractory_samples: u64) -> u
         .count()
 }
 
+/// Return sorted local indices to discard from runs of consecutive spikes
+/// at most `tol_samples` apart. Keep the earliest spike with the highest
+/// finite amplitude, or the first spike if amplitudes are missing or unusable.
+pub fn duplicate_spike_indices(times: &[SampleIndex], amps: &[f32], tol_samples: u64) -> Vec<u32> {
+    let mut duplicates = Vec::new();
+    let mut start = 0;
+    for run in times.chunk_by(|prev, next| next.0.saturating_sub(prev.0) <= tol_samples) {
+        let end = start + run.len();
+        if run.len() > 1 {
+            let mut keep = start;
+            if amps.len() >= times.len() {
+                let mut best = f32::NEG_INFINITY;
+                for (i, &amp) in amps[start..end].iter().enumerate() {
+                    if amp.is_finite() && amp > best {
+                        keep = start + i;
+                        best = amp;
+                    }
+                }
+            }
+            duplicates.extend((start..end).filter(|&i| i != keep).map(|i| i as u32));
+        }
+        start = end;
+    }
+    duplicates
+}
+
 /// ISI violations per second, useful as a noise indicator (legitimate
 /// neurons fire well below this rate after the refractory period).
 /// `NaN` without a usable spike-train span or refractory window.
@@ -591,6 +617,30 @@ mod tests {
             );
             assert_eq!(params.sweep(&times[..1], 4 * final_width, rate), (0.0, 0));
         }
+    }
+
+    #[test]
+    fn duplicate_indices_use_inclusive_consecutive_gaps() {
+        let times = si([0, 2, 4, 7, 9, 11]);
+        assert!(duplicate_spike_indices(&[], &[], 2).is_empty());
+        assert!(duplicate_spike_indices(&times[..1], &[], 2).is_empty());
+        assert!(duplicate_spike_indices(&times, &[], 1).is_empty());
+        assert_eq!(
+            duplicate_spike_indices(&times, &[1.0, 3.0, 2.0, 1.0, 2.0, 3.0], 2),
+            [0, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn duplicate_indices_keep_earliest_ties_and_ignore_nonfinite_amplitudes() {
+        let times = si([10, 10, 10, 10]);
+        for amps in [&[][..], &[1.0, 5.0][..], &[f32::NAN; 4][..]] {
+            assert_eq!(duplicate_spike_indices(&times, amps, 0), [1, 2, 3]);
+        }
+        assert_eq!(
+            duplicate_spike_indices(&times, &[f32::NAN, -2.0, -2.0, f32::INFINITY], 0),
+            [0, 2, 3]
+        );
     }
 
     #[test]

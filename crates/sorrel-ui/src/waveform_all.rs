@@ -7,8 +7,8 @@
 //! raw traces must not silently be a 100-spike sample.
 //!
 //! [`run_all`] streams the extraction in prefetched batches. Pass 1
-//! accumulates the mean and the true min/max over every valid spike and is
-//! published as soon as it finishes (exact full-set mean, no raster yet), so
+//! accumulates the mean, sample SD, and true min/max over every valid spike and
+//! publishes them as soon as it finishes (no raster yet), so
 //! `M` mean-only never waits for the density images. Pass 2 rasterizes
 //! **every** valid spike into a small fixed-size density image (so a million
 //! spike cluster does not create a million egui polylines). Counts make
@@ -44,7 +44,7 @@ const PREFETCH_BATCH: usize = 256;
 const PARALLEL_EXTRACT_MIN: usize = 4_096;
 
 /// Spikes per parallel mean task. Chunk results are merged in index order, so
-/// the published mean/extrema are deterministic for a given input.
+/// the published waveform statistics are deterministic for a given input.
 const EXTRACT_CHUNK: usize = 4_096;
 
 /// Below this many valid spikes the raster pass stays on the worker thread;
@@ -149,7 +149,8 @@ pub(crate) struct ProgressSnapshot {
     pub n_clusters: usize,
 }
 
-/// Per-cluster output. `mean` and `min`/`max` cover every channel; `raster`
+/// Per-cluster output. Pass-1 waveform statistics (`mean`, `std`, `min`, `max`)
+/// cover [`AllResult::render_channels`] (other channels remain `0.0`); `raster`
 /// has one density image per entry of [`AllResult::render_channels`].
 #[derive(Clone, Debug)]
 pub(crate) struct AllCluster {
@@ -160,6 +161,8 @@ pub(crate) struct AllCluster {
     pub missing: usize,
     pub drawn: usize,
     pub mean: Vec<Vec<f32>>,
+    /// Sample standard deviation, indexed like `mean`.
+    pub std: Vec<Vec<f32>>,
     pub min: Vec<f32>,
     pub max: Vec<f32>,
     pub raster: Vec<Vec<u8>>,
@@ -175,6 +178,7 @@ impl AllCluster {
             missing: 0,
             drawn: 0,
             mean: vec![vec![0.0; snippet_len]; nc],
+            std: vec![vec![0.0; snippet_len]; nc],
             min: vec![0.0; nc],
             max: vec![0.0; nc],
             // Allocated only for non-empty clusters that will rasterize
@@ -200,7 +204,7 @@ pub(crate) struct AllResult {
     /// Never silently replaced by a sample; the pane reports this.
     pub raster_failed: usize,
     /// True only once pass 2 has rasterized the complete valid set. A
-    /// provisional result carries the exact all-spike mean and extrema but no
+    /// provisional result carries the full waveform statistics but no
     /// density images yet, so the pane can show the full mean immediately.
     pub raster_complete: bool,
     /// Spikes extraction skipped while their trace window was still being
@@ -562,10 +566,11 @@ fn subtract_render_medians(
 }
 
 /// Partial pass-1 result for one contiguous spike chunk. Merged in chunk
-/// order for a deterministic mean.
+/// order for deterministic statistics.
 #[derive(Default)]
 struct Pass1Chunk {
-    sums: Vec<Vec<f64>>,
+    mean: Vec<Vec<f64>>,
+    m2: Vec<Vec<f64>>,
     min: Vec<f32>,
     max: Vec<f32>,
     valid: usize,
@@ -577,7 +582,39 @@ struct Pass1Chunk {
     cancelled: bool,
 }
 
-/// Extract a chunk of spikes for the full-set mean and true extrema. Fills
+impl Pass1Chunk {
+    fn empty(nc: usize, snippet_len: usize) -> Self {
+        Self {
+            mean: vec![vec![0.0; snippet_len]; nc],
+            m2: vec![vec![0.0; snippet_len]; nc],
+            min: vec![f32::INFINITY; nc],
+            max: vec![f32::NEG_INFINITY; nc],
+            ..Self::default()
+        }
+    }
+
+    fn write_waveforms(&self, cluster: &mut AllCluster, render_channels: &[usize]) {
+        for &ch in render_channels {
+            if let (Some(row), Some(mean)) = (cluster.mean.get_mut(ch), self.mean.get(ch)) {
+                for (dest, &value) in row.iter_mut().zip(mean) {
+                    *dest = value as f32;
+                }
+            }
+        }
+        if self.valid >= 2 {
+            let divisor = (self.valid - 1) as f64;
+            for &ch in render_channels {
+                if let (Some(row), Some(m2)) = (cluster.std.get_mut(ch), self.m2.get(ch)) {
+                    for (dest, &value) in row.iter_mut().zip(m2) {
+                        *dest = (value / divisor).max(0.0).sqrt() as f32;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Extract a chunk of spikes for the full-set waveform statistics. Fills
 /// the matching slice of the valid bitmask. Used by both the sequential and
 /// parallel path so counting/validity cannot drift.
 #[allow(clippy::too_many_arguments)]
@@ -594,12 +631,7 @@ fn extract_pass1_chunk<P: DataProvider>(
     cancel: &AtomicBool,
 ) -> Pass1Chunk {
     let render_channels = &key.render_channels;
-    let mut out = Pass1Chunk {
-        sums: vec![vec![0.0f64; snippet_len]; nc],
-        min: vec![f32::INFINITY; nc],
-        max: vec![f32::NEG_INFINITY; nc],
-        ..Default::default()
-    };
+    let mut out = Pass1Chunk::empty(nc, snippet_len);
     let mut scratch = SnipScratch::new(nc, snippet_len);
     let mut local = 0usize;
     for batch in times.chunks(PREFETCH_BATCH) {
@@ -672,23 +704,23 @@ fn extract_pass1_chunk<P: DataProvider>(
             out.valid += 1;
             progress.valid.fetch_add(1, Ordering::Relaxed);
 
-            // Only the shared display channels need a mean/min/max: the
-            // channel set is part of the work key, so changing it starts a
-            // fresh request instead of paying for all 384 probe channels on
-            // every spike.
+            let n = out.valid as f64;
             for &ch in render_channels {
                 if ch >= nc {
                     continue;
                 }
+                let mean = &mut out.mean[ch];
+                let m2 = &mut out.m2[ch];
                 let (mut ch_min, mut ch_max) = (out.min[ch], out.max[ch]);
-                let sum_row = &mut out.sums[ch];
-                for (sample, &value) in scratch.buf[ch..]
-                    .iter()
-                    .step_by(nc)
-                    .take(snippet_len)
-                    .enumerate()
+                for ((mean, m2), &value) in mean
+                    .iter_mut()
+                    .zip(m2)
+                    .zip(scratch.buf[ch..].iter().step_by(nc))
                 {
-                    sum_row[sample] += value as f64;
+                    let x = value as f64;
+                    let delta = x - *mean;
+                    *mean += delta / n;
+                    *m2 += delta * (x - *mean);
                     if value < ch_min {
                         ch_min = value;
                     }
@@ -706,24 +738,43 @@ fn extract_pass1_chunk<P: DataProvider>(
 }
 
 /// Merge chunk results in their original order.
-fn merge_pass1(mut chunks: Vec<Pass1Chunk>, nc: usize, snippet_len: usize) -> Pass1Chunk {
-    let mut merged = Pass1Chunk {
-        sums: vec![vec![0.0f64; snippet_len]; nc],
-        min: vec![f32::INFINITY; nc],
-        max: vec![f32::NEG_INFINITY; nc],
-        ..Default::default()
-    };
-    for chunk in chunks.drain(..) {
-        for (row, chunk_row) in merged.sums.iter_mut().zip(&chunk.sums) {
-            for (sum, value) in row.iter_mut().zip(chunk_row) {
-                *sum += value;
+fn merge_pass1(
+    chunks: Vec<Pass1Chunk>,
+    nc: usize,
+    snippet_len: usize,
+    render_channels: &[usize],
+) -> Pass1Chunk {
+    let mut merged = Pass1Chunk::empty(nc, snippet_len);
+    for chunk in chunks {
+        if chunk.valid != 0 {
+            if merged.valid == 0 {
+                merged.mean = chunk.mean;
+                merged.m2 = chunk.m2;
+            } else {
+                // Chan's combination adds the between-chunk contribution to M2.
+                let n = (merged.valid + chunk.valid) as f64;
+                let weight = chunk.valid as f64 / n;
+                let cross = merged.valid as f64 * weight;
+                for &ch in render_channels {
+                    if ch >= nc {
+                        continue;
+                    }
+                    let target = merged.mean[ch].iter_mut().zip(merged.m2[ch].iter_mut());
+                    let source = chunk.mean[ch].iter().zip(chunk.m2[ch].iter());
+                    for ((mean, m2), (&chunk_mean, &chunk_m2)) in target.zip(source) {
+                        let delta = chunk_mean - *mean;
+                        *mean += delta * weight;
+                        *m2 += chunk_m2 + delta * delta * cross;
+                    }
+                }
             }
         }
-        for (current, value) in merged.min.iter_mut().zip(&chunk.min) {
-            *current = current.min(*value);
-        }
-        for (current, value) in merged.max.iter_mut().zip(&chunk.max) {
-            *current = current.max(*value);
+        for &ch in render_channels {
+            if ch >= nc {
+                continue;
+            }
+            merged.min[ch] = merged.min[ch].min(chunk.min[ch]);
+            merged.max[ch] = merged.max[ch].max(chunk.max[ch]);
         }
         merged.valid += chunk.valid;
         merged.invalid += chunk.invalid;
@@ -779,7 +830,7 @@ fn run_all_emit<P: DataProvider>(
     let (mut all_total, mut all_valid, mut all_invalid) = (0usize, 0usize, 0usize);
     let (mut all_edge, mut all_missing, mut all_unavailable) = (0usize, 0usize, 0usize);
 
-    // Pass 1: every valid spike for the mean and the true amplitude range.
+    // Pass 1: every valid spike for the waveform statistics.
     for &cluster in &key.clusters {
         let times = session.spike_times(cluster);
         let mut counts = AllCluster::empty(nc, snippet_len);
@@ -813,7 +864,7 @@ fn run_all_emit<P: DataProvider>(
                     )
                 })
                 .collect();
-            merge_pass1(chunks, nc, snippet_len)
+            merge_pass1(chunks, nc, snippet_len, render_channels)
         } else {
             extract_pass1_chunk(
                 session,
@@ -835,16 +886,7 @@ fn run_all_emit<P: DataProvider>(
         counts.invalid = stats.invalid;
         counts.out_of_range = stats.out_of_range;
         counts.missing = stats.missing;
-        let divisor = counts.valid.max(1) as f64;
-        counts.mean = stats
-            .sums
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(|value| (value / divisor) as f32)
-                    .collect()
-            })
-            .collect();
+        stats.write_waveforms(&mut counts, render_channels);
         let mut min = stats.min;
         let mut max = stats.max;
         for (low, high) in min.iter_mut().zip(max.iter_mut()) {
@@ -877,9 +919,8 @@ fn run_all_emit<P: DataProvider>(
     progress.stage.store(STAGE_RASTER, Ordering::Relaxed);
     progress.raster_total.store(all_total, Ordering::Relaxed);
 
-    // Publish the exact full-set mean before touching the raster pass. This
-    // is the whole pass-1 result (means, extrema and honest counts); only the
-    // density images are missing.
+    // Publish the full waveform statistics and counts before touching the
+    // raster pass; only the density images are missing.
     let provisional = AllResult {
         clusters: out.clone(),
         render_channels: render_channels.clone(),
@@ -1517,6 +1558,112 @@ mod tests {
     }
 
     #[test]
+    fn pass1_mean_and_std_agree_across_uneven_and_empty_chunks() {
+        let offset = 16_777_216.0f32;
+        let mut provider = provider_with_spikes_at(6, 1_000.0, 20);
+        // Zero flanking samples so the 3-sample median is 0 and the large offset
+        // survives `subtract_render_medians`.
+        provider.trace.fill(0.0);
+        for (&t, delta) in provider.spikes[0]
+            .iter()
+            .zip([0.0, 2.0, 4.0, 6.0, 8.0, 12.0])
+        {
+            let center = t.0 as usize * NC;
+            provider.trace[center] = offset + delta;
+            provider.trace[center + 1] = -offset - delta;
+        }
+        let (session, _dir) = session(provider);
+        let mut key = all_key(&session, &[ClusterId(0)]);
+        key.render_channels = vec![0, 1];
+        let times = session.spike_times(ClusterId(0));
+        let extract = |times: &[SampleIndex]| {
+            extract_pass1_chunk(
+                &session,
+                &key,
+                times,
+                &mut vec![false; times.len()],
+                NC,
+                3,
+                key.sample_rate,
+                key.n_samples,
+                &AllProgress::new(times.len(), 1),
+                &AtomicBool::new(false),
+            )
+        };
+        let one = merge_pass1(vec![extract(times)], NC, 3, &key.render_channels);
+        let split = merge_pass1(
+            vec![
+                extract(&[]),
+                extract(&times[..1]),
+                extract(&times[1..3]),
+                extract(&[]),
+                extract(&times[3..]),
+                extract(&[]),
+            ],
+            NC,
+            3,
+            &key.render_channels,
+        );
+        assert_eq!((one.valid, split.valid), (6, 6));
+        let mut single = AllCluster::empty(NC, 3);
+        let mut parallel = AllCluster::empty(NC, 3);
+        one.write_waveforms(&mut single, &key.render_channels);
+        split.write_waveforms(&mut parallel, &key.render_channels);
+        for (a, b) in single
+            .mean
+            .iter()
+            .flatten()
+            .zip(parallel.mean.iter().flatten())
+        {
+            assert!((a - b).abs() < 1e-5);
+        }
+        for (a, b) in single
+            .std
+            .iter()
+            .flatten()
+            .zip(parallel.std.iter().flatten())
+        {
+            assert!((a - b).abs() < 1e-5);
+        }
+        assert!((parallel.std[0][1] - (56.0f32 / 3.0).sqrt()).abs() < 1e-5);
+        assert!((parallel.std[1][1] - (56.0f32 / 3.0).sqrt()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn pass1_sample_std_handles_empty_singleton_constant_and_known_waveforms() {
+        for (n, constant, expected) in [
+            (0, false, 0.0),
+            (1, false, 0.0),
+            (3, true, 0.0),
+            (3, false, 10.0),
+        ] {
+            let mut provider = provider_with_spikes_at(n, 1_000.0, 20);
+            if constant {
+                provider.trace.fill(5.0);
+            }
+            let (session, _dir) = session(provider);
+            let mut key = all_key(&session, &[ClusterId(0)]);
+            key.render_channels = vec![0, 1];
+            let result = run_all(
+                &session,
+                &key,
+                &AllProgress::new(n, 1),
+                &AtomicBool::new(false),
+                None,
+            );
+            let cluster = &result.clusters[0];
+            assert_eq!(cluster.valid, n);
+            assert_eq!(
+                cluster.std,
+                vec![
+                    vec![0.0, expected / 2.0, 0.0],
+                    vec![0.0, expected / 2.0, 0.0]
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn edge_and_missing_windows_are_reported_but_do_not_stop_the_mean() {
         let mut provider = provider_with_spikes(4);
         // Both recording edges are invalid, not shifted to another centre.
@@ -1590,6 +1737,7 @@ mod tests {
         assert!(!provisional.raster_complete);
         assert_eq!((provisional.valid, provisional.drawn), (300, 0));
         assert_eq!(provisional.clusters[0].mean, result.clusters[0].mean);
+        assert_eq!(provisional.clusters[0].std, result.clusters[0].std);
         assert_eq!(provisional.clusters[0].min, result.clusters[0].min);
         assert_eq!(provisional.clusters[0].max, result.clusters[0].max);
         assert!(result.raster_complete);

@@ -19,16 +19,38 @@ pub(crate) struct MergeTip {
     pub composite: f32,
     pub contamination: f32,
     pub warns: bool,
+    pub feature_d_prime: Option<f32>,
+    pub feature_overlap_est: Option<f32>,
 }
 
 impl MergeTip {
-    /// "composite +0.04\ncontamination +0.8 %" (contamination is a fraction).
+    /// "composite +0.04\ncontamination +0.8 %" (contamination is a fraction),
+    /// plus feature separation metrics when available.
     pub(crate) fn text(&self) -> String {
-        format!(
+        let mut out = format!(
             "composite {:+.2}\ncontamination {:+.1} %",
             self.composite,
             self.contamination * 100.0
-        )
+        );
+        match (
+            self.feature_d_prime.filter(|v| v.is_finite()),
+            self.feature_overlap_est.filter(|v| v.is_finite()),
+        ) {
+            (Some(dp), Some(ov)) => {
+                out.push_str(&format!(
+                    " · feature d' {dp:.2}, overlap {:.1}%",
+                    ov * 100.0
+                ));
+            }
+            (Some(dp), None) => {
+                out.push_str(&format!(" · feature d' {dp:.2}"));
+            }
+            (None, Some(ov)) => {
+                out.push_str(&format!(" · overlap {:.1}%", ov * 100.0));
+            }
+            (None, None) => {}
+        }
+        out
     }
 }
 
@@ -76,10 +98,16 @@ impl MergeTips {
                 jobs.repaint(),
                 move |s, _| {
                     let p = preview_merge(s, &[c], target);
+                    let sep = s
+                        .has_pc_features()
+                        .then(|| sorrel_data::pairwise_cluster_separation(s, c, target))
+                        .flatten();
                     MergeTip {
                         composite: p.composite_delta(),
                         contamination: p.contamination_delta(),
                         warns: p.warns(),
+                        feature_d_prime: sep.map(|x| x.d_prime).filter(|v| v.is_finite()),
+                        feature_overlap_est: sep.map(|x| x.overlap_est).filter(|v| v.is_finite()),
                     }
                 },
             )
@@ -267,7 +295,34 @@ mod tests {
             composite: 0.04,
             contamination: 0.008,
             warns: false,
+            feature_d_prime: None,
+            feature_overlap_est: None,
         };
         assert_eq!(t.text(), "composite +0.04\ncontamination +0.8 %");
+    }
+
+    #[test]
+    fn tip_text_includes_finite_feature_separation() {
+        let t = MergeTip {
+            composite: -0.05,
+            contamination: 0.012,
+            warns: true,
+            feature_d_prime: Some(2.45),
+            feature_overlap_est: Some(0.123),
+        };
+        assert_eq!(
+            t.text(),
+            "composite -0.05\ncontamination +1.2 % · feature d' 2.45, overlap 12.3%"
+        );
+
+        let partial = MergeTip {
+            feature_d_prime: Some(3.1),
+            feature_overlap_est: Some(f32::NAN),
+            ..t
+        };
+        assert_eq!(
+            partial.text(),
+            "composite -0.05\ncontamination +1.2 % · feature d' 3.10"
+        );
     }
 }

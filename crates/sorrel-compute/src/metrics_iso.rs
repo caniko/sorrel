@@ -25,7 +25,7 @@
 //! - Skip clusters with fewer than [`MIN_CLUSTER_SPIKES`] spikes — the
 //!   metrics return `f32::NAN` rather than misleading values.
 
-use crate::linalg::{chi2_sf, covariance, invert, mahalanobis_sq, row_mean, Sym};
+use crate::linalg::{chi2_sf, covariance, invert, log_det, mahalanobis_sq, row_mean, Sym};
 
 /// Minimum cluster size for which the Mahalanobis-based metrics are
 /// considered meaningful. Below this the covariance is too noisy to invert
@@ -212,6 +212,104 @@ pub fn isolation_metrics(
     // for free in callers that need it later.
     out.nn_isolation = nn_isolation_metric(features, is_in_cluster, d, k_nn);
 
+    out
+}
+
+/// Separation metrics and finite row counts for two clusters.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PairwiseSeparation {
+    pub d_prime: f32,
+    pub bhattacharyya: f32,
+    /// Bhattacharyya coefficient for the fitted Gaussians (`exp(-distance)`).
+    pub overlap_est: f32,
+    /// The larger of the two directional L-ratios.
+    pub l_ratio_ab: f32,
+    pub n_a: u32,
+    pub n_b: u32,
+}
+
+/// Compare two row-major feature clouds of dimension `d`. Only complete,
+/// finite rows are used. Fewer than two rows in either cloud yields NaN metrics.
+pub fn pairwise_separation(feats_a: &[f32], feats_b: &[f32], d: usize) -> PairwiseSeparation {
+    let mut out = PairwiseSeparation {
+        d_prime: f32::NAN,
+        bhattacharyya: f32::NAN,
+        overlap_est: f32::NAN,
+        l_ratio_ab: f32::NAN,
+        n_a: 0,
+        n_b: 0,
+    };
+    if d == 0 {
+        return out;
+    }
+    let finite_rows = |feats: &[f32], dest: &mut Vec<f32>| {
+        dest.extend(
+            feats
+                .chunks_exact(d)
+                .filter(|row| row.iter().all(|v| v.is_finite()))
+                .flatten()
+                .copied(),
+        );
+    };
+    let mut feats = Vec::new();
+    finite_rows(feats_a, &mut feats);
+    let split = feats.len();
+    finite_rows(feats_b, &mut feats);
+    let (n_a, n_b) = (split / d, (feats.len() - split) / d);
+    out.n_a = n_a as u32;
+    out.n_b = n_b as u32;
+    if n_a < 2 || n_b < 2 {
+        return out;
+    }
+
+    let rows: Vec<f64> = feats.iter().copied().map(f64::from).collect();
+    let (a, b) = rows.split_at(split);
+    let (mu_a, mu_b) = (row_mean(a, n_a, d), row_mean(b, n_b, d));
+    let (mut cov_a, mut cov_b) = (covariance(a, n_a, d), covariance(b, n_b, d));
+    let mean_diag = |cov: &Sym| (0..d).map(|i| cov.get(i, i)).sum::<f64>() / d as f64;
+    let (mean_diag_a, mean_diag_b) = (mean_diag(&cov_a), mean_diag(&cov_b));
+    // Equal centroids give a zero Fisher axis. Report zero separation when
+    // there is variance but no mean difference, rather than dividing by zero.
+    out.d_prime = if mu_a == mu_b && (mean_diag_a > 0.0 || mean_diag_b > 0.0) {
+        0.0
+    } else {
+        let mut is_a = vec![true; n_a];
+        is_a.resize(n_a + n_b, false);
+        lda_d_prime(&feats, &is_a, d)
+    };
+    cov_a.ridge((mean_diag_a * RIDGE_FRAC).max(1e-9));
+    cov_b.ridge((mean_diag_b * RIDGE_FRAC).max(1e-9));
+
+    let mut sigma = Sym {
+        d,
+        data: cov_a
+            .data
+            .iter()
+            .zip(&cov_b.data)
+            .map(|(x, y)| 0.5 * (x + y))
+            .collect(),
+    };
+    let log_sigma = log_det(&sigma).filter(|_| invert(&mut sigma, 1e-12).is_some());
+    if let (Some(log_a), Some(log_b), Some(log_sigma)) =
+        (log_det(&cov_a), log_det(&cov_b), log_sigma)
+    {
+        let distance = (0.125 * mahalanobis_sq(&mu_a, &mu_b, &sigma)
+            + 0.5 * (log_sigma - 0.5 * (log_a + log_b)))
+            .max(0.0);
+        out.bhattacharyya = distance as f32;
+        out.overlap_est = (-distance).exp().clamp(0.0, 1.0) as f32;
+    }
+
+    if invert(&mut cov_a, 1e-12).is_some() && invert(&mut cov_b, 1e-12).is_some() {
+        let tail_sum = |rows: &[f64], mu: &[f64], inv: &Sym| {
+            rows.chunks_exact(d)
+                .map(|row| chi2_sf(mahalanobis_sq(row, mu, inv), d as f64))
+                .sum::<f64>()
+        };
+        let l_ab = tail_sum(b, &mu_a, &cov_a) / n_a as f64;
+        let l_ba = tail_sum(a, &mu_b, &cov_b) / n_b as f64;
+        out.l_ratio_ab = l_ab.max(l_ba) as f32;
+    }
     out
 }
 
@@ -471,6 +569,74 @@ mod tests {
             v.push(mu[1] + g2 * sigma);
         }
         v
+    }
+
+    #[test]
+    fn pairwise_separation_distinguishes_separated_and_identical_clouds() {
+        let a = cloud(100, [0.0, 0.0], 1.0, 11);
+        let b = cloud(150, [10.0, 10.0], 1.0, 13);
+        let far = pairwise_separation(&a, &b, 2);
+        assert!(far.d_prime > 8.0 && far.bhattacharyya > 10.0, "{far:?}");
+        assert!(far.overlap_est < 1e-6 && far.l_ratio_ab < 1e-6, "{far:?}");
+
+        let same = pairwise_separation(&a, &a, 2);
+        assert_eq!(same.d_prime, 0.0);
+        assert_eq!(same.bhattacharyya, 0.0);
+        assert_eq!(same.overlap_est, 1.0);
+    }
+
+    #[test]
+    fn pairwise_separation_matches_isotropic_formula() {
+        // Squares centered at (0, 0) and (3, 4) give exact sample
+        // covariances 4/3 I and 16/3 I before the ridge.
+        let a = [-1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0];
+        let b = [1.0, 2.0, 1.0, 6.0, 5.0, 2.0, 5.0, 6.0];
+        let average_var = (10.0 / 3.0) * 1.0001;
+        let expected = 25.0 / (8.0 * average_var) + 1.25_f64.ln();
+        let m = pairwise_separation(&a, &b, 2);
+        assert!((f64::from(m.bhattacharyya) - expected).abs() < 1e-7);
+        assert!((f64::from(m.overlap_est) - (-expected).exp()).abs() < 1e-7);
+    }
+
+    #[test]
+    fn pairwise_separation_is_symmetric_except_for_counts() {
+        let a = cloud(40, [0.0, 0.0], 1.0, 11);
+        let b = cloud(60, [1.0, 2.0], 2.0, 13);
+        let ab = pairwise_separation(&a, &b, 2);
+        let mut ba = pairwise_separation(&b, &a, 2);
+        assert_eq!((ab.n_a, ab.n_b), (40, 60));
+        assert_eq!((ba.n_a, ba.n_b), (60, 40));
+        std::mem::swap(&mut ba.n_a, &mut ba.n_b);
+        assert_eq!(ab, ba);
+    }
+
+    #[test]
+    fn pairwise_separation_filters_invalid_rows_and_reports_small_samples() {
+        let a = [0.0, 0.0, 1.0, 1.0];
+        let b = [1.0, 2.0, 2.0, 3.0];
+        let noisy = [0.0, 0.0, f32::NAN, 4.0, 1.0, 1.0, 2.0, f32::INFINITY, 2.0];
+        assert_eq!(
+            pairwise_separation(&noisy, &b, 2),
+            pairwise_separation(&a, &b, 2)
+        );
+        for (m, counts) in [
+            (pairwise_separation(&a, &b, 0), (0, 0)),
+            (pairwise_separation(&noisy[..4], &b, 2), (1, 2)),
+            (pairwise_separation(&a, &[], 2), (2, 0)),
+        ] {
+            assert_eq!((m.n_a, m.n_b), counts);
+            assert!([m.d_prime, m.bhattacharyya, m.overlap_est, m.l_ratio_ab]
+                .into_iter()
+                .all(f32::is_nan));
+        }
+    }
+
+    #[test]
+    fn pairwise_separation_ridges_zero_variance_and_uses_max_directional_l_ratio() {
+        let m = pairwise_separation(&[0.0; 4], &[0.0; 6], 2);
+        assert_eq!(m.bhattacharyya, 0.0);
+        assert_eq!(m.overlap_est, 1.0);
+        assert_eq!(m.l_ratio_ab, 1.5);
     }
 
     #[test]
