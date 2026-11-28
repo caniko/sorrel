@@ -370,6 +370,17 @@
       inherit (rustPackages) sorrel sorrelRelay commonArgs cargoArtifacts;
 
       sorrelVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+      darwinLinkerArgs = let
+        osxcross = cross.osxcrossToolchain;
+        ld = "${osxcross}/bin/arm64-apple-${osxcross.darwinTarget}-ld";
+      in
+        pkgs.lib.optionalAttrs (osxcross != null) {
+          # osxcross provides a prefixed Mach-O linker, but Clang can otherwise
+          # pick the build host's GNU ld, including in CMake compiler probes.
+          CFLAGS_aarch64_apple_darwin = "--ld-path=${ld}";
+          CXXFLAGS_aarch64_apple_darwin = "--ld-path=${ld}";
+          CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS = "-C link-arg=--ld-path=${ld}";
+        };
       crossSorrelPackages = harbor-rs.lib.mkCrossPackages {
         inherit pkgs craneLib cross;
         pname = "sorrel";
@@ -415,11 +426,13 @@
             CFLAGS_aarch64_pc_windows_gnullvm = "-I${cross.winpthreads}/include -fuse-ld=lld";
             doCheck = false;
           };
-          darwin-aarch64 = {
-            buildInputs = [];
-            inherit (deps) nativeBuildInputs;
-            doCheck = false;
-          };
+          darwin-aarch64 =
+            {
+              buildInputs = [];
+              inherit (deps) nativeBuildInputs;
+              doCheck = false;
+            }
+            // darwinLinkerArgs;
         };
       };
 
@@ -451,6 +464,7 @@
           '';
         };
         targetArgs = {
+          darwin-aarch64 = darwinLinkerArgs;
           # pyo3 reads the interpreter config on native builds; cross builds
           # use the abi3 defaults.
           native = {
