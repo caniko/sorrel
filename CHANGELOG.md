@@ -7,12 +7,16 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-28
+
 ### Breaking
 
 - **`curation.json` with merges or splits is a list.** A session whose history merged or split units now writes SpikeInterface's list form (`SequentialCuration`): structural steps, then one labels-only step keyed by the final unit ids. `apply_curation` takes it as-is, and so does `sorrel.read_curation`. Code that loads the file as one `Curation` dict must accept a list. Labels-only sessions and sealed phy saves still write one dict. `sorrel apply --curation` refuses a list.
 
 ### Added
 
+- **Moving from phy ([#85](https://github.com/caniko/sorrel/pull/85)).** A migration guide and updated parity reference explain how familiar phy tasks map to Sorrel. The repository adds contribution and security reporting policies, a governance note, and issue templates.
+- **DANDI pre-outreach audit ([#88](https://github.com/caniko/sorrel/pull/88)).** The review kit checks findings against evidence from the cited asset in a pinned public snapshot, blocks unsupported claims, and holds human-data findings for privacy review.
 - **MClust-style curation.** Combine limits across feature projections, switch between PC, energy, peak and valley features, and show density contours or same-shank neighbours. Inspect ISIs on a log scale, remove duplicate spikes in one undoable edit, and review pairwise feature separation before merging.
 - **Waveform and report evidence.** Show waveform variability and the mean for spikes inside a time brush. HTML reports mark the configured refractory window on the log-ISI plot and show binned median amplitude with its interquartile range.
 - **DANDI streaming.** Open HDF5 NWB and NWB-Zarr assets by `dandi://` or HTTPS. Sessions with remote inputs always open fresh, equivalent asset paths share one pinned store, and two distinct draft assets can't be combined (unversioned DANDI asset-ID URLs also count as draft). Sorrel verifies DANDI Zarr listings and pins storage objects before reusing cached ranges. Remote NWB GUI sessions show trial events, and waveform probes report failed reads. Journals stay local.
@@ -54,10 +58,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Changed
 
+- **Website ([#86](https://github.com/caniko/sorrel/pull/86), [#88](https://github.com/caniko/sorrel/pull/88)).** The canonical URL is now `https://sorrel.beloda.co/`. The homepage has a more descriptive title and links to the DANDI Review Ledger.
 - **Website and installation docs ([#84](https://github.com/caniko/sorrel/pull/84)).** The download page leads with native builds for the visitor's OS and distinguishes Linux variants and mobile visitors. Installation docs distinguish published 0.4.0 binaries from `trunk` and improve dark-theme navigation, site links, and wide code blocks and tables. The site build checks release URL versions and expected asset names without requiring the site to target the unreleased workspace version.
 
 ### Fixed
 
+- **NWB, remote reads, and review briefs ([#88](https://github.com/caniko/sorrel/pull/88)).** NWB provenance reports source timing, duplicate or out-of-trace spikes, and conflicting imported labels; malformed ragged indexes with unreferenced spikes are rejected. Interrupted HTTP range reads retry without relaxing object pins. Briefs distinguish uncorroborated merge or split screening from a verdict.
 - **NWB compatibility for DANDI files ([#81](https://github.com/caniko/sorrel/pull/81)).** The HDF5 reader follows supported same-file soft links. An unselected processed series no longer silently supplies the Units clock. Gapped or backward trace timestamps are still rejected for trace reads; `--nwb-series none` opens Units without the trace when a Units clock is available or supplied, and records why the trace was skipped when detected.
 - **Gapped NWB quality metrics and plots ([#81](https://github.com/caniko/sorrel/pull/81)).** Refractory estimates require recorded sample pairs at the tested lags, correlogram baselines use unit and pair exposure, and `:frb` sizes bins on elapsed time. Invalid HDF5 observation-index targets fall back to valid epoch or trial intervals. QC provenance lists per-unit recorded durations when they differ from the session span.
 - **`sorrel auto` on Windows ARM64.** SpikeInterface 0.106 needs zarr 3 and numcodecs 0.16.6 or newer, which has no Windows ARM64 wheel and fails to build from source there. The sidecar now keeps SpikeInterface 0.105 on Windows ARM64 only.
@@ -757,7 +763,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Downstream dry-runs can fail until their local path dependencies have been
   published in order. See `RELEASE.md` for the publish sequence.
 
-[Unreleased]: https://github.com/caniko/sorrel/compare/0.4.0...HEAD
+[Unreleased]: https://github.com/caniko/sorrel/compare/0.5.0...HEAD
+[0.5.0]: https://github.com/caniko/sorrel/compare/0.4.0...0.5.0
 [0.4.0]: https://github.com/caniko/sorrel/compare/0.3.0...0.4.0
 [0.3.0]: https://github.com/caniko/sorrel/compare/0.2.4...0.3.0
 [0.2.4]: https://github.com/caniko/sorrel/compare/0.2.3...0.2.4

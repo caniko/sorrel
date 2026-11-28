@@ -11,8 +11,8 @@ abstract: >-
 authors:
   - family-names: Tartanoglu
     given-names: Can H.
-version: 0.4.0
-date-released: "2026-11-03"
+version: 0.5.0
+date-released: "2026-11-28"
 license:
   - MIT
   - Apache-2.0
