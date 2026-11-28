@@ -7,6 +7,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-28
+
+### Fixed
+
+- **Apple Silicon release build ([#90](https://github.com/caniko/sorrel/pull/90)).** Pass osxcross's Mach-O linker explicitly for `aarch64-apple-darwin` so bundled static HDF5 builds for macOS archives and wheels. Sorrel 0.5.1 brings all release channels back together after the 0.5.0 crates went live on crates.io.
+
 ## [0.5.0] - 2026-11-28
 
 ### Breaking
@@ -763,7 +769,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Downstream dry-runs can fail until their local path dependencies have been
   published in order. See `RELEASE.md` for the publish sequence.
 
-[Unreleased]: https://github.com/caniko/sorrel/compare/0.5.0...HEAD
+[Unreleased]: https://github.com/caniko/sorrel/compare/0.5.1...HEAD
+[0.5.1]: https://github.com/caniko/sorrel/compare/0.5.0...0.5.1
 [0.5.0]: https://github.com/caniko/sorrel/compare/0.4.0...0.5.0
 [0.4.0]: https://github.com/caniko/sorrel/compare/0.3.0...0.4.0
 [0.3.0]: https://github.com/caniko/sorrel/compare/0.2.4...0.3.0
